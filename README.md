@@ -4,21 +4,22 @@ Portable GitHub Copilot configuration, shared across machines.
 
 ## Setup on a new machine
 
-```powershell
-git clone <repo-url> C:\src\copilot-config
-cd C:\src\copilot-config
-.\link.ps1
+```bash
+git clone <repo-url> /c/src/copilot-config
+cd /c/src/copilot-config
+./link.sh
 ```
 
-`link.ps1` creates NTFS junctions from `~/.copilot` into this repo, so edits made
-through Copilot land directly in the working tree and show up in `git status`.
-Junctions are used instead of symlinks because symlinks require administrator
-rights on Windows unless Developer Mode is enabled.
+`link.sh` creates links from `~/.copilot` into this repo, so edits made through
+Copilot land directly in the working tree and show up in `git status`. On Windows
+(Git Bash / MSYS) it uses NTFS junctions rather than symlinks, because symlinks
+require administrator rights unless Developer Mode is enabled. On macOS and Linux
+it uses ordinary symlinks. The script is idempotent — re-run it any time.
 
 Anything already at a target path is moved aside to
-`%USERPROFILE%\.copilot-backups\<timestamp>\` first — deliberately outside
-`~/.copilot`, since a leftover copy under `skills/` or `agents/` would be scanned
-and loaded as a duplicate.
+`~/.copilot-backups/<timestamp>/` first — deliberately outside `~/.copilot`,
+since a leftover copy under `skills/` or `agents/` would be scanned and loaded as
+a duplicate.
 
 ## What is tracked
 
@@ -26,9 +27,9 @@ and loaded as a duplicate.
 | --- | --- |
 | `copilot-instructions.md` | Global custom instructions (copied, not linked) |
 | `settings.json` | Theme, allowed URLs, marketplaces, enabled plugins (copied) |
-| `instructions/` | Conditional `*.instructions.md` rules (junction) |
-| `agents/` | Custom agents and their scripts (junction) |
-| `skills/*` | Hand-written skills only (junction per skill) |
+| `instructions/` | Conditional `*.instructions.md` rules (linked) |
+| `agents/` | Custom agents and their scripts (linked) |
+| `skills/*` | Hand-written skills only (linked per skill) |
 
 Bundled skills that ship with Copilot (`docx`, `pptx`, `xlsx`, `excalidraw`,
 `loop`, `expense-report`, `web-artifacts-builder`, …) are deliberately excluded —
@@ -47,9 +48,9 @@ enabled plugin list, and Copilot reinstalls them into
 
 ## Updating
 
-Files under a junction are edited in place, so just commit them:
+Files under a link are edited in place, so just commit them:
 
-```powershell
+```bash
 git add -A
 git commit -m "Update instructions"
 git push
@@ -58,9 +59,9 @@ git push
 The two copied files (`copilot-instructions.md`, `settings.json`) need an
 explicit pull back into the repo after Copilot changes them:
 
-```powershell
-.\link.ps1 -Pull
+```bash
+./link.sh pull
 ```
 
-On the other machine, `git pull` then re-run `.\link.ps1` to refresh the copied
+On the other machine, `git pull` then re-run `./link.sh` to refresh the copied
 files.
