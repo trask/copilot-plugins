@@ -46,9 +46,15 @@ $copiedFiles = @(
     'settings.json'
 )
 
-function Get-Backup([string]$path) {
+# Backups live outside ~/.copilot on purpose: a leftover copy under skills/ or
+# agents/ would be scanned and loaded as a duplicate skill/agent.
+$backupRoot = Join-Path $env:USERPROFILE '.copilot-backups'
+
+function Get-Backup([string]$relative) {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    return "$path.bak-$stamp"
+    $dest = Join-Path $backupRoot (Join-Path $stamp $relative)
+    New-Item -ItemType Directory -Force -Path (Split-Path $dest -Parent) | Out-Null
+    return $dest
 }
 
 if ($Pull) {
@@ -86,9 +92,9 @@ foreach ($dir in $linkedDirs) {
             Remove-Item $link -Force
         }
         else {
-            $backup = Get-Backup $link
+            $backup = Get-Backup $dir
             Move-Item $link $backup
-            Write-Host "backup  $dir -> $(Split-Path $backup -Leaf)"
+            Write-Host "backup  $dir -> $backup"
         }
     }
 
@@ -108,9 +114,9 @@ foreach ($file in $copiedFiles) {
     }
 
     if ((Test-Path $dst) -and -not (Get-FileHash $src).Hash.Equals((Get-FileHash $dst).Hash)) {
-        $backup = Get-Backup $dst
+        $backup = Get-Backup $file
         Copy-Item $dst $backup
-        Write-Host "backup  $file -> $(Split-Path $backup -Leaf)"
+        Write-Host "backup  $file -> $backup"
     }
 
     Copy-Item $src $dst -Force

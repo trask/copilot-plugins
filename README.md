@@ -15,7 +15,10 @@ through Copilot land directly in the working tree and show up in `git status`.
 Junctions are used instead of symlinks because symlinks require administrator
 rights on Windows unless Developer Mode is enabled.
 
-Anything already at a target path is backed up to `<name>.bak-<timestamp>` first.
+Anything already at a target path is moved aside to
+`%USERPROFILE%\.copilot-backups\<timestamp>\` first — deliberately outside
+`~/.copilot`, since a leftover copy under `skills/` or `agents/` would be scanned
+and loaded as a duplicate.
 
 ## What is tracked
 
