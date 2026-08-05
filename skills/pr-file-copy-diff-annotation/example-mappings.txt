@@ -1,0 +1,7 @@
+# File mappings for PR diff annotations
+# Format: new-file-path|old-file-path
+# Lines starting with # are ignored
+
+# Example mappings (from PR #16071):
+# instrumentation-api-incubator/src/main/java/io/opentelemetry/instrumentation/api/incubator/semconv/service/ServicePeerResolver.java|instrumentation-api-incubator/src/main/java/io/opentelemetry/instrumentation/api/incubator/semconv/net/PeerServiceResolver.java
+# instrumentation-api-incubator/src/main/java/io/opentelemetry/instrumentation/api/incubator/semconv/service/ServicePeerAttributesExtractor.java|instrumentation-api-incubator/src/main/java/io/opentelemetry/instrumentation/api/incubator/semconv/net/PeerServiceAttributesExtractor.java

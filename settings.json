@@ -1,0 +1,29 @@
+{
+  "renderMarkdown": true,
+  "theme": "auto",
+  "logLevel": "all",
+  "allowedUrls": [
+    "https://github.com",
+    "https://api.github.com",
+    "https://docs.github.com",
+    "https://learn.microsoft.com"
+  ],
+  "sessionSync": [
+    {
+      "origin": "trask/opentelemetry-java-instrumentation",
+      "level": "user"
+    }
+  ],
+  "extraKnownMarketplaces": {
+    "obs-internal-common": {
+      "source": {
+        "source": "github",
+        "repo": "azure-data-database-platform/observability-common"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "repo-skill-discovery@obs-internal-common": true,
+    "ai-maturity-self-assessment@obs-internal-common": true
+  }
+}
