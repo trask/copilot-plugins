@@ -65,3 +65,16 @@ explicit pull back into the repo after Copilot changes them:
 
 On the other machine, `git pull` then re-run `./link.sh` to refresh the copied
 files.
+
+## Maintaining and publishing
+
+This repository is the source of truth; do not maintain duplicate configuration
+under `~/.copilot`. Start configuration changes in an isolated Copilot project
+session and edit that session's worktree, not the primary `C:\src\copilot-config`
+checkout. Every hand-written skill must also have its `skills/<name>` path
+listed in `linked_dirs` in `link.sh`.
+
+Publish changes on a feature branch through a draft pull request. After it
+merges, update the primary clone, run `./link.sh` when copied files or the set of
+linked skills changed, and restart Copilot. Existing linked agents and
+instructions update without relinking, though a restart may still be needed.

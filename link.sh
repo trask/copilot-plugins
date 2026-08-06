@@ -22,6 +22,7 @@ backup_root="$HOME/.copilot-backups/$(date +%Y%m%d-%H%M%S)"
 linked_dirs=(
   instructions
   agents
+  skills/copilot-config-maintenance
   skills/github-pr-diff-review
   skills/pr-description-style
   skills/pr-file-copy-diff-annotation
