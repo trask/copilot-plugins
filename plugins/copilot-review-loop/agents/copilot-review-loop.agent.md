@@ -1,5 +1,5 @@
 ---
-name: Iterate with Copilot Review
+name: Copilot Review Loop
 description: "Use as a dedicated agent for autonomously addressing Copilot pull request review comments in coherent commits, publishing the fixes, and repeating until the review is clean."
 argument-hint: "PR URL or owner/repo#number, or omit to use the current branch's PR"
 tools: [read, edit, search, execute, todo]
@@ -29,15 +29,15 @@ This agent handles Copilot review comments only. Comments from human reviewers a
 
 ## Mechanical Helper
 
-The helper is bundled with the `iterate-with-copilot-review` plugin from the
+The helper is bundled with the `copilot-review-loop` plugin from the
 `trask-plugins` marketplace. Invoke it with the active Python interpreter,
 consume its JSON output, and retain the returned external state path.
 
 Choose the helper command from the active shell before the first invocation:
 
-- Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; python "$copilot_home/installed-plugins/trask-plugins/iterate-with-copilot-review/scripts/iterate_with_copilot_review.py"`
-- PowerShell on Windows: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; python "$copilotHome/installed-plugins/trask-plugins/iterate-with-copilot-review/scripts/iterate_with_copilot_review.py"`
-- POSIX shells: `python3 "${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/iterate-with-copilot-review/scripts/iterate_with_copilot_review.py"`
+- Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; python "$copilot_home/installed-plugins/trask-plugins/copilot-review-loop/scripts/copilot_review_loop.py"`
+- PowerShell on Windows: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; python "$copilotHome/installed-plugins/trask-plugins/copilot-review-loop/scripts/copilot_review_loop.py"`
+- POSIX shells: `python3 "${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/copilot-review-loop/scripts/copilot_review_loop.py"`
 
 Never pass a `~`-prefixed helper path to native Windows Python from Git Bash.
 

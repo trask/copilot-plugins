@@ -6,13 +6,13 @@ import unittest
 from unittest import mock
 
 
-SCRIPT = Path(__file__).parents[1] / "scripts" / "iterate_with_copilot_review.py"
+SCRIPT = Path(__file__).parents[1] / "scripts" / "copilot_review_loop.py"
 AGENT = (
     Path(__file__).parents[1]
     / "agents"
-    / "iterate-with-copilot-review.agent.md"
+    / "copilot-review-loop.agent.md"
 )
-SPEC = importlib.util.spec_from_file_location("iterate_with_copilot_review", SCRIPT)
+SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -22,6 +22,7 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_targetless_requests_resolve_the_current_branch_pr(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
+        self.assertIn("name: Copilot Review Loop", instructions)
         self.assertIn(
             "`status --current --repo-root <workspace>`",
             instructions,
@@ -71,7 +72,7 @@ class AgentInstructionsTest(unittest.TestCase):
             "${COPILOT_HOME:-${USERPROFILE//\\\\//}/.copilot}", instructions
         )
         self.assertIn(
-            "installed-plugins/trask-plugins/iterate-with-copilot-review",
+            "installed-plugins/trask-plugins/copilot-review-loop",
             instructions,
         )
         self.assertIn("$env:COPILOT_HOME", instructions)

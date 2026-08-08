@@ -1,5 +1,5 @@
 {
-  "name": "iterate-with-copilot-review",
+  "name": "copilot-review-loop",
   "description": "Address Copilot pull request review comments, publish fixes, and repeat until the review is clean.",
   "version": "1.0.0",
   "author": {

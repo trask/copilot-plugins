@@ -1,5 +1,5 @@
 ---
-name: Draft PR Review
+name: PR Reviewer
 description: "Manually review a GitHub pull request and create a verified pending review containing only high-confidence inline comments."
 argument-hint: "PR URL or owner/repo#number"
 tools: [read, search, execute, agent]
@@ -33,12 +33,12 @@ Step 5 evaluates every candidate with a fixed **GPT-5.6 Sol** subagent, so that 
 
 ## Helper
 
-The helper is bundled with the `draft-pr-review` plugin from the `trask-plugins`
+The helper is bundled with the `pr-reviewer` plugin from the `trask-plugins`
 marketplace. Choose the command for the active shell:
 
-- Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; python "$copilot_home/installed-plugins/trask-plugins/draft-pr-review/scripts/draft_pr_review.py"`
-- PowerShell on Windows: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; python "$copilotHome/installed-plugins/trask-plugins/draft-pr-review/scripts/draft_pr_review.py"`
-- POSIX shells: `python3 "${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/draft-pr-review/scripts/draft_pr_review.py"`
+- Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; python "$copilot_home/installed-plugins/trask-plugins/pr-reviewer/scripts/pr_reviewer.py"`
+- PowerShell on Windows: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; python "$copilotHome/installed-plugins/trask-plugins/pr-reviewer/scripts/pr_reviewer.py"`
+- POSIX shells: `python3 "${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/pr-reviewer/scripts/pr_reviewer.py"`
 
 It emits deterministic JSON. `check <target>` resolves the PR and authenticated viewer, refuses an existing viewer-owned pending review, parses the authoritative GitHub diff, and returns the stable `head_sha` captured around that diff fetch. `post <target> --expected-head <head_sha> --comments <file-or->` requires that exact snapshot, repeats the stability checks, validates every comment, creates one batch pending review without a top-level body or event, and verifies the result. There is no posting path without `--expected-head`. The comments JSON is an array of:
 

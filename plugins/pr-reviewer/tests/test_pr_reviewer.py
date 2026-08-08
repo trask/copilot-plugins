@@ -8,9 +8,9 @@ import unittest
 from unittest import mock
 
 
-SCRIPT = Path(__file__).parents[1] / "scripts" / "draft_pr_review.py"
-AGENT = Path(__file__).parents[1] / "agents" / "draft-pr-review.agent.md"
-SPEC = importlib.util.spec_from_file_location("draft_pr_review", SCRIPT)
+SCRIPT = Path(__file__).parents[1] / "scripts" / "pr_reviewer.py"
+AGENT = Path(__file__).parents[1] / "agents" / "pr-reviewer.agent.md"
+SPEC = importlib.util.spec_from_file_location("pr_reviewer", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -46,6 +46,7 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_is_manual_only_and_requires_independent_candidate_checks(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
+        self.assertIn("name: PR Reviewer", instructions)
         self.assertIn("user-invocable: true", instructions)
         self.assertIn("disable-model-invocation: true", instructions)
         self.assertIn("gh pr diff", instructions)

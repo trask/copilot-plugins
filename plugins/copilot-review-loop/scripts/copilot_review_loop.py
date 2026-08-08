@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic mechanics for the Iterate with Copilot Review custom agent."""
+"""Deterministic mechanics for the Copilot Review Loop custom agent."""
 
 from __future__ import annotations
 
@@ -121,7 +121,7 @@ def parse_target(target: str) -> dict[str, Any]:
 
 def default_state_path(target: dict[str, Any]) -> Path:
     name = f"{target['owner']}--{target['repo']}--{target['number']}.json"
-    return Path.home() / ".copilot" / "run" / "iterate-with-copilot-review" / name
+    return Path.home() / ".copilot" / "run" / "copilot-review-loop" / name
 
 
 def load_state(path: Path) -> dict[str, Any]:

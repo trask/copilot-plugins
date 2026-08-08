@@ -13,6 +13,10 @@ class MarketplaceTest(unittest.TestCase):
 
         self.assertEqual("trask-plugins", marketplace["name"])
         self.assertEqual(2, len(marketplace["plugins"]))
+        self.assertEqual(
+            {"copilot-review-loop", "pr-reviewer"},
+            {entry["name"] for entry in marketplace["plugins"]},
+        )
 
         for entry in marketplace["plugins"]:
             plugin_root = ROOT / entry["source"]
