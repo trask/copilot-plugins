@@ -252,17 +252,211 @@ class ProcessLivenessTest(unittest.TestCase):
 
 class CurrentPrStatusTest(unittest.TestCase):
     def test_resolves_current_pr_from_checked_out_repository(self):
-        completed = mock.Mock(
-            stdout='{"url":"https://github.com/open-telemetry/repo/pull/42"}\n'
-        )
         repo_root = Path("repo")
+        upstream = {
+            "remote": "origin",
+            "repo": "open-telemetry/repo",
+            "branch": "topic",
+        }
+        target = MODULE.parse_target("open-telemetry/repo#42")
 
-        with mock.patch.object(MODULE, "run", return_value=completed) as run:
-            target = MODULE.current_pr_target(repo_root)
+        with (
+            mock.patch.object(MODULE, "git", return_value="topic"),
+            mock.patch.object(
+                MODULE, "configured_upstream", return_value=upstream
+            ),
+            mock.patch.object(
+                MODULE, "simple_current_pr_target", return_value=target
+            ) as simple,
+            mock.patch.object(
+                MODULE, "exact_upstream_pr_targets", return_value=[target]
+            ) as exact,
+        ):
+            resolved = MODULE.current_pr_target(repo_root)
 
-        self.assertEqual(target["number"], 42)
-        run.assert_called_once_with(
-            ["gh", "pr", "view", "--json", "url"], cwd=repo_root
+        self.assertEqual(resolved["number"], 42)
+        simple.assert_called_once_with(repo_root, upstream)
+        exact.assert_called_once_with(upstream)
+
+    def test_simple_lookup_ignores_closed_pull_request(self):
+        payload = {
+            "url": "https://github.com/open-telemetry/repo/pull/42",
+            "state": "CLOSED",
+        }
+
+        self.assertIsNone(MODULE.pr_target_from_payload(payload))
+
+    def test_reads_configured_upstream_remote_and_merge_ref(self):
+        outputs = {
+            (
+                "config",
+                "--get",
+                "branch.local-topic.remote",
+            ): mock.Mock(returncode=0, stdout="fork\n"),
+            (
+                "config",
+                "--get",
+                "branch.local-topic.merge",
+            ): mock.Mock(
+                returncode=0, stdout="refs/heads/trask/grpc-metadata-selectors\n"
+            ),
+            (
+                "remote",
+                "get-url",
+                "fork",
+            ): mock.Mock(
+                returncode=0, stdout="git@github.com:trask/repo.git\n"
+            ),
+        }
+
+        def fake_run(command, **_kwargs):
+            return outputs[tuple(command[3:])]
+
+        with mock.patch.object(MODULE, "run", side_effect=fake_run):
+            upstream = MODULE.configured_upstream(Path("repo"), "local-topic")
+
+        self.assertEqual(
+            upstream,
+            {
+                "remote": "fork",
+                "repo": "trask/repo",
+                "branch": "trask/grpc-metadata-selectors",
+            },
+        )
+
+    def test_uses_upstream_branch_when_local_branch_name_differs(self):
+        repo_root = Path("repo")
+        upstream = {
+            "remote": "origin",
+            "repo": "open-telemetry/repo",
+            "branch": "trask/grpc-metadata-selectors",
+        }
+        target = MODULE.parse_target("open-telemetry/repo#19447")
+
+        with (
+            mock.patch.object(
+                MODULE, "git", return_value="trask-grpc-metadata-selectors"
+            ),
+            mock.patch.object(
+                MODULE, "configured_upstream", return_value=upstream
+            ),
+            mock.patch.object(MODULE, "simple_current_pr_target") as simple,
+            mock.patch.object(
+                MODULE, "exact_upstream_pr_targets", return_value=[target]
+            ) as exact,
+        ):
+            resolved = MODULE.current_pr_target(repo_root)
+
+        self.assertEqual(resolved["number"], 19447)
+        simple.assert_not_called()
+        exact.assert_called_once_with(upstream)
+
+    def test_rejects_multiple_exact_upstream_pull_requests(self):
+        upstream = {
+            "remote": "origin",
+            "repo": "fork-owner/repo",
+            "branch": "topic",
+        }
+        targets = [
+            MODULE.parse_target("upstream/repo#1"),
+            MODULE.parse_target("upstream/repo#2"),
+        ]
+
+        with (
+            mock.patch.object(MODULE, "git", return_value="local-topic"),
+            mock.patch.object(
+                MODULE, "configured_upstream", return_value=upstream
+            ),
+            mock.patch.object(
+                MODULE, "exact_upstream_pr_targets", return_value=targets
+            ),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "multiple open pull requests"
+            ),
+        ):
+            MODULE.current_pr_target(Path("repo"))
+
+    def test_reports_no_matching_upstream_pull_request(self):
+        upstream = {
+            "remote": "origin",
+            "repo": "fork-owner/repo",
+            "branch": "topic",
+        }
+
+        with (
+            mock.patch.object(MODULE, "git", return_value="local-topic"),
+            mock.patch.object(
+                MODULE, "configured_upstream", return_value=upstream
+            ),
+            mock.patch.object(MODULE, "exact_upstream_pr_targets", return_value=[]),
+            self.assertRaisesRegex(MODULE.WorkflowError, "no open pull request"),
+        ):
+            MODULE.current_pr_target(Path("repo"))
+
+    def test_reports_failed_lookup_without_an_upstream(self):
+        with (
+            mock.patch.object(MODULE, "git", return_value="topic"),
+            mock.patch.object(MODULE, "configured_upstream", return_value=None),
+            mock.patch.object(
+                MODULE, "simple_current_pr_target", return_value=None
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "no configured upstream"),
+        ):
+            MODULE.current_pr_target(Path("repo"))
+
+    def test_exact_search_filters_to_remote_repository_and_branch(self):
+        upstream = {
+            "remote": "fork",
+            "repo": "fork-owner/repo",
+            "branch": "feature/topic",
+        }
+        payload = {
+            "data": {
+                "repository": {
+                    "ref": {
+                        "target": {
+                            "associatedPullRequests": {
+                                "pageInfo": {
+                                    "hasNextPage": False,
+                                    "endCursor": None,
+                                },
+                                "nodes": [
+                                    {
+                                        "url": "https://github.com/upstream/repo/pull/42",
+                                        "state": "OPEN",
+                                        "headRefName": "feature/topic",
+                                        "headRepository": {
+                                            "nameWithOwner": "fork-owner/repo"
+                                        },
+                                    },
+                                    {
+                                        "url": "https://github.com/other/repo/pull/99",
+                                        "state": "OPEN",
+                                        "headRefName": "feature/topic",
+                                        "headRepository": {
+                                            "nameWithOwner": "other/repo"
+                                        },
+                                    },
+                                ],
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        with mock.patch.object(MODULE, "graphql", return_value=payload) as graphql:
+            targets = MODULE.exact_upstream_pr_targets(upstream)
+
+        self.assertEqual([target["number"] for target in targets], [42])
+        self.assertEqual(
+            graphql.call_args.args[1],
+            {
+                "owner": "fork-owner",
+                "repo": "repo",
+                "refName": "refs/heads/feature/topic",
+                "after": None,
+            },
         )
 
     def test_status_current_loads_only_current_pr_state(self):
@@ -630,6 +824,24 @@ class RemoteParsingTest(unittest.TestCase):
         self.assertEqual(
             MODULE.github_repo_from_remote("git@github.com:trask/repo.git"),
             "trask/repo",
+        )
+        self.assertEqual(
+            MODULE.github_repo_from_remote(
+                "ssh://git@github.com:22/fork-owner/repo.git"
+            ),
+            "fork-owner/repo",
+        )
+        self.assertEqual(
+            MODULE.github_repo_from_remote("git://github.com/trask/repo"),
+            "trask/repo",
+        )
+
+    def test_rejects_non_github_and_malformed_remotes(self):
+        self.assertIsNone(
+            MODULE.github_repo_from_remote("https://example.com/trask/repo.git")
+        )
+        self.assertIsNone(
+            MODULE.github_repo_from_remote("https://notgithub.com/trask/repo.git")
         )
 
     def test_rejects_upstream_owned_pr_head(self):

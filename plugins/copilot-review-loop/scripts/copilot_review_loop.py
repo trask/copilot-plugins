@@ -177,13 +177,171 @@ def resolve_repo_root(value: str | None) -> Path:
     return Path(output).resolve()
 
 
-def current_pr_target(repo_root: Path) -> dict[str, Any]:
-    payload = json.loads(
-        run(["gh", "pr", "view", "--json", "url"], cwd=repo_root).stdout
+def configured_upstream(repo_root: Path, branch: str) -> dict[str, str] | None:
+    remote = run(
+        ["git", "-C", str(repo_root), "config", "--get", f"branch.{branch}.remote"],
+        check=False,
     )
+    merge = run(
+        ["git", "-C", str(repo_root), "config", "--get", f"branch.{branch}.merge"],
+        check=False,
+    )
+    if remote.returncode != 0 and merge.returncode != 0:
+        return None
+    if remote.returncode != 0 or merge.returncode != 0:
+        raise WorkflowError(f"current branch {branch!r} has incomplete upstream configuration")
+
+    remote_name = remote.stdout.strip()
+    merge_ref = merge.stdout.strip()
+    if not remote_name or remote_name == ".":
+        raise WorkflowError(
+            f"current branch {branch!r} does not track a GitHub remote branch"
+        )
+    prefix = "refs/heads/"
+    if not merge_ref.startswith(prefix) or merge_ref == prefix:
+        raise WorkflowError(
+            f"current branch {branch!r} has unsupported upstream merge ref {merge_ref!r}"
+        )
+
+    remote_url = run(
+        ["git", "-C", str(repo_root), "remote", "get-url", remote_name]
+    ).stdout.strip()
+    remote_repo = github_repo_from_remote(remote_url)
+    if remote_repo is None:
+        raise WorkflowError(
+            f"upstream remote {remote_name!r} is not a supported GitHub URL: {remote_url}"
+        )
+    return {
+        "remote": remote_name,
+        "repo": remote_repo,
+        "branch": merge_ref[len(prefix) :],
+    }
+
+
+def pr_target_from_payload(
+    payload: Any, expected_upstream: dict[str, str] | None = None
+) -> dict[str, Any] | None:
     if not isinstance(payload, dict) or not isinstance(payload.get("url"), str):
         raise WorkflowError("gh pr view did not return a pull request URL")
+    if payload.get("state") != "OPEN":
+        return None
+    if expected_upstream is not None:
+        owner = payload.get("headRepositoryOwner")
+        repository = payload.get("headRepository")
+        head_repo = (
+            f"{owner.get('login')}/{repository.get('name')}"
+            if isinstance(owner, dict)
+            and isinstance(owner.get("login"), str)
+            and isinstance(repository, dict)
+            and isinstance(repository.get("name"), str)
+            else None
+        )
+        if (
+            head_repo is None
+            or head_repo.lower() != expected_upstream["repo"].lower()
+            or payload.get("headRefName") != expected_upstream["branch"]
+        ):
+            return None
     return parse_target(payload["url"])
+
+
+def simple_current_pr_target(
+    repo_root: Path, expected_upstream: dict[str, str] | None
+) -> dict[str, Any] | None:
+    fields = "url,state,headRefName,headRepositoryOwner,headRepository"
+    process = run(
+        ["gh", "pr", "view", "--json", fields], cwd=repo_root, check=False
+    )
+    if process.returncode != 0:
+        return None
+    try:
+        payload = json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        raise WorkflowError(f"gh pr view returned invalid JSON: {error}") from error
+    return pr_target_from_payload(payload, expected_upstream)
+
+
+def exact_upstream_pr_targets(upstream: dict[str, str]) -> list[dict[str, Any]]:
+    query = """
+query($owner:String!,$repo:String!,$refName:String!,$after:String){
+  repository(owner:$owner,name:$repo){
+    ref(qualifiedName:$refName){
+      target{
+        ... on Commit{
+          associatedPullRequests(first:100,after:$after){
+            pageInfo{hasNextPage endCursor}
+            nodes{
+              url state headRefName headRepository{nameWithOwner}
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+    owner, repo = upstream["repo"].split("/", 1)
+    after: str | None = None
+    targets: dict[str, dict[str, Any]] = {}
+    while True:
+        payload = graphql(
+            query,
+            {
+                "owner": owner,
+                "repo": repo,
+                "refName": f"refs/heads/{upstream['branch']}",
+                "after": after,
+            },
+        )
+        repository = payload["data"].get("repository") or {}
+        ref = repository.get("ref") or {}
+        target = ref.get("target") or {}
+        connection = target.get("associatedPullRequests")
+        if connection is None:
+            return []
+        for node in connection["nodes"]:
+            repository = node.get("headRepository") or {}
+            if (
+                node.get("state") == "OPEN"
+                and node.get("headRefName") == upstream["branch"]
+                and repository.get("nameWithOwner", "").lower()
+                == upstream["repo"].lower()
+            ):
+                target = parse_target(node["url"])
+                targets[target["pr_url"]] = target
+        if not connection["pageInfo"]["hasNextPage"]:
+            return list(targets.values())
+        after = connection["pageInfo"]["endCursor"]
+
+
+def current_pr_target(repo_root: Path) -> dict[str, Any]:
+    branch = git(repo_root, "branch", "--show-current")
+    if not branch:
+        raise WorkflowError("cannot resolve the current pull request from detached HEAD")
+    upstream = configured_upstream(repo_root, branch)
+
+    if upstream is None or branch == upstream["branch"]:
+        target = simple_current_pr_target(repo_root, upstream)
+        if upstream is None and target is not None:
+            return target
+    if upstream is None:
+        raise WorkflowError(
+            f"no pull request found for current branch {branch!r}, which has no configured upstream"
+        )
+
+    targets = exact_upstream_pr_targets(upstream)
+    if not targets:
+        raise WorkflowError(
+            "no open pull request found for upstream "
+            f"{upstream['repo']}:{upstream['branch']}"
+        )
+    if len(targets) > 1:
+        urls = ", ".join(sorted(target["pr_url"] for target in targets))
+        raise WorkflowError(
+            "multiple open pull requests found for upstream "
+            f"{upstream['repo']}:{upstream['branch']}: {urls}"
+        )
+    return targets[0]
 
 
 def resolve_target(value: str | None, repo_root: Path) -> dict[str, Any]:
@@ -790,11 +948,19 @@ def command_skip(args: argparse.Namespace) -> None:
 
 def github_repo_from_remote(url: str) -> str | None:
     patterns = (
-        re.compile(r"github\.com[:/](?P<repo>[^/]+/[^/]+?)(?:\.git)?$"),
-        re.compile(r"^git@github\.com:(?P<repo>[^/]+/[^/]+?)(?:\.git)?$"),
+        re.compile(
+            r"^(?:https?|git|ssh)://(?:[^@/\s]+@)?github\.com(?::\d+)?/"
+            r"(?P<repo>[^/\s]+/[^/\s]+?)(?:\.git)?/?$",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^(?:[^@/\s]+@)?github\.com:"
+            r"(?P<repo>[^/\s]+/[^/\s]+?)(?:\.git)?$",
+            re.IGNORECASE,
+        ),
     )
     for pattern in patterns:
-        match = pattern.search(url)
+        match = pattern.match(url)
         if match:
             return match.group("repo")
     return None
