@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""Create a validated, viewer-owned pending GitHub pull request review."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+from collections import Counter
+import json
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+from typing import Any
+
+
+PR_URL_PATTERN = re.compile(
+    r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)/?$"
+)
+SHORT_TARGET_PATTERN = re.compile(
+    r"^(?P<owner>[^/\s]+)/(?P<repo>[^#/\s]+)#(?P<number>\d+)$"
+)
+HUNK_PATTERN = re.compile(
+    r"^@@ -(?P<old>\d+)(?:,(?P<old_count>\d+))? "
+    r"\+(?P<new>\d+)(?:,(?P<new_count>\d+))? @@"
+)
+
+
+class WorkflowError(RuntimeError):
+    pass
+
+
+def run(
+    command: list[str],
+    *,
+    input_text: str | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.run(
+        command,
+        input=input_text,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if check and process.returncode != 0:
+        detail = process.stderr.strip() or process.stdout.strip() or "no output"
+        raise WorkflowError(f"{' '.join(command)} failed ({process.returncode}): {detail}")
+    return process
+
+
+def emit(payload: dict[str, Any], *, stream: Any = sys.stdout) -> None:
+    print(json.dumps(payload, indent=2, sort_keys=True), file=stream, flush=True)
+
+
+def gh_json(arguments: list[str], *, input_payload: Any = None) -> Any:
+    input_text = None
+    if input_payload is not None:
+        input_text = json.dumps(input_payload, separators=(",", ":"), sort_keys=True)
+    output = run(["gh", *arguments], input_text=input_text).stdout
+    try:
+        return json.loads(output) if output.strip() else None
+    except json.JSONDecodeError as error:
+        raise WorkflowError(f"gh returned invalid JSON: {error}") from error
+
+
+def gh_paginated(endpoint: str) -> list[dict[str, Any]]:
+    pages = gh_json(["api", "--paginate", "--slurp", endpoint])
+    if not isinstance(pages, list):
+        raise WorkflowError("gh pagination did not return a JSON array")
+    if pages and all(isinstance(page, list) for page in pages):
+        return [item for page in pages for item in page]
+    if all(isinstance(item, dict) for item in pages):
+        return pages
+    raise WorkflowError("gh pagination returned an unexpected JSON shape")
+
+
+def parse_target(target: str) -> dict[str, Any]:
+    match = PR_URL_PATTERN.fullmatch(target) or SHORT_TARGET_PATTERN.fullmatch(target)
+    if not match:
+        raise WorkflowError("target must be a GitHub PR URL or owner/repo#number")
+    values = match.groupdict()
+    owner = values["owner"]
+    repo = values["repo"]
+    number = int(values["number"])
+    return {
+        "owner": owner,
+        "repo": repo,
+        "number": number,
+        "repo_name": f"{owner}/{repo}",
+        "pr_url": f"https://github.com/{owner}/{repo}/pull/{number}",
+    }
+
+
+def resolve_pr(target: dict[str, Any]) -> dict[str, Any]:
+    metadata = gh_json(
+        [
+            "pr",
+            "view",
+            target["pr_url"],
+            "--repo",
+            target["repo_name"],
+            "--json",
+            "number,url,headRefOid",
+        ]
+    )
+    if not isinstance(metadata, dict):
+        raise WorkflowError("gh pr view did not return PR metadata")
+    metadata_url = metadata.get("url")
+    if not isinstance(metadata_url, str):
+        raise WorkflowError("resolved PR metadata has no URL")
+    resolved = parse_target(metadata_url)
+    if (
+        metadata.get("number") != target["number"]
+        or resolved["repo_name"].casefold() != target["repo_name"].casefold()
+    ):
+        raise WorkflowError("resolved PR metadata does not match the requested target")
+    head_sha = metadata.get("headRefOid")
+    if not isinstance(head_sha, str) or not head_sha:
+        raise WorkflowError("resolved PR metadata has no head commit")
+    return {**resolved, "head_sha": head_sha}
+
+
+def ensure_head_unchanged(pr: dict[str, Any], stage: str) -> None:
+    expected_head = pr["head_sha"]
+    current_head = resolve_pr(pr)["head_sha"]
+    if current_head != expected_head:
+        raise WorkflowError(
+            f"PR head changed {stage}: expected {expected_head}, got {current_head}"
+        )
+
+
+def ensure_expected_head(pr: dict[str, Any], expected_head: str) -> None:
+    current_head = pr["head_sha"]
+    if current_head != expected_head:
+        raise WorkflowError(
+            "PR head does not match the snapshot analyzed by check: "
+            f"expected {expected_head}, got {current_head}; restart from check"
+        )
+
+
+def resolve_viewer() -> str:
+    viewer = gh_json(["api", "user"])
+    login = viewer.get("login") if isinstance(viewer, dict) else None
+    if not isinstance(login, str) or not login:
+        raise WorkflowError("could not resolve the authenticated GitHub viewer")
+    return login
+
+
+def review_url(pr: dict[str, Any], review: dict[str, Any]) -> str:
+    url = review.get("html_url")
+    if isinstance(url, str) and url:
+        return url
+    review_id = review.get("id")
+    if not isinstance(review_id, int):
+        raise WorkflowError("review response has neither a URL nor numeric ID")
+    return f"{pr['pr_url']}#pullrequestreview-{review_id}"
+
+
+def find_pending_review(pr: dict[str, Any], viewer: str) -> dict[str, Any] | None:
+    reviews = gh_paginated(
+        f"repos/{pr['repo_name']}/pulls/{pr['number']}/reviews?per_page=100"
+    )
+    return next(
+        (
+            review
+            for review in reviews
+            if str(review.get("state", "")).upper() == "PENDING"
+            and str((review.get("user") or {}).get("login", "")).casefold()
+            == viewer.casefold()
+        ),
+        None,
+    )
+
+
+def decode_diff_path(value: str) -> str | None:
+    value = value.rstrip()
+    if value == "/dev/null":
+        return None
+    if value.startswith('"'):
+        try:
+            value = ast.literal_eval(value)
+        except (SyntaxError, ValueError) as error:
+            raise WorkflowError(f"invalid quoted path in PR diff: {value}") from error
+        try:
+            value = value.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+    else:
+        value = value.split("\t", 1)[0]
+    if value.startswith(("a/", "b/")):
+        value = value[2:]
+    if not value:
+        raise WorkflowError("empty file path in PR diff")
+    return value
+
+
+def parse_unified_diff(diff_text: str) -> dict[str, dict[str, set[int]]]:
+    anchors: dict[str, dict[str, set[int]]] = {}
+    old_path: str | None = None
+    new_path: str | None = None
+    path: str | None = None
+    old_line = new_line = 0
+    old_remaining = new_remaining = 0
+    in_hunk = False
+
+    def finish_hunk() -> None:
+        nonlocal in_hunk
+        if in_hunk and (old_remaining or new_remaining):
+            raise WorkflowError("PR diff ended before a hunk's declared line counts")
+        in_hunk = False
+
+    for raw_line in diff_text.split("\n"):
+        raw_line = raw_line.removesuffix("\r")
+        if raw_line.startswith("diff --git "):
+            finish_hunk()
+            old_path = new_path = path = None
+            continue
+        if not in_hunk and raw_line.startswith("--- "):
+            old_path = decode_diff_path(raw_line[4:])
+            continue
+        if not in_hunk and raw_line.startswith("+++ "):
+            new_path = decode_diff_path(raw_line[4:])
+            path = new_path or old_path
+            if path is None:
+                raise WorkflowError("PR diff file has no usable path")
+            anchors.setdefault(path, {"LEFT": set(), "RIGHT": set()})
+            continue
+
+        hunk = HUNK_PATTERN.match(raw_line)
+        if hunk:
+            finish_hunk()
+            if path is None:
+                raise WorkflowError("PR diff hunk appeared before file headers")
+            old_line = int(hunk.group("old"))
+            new_line = int(hunk.group("new"))
+            old_remaining = int(hunk.group("old_count") or 1)
+            new_remaining = int(hunk.group("new_count") or 1)
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if raw_line.startswith("\\"):
+            continue
+        if raw_line.startswith("+"):
+            anchors[path]["RIGHT"].add(new_line)
+            new_line += 1
+            new_remaining -= 1
+        elif raw_line.startswith("-"):
+            anchors[path]["LEFT"].add(old_line)
+            old_line += 1
+            old_remaining -= 1
+        elif raw_line.startswith(" "):
+            old_line += 1
+            new_line += 1
+            old_remaining -= 1
+            new_remaining -= 1
+        else:
+            raise WorkflowError(f"unexpected line inside PR diff hunk: {raw_line!r}")
+        if old_remaining < 0 or new_remaining < 0:
+            raise WorkflowError("PR diff hunk contains more lines than declared")
+        if old_remaining == 0 and new_remaining == 0:
+            in_hunk = False
+
+    finish_hunk()
+    return anchors
+
+
+def fetch_authoritative_diff(pr: dict[str, Any]) -> str:
+    return run(
+        ["gh", "pr", "diff", pr["pr_url"], "--repo", pr["repo_name"]]
+    ).stdout
+
+
+def load_comments(path_value: str) -> list[dict[str, Any]]:
+    try:
+        text = sys.stdin.read() if path_value == "-" else Path(path_value).read_text(
+            encoding="utf-8"
+        )
+    except OSError as error:
+        raise WorkflowError(f"could not read comments JSON: {error}") from error
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise WorkflowError(f"comments are not valid JSON: {error}") from error
+    if not isinstance(payload, list):
+        raise WorkflowError("comments JSON must be an array")
+    return payload
+
+
+def validate_comments(
+    comments: list[dict[str, Any]],
+    anchors: dict[str, dict[str, set[int]]],
+) -> list[dict[str, Any]]:
+    if not comments:
+        raise WorkflowError("at least one inline comment is required")
+    normalized: list[dict[str, Any]] = []
+    expected_keys = {"path", "line", "side", "body"}
+    for index, comment in enumerate(comments):
+        if not isinstance(comment, dict):
+            raise WorkflowError(f"comment {index} must be an object")
+        unknown = set(comment) - expected_keys
+        missing = expected_keys - set(comment)
+        if unknown or missing:
+            raise WorkflowError(
+                f"comment {index} must contain exactly path, line, side, and body"
+            )
+        path = comment["path"]
+        line = comment["line"]
+        side = comment["side"]
+        body = comment["body"]
+        if not isinstance(path, str) or not path:
+            raise WorkflowError(f"comment {index} has an invalid path")
+        if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
+            raise WorkflowError(f"comment {index} has an invalid line")
+        if not isinstance(side, str) or side not in {"LEFT", "RIGHT"}:
+            raise WorkflowError(f"comment {index} side must be LEFT or RIGHT")
+        if not isinstance(body, str) or not body.strip():
+            raise WorkflowError(f"comment {index} body must not be empty")
+        if path not in anchors or line not in anchors[path][side]:
+            raise WorkflowError(
+                f"comment {index} anchor is not a changed {side} line: {path}:{line}"
+            )
+        normalized.append({"path": path, "line": line, "side": side, "body": body})
+    return normalized
+
+
+def comment_signature(comment: dict[str, Any]) -> tuple[str, int, str, str]:
+    return (
+        str(comment.get("path")),
+        int(comment.get("line") or 0),
+        str(comment.get("side")),
+        str(comment.get("body")),
+    )
+
+
+def verify_created_review(
+    pr: dict[str, Any],
+    viewer: str,
+    review_id: int,
+    expected_comments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    endpoint = f"repos/{pr['repo_name']}/pulls/{pr['number']}/reviews/{review_id}"
+    review = gh_json(["api", endpoint])
+    if not isinstance(review, dict):
+        raise WorkflowError("created review verification returned no review")
+    if review.get("commit_id") != pr["head_sha"]:
+        raise WorkflowError(
+            f"created review {review_id} commit does not match expected PR head "
+            f"{pr['head_sha']}"
+        )
+    actual_viewer = str((review.get("user") or {}).get("login", ""))
+    if (
+        str(review.get("state", "")).upper() != "PENDING"
+        or actual_viewer.casefold() != viewer.casefold()
+    ):
+        raise WorkflowError(
+            f"created review {review_id} is not a viewer-owned PENDING review"
+        )
+    actual_comments = gh_paginated(f"{endpoint}/comments?per_page=100")
+    expected = Counter(comment_signature(comment) for comment in expected_comments)
+    actual = Counter(comment_signature(comment) for comment in actual_comments)
+    if actual != expected:
+        raise WorkflowError(
+            "created review inline comments failed verification: "
+            f"expected {list(expected.elements())!r}, got {list(actual.elements())!r}"
+        )
+    ensure_head_unchanged(pr, "during final verification")
+    return review
+
+
+def preflight(
+    target_value: str,
+    expected_head: str | None = None,
+) -> tuple[dict[str, Any], str, dict[str, dict[str, set[int]]], str | None]:
+    pr = resolve_pr(parse_target(target_value))
+    if expected_head is not None:
+        ensure_expected_head(pr, expected_head)
+    viewer = resolve_viewer()
+    pending = find_pending_review(pr, viewer)
+    if pending is not None:
+        return pr, viewer, {}, review_url(pr, pending)
+    anchors = parse_unified_diff(fetch_authoritative_diff(pr))
+    ensure_head_unchanged(pr, "after fetching and parsing the authoritative diff")
+    return pr, viewer, anchors, None
+
+
+def command_check(args: argparse.Namespace) -> None:
+    pr, viewer, anchors, pending_url = preflight(args.target)
+    if pending_url:
+        emit({"result": "existing_pending_review", "review_url": pending_url})
+        return
+    emit(
+        {
+            "result": "ready",
+            "pr_url": pr["pr_url"],
+            "head_sha": pr["head_sha"],
+            "viewer": viewer,
+            "changed_files": sorted(anchors),
+        }
+    )
+
+
+def command_post(args: argparse.Namespace) -> None:
+    pr, viewer, anchors, pending_url = preflight(args.target, args.expected_head)
+    ensure_expected_head(pr, args.expected_head)
+    if pending_url:
+        emit({"result": "existing_pending_review", "review_url": pending_url})
+        return
+    comments = validate_comments(load_comments(args.comments), anchors)
+    payload = {"commit_id": pr["head_sha"], "comments": comments}
+    endpoint = f"repos/{pr['repo_name']}/pulls/{pr['number']}/reviews"
+    ensure_head_unchanged(pr, "immediately before creating the review")
+    created = gh_json(
+        ["api", "--method", "POST", "--input", "-", endpoint],
+        input_payload=payload,
+    )
+    review_id = created.get("id") if isinstance(created, dict) else None
+    if isinstance(review_id, bool) or not isinstance(review_id, int):
+        raise WorkflowError("review creation returned no numeric review ID")
+    try:
+        verified = verify_created_review(pr, viewer, review_id, comments)
+    except WorkflowError as error:
+        created_url = review_url(pr, created)
+        raise WorkflowError(
+            f"review {created_url} was created but verification failed: {error}"
+        ) from error
+    emit(
+        {
+            "result": "created_pending_review",
+            "review_id": review_id,
+            "review_url": review_url(pr, verified),
+        }
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    check = subparsers.add_parser("check", help="check for a pending review and parse the PR diff")
+    check.add_argument("target")
+    check.set_defaults(function=command_check)
+    post = subparsers.add_parser("post", help="create and verify one pending review")
+    post.add_argument("target")
+    post.add_argument(
+        "--expected-head",
+        required=True,
+        help="head SHA returned by check for the snapshot that was analyzed",
+    )
+    post.add_argument("--comments", required=True, help="JSON file, or - for standard input")
+    post.set_defaults(function=command_post)
+    return parser
+
+
+def main() -> int:
+    try:
+        if shutil.which("gh") is None:
+            raise WorkflowError("required tool not found: gh")
+        args = build_parser().parse_args()
+        args.function(args)
+        return 0
+    except WorkflowError as error:
+        emit({"result": "error", "error": str(error)}, stream=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

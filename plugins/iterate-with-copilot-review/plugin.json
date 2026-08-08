@@ -1,0 +1,17 @@
+{
+  "name": "iterate-with-copilot-review",
+  "description": "Address Copilot pull request review comments, publish fixes, and repeat until the review is clean.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Trask Stalnaker"
+  },
+  "repository": "https://github.com/trask/copilot-plugins",
+  "license": "MIT",
+  "keywords": [
+    "github",
+    "copilot",
+    "pull-request",
+    "review"
+  ],
+  "agents": "agents/"
+}

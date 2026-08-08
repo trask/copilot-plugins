@@ -1,0 +1,16 @@
+{
+  "name": "draft-pr-review",
+  "description": "Review a GitHub pull request and create a verified pending review with high-confidence inline comments.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Trask Stalnaker"
+  },
+  "repository": "https://github.com/trask/copilot-plugins",
+  "license": "MIT",
+  "keywords": [
+    "github",
+    "pull-request",
+    "review"
+  ],
+  "agents": "agents/"
+}

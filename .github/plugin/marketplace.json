@@ -1,0 +1,24 @@
+{
+  "name": "trask-plugins",
+  "owner": {
+    "name": "Trask Stalnaker"
+  },
+  "metadata": {
+    "description": "GitHub Copilot plugins by Trask Stalnaker",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "draft-pr-review",
+      "description": "Review a GitHub pull request and create a verified pending review with high-confidence inline comments.",
+      "version": "1.0.0",
+      "source": "./plugins/draft-pr-review"
+    },
+    {
+      "name": "iterate-with-copilot-review",
+      "description": "Address Copilot pull request review comments, publish fixes, and repeat until the review is clean.",
+      "version": "1.0.0",
+      "source": "./plugins/iterate-with-copilot-review"
+    }
+  ]
+}
