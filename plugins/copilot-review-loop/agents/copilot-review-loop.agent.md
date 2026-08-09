@@ -71,11 +71,12 @@ The workflow always covers the entire Copilot queue for one pull request. A past
 6. After `preflight` succeeds, use its `pr.number` and `pr.title` fields to call `rename_session` with `Review Loop: <PR number> - <PR title>`.
 7. Handle results as follows:
    - `ready`: continue immediately with investigation and batching.
+   - `review_required`: the queue is empty but the current head has no clean Copilot review. Run `publish --state <path> --no-comments` immediately, then continue with the normal synchronous `watch` flow.
    - `no_unresolved_comments`: the loop is clean; send the final compact index.
    - `no_copilot_comments`: only the authors in `skipped_authors` have unresolved threads; send the final compact index without touching them.
    - `max_iterations_reached`: stop before editing and report the cap in the final compact index.
 
-Preflight appends suppressed comments after thread comments and reports the latest `suppressed_review_id`. Re-running it safely carries over handled but unpublished records.
+Preflight appends suppressed comments after thread comments and reports the latest `suppressed_review_id`. An empty queue is clean only when `head_review_clean` is true for a completed Copilot review on the exact current head. Re-running preflight safely carries over handled but unpublished records.
 
 ## Suppressed Comments
 

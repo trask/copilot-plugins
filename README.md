@@ -34,7 +34,8 @@ independent evaluator.
 
 Processes unresolved Copilot pull request review comments, groups related
 feedback into coherent commits, publishes fixes, requests another Copilot
-review, and repeats until the review is clean or a stop condition is reached.
+review when the current head has not received a clean one, and repeats until
+the review is clean or a stop condition is reached.
 
 ## Update
 

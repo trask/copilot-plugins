@@ -461,6 +461,32 @@ def latest_copilot_review(
     )
 
 
+def latest_copilot_review_for_head(
+    reviews: list[dict[str, Any]], bot_id: str | None, head_sha: str
+) -> dict[str, Any] | None:
+    return latest_copilot_review(
+        [
+            review
+            for review in reviews
+            if review.get("commit_id") == head_sha
+            and review.get("submitted_at")
+            and str(review.get("state", "")).upper() != "DISMISSED"
+        ],
+        bot_id,
+    )
+
+
+def review_has_inline_findings(
+    review: dict[str, Any], threads: list[dict[str, Any]]
+) -> bool:
+    review_id = int(review["id"])
+    return any(
+        (comment.get("pullRequestReview") or {}).get("databaseId") == review_id
+        for thread in threads
+        for comment in thread["comments"]["nodes"]
+    )
+
+
 def parse_suppressed_comments(body: str | None) -> list[dict[str, Any]]:
     if not body:
         return []
@@ -745,6 +771,12 @@ def command_preflight(args: argparse.Namespace) -> None:
     )
     if suppressed_review:
         comments.extend(suppressed_queue(suppressed_review, suppressed_entries))
+    head_review = latest_copilot_review_for_head(reviews, known_bot_id, head)
+    head_review_clean = bool(
+        head_review
+        and not review_has_inline_findings(head_review, threads)
+        and not parse_suppressed_comments(head_review.get("body"))
+    )
     state = prior_state or {"version": STATE_VERSION, "created_at": utc_now()}
     state["iterations"] = int(state.get("iterations", 0))
     previous_queue = state.get("queue") or {}
@@ -777,10 +809,13 @@ def command_preflight(args: argparse.Namespace) -> None:
     save_state(state_path, state)
     max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
     iteration = state["iterations"] + 1
-    if comments and state["iterations"] >= max_iterations:
+    review_required = not comments and not head_review_clean
+    if (comments or review_required) and state["iterations"] >= max_iterations:
         result = "max_iterations_reached"
     elif comments:
         result = "ready"
+    elif review_required:
+        result = "review_required"
     elif skipped_authors:
         result = "no_copilot_comments"
     else:
@@ -795,6 +830,8 @@ def command_preflight(args: argparse.Namespace) -> None:
             "suppressed_review_id": (
                 int(suppressed_review["id"]) if suppressed_review else None
             ),
+            "head_review_id": int(head_review["id"]) if head_review else None,
+            "head_review_clean": head_review_clean,
             "iteration": iteration,
             "max_iterations": max_iterations,
             "pr": metadata,

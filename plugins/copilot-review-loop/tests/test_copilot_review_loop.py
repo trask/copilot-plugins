@@ -134,6 +134,19 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertNotIn("## Approval And Advancement", instructions)
         self.assertNotIn("## Revision, Revert, And Skip", instructions)
 
+    def test_empty_queue_without_clean_head_review_requests_review(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "`review_required`: the queue is empty but the current head has no clean Copilot review",
+            instructions,
+        )
+        self.assertIn("`publish --state <path> --no-comments`", instructions)
+        self.assertIn(
+            "An empty queue is clean only when `head_review_clean` is true",
+            instructions,
+        )
+
     def test_watcher_runs_synchronously_without_terminal_notification_handoff(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
@@ -701,6 +714,15 @@ class QueueSelectionTest(unittest.TestCase):
         self.assertEqual(threads, [self.copilot_thread])
         self.assertIn('node(id:"thread-1")', graphql.call_args.args[0])
 
+    def test_resolved_thread_still_marks_its_review_as_having_findings(self):
+        review = {"id": 103}
+
+        self.assertTrue(
+            MODULE.review_has_inline_findings(
+                review, [self.resolved_copilot_thread]
+            )
+        )
+
 
 class CarryOverProgressTest(unittest.TestCase):
     def test_preserves_approved_but_unpublished_work(self):
@@ -849,6 +871,43 @@ return value;
         ]
 
         self.assertEqual(MODULE.latest_copilot_review(reviews, None)["id"], 101)
+
+    def test_latest_head_review_requires_matching_commit_and_completed_state(self):
+        reviews = [
+            {
+                "id": 100,
+                "commit_id": "old-head",
+                "submitted_at": "2026-08-09T12:00:00Z",
+                "state": "COMMENTED",
+                "user": {"login": "copilot-pull-request-reviewer[bot]"},
+            },
+            {
+                "id": 101,
+                "commit_id": "head",
+                "submitted_at": None,
+                "state": "PENDING",
+                "user": {"login": "copilot-pull-request-reviewer[bot]"},
+            },
+            {
+                "id": 102,
+                "commit_id": "head",
+                "submitted_at": "2026-08-09T12:02:00Z",
+                "state": "DISMISSED",
+                "user": {"login": "copilot-pull-request-reviewer[bot]"},
+            },
+            {
+                "id": 103,
+                "commit_id": "head",
+                "submitted_at": "2026-08-09T12:03:00Z",
+                "state": "COMMENTED",
+                "user": {"login": "copilot-pull-request-reviewer[bot]"},
+            },
+        ]
+
+        self.assertEqual(
+            MODULE.latest_copilot_review_for_head(reviews, None, "head")["id"],
+            103,
+        )
 
 
 class CheckoutHeadTest(unittest.TestCase):
@@ -1355,6 +1414,56 @@ class WatcherStateTest(unittest.TestCase):
 
 
 class PreflightTargetTest(unittest.TestCase):
+    def run_preflight(
+        self,
+        *,
+        threads=None,
+        reviews=None,
+        iterations=0,
+        max_iterations=5,
+    ):
+        metadata = {"head_branch": "branch", "head_sha": "head"}
+
+        def fake_git(repo_root, *arguments):
+            del repo_root
+            return {
+                ("status", "--porcelain=v1"): "",
+                ("branch", "--show-current"): "branch",
+                ("rev-parse", "HEAD"): "head",
+            }[arguments]
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            if iterations:
+                MODULE.save_state(
+                    path,
+                    {
+                        "version": MODULE.STATE_VERSION,
+                        "iterations": iterations,
+                        "queue": {"comments": [], "batches": []},
+                    },
+                )
+            args = SimpleNamespace(
+                target="owner/repo#7",
+                repo_root=directory,
+                state=str(path),
+                max_iterations=max_iterations,
+            )
+
+            with (
+                mock.patch.object(MODULE, "require_tools"),
+                mock.patch.object(MODULE, "resolve_repo_root", return_value=Path(directory)),
+                mock.patch.object(MODULE, "git", side_effect=fake_git),
+                mock.patch.object(MODULE, "metadata_for", return_value=metadata),
+                mock.patch.object(MODULE, "run"),
+                mock.patch.object(MODULE, "fetch_threads", return_value=threads or []),
+                mock.patch.object(MODULE, "fetch_reviews", return_value=reviews or []),
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_preflight(args)
+
+        return emit.call_args.args[0]
+
     def test_targetless_preflight_uses_the_current_branch_pr(self):
         metadata = {"head_branch": "branch", "head_sha": "head"}
         target = MODULE.parse_target("https://github.com/owner/repo/pull/7")
@@ -1390,7 +1499,113 @@ class PreflightTargetTest(unittest.TestCase):
 
         current_pr_target.assert_called_once_with(Path(directory))
         self.assertEqual(saved["queue"]["id"], "pr-7")
-        self.assertEqual(emit.call_args.args[0]["result"], "no_unresolved_comments")
+        self.assertEqual(emit.call_args.args[0]["result"], "review_required")
+        self.assertFalse(emit.call_args.args[0]["head_review_clean"])
+
+    def test_preflight_accepts_clean_review_on_exact_head(self):
+        review = {
+            "id": 10,
+            "commit_id": "head",
+            "submitted_at": "2026-08-09T12:00:00Z",
+            "state": "APPROVED",
+            "body": "No comments.",
+            "user": {"login": "copilot-pull-request-reviewer[bot]"},
+        }
+
+        payload = self.run_preflight(reviews=[review])
+
+        self.assertEqual(payload["result"], "no_unresolved_comments")
+        self.assertEqual(payload["head_review_id"], 10)
+        self.assertTrue(payload["head_review_clean"])
+
+    def test_preflight_requests_review_when_only_review_is_for_older_head(self):
+        review = {
+            "id": 10,
+            "commit_id": "old-head",
+            "submitted_at": "2026-08-09T12:00:00Z",
+            "state": "COMMENTED",
+            "body": "No comments.",
+            "user": {"login": "copilot-pull-request-reviewer[bot]"},
+        }
+
+        payload = self.run_preflight(reviews=[review])
+
+        self.assertEqual(payload["result"], "review_required")
+        self.assertIsNone(payload["head_review_id"])
+        self.assertFalse(payload["head_review_clean"])
+
+    def test_preflight_requests_review_when_exact_head_review_was_dismissed(self):
+        review = {
+            "id": 10,
+            "commit_id": "head",
+            "submitted_at": "2026-08-09T12:00:00Z",
+            "state": "DISMISSED",
+            "body": "No comments.",
+            "user": {"login": "copilot-pull-request-reviewer[bot]"},
+        }
+
+        payload = self.run_preflight(reviews=[review])
+
+        self.assertEqual(payload["result"], "review_required")
+        self.assertIsNone(payload["head_review_id"])
+        self.assertFalse(payload["head_review_clean"])
+
+    def test_preflight_requests_review_after_resolved_exact_head_finding(self):
+        review = {
+            "id": 10,
+            "commit_id": "head",
+            "submitted_at": "2026-08-09T12:00:00Z",
+            "state": "COMMENTED",
+            "body": "",
+            "user": {"login": "copilot-pull-request-reviewer[bot]"},
+        }
+        thread = {
+            "id": "thread-1",
+            "isResolved": True,
+            "comments": {
+                "nodes": [
+                    {
+                        "databaseId": 1,
+                        "author": {
+                            "login": "copilot-pull-request-reviewer[bot]",
+                            "id": "BOT_1",
+                        },
+                        "pullRequestReview": {"databaseId": 10},
+                    }
+                ]
+            },
+        }
+
+        payload = self.run_preflight(threads=[thread], reviews=[review])
+
+        self.assertEqual(payload["result"], "review_required")
+        self.assertEqual(payload["head_review_id"], 10)
+        self.assertFalse(payload["head_review_clean"])
+
+    def test_preflight_queues_suppressed_exact_head_finding(self):
+        review = {
+            "id": 10,
+            "commit_id": "head",
+            "submitted_at": "2026-08-09T12:00:00Z",
+            "state": "COMMENTED",
+            "html_url": "https://example.test/review/10",
+            "body": """
+<details><summary>Suppressed comments (1)</summary>
+**src/example.py:4**
+* Fix this.
+</details>
+""",
+            "user": {
+                "login": "copilot-pull-request-reviewer[bot]",
+                "node_id": "BOT_1",
+            },
+        }
+
+        payload = self.run_preflight(reviews=[review])
+
+        self.assertEqual(payload["result"], "ready")
+        self.assertEqual(payload["queue"]["comments"][0]["source"], "suppressed")
+        self.assertFalse(payload["head_review_clean"])
 
     def test_preflight_reports_when_only_human_comments_remain(self):
         metadata = {"head_branch": "branch", "head_sha": "head"}
@@ -1433,7 +1648,22 @@ class PreflightTargetTest(unittest.TestCase):
                 mock.patch.object(MODULE, "metadata_for", return_value=metadata),
                 mock.patch.object(MODULE, "run"),
                 mock.patch.object(MODULE, "fetch_threads", return_value=threads),
-                mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
+                mock.patch.object(
+                    MODULE,
+                    "fetch_reviews",
+                    return_value=[
+                        {
+                            "id": 6,
+                            "commit_id": "head",
+                            "submitted_at": "2026-08-09T12:00:00Z",
+                            "state": "COMMENTED",
+                            "body": "No comments.",
+                            "user": {
+                                "login": "copilot-pull-request-reviewer[bot]"
+                            },
+                        }
+                    ],
+                ),
                 mock.patch.object(MODULE, "emit") as emit,
             ):
                 MODULE.command_preflight(args)
@@ -1441,6 +1671,36 @@ class PreflightTargetTest(unittest.TestCase):
         payload = emit.call_args.args[0]
         self.assertEqual(payload["result"], "no_copilot_comments")
         self.assertEqual(payload["skipped_authors"], ["reviewer"])
+
+    def test_preflight_requests_review_with_only_human_threads_and_no_clean_review(
+        self,
+    ):
+        thread = {
+            "id": "thread-1",
+            "isResolved": False,
+            "comments": {
+                "nodes": [
+                    {
+                        "databaseId": 1,
+                        "author": {"login": "reviewer"},
+                        "pullRequestReview": {"databaseId": 5},
+                    }
+                ]
+            },
+        }
+
+        payload = self.run_preflight(threads=[thread])
+
+        self.assertEqual(payload["result"], "review_required")
+        self.assertEqual(payload["skipped_authors"], ["reviewer"])
+        self.assertEqual(payload["queue"]["comments"], [])
+
+    def test_preflight_caps_empty_review_required_iteration(self):
+        payload = self.run_preflight(iterations=5, max_iterations=5)
+
+        self.assertEqual(payload["result"], "max_iterations_reached")
+        self.assertEqual(payload["iteration"], 6)
+        self.assertEqual(payload["max_iterations"], 5)
 
     def test_preflight_stops_at_the_iteration_cap(self):
         metadata = {"head_branch": "branch", "head_sha": "head"}
