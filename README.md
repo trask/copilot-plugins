@@ -10,11 +10,12 @@ Register the marketplace once:
 copilot plugin marketplace add trask/copilot-plugins
 ```
 
-Then install either plugin:
+Then install any of the plugins:
 
 ```bash
 copilot plugin install pr-reviewer@trask-plugins
 copilot plugin install copilot-review-loop@trask-plugins
+copilot plugin install self-review-loop@trask-plugins
 ```
 
 Restart Copilot after installing or updating a plugin.
@@ -37,12 +38,25 @@ feedback into coherent commits, publishes fixes, requests another Copilot
 review when the current head has not received a clean one, and repeats until
 the review is clean or a stop condition is reached.
 
+### Self Review Loop
+
+Reviews the authoritative pull request diff itself, independently evaluates
+every candidate finding, and then commits the fixes instead of posting review
+comments. Each commit records the original finding, the analysis, and the
+upsides and downsides, so the reasoning stays reviewable in git. It pushes
+after every iteration and reviews the new head again until a full pass produces
+no findings or a stop condition is reached.
+
+This agent must run on a Claude model because it uses GPT-5.6 Sol as an
+independent evaluator.
+
 ## Update
 
 ```bash
 copilot plugin marketplace update trask-plugins
 copilot plugin update pr-reviewer
 copilot plugin update copilot-review-loop
+copilot plugin update self-review-loop
 ```
 
 ## Requirements

@@ -61,7 +61,7 @@ If an operation partially fails, preserve its state and retry that same operatio
 
 ## Session Naming
 
-Call `rename_session` exactly once per run. Run `preflight` first so the canonical PR metadata is available. After `preflight` succeeds, call `rename_session` with `Review Loop: <PR number> - <PR title>` from its `pr.number` and `pr.title` fields. Never use an interim number-only name.
+Call `rename_session` exactly once per run. Run `preflight` first so the canonical PR metadata is available. After `preflight` succeeds, call `rename_session` with `Copilot Review Loop: <PR number> - <PR title>` from its `pr.number` and `pr.title` fields. Never use an interim number-only name.
 
 ## Target And Preflight
 

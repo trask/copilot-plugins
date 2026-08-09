@@ -1,7 +1,7 @@
 {
-  "name": "copilot-review-loop",
-  "description": "Address Copilot pull request review comments, publish fixes, and repeat until the review is clean.",
-  "version": "1.0.8",
+  "name": "self-review-loop",
+  "description": "Review a GitHub pull request, verify each finding independently, and commit the fixes without posting review comments.",
+  "version": "1.0.0",
   "author": {
     "name": "Trask Stalnaker"
   },
@@ -9,7 +9,6 @@
   "license": "MIT",
   "keywords": [
     "github",
-    "copilot",
     "pull-request",
     "review"
   ],

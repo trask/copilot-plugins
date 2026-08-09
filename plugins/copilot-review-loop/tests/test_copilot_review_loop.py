@@ -32,7 +32,7 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
-            "call `rename_session` with `Review Loop: <PR number> - <PR title>` "
+            "call `rename_session` with `Copilot Review Loop: <PR number> - <PR title>` "
             "from its `pr.number` and `pr.title` fields",
             instructions,
         )
