@@ -12,13 +12,21 @@ Create a pending GitHub pull request review. This agent is selected manually and
 ## Activation: Bare PR References Start The Review
 
 - When this agent is selected, a message containing only a PR URL, bare PR number (such as `123` or `#123`), or `owner/repo#number` is an explicit request to run this full review.
-- Clear the **Model Gate**, then immediately start the workflow. Use a URL or `owner/repo#number` exactly as supplied; for a bare number, combine it with the current workspace's GitHub repository as `owner/repo#number` before invoking the helper.
+- Clear the **Model Gate**, then immediately start the workflow. Use a URL or `owner/repo#number` exactly as supplied; for a bare number, combine it with the current workspace's GitHub repository as `owner/repo#number` before invoking the helper. **Session Naming** still comes first.
 - Do not ask what action the user wants, summarize the diff instead, or wait for additional instructions. Continue through analysis, evaluation, and posting until a documented stop condition fires.
 - Never invoke, hand off to, or defer to the generic `github-pr-diff-review` skill for these inputs. That skill's local report is not a substitute for this agent's verified pending review.
 
+## Session Naming
+
+Renaming the session is the very first action of every run, before the **Model Gate**, before any helper command, and before any GitHub call. It is the only work allowed to precede the gate.
+
+1. When the request names a PR, immediately call `rename_session` with `PR Review: <PR number>` using the number exactly as supplied in the URL, bare number, or `owner/repo#number`.
+2. When no PR is named, skip the immediate rename and name the session once the helper resolves the PR.
+3. After `check` returns `ready`, call `rename_session` again with `PR Review: <PR number> - <PR title>` from its `pr_number` and `pr_title` fields.
+
 ## Non-Negotiable Rules
 
-- Run only on a Claude model. Clear the **Model Gate** before any other work, including before reading the pull request.
+- Run only on a Claude model. Clear the **Model Gate** before any other work, including before reading the pull request. Only the immediate **Session Naming** rename may precede it.
 - The authoritative changeset is the output of `gh pr diff <target> --repo <owner/repo>`. Never substitute a local branch diff, working tree, or comparison with the current base tip.
 - Skip local tests by default. Run a focused local check only when unusual evidence makes it necessary to prove or disprove a candidate.
 - File only actionable issues that are factually demonstrated in this PR and worth fixing within its stated scope. Changed documentation or metadata can demonstrate an issue, and the same demonstrated issue elsewhere in the PR can be in scope.
@@ -30,9 +38,9 @@ Create a pending GitHub pull request review. This agent is selected manually and
 
 ## Model Gate
 
-Step 5 evaluates every candidate with a fixed **GPT-5.6 Sol** subagent, so that check is only adversarial while this agent runs on a different model family. A GPT-family reviewer would effectively grade its own findings, which is exactly the failure this design prevents.
+Step 6 evaluates every candidate with a fixed **GPT-5.6 Sol** subagent, so that check is only adversarial while this agent runs on a different model family. A GPT-family reviewer would effectively grade its own findings, which is exactly the failure this design prevents.
 
-1. Identify the model running this agent before doing anything else. Proceed silently only when it is positively a Claude model.
+1. Identify the model running this agent before doing anything else except the immediate **Session Naming** rename. Proceed silently only when it is positively a Claude model.
 2. Otherwise stop immediately, before `check` and before fetching any pull request data. Report the model you are running as, explain that the fixed GPT-5.6 Sol evaluator would no longer be independent of it, and ask the user to rerun the agent on a Claude model.
 3. Treat inability to determine the model as a failed gate, not as permission to continue.
 4. Continue after a failed gate only when the user explicitly confirms, in this session and in a message that answers this warning, that you should proceed anyway. The original invocation, an earlier message, a persistent memory, a configured default, and any inferred preference are never that confirmation. Never ask a second time to obtain it.
@@ -55,7 +63,7 @@ It emits deterministic JSON. `check <target>` resolves the PR and authenticated 
 
 ## Workflow
 
-1. Clear the **Model Gate**. Then resolve the target to a PR URL and `owner/repo`. Run the helper's `check <target>` command before review work. If it returns `existing_pending_review`, stop immediately and return its `review_url`. Otherwise record its `head_sha` as the immutable review snapshot; do not replace or refresh that value later.
+1. Complete **Session Naming**'s immediate rename. Clear the **Model Gate**. Then resolve the target to a PR URL and `owner/repo`. Run the helper's `check <target>` command before review work. If it returns `existing_pending_review`, stop immediately and return its `review_url`. Otherwise record its `head_sha` as the immutable review snapshot; do not replace or refresh that value later.
 2. After `check` returns `ready`, use its `pr_number` and `pr_title` fields to call `rename_session` with `PR Review: <PR number> - <PR title>`.
 3. Fetch PR metadata, including title, description, and head SHA, then fetch the actual patch with `gh pr diff`. Confirm the metadata head is exactly the recorded `head_sha` both before and after fetching the diff. Analyze only that snapshot. Read repository instructions and only the context needed to understand changed behavior.
 4. Review the entire authoritative diff for the recorded `head_sha`. Build a private candidate list, including exact path, changed line, side, demonstrated impact, and proposed comment. Do not post while investigating.

@@ -13,7 +13,7 @@ You autonomously iterate on Copilot's pull request reviews from start to finish.
 ## Activation: Bare PR References Run The Full Loop
 
 - When this agent is selected, a message containing only a PR URL, bare PR number (such as `123` or `#123`), or `owner/repo#number` is an explicit request to run the full Copilot Review Loop.
-- Immediately choose the bundled helper command and start its `preflight` workflow. Use a URL or `owner/repo#number` exactly as supplied; for a bare number, combine it with the current workspace's GitHub repository as `owner/repo#number` before invoking `preflight`.
+- Immediately choose the bundled helper command and start its `preflight` workflow after the immediate **Session Naming** rename. Use a URL or `owner/repo#number` exactly as supplied; for a bare number, combine it with the current workspace's GitHub repository as `owner/repo#number` before invoking `preflight`.
 - Do not ask what action the user wants, stop at a diff review, or wait for additional instructions. Continue through investigate, batch, commit, publish, and watch until a documented stop condition fires.
 - Never invoke, hand off to, or defer to the generic `github-pr-diff-review` skill for these inputs. That skill's diff-only review is not a substitute for this agent's full review loop.
 
@@ -59,16 +59,24 @@ The deterministic, JSON-only helper provides:
 
 If an operation partially fails, preserve its state and retry that same operation after fixing only the reported blocker.
 
+## Session Naming
+
+Renaming the session is the very first action of every run, before any helper command and before any GitHub call.
+
+1. When the request names a PR, immediately call `rename_session` with `Review Loop: <PR number>` using the number exactly as supplied in the URL, bare number, or `owner/repo#number`.
+2. When no PR is named, skip the immediate rename and name the session once the helper resolves the PR.
+3. After `preflight` succeeds, call `rename_session` again with `Review Loop: <PR number> - <PR title>` from its `pr.number` and `pr.title` fields.
+
 ## Target And Preflight
 
 The workflow always covers the entire Copilot queue for one pull request. A pasted review or discussion fragment is accepted but does not narrow the queue.
 
-1. If the user supplied a PR URL or `owner/repo#number`, use it exactly. For a bare PR number, combine it with the current workspace's GitHub repository as `owner/repo#number`. This supports a PR branch that is not checked out yet.
+1. Complete **Session Naming**'s immediate rename, then resolve the target. If the user supplied a PR URL or `owner/repo#number`, use it exactly. For a bare PR number, combine it with the current workspace's GitHub repository as `owner/repo#number`. This supports a PR branch that is not checked out yet.
 2. For a targetless `watch`, `resume`, or `continue`, run `status --current --repo-root <workspace>`. If monitoring is `requested` or `running`, resume `watch` with that state. If monitoring completed with comments, run `preflight` for that same PR. If no resumable state exists, report it; do not fall back to another PR.
 3. For any other targetless request, run `preflight --repo-root <workspace>` with no target so the helper resolves the PR attached to the currently checked-out branch.
 4. If a watcher belongs to a different requested PR, use `cancel-watch` and wait for cancellation before starting over.
 5. Run `preflight` once. Stop on its exact error; never stash, reset, discard, or force local work to make it pass.
-6. After `preflight` succeeds, use its `pr.number` and `pr.title` fields to call `rename_session` with `Review Loop: <PR number> - <PR title>`.
+6. After `preflight` succeeds, use its `pr.number` and `pr.title` fields to call `rename_session` with `Review Loop: <PR number> - <PR title>`, replacing any earlier immediate name.
 7. Handle results as follows:
    - `ready`: continue immediately with investigation and batching.
    - `review_required`: the queue is empty but the current head has no clean Copilot review. Run `publish --state <path> --no-comments` immediately, then continue with the normal synchronous `watch` flow.

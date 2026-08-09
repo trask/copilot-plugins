@@ -26,6 +26,15 @@ class AgentInstructionsTest(unittest.TestCase):
             "tools: [read, edit, search, execute, todo, rename_session]",
             instructions,
         )
+        self.assertIn("## Session Naming", instructions)
+        self.assertIn(
+            "Renaming the session is the very first action of every run",
+            instructions,
+        )
+        self.assertIn(
+            "immediately call `rename_session` with `Review Loop: <PR number>`",
+            instructions,
+        )
         self.assertIn(
             "use its `pr.number` and `pr.title` fields to call `rename_session`",
             instructions,

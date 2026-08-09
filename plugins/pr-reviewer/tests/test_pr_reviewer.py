@@ -47,6 +47,15 @@ class AgentInstructionsTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn("tools: [read, search, execute, agent, rename_session]", instructions)
+        self.assertIn("## Session Naming", instructions)
+        self.assertIn(
+            "Renaming the session is the very first action of every run",
+            instructions,
+        )
+        self.assertIn(
+            "immediately call `rename_session` with `PR Review: <PR number>`",
+            instructions,
+        )
         self.assertIn(
             "use its `pr_number` and `pr_title` fields to call `rename_session`",
             instructions,
