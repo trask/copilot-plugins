@@ -57,10 +57,14 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
-            "use its `pr_number` and `pr_title` fields to call `rename_session`",
+            "call `rename_session` again with `PR Review: <PR number> - <PR title>` "
+            "from its `pr_number` and `pr_title` fields",
             instructions,
         )
-        self.assertIn("`PR Review: <PR number> - <PR title>`", instructions)
+        self.assertIn(
+            "the only work allowed to precede the gate",
+            instructions,
+        )
 
     def test_bare_pr_reference_starts_the_review(self):
         instructions = AGENT.read_text(encoding="utf-8")

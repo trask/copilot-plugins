@@ -36,11 +36,8 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
-            "use its `pr.number` and `pr.title` fields to call `rename_session`",
-            instructions,
-        )
-        self.assertIn(
-            "`Review Loop: <PR number> - <PR title>`",
+            "call `rename_session` again with `Review Loop: <PR number> - <PR title>` "
+            "from its `pr.number` and `pr.title` fields",
             instructions,
         )
 
