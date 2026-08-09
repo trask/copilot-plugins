@@ -19,6 +19,22 @@ SPEC.loader.exec_module(MODULE)
 
 
 class AgentInstructionsTest(unittest.TestCase):
+    def test_renames_the_session_from_preflight_metadata(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "tools: [read, edit, search, execute, todo, rename_session]",
+            instructions,
+        )
+        self.assertIn(
+            "use its `pr.number` and `pr.title` fields to call `rename_session`",
+            instructions,
+        )
+        self.assertIn(
+            "`Review Loop: <PR number> - <PR title>`",
+            instructions,
+        )
+
     def test_bare_pr_reference_starts_the_full_review_loop(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
@@ -229,6 +245,27 @@ class CliPathTest(unittest.TestCase):
 
 
 class MetadataTest(unittest.TestCase):
+    def test_includes_the_pr_title(self):
+        target = MODULE.parse_target("owner/repo#42")
+        metadata = {
+            "id": "PR_1",
+            "number": 42,
+            "title": "Fix the review loop",
+            "url": target["pr_url"],
+            "headRepositoryOwner": {"login": "owner"},
+            "headRepository": {"name": "repo"},
+            "headRefName": "branch",
+            "headRefOid": "head",
+            "baseRefName": "main",
+            "baseRefOid": "base",
+        }
+
+        with mock.patch.object(MODULE, "gh_json", return_value=metadata) as gh_json:
+            result = MODULE.metadata_for(target)
+
+        self.assertEqual(result["title"], "Fix the review loop")
+        self.assertIn("title", gh_json.call_args.args[0][-1].split(","))
+
     def test_reports_a_deleted_head_repository(self):
         target = MODULE.parse_target("owner/repo#42")
         metadata = {

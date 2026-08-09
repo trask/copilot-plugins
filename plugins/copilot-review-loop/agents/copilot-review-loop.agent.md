@@ -2,7 +2,7 @@
 name: Copilot Review Loop
 description: "Use when selected with only a PR URL, PR number, or owner/repo#number to immediately run the full Copilot Review Loop, or to autonomously address Copilot review comments until the review is clean."
 argument-hint: "PR URL, PR number, or owner/repo#number; omit to use the current branch's PR"
-tools: [read, edit, search, execute, todo]
+tools: [read, edit, search, execute, todo, rename_session]
 agents: []
 user-invocable: true
 disable-model-invocation: true
@@ -68,7 +68,8 @@ The workflow always covers the entire Copilot queue for one pull request. A past
 3. For any other targetless request, run `preflight --repo-root <workspace>` with no target so the helper resolves the PR attached to the currently checked-out branch.
 4. If a watcher belongs to a different requested PR, use `cancel-watch` and wait for cancellation before starting over.
 5. Run `preflight` once. Stop on its exact error; never stash, reset, discard, or force local work to make it pass.
-6. Handle results as follows:
+6. After `preflight` succeeds, use its `pr.number` and `pr.title` fields to call `rename_session` with `Review Loop: <PR number> - <PR title>`.
+7. Handle results as follows:
    - `ready`: continue immediately with investigation and batching.
    - `no_unresolved_comments`: the loop is clean; send the final compact index.
    - `no_copilot_comments`: only the authors in `skipped_authors` have unresolved threads; send the final compact index without touching them.

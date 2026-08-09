@@ -539,7 +539,7 @@ def suppressed_queue(
 
 def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     fields = (
-        "id,number,url,headRefName,headRefOid,headRepositoryOwner,headRepository,"
+        "id,number,title,url,headRefName,headRefOid,headRepositoryOwner,headRepository,"
         "baseRefName,baseRefOid"
     )
     metadata = gh_json(
@@ -567,6 +567,7 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     return {
         "pr_node_id": metadata["id"],
         "number": metadata["number"],
+        "title": metadata["title"],
         "url": metadata["url"],
         "upstream_owner": target["owner"],
         "upstream_repo": target["repo"],
