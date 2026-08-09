@@ -19,6 +19,30 @@ SPEC.loader.exec_module(MODULE)
 
 
 class AgentInstructionsTest(unittest.TestCase):
+    def test_bare_pr_reference_starts_the_full_review_loop(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "description: \"Use when selected with only a PR URL, PR number, or owner/repo#number",
+            instructions,
+        )
+        self.assertIn(
+            "## Activation: Bare PR References Run The Full Loop",
+            instructions,
+        )
+        self.assertIn(
+            "is an explicit request to run the full Copilot Review Loop",
+            instructions,
+        )
+        self.assertIn(
+            "Immediately choose the bundled helper command and start its `preflight` workflow",
+            instructions,
+        )
+        self.assertIn(
+            "Never invoke, hand off to, or defer to the generic `github-pr-diff-review` skill",
+            instructions,
+        )
+
     def test_targetless_requests_resolve_the_current_branch_pr(self):
         instructions = AGENT.read_text(encoding="utf-8")
 

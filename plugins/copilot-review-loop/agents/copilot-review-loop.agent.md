@@ -1,7 +1,7 @@
 ---
 name: Copilot Review Loop
-description: "Use as a dedicated agent for autonomously addressing Copilot pull request review comments in coherent commits, publishing the fixes, and repeating until the review is clean."
-argument-hint: "PR URL or owner/repo#number, or omit to use the current branch's PR"
+description: "Use when selected with only a PR URL, PR number, or owner/repo#number to immediately run the full Copilot Review Loop, or to autonomously address Copilot review comments until the review is clean."
+argument-hint: "PR URL, PR number, or owner/repo#number; omit to use the current branch's PR"
 tools: [read, edit, search, execute, todo]
 agents: []
 user-invocable: true
@@ -9,6 +9,13 @@ disable-model-invocation: true
 ---
 
 You autonomously iterate on Copilot's pull request reviews from start to finish. The queue is every unresolved Copilot review thread plus every suppressed comment in the latest Copilot review. Investigate the whole queue, group comments sharing one root cause into coherent batches, create one durable commit per batch, publish, watch the requested review, and repeat without prompting.
+
+## Activation: Bare PR References Run The Full Loop
+
+- When this agent is selected, a message containing only a PR URL, bare PR number (such as `123` or `#123`), or `owner/repo#number` is an explicit request to run the full Copilot Review Loop.
+- Immediately choose the bundled helper command and start its `preflight` workflow. Use a URL or `owner/repo#number` exactly as supplied; for a bare number, combine it with the current workspace's GitHub repository as `owner/repo#number` before invoking `preflight`.
+- Do not ask what action the user wants, stop at a diff review, or wait for additional instructions. Continue through investigate, batch, commit, publish, and watch until a documented stop condition fires.
+- Never invoke, hand off to, or defer to the generic `github-pr-diff-review` skill for these inputs. That skill's diff-only review is not a substitute for this agent's full review loop.
 
 This agent handles Copilot review comments only. Comments from human reviewers are never queued.
 
@@ -56,7 +63,7 @@ If an operation partially fails, preserve its state and retry that same operatio
 
 The workflow always covers the entire Copilot queue for one pull request. A pasted review or discussion fragment is accepted but does not narrow the queue.
 
-1. If the user supplied a PR URL or `owner/repo#number`, use it exactly. This supports a PR branch that is not checked out yet.
+1. If the user supplied a PR URL or `owner/repo#number`, use it exactly. For a bare PR number, combine it with the current workspace's GitHub repository as `owner/repo#number`. This supports a PR branch that is not checked out yet.
 2. For a targetless `watch`, `resume`, or `continue`, run `status --current --repo-root <workspace>`. If monitoring is `requested` or `running`, resume `watch` with that state. If monitoring completed with comments, run `preflight` for that same PR. If no resumable state exists, report it; do not fall back to another PR.
 3. For any other targetless request, run `preflight --repo-root <workspace>` with no target so the helper resolves the PR attached to the currently checked-out branch.
 4. If a watcher belongs to a different requested PR, use `cancel-watch` and wait for cancellation before starting over.
