@@ -16,7 +16,8 @@ from typing import Any
 
 
 PR_URL_PATTERN = re.compile(
-    r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)/?$"
+    r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
+    r"/?(?:#\S*)?$"
 )
 SHORT_TARGET_PATTERN = re.compile(
     r"^(?P<owner>[^/\s]+)/(?P<repo>[^#/\s]+)#(?P<number>\d+)$"
@@ -104,7 +105,7 @@ def resolve_pr(target: dict[str, Any]) -> dict[str, Any]:
             "--repo",
             target["repo_name"],
             "--json",
-            "number,url,headRefOid",
+            "number,title,url,headRefOid",
         ]
     )
     if not isinstance(metadata, dict):
@@ -121,7 +122,10 @@ def resolve_pr(target: dict[str, Any]) -> dict[str, Any]:
     head_sha = metadata.get("headRefOid")
     if not isinstance(head_sha, str) or not head_sha:
         raise WorkflowError("resolved PR metadata has no head commit")
-    return {**resolved, "head_sha": head_sha}
+    title = metadata.get("title")
+    if not isinstance(title, str) or not title.strip():
+        raise WorkflowError("resolved PR metadata has no title")
+    return {**resolved, "head_sha": head_sha, "title": title.strip()}
 
 
 def ensure_head_unchanged(pr: dict[str, Any], stage: str) -> None:
@@ -397,6 +401,8 @@ def command_check(args: argparse.Namespace) -> None:
         {
             "result": "ready",
             "pr_url": pr["pr_url"],
+            "pr_number": pr["number"],
+            "pr_title": pr["title"],
             "head_sha": pr["head_sha"],
             "viewer": viewer,
             "changed_files": sorted(anchors),

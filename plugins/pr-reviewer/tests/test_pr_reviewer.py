@@ -43,6 +43,29 @@ index 3333333..4444444 100644
 
 
 class AgentInstructionsTest(unittest.TestCase):
+    def test_renames_the_session_from_check_metadata(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn("tools: [read, search, execute, agent, rename_session]", instructions)
+        self.assertIn(
+            "use its `pr_number` and `pr_title` fields to call `rename_session`",
+            instructions,
+        )
+        self.assertIn("`PR Review: <PR number> - <PR title>`", instructions)
+
+    def test_bare_pr_reference_starts_the_review(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn("## Activation: Bare PR References Start The Review", instructions)
+        self.assertIn("a message containing only a PR URL", instructions)
+        self.assertIn("bare PR number (such as `123` or `#123`)", instructions)
+        self.assertIn(
+            "combine it with the current workspace's GitHub repository as `owner/repo#number`",
+            instructions,
+        )
+        self.assertIn("Do not ask what action the user wants", instructions)
+        self.assertIn("defer to the generic `github-pr-diff-review` skill", instructions)
+
     def test_is_manual_only_and_requires_independent_candidate_checks(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
@@ -91,6 +114,13 @@ class ParseTargetTest(unittest.TestCase):
         self.assertEqual(url, short)
         self.assertEqual(url["repo_name"], "owner/repo")
         self.assertEqual(url["number"], 42)
+
+    def test_parses_a_raw_url_with_a_fragment(self):
+        target = MODULE.parse_target(
+            "https://github.com/owner/repo/pull/42#pullrequestreview-7"
+        )
+
+        self.assertEqual(target, MODULE.parse_target("owner/repo#42"))
 
     def test_rejects_non_pr_target(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "GitHub PR URL"):
@@ -286,10 +316,11 @@ class PendingReviewTest(unittest.TestCase):
             f"{pr['pr_url']}#pullrequestreview-7",
         )
 
-    def test_check_ready_emits_captured_head_sha(self):
+    def test_check_ready_emits_captured_head_sha_and_pr_identity(self):
         pr = {
             "repo_name": "owner/repo",
             "number": 42,
+            "title": "Fix the reviewer",
             "pr_url": "https://github.com/owner/repo/pull/42",
             "head_sha": "abc123",
         }
@@ -306,6 +337,39 @@ class PendingReviewTest(unittest.TestCase):
         payload = emit.call_args.args[0]
         self.assertEqual(payload["result"], "ready")
         self.assertEqual(payload["head_sha"], "abc123")
+        self.assertEqual(payload["pr_number"], 42)
+        self.assertEqual(payload["pr_title"], "Fix the reviewer")
+
+
+class ResolvePrTest(unittest.TestCase):
+    def metadata(self, **overrides):
+        base = {
+            "number": 42,
+            "title": "Fix the reviewer",
+            "url": "https://github.com/owner/repo/pull/42",
+            "headRefOid": "abc123",
+        }
+        base.update(overrides)
+        return base
+
+    def test_returns_the_pr_title(self):
+        target = MODULE.parse_target("owner/repo#42")
+
+        with mock.patch.object(
+            MODULE, "gh_json", return_value=self.metadata()
+        ) as gh_json:
+            result = MODULE.resolve_pr(target)
+
+        self.assertEqual(result["title"], "Fix the reviewer")
+        self.assertEqual(result["head_sha"], "abc123")
+        self.assertIn("title", gh_json.call_args.args[0][-1].split(","))
+
+    def test_rejects_metadata_without_a_title(self):
+        target = MODULE.parse_target("owner/repo#42")
+
+        with mock.patch.object(MODULE, "gh_json", return_value=self.metadata(title="  ")):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "no title"):
+                MODULE.resolve_pr(target)
 
 
 class HeadStabilityTest(unittest.TestCase):
