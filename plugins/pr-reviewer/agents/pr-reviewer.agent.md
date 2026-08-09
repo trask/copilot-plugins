@@ -18,11 +18,7 @@ Create a pending GitHub pull request review. This agent is selected manually and
 
 ## Session Naming
 
-Renaming the session is the very first action of every run, before the **Model Gate**, before any helper command, and before any GitHub call. It is the only work allowed to precede the gate.
-
-1. When the request names a PR, immediately call `rename_session` with `PR Review: <PR number>` using the number exactly as supplied in the URL, bare number, or `owner/repo#number`.
-2. When no PR is named, skip the immediate rename and name the session once the helper resolves the PR.
-3. After `check` returns `ready`, call `rename_session` again with `PR Review: <PR number> - <PR title>` from its `pr_number` and `pr_title` fields.
+Call `rename_session` exactly once per run. Clear the **Model Gate** first, then run `check`. After `check` returns `ready`, call `rename_session` with `PR Review: <PR number> - <PR title>` from its `pr_number` and `pr_title` fields. Never use an interim number-only name.
 
 ## Non-Negotiable Rules
 
@@ -40,7 +36,7 @@ Renaming the session is the very first action of every run, before the **Model G
 
 Step 5 evaluates every candidate with a fixed **GPT-5.6 Sol** subagent, so that check is only adversarial while this agent runs on a different model family. A GPT-family reviewer would effectively grade its own findings, which is exactly the failure this design prevents.
 
-1. Identify the model running this agent before doing anything else except the immediate **Session Naming** rename. Proceed silently only when it is positively a Claude model.
+1. Identify the model running this agent before doing anything else. Proceed silently only when it is positively a Claude model.
 2. Otherwise stop immediately, before `check` and before fetching any pull request data. Report the model you are running as, explain that the fixed GPT-5.6 Sol evaluator would no longer be independent of it, and ask the user to rerun the agent on a Claude model.
 3. Treat inability to determine the model as a failed gate, not as permission to continue.
 4. Continue after a failed gate only when the user explicitly confirms, in this session and in a message that answers this warning, that you should proceed anyway. The original invocation, an earlier message, a persistent memory, a configured default, and any inferred preference are never that confirmation. Never ask a second time to obtain it.

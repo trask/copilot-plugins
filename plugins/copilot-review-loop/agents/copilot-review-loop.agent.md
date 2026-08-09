@@ -61,11 +61,7 @@ If an operation partially fails, preserve its state and retry that same operatio
 
 ## Session Naming
 
-Renaming the session is the very first action of every run, before any helper command and before any GitHub call.
-
-1. When the request names a PR, immediately call `rename_session` with `Review Loop: <PR number>` using the number exactly as supplied in the URL, bare number, or `owner/repo#number`.
-2. When no PR is named, skip the immediate rename and name the session once the helper resolves the PR.
-3. After `preflight` succeeds, call `rename_session` again with `Review Loop: <PR number> - <PR title>` from its `pr.number` and `pr.title` fields.
+Call `rename_session` exactly once per run. Run `preflight` first so the canonical PR metadata is available. After `preflight` succeeds, call `rename_session` with `Review Loop: <PR number> - <PR title>` from its `pr.number` and `pr.title` fields. Never use an interim number-only name.
 
 ## Target And Preflight
 

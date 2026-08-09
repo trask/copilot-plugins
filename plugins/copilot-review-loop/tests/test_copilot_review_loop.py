@@ -28,18 +28,17 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn("## Session Naming", instructions)
         self.assertIn(
-            "Renaming the session is the very first action of every run",
+            "Call `rename_session` exactly once per run",
             instructions,
         )
         self.assertIn(
-            "immediately call `rename_session` with `Review Loop: <PR number>`",
-            instructions,
-        )
-        self.assertIn(
-            "call `rename_session` again with `Review Loop: <PR number> - <PR title>` "
+            "call `rename_session` with `Review Loop: <PR number> - <PR title>` "
             "from its `pr.number` and `pr.title` fields",
             instructions,
         )
+        self.assertIn("Never use an interim number-only name", instructions)
+        self.assertNotIn("call `rename_session` again", instructions)
+        self.assertNotIn("immediately call `rename_session`", instructions)
 
     def test_bare_pr_reference_starts_the_full_review_loop(self):
         instructions = AGENT.read_text(encoding="utf-8")
