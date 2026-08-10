@@ -1,8 +1,12 @@
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -354,7 +358,12 @@ class StatePersistenceTest(unittest.TestCase):
                 MODULE, "secrets"
             ) as secrets_module,
         ):
-            secrets_module.token_hex.side_effect = ["run-a", "run-b"]
+            secrets_module.token_hex.side_effect = [
+                "run-a",
+                "lock-a",
+                "run-b",
+                "lock-b",
+            ]
             MODULE.command_preflight(args)
             first = self.emitted[-1]
             body_path = self.directory / "body.md"
@@ -836,6 +845,173 @@ class NoChangeValidationTest(unittest.TestCase):
         self.assertEqual(index["validated_head_sha"], "head1")
         self.assertEqual(index["validation"]["run_id"], "run-1")
         self.assertEqual(self.emitted[-1]["result"], "validated")
+
+
+class IndexLockTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temporary.name)
+        self.addCleanup(self.temporary.cleanup)
+        self.index_path = self.directory / "owner--repo--7.json"
+
+    def state_for(self, run_id, updated_at, *, validation=None):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "kind": MODULE.RUN_KIND,
+            "created_at": updated_at,
+            "updated_at": updated_at,
+            "run_id": run_id,
+            "pr": pr_metadata(title=f"Title {run_id}"),
+        }
+        if validation is not None:
+            state["validated_head_sha"] = "head1"
+            state["validation"] = {
+                "mode": "no_change",
+                "run_id": run_id,
+                "validated_at": validation,
+            }
+        return state
+
+    def write_lock(self, owner):
+        path = MODULE.index_lock_path(self.index_path)
+        path.write_text(json.dumps(owner), encoding="utf-8")
+        return path
+
+    def test_process_liveness_check_is_safe_for_the_current_process(self):
+        self.assertTrue(MODULE.process_is_alive(os.getpid()))
+
+    def test_concurrent_index_writers_preserve_every_run(self):
+        states = [
+            self.state_for(
+                f"run-{index}",
+                f"2026-01-01T00:00:{index:02d}Z",
+            )
+            for index in range(20)
+        ]
+
+        def update(state):
+            MODULE.update_run_index(
+                self.index_path,
+                self.directory / f"{state['run_id']}.json",
+                state,
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(update, states))
+
+        index = MODULE.load_state(self.index_path)
+        self.assertEqual(
+            {item["run_id"] for item in index["runs"]},
+            {state["run_id"] for state in states},
+        )
+        self.assertEqual(index["latest_run_id"], "run-19")
+        self.assertEqual(index["pr"]["title"], "Title run-19")
+
+    def test_older_writer_cannot_revert_newer_validation_or_current_state(self):
+        newer = self.state_for(
+            "newer",
+            "2026-01-01T00:00:02Z",
+            validation="2026-01-01T00:00:03Z",
+        )
+        older = self.state_for(
+            "older",
+            "2026-01-01T00:00:01Z",
+            validation="2026-01-01T00:00:01Z",
+        )
+
+        MODULE.update_run_index(
+            self.index_path, self.directory / "newer.json", newer
+        )
+        MODULE.update_run_index(
+            self.index_path, self.directory / "older.json", older
+        )
+
+        index = MODULE.load_state(self.index_path)
+        self.assertEqual(
+            {item["run_id"] for item in index["runs"]}, {"newer", "older"}
+        )
+        self.assertEqual(index["latest_run_id"], "newer")
+        self.assertEqual(index["pr"]["title"], "Title newer")
+        self.assertEqual(index["validation"]["run_id"], "newer")
+        self.assertEqual(index["validated_head_sha"], "head1")
+
+    def test_reclaims_an_old_lock_only_after_owner_is_dead(self):
+        stale = {
+            "pid": 99999999,
+            "created_at": time.time() - 100,
+            "nonce": "stale",
+        }
+        path = self.write_lock(stale)
+
+        with (
+            mock.patch.object(MODULE, "process_is_alive", return_value=False),
+            MODULE.index_lock(
+                self.index_path,
+                timeout_seconds=0.2,
+                stale_seconds=0.01,
+                poll_seconds=0.001,
+            ),
+        ):
+            owner = MODULE.read_lock_owner(path)
+            self.assertIsNotNone(owner)
+            self.assertNotEqual(owner["nonce"], "stale")
+
+        self.assertFalse(path.exists())
+
+    def test_times_out_without_deleting_a_live_owner_lock(self):
+        owner = {
+            "pid": os.getpid(),
+            "created_at": time.time() - 100,
+            "nonce": "live",
+        }
+        path = self.write_lock(owner)
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "timed out"):
+            with MODULE.index_lock(
+                self.index_path,
+                timeout_seconds=0.02,
+                stale_seconds=0.001,
+                poll_seconds=0.002,
+            ):
+                self.fail("lock should not have been acquired")
+
+        self.assertEqual(MODULE.read_lock_owner(path), owner)
+
+    def test_guard_wait_is_bounded_while_another_writer_is_live(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold_lock():
+            with MODULE.index_lock(self.index_path):
+                entered.set()
+                release.wait(2)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(hold_lock)
+            self.assertTrue(entered.wait(1))
+            with self.assertRaisesRegex(MODULE.WorkflowError, "index guard"):
+                with MODULE.index_lock(
+                    self.index_path,
+                    timeout_seconds=0.02,
+                    poll_seconds=0.002,
+                ):
+                    self.fail("guard should not have been acquired")
+            release.set()
+            future.result(timeout=2)
+
+    def test_release_does_not_delete_a_different_owners_lock(self):
+        path = MODULE.index_lock_path(self.index_path)
+        replacement = {
+            "pid": os.getpid(),
+            "created_at": time.time(),
+            "nonce": "replacement",
+        }
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "not owned"):
+            with MODULE.index_lock(self.index_path):
+                path.write_text(json.dumps(replacement), encoding="utf-8")
+
+        self.assertEqual(MODULE.read_lock_owner(path), replacement)
 
 
 class StatusAndCleanupTest(unittest.TestCase):

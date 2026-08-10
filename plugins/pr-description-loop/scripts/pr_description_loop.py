@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import datetime as dt
+import errno
 import hashlib
 import json
 import os
@@ -15,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
 
@@ -27,6 +30,9 @@ RESIDUAL_UPDATE_RACE = (
     "requests. Another writer can still change metadata between the helper's final "
     "exact snapshot check and the PATCH request."
 )
+INDEX_LOCK_TIMEOUT_SECONDS = 10.0
+INDEX_LOCK_STALE_SECONDS = 120.0
+INDEX_LOCK_POLL_SECONDS = 0.05
 PR_URL_PATTERN = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
     r"/?(?:#\S*)?$"
@@ -205,18 +211,255 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
         raise
 
 
+def index_lock_path(index_path: Path) -> Path:
+    return index_path.with_name(f".{index_path.name}.lock")
+
+
+def index_guard_path(index_path: Path) -> Path:
+    return index_path.with_name(f".{index_path.name}.guard")
+
+
+@contextmanager
+def index_guard(
+    index_path: Path,
+    *,
+    timeout_seconds: float,
+    poll_seconds: float,
+):
+    path = index_guard_path(index_path)
+    handle = path.open("a+b")
+    if path.stat().st_size == 0:
+        handle.write(b"\0")
+        handle.flush()
+        os.fsync(handle.fileno())
+    deadline = time.monotonic() + timeout_seconds
+    acquired = False
+    try:
+        while True:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (BlockingIOError, PermissionError, OSError):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WorkflowError(
+                        f"timed out waiting for PR state index guard {path}"
+                    )
+                time.sleep(min(poll_seconds, remaining))
+        yield
+    finally:
+        if acquired:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == 5
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return True
+            return exit_code.value == 259
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as error:
+        if error.errno == errno.ESRCH:
+            return False
+        return True
+    return True
+
+
+def read_lock_owner(path: Path) -> dict[str, Any] | None:
+    try:
+        owner = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError, OSError):
+        return None
+    if (
+        not isinstance(owner, dict)
+        or isinstance(owner.get("pid"), bool)
+        or not isinstance(owner.get("pid"), int)
+        or not isinstance(owner.get("created_at"), (int, float))
+        or not isinstance(owner.get("nonce"), str)
+        or not owner["nonce"]
+    ):
+        return None
+    return owner
+
+
+def reclaim_stale_index_lock(
+    path: Path, *, stale_seconds: float = INDEX_LOCK_STALE_SECONDS
+) -> bool:
+    owner = read_lock_owner(path)
+    if owner is None:
+        return False
+    if time.time() - owner["created_at"] < stale_seconds:
+        return False
+    if process_is_alive(owner["pid"]):
+        return False
+    confirmed = read_lock_owner(path)
+    if confirmed != owner or process_is_alive(owner["pid"]):
+        return False
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return True
+    except PermissionError:
+        return False
+    return True
+
+
+def release_index_lock(path: Path, nonce: str, *, timeout_seconds: float = 1.0) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        owner = read_lock_owner(path)
+        if owner is None:
+            return not path.exists()
+        if owner["nonce"] != nonce:
+            return False
+        confirmed = read_lock_owner(path)
+        if confirmed != owner:
+            return False
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return True
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(INDEX_LOCK_POLL_SECONDS)
+            continue
+        return True
+
+
+@contextmanager
+def index_lock(
+    index_path: Path,
+    *,
+    timeout_seconds: float = INDEX_LOCK_TIMEOUT_SECONDS,
+    stale_seconds: float = INDEX_LOCK_STALE_SECONDS,
+    poll_seconds: float = INDEX_LOCK_POLL_SECONDS,
+):
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    # The OS-released guard serializes stale reclamation so a verified unlink cannot
+    # race with another process replacing the owner-record lock.
+    with index_guard(
+        index_path,
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+    ):
+        path = index_lock_path(index_path)
+        nonce = secrets.token_hex(16)
+        owner = {
+            "pid": os.getpid(),
+            "created_at": time.time(),
+            "nonce": nonce,
+        }
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                handle = os.open(
+                    path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                reclaim_stale_index_lock(path, stale_seconds=stale_seconds)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    current = read_lock_owner(path)
+                    detail = (
+                        f"pid {current['pid']}, nonce {current['nonce']}"
+                        if current
+                        else "an unreadable owner record"
+                    )
+                    raise WorkflowError(
+                        f"timed out waiting for PR state index lock {path}: {detail}"
+                    )
+                time.sleep(min(poll_seconds, remaining))
+                continue
+            try:
+                with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
+                    json.dump(owner, stream, separators=(",", ":"), sort_keys=True)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except BaseException:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                raise
+            break
+        try:
+            yield
+        finally:
+            if not release_index_lock(path, nonce):
+                raise WorkflowError(
+                    "refusing to release PR state index lock not owned by this "
+                    f"process: {path}"
+                )
+
+
 def run_summary(path: Path, state: dict[str, Any]) -> dict[str, Any]:
     return {
         "run_id": state["run_id"],
         "state": str(path),
         "created_at": state["created_at"],
+        "updated_at": state["updated_at"],
         "head_sha": state["pr"]["head_sha"],
         "title": state["pr"]["title"],
         "validated_head_sha": state.get("validated_head_sha"),
     }
 
 
-def update_run_index(index_path: Path, run_path: Path, state: dict[str, Any]) -> None:
+def update_run_index_unlocked(
+    index_path: Path, run_path: Path, state: dict[str, Any]
+) -> None:
     if index_path.is_file():
         index = load_state(index_path)
         if index.get("kind") != INDEX_KIND:
@@ -235,13 +478,27 @@ def update_run_index(index_path: Path, run_path: Path, state: dict[str, Any]) ->
         item for item in index.get("runs", []) if item.get("run_id") != state["run_id"]
     ]
     index["runs"].append(summary)
-    index["pr"] = state["pr"]
-    index["latest_run_id"] = state["run_id"]
-    index["latest_state"] = str(run_path)
-    if state.get("validated_head_sha"):
+    candidate_updated_at = state["updated_at"]
+    if candidate_updated_at >= index.get("current_updated_at", ""):
+        index["pr"] = state["pr"]
+        index["latest_run_id"] = state["run_id"]
+        index["latest_state"] = str(run_path)
+        index["current_updated_at"] = candidate_updated_at
+    validation = state.get("validation")
+    if (
+        state.get("validated_head_sha")
+        and isinstance(validation, dict)
+        and validation.get("validated_at", "")
+        >= (index.get("validation") or {}).get("validated_at", "")
+    ):
         index["validated_head_sha"] = state["validated_head_sha"]
-        index["validation"] = state.get("validation")
+        index["validation"] = validation
     save_state(index_path, index)
+
+
+def update_run_index(index_path: Path, run_path: Path, state: dict[str, Any]) -> None:
+    with index_lock(index_path):
+        update_run_index_unlocked(index_path, run_path, state)
 
 
 def refresh_run_index(run_path: Path, state: dict[str, Any]) -> None:
@@ -874,24 +1131,42 @@ def command_status(args: argparse.Namespace) -> None:
 def command_cleanup(args: argparse.Namespace) -> None:
     path = cli_path(args.state)
     state = load_state(path)
+    if state.get("kind") == INDEX_KIND:
+        with index_lock(path):
+            path.unlink()
+        emit({"result": "cleaned_up", "state": str(path)})
+        return
     index_value = state.get("index_path")
     if state.get("kind") == RUN_KIND and isinstance(index_value, str):
         index_path = cli_path(index_value)
         if index_path.is_file():
-            index = load_state(index_path)
-            if index.get("kind") == INDEX_KIND:
-                index["runs"] = [
-                    item
-                    for item in index.get("runs", [])
-                    if item.get("run_id") != state.get("run_id")
-                ]
-                if index.get("latest_run_id") == state.get("run_id"):
-                    latest = index["runs"][-1] if index["runs"] else None
-                    index["latest_run_id"] = (
-                        latest.get("run_id") if latest else None
-                    )
-                    index["latest_state"] = latest.get("state") if latest else None
-                save_state(index_path, index)
+            with index_lock(index_path):
+                index = load_state(index_path)
+                if index.get("kind") == INDEX_KIND:
+                    index["runs"] = [
+                        item
+                        for item in index.get("runs", [])
+                        if item.get("run_id") != state.get("run_id")
+                    ]
+                    if index.get("latest_run_id") == state.get("run_id"):
+                        latest = (
+                            max(
+                                index["runs"],
+                                key=lambda item: item.get("updated_at", ""),
+                            )
+                            if index["runs"]
+                            else None
+                        )
+                        index["latest_run_id"] = (
+                            latest.get("run_id") if latest else None
+                        )
+                        index["latest_state"] = (
+                            latest.get("state") if latest else None
+                        )
+                        index["current_updated_at"] = (
+                            latest.get("updated_at") if latest else None
+                        )
+                    save_state(index_path, index)
     path.unlink()
     emit({"result": "cleaned_up", "state": str(path)})
 

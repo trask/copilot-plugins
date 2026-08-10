@@ -26,7 +26,7 @@ You run a human-in-the-middle loop for one pull request's title and description.
 
 ## Mechanical Helper
 
-The helper is bundled with the `pr-description-loop` plugin from the `trask-plugins` marketplace. Invoke it with the active Python interpreter, consume its JSON-only output, and retain its unique run state path. A stable PR-scoped index supports dashboard status without sharing mutable proposals between runs.
+The helper is bundled with the `pr-description-loop` plugin from the `trask-plugins` marketplace. Invoke it with the active Python interpreter, consume its JSON-only output, and retain its unique run state path. A stable PR-scoped index supports dashboard status without sharing mutable proposals between runs, and every index transaction is protected by a bounded cross-process lock.
 
 Choose the helper command from the active shell before the first invocation:
 
