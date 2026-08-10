@@ -53,7 +53,7 @@ The deterministic, JSON-only helper provides:
 - `preflight [target] [--max-iterations 5]`: resolve and check out the PR, require a clean worktree, verify its head, fetch thread and suppressed comments, enforce the iteration cap, and initialize external state
 - `plan`, `refresh`, `record`, and `skip`: maintain batch and comment state
 - `status --current --repo-root <workspace>`: return only the workflow state attached to the current branch's PR
-- `publish`: push only when needed, post idempotent thread replies, resolve thread comments, request Copilot even without a new commit, and verify publication
+- `publish`: push only when needed, post each thread reply idempotently as its own published comment, resolve thread comments, request Copilot even without a new commit, and verify publication
 - `watch`: synchronously monitor exactly the requested Copilot review
 - `cancel-watch`: preempt stale or superseded monitoring
 
@@ -168,11 +168,12 @@ After all batches in the iteration are recorded:
 
 1. Run `publish --state <path>` immediately. Never perform its push, reply, resolve, review-request, or verification substeps manually.
 2. Publishing filters suppressed entries from replies, thread resolution, and thread verification while still allowing a suppressed-only queue to publish.
-3. If local and remote heads match, no push occurs. Publication still requests and verifies a fresh Copilot review, including commit-free and no-code iterations.
-4. On a publish error, preserve state and retry `publish` only after resolving its reported blocker.
-5. After `published`, start exactly one `watch --state <path>` process with terminal parameter `mode: sync`; omit both `timeout` and `isBackground` entirely.
-6. Never use `mode: async`, `isBackground: true`, or `timeout: 0`; consume its final JSON result directly from that same call. Do not send a final response while the watcher is active.
-7. Process the watcher result:
+3. Each reply is published on its own rather than bundled into one review, and verification fails if any reply is left in an unsubmitted review.
+4. If local and remote heads match, no push occurs. Publication still requests and verifies a fresh Copilot review, including commit-free and no-code iterations.
+5. On a publish error, preserve state and retry `publish` only after resolving its reported blocker.
+6. After `published`, start exactly one `watch --state <path>` process with terminal parameter `mode: sync`; omit both `timeout` and `isBackground` entirely.
+7. Never use `mode: async`, `isBackground: true`, or `timeout: 0`; consume its final JSON result directly from that same call. Do not send a final response while the watcher is active.
+8. Process the watcher result:
    - `review_no_comments`: the loop is clean; send the final compact index with the exact `review_id` and `review_url`.
    - `review_comments`: run `preflight` on the same PR and begin the next iteration immediately.
    - `head_changed`, `request_cancelled`, `review_dismissed`, `cancelled_locally`, or `stopped`: stop and include that exact outcome in the final compact index.

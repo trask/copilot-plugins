@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import json
 import os
@@ -67,8 +66,9 @@ def git(repo_root: Path, *arguments: str) -> str:
     return run(["git", "-C", str(repo_root), *arguments]).stdout.strip()
 
 
-def gh_json(arguments: list[str]) -> Any:
-    output = run(["gh", *arguments]).stdout
+def gh_json(arguments: list[str], *, input_payload: Any = None) -> Any:
+    input_text = json.dumps(input_payload) if input_payload is not None else None
+    output = run(["gh", *arguments], input_text=input_text).stdout
     return json.loads(output) if output.strip() else None
 
 
@@ -1155,27 +1155,24 @@ def post_missing_replies(
         else:
             missing.append((comment, expected_body))
 
-    def post(item: tuple[dict[str, Any], str]) -> tuple[int, dict[str, Any]]:
-        comment, expected_body = item
-        query = """
-mutation($threadId:ID!,$body:String!){
- addPullRequestReviewThreadReply(input:{
-  pullRequestReviewThreadId:$threadId,
-  body:$body
- }){comment{databaseId}}
-}
-"""
-        payload = graphql(
-            query,
-            {"threadId": comment["thread_id"], "body": expected_body},
+    # Each reply is posted through the REST replies endpoint, one at a time, so
+    # every reply is published on its own instead of being collected into the
+    # viewer's pending review.
+    for comment, expected_body in missing:
+        endpoint = (
+            f"repos/{pr['upstream_owner']}/{pr['upstream_repo']}"
+            f"/pulls/{pr['number']}/comments/{comment['id']}/replies"
         )
-        reply = payload["data"]["addPullRequestReviewThreadReply"]["comment"]
-        return comment["id"], {"id": reply["databaseId"]}
-
-    if missing:
-        with ThreadPoolExecutor(max_workers=min(8, len(missing))) as executor:
-            for comment_id, reply in executor.map(post, missing):
-                replies[comment_id] = reply
+        reply = gh_json(
+            ["api", "--method", "POST", "--input", "-", endpoint],
+            input_payload={"body": expected_body},
+        )
+        reply_id = reply.get("id") if isinstance(reply, dict) else None
+        if isinstance(reply_id, bool) or not isinstance(reply_id, int):
+            raise WorkflowError(
+                f"reply to comment {comment['id']} returned no numeric comment ID"
+            )
+        replies[comment["id"]] = reply
 
     reply_ids: dict[int, int] = {}
     for comment in comments:
@@ -1290,18 +1287,27 @@ def verify_publish(state: dict[str, Any], comments: list[dict[str, Any]]) -> dic
         if thread_comments
         else []
     )
+    # Only published comments are listed by the REST comments endpoint, so this
+    # also proves that no reply was left pending in an unsubmitted review.
+    published_reply_ids = (
+        {
+            item["id"]
+            for item in fetch_review_comments(
+                pr["upstream_owner"], pr["upstream_repo"], pr["number"]
+            )
+        }
+        if thread_comments
+        else set()
+    )
     by_thread = {thread["id"]: thread for thread in threads}
     thread_results = []
     for comment in thread_comments:
         thread = by_thread.get(comment["thread_id"])
-        reply_ids = {
-            item["databaseId"] for item in thread["comments"]["nodes"]
-        } if thread else set()
         thread_results.append(
             {
                 "thread_id": comment["thread_id"],
                 "resolved": bool(thread and thread["isResolved"]),
-                "reply_present": comment.get("reply_id") in reply_ids,
+                "reply_present": comment.get("reply_id") in published_reply_ids,
             }
         )
     query = """

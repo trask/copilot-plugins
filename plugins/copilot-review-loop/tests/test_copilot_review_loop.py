@@ -215,6 +215,22 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("Suppressed comments are never replied to or resolved", instructions)
         self.assertIn("re-derived on every iteration", instructions)
 
+    def test_documents_independent_reply_publication(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "post each thread reply idempotently as its own published comment",
+            instructions,
+        )
+        self.assertIn(
+            "Each reply is published on its own rather than bundled into one review",
+            instructions,
+        )
+        self.assertIn(
+            "verification fails if any reply is left in an unsubmitted review",
+            instructions,
+        )
+
 
 class ParseTargetTest(unittest.TestCase):
     def test_ignores_a_pasted_review_fragment(self):
@@ -1086,7 +1102,86 @@ class ReplyPublishingTest(unittest.TestCase):
             f"No code change.\n\n{reply}",
         )
 
-    def test_posts_reply_to_existing_thread_with_graphql(self):
+    def test_posts_each_reply_as_its_own_published_comment(self):
+        state = {
+            "pr": {
+                "upstream_owner": "open-telemetry",
+                "upstream_repo": "repo",
+                "number": 42,
+            }
+        }
+        comments = [
+            {
+                "id": 10,
+                "thread_id": "THREAD_1",
+                "commit": "abc123",
+                "reply": "Analysis: Applied the requested change.",
+            },
+            {
+                "id": 20,
+                "thread_id": "THREAD_2",
+                "commit": None,
+                "reply": "Analysis: The existing behavior is intentional.",
+            },
+        ]
+
+        def fake_gh_json(arguments, input_payload=None):
+            if arguments == ["api", "user"]:
+                return {"login": "author"}
+            self.assertIsNotNone(input_payload)
+            return {"id": 11 if "/10/replies" in arguments[-1] else 21}
+
+        with (
+            mock.patch.object(MODULE, "fetch_review_comments", return_value=[]),
+            mock.patch.object(
+                MODULE, "gh_json", side_effect=fake_gh_json
+            ) as gh_json,
+            mock.patch.object(MODULE, "graphql") as graphql,
+        ):
+            reply_ids = MODULE.post_missing_replies(state, comments)
+
+        self.assertEqual(reply_ids, {10: 11, 20: 21})
+        self.assertEqual(comments[0]["reply_id"], 11)
+        self.assertEqual(comments[1]["reply_id"], 21)
+        # A single bundled review is never created for the replies.
+        graphql.assert_not_called()
+        posts = [call for call in gh_json.call_args_list if call.args[0] != ["api", "user"]]
+        self.assertEqual(
+            [call.args[0] for call in posts],
+            [
+                [
+                    "api",
+                    "--method",
+                    "POST",
+                    "--input",
+                    "-",
+                    "repos/open-telemetry/repo/pulls/42/comments/10/replies",
+                ],
+                [
+                    "api",
+                    "--method",
+                    "POST",
+                    "--input",
+                    "-",
+                    "repos/open-telemetry/repo/pulls/42/comments/20/replies",
+                ],
+            ],
+        )
+        self.assertEqual(
+            [call.kwargs["input_payload"] for call in posts],
+            [
+                {
+                    "body": "Addressed in abc123.\n\n"
+                    "Analysis: Applied the requested change."
+                },
+                {
+                    "body": "No code change.\n\n"
+                    "Analysis: The existing behavior is intentional."
+                },
+            ],
+        )
+
+    def test_reuses_an_existing_identical_reply(self):
         state = {
             "pr": {
                 "upstream_owner": "open-telemetry",
@@ -1100,33 +1195,55 @@ class ReplyPublishingTest(unittest.TestCase):
             "commit": "abc123",
             "reply": "Analysis: Applied the requested change.",
         }
-        payload = {
-            "data": {
-                "addPullRequestReviewThreadReply": {
-                    "comment": {"databaseId": 11}
-                }
+        existing = [
+            {
+                "id": 11,
+                "in_reply_to_id": 10,
+                "user": {"login": "author"},
+                "body": "Addressed in abc123.\n\nAnalysis: Applied the requested change.",
             }
-        }
+        ]
 
         with (
-            mock.patch.object(MODULE, "fetch_review_comments", return_value=[]),
-            mock.patch.object(MODULE, "gh_json", return_value={"login": "author"}),
-            mock.patch.object(MODULE, "graphql", return_value=payload) as graphql,
+            mock.patch.object(MODULE, "fetch_review_comments", return_value=existing),
+            mock.patch.object(
+                MODULE, "gh_json", return_value={"login": "author"}
+            ) as gh_json,
         ):
             reply_ids = MODULE.post_missing_replies(state, [comment])
 
         self.assertEqual(reply_ids, {10: 11})
-        self.assertEqual(comment["reply_id"], 11)
-        query, variables = graphql.call_args.args
-        self.assertIn("addPullRequestReviewThreadReply", query)
-        self.assertEqual(
-            variables,
-            {
-                "threadId": "THREAD_1",
-                "body": "Addressed in abc123.\n\n"
-                "Analysis: Applied the requested change.",
-            },
-        )
+        gh_json.assert_called_once_with(["api", "user"])
+
+    def test_rejects_a_reply_without_a_numeric_comment_id(self):
+        state = {
+            "pr": {
+                "upstream_owner": "open-telemetry",
+                "upstream_repo": "repo",
+                "number": 42,
+            }
+        }
+        comment = {
+            "id": 10,
+            "thread_id": "THREAD_1",
+            "commit": "abc123",
+            "reply": "Analysis: Applied the requested change.",
+        }
+
+        def fake_gh_json(arguments, input_payload=None):
+            del input_payload
+            if arguments == ["api", "user"]:
+                return {"login": "author"}
+            return {}
+
+        with (
+            mock.patch.object(MODULE, "fetch_review_comments", return_value=[]),
+            mock.patch.object(MODULE, "gh_json", side_effect=fake_gh_json),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "returned no numeric comment ID"
+            ):
+                MODULE.post_missing_replies(state, [comment])
 
     def test_suppressed_comments_get_no_reply_or_resolution(self):
         comment = {
@@ -1268,6 +1385,75 @@ class ReplyPublishingTest(unittest.TestCase):
         graphql.assert_not_called()
         self.assertEqual(saved["iterations"], 3)
         self.assertEqual(saved["queue"]["status"], "published")
+
+
+class VerifyPublishTest(unittest.TestCase):
+    STATE = {
+        "repo_root": "repo",
+        "pr": {
+            "upstream_owner": "open-telemetry",
+            "upstream_repo": "repo",
+            "number": 42,
+        },
+        "monitoring": {"copilot_bot_id": "BOT_1"},
+    }
+
+    def run_verify(self, published_reply_ids):
+        comment = {
+            "id": 10,
+            "source": "thread",
+            "thread_id": "THREAD_1",
+            "reply_id": 11,
+        }
+        threads = [
+            {
+                "id": "THREAD_1",
+                "isResolved": True,
+                "comments": {"nodes": [{"databaseId": 10}, {"databaseId": 11}]},
+            }
+        ]
+        review_requests = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewRequests": {
+                            "nodes": [{"requestedReviewer": {"id": "BOT_1"}}]
+                        }
+                    }
+                }
+            }
+        }
+
+        with (
+            mock.patch.object(MODULE, "git", return_value="abc123"),
+            mock.patch.object(
+                MODULE, "gh_json", return_value={"head": {"sha": "abc123"}}
+            ),
+            mock.patch.object(MODULE, "fetch_threads", return_value=threads),
+            mock.patch.object(
+                MODULE,
+                "fetch_review_comments",
+                return_value=[{"id": item} for item in published_reply_ids],
+            ),
+            mock.patch.object(MODULE, "graphql", return_value=review_requests),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
+        ):
+            return MODULE.verify_publish(dict(self.STATE), [comment])
+
+    def test_accepts_a_published_reply(self):
+        result = self.run_verify([10, 11])
+
+        self.assertEqual(
+            result["threads"],
+            [{"thread_id": "THREAD_1", "resolved": True, "reply_present": True}],
+        )
+
+    def test_rejects_a_reply_left_in_an_unsubmitted_review(self):
+        # A pending reply is absent from the REST review comments listing.
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "publishing verification failed"
+        ):
+            self.run_verify([10])
 
 
 class CopilotReviewTest(unittest.TestCase):
