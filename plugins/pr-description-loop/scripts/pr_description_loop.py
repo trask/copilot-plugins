@@ -506,7 +506,8 @@ def update_run_index_unlocked(
     ]
     index["runs"].append(summary)
     candidate_updated_at = state["updated_at"]
-    if candidate_updated_at >= index.get("current_updated_at", ""):
+    current_updated_at = index.get("current_updated_at")
+    if current_updated_at is None or candidate_updated_at >= current_updated_at:
         index["pr"] = state["pr"]
         index["latest_run_id"] = state["run_id"]
         index["latest_state"] = str(run_path)

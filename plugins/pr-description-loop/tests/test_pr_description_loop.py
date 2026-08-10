@@ -244,7 +244,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.3")
+        self.assertEqual(plugin["version"], "1.0.4")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 
@@ -496,6 +496,54 @@ class StatePersistenceTest(unittest.TestCase):
         self.assertEqual(
             [item["run_id"] for item in index["runs"]], ["run-a", "run-b"]
         )
+
+    def test_preflight_replaces_null_current_timestamp_in_stable_index(self):
+        index_path = self.directory / "owner--repo--7.json"
+        MODULE.save_state(
+            index_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "kind": MODULE.INDEX_KIND,
+                "created_at": "2026-01-01T00:00:00Z",
+                "pr": pr_metadata(),
+                "runs": [],
+                "latest_run_id": None,
+                "latest_state": None,
+                "current_updated_at": None,
+            },
+        )
+        target = MODULE.parse_target("owner/repo#7")
+        args = SimpleNamespace(
+            target="owner/repo#7",
+            repo_root=str(self.directory),
+            state=None,
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=self.directory
+            ),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "current_pr_target", return_value=target),
+            mock.patch.object(MODULE, "metadata_for", return_value=pr_metadata()),
+            mock.patch.object(
+                MODULE, "default_state_path", return_value=index_path
+            ),
+            mock.patch.object(MODULE, "secrets") as secrets_module,
+        ):
+            secrets_module.token_hex.side_effect = ["run-null", "lock-null"]
+            MODULE.command_preflight(args)
+            preflight = self.emitted[-1]
+            MODULE.command_status(
+                SimpleNamespace(state=None, current=True, repo_root=None)
+            )
+
+        index = MODULE.load_state(index_path)
+        self.assertEqual(index["latest_run_id"], "run-null")
+        self.assertEqual(index["latest_state"], preflight["state"])
+        self.assertIsInstance(index["current_updated_at"], str)
+        self.assertEqual(self.emitted[-1]["kind"], MODULE.INDEX_KIND)
+        self.assertEqual(self.emitted[-1]["latest_run_id"], "run-null")
 
     def test_propose_increments_a_durable_counter_and_preserves_body(self):
         path = write_state(self.directory)
