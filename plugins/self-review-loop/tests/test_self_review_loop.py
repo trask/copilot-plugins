@@ -395,40 +395,55 @@ class HeadVerificationTest(unittest.TestCase):
 
         remote_head.assert_not_called()
 
-    def test_retries_detached_when_pr_branch_is_in_another_worktree(self):
+    def test_keeps_the_existing_pr_branch_checked_out(self):
         target = {"pr_url": "https://github.com/owner/repo/pull/7"}
-        collision = MODULE.WorkflowError(
-            "fatal: 'feature' is already used by worktree at 'C:\\other-worktree'"
+        metadata = {"head_branch": "feature"}
+
+        with (
+            mock.patch.object(MODULE, "run") as run,
+            mock.patch.object(MODULE, "git", return_value="feature"),
+        ):
+            checked_out_branch = MODULE.checkout_pr(Path("repo"), target, metadata)
+
+        self.assertTrue(checked_out_branch)
+        self.assertEqual(
+            run.call_args,
+            mock.call(
+                ["gh", "pr", "checkout", target["pr_url"]],
+                cwd=Path("repo"),
+            ),
         )
 
-        with mock.patch.object(
-            MODULE, "run", side_effect=[collision, mock.Mock()]
-        ) as run:
-            checked_out_branch = MODULE.checkout_pr(Path("repo"), target)
+    def test_checks_out_the_remote_pr_head_when_on_another_branch(self):
+        target = {"pr_url": "https://github.com/owner/repo/pull/7"}
+        metadata = {"head_branch": "feature"}
+
+        with (
+            mock.patch.object(MODULE, "run") as run,
+            mock.patch.object(MODULE, "git", return_value="session-branch"),
+        ):
+            checked_out_branch = MODULE.checkout_pr(Path("repo"), target, metadata)
 
         self.assertFalse(checked_out_branch)
         self.assertEqual(
-            run.call_args_list[1],
+            run.call_args,
             mock.call(
                 ["gh", "pr", "checkout", target["pr_url"], "--detach"],
                 cwd=Path("repo"),
             ),
         )
 
-    def test_recognizes_legacy_worktree_collision_wording(self):
-        error = MODULE.WorkflowError(
-            "fatal: 'feature' is already checked out at 'C:\\other-worktree'"
-        )
-
-        self.assertTrue(MODULE.is_worktree_checkout_collision(error))
-
     def test_does_not_mask_other_checkout_failures(self):
         target = {"pr_url": "https://github.com/owner/repo/pull/7"}
+        metadata = {"head_branch": "feature"}
         error = MODULE.WorkflowError("authentication failed")
 
-        with mock.patch.object(MODULE, "run", side_effect=error):
+        with (
+            mock.patch.object(MODULE, "git", return_value="feature"),
+            mock.patch.object(MODULE, "run", side_effect=error),
+        ):
             with self.assertRaisesRegex(MODULE.WorkflowError, "authentication failed"):
-                MODULE.checkout_pr(Path("repo"), target)
+                MODULE.checkout_pr(Path("repo"), target, metadata)
 
 
 class StateCommandTest(unittest.TestCase):
@@ -932,7 +947,7 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(state["review"]["diff_path"], str(diff_path))
         self.assertEqual(diff_path.read_text(encoding="utf-8"), DIFF)
 
-    def test_accepts_detached_checkout_for_worktree_collision(self):
+    def test_accepts_detached_checkout_from_another_branch(self):
         self.git_results[("branch", "--show-current")] = ""
 
         result = self.preflight(

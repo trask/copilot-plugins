@@ -629,33 +629,16 @@ def verify_checkout_head(repo_root: Path, local_head: str, pr_head: str) -> None
     raise WorkflowError(f"HEAD mismatch: local {local_head}, PR head {pr_head}")
 
 
-def is_worktree_checkout_collision(error: WorkflowError) -> bool:
-    message = str(error).lower()
-    return any(
-        text in message
-        for text in ("already checked out at", "already used by worktree at")
-    )
-
-
 def checkout_pr(
     repo_root: Path, target: dict[str, Any], metadata: dict[str, Any]
 ) -> bool:
-    try:
-        run(["gh", "pr", "checkout", target["pr_url"]], cwd=repo_root)
-        return True
-    except WorkflowError as error:
-        if not is_worktree_checkout_collision(error):
-            raise
-
-    local_head = git(repo_root, "rev-parse", "HEAD")
-    try:
-        verify_checkout_head(repo_root, local_head, metadata["head_sha"])
-    except WorkflowError:
-        run(
-            ["gh", "pr", "checkout", target["pr_url"], "--detach"],
-            cwd=repo_root,
-        )
-    return False
+    current_branch = git(repo_root, "branch", "--show-current")
+    on_pr_branch = current_branch == metadata["head_branch"]
+    command = ["gh", "pr", "checkout", target["pr_url"]]
+    if not on_pr_branch:
+        command.append("--detach")
+    run(command, cwd=repo_root)
+    return on_pr_branch
 
 
 def windows_process_is_running(pid: int) -> bool:

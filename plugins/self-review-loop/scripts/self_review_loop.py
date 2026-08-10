@@ -436,27 +436,16 @@ def require_checkout_head(local_head: str, pr_head: str) -> None:
     )
 
 
-def is_worktree_checkout_collision(error: WorkflowError) -> bool:
-    message = str(error).lower()
-    return any(
-        text in message
-        for text in ("already checked out at", "already used by worktree at")
-    )
-
-
-def checkout_pr(repo_root: Path, target: dict[str, Any]) -> bool:
-    try:
-        run(["gh", "pr", "checkout", target["pr_url"]], cwd=repo_root)
-        return True
-    except WorkflowError as error:
-        if not is_worktree_checkout_collision(error):
-            raise
-
-    run(
-        ["gh", "pr", "checkout", target["pr_url"], "--detach"],
-        cwd=repo_root,
-    )
-    return False
+def checkout_pr(
+    repo_root: Path, target: dict[str, Any], metadata: dict[str, Any]
+) -> bool:
+    current_branch = git(repo_root, "branch", "--show-current")
+    on_pr_branch = current_branch == metadata["head_branch"]
+    command = ["gh", "pr", "checkout", target["pr_url"]]
+    if not on_pr_branch:
+        command.append("--detach")
+    run(command, cwd=repo_root)
+    return on_pr_branch
 
 
 def decode_diff_path(value: str) -> str | None:
@@ -691,7 +680,7 @@ def command_preflight(args: argparse.Namespace) -> None:
         raise WorkflowError(f"worktree is not clean:\n{dirty}")
 
     metadata = metadata_for(target)
-    checked_out_branch = checkout_pr(repo_root, target)
+    checked_out_branch = checkout_pr(repo_root, target, metadata)
     branch = git(repo_root, "branch", "--show-current")
     if checked_out_branch and branch != metadata["head_branch"]:
         raise WorkflowError(
