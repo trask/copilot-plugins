@@ -189,6 +189,31 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
 
+    def test_final_response_uses_the_current_run_iteration_count(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "Initialize a run-local iteration counter to 0 before the first preflight",
+            instructions,
+        )
+        self.assertIn(
+            "After `published`, increment the run-local iteration counter exactly once",
+            instructions,
+        )
+        self.assertIn(
+            "`<n>` is the run-local iteration counter, not the helper's cumulative "
+            "persisted iteration count",
+            instructions,
+        )
+        self.assertIn(
+            "exits clean during its first preflight reports `0 iterations`",
+            instructions,
+        )
+        self.assertIn(
+            "begins with four persisted iterations and publishes once reports `1 iteration`",
+            instructions,
+        )
+
     def test_documents_durable_commit_and_reply_formats(self):
         instructions = AGENT.read_text(encoding="utf-8")
 

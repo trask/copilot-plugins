@@ -24,6 +24,7 @@ This agent handles Copilot review comments only. Comments from human reviewers a
 - Never wait for `next`, `commit`, `looks good`, `publish`, or `push etc`. Run the autonomous loop continuously until it is clean, the iteration cap is reached, or a stop condition fires.
 - The loop is `preflight -> investigate -> batch -> commit -> publish -> watch`, repeated for each new Copilot review.
 - The maximum is 5 iterations. Respect `max_iterations_reached` before editing; do not bypass it.
+- Initialize a run-local iteration counter to 0 before the first preflight. Increment it once after each successful `publish` in this invocation. Never initialize it from or replace it with the helper's persisted PR-scoped iteration count.
 - Group comments that share one root cause into one batch and one commit. Keep unrelated causes in separate commits even when they are close together.
 - Every code-change commit must durably record the original comment, technical analysis, and concrete upsides and downsides using **Commit And Reply Content**.
 - Publish every successfully handled iteration immediately. An iteration with no new commit still requests a fresh Copilot review; when the remote head already matches, the helper skips the push.
@@ -171,7 +172,7 @@ After all batches in the iteration are recorded:
 3. Each reply is published on its own rather than bundled into one review, and verification fails if any reply is left in an unsubmitted review.
 4. If local and remote heads match, no push occurs. Publication still requests and verifies a fresh Copilot review, including commit-free and no-code iterations.
 5. On a publish error, preserve state and retry `publish` only after resolving its reported blocker.
-6. After `published`, start exactly one `watch --state <path>` process with terminal parameter `mode: sync`; omit both `timeout` and `isBackground` entirely.
+6. After `published`, increment the run-local iteration counter exactly once, then start exactly one `watch --state <path>` process with terminal parameter `mode: sync`; omit both `timeout` and `isBackground` entirely.
 7. Never use `mode: async`, `isBackground: true`, or `timeout: 0`; consume its final JSON result directly from that same call. Do not send a final response while the watcher is active.
 8. Process the watcher result:
    - `review_no_comments`: the loop is clean; send the final compact index with the exact `review_id` and `review_url`.
@@ -191,3 +192,5 @@ Outcome: clean after <n> iteration(s), [Copilot review <id>](<review-url>).
 ```
 
 For a preflight-only clean exit, build the same link from `head_review_id` and `head_review_url`. Never print a bare review ID when its URL is available. For a capped or interrupted run, use `Outcome: <exact stop condition> after <n> iteration(s).` and append the same review link when the terminal helper result includes a review ID and URL. Mention uncommitted work only for an unfixable validation stop. Do not repeat Copilot comments, analysis, upsides, downsides, validation success, or publication mechanics in chat.
+
+In every outcome, `<n>` is the run-local iteration counter, not the helper's cumulative persisted iteration count. A run that exits clean during its first preflight reports `0 iterations`; a run that begins with four persisted iterations and publishes once reports `1 iteration`.
