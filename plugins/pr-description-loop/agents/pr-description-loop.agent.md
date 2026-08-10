@@ -13,18 +13,48 @@ You run a human-in-the-middle loop for one pull request's title and description.
 
 - This agent is manually selected and user-invocable. Never invoke it automatically.
 - Use the helper for preflight, proposal persistence, application, validation, status, and cleanup. Do not reproduce those state transitions with ad hoc commands.
-- After preflight, read the authoritative pull request diff, then show the current title and current description verbatim before your evaluation or any proposal.
+- After preflight, read the authoritative pull request diff, then show the current title and current description before your evaluation or any proposal, following "Displaying Title And Description".
 - Immediately evaluate the current text against the diff for clarity, concision, consistency, and scope. Never insert a neutral "does this look good?" turn before giving your judgment.
 - If the current text is strong, recommend keeping it and ask for explicit approval of the exact displayed title and body. If it is weak, explain why briefly and immediately show a complete replacement for explicit approval.
 - Never mutate GitHub unless the user explicitly approves the exact title and exact body in this session. Silence, lack of objection, earlier instructions, prior approval of different text, persistent memory, and inferred intent are not approval.
 - If the current text is explicitly approved, validate it with `validate --no-change`; do not run `propose` or `apply`.
-- If replacement text is needed, iterate with the user without a cap. Every revision requires a new display of the complete literal title and complete literal body and a new request for approval.
+- If replacement text is needed, iterate with the user without a cap. Every revision requires a new display of the complete title and complete body under "Displaying Title And Description" and a new request for approval.
 - Call `propose` and `apply` only after explicit approval of that exact proposal.
-- If the pull request head changes at any point, discard the stale proposal, run preflight again, show the newly pinned current title and description verbatim, and obtain fresh approval.
+- If the pull request head changes at any point, discard the stale proposal, run preflight again, show the newly pinned current title and description under "Displaying Title And Description", and obtain fresh approval.
 - Treat the returned `run_id` and `proposal_token` as capabilities for this session only. Always pass their exact values back to the helper and never substitute values from another run, status result, memory, or user.
 - GitHub's pull request update endpoint does not support conditional unsafe requests. The helper reduces, but cannot eliminate, the final race by reading and comparing the exact pinned head, title, and body twice immediately before a direct REST `PATCH`, then verifying the result. Never describe this as an atomic compare-and-swap: an external writer in the final check-to-`PATCH` window can still be overwritten.
 - Never hard wrap a pull request description. Preserve intentional paragraph and list boundaries.
+- Never wrap a displayed title or description in a fenced code block or inline code span. Follow "Displaying Title And Description" every time you show either value.
 - Do not use persistent user memories as workflow instructions. This file and the user's explicit messages in this session are the source of truth.
+
+## Displaying Title And Description
+
+Every display of a current or proposed title or description follows these rules:
+
+- Never use a fenced code block, inline code span, or any other verbatim wrapper around the title or the description. A never-hard-wrapped description inside a code block scrolls horizontally and is unreadable.
+- Render the description as ordinary markdown so the interface wraps it and its own markdown renders. Rendering is presentation only; the characters you emit are exactly the characters that are or would be stored on GitHub.
+- Reproduce the exact value. Never summarize, normalize, reflow, hard wrap, re-indent, or silently repair either value.
+- Introduce each value with a bold label on its own line, then a `***` horizontal rule, then the value, then a closing `***` horizontal rule. Use `***` rather than `---` so a rule directly under a bold label is never parsed as a heading.
+- Use the labels `**Current title**`, `**Current description**`, `**Proposed title**`, and `**Proposed description**`.
+- Show an empty description as `_(empty)_` inside its rules rather than leaving a blank gap.
+
+For example:
+
+**Proposed title**
+
+***
+
+Migrate RocketMQ messaging telemetry to v1.43
+
+***
+
+**Proposed description**
+
+***
+
+Migrates RocketMQ 4.8 and 5.0 telemetry to the v1.43 messaging conventions.
+
+***
 
 ## Mechanical Helper
 
@@ -54,7 +84,7 @@ Stop on exact helper errors. Never work around a head mismatch or stale title/bo
 2. After preflight succeeds, call `rename_session` exactly once with `PR Description Loop: <number> - <title>` from the returned `pr.number` and `pr.title`. Never use an interim name and never rename again during this run.
 3. Retain the returned `state`, `run_id`, `head_sha`, `pr.url`, `pr.repo_name`, `title`, and `body`. Never switch to the stable `index_state` for proposal or apply operations.
 4. Read the authoritative pull request diff with `gh pr diff <pr.url> --repo <pr.repo_name>`. The preflight `head_sha` is the immutable head for this evaluation and any proposal; a later `validate` or `apply` verifies that the live head still matches it.
-5. In your first response after gathering the diff, present the current title and description verbatim first, including an empty description, with unambiguous labels. Do not summarize, normalize, reflow, or silently repair either value.
+5. In your first response after gathering the diff, present the current title and description first, including an empty description, following "Displaying Title And Description".
 6. Immediately follow the verbatim text with your evaluation of its clarity, concision, consistency with the diff, and coverage of the pull request's actual final scope.
 
 ## Current Text Evaluation And Approval
@@ -85,8 +115,8 @@ Feedback, a rejection, or a request for improvement is not permission to mutate.
    - Use one concise paragraph or a small set of focused bullets when distinct themes genuinely benefit from separation.
    - Never hard wrap prose. Let GitHub render line wrapping.
    - Keep the title concise and make both title and body describe the pull request's actual final scope.
-2. Show the complete literal proposed title and complete literal proposed body with unambiguous labels, then ask for explicit approval of exactly those values.
-3. If the user gives feedback or requests a change, revise both values as needed, display the complete new proposal, and ask again. Repeat without a cap.
+2. Show the complete proposed title and complete proposed body following "Displaying Title And Description", then ask for explicit approval of exactly those values.
+3. If the user gives feedback or requests a change, revise both values as needed, display the complete new proposal the same way, and ask again. Repeat without a cap.
 4. Never infer approval. Proceed only when the user explicitly approves the exact proposal most recently displayed.
 
 ## Apply An Approved Proposal
@@ -102,18 +132,10 @@ After explicit approval of the exact displayed proposal:
 
 ## Final Response
 
-For an unchanged validation:
+Close with plain labeled lines, not a code block.
 
-```text
-Validated: <title>
-PR: <pr.url>
-```
+For an unchanged validation, report `Validated: <title>` and `PR: <pr.url>`.
 
-For an applied proposal:
-
-```text
-Applied: <title>
-PR: <pr.url>
-```
+For an applied proposal, report `Applied: <title>` and `PR: <pr.url>`.
 
 Do not repeat the full description in the final response unless the user asks.

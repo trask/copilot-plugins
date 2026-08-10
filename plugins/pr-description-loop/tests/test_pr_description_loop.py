@@ -75,15 +75,50 @@ class AgentInstructionsTest(unittest.TestCase):
 
     def test_always_shows_current_text_before_evaluating_or_proposing(self):
         self.assertIn(
-            "show the current title and current description verbatim before your "
+            "show the current title and current description before your "
             "evaluation or any proposal",
             self.instructions,
         )
         self.assertIn(
-            "present the current title and description verbatim first",
+            "present the current title and description first",
             self.instructions,
         )
         self.assertIn("including an empty description", self.instructions)
+
+    def test_renders_title_and_description_without_code_blocks(self):
+        self.assertIn("## Displaying Title And Description", self.instructions)
+        self.assertIn(
+            "Never wrap a displayed title or description in a fenced code block "
+            "or inline code span",
+            self.instructions,
+        )
+        self.assertIn(
+            "Never use a fenced code block, inline code span, or any other "
+            "verbatim wrapper around the title or the description",
+            self.instructions,
+        )
+        self.assertIn(
+            "Render the description as ordinary markdown so the interface wraps it",
+            self.instructions,
+        )
+        self.assertIn(
+            "Never summarize, normalize, reflow, hard wrap, re-indent, or "
+            "silently repair either value",
+            self.instructions,
+        )
+        self.assertIn(
+            "a bold label on its own line, then a `***` horizontal rule",
+            self.instructions,
+        )
+        for label in (
+            "`**Current title**`",
+            "`**Current description**`",
+            "`**Proposed title**`",
+            "`**Proposed description**`",
+        ):
+            self.assertIn(label, self.instructions)
+        self.assertIn("Show an empty description as `_(empty)_`", self.instructions)
+        self.assertNotIn("```text", self.instructions)
 
     def test_immediately_evaluates_and_recommends_a_decision(self):
         self.assertIn(
@@ -171,7 +206,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.1")
+        self.assertEqual(plugin["version"], "1.0.2")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 
