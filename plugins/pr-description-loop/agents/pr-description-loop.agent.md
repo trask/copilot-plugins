@@ -118,7 +118,12 @@ Feedback, a rejection, or a request for improvement is not permission to mutate.
 
 1. Use the authoritative diff already read to understand the complete change and apply the `pr-description-style` requirements:
    - The entire body is the summary; never add `Summary`, `Details`, or `Testing` headers.
+   - Open with a short, unheaded paragraph that states the user-visible outcome. Lead with what changes and why it matters, not implementation mechanics.
+   - Treat configuration as a user-facing public interface. When the pull request changes configuration, put concise before-and-after configuration examples immediately after the opening paragraph. Use actual keys and representative values for each materially distinct configuration surface, but do not enumerate equivalent variants that add no understanding.
+   - Treat public and programmatic APIs as user-facing interfaces too. When the pull request changes one, show a concrete usage example early in the body; use before-and-after examples when callers must migrate from existing API usage. Do not add API examples for internal-only changes.
+   - In a longer body, give distinct substantial ideas descriptive, topic-specific headings so readers can scan the explanation. Do not add headings to a short or single-idea body, and never use generic headings such as `Summary` or `Details`.
    - Do not include validation lists, test results, checklists, implementation diaries, or incidental details.
+   - Describe implementation details only when they clarify user-visible behavior, compatibility, or an important scope boundary. Do not turn the body into an exhaustive change log.
    - Default to short, single-idea paragraphs of roughly one to three sentences, separated by blank lines. Split a paragraph as soon as it starts covering more than one idea.
    - Use bullets only for genuinely list-like content; short paragraphs remain the default shape.
    - Splitting is about shape, not length. Never pad, restate, or add words to fill out a paragraph.

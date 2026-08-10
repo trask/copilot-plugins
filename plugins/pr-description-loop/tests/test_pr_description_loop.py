@@ -224,6 +224,46 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn("Never hard wrap prose", self.instructions)
 
+    def test_prioritizes_user_facing_examples_and_skimmable_structure(self):
+        self.assertIn(
+            "Open with a short, unheaded paragraph that states the user-visible "
+            "outcome",
+            self.instructions,
+        )
+        self.assertIn(
+            "When the pull request changes configuration, put concise "
+            "before-and-after configuration examples immediately after the opening "
+            "paragraph",
+            self.instructions,
+        )
+        self.assertIn(
+            "Use actual keys and representative values for each materially distinct "
+            "configuration surface",
+            self.instructions,
+        )
+        self.assertIn(
+            "When the pull request changes one, show a concrete usage example early "
+            "in the body",
+            self.instructions,
+        )
+        self.assertIn(
+            "use before-and-after examples when callers must migrate from existing "
+            "API usage",
+            self.instructions,
+        )
+        self.assertIn(
+            "give distinct substantial ideas descriptive, topic-specific headings",
+            self.instructions,
+        )
+        self.assertIn(
+            "Do not add headings to a short or single-idea body",
+            self.instructions,
+        )
+        self.assertIn(
+            "Do not turn the body into an exhaustive change log",
+            self.instructions,
+        )
+
     def test_restarts_on_head_change_and_uses_external_body_file(self):
         self.assertIn(
             "discard the stale proposal, run preflight again", self.instructions
@@ -250,7 +290,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.5")
+        self.assertEqual(plugin["version"], "1.0.6")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 
