@@ -157,14 +157,11 @@ The helper increments the persisted iteration count only after a successful publ
 
 ## Final Response
 
-Keep chat as a compact index because the reasoning lives in git. Emit one line per commit, then any no-code outcome, one loop-outcome line, and finally the canonical pull request link from the most recent preflight result's `pr.pr_url`:
+Keep chat as a compact index because the reasoning lives in git. Render ordinary Markdown, never a fenced code block. Emit one linked list item per commit, then any no-code outcome, one loop-outcome line, and finally the canonical pull request link from the most recent preflight result's `pr.pr_url`:
 
-```text
-<short-sha> <short batch summary>
-<short-sha> <short batch summary>
-No code change: <short summary> - <one-line rationale>
-Outcome: clean after <n> iteration(s).
-PR: <pr.pr_url>
-```
+- `[<short-sha> <short batch summary>](<pr.pr_url>/commits/<full-sha>)`
+- `No code change: <short summary> - <one-line rationale>`
+- `**Outcome:** clean after <n> iteration(s).`
+- `**PR:** [#<pr.number> <pr.title>](<pr.pr_url>)`
 
-For a capped or interrupted run, use `Outcome: <exact stop condition> after <n> iteration(s).` Always end with the `PR: <pr.pr_url>` line so the pull request is directly accessible. Mention uncommitted work only for an unfixable validation stop. Report dropped candidates only as a count unless the user asks for detail, and do not repeat findings, analysis, upsides, downsides, validation success, or publication mechanics in chat.
+The backticks above delimit templates only; do not include them in the final response. For a capped or interrupted run, use `**Outcome:** <exact stop condition> after <n> iteration(s).` Always end with the linked `**PR:**` line so the pull request is directly accessible. Mention uncommitted work only for an unfixable validation stop. Report dropped candidates only as a count unless the user asks for detail, and do not repeat findings, analysis, upsides, downsides, validation success, or publication mechanics in chat.

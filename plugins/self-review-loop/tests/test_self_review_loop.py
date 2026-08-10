@@ -160,13 +160,23 @@ class AgentInstructionsTest(unittest.TestCase):
             "run `preflight --repo-root <workspace>` with no target", self.instructions
         )
 
-    def test_final_response_ends_with_the_pull_request_link(self):
+    def test_final_response_renders_commit_and_pull_request_links(self):
         self.assertIn(
             "canonical pull request link from the most recent preflight result's "
             "`pr.pr_url`",
             self.instructions,
         )
-        self.assertIn("Always end with the `PR: <pr.pr_url>` line", self.instructions)
+        self.assertIn(
+            "Render ordinary Markdown, never a fenced code block", self.instructions
+        )
+        self.assertIn(
+            "[<short-sha> <short batch summary>](<pr.pr_url>/commits/<full-sha>)",
+            self.instructions,
+        )
+        self.assertIn(
+            "**PR:** [#<pr.number> <pr.title>](<pr.pr_url>)", self.instructions
+        )
+        self.assertNotIn("PR: <pr.pr_url>", self.instructions)
 
     def test_reads_the_pinned_diff_from_the_helper_snapshot(self):
         self.assertIn(
