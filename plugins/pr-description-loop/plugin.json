@@ -1,7 +1,7 @@
 {
   "name": "pr-description-loop",
   "description": "Review and update a pull request title and description with explicit user approval and head verification.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": {
     "name": "Trask Stalnaker"
   },

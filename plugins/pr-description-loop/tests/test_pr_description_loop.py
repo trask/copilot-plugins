@@ -73,13 +73,42 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("`PR Description Loop: <number> - <title>`", self.instructions)
         self.assertIn("never rename again during this run", self.instructions)
 
-    def test_always_shows_current_text_before_proposing(self):
+    def test_always_shows_current_text_before_evaluating_or_proposing(self):
         self.assertIn(
-            "always display the current title and current description verbatim",
+            "show the current title and current description verbatim before your "
+            "evaluation or any proposal",
             self.instructions,
         )
-        self.assertIn("Ask whether that exact current title and description look good", self.instructions)
+        self.assertIn(
+            "present the current title and description verbatim first",
+            self.instructions,
+        )
         self.assertIn("including an empty description", self.instructions)
+
+    def test_immediately_evaluates_and_recommends_a_decision(self):
+        self.assertIn(
+            "Immediately evaluate the current text against the diff for clarity, "
+            "concision, consistency, and scope",
+            self.instructions,
+        )
+        self.assertIn(
+            'Never insert a neutral "does this look good?" turn',
+            self.instructions,
+        )
+        self.assertIn(
+            "If the current text is strong, recommend keeping it and ask for explicit "
+            "approval",
+            self.instructions,
+        )
+        self.assertIn(
+            "If it is weak, explain why briefly and immediately show a complete "
+            "replacement",
+            self.instructions,
+        )
+        self.assertIn(
+            "Do not first ask whether the current text looks good",
+            self.instructions,
+        )
 
     def test_requires_explicit_session_approval(self):
         self.assertIn(
@@ -142,7 +171,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.0")
+        self.assertEqual(plugin["version"], "1.0.1")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 
