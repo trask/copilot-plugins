@@ -398,7 +398,7 @@ class HeadVerificationTest(unittest.TestCase):
     def test_retries_detached_when_pr_branch_is_in_another_worktree(self):
         target = {"pr_url": "https://github.com/owner/repo/pull/7"}
         collision = MODULE.WorkflowError(
-            "fatal: 'feature' is already checked out at 'C:\\other-worktree'"
+            "fatal: 'feature' is already used by worktree at 'C:\\other-worktree'"
         )
 
         with mock.patch.object(
@@ -414,6 +414,13 @@ class HeadVerificationTest(unittest.TestCase):
                 cwd=Path("repo"),
             ),
         )
+
+    def test_recognizes_legacy_worktree_collision_wording(self):
+        error = MODULE.WorkflowError(
+            "fatal: 'feature' is already checked out at 'C:\\other-worktree'"
+        )
+
+        self.assertTrue(MODULE.is_worktree_checkout_collision(error))
 
     def test_does_not_mask_other_checkout_failures(self):
         target = {"pr_url": "https://github.com/owner/repo/pull/7"}

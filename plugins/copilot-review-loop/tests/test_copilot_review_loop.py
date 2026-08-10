@@ -944,7 +944,7 @@ class CheckoutHeadTest(unittest.TestCase):
         target = {"pr_url": "https://github.com/owner/repo/pull/7"}
         metadata = {"head_sha": "remote123"}
         collision = MODULE.WorkflowError(
-            "fatal: 'feature' is already checked out at 'C:\\other-worktree'"
+            "fatal: 'feature' is already used by worktree at 'C:\\other-worktree'"
         )
         mismatch = MODULE.WorkflowError(
             "HEAD mismatch: local base123, PR head remote123"
@@ -985,6 +985,13 @@ class CheckoutHeadTest(unittest.TestCase):
         self.assertFalse(checked_out_branch)
         self.assertEqual(run.call_count, 1)
         verify.assert_called_once_with(Path("repo"), "local123", "remote123")
+
+    def test_recognizes_legacy_worktree_collision_wording(self):
+        error = MODULE.WorkflowError(
+            "fatal: 'feature' is already checked out at 'C:\\other-worktree'"
+        )
+
+        self.assertTrue(MODULE.is_worktree_checkout_collision(error))
 
     def test_does_not_mask_other_checkout_failures(self):
         target = {"pr_url": "https://github.com/owner/repo/pull/7"}

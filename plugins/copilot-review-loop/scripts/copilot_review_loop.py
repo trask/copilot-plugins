@@ -629,6 +629,14 @@ def verify_checkout_head(repo_root: Path, local_head: str, pr_head: str) -> None
     raise WorkflowError(f"HEAD mismatch: local {local_head}, PR head {pr_head}")
 
 
+def is_worktree_checkout_collision(error: WorkflowError) -> bool:
+    message = str(error).lower()
+    return any(
+        text in message
+        for text in ("already checked out at", "already used by worktree at")
+    )
+
+
 def checkout_pr(
     repo_root: Path, target: dict[str, Any], metadata: dict[str, Any]
 ) -> bool:
@@ -636,7 +644,7 @@ def checkout_pr(
         run(["gh", "pr", "checkout", target["pr_url"]], cwd=repo_root)
         return True
     except WorkflowError as error:
-        if "already checked out at" not in str(error).lower():
+        if not is_worktree_checkout_collision(error):
             raise
 
     local_head = git(repo_root, "rev-parse", "HEAD")
