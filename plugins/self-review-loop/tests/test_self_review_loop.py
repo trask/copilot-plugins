@@ -85,6 +85,9 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn("Never use an interim number-only name", self.instructions)
+        # rename_session only replaces an auto-generated name; a second call is skipped.
+        self.assertNotIn("call `rename_session` again", self.instructions)
+        self.assertNotIn("immediately call `rename_session`", self.instructions)
 
     def test_bare_pr_reference_runs_the_full_loop(self):
         self.assertIn("name: Self Review Loop", self.instructions)
