@@ -183,14 +183,11 @@ The helper increments the persisted iteration count only after successful public
 
 ## Final Response
 
-Keep chat as a compact index because reasoning lives in git. Emit one line per commit, then one loop-outcome line:
+Keep chat as a compact index because reasoning lives in git. Render ordinary Markdown, never a fenced code block. Emit one linked list item per commit using the canonical pull request URL from the most recent preflight result's `pr.url`, then one loop-outcome line:
 
-```text
-<short-sha> <short batch summary>
-<short-sha> <short batch summary>
-Outcome: clean after <n> iteration(s), [Copilot review <id>](<review-url>).
-```
+- `[<short-sha> <short batch summary>](<pr.url>/changes/<full-sha>)`
+- `**Outcome:** clean after <n> iteration(s), [Copilot review <id>](<review-url>).`
 
-For a preflight-only clean exit, build the same link from `head_review_id` and `head_review_url`. Never print a bare review ID when its URL is available. For a capped or interrupted run, use `Outcome: <exact stop condition> after <n> iteration(s).` and append the same review link when the terminal helper result includes a review ID and URL. Mention uncommitted work only for an unfixable validation stop. Do not repeat Copilot comments, analysis, upsides, downsides, validation success, or publication mechanics in chat.
+The backticks above delimit templates only; do not include them in the final response. For a preflight-only clean exit, build the same link from `head_review_id` and `head_review_url`. Never print a bare review ID when its URL is available. For a capped or interrupted run, use `**Outcome:** <exact stop condition> after <n> iteration(s).` and append the same review link when the terminal helper result includes a review ID and URL. Mention uncommitted work only for an unfixable validation stop. Do not repeat Copilot comments, analysis, upsides, downsides, validation success, or publication mechanics in chat.
 
 In every outcome, `<n>` is the run-local iteration counter, not the helper's cumulative persisted iteration count. A run that exits clean during its first preflight reports `0 iterations`; a run that begins with four persisted iterations and publishes once reports `1 iteration`.

@@ -159,7 +159,7 @@ The helper increments the persisted iteration count only after a successful publ
 
 Keep chat as a compact index because the reasoning lives in git. Render ordinary Markdown, never a fenced code block. Emit one linked list item per commit, then any no-code outcome, one loop-outcome line, and finally the canonical pull request link from the most recent preflight result's `pr.pr_url`:
 
-- `[<short-sha> <short batch summary>](<pr.pr_url>/commits/<full-sha>)`
+- `[<short-sha> <short batch summary>](<pr.pr_url>/changes/<full-sha>)`
 - `No code change: <short summary> - <one-line rationale>`
 - `**Outcome:** clean after <n> iteration(s).`
 - `**PR:** [#<pr.number> <pr.title>](<pr.pr_url>)`

@@ -170,9 +170,10 @@ class AgentInstructionsTest(unittest.TestCase):
             "Render ordinary Markdown, never a fenced code block", self.instructions
         )
         self.assertIn(
-            "[<short-sha> <short batch summary>](<pr.pr_url>/commits/<full-sha>)",
+            "[<short-sha> <short batch summary>](<pr.pr_url>/changes/<full-sha>)",
             self.instructions,
         )
+        self.assertNotIn("/commits/<full-sha>", self.instructions)
         self.assertIn(
             "**PR:** [#<pr.number> <pr.title>](<pr.pr_url>)", self.instructions
         )

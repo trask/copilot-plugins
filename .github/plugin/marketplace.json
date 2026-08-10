@@ -17,13 +17,13 @@
     {
       "name": "copilot-review-loop",
       "description": "Address Copilot pull request review comments, publish fixes, and repeat until the review is clean.",
-      "version": "1.0.14",
+      "version": "1.0.15",
       "source": "./plugins/copilot-review-loop"
     },
     {
       "name": "self-review-loop",
       "description": "Review a GitHub pull request, verify each finding independently, and commit the fixes without posting review comments.",
-      "version": "1.0.6",
+      "version": "1.0.7",
       "source": "./plugins/self-review-loop"
     },
     {

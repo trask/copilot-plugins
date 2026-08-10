@@ -177,6 +177,14 @@ class AgentInstructionsTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn(
+            "Render ordinary Markdown, never a fenced code block", instructions
+        )
+        self.assertIn(
+            "[<short-sha> <short batch summary>](<pr.url>/changes/<full-sha>)",
+            instructions,
+        )
+        self.assertNotIn("/commits/<full-sha>", instructions)
+        self.assertIn(
             "[Copilot review <id>](<review-url>)",
             instructions,
         )
