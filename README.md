@@ -16,6 +16,7 @@ Then install any of the plugins:
 copilot plugin install pr-reviewer@trask-plugins
 copilot plugin install copilot-review-loop@trask-plugins
 copilot plugin install self-review-loop@trask-plugins
+copilot plugin install pr-description-loop@trask-plugins
 ```
 
 Restart Copilot after installing or updating a plugin.
@@ -50,6 +51,13 @@ no findings or a stop condition is reached.
 This agent must run on a Claude model because it uses GPT-5.6 Sol as an
 independent evaluator.
 
+### PR Description Loop
+
+Shows the current pull request title and description, validates them unchanged
+when the user approves, or iterates on a focused replacement and applies it only
+after explicit approval. Every accepted outcome is verified against the pinned
+pull request head and exact live text.
+
 ## Update
 
 ```bash
@@ -57,6 +65,7 @@ copilot plugin marketplace update trask-plugins
 copilot plugin update pr-reviewer
 copilot plugin update copilot-review-loop
 copilot plugin update self-review-loop
+copilot plugin update pr-description-loop
 ```
 
 ## Requirements

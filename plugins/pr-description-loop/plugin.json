@@ -1,7 +1,7 @@
 {
-  "name": "self-review-loop",
-  "description": "Review a GitHub pull request, verify each finding independently, and commit the fixes without posting review comments.",
-  "version": "1.0.3",
+  "name": "pr-description-loop",
+  "description": "Review and update a pull request title and description with explicit user approval and head verification.",
+  "version": "1.0.0",
   "author": {
     "name": "Trask Stalnaker"
   },
@@ -10,7 +10,7 @@
   "keywords": [
     "github",
     "pull-request",
-    "review"
+    "description"
   ],
   "agents": "agents/"
 }

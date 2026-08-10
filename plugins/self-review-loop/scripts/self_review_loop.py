@@ -872,6 +872,25 @@ def command_skip(args: argparse.Namespace) -> None:
     )
 
 
+def command_resolve(args: argparse.Namespace) -> None:
+    if args.outcome != "clean":
+        raise WorkflowError("resolve outcome must be clean")
+    path = cli_path(args.state)
+    state = load_state(path)
+    review = active_review(state)
+    review["outcome"] = args.outcome
+    review["clean_at_head_sha"] = review["head_sha"]
+    save_state(path, state)
+    emit(
+        {
+            "result": "resolved",
+            "state": str(path),
+            "outcome": args.outcome,
+            "clean_at_head_sha": review["clean_at_head_sha"],
+        }
+    )
+
+
 def find_push_remote(repo_root: Path, owner: str, repo: str) -> str:
     expected = f"{owner}/{repo}".lower()
     for remote in git(repo_root, "remote").splitlines():
@@ -1102,6 +1121,11 @@ def build_parser() -> argparse.ArgumentParser:
     skip.add_argument("--candidates", type=int, nargs="+", required=True)
     skip.add_argument("--rationale", required=True)
     skip.set_defaults(function=command_skip)
+
+    resolve = subparsers.add_parser("resolve", help="record a clean review outcome")
+    resolve.add_argument("--state", required=True)
+    resolve.add_argument("--outcome", choices=["clean"], required=True)
+    resolve.set_defaults(function=command_resolve)
 
     publish = subparsers.add_parser(
         "publish", help="push this iteration's commits and verify the new head"

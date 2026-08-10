@@ -117,6 +117,12 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertNotIn("pending review", self.instructions)
         self.assertNotIn("thread", self.instructions.lower())
 
+    def test_records_both_clean_exits(self):
+        self.assertEqual(
+            self.instructions.count("run `resolve --state <path> --outcome clean`"),
+            2,
+        )
+
     def test_keeps_the_claude_only_model_gate(self):
         self.assertIn("## Model Gate", self.instructions)
         self.assertIn("Run only on a Claude model.", self.instructions)
@@ -563,6 +569,17 @@ class StateCommandTest(unittest.TestCase):
         self.assertEqual(candidate["commit"], "fullsha")
         self.assertEqual(candidate["summary"], "fix the guard")
         self.assertEqual(state["review"]["batches"][0]["status"], "approved")
+
+    def test_resolve_marks_the_active_review_clean_at_its_pinned_head(self):
+        path = write_state(self.directory)
+
+        MODULE.command_resolve(SimpleNamespace(state=str(path), outcome="clean"))
+
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(state["review"]["outcome"], "clean")
+        self.assertEqual(state["review"]["clean_at_head_sha"], "head1")
+        self.assertEqual(self.emitted[-1]["result"], "resolved")
+        self.assertEqual(self.emitted[-1]["clean_at_head_sha"], "head1")
 
 
 class PublishTest(unittest.TestCase):

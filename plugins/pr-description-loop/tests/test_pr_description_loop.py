@@ -1,0 +1,768 @@
+import importlib.util
+import json
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+
+ROOT = Path(__file__).parents[1]
+SCRIPT = ROOT / "scripts" / "pr_description_loop.py"
+AGENT = ROOT / "agents" / "pr-description-loop.agent.md"
+PLUGIN = ROOT / "plugin.json"
+MARKETPLACE = ROOT.parents[1] / ".github" / "plugin" / "marketplace.json"
+SPEC = importlib.util.spec_from_file_location("pr_description_loop", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MODULE)
+
+
+def pr_metadata(**overrides):
+    url = "https://github.com/owner/repo/pull/7"
+    metadata = {
+        "owner": "owner",
+        "repo": "repo",
+        "number": 7,
+        "repo_name": "owner/repo",
+        "pr_url": url,
+        "url": url,
+        "title": "Current title",
+        "body": "Current body",
+        "head_sha": "head1",
+        "is_draft": False,
+    }
+    metadata.update(overrides)
+    return metadata
+
+
+def write_state(directory: Path, **overrides) -> Path:
+    state = {
+        "version": MODULE.STATE_VERSION,
+        "created_at": "2026-01-01T00:00:00Z",
+        "proposal_count": 0,
+        "repo_root": str(directory),
+        "pr": pr_metadata(),
+        "pinned_at": "2026-01-01T00:00:00Z",
+    }
+    state.update(overrides)
+    path = directory / "state.json"
+    MODULE.save_state(path, state)
+    return path
+
+
+class AgentInstructionsTest(unittest.TestCase):
+    def setUp(self):
+        self.instructions = AGENT.read_text(encoding="utf-8")
+
+    def test_is_manually_selected_and_user_invocable(self):
+        self.assertIn("user-invocable: true", self.instructions)
+        self.assertIn("disable-model-invocation: true", self.instructions)
+        self.assertIn("This agent is manually selected and user-invocable", self.instructions)
+
+    def test_renames_once_after_preflight(self):
+        self.assertIn("tools: [read, search, execute, todo, rename_session]", self.instructions)
+        self.assertIn("After preflight succeeds, call `rename_session` exactly once", self.instructions)
+        self.assertIn("`PR Description Loop: <number> - <title>`", self.instructions)
+        self.assertIn("never rename again during this run", self.instructions)
+
+    def test_always_shows_current_text_before_proposing(self):
+        self.assertIn(
+            "always display the current title and current description verbatim",
+            self.instructions,
+        )
+        self.assertIn("Ask whether that exact current title and description look good", self.instructions)
+        self.assertIn("including an empty description", self.instructions)
+
+    def test_requires_explicit_session_approval(self):
+        self.assertIn(
+            "Never mutate GitHub unless the user explicitly approves the exact title "
+            "and exact body in this session",
+            self.instructions,
+        )
+        self.assertIn(
+            "Silence, lack of objection, earlier instructions, prior approval of "
+            "different text, persistent memory, and inferred intent are not approval",
+            self.instructions,
+        )
+        self.assertIn(
+            "Call `propose` and `apply` only after explicit approval",
+            self.instructions,
+        )
+
+    def test_validates_approved_current_text_without_mutation(self):
+        self.assertIn(
+            "`validate --state <path> --expected-head <head_sha> --no-change`",
+            self.instructions,
+        )
+        self.assertIn("do not run `propose` or `apply`", self.instructions)
+
+    def test_documents_description_style_and_diff_source(self):
+        self.assertIn(
+            "`gh pr diff <pr.url> --repo <pr.repo_name>`",
+            self.instructions,
+        )
+        for forbidden_header in ("`Summary`", "`Details`", "`Testing`"):
+            self.assertIn(forbidden_header, self.instructions)
+        self.assertIn("Do not include validation lists", self.instructions)
+        self.assertIn("Use one concise paragraph", self.instructions)
+        self.assertIn("Never hard wrap prose", self.instructions)
+
+    def test_restarts_on_head_change_and_uses_external_body_file(self):
+        self.assertIn(
+            "discard the stale proposal, run preflight again", self.instructions
+        )
+        self.assertIn("The earlier approval does not carry forward", self.instructions)
+        self.assertIn(
+            "UTF-8 to a body file outside the repository", self.instructions
+        )
+
+    def test_manifest_and_marketplace_versions_match(self):
+        plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
+        marketplace = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
+        entry = next(
+            item for item in marketplace["plugins"] if item["name"] == plugin["name"]
+        )
+        self.assertEqual(plugin["version"], "1.0.0")
+        self.assertEqual(entry["version"], plugin["version"])
+        self.assertEqual(entry["source"], "./plugins/pr-description-loop")
+
+
+class TargetParsingTest(unittest.TestCase):
+    def test_accepts_urls_short_targets_and_bare_numbers_with_context(self):
+        expected = {
+            "owner": "owner",
+            "repo": "repo",
+            "number": 7,
+            "repo_name": "owner/repo",
+            "pr_url": "https://github.com/owner/repo/pull/7",
+        }
+        self.assertEqual(
+            MODULE.parse_target("https://github.com/owner/repo/pull/7"), expected
+        )
+        self.assertEqual(MODULE.parse_target("owner/repo#7"), expected)
+        self.assertEqual(
+            MODULE.parse_target("#7", repo_name="owner/repo"), expected
+        )
+        self.assertEqual(MODULE.parse_target("7", repo_name="owner/repo"), expected)
+        self.assertEqual(
+            MODULE.parse_target(
+                "https://github.com/owner/repo/pull/7#discussion_r1"
+            ),
+            expected,
+        )
+
+    def test_rejects_invalid_targets_and_context_free_bare_numbers(self):
+        for value in (
+            "owner/repo",
+            "https://github.com/owner/repo/issues/7",
+            "not-a-target",
+            "7",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(MODULE.WorkflowError):
+                    MODULE.parse_target(value)
+
+    def test_resolves_a_bare_number_from_current_repository_context(self):
+        with mock.patch.object(
+            MODULE, "repository_context", return_value="owner/repo"
+        ) as repository_context:
+            target = MODULE.resolve_target("7", Path("repo"))
+
+        self.assertEqual(target["pr_url"], "https://github.com/owner/repo/pull/7")
+        repository_context.assert_called_once_with(Path("repo"))
+
+    def test_resolves_an_omitted_target_from_the_current_branch(self):
+        expected = MODULE.parse_target("owner/repo#7")
+        with mock.patch.object(
+            MODULE, "current_pr_target", return_value=expected
+        ) as current_pr_target:
+            target = MODULE.resolve_target(None, Path("repo"))
+
+        self.assertEqual(target, expected)
+        current_pr_target.assert_called_once_with(Path("repo"))
+
+    def test_reads_repository_context_from_gh(self):
+        with mock.patch.object(
+            MODULE, "gh_json", return_value={"nameWithOwner": "owner/repo"}
+        ) as gh_json:
+            self.assertEqual(MODULE.repository_context(Path("repo")), "owner/repo")
+
+        gh_json.assert_called_once_with(
+            ["repo", "view", "--json", "nameWithOwner"], cwd=Path("repo")
+        )
+
+    def test_current_branch_without_upstream_uses_direct_gh_resolution(self):
+        expected = MODULE.parse_target("owner/repo#7")
+        with (
+            mock.patch.object(MODULE, "git", return_value="feature"),
+            mock.patch.object(MODULE, "configured_upstream", return_value=None),
+            mock.patch.object(
+                MODULE, "simple_current_pr_target", return_value=expected
+            ) as simple,
+            mock.patch.object(MODULE, "exact_upstream_pr_targets") as exact,
+        ):
+            target = MODULE.current_pr_target(Path("repo"))
+
+        self.assertEqual(target, expected)
+        simple.assert_called_once_with(Path("repo"), None)
+        exact.assert_not_called()
+
+    def test_current_branch_with_upstream_uses_exact_remote_resolution(self):
+        expected = MODULE.parse_target("owner/repo#7")
+        upstream = {"repo": "fork/repo", "branch": "feature"}
+        with (
+            mock.patch.object(MODULE, "git", return_value="feature"),
+            mock.patch.object(
+                MODULE, "configured_upstream", return_value=upstream
+            ),
+            mock.patch.object(MODULE, "simple_current_pr_target") as simple,
+            mock.patch.object(
+                MODULE, "exact_upstream_pr_targets", return_value=[expected]
+            ) as exact,
+        ):
+            target = MODULE.current_pr_target(Path("repo"))
+
+        self.assertEqual(target, expected)
+        simple.assert_not_called()
+        exact.assert_called_once_with(upstream)
+
+    def test_normalizes_git_bash_style_paths_on_windows(self):
+        self.assertEqual(
+            MODULE.normalize_cli_path("/c/Users/me/state.json", windows=True),
+            "C:/Users/me/state.json",
+        )
+        self.assertEqual(
+            MODULE.normalize_cli_path("/c/Users/me/state.json", windows=False),
+            "/c/Users/me/state.json",
+        )
+
+
+class StatePersistenceTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temporary.name)
+        self.addCleanup(self.temporary.cleanup)
+        self.emitted = []
+        patcher = mock.patch.object(MODULE, "emit", self.emitted.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_atomically_round_trips_state(self):
+        path = write_state(self.directory)
+
+        state = MODULE.load_state(path)
+
+        self.assertEqual(state["pr"]["head_sha"], "head1")
+        self.assertIn("updated_at", state)
+        self.assertTrue(path.read_bytes().endswith(b"\n"))
+        self.assertEqual(
+            list(self.directory.glob(f".{path.name}.*.tmp")),
+            [],
+        )
+
+    def test_rejects_an_unsupported_state_version(self):
+        path = write_state(self.directory)
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["version"] = MODULE.STATE_VERSION + 1
+        path.write_text(json.dumps(state), encoding="utf-8")
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "unsupported state version"):
+            MODULE.load_state(path)
+
+    def test_preflight_initializes_pinned_state(self):
+        path = self.directory / "state.json"
+        metadata = pr_metadata()
+        target = MODULE.parse_target("owner/repo#7")
+        args = SimpleNamespace(
+            target="owner/repo#7",
+            repo_root=str(self.directory),
+            state=str(path),
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=self.directory
+            ),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "metadata_for", return_value=metadata),
+        ):
+            MODULE.command_preflight(args)
+
+        state = MODULE.load_state(path)
+        self.assertEqual(state["pr"], metadata)
+        self.assertEqual(state["proposal_count"], 0)
+        self.assertEqual(self.emitted[-1]["title"], "Current title")
+        self.assertEqual(self.emitted[-1]["body"], "Current body")
+        self.assertEqual(self.emitted[-1]["head_sha"], "head1")
+
+    def test_preflight_preserves_counter_and_clears_stale_proposal_validation(self):
+        path = write_state(
+            self.directory,
+            proposal_count=3,
+            proposal={"number": 3, "title": "Stale", "body": "Stale"},
+            validated_head_sha="old",
+            validation={"mode": "applied"},
+        )
+        args = SimpleNamespace(
+            target="owner/repo#7",
+            repo_root=str(self.directory),
+            state=str(path),
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=self.directory
+            ),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "metadata_for", return_value=pr_metadata()),
+        ):
+            MODULE.command_preflight(args)
+
+        state = MODULE.load_state(path)
+        self.assertEqual(state["proposal_count"], 3)
+        self.assertNotIn("proposal", state)
+        self.assertNotIn("validated_head_sha", state)
+        self.assertNotIn("validation", state)
+
+    def test_propose_increments_a_durable_counter_and_preserves_body(self):
+        path = write_state(self.directory)
+        body_path = self.directory / "body.md"
+        body_path.write_text("First paragraph.\n\n- One\n- Two", encoding="utf-8")
+
+        MODULE.command_propose(
+            SimpleNamespace(
+                state=str(path), title="First title", body_file=str(body_path)
+            )
+        )
+        MODULE.command_propose(
+            SimpleNamespace(
+                state=str(path), title="Second title", body_file=str(body_path)
+            )
+        )
+
+        state = MODULE.load_state(path)
+        self.assertEqual(state["proposal_count"], 2)
+        self.assertEqual(state["proposal"]["number"], 2)
+        self.assertEqual(state["proposal"]["title"], "Second title")
+        self.assertEqual(
+            state["proposal"]["body"], "First paragraph.\n\n- One\n- Two"
+        )
+
+    def test_propose_rejects_a_blank_title_without_changing_state(self):
+        path = write_state(self.directory)
+        body_path = self.directory / "body.md"
+        body_path.write_text("Body", encoding="utf-8")
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "must not be blank"):
+            MODULE.command_propose(
+                SimpleNamespace(
+                    state=str(path), title=" \t", body_file=str(body_path)
+                )
+            )
+
+        self.assertEqual(MODULE.load_state(path)["proposal_count"], 0)
+
+    def test_propose_rejects_a_missing_body_file(self):
+        path = write_state(self.directory)
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "could not read body file"):
+            MODULE.command_propose(
+                SimpleNamespace(
+                    state=str(path),
+                    title="Title",
+                    body_file=str(self.directory / "missing.md"),
+                )
+            )
+
+
+class ApplyTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temporary.name)
+        self.addCleanup(self.temporary.cleanup)
+        self.emitted = []
+        patcher = mock.patch.object(MODULE, "emit", self.emitted.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def state_with_proposal(self, **proposal_overrides):
+        proposal = {
+            "number": 1,
+            "title": "Proposed title",
+            "body": "Proposed body",
+            "proposed_at": "2026-01-01T00:00:00Z",
+        }
+        proposal.update(proposal_overrides)
+        return write_state(
+            self.directory, proposal_count=1, proposal=proposal
+        )
+
+    def apply(self, path, expected_head="head1"):
+        MODULE.command_apply(
+            SimpleNamespace(state=str(path), expected_head=expected_head)
+        )
+
+    def test_rejects_a_missing_proposal_before_reading_live_metadata(self):
+        path = write_state(self.directory)
+
+        with (
+            mock.patch.object(MODULE, "metadata_for") as metadata_for,
+            mock.patch.object(MODULE, "edit_pr") as edit_pr,
+            self.assertRaisesRegex(MODULE.WorkflowError, "no stored proposal"),
+        ):
+            self.apply(path)
+
+        metadata_for.assert_not_called()
+        edit_pr.assert_not_called()
+
+    def test_rejects_a_blank_stored_proposal_before_mutation(self):
+        path = self.state_with_proposal(title=" ")
+
+        with (
+            mock.patch.object(MODULE, "metadata_for") as metadata_for,
+            mock.patch.object(MODULE, "edit_pr") as edit_pr,
+            self.assertRaisesRegex(MODULE.WorkflowError, "stored proposal is invalid"),
+        ):
+            self.apply(path)
+
+        metadata_for.assert_not_called()
+        edit_pr.assert_not_called()
+
+    def test_rejects_an_expected_head_that_differs_from_the_pin(self):
+        path = self.state_with_proposal()
+
+        with (
+            mock.patch.object(MODULE, "metadata_for") as metadata_for,
+            mock.patch.object(MODULE, "edit_pr") as edit_pr,
+            self.assertRaisesRegex(MODULE.WorkflowError, "pinned head"),
+        ):
+            self.apply(path, expected_head="other")
+
+        metadata_for.assert_not_called()
+        edit_pr.assert_not_called()
+
+    def test_rejects_a_moved_live_head_before_mutation(self):
+        path = self.state_with_proposal()
+
+        with (
+            mock.patch.object(
+                MODULE, "metadata_for", return_value=pr_metadata(head_sha="head2")
+            ),
+            mock.patch.object(MODULE, "edit_pr") as edit_pr,
+            self.assertRaisesRegex(MODULE.WorkflowError, "PR head moved"),
+        ):
+            self.apply(path)
+
+        edit_pr.assert_not_called()
+        self.assertNotIn("validated_head_sha", MODULE.load_state(path))
+
+    def test_rejects_live_text_that_changed_after_preflight(self):
+        path = self.state_with_proposal()
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                return_value=pr_metadata(body="Externally changed"),
+            ),
+            mock.patch.object(MODULE, "edit_pr") as edit_pr,
+            self.assertRaisesRegex(MODULE.WorkflowError, "no longer matches"),
+        ):
+            self.apply(path)
+
+        edit_pr.assert_not_called()
+
+    def test_rejects_a_verification_mismatch_after_edit(self):
+        path = self.state_with_proposal()
+        verified = pr_metadata(title="Proposed title", body="Wrong body")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                side_effect=[pr_metadata(), verified],
+            ),
+            mock.patch.object(MODULE, "edit_pr") as edit_pr,
+            self.assertRaisesRegex(MODULE.WorkflowError, "did not exactly match"),
+        ):
+            self.apply(path)
+
+        edit_pr.assert_called_once()
+        state = MODULE.load_state(path)
+        self.assertNotIn("validated_head_sha", state)
+        self.assertNotIn("validation", state)
+
+    def test_rejects_a_head_move_during_verification(self):
+        path = self.state_with_proposal()
+        verified = pr_metadata(
+            title="Proposed title", body="Proposed body", head_sha="head2"
+        )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                side_effect=[pr_metadata(), verified],
+            ),
+            mock.patch.object(MODULE, "edit_pr"),
+            self.assertRaisesRegex(MODULE.WorkflowError, "while applying"),
+        ):
+            self.apply(path)
+
+        self.assertNotIn("validated_head_sha", MODULE.load_state(path))
+
+    def test_applies_and_records_validation_only_after_exact_verification(self):
+        path = self.state_with_proposal()
+        verified = pr_metadata(title="Proposed title", body="Proposed body")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                side_effect=[pr_metadata(), verified],
+            ),
+            mock.patch.object(MODULE, "edit_pr") as edit_pr,
+        ):
+            self.apply(path)
+
+        edit_pr.assert_called_once()
+        state = MODULE.load_state(path)
+        self.assertEqual(state["pr"], verified)
+        self.assertEqual(state["validated_head_sha"], "head1")
+        self.assertEqual(state["validation"]["mode"], "applied")
+        self.assertEqual(state["validation"]["proposal_number"], 1)
+        self.assertEqual(state["validation"]["title"], "Proposed title")
+        self.assertEqual(self.emitted[-1]["result"], "applied")
+
+    def test_edit_uses_gh_title_and_temporary_utf8_body_file(self):
+        state = {
+            "pr": pr_metadata(),
+        }
+        proposal = {
+            "title": "Literal title",
+            "body": "Literal body\n\n- item",
+        }
+        state_path = self.directory / "state.json"
+        observed = {}
+
+        def capture(command, **_kwargs):
+            body_path = Path(command[command.index("--body-file") + 1])
+            observed["body"] = body_path.read_text(encoding="utf-8")
+            observed["command"] = command
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(MODULE, "run", side_effect=capture):
+            MODULE.edit_pr(state_path, state, proposal)
+
+        command = observed["command"]
+        self.assertEqual(command[:3], ["gh", "pr", "edit"])
+        self.assertEqual(command[command.index("--title") + 1], "Literal title")
+        self.assertEqual(observed["body"], "Literal body\n\n- item")
+        self.assertFalse(Path(command[command.index("--body-file") + 1]).exists())
+
+
+class NoChangeValidationTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temporary.name)
+        self.addCleanup(self.temporary.cleanup)
+        self.emitted = []
+        patcher = mock.patch.object(MODULE, "emit", self.emitted.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def validate(self, path, expected_head="head1", no_change=True):
+        MODULE.command_validate(
+            SimpleNamespace(
+                state=str(path),
+                expected_head=expected_head,
+                no_change=no_change,
+            )
+        )
+
+    def test_requires_the_no_change_flag(self):
+        path = write_state(self.directory)
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "requires --no-change"):
+            self.validate(path, no_change=False)
+
+    def test_rejects_expected_and_live_head_mismatches(self):
+        path = write_state(self.directory)
+        with (
+            mock.patch.object(MODULE, "metadata_for") as metadata_for,
+            self.assertRaisesRegex(MODULE.WorkflowError, "pinned head"),
+        ):
+            self.validate(path, expected_head="other")
+        metadata_for.assert_not_called()
+
+        with (
+            mock.patch.object(
+                MODULE, "metadata_for", return_value=pr_metadata(head_sha="head2")
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "PR head moved"),
+        ):
+            self.validate(path)
+
+    def test_requires_exact_live_title_and_body(self):
+        for changes in (
+            {"title": "Different title"},
+            {"body": "Different body"},
+        ):
+            with self.subTest(changes=changes):
+                path = write_state(self.directory)
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "metadata_for",
+                        return_value=pr_metadata(**changes),
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.WorkflowError, "no longer matches"
+                    ),
+                ):
+                    self.validate(path)
+                self.assertNotIn("validated_head_sha", MODULE.load_state(path))
+
+    def test_records_validated_head_without_mutation(self):
+        path = write_state(self.directory)
+
+        with mock.patch.object(
+            MODULE, "metadata_for", return_value=pr_metadata()
+        ):
+            self.validate(path)
+
+        state = MODULE.load_state(path)
+        self.assertEqual(state["validated_head_sha"], "head1")
+        self.assertEqual(state["validation"]["mode"], "no_change")
+        self.assertEqual(state["validation"]["title"], "Current title")
+        self.assertEqual(state["validation"]["body"], "Current body")
+        self.assertEqual(self.emitted[-1]["result"], "validated")
+
+
+class StatusAndCleanupTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temporary.name)
+        self.addCleanup(self.temporary.cleanup)
+        self.emitted = []
+        patcher = mock.patch.object(MODULE, "emit", self.emitted.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_status_reports_explicit_state(self):
+        path = write_state(self.directory, proposal_count=2)
+
+        MODULE.command_status(
+            SimpleNamespace(state=str(path), current=False, repo_root=None)
+        )
+
+        result = self.emitted[-1]
+        self.assertEqual(result["result"], "ready")
+        self.assertEqual(result["pr"]["number"], 7)
+        self.assertEqual(result["proposal_count"], 2)
+        self.assertIsNone(result["validated_head_sha"])
+
+    def test_status_reports_no_state_for_the_current_branch_pr(self):
+        target = MODULE.parse_target("owner/repo#7")
+        missing = self.directory / "missing.json"
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=self.directory
+            ),
+            mock.patch.object(MODULE, "current_pr_target", return_value=target),
+            mock.patch.object(
+                MODULE, "default_state_path", return_value=missing
+            ),
+        ):
+            MODULE.command_status(
+                SimpleNamespace(state=None, current=True, repo_root=None)
+            )
+
+        result = self.emitted[-1]
+        self.assertEqual(result["result"], "no_state")
+        self.assertEqual(result["pr"]["number"], 7)
+        self.assertEqual(result["state"], str(missing))
+
+    def test_cleanup_removes_valid_state(self):
+        path = write_state(self.directory)
+
+        MODULE.command_cleanup(SimpleNamespace(state=str(path)))
+
+        self.assertFalse(path.exists())
+        self.assertEqual(self.emitted[-1]["result"], "cleaned_up")
+
+
+class ParserShapeTest(unittest.TestCase):
+    def setUp(self):
+        self.parser = MODULE.build_parser()
+
+    def test_parses_every_command_shape(self):
+        cases = (
+            (
+                ["preflight", "owner/repo#7", "--repo-root", "repo", "--state", "state"],
+                "command_preflight",
+            ),
+            (
+                [
+                    "propose",
+                    "--state",
+                    "state",
+                    "--title",
+                    "Title",
+                    "--body-file",
+                    "body",
+                ],
+                "command_propose",
+            ),
+            (
+                ["apply", "--state", "state", "--expected-head", "abc"],
+                "command_apply",
+            ),
+            (
+                [
+                    "validate",
+                    "--state",
+                    "state",
+                    "--expected-head",
+                    "abc",
+                    "--no-change",
+                ],
+                "command_validate",
+            ),
+            (
+                ["status", "--current", "--repo-root", "repo"],
+                "command_status",
+            ),
+            (["status", "--state", "state"], "command_status"),
+            (["cleanup", "--state", "state"], "command_cleanup"),
+        )
+        for arguments, function_name in cases:
+            with self.subTest(arguments=arguments):
+                parsed = self.parser.parse_args(arguments)
+                self.assertEqual(parsed.function.__name__, function_name)
+
+    def test_requires_exactly_one_status_source(self):
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(["status"])
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(
+                ["status", "--state", "state", "--current"]
+            )
+
+    def test_validate_requires_no_change(self):
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(
+                ["validate", "--state", "state", "--expected-head", "abc"]
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -71,6 +71,7 @@ The deterministic, JSON-only helper provides:
 - `preflight [target] [--repo-root <workspace>] [--max-iterations 5]`: resolve and check out the PR, require a clean worktree, require the local head to equal the PR head, fetch and parse the authoritative diff, confirm the head did not move around that fetch, enforce the iteration cap, archive the previous iteration, and return `head_sha`, `diff_path`, `changed_files`, and the carried-forward `history`
 - `candidates --state <path> --input <file-or->`: register this iteration's full candidate list and reject any candidate that is not anchored to a changed line of the pinned diff
 - `drop`, `plan`, `record`, and `skip`: maintain candidate and batch state
+- `resolve --state <path> --outcome clean`: durably mark the active review clean at its pinned head
 - `publish --state <path>`: require a clean worktree and complete records, refuse to publish a skipped batch, require the commits sitting on the pinned head to be exactly the recorded ones, push only when needed, and verify that the remote branch and the PR head both match the local head
 - `status [--state <path> | --current --repo-root <workspace>]` and `cleanup --state <path>`
 
@@ -97,12 +98,12 @@ For each iteration, before editing anything:
 1. Fetch the PR title and description and read repository and path-specific instructions, then read only the context needed to understand changed behavior.
 2. Review the entire pinned diff read from `diff_path`, including commits this loop created in earlier iterations. Build a private candidate list, each with exact path, changed line, `LEFT` for a deleted line or `RIGHT` for an added line, demonstrated impact, and a plain few-sentence description of the problem and one concrete fix.
 3. Discard anything the carried-forward `history` already resolved.
-4. If no candidates remain, the loop is clean: stop without registering candidates, editing, or publishing, and send the final index.
+4. If no candidates remain, run `resolve --state <path> --outcome clean`, then stop without registering candidates, editing, or publishing, and send the final index.
 5. Otherwise register the full surviving list with `candidates`, which also proves every anchor is a genuinely changed line.
 6. Launch a fresh independent subagent for **each candidate separately** using model **GPT-5.6 Sol** with reasoning effort **max**. Never combine candidates in one evaluation. Give that evaluator the PR's stated scope, the relevant diff and context, and exactly one candidate. Require two independent decisions with evidence:
    - Is the candidate factually correct and demonstrated by this PR?
    - Is it actionable and worth fixing within the PR's stated scope?
-7. Run `drop` for any candidate whose either decision fails or is uncertain, recording the evaluator's concrete reason. If every candidate is dropped, the loop is clean: stop without editing or publishing and send the final index.
+7. Run `drop` for any candidate whose either decision fails or is uncertain, recording the evaluator's concrete reason. If every candidate is dropped, run `resolve --state <path> --outcome clean`, then stop without editing or publishing and send the final index.
 
 ## Batching And Batch Execution
 
