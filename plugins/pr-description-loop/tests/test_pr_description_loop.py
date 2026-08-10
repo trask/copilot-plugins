@@ -107,7 +107,21 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "a bold label on its own line, then a `***` horizontal rule",
+            "a bold label on its own line, then a blank line, then the value "
+            "as a blockquote",
+            self.instructions,
+        )
+        self.assertIn(
+            "Prefix every line of the value with `> `, including blank lines",
+            self.instructions,
+        )
+        self.assertIn(
+            "The `> ` prefix is presentation only and is never part of the "
+            "stored value",
+            self.instructions,
+        )
+        self.assertIn(
+            "Do not add horizontal rules around it; the blockquote is the boundary",
             self.instructions,
         )
         for label in (
@@ -117,8 +131,32 @@ class AgentInstructionsTest(unittest.TestCase):
             "`**Proposed description**`",
         ):
             self.assertIn(label, self.instructions)
-        self.assertIn("Show an empty description as `_(empty)_`", self.instructions)
+        self.assertIn("Show an empty description as `> _(empty)_`", self.instructions)
         self.assertNotIn("```text", self.instructions)
+        self.assertNotIn("\n***\n", self.instructions)
+
+    def test_summarizes_how_a_proposal_differs_from_the_current_text(self):
+        self.assertIn("## Summarizing What Changed", self.instructions)
+        self.assertIn(
+            "Every time you display a proposal, follow it with a "
+            "`**What changed**` summary of how that proposal differs from the "
+            "current title and description, before asking for approval",
+            self.instructions,
+        )
+        self.assertIn(
+            "Describe the differences only. Never restate the full proposed "
+            "title or body",
+            self.instructions,
+        )
+        self.assertIn(
+            "Repeat the summary for every revision",
+            self.instructions,
+        )
+        self.assertIn(
+            "add the `**What changed**` summary from \"Summarizing What "
+            "Changed\", then ask for explicit approval",
+            self.instructions,
+        )
 
     def test_immediately_evaluates_and_recommends_a_decision(self):
         self.assertIn(
@@ -206,7 +244,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.2")
+        self.assertEqual(plugin["version"], "1.0.3")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 

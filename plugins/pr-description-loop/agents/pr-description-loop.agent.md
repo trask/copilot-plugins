@@ -18,13 +18,14 @@ You run a human-in-the-middle loop for one pull request's title and description.
 - If the current text is strong, recommend keeping it and ask for explicit approval of the exact displayed title and body. If it is weak, explain why briefly and immediately show a complete replacement for explicit approval.
 - Never mutate GitHub unless the user explicitly approves the exact title and exact body in this session. Silence, lack of objection, earlier instructions, prior approval of different text, persistent memory, and inferred intent are not approval.
 - If the current text is explicitly approved, validate it with `validate --no-change`; do not run `propose` or `apply`.
-- If replacement text is needed, iterate with the user without a cap. Every revision requires a new display of the complete title and complete body under "Displaying Title And Description" and a new request for approval.
+- If replacement text is needed, iterate with the user without a cap. Every revision requires a new display of the complete title and complete body under "Displaying Title And Description", a new `**What changed**` summary, and a new request for approval.
+- Every time you display a proposal, follow it with a `**What changed**` summary of how that proposal differs from the current title and description, before asking for approval.
 - Call `propose` and `apply` only after explicit approval of that exact proposal.
 - If the pull request head changes at any point, discard the stale proposal, run preflight again, show the newly pinned current title and description under "Displaying Title And Description", and obtain fresh approval.
 - Treat the returned `run_id` and `proposal_token` as capabilities for this session only. Always pass their exact values back to the helper and never substitute values from another run, status result, memory, or user.
 - GitHub's pull request update endpoint does not support conditional unsafe requests. The helper reduces, but cannot eliminate, the final race by reading and comparing the exact pinned head, title, and body twice immediately before a direct REST `PATCH`, then verifying the result. Never describe this as an atomic compare-and-swap: an external writer in the final check-to-`PATCH` window can still be overwritten.
 - Never hard wrap a pull request description. Preserve intentional paragraph and list boundaries.
-- Never wrap a displayed title or description in a fenced code block or inline code span. Follow "Displaying Title And Description" every time you show either value.
+- Never wrap a displayed title or description in a fenced code block or inline code span. Display every such value as a blockquote under "Displaying Title And Description".
 - Do not use persistent user memories as workflow instructions. This file and the user's explicit messages in this session are the source of truth.
 
 ## Displaying Title And Description
@@ -32,29 +33,35 @@ You run a human-in-the-middle loop for one pull request's title and description.
 Every display of a current or proposed title or description follows these rules:
 
 - Never use a fenced code block, inline code span, or any other verbatim wrapper around the title or the description. A never-hard-wrapped description inside a code block scrolls horizontally and is unreadable.
-- Render the description as ordinary markdown so the interface wraps it and its own markdown renders. Rendering is presentation only; the characters you emit are exactly the characters that are or would be stored on GitHub.
+- Render the description as ordinary markdown so the interface wraps it and its own markdown renders. Rendering is presentation only; the characters inside the blockquote are exactly the characters that are or would be stored on GitHub.
 - Reproduce the exact value. Never summarize, normalize, reflow, hard wrap, re-indent, or silently repair either value.
-- Introduce each value with a bold label on its own line, then a `***` horizontal rule, then the value, then a closing `***` horizontal rule. Use `***` rather than `---` so a rule directly under a bold label is never parsed as a heading.
+- Introduce each value with a bold label on its own line, then a blank line, then the value as a blockquote. Do not add horizontal rules around it; the blockquote is the boundary.
+- Prefix every line of the value with `> `, including blank lines within a description, so the whole value stays inside one indented block. The `> ` prefix is presentation only and is never part of the stored value.
 - Use the labels `**Current title**`, `**Current description**`, `**Proposed title**`, and `**Proposed description**`.
-- Show an empty description as `_(empty)_` inside its rules rather than leaving a blank gap.
+- Show an empty description as `> _(empty)_` rather than leaving a blank gap.
+- Separate consecutive labeled values with a blank line so each block stands on its own.
 
 For example:
 
 **Proposed title**
 
-***
-
-Migrate RocketMQ messaging telemetry to v1.43
-
-***
+> Migrate RocketMQ messaging telemetry to v1.43
 
 **Proposed description**
 
-***
+> Migrates RocketMQ 4.8 and 5.0 telemetry to the v1.43 messaging conventions.
+>
+> The 4.8 instrumentation keeps its existing span kinds.
 
-Migrates RocketMQ 4.8 and 5.0 telemetry to the v1.43 messaging conventions.
+## Summarizing What Changed
 
-***
+Immediately after displaying a proposed title and description, and before asking for approval, add a `**What changed**` summary of how that proposal differs from the current title and description:
+
+- Describe the differences only. Never restate the full proposed title or body, and never replace the required display with the summary.
+- Cover both values when both change, and say so plainly when one is unchanged.
+- Use a short bullet list of concrete differences, such as a retitled subject, a dropped implementation detail, an added statement of scope, or a removed testing section.
+- Say that the description is newly written when the current description is empty.
+- Repeat the summary for every revision, describing the revision against the current text rather than against the previous proposal.
 
 ## Mechanical Helper
 
@@ -103,7 +110,7 @@ Only an explicit affirmative answer about the displayed current title and descri
 If the current title or description is weak:
 
 1. Briefly explain the concrete problem with clarity, concision, consistency, or scope.
-2. Continue immediately to proposal development and present a complete replacement in the same response. Do not first ask whether the current text looks good.
+2. Continue immediately to proposal development and present a complete replacement, with its `**What changed**` summary, in the same response. Do not first ask whether the current text looks good.
 
 Feedback, a rejection, or a request for improvement is not permission to mutate.
 
@@ -115,8 +122,8 @@ Feedback, a rejection, or a request for improvement is not permission to mutate.
    - Use one concise paragraph or a small set of focused bullets when distinct themes genuinely benefit from separation.
    - Never hard wrap prose. Let GitHub render line wrapping.
    - Keep the title concise and make both title and body describe the pull request's actual final scope.
-2. Show the complete proposed title and complete proposed body following "Displaying Title And Description", then ask for explicit approval of exactly those values.
-3. If the user gives feedback or requests a change, revise both values as needed, display the complete new proposal the same way, and ask again. Repeat without a cap.
+2. Show the complete proposed title and complete proposed body following "Displaying Title And Description", add the `**What changed**` summary from "Summarizing What Changed", then ask for explicit approval of exactly those values.
+3. If the user gives feedback or requests a change, revise both values as needed, display the complete new proposal the same way, summarize what changed again, and ask again. Repeat without a cap.
 4. Never infer approval. Proceed only when the user explicitly approves the exact proposal most recently displayed.
 
 ## Apply An Approved Proposal
