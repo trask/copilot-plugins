@@ -13,12 +13,32 @@ marketplace.
 ## Validation
 
 1. Run the narrowest affected tests, then `python -m pytest`.
-2. Install changed plugins from their local directories when behavior or
-   packaging changes.
-3. Run `git diff --check`, inspect `git status`, and review the final diff.
+2. Run `git diff --check`, inspect `git status`, and review the final diff.
+3. Verify a plugin change by installing it from the marketplace, which requires
+   publishing it first. The Copilot CLI cannot install from a local directory,
+   so never attempt one; `plugin install` accepts only `plugin@marketplace`,
+   `owner/repo`, `owner/repo:path`, or a URL.
 
 ## Publication
 
 Maintainers publish directly to `main`; contributors use focused pull requests.
-For a plugin release, bump its semantic version in both manifests, push the
-change, and verify installation through the `trask-plugins` marketplace.
+The marketplace catalog is served from `main`, so a change cannot be installed
+or verified until it is pushed there.
+
+Bump the plugin version in both `plugin.json` and the marketplace entry for a
+behavior or packaging change. Test-only and documentation-only changes keep the
+current version.
+
+Publishing a behavior change is part of the normal flow rather than a separate
+request, but always pause for explicit confirmation before pushing to `main`:
+
+1. Rebase onto `origin/main`, which moves independently of local work.
+2. Bump the version in both manifests when the change requires it.
+3. Run the validation steps above.
+4. Commit, then ask for confirmation and push to `main` once it is given.
+5. Refresh the catalog with `copilot plugin marketplace update trask-plugins`.
+6. Install each changed plugin with `copilot plugin install <name>@trask-plugins`.
+7. Confirm the installed versions with `copilot plugin list`.
+
+Skip steps 5 through 7 when the change cannot affect how an installed plugin
+behaves, such as a repository documentation change or a test-only change.
