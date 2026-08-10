@@ -30,12 +30,12 @@ behavior or packaging change. Test-only and documentation-only changes keep the
 current version.
 
 Publishing a behavior change is part of the normal flow rather than a separate
-request, but always pause for explicit confirmation before pushing to `main`:
+request. Maintainers do not need separate confirmation before pushing to `main`:
 
 1. Rebase onto `origin/main`, which moves independently of local work.
 2. Bump the version in both manifests when the change requires it.
 3. Run the validation steps above.
-4. Commit, then ask for confirmation and push to `main` once it is given.
+4. Commit and push to `main`.
 5. Refresh the catalog with `copilot plugin marketplace update trask-plugins`.
 6. Install each changed plugin with `copilot plugin install <name>@trask-plugins`.
 7. Confirm the installed versions with `copilot plugin list`.
