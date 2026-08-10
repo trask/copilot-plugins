@@ -37,6 +37,7 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn("Never use an interim number-only name", instructions)
+        # rename_session only replaces an auto-generated name; a second call is skipped.
         self.assertNotIn("call `rename_session` again", instructions)
         self.assertNotIn("immediately call `rename_session`", instructions)
 
