@@ -89,6 +89,19 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("Skip local tests by default", instructions)
         self.assertIn("report every dropped candidate", instructions)
         self.assertIn("If no candidates survive", instructions)
+        self.assertIn(
+            "every suppressed Copilot comment returned by `check`", instructions
+        )
+        self.assertIn("latest completed, non-dismissed Copilot review", instructions)
+        self.assertIn("investigate every entry in `suppressed_comments`", instructions)
+        self.assertIn("Deduplicate candidates", instructions)
+        self.assertIn(
+            "applies equally to candidates discovered directly and candidates derived "
+            "from suppressed Copilot comments",
+            instructions,
+        )
+        self.assertIn("derive an honest changed-line anchor", instructions)
+        self.assertIn("fails rather than silently omitting them", instructions)
 
     def test_requires_a_claude_model_gate_before_any_review_work(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -281,6 +294,203 @@ class CommentValidationTest(unittest.TestCase):
             )
 
 
+class SuppressedCommentTest(unittest.TestCase):
+    def test_parses_current_and_low_confidence_headings(self):
+        body = """
+<details>
+<summary>Show a summary per file</summary>
+
+**ignored.py:1**
+* Not a suppressed comment.
+</details>
+<details>
+<summary>Comments suppressed due to low confidence (1)</summary>
+
+**src/first.py:12**
+* Preserve this fallback.
+</details>
+<details>
+<summary>Suppressed comments (1)</summary>
+
+**src/second.py:7**
+* Add coverage for this branch.
+```python
+assert result
+```
+</details>
+"""
+
+        self.assertEqual(
+            MODULE.parse_suppressed_comments(body),
+            [
+                {
+                    "path": "src/first.py",
+                    "line": 12,
+                    "body": "Preserve this fallback.",
+                },
+                {
+                    "path": "src/second.py",
+                    "line": 7,
+                    "body": "Add coverage for this branch.\n"
+                    "```python\nassert result\n```",
+                },
+            ],
+        )
+
+    def test_rejects_missing_declared_count(self):
+        body = """
+<details><summary>Suppressed comments</summary>
+**src/first.py:12**
+* Preserve this fallback.
+</details>
+"""
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "no declared count"):
+            MODULE.parse_suppressed_comments(body)
+
+    def test_rejects_declared_count_mismatch(self):
+        body = """
+<details><summary>Suppressed comments (2)</summary>
+**src/first.py:12**
+* Preserve this fallback.
+</details>
+"""
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "count mismatch"):
+            MODULE.parse_suppressed_comments(body)
+
+    def test_rejects_empty_comment_body(self):
+        body = """
+<details><summary>Suppressed comments (1)</summary>
+**src/first.py:12**
+</details>
+"""
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "empty body"):
+            MODULE.parse_suppressed_comments(body)
+
+    def test_rejects_unrecognized_suppressed_layout(self):
+        body = """
+### Suppressed comments (1)
+
+**src/first.py:12**
+* Preserve this fallback.
+"""
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "recognized details block"):
+            MODULE.parse_suppressed_comments(body)
+
+    def test_rejects_nonpositive_line(self):
+        body = """
+<details><summary>Suppressed comments (1)</summary>
+**src/first.py:0**
+* Preserve this fallback.
+</details>
+"""
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "invalid location"):
+            MODULE.parse_suppressed_comments(body)
+
+    def test_latest_completed_copilot_review_requires_exact_head(self):
+        reviews = [
+            {
+                "id": 100,
+                "commit_id": "old-head",
+                "submitted_at": "2026-08-09T12:00:00Z",
+                "state": "COMMENTED",
+                "user": {"login": "copilot-pull-request-reviewer[bot]"},
+            },
+            {
+                "id": 101,
+                "commit_id": "head",
+                "submitted_at": None,
+                "state": "PENDING",
+                "user": {"login": "copilot-pull-request-reviewer[bot]"},
+            },
+            {
+                "id": 102,
+                "commit_id": "head",
+                "submitted_at": "2026-08-09T12:02:00Z",
+                "state": "DISMISSED",
+                "user": {"login": "copilot-pull-request-reviewer[bot]"},
+            },
+            {
+                "id": 103,
+                "commit_id": "head",
+                "submitted_at": "2026-08-09T12:03:00Z",
+                "state": "COMMENTED",
+                "user": {"login": "copilot-pull-request-reviewer[bot]"},
+            },
+            {
+                "id": 999,
+                "commit_id": "head",
+                "submitted_at": "2026-08-09T12:04:00Z",
+                "state": "COMMENTED",
+                "user": {"login": "human"},
+            },
+            {
+                "id": 104,
+                "commit_id": "head",
+                "submitted_at": "2026-08-09T12:05:00Z",
+                "state": "COMMENTED",
+                "user": {"login": "copilot-pull-request-reviewer"},
+            },
+        ]
+
+        self.assertEqual(
+            MODULE.latest_copilot_review_for_head(reviews, "head")["id"], 104
+        )
+
+    def test_extracts_suppressed_comments_from_latest_exact_head_review(self):
+        reviews = [
+            {
+                "id": 10,
+                "commit_id": "head",
+                "submitted_at": "2026-08-09T12:00:00Z",
+                "state": "COMMENTED",
+                "html_url": "https://example.test/review/10",
+                "body": """
+<details><summary>Suppressed comments (1)</summary>
+**src/one.py:2**
+* Preserve the old behavior.
+</details>
+""",
+                "user": {"login": "copilot-pull-request-reviewer[bot]"},
+            }
+        ]
+
+        review, comments = MODULE.suppressed_comments_for_head(reviews, "head")
+
+        self.assertEqual(
+            review, {"id": 10, "url": "https://example.test/review/10"}
+        )
+        self.assertEqual(
+            comments,
+            [
+                {
+                    "path": "src/one.py",
+                    "line": 2,
+                    "body": "Preserve the old behavior.",
+                }
+            ],
+        )
+
+    def test_returns_empty_without_an_exact_head_copilot_review(self):
+        reviews = [
+            {
+                "id": 10,
+                "commit_id": "old-head",
+                "submitted_at": "2026-08-09T12:00:00Z",
+                "state": "COMMENTED",
+                "user": {"login": "copilot-pull-request-reviewer[bot]"},
+            }
+        ]
+
+        result = MODULE.suppressed_comments_for_head(reviews, "head")
+
+        self.assertEqual(result, (None, []))
+
+
 class PendingReviewTest(unittest.TestCase):
     def test_refuses_existing_viewer_owned_pending_review(self):
         pr = {
@@ -297,10 +507,22 @@ class PendingReviewTest(unittest.TestCase):
             }
         ]
 
-        with mock.patch.object(MODULE, "gh_paginated", return_value=reviews):
-            pending = MODULE.find_pending_review(pr, "viewer")
+        pending = MODULE.find_pending_review(reviews, "viewer")
 
         self.assertEqual(pending["id"], 7)
+
+    def test_fetches_paginated_reviews_once(self):
+        pr = {
+            "repo_name": "owner/repo",
+            "number": 42,
+        }
+
+        with mock.patch.object(MODULE, "gh_paginated", return_value=[]) as paginated:
+            self.assertEqual(MODULE.fetch_reviews(pr), [])
+
+        paginated.assert_called_once_with(
+            "repos/owner/repo/pulls/42/reviews?per_page=100"
+        )
 
     def test_check_returns_existing_pending_review_without_fetching_diff(self):
         pr = {
@@ -313,7 +535,9 @@ class PendingReviewTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                MODULE, "preflight", return_value=(pr, "viewer", {}, pending_url)
+                MODULE,
+                "preflight",
+                return_value=(pr, "viewer", {}, pending_url, None, []),
             ),
             mock.patch.object(MODULE, "emit") as emit,
         ):
@@ -337,7 +561,22 @@ class PendingReviewTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                MODULE, "preflight", return_value=(pr, "viewer", anchors, None)
+                MODULE,
+                "preflight",
+                return_value=(
+                    pr,
+                    "viewer",
+                    anchors,
+                    None,
+                    {"id": 10, "url": "https://example.test/review/10"},
+                    [
+                        {
+                            "path": "src/one.py",
+                            "line": 2,
+                            "body": "Preserve the old behavior.",
+                        }
+                    ],
+                ),
             ),
             mock.patch.object(MODULE, "emit") as emit,
         ):
@@ -348,6 +587,32 @@ class PendingReviewTest(unittest.TestCase):
         self.assertEqual(payload["head_sha"], "abc123")
         self.assertEqual(payload["pr_number"], 42)
         self.assertEqual(payload["pr_title"], "Fix the reviewer")
+        self.assertEqual(payload["copilot_review"]["id"], 10)
+        self.assertEqual(payload["suppressed_comments"][0]["path"], "src/one.py")
+
+    def test_check_ready_emits_empty_suppressed_fields_without_copilot_review(self):
+        pr = {
+            "repo_name": "owner/repo",
+            "number": 42,
+            "title": "Fix the reviewer",
+            "pr_url": "https://github.com/owner/repo/pull/42",
+            "head_sha": "abc123",
+        }
+        anchors = MODULE.parse_unified_diff(DIFF)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "preflight",
+                return_value=(pr, "viewer", anchors, None, None, []),
+            ),
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_check(SimpleNamespace(target=pr["pr_url"]))
+
+        payload = emit.call_args.args[0]
+        self.assertIsNone(payload["copilot_review"])
+        self.assertEqual(payload["suppressed_comments"], [])
 
 
 class ResolvePrTest(unittest.TestCase):
@@ -401,12 +666,14 @@ class HeadStabilityTest(unittest.TestCase):
         with (
             mock.patch.object(MODULE, "resolve_pr", side_effect=[self.pr, changed]),
             mock.patch.object(MODULE, "resolve_viewer", return_value="viewer"),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
             mock.patch.object(MODULE, "find_pending_review", return_value=None),
             mock.patch.object(MODULE, "fetch_authoritative_diff", return_value=DIFF),
         ):
             with self.assertRaisesRegex(
                 MODULE.WorkflowError,
-                "PR head changed after fetching and parsing the authoritative diff",
+                "PR head changed after fetching and parsing the authoritative diff "
+                "and Copilot review",
             ):
                 MODULE.preflight(self.pr["pr_url"])
 
@@ -415,6 +682,7 @@ class HeadStabilityTest(unittest.TestCase):
         with (
             mock.patch.object(MODULE, "resolve_pr", return_value=changed),
             mock.patch.object(MODULE, "resolve_viewer") as resolve_viewer,
+            mock.patch.object(MODULE, "fetch_reviews") as fetch_reviews,
             mock.patch.object(MODULE, "find_pending_review") as find_pending,
             mock.patch.object(MODULE, "fetch_authoritative_diff") as fetch_diff,
         ):
@@ -425,6 +693,7 @@ class HeadStabilityTest(unittest.TestCase):
                 MODULE.preflight(self.pr["pr_url"], self.pr["head_sha"])
 
         resolve_viewer.assert_not_called()
+        fetch_reviews.assert_not_called()
         find_pending.assert_not_called()
         fetch_diff.assert_not_called()
 
@@ -466,7 +735,7 @@ class PostingTest(unittest.TestCase):
                 mock.patch.object(
                     MODULE,
                     "preflight",
-                    return_value=(self.pr, "viewer", self.anchors, None),
+                    return_value=(self.pr, "viewer", self.anchors, None, None, []),
                 ) as preflight,
                 mock.patch.object(MODULE, "gh_json", return_value=created) as gh_json,
                 mock.patch.object(
@@ -507,7 +776,7 @@ class PostingTest(unittest.TestCase):
                 mock.patch.object(
                     MODULE,
                     "preflight",
-                    return_value=(self.pr, "viewer", self.anchors, None),
+                    return_value=(self.pr, "viewer", self.anchors, None, None, []),
                 ),
                 mock.patch.object(MODULE, "gh_json", return_value=created),
                 mock.patch.object(
@@ -536,7 +805,7 @@ class PostingTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "preflight",
-                return_value=(self.pr, "viewer", self.anchors, None),
+                return_value=(self.pr, "viewer", self.anchors, None, None, []),
             ),
             mock.patch.object(MODULE, "load_comments", return_value=self.comments),
             mock.patch.object(
@@ -568,7 +837,7 @@ class PostingTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "preflight",
-                return_value=(changed, "viewer", self.anchors, None),
+                return_value=(changed, "viewer", self.anchors, None, None, []),
             ),
             mock.patch.object(MODULE, "load_comments") as load_comments,
             mock.patch.object(MODULE, "gh_json") as gh_json,

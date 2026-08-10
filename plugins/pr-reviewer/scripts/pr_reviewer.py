@@ -26,6 +26,10 @@ HUNK_PATTERN = re.compile(
     r"^@@ -(?P<old>\d+)(?:,(?P<old_count>\d+))? "
     r"\+(?P<new>\d+)(?:,(?P<new_count>\d+))? @@"
 )
+COPILOT_LOGINS = {
+    "copilot-pull-request-reviewer",
+    "copilot-pull-request-reviewer[bot]",
+}
 
 
 class WorkflowError(RuntimeError):
@@ -164,10 +168,15 @@ def review_url(pr: dict[str, Any], review: dict[str, Any]) -> str:
     return f"{pr['pr_url']}#pullrequestreview-{review_id}"
 
 
-def find_pending_review(pr: dict[str, Any], viewer: str) -> dict[str, Any] | None:
-    reviews = gh_paginated(
+def fetch_reviews(pr: dict[str, Any]) -> list[dict[str, Any]]:
+    return gh_paginated(
         f"repos/{pr['repo_name']}/pulls/{pr['number']}/reviews?per_page=100"
     )
+
+
+def find_pending_review(
+    reviews: list[dict[str, Any]], viewer: str
+) -> dict[str, Any] | None:
     return next(
         (
             review
@@ -178,6 +187,129 @@ def find_pending_review(pr: dict[str, Any], viewer: str) -> dict[str, Any] | Non
         ),
         None,
     )
+
+
+def parse_suppressed_comments(body: str | None) -> list[dict[str, Any]]:
+    if not body:
+        return []
+
+    entries: list[dict[str, Any]] = []
+    found_suppressed_block = False
+    for details_match in re.finditer(
+        r"<details\b[^>]*>(?P<body>.*?)</details\s*>",
+        body,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        details = details_match.group("body")
+        summary_match = re.search(
+            r"<summary\b[^>]*>(?P<summary>.*?)</summary\s*>",
+            details,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not summary_match:
+            continue
+        summary = re.sub(r"<[^>]+>", "", summary_match.group("summary"))
+        normalized_summary = " ".join(summary.split()).casefold()
+        if (
+            "suppressed comments" not in normalized_summary
+            and "comments suppressed" not in normalized_summary
+        ):
+            continue
+        found_suppressed_block = True
+        count_match = re.search(r"\((?P<count>\d+)\)\s*$", normalized_summary)
+        if not count_match:
+            raise WorkflowError(
+                "suppressed Copilot comments summary has no declared count"
+            )
+
+        content = details[summary_match.end() :]
+        headers = list(
+            re.finditer(
+                r"^\s*\*\*(?P<path>.+):(?P<line>\d+)\*\*\s*$",
+                content,
+                flags=re.MULTILINE,
+            )
+        )
+        block_entries: list[dict[str, Any]] = []
+        for index, header in enumerate(headers):
+            end = (
+                headers[index + 1].start()
+                if index + 1 < len(headers)
+                else len(content)
+            )
+            path = header.group("path").strip()
+            line = int(header.group("line"))
+            if not path or line <= 0:
+                raise WorkflowError("suppressed Copilot comment has an invalid location")
+            comment_body = content[header.end() : end].strip()
+            if comment_body.startswith("* "):
+                comment_body = comment_body[2:].lstrip()
+            if not comment_body:
+                raise WorkflowError(
+                    "suppressed Copilot comment has an empty body at "
+                    f"{path}:{line}"
+                )
+            block_entries.append(
+                {
+                    "path": path,
+                    "line": line,
+                    "body": comment_body,
+                }
+            )
+
+        declared_count = int(count_match.group("count"))
+        if len(block_entries) != declared_count:
+            raise WorkflowError(
+                "suppressed Copilot comments count mismatch: "
+                f"summary declares {declared_count}, parsed {len(block_entries)}"
+            )
+        entries.extend(block_entries)
+    normalized_body = body.casefold()
+    if not found_suppressed_block and (
+        "suppressed comments" in normalized_body
+        or "comments suppressed" in normalized_body
+    ):
+        raise WorkflowError(
+            "suppressed Copilot comments were not in a recognized details block"
+        )
+    return entries
+
+
+def latest_copilot_review_for_head(
+    reviews: list[dict[str, Any]], head_sha: str
+) -> dict[str, Any] | None:
+    candidates = []
+    for review in reviews:
+        user = review.get("user") or {}
+        login = user.get("login") if isinstance(user, dict) else None
+        if not isinstance(login, str) or login.casefold() not in COPILOT_LOGINS:
+            continue
+        if review.get("commit_id") != head_sha or not review.get("submitted_at"):
+            continue
+        if str(review.get("state", "")).upper() in {"DISMISSED", "PENDING"}:
+            continue
+        review_id = review.get("id")
+        if isinstance(review_id, bool) or not isinstance(review_id, int):
+            raise WorkflowError("completed Copilot review has no numeric ID")
+        candidates.append(review)
+    return max(candidates, key=lambda review: int(review["id"]), default=None)
+
+
+def suppressed_comments_for_head(
+    reviews: list[dict[str, Any]],
+    head_sha: str,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    review = latest_copilot_review_for_head(reviews, head_sha)
+    if review is None:
+        return None, []
+    review_url_value = review.get("html_url")
+    if not isinstance(review_url_value, str) or not review_url_value:
+        raise WorkflowError("completed Copilot review has no URL")
+    review_summary = {
+        "id": review["id"],
+        "url": review_url_value,
+    }
+    return review_summary, parse_suppressed_comments(review.get("body"))
 
 
 def decode_diff_path(value: str) -> str | None:
@@ -379,21 +511,36 @@ def verify_created_review(
 def preflight(
     target_value: str,
     expected_head: str | None = None,
-) -> tuple[dict[str, Any], str, dict[str, dict[str, set[int]]], str | None]:
+) -> tuple[
+    dict[str, Any],
+    str,
+    dict[str, dict[str, set[int]]],
+    str | None,
+    dict[str, Any] | None,
+    list[dict[str, Any]],
+]:
     pr = resolve_pr(parse_target(target_value))
     if expected_head is not None:
         ensure_expected_head(pr, expected_head)
     viewer = resolve_viewer()
-    pending = find_pending_review(pr, viewer)
+    reviews = fetch_reviews(pr)
+    pending = find_pending_review(reviews, viewer)
     if pending is not None:
-        return pr, viewer, {}, review_url(pr, pending)
+        return pr, viewer, {}, review_url(pr, pending), None, []
     anchors = parse_unified_diff(fetch_authoritative_diff(pr))
-    ensure_head_unchanged(pr, "after fetching and parsing the authoritative diff")
-    return pr, viewer, anchors, None
+    copilot_review, suppressed_comments = suppressed_comments_for_head(
+        reviews, pr["head_sha"]
+    )
+    ensure_head_unchanged(
+        pr, "after fetching and parsing the authoritative diff and Copilot review"
+    )
+    return pr, viewer, anchors, None, copilot_review, suppressed_comments
 
 
 def command_check(args: argparse.Namespace) -> None:
-    pr, viewer, anchors, pending_url = preflight(args.target)
+    pr, viewer, anchors, pending_url, copilot_review, suppressed_comments = preflight(
+        args.target
+    )
     if pending_url:
         emit({"result": "existing_pending_review", "review_url": pending_url})
         return
@@ -406,12 +553,14 @@ def command_check(args: argparse.Namespace) -> None:
             "head_sha": pr["head_sha"],
             "viewer": viewer,
             "changed_files": sorted(anchors),
+            "copilot_review": copilot_review,
+            "suppressed_comments": suppressed_comments,
         }
     )
 
 
 def command_post(args: argparse.Namespace) -> None:
-    pr, viewer, anchors, pending_url = preflight(args.target, args.expected_head)
+    pr, viewer, anchors, pending_url, _, _ = preflight(args.target, args.expected_head)
     ensure_expected_head(pr, args.expected_head)
     if pending_url:
         emit({"result": "existing_pending_review", "review_url": pending_url})
