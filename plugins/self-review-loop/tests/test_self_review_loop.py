@@ -154,6 +154,14 @@ class AgentInstructionsTest(unittest.TestCase):
             "run `preflight --repo-root <workspace>` with no target", self.instructions
         )
 
+    def test_final_response_ends_with_the_pull_request_link(self):
+        self.assertIn(
+            "canonical pull request link from the most recent preflight result's "
+            "`pr.pr_url`",
+            self.instructions,
+        )
+        self.assertIn("Always end with the `PR: <pr.pr_url>` line", self.instructions)
+
     def test_reads_the_pinned_diff_from_the_helper_snapshot(self):
         self.assertIn(
             "Read the pinned diff only from the returned `diff_path`",
