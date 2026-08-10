@@ -119,7 +119,9 @@ Feedback, a rejection, or a request for improvement is not permission to mutate.
 1. Use the authoritative diff already read to understand the complete change and apply the `pr-description-style` requirements:
    - The entire body is the summary; never add `Summary`, `Details`, or `Testing` headers.
    - Do not include validation lists, test results, checklists, implementation diaries, or incidental details.
-   - Use one concise paragraph or a small set of focused bullets when distinct themes genuinely benefit from separation.
+   - Default to short, single-idea paragraphs of roughly one to three sentences, separated by blank lines. Split a paragraph as soon as it starts covering more than one idea.
+   - Use bullets only for genuinely list-like content; short paragraphs remain the default shape.
+   - Splitting is about shape, not length. Never pad, restate, or add words to fill out a paragraph.
    - Never hard wrap prose. Let GitHub render line wrapping.
    - Keep the title concise and make both title and body describe the pull request's actual final scope.
 2. Show the complete proposed title and complete proposed body following "Displaying Title And Description", add the `**What changed**` summary from "Summarizing What Changed", then ask for explicit approval of exactly those values.

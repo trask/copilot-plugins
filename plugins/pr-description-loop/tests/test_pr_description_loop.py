@@ -215,7 +215,13 @@ class AgentInstructionsTest(unittest.TestCase):
         for forbidden_header in ("`Summary`", "`Details`", "`Testing`"):
             self.assertIn(forbidden_header, self.instructions)
         self.assertIn("Do not include validation lists", self.instructions)
-        self.assertIn("Use one concise paragraph", self.instructions)
+        self.assertIn(
+            "Default to short, single-idea paragraphs", self.instructions
+        )
+        self.assertIn(
+            "Split a paragraph as soon as it starts covering more than one idea",
+            self.instructions,
+        )
         self.assertIn("Never hard wrap prose", self.instructions)
 
     def test_restarts_on_head_change_and_uses_external_body_file(self):
@@ -244,7 +250,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.4")
+        self.assertEqual(plugin["version"], "1.0.5")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 
