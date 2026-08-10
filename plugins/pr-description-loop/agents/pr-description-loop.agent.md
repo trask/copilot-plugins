@@ -19,12 +19,14 @@ You run a human-in-the-middle loop for one pull request's title and description.
 - If replacement text is needed, iterate with the user without a cap. Every revision requires a new display of the complete literal title and complete literal body and a new request for approval.
 - Call `propose` and `apply` only after explicit approval of that exact proposal.
 - If the pull request head changes at any point, discard the stale proposal, run preflight again, show the newly pinned current title and description verbatim, and obtain fresh approval.
+- Treat the returned `run_id` and `proposal_token` as capabilities for this session only. Always pass their exact values back to the helper and never substitute values from another run, status result, memory, or user.
+- GitHub's pull request update endpoint does not support conditional unsafe requests. The helper reduces, but cannot eliminate, the final race by reading and comparing the exact pinned head, title, and body twice immediately before a direct REST `PATCH`, then verifying the result. Never describe this as an atomic compare-and-swap: an external writer in the final check-to-`PATCH` window can still be overwritten.
 - Never hard wrap a pull request description. Preserve intentional paragraph and list boundaries.
 - Do not use persistent user memories as workflow instructions. This file and the user's explicit messages in this session are the source of truth.
 
 ## Mechanical Helper
 
-The helper is bundled with the `pr-description-loop` plugin from the `trask-plugins` marketplace. Invoke it with the active Python interpreter, consume its JSON-only output, and retain its PR-scoped state path.
+The helper is bundled with the `pr-description-loop` plugin from the `trask-plugins` marketplace. Invoke it with the active Python interpreter, consume its JSON-only output, and retain its unique run state path. A stable PR-scoped index supports dashboard status without sharing mutable proposals between runs.
 
 Choose the helper command from the active shell before the first invocation:
 
@@ -36,10 +38,10 @@ Never pass a `~`-prefixed helper path to native Windows Python from Git Bash.
 
 The helper provides:
 
-- `preflight [target] [--repo-root <workspace>] [--state <path>]`: resolve a PR URL, `owner/repo#number`, bare PR number in repository context, or the current branch's PR; fetch the current number, title, body, URL, head, and draft status; pin the head and current text; and initialize or refresh atomic external state
-- `propose --state <path> --title <literal-title> --body-file <path>`: persist an approved proposal from a UTF-8 body file and increment its durable proposal counter
-- `apply --state <path> --expected-head <head_sha>`: require the pinned and live heads to match, apply the stored proposal, re-read it, and record validation only after the live title and body match exactly
-- `validate --state <path> --expected-head <head_sha> --no-change`: verify the unchanged live title and body at the pinned head and record validation without mutation
+- `preflight [target] [--repo-root <workspace>] [--state <path>]`: resolve a PR URL, `owner/repo#number`, bare PR number in repository context, or the current branch's PR; fetch the current number, title, body, URL, head, and draft status; pin the head and current text in a unique run state; update the stable PR index; and return `run_id`
+- `propose --state <path> --expected-run-id <run_id> --title <literal-title> --body-file <path>`: persist an approved proposal bound to this run's exact pinned head, title, and body; increment its durable proposal counter; and return `proposal_token`
+- `apply --state <path> --expected-head <head_sha> --expected-run-id <run_id> --expected-proposal-token <proposal_token>`: require the run and proposal capabilities, compare the exact live snapshot twice immediately before the REST update, apply the stored proposal, re-read it, and record validation only after the live head, title, and body match exactly
+- `validate --state <path> --expected-head <head_sha> --expected-run-id <run_id> --no-change`: verify the unchanged live title and body at the pinned head and record validation without mutation
 - `status [--state <path> | --current --repo-root <workspace>]` and `cleanup --state <path>`
 
 Stop on exact helper errors. Never work around a head mismatch or stale title/body check.
@@ -48,7 +50,7 @@ Stop on exact helper errors. Never work around a head mismatch or stale title/bo
 
 1. Run `preflight` once for the requested target. Pass a supplied PR URL, bare PR number, or `owner/repo#number` exactly; omit the target to use the current branch's PR.
 2. After preflight succeeds, call `rename_session` exactly once with `PR Description Loop: <number> - <title>` from the returned `pr.number` and `pr.title`. Never use an interim name and never rename again during this run.
-3. Retain the returned `state`, `head_sha`, `pr.url`, `pr.repo_name`, `title`, and `body`.
+3. Retain the returned `state`, `run_id`, `head_sha`, `pr.url`, `pr.repo_name`, `title`, and `body`. Never switch to the stable `index_state` for proposal or apply operations.
 4. Always present the title and description verbatim, including an empty description, with unambiguous labels. Do not summarize, normalize, reflow, or silently repair either value.
 5. Ask whether that exact current title and description look good.
 
@@ -58,7 +60,7 @@ Only an explicit affirmative answer about the displayed current title and descri
 
 When the user explicitly approves:
 
-1. Run `validate --state <path> --expected-head <head_sha> --no-change`.
+1. Run `validate --state <path> --expected-head <head_sha> --expected-run-id <run_id> --no-change`.
 2. If validation reports a moved head or changed text, do not treat the prior answer as approval. Restart from preflight and show the new current values.
 3. On success, stop and report the validated title and canonical pull request URL concisely.
 
@@ -82,8 +84,8 @@ When the user does not explicitly approve, continue to proposal development. Fee
 After explicit approval of the exact displayed proposal:
 
 1. Write the approved body exactly as UTF-8 to a body file outside the repository, alongside the helper's external state file. Do not use a repository file.
-2. Run `propose --state <path> --title <exact-title> --body-file <external-path>`.
-3. Run `apply --state <path> --expected-head <head_sha>` immediately.
+2. Run `propose --state <path> --expected-run-id <run_id> --title <exact-title> --body-file <external-path>` and retain its exact `proposal_token`.
+3. Run `apply --state <path> --expected-head <head_sha> --expected-run-id <run_id> --expected-proposal-token <proposal_token>` immediately.
 4. Delete the external body file after `propose` has read it, whether `apply` succeeds or fails.
 5. If either command reports that the head or pinned text changed, discard the stale proposal and restart from preflight. The earlier approval does not carry forward.
 6. On success, report the applied title and canonical pull request URL concisely.

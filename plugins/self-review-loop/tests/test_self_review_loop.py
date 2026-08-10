@@ -573,13 +573,66 @@ class StateCommandTest(unittest.TestCase):
     def test_resolve_marks_the_active_review_clean_at_its_pinned_head(self):
         path = write_state(self.directory)
 
-        MODULE.command_resolve(SimpleNamespace(state=str(path), outcome="clean"))
+        with mock.patch.object(
+            MODULE, "metadata_for", return_value={"head_sha": "head1"}
+        ):
+            MODULE.command_resolve(SimpleNamespace(state=str(path), outcome="clean"))
 
         state = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(state["review"]["outcome"], "clean")
         self.assertEqual(state["review"]["clean_at_head_sha"], "head1")
         self.assertEqual(self.emitted[-1]["result"], "resolved")
         self.assertEqual(self.emitted[-1]["clean_at_head_sha"], "head1")
+
+    def test_resolve_refuses_a_stale_live_pr_head(self):
+        path = write_state(self.directory)
+
+        with (
+            mock.patch.object(
+                MODULE, "metadata_for", return_value={"head_sha": "head2"}
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "PR head changed"),
+        ):
+            MODULE.command_resolve(SimpleNamespace(state=str(path), outcome="clean"))
+
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertNotIn("outcome", state["review"])
+
+    def test_resolve_requires_no_candidates_or_all_dropped(self):
+        for status in ("pending", "planned", "handled", "skipped"):
+            with self.subTest(status=status):
+                path = write_state(self.directory)
+                state = json.loads(path.read_text(encoding="utf-8"))
+                state["review"]["candidates"] = [{"id": 1, "status": status}]
+                path.write_text(json.dumps(state), encoding="utf-8")
+
+                with (
+                    mock.patch.object(MODULE, "metadata_for") as metadata_for,
+                    self.assertRaisesRegex(
+                        MODULE.WorkflowError, "every candidate is dropped"
+                    ),
+                ):
+                    MODULE.command_resolve(
+                        SimpleNamespace(state=str(path), outcome="clean")
+                    )
+
+                metadata_for.assert_not_called()
+
+        path = write_state(self.directory)
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["review"]["candidates"] = [
+            {"id": 1, "status": "dropped"},
+            {"id": 2, "status": "dropped"},
+        ]
+        path.write_text(json.dumps(state), encoding="utf-8")
+        with mock.patch.object(
+            MODULE, "metadata_for", return_value={"head_sha": "head1"}
+        ):
+            MODULE.command_resolve(SimpleNamespace(state=str(path), outcome="clean"))
+        self.assertEqual(
+            json.loads(path.read_text(encoding="utf-8"))["review"]["outcome"],
+            "clean",
+        )
 
 
 class PublishTest(unittest.TestCase):

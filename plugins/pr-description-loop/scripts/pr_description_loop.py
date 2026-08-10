@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -16,8 +18,15 @@ import tempfile
 from typing import Any
 
 
-STATE_VERSION = 1
+STATE_VERSION = 2
+INDEX_KIND = "index"
+RUN_KIND = "run"
 IS_WINDOWS = os.name == "nt"
+RESIDUAL_UPDATE_RACE = (
+    "GitHub's pull request update endpoint does not support conditional unsafe "
+    "requests. Another writer can still change metadata between the helper's final "
+    "exact snapshot check and the PATCH request."
+)
 PR_URL_PATTERN = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
     r"/?(?:#\S*)?$"
@@ -150,6 +159,10 @@ def default_state_path(target: dict[str, Any]) -> Path:
     return Path.home() / ".copilot" / "run" / "pr-description-loop" / name
 
 
+def run_state_path(index_path: Path, run_id: str) -> Path:
+    return index_path.with_name(f"{index_path.stem}--{run_id}.json")
+
+
 def load_state(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise WorkflowError(f"state file does not exist: {path}")
@@ -163,6 +176,13 @@ def load_state(path: Path) -> dict[str, Any]:
         raise WorkflowError(f"unsupported state version in {path}")
     if not isinstance(state.get("pr"), dict):
         raise WorkflowError(f"state file has no pull request metadata: {path}")
+    return state
+
+
+def load_run_state(path: Path) -> dict[str, Any]:
+    state = load_state(path)
+    if state.get("kind") != RUN_KIND or not isinstance(state.get("run_id"), str):
+        raise WorkflowError(f"state file is not a run state: {path}")
     return state
 
 
@@ -183,6 +203,51 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def run_summary(path: Path, state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "run_id": state["run_id"],
+        "state": str(path),
+        "created_at": state["created_at"],
+        "head_sha": state["pr"]["head_sha"],
+        "title": state["pr"]["title"],
+        "validated_head_sha": state.get("validated_head_sha"),
+    }
+
+
+def update_run_index(index_path: Path, run_path: Path, state: dict[str, Any]) -> None:
+    if index_path.is_file():
+        index = load_state(index_path)
+        if index.get("kind") != INDEX_KIND:
+            raise WorkflowError(f"PR state index has an unsupported shape: {index_path}")
+        if not same_pr(index["pr"], state["pr"]):
+            raise WorkflowError("PR state index belongs to a different pull request")
+    else:
+        index = {
+            "version": STATE_VERSION,
+            "kind": INDEX_KIND,
+            "created_at": utc_now(),
+            "runs": [],
+        }
+    summary = run_summary(run_path, state)
+    index["runs"] = [
+        item for item in index.get("runs", []) if item.get("run_id") != state["run_id"]
+    ]
+    index["runs"].append(summary)
+    index["pr"] = state["pr"]
+    index["latest_run_id"] = state["run_id"]
+    index["latest_state"] = str(run_path)
+    if state.get("validated_head_sha"):
+        index["validated_head_sha"] = state["validated_head_sha"]
+        index["validation"] = state.get("validation")
+    save_state(index_path, index)
+
+
+def refresh_run_index(run_path: Path, state: dict[str, Any]) -> None:
+    value = state.get("index_path")
+    if isinstance(value, str):
+        update_run_index(cli_path(value), run_path, state)
 
 
 def resolve_repo_root(value: str | None) -> Path:
@@ -397,21 +462,12 @@ def resolve_target(value: str | None, repo_root: Path) -> dict[str, Any]:
 
 
 def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
-    fields = "number,title,body,url,headRefOid,isDraft"
     metadata = gh_json(
-        [
-            "pr",
-            "view",
-            target["pr_url"],
-            "--repo",
-            target["repo_name"],
-            "--json",
-            fields,
-        ]
+        ["api", f"repos/{target['repo_name']}/pulls/{target['number']}"]
     )
     if not isinstance(metadata, dict):
-        raise WorkflowError("gh pr view did not return PR metadata")
-    metadata_url = metadata.get("url")
+        raise WorkflowError("GitHub API did not return PR metadata")
+    metadata_url = metadata.get("html_url")
     if not isinstance(metadata_url, str):
         raise WorkflowError("resolved PR metadata has no URL")
     resolved = parse_target(metadata_url)
@@ -421,9 +477,10 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     ):
         raise WorkflowError("resolved PR metadata does not match the requested target")
     title = metadata.get("title")
-    body = metadata.get("body")
-    head_sha = metadata.get("headRefOid")
-    is_draft = metadata.get("isDraft")
+    body = metadata.get("body") or ""
+    head = metadata.get("head")
+    head_sha = head.get("sha") if isinstance(head, dict) else None
+    is_draft = metadata.get("draft")
     if not isinstance(title, str) or not title.strip():
         raise WorkflowError("resolved PR metadata has no title")
     if not isinstance(body, str):
@@ -473,18 +530,30 @@ def require_expected_head(state: dict[str, Any], expected_head: str) -> str:
     return pinned_head
 
 
+def require_run_id(state: dict[str, Any], expected_run_id: str) -> str:
+    run_id = state.get("run_id")
+    if run_id != expected_run_id:
+        raise WorkflowError(
+            f"run ID mismatch: expected {expected_run_id}, state belongs to {run_id}"
+        )
+    return run_id
+
+
 def require_live_snapshot(
-    state: dict[str, Any], live: dict[str, Any], expected_head: str
+    snapshot: dict[str, Any], live: dict[str, Any], expected_head: str
 ) -> None:
     if live["head_sha"] != expected_head:
         raise WorkflowError(
-            f"PR head moved: expected {expected_head}, got {live['head_sha']}"
+            f"PR head moved: expected {expected_head}, got {live['head_sha']}; "
+            "no mutation was performed"
         )
-    pinned = state["pr"]
-    if live["title"] != pinned.get("title") or live["body"] != pinned.get("body"):
+    if (
+        live["title"] != snapshot.get("title")
+        or live["body"] != snapshot.get("body")
+    ):
         raise WorkflowError(
-            "live PR title or body no longer matches the pinned state; "
-            "run preflight again"
+            "live PR title or body no longer matches the exact approved snapshot; "
+            "no mutation was performed; run preflight again"
         )
 
 
@@ -495,37 +564,54 @@ def proposal_count(state: dict[str, Any]) -> int:
     return value
 
 
+def proposal_token_for(proposal: dict[str, Any]) -> str:
+    bound = {
+        "run_id": proposal.get("run_id"),
+        "number": proposal.get("number"),
+        "base": proposal.get("base"),
+        "title": proposal.get("title"),
+        "body": proposal.get("body"),
+    }
+    encoded = json.dumps(
+        bound, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def command_preflight(args: argparse.Namespace) -> None:
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
     target = resolve_target(args.target, repo_root)
-    path = cli_path(args.state) if args.state else default_state_path(target)
-    state = load_state(path) if path.is_file() else None
     metadata = metadata_for(target)
-    if state is None:
-        state = {
-            "version": STATE_VERSION,
-            "created_at": utc_now(),
-            "proposal_count": 0,
-        }
-    elif not same_pr(state["pr"], metadata):
-        raise WorkflowError("state file belongs to a different pull request")
-    count = proposal_count(state)
-    state.update(
-        {
-            "repo_root": str(repo_root),
-            "pr": metadata,
-            "proposal_count": count,
-            "pinned_at": utc_now(),
-        }
-    )
-    for key in ("proposal", "validated_head_sha", "validation"):
-        state.pop(key, None)
+    run_id = secrets.token_hex(16)
+    index_path = default_state_path(target)
+    path = cli_path(args.state) if args.state else run_state_path(index_path, run_id)
+    if path.exists():
+        raise WorkflowError(
+            f"refusing to invalidate an existing run state: {path}; "
+            "start a new run without --state or choose a new path"
+        )
+    state = {
+        "version": STATE_VERSION,
+        "kind": RUN_KIND,
+        "created_at": utc_now(),
+        "run_id": run_id,
+        "repo_root": str(repo_root),
+        "pr": metadata,
+        "proposal_count": 0,
+        "pinned_at": utc_now(),
+    }
+    if not args.state:
+        state["index_path"] = str(index_path)
     save_state(path, state)
+    if not args.state:
+        update_run_index(index_path, path, state)
     emit(
         {
             "result": "ready",
             "state": str(path),
+            "index_state": str(index_path) if not args.state else None,
+            "run_id": run_id,
             "pr": metadata,
             "title": metadata["title"],
             "body": metadata["body"],
@@ -547,16 +633,24 @@ def command_propose(args: argparse.Namespace) -> None:
     if not args.title.strip():
         raise WorkflowError("proposal title must not be blank")
     path = cli_path(args.state)
-    state = load_state(path)
+    state = load_run_state(path)
+    run_id = require_run_id(state, args.expected_run_id)
     body_path = cli_path(args.body_file)
     body = read_utf8(body_path)
     count = proposal_count(state) + 1
     proposal = {
         "number": count,
+        "run_id": run_id,
+        "base": {
+            "head_sha": state["pr"]["head_sha"],
+            "title": state["pr"]["title"],
+            "body": state["pr"]["body"],
+        },
         "title": args.title,
         "body": body,
         "proposed_at": utc_now(),
     }
+    proposal["token"] = proposal_token_for(proposal)
     state["proposal_count"] = count
     state["proposal"] = proposal
     state.pop("validated_head_sha", None)
@@ -568,43 +662,48 @@ def command_propose(args: argparse.Namespace) -> None:
             "state": str(path),
             "proposal": proposal,
             "proposal_count": count,
+            "proposal_token": proposal["token"],
+            "run_id": run_id,
         }
     )
 
 
-def edit_pr(state_path: Path, state: dict[str, Any], proposal: dict[str, Any]) -> None:
+def update_pr(state_path: Path, state: dict[str, Any], proposal: dict[str, Any]) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    handle, body_name = tempfile.mkstemp(
-        prefix=f".{state_path.name}.body.", suffix=".txt", dir=state_path.parent
+    handle, payload_name = tempfile.mkstemp(
+        prefix=f".{state_path.name}.update.", suffix=".json", dir=state_path.parent
     )
     try:
-        with os.fdopen(handle, "w", encoding="utf-8", newline="") as stream:
-            stream.write(proposal["body"])
+        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(
+                {"title": proposal["title"], "body": proposal["body"]},
+                stream,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
         pr = state["pr"]
         run(
             [
                 "gh",
-                "pr",
-                "edit",
-                pr["url"],
-                "--repo",
-                pr["repo_name"],
-                "--title",
-                proposal["title"],
-                "--body-file",
-                body_name,
+                "api",
+                "--method",
+                "PATCH",
+                f"repos/{pr['repo_name']}/pulls/{pr['number']}",
+                "--input",
+                payload_name,
             ]
         )
     finally:
         try:
-            os.unlink(body_name)
+            os.unlink(payload_name)
         except FileNotFoundError:
             pass
 
 
 def command_apply(args: argparse.Namespace) -> None:
     path = cli_path(args.state)
-    state = load_state(path)
+    state = load_run_state(path)
+    run_id = require_run_id(state, args.expected_run_id)
     pinned_head = require_expected_head(state, args.expected_head)
     proposal = state.get("proposal")
     if not isinstance(proposal, dict):
@@ -613,31 +712,62 @@ def command_apply(args: argparse.Namespace) -> None:
     body = proposal.get("body")
     if not isinstance(title, str) or not title.strip() or not isinstance(body, str):
         raise WorkflowError("stored proposal is invalid")
+    token = proposal.get("token")
+    if (
+        proposal.get("run_id") != run_id
+        or token != args.expected_proposal_token
+        or token != proposal_token_for(proposal)
+    ):
+        raise WorkflowError(
+            "proposal token mismatch; refusing to apply a proposal from another "
+            "run or a modified proposal"
+        )
+    base = proposal.get("base")
+    if not isinstance(base, dict) or base != {
+        "head_sha": pinned_head,
+        "title": state["pr"].get("title"),
+        "body": state["pr"].get("body"),
+    }:
+        raise WorkflowError(
+            "proposal is not bound to this run's exact pinned snapshot"
+        )
     target = target_from_state(state)
     live = metadata_for(target)
-    require_live_snapshot(state, live, pinned_head)
-    edit_pr(path, state, proposal)
+    require_live_snapshot(base, live, pinned_head)
+    # GitHub does not support conditional requests for this unsafe endpoint, so keep
+    # the final exact read adjacent to the direct PATCH and verify again afterward.
+    immediately_before = metadata_for(target)
+    require_live_snapshot(base, immediately_before, pinned_head)
+    update_pr(path, state, proposal)
     verified = metadata_for(target)
     if verified["head_sha"] != pinned_head:
         raise WorkflowError(
             f"PR head moved while applying the proposal: expected {pinned_head}, "
-            f"got {verified['head_sha']}"
+            f"got {verified['head_sha']}; the update may already have been applied; "
+            f"{RESIDUAL_UPDATE_RACE}"
         )
     if verified["title"] != title or verified["body"] != body:
         raise WorkflowError(
-            "PR title or body did not exactly match the stored proposal after apply"
+            "PR title or body did not exactly match the stored proposal after apply; "
+            f"{RESIDUAL_UPDATE_RACE}"
         )
     state["pr"] = verified
     state["validated_head_sha"] = pinned_head
     state["validation"] = {
         "mode": "applied",
         "proposal_number": proposal.get("number"),
+        "proposal_token": token,
+        "run_id": run_id,
         "head_sha": pinned_head,
         "title": verified["title"],
         "body": verified["body"],
         "validated_at": utc_now(),
+        "conditional_update": False,
+        "precondition_strategy": "two_exact_reads_immediately_before_patch",
+        "residual_race": RESIDUAL_UPDATE_RACE,
     }
     save_state(path, state)
+    refresh_run_index(path, state)
     emit(
         {
             "result": "applied",
@@ -646,6 +776,10 @@ def command_apply(args: argparse.Namespace) -> None:
             "title": verified["title"],
             "body": verified["body"],
             "validated_head_sha": pinned_head,
+            "run_id": run_id,
+            "proposal_token": token,
+            "conditional_update": False,
+            "residual_race": RESIDUAL_UPDATE_RACE,
         }
     )
 
@@ -654,20 +788,23 @@ def command_validate(args: argparse.Namespace) -> None:
     if not args.no_change:
         raise WorkflowError("validate requires --no-change")
     path = cli_path(args.state)
-    state = load_state(path)
+    state = load_run_state(path)
+    run_id = require_run_id(state, args.expected_run_id)
     pinned_head = require_expected_head(state, args.expected_head)
     live = metadata_for(target_from_state(state))
-    require_live_snapshot(state, live, pinned_head)
+    require_live_snapshot(state["pr"], live, pinned_head)
     state["pr"] = live
     state["validated_head_sha"] = pinned_head
     state["validation"] = {
         "mode": "no_change",
+        "run_id": run_id,
         "head_sha": pinned_head,
         "title": live["title"],
         "body": live["body"],
         "validated_at": utc_now(),
     }
     save_state(path, state)
+    refresh_run_index(path, state)
     emit(
         {
             "result": "validated",
@@ -676,6 +813,7 @@ def command_validate(args: argparse.Namespace) -> None:
             "title": live["title"],
             "body": live["body"],
             "validated_head_sha": pinned_head,
+            "run_id": run_id,
         }
     )
 
@@ -701,10 +839,29 @@ def command_status(args: argparse.Namespace) -> None:
     else:
         path = cli_path(args.state)
     state = load_state(path)
+    if state.get("kind") == INDEX_KIND:
+        emit(
+            {
+                "result": "ready",
+                "state": str(path),
+                "kind": INDEX_KIND,
+                "pr": state["pr"],
+                "latest_run_id": state.get("latest_run_id"),
+                "latest_state": state.get("latest_state"),
+                "runs": state.get("runs") or [],
+                "validated_head_sha": state.get("validated_head_sha"),
+                "validation": state.get("validation"),
+            }
+        )
+        return
+    if state.get("kind") != RUN_KIND:
+        raise WorkflowError(f"state file has an unsupported shape: {path}")
     emit(
         {
             "result": "ready",
             "state": str(path),
+            "kind": RUN_KIND,
+            "run_id": state["run_id"],
             "pr": state["pr"],
             "proposal": state.get("proposal"),
             "proposal_count": proposal_count(state),
@@ -716,7 +873,25 @@ def command_status(args: argparse.Namespace) -> None:
 
 def command_cleanup(args: argparse.Namespace) -> None:
     path = cli_path(args.state)
-    load_state(path)
+    state = load_state(path)
+    index_value = state.get("index_path")
+    if state.get("kind") == RUN_KIND and isinstance(index_value, str):
+        index_path = cli_path(index_value)
+        if index_path.is_file():
+            index = load_state(index_path)
+            if index.get("kind") == INDEX_KIND:
+                index["runs"] = [
+                    item
+                    for item in index.get("runs", [])
+                    if item.get("run_id") != state.get("run_id")
+                ]
+                if index.get("latest_run_id") == state.get("run_id"):
+                    latest = index["runs"][-1] if index["runs"] else None
+                    index["latest_run_id"] = (
+                        latest.get("run_id") if latest else None
+                    )
+                    index["latest_state"] = latest.get("state") if latest else None
+                save_state(index_path, index)
     path.unlink()
     emit({"result": "cleaned_up", "state": str(path)})
 
@@ -742,6 +917,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     propose = subparsers.add_parser("propose", help="store a title and body proposal")
     propose.add_argument("--state", required=True)
+    propose.add_argument("--expected-run-id", required=True)
     propose.add_argument("--title", required=True)
     propose.add_argument("--body-file", required=True)
     propose.set_defaults(function=command_propose)
@@ -751,6 +927,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     apply.add_argument("--state", required=True)
     apply.add_argument("--expected-head", required=True)
+    apply.add_argument("--expected-run-id", required=True)
+    apply.add_argument("--expected-proposal-token", required=True)
     apply.set_defaults(function=command_apply)
 
     validate = subparsers.add_parser(
@@ -758,6 +936,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate.add_argument("--state", required=True)
     validate.add_argument("--expected-head", required=True)
+    validate.add_argument("--expected-run-id", required=True)
     validate.add_argument("--no-change", action="store_true", required=True)
     validate.set_defaults(function=command_validate)
 

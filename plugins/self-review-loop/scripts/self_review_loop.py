@@ -878,6 +878,23 @@ def command_resolve(args: argparse.Namespace) -> None:
     path = cli_path(args.state)
     state = load_state(path)
     review = active_review(state)
+    disallowed = [
+        {"id": candidate["id"], "status": candidate.get("status")}
+        for candidate in review.get("candidates") or []
+        if candidate.get("status") != "dropped"
+    ]
+    if disallowed:
+        raise WorkflowError(
+            "a review can be marked clean only with no candidates or when every "
+            f"candidate is dropped: {disallowed}"
+        )
+    target = parse_target(state["pr"]["pr_url"])
+    live_head = metadata_for(target)["head_sha"]
+    if live_head != review["head_sha"]:
+        raise WorkflowError(
+            f"PR head changed before clean resolution: expected {review['head_sha']}, "
+            f"got {live_head}"
+        )
     review["outcome"] = args.outcome
     review["clean_at_head_sha"] = review["head_sha"]
     save_state(path, state)

@@ -71,7 +71,7 @@ The deterministic, JSON-only helper provides:
 - `preflight [target] [--repo-root <workspace>] [--max-iterations 5]`: resolve and check out the PR, require a clean worktree, require the local head to equal the PR head, fetch and parse the authoritative diff, confirm the head did not move around that fetch, enforce the iteration cap, archive the previous iteration, and return `head_sha`, `diff_path`, `changed_files`, and the carried-forward `history`
 - `candidates --state <path> --input <file-or->`: register this iteration's full candidate list and reject any candidate that is not anchored to a changed line of the pinned diff
 - `drop`, `plan`, `record`, and `skip`: maintain candidate and batch state
-- `resolve --state <path> --outcome clean`: durably mark the active review clean at its pinned head
+- `resolve --state <path> --outcome clean`: require no candidates or only dropped candidates, verify the live PR head still matches the pin, and durably mark the active review clean
 - `publish --state <path>`: require a clean worktree and complete records, refuse to publish a skipped batch, require the commits sitting on the pinned head to be exactly the recorded ones, push only when needed, and verify that the remote branch and the PR head both match the local head
 - `status [--state <path> | --current --repo-root <workspace>]` and `cleanup --state <path>`
 
