@@ -331,19 +331,44 @@ def read_lock_owner(path: Path) -> dict[str, Any] | None:
     return owner
 
 
-def reclaim_stale_index_lock(
+def lock_file_fingerprint(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        status = path.stat()
+    except FileNotFoundError:
+        return None
+    return (status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns)
+
+
+def reclaim_stale_index_lock_under_guard(
     path: Path, *, stale_seconds: float = INDEX_LOCK_STALE_SECONDS
 ) -> bool:
     owner = read_lock_owner(path)
     if owner is None:
-        return False
-    if time.time() - owner["created_at"] < stale_seconds:
-        return False
-    if process_is_alive(owner["pid"]):
-        return False
-    confirmed = read_lock_owner(path)
-    if confirmed != owner or process_is_alive(owner["pid"]):
-        return False
+        # A creator can crash between O_EXCL and writing its owner record. The OS
+        # guard excludes a live creator; the mtime threshold avoids stealing a fresh
+        # file before its record is complete.
+        fingerprint = lock_file_fingerprint(path)
+        if fingerprint is None:
+            return True
+        try:
+            age = time.time() - path.stat().st_mtime
+        except FileNotFoundError:
+            return True
+        if age < stale_seconds:
+            return False
+        if (
+            read_lock_owner(path) is not None
+            or lock_file_fingerprint(path) != fingerprint
+        ):
+            return False
+    else:
+        if time.time() - owner["created_at"] < stale_seconds:
+            return False
+        if process_is_alive(owner["pid"]):
+            return False
+        confirmed = read_lock_owner(path)
+        if confirmed != owner or process_is_alive(owner["pid"]):
+            return False
     try:
         path.unlink()
     except FileNotFoundError:
@@ -408,7 +433,9 @@ def index_lock(
                     0o600,
                 )
             except FileExistsError:
-                reclaim_stale_index_lock(path, stale_seconds=stale_seconds)
+                reclaim_stale_index_lock_under_guard(
+                    path, stale_seconds=stale_seconds
+                )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     current = read_lock_owner(path)

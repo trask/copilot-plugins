@@ -958,6 +958,44 @@ class IndexLockTest(unittest.TestCase):
 
         self.assertFalse(path.exists())
 
+    def test_fresh_empty_or_malformed_lock_is_not_reclaimed(self):
+        path = MODULE.index_lock_path(self.index_path)
+        for content in ("", "{not-json"):
+            with self.subTest(content=content):
+                path.write_text(content, encoding="utf-8")
+
+                with self.assertRaisesRegex(MODULE.WorkflowError, "timed out"):
+                    with MODULE.index_lock(
+                        self.index_path,
+                        timeout_seconds=0.02,
+                        stale_seconds=60,
+                        poll_seconds=0.002,
+                    ):
+                        self.fail("fresh malformed lock should not be reclaimed")
+
+                self.assertEqual(path.read_text(encoding="utf-8"), content)
+                path.unlink()
+
+    def test_aged_empty_or_malformed_lock_is_reclaimed(self):
+        path = MODULE.index_lock_path(self.index_path)
+        for content in ("", "{not-json"):
+            with self.subTest(content=content):
+                path.write_text(content, encoding="utf-8")
+                old = time.time() - 100
+                os.utime(path, (old, old))
+
+                with MODULE.index_lock(
+                    self.index_path,
+                    timeout_seconds=0.2,
+                    stale_seconds=0.01,
+                    poll_seconds=0.001,
+                ):
+                    owner = MODULE.read_lock_owner(path)
+                    self.assertIsNotNone(owner)
+                    self.assertNotEqual(owner["nonce"], content)
+
+                self.assertFalse(path.exists())
+
     def test_times_out_without_deleting_a_live_owner_lock(self):
         owner = {
             "pid": os.getpid(),
@@ -989,6 +1027,9 @@ class IndexLockTest(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(hold_lock)
             self.assertTrue(entered.wait(1))
+            path = MODULE.index_lock_path(self.index_path)
+            original_owner = MODULE.read_lock_owner(path)
+            self.assertIsNotNone(original_owner)
             with self.assertRaisesRegex(MODULE.WorkflowError, "index guard"):
                 with MODULE.index_lock(
                     self.index_path,
@@ -996,6 +1037,7 @@ class IndexLockTest(unittest.TestCase):
                     poll_seconds=0.002,
                 ):
                     self.fail("guard should not have been acquired")
+            self.assertEqual(MODULE.read_lock_owner(path), original_owner)
             release.set()
             future.result(timeout=2)
 
