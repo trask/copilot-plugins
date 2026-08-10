@@ -940,6 +940,60 @@ class CheckoutHeadTest(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.WorkflowError, "HEAD mismatch"):
                 MODULE.verify_checkout_head(Path("repo"), "local123", "remote123")
 
+    def test_retries_detached_when_pr_branch_is_in_another_worktree(self):
+        target = {"pr_url": "https://github.com/owner/repo/pull/7"}
+        metadata = {"head_sha": "remote123"}
+        collision = MODULE.WorkflowError(
+            "fatal: 'feature' is already checked out at 'C:\\other-worktree'"
+        )
+        mismatch = MODULE.WorkflowError(
+            "HEAD mismatch: local base123, PR head remote123"
+        )
+
+        with (
+            mock.patch.object(MODULE, "run", side_effect=[collision, mock.Mock()]) as run,
+            mock.patch.object(MODULE, "git", return_value="base123"),
+            mock.patch.object(
+                MODULE, "verify_checkout_head", side_effect=mismatch
+            ),
+        ):
+            checked_out_branch = MODULE.checkout_pr(Path("repo"), target, metadata)
+
+        self.assertFalse(checked_out_branch)
+        self.assertEqual(
+            run.call_args_list[1],
+            mock.call(
+                ["gh", "pr", "checkout", target["pr_url"], "--detach"],
+                cwd=Path("repo"),
+            ),
+        )
+
+    def test_keeps_local_commits_when_pr_branch_is_in_another_worktree(self):
+        target = {"pr_url": "https://github.com/owner/repo/pull/7"}
+        metadata = {"head_sha": "remote123"}
+        collision = MODULE.WorkflowError(
+            "fatal: 'feature' is already checked out at 'C:\\other-worktree'"
+        )
+
+        with (
+            mock.patch.object(MODULE, "run", side_effect=collision) as run,
+            mock.patch.object(MODULE, "git", return_value="local123"),
+            mock.patch.object(MODULE, "verify_checkout_head") as verify,
+        ):
+            checked_out_branch = MODULE.checkout_pr(Path("repo"), target, metadata)
+
+        self.assertFalse(checked_out_branch)
+        self.assertEqual(run.call_count, 1)
+        verify.assert_called_once_with(Path("repo"), "local123", "remote123")
+
+    def test_does_not_mask_other_checkout_failures(self):
+        target = {"pr_url": "https://github.com/owner/repo/pull/7"}
+        error = MODULE.WorkflowError("authentication failed")
+
+        with mock.patch.object(MODULE, "run", side_effect=error):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "authentication failed"):
+                MODULE.checkout_pr(Path("repo"), target, {"head_sha": "remote123"})
+
 
 class RemoteParsingTest(unittest.TestCase):
     def test_parses_https_and_ssh_remotes(self):
@@ -1427,6 +1481,8 @@ class PreflightTargetTest(unittest.TestCase):
         reviews=None,
         iterations=0,
         max_iterations=5,
+        local_branch="branch",
+        checked_out_branch=True,
     ):
         metadata = {"head_branch": "branch", "head_sha": "head"}
 
@@ -1434,7 +1490,7 @@ class PreflightTargetTest(unittest.TestCase):
             del repo_root
             return {
                 ("status", "--porcelain=v1"): "",
-                ("branch", "--show-current"): "branch",
+                ("branch", "--show-current"): local_branch,
                 ("rev-parse", "HEAD"): "head",
             }[arguments]
 
@@ -1461,6 +1517,9 @@ class PreflightTargetTest(unittest.TestCase):
                 mock.patch.object(MODULE, "resolve_repo_root", return_value=Path(directory)),
                 mock.patch.object(MODULE, "git", side_effect=fake_git),
                 mock.patch.object(MODULE, "metadata_for", return_value=metadata),
+                mock.patch.object(
+                    MODULE, "checkout_pr", return_value=checked_out_branch
+                ),
                 mock.patch.object(MODULE, "run"),
                 mock.patch.object(MODULE, "fetch_threads", return_value=threads or []),
                 mock.patch.object(MODULE, "fetch_reviews", return_value=reviews or []),
@@ -1469,6 +1528,14 @@ class PreflightTargetTest(unittest.TestCase):
                 MODULE.command_preflight(args)
 
         return emit.call_args.args[0]
+
+    def test_preflight_accepts_detached_checkout_for_worktree_collision(self):
+        payload = self.run_preflight(
+            local_branch="session-branch", checked_out_branch=False
+        )
+
+        self.assertEqual(payload["pr"]["head_branch"], "branch")
+        self.assertEqual(payload["pr"]["head_sha"], "head")
 
     def test_targetless_preflight_uses_the_current_branch_pr(self):
         metadata = {"head_branch": "branch", "head_sha": "head"}

@@ -389,6 +389,34 @@ class HeadVerificationTest(unittest.TestCase):
 
         remote_head.assert_not_called()
 
+    def test_retries_detached_when_pr_branch_is_in_another_worktree(self):
+        target = {"pr_url": "https://github.com/owner/repo/pull/7"}
+        collision = MODULE.WorkflowError(
+            "fatal: 'feature' is already checked out at 'C:\\other-worktree'"
+        )
+
+        with mock.patch.object(
+            MODULE, "run", side_effect=[collision, mock.Mock()]
+        ) as run:
+            checked_out_branch = MODULE.checkout_pr(Path("repo"), target)
+
+        self.assertFalse(checked_out_branch)
+        self.assertEqual(
+            run.call_args_list[1],
+            mock.call(
+                ["gh", "pr", "checkout", target["pr_url"], "--detach"],
+                cwd=Path("repo"),
+            ),
+        )
+
+    def test_does_not_mask_other_checkout_failures(self):
+        target = {"pr_url": "https://github.com/owner/repo/pull/7"}
+        error = MODULE.WorkflowError("authentication failed")
+
+        with mock.patch.object(MODULE, "run", side_effect=error):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "authentication failed"):
+                MODULE.checkout_pr(Path("repo"), target)
+
 
 class StateCommandTest(unittest.TestCase):
     def setUp(self):
@@ -774,7 +802,14 @@ class PreflightTest(unittest.TestCase):
             ("rev-parse", "HEAD"): "head1",
         }
 
-    def preflight(self, state_path, *, metadata_sequence=None, max_iterations=5):
+    def preflight(
+        self,
+        state_path,
+        *,
+        metadata_sequence=None,
+        max_iterations=5,
+        checked_out_branch=True,
+    ):
         arguments = SimpleNamespace(
             target="owner/repo#7",
             repo_root=str(self.directory),
@@ -791,6 +826,9 @@ class PreflightTest(unittest.TestCase):
                 MODULE, "git", side_effect=lambda root, *args: self.git_results[args]
             ),
             mock.patch.object(MODULE, "metadata_for", side_effect=metadata_sequence),
+            mock.patch.object(
+                MODULE, "checkout_pr", return_value=checked_out_branch
+            ),
             mock.patch.object(MODULE, "fetch_authoritative_diff", return_value=DIFF),
             mock.patch.object(MODULE, "run"),
         ):
@@ -816,6 +854,15 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(diff_path, MODULE.diff_path_for(state_path))
         self.assertEqual(state["review"]["diff_path"], str(diff_path))
         self.assertEqual(diff_path.read_text(encoding="utf-8"), DIFF)
+
+    def test_accepts_detached_checkout_for_worktree_collision(self):
+        self.git_results[("branch", "--show-current")] = ""
+
+        result = self.preflight(
+            self.directory / "state.json", checked_out_branch=False
+        )
+
+        self.assertEqual(result["head_sha"], "head1")
 
     def test_rejects_a_dirty_worktree(self):
         self.git_results[("status", "--porcelain=v1")] = " M app.py"

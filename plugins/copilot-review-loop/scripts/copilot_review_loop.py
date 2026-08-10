@@ -629,6 +629,27 @@ def verify_checkout_head(repo_root: Path, local_head: str, pr_head: str) -> None
     raise WorkflowError(f"HEAD mismatch: local {local_head}, PR head {pr_head}")
 
 
+def checkout_pr(
+    repo_root: Path, target: dict[str, Any], metadata: dict[str, Any]
+) -> bool:
+    try:
+        run(["gh", "pr", "checkout", target["pr_url"]], cwd=repo_root)
+        return True
+    except WorkflowError as error:
+        if "already checked out at" not in str(error).lower():
+            raise
+
+    local_head = git(repo_root, "rev-parse", "HEAD")
+    try:
+        verify_checkout_head(repo_root, local_head, metadata["head_sha"])
+    except WorkflowError:
+        run(
+            ["gh", "pr", "checkout", target["pr_url"], "--detach"],
+            cwd=repo_root,
+        )
+    return False
+
+
 def windows_process_is_running(pid: int) -> bool:
     """Query a Windows process handle without delivering a console signal."""
     import ctypes
@@ -749,10 +770,10 @@ def command_preflight(args: argparse.Namespace) -> None:
         raise WorkflowError(f"worktree is not clean:\n{dirty}")
 
     metadata = metadata_for(target)
-    run(["gh", "pr", "checkout", target["pr_url"]], cwd=repo_root)
+    checked_out_branch = checkout_pr(repo_root, target, metadata)
     branch = git(repo_root, "branch", "--show-current")
     head = git(repo_root, "rev-parse", "HEAD")
-    if branch != metadata["head_branch"]:
+    if checked_out_branch and branch != metadata["head_branch"]:
         raise WorkflowError(
             f"branch mismatch: local {branch!r}, PR head {metadata['head_branch']!r}"
         )

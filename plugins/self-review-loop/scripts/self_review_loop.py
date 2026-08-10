@@ -436,6 +436,21 @@ def require_checkout_head(local_head: str, pr_head: str) -> None:
     )
 
 
+def checkout_pr(repo_root: Path, target: dict[str, Any]) -> bool:
+    try:
+        run(["gh", "pr", "checkout", target["pr_url"]], cwd=repo_root)
+        return True
+    except WorkflowError as error:
+        if "already checked out at" not in str(error).lower():
+            raise
+
+    run(
+        ["gh", "pr", "checkout", target["pr_url"], "--detach"],
+        cwd=repo_root,
+    )
+    return False
+
+
 def decode_diff_path(value: str) -> str | None:
     value = value.rstrip()
     if value == "/dev/null":
@@ -668,9 +683,9 @@ def command_preflight(args: argparse.Namespace) -> None:
         raise WorkflowError(f"worktree is not clean:\n{dirty}")
 
     metadata = metadata_for(target)
-    run(["gh", "pr", "checkout", target["pr_url"]], cwd=repo_root)
+    checked_out_branch = checkout_pr(repo_root, target)
     branch = git(repo_root, "branch", "--show-current")
-    if branch != metadata["head_branch"]:
+    if checked_out_branch and branch != metadata["head_branch"]:
         raise WorkflowError(
             f"branch mismatch: local {branch!r}, PR head {metadata['head_branch']!r}"
         )
