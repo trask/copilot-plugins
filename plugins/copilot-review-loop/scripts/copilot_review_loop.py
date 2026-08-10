@@ -843,6 +843,7 @@ def command_preflight(args: argparse.Namespace) -> None:
                 int(suppressed_review["id"]) if suppressed_review else None
             ),
             "head_review_id": int(head_review["id"]) if head_review else None,
+            "head_review_url": head_review.get("html_url") if head_review else None,
             "head_review_clean": head_review_clean,
             "iteration": iteration,
             "max_iterations": max_iterations,

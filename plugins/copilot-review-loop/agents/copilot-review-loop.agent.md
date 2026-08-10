@@ -173,7 +173,7 @@ After all batches in the iteration are recorded:
 5. After `published`, start exactly one `watch --state <path>` process with terminal parameter `mode: sync`; omit both `timeout` and `isBackground` entirely.
 6. Never use `mode: async`, `isBackground: true`, or `timeout: 0`; consume its final JSON result directly from that same call. Do not send a final response while the watcher is active.
 7. Process the watcher result:
-   - `review_no_comments`: the loop is clean; send the final compact index.
+   - `review_no_comments`: the loop is clean; send the final compact index with the exact `review_id` and `review_url`.
    - `review_comments`: run `preflight` on the same PR and begin the next iteration immediately.
    - `head_changed`, `request_cancelled`, `review_dismissed`, `cancelled_locally`, or `stopped`: stop and include that exact outcome in the final compact index.
 
@@ -186,7 +186,7 @@ Keep chat as a compact index because reasoning lives in git. Emit one line per c
 ```text
 <short-sha> <short batch summary>
 <short-sha> <short batch summary>
-Outcome: clean after <n> iteration(s), Copilot review <id>.
+Outcome: clean after <n> iteration(s), [Copilot review <id>](<review-url>).
 ```
 
-For a capped or interrupted run, use `Outcome: <exact stop condition> after <n> iteration(s).` Mention uncommitted work only for an unfixable validation stop. Do not repeat Copilot comments, analysis, upsides, downsides, validation success, or publication mechanics in chat.
+For a preflight-only clean exit, build the same link from `head_review_id` and `head_review_url`. Never print a bare review ID when its URL is available. For a capped or interrupted run, use `Outcome: <exact stop condition> after <n> iteration(s).` and append the same review link when the terminal helper result includes a review ID and URL. Mention uncommitted work only for an unfixable validation stop. Do not repeat Copilot comments, analysis, upsides, downsides, validation success, or publication mechanics in chat.

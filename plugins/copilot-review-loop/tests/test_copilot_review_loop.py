@@ -173,6 +173,22 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
 
+    def test_final_response_links_the_exact_copilot_review(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "[Copilot review <id>](<review-url>)",
+            instructions,
+        )
+        self.assertIn(
+            "build the same link from `head_review_id` and `head_review_url`",
+            instructions,
+        )
+        self.assertIn(
+            "Never print a bare review ID when its URL is available",
+            instructions,
+        )
+
     def test_documents_durable_commit_and_reply_formats(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
@@ -1577,6 +1593,7 @@ class PreflightTargetTest(unittest.TestCase):
             "commit_id": "head",
             "submitted_at": "2026-08-09T12:00:00Z",
             "state": "APPROVED",
+            "html_url": "https://example.test/review/10",
             "body": "No comments.",
             "user": {"login": "copilot-pull-request-reviewer[bot]"},
         }
@@ -1585,6 +1602,10 @@ class PreflightTargetTest(unittest.TestCase):
 
         self.assertEqual(payload["result"], "no_unresolved_comments")
         self.assertEqual(payload["head_review_id"], 10)
+        self.assertEqual(
+            payload["head_review_url"],
+            "https://example.test/review/10",
+        )
         self.assertTrue(payload["head_review_clean"])
 
     def test_preflight_requests_review_when_only_review_is_for_older_head(self):
