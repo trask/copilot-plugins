@@ -153,6 +153,21 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
 
+    def test_uses_pinned_head_ci_as_review_evidence(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "CI logs and generated report artifacts for the exact pinned PR head "
+            "as first-class evidence",
+            instructions,
+        )
+        self.assertIn("never use results from another head", instructions)
+        self.assertIn(
+            "Pass all paths after one `--paths` flag or repeat the flag; the helper "
+            "retains every value",
+            instructions,
+        )
+
     def test_watcher_runs_synchronously_without_terminal_notification_handoff(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
@@ -1185,6 +1200,30 @@ class RemoteParsingTest(unittest.TestCase):
                 MODULE.require_fork_head(pr)
 
 
+class ParserTest(unittest.TestCase):
+    def test_plan_accumulates_repeated_path_flags(self):
+        args = MODULE.build_parser().parse_args(
+            [
+                "plan",
+                "--state",
+                "state.json",
+                "--batch",
+                "batch-1",
+                "--comments",
+                "1",
+                "--label",
+                "Fix paths",
+                "--paths",
+                "one.java",
+                "two.java",
+                "--paths",
+                "three.java",
+            ]
+        )
+
+        self.assertEqual(args.paths, ["one.java", "two.java", "three.java"])
+
+
 class ReplyPublishingTest(unittest.TestCase):
     def test_reply_body_uses_model_authored_text(self):
         reply = "Analysis: The guard is needed.\n\nUpsides: Safer.\n\nDownsides: None."
@@ -1550,6 +1589,73 @@ class VerifyPublishTest(unittest.TestCase):
             MODULE.WorkflowError, "publishing verification failed"
         ):
             self.run_verify([10])
+
+
+class RequestCopilotTest(unittest.TestCase):
+    def test_retries_pr_head_mismatch_after_remote_head_is_confirmed(self):
+        state = {
+            "repo_root": "repo",
+            "pr": {
+                "upstream_owner": "owner",
+                "upstream_repo": "repo",
+                "number": 7,
+                "pr_node_id": "PR_1",
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            with (
+                mock.patch.object(MODULE, "git", return_value="new-head"),
+                mock.patch.object(MODULE, "resolve_copilot_bot", return_value="BOT_1"),
+                mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
+                mock.patch.object(
+                    MODULE,
+                    "graphql",
+                    side_effect=[
+                        MODULE.WorkflowError("GraphQL failed: PR head mismatch"),
+                        {"data": {}},
+                    ],
+                ) as graphql,
+                mock.patch.object(MODULE.time, "sleep") as sleep,
+            ):
+                result = MODULE.request_copilot(state, path, "new-head")
+
+        self.assertEqual(result["status"], "requested")
+        self.assertEqual(graphql.call_count, 2)
+        sleep.assert_called_once_with(MODULE.PR_HEAD_LAG_RETRY_DELAYS[0])
+
+    def test_does_not_retry_pr_head_mismatch_without_confirmed_remote_head(self):
+        state = {
+            "repo_root": "repo",
+            "pr": {
+                "upstream_owner": "owner",
+                "upstream_repo": "repo",
+                "number": 7,
+                "pr_node_id": "PR_1",
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            with (
+                mock.patch.object(MODULE, "git", return_value="new-head"),
+                mock.patch.object(MODULE, "resolve_copilot_bot", return_value="BOT_1"),
+                mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
+                mock.patch.object(
+                    MODULE,
+                    "graphql",
+                    side_effect=MODULE.WorkflowError(
+                        "GraphQL failed: PR head mismatch"
+                    ),
+                ) as graphql,
+                mock.patch.object(MODULE.time, "sleep") as sleep,
+                self.assertRaisesRegex(MODULE.WorkflowError, "PR head mismatch"),
+            ):
+                MODULE.request_copilot(state, path, "old-head")
+
+        graphql.assert_called_once()
+        sleep.assert_not_called()
 
 
 class CopilotReviewTest(unittest.TestCase):

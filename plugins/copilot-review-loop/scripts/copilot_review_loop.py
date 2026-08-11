@@ -23,6 +23,7 @@ COPILOT_LOGINS = {
 }
 STATE_VERSION = 3
 DEFAULT_MAX_ITERATIONS = 5
+PR_HEAD_LAG_RETRY_DELAYS = (1, 2, 4)
 IS_WINDOWS = os.name == "nt"
 # A pasted review or comment fragment is accepted and ignored: the queue is always
 # every unresolved Copilot comment on the pull request.
@@ -1225,7 +1226,9 @@ query($owner:String!,$repo:String!,$number:Int!){
     )
 
 
-def request_copilot(state: dict[str, Any], path: Path) -> dict[str, Any]:
+def request_copilot(
+    state: dict[str, Any], path: Path, confirmed_remote_head: str
+) -> dict[str, Any]:
     pr = state["pr"]
     local_head = git(Path(state["repo_root"]), "rev-parse", "HEAD")
     existing = state.get("monitoring") or {}
@@ -1267,7 +1270,19 @@ mutation($pullRequest:ID!,$bot:ID!){
  }
 }
 """
-    graphql(query, {"pullRequest": pr["pr_node_id"], "bot": bot_id})
+    for attempt in range(len(PR_HEAD_LAG_RETRY_DELAYS) + 1):
+        try:
+            graphql(query, {"pullRequest": pr["pr_node_id"], "bot": bot_id})
+            break
+        except WorkflowError as error:
+            retryable = (
+                "pr head mismatch" in str(error).lower()
+                and confirmed_remote_head == local_head
+                and attempt < len(PR_HEAD_LAG_RETRY_DELAYS)
+            )
+            if not retryable:
+                raise
+            time.sleep(PR_HEAD_LAG_RETRY_DELAYS[attempt])
     monitoring["status"] = "requested"
     save_state(path, state)
     return monitoring
@@ -1395,7 +1410,7 @@ def command_publish(args: argparse.Namespace) -> None:
         save_state(path, state)
         resolve_threads(comments)
         save_state(path, state)
-    monitoring = request_copilot(state, path)
+    monitoring = request_copilot(state, path, pushed_head)
     verification = verify_publish(state, comments)
     queue["status"] = "published"
     state["iterations"] = int(state.get("iterations", 0)) + 1
@@ -1634,7 +1649,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--batch", required=True)
     plan.add_argument("--comments", type=int, nargs="+", required=True)
     plan.add_argument("--label", required=True)
-    plan.add_argument("--paths", nargs="*")
+    plan.add_argument("--paths", nargs="+", action="extend")
     plan.add_argument("--validation")
     plan.set_defaults(function=command_plan)
 

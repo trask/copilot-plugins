@@ -97,10 +97,11 @@ Before editing an iteration:
 
 1. Load repository and path-specific instructions for the queue.
 2. For every comment, read the referenced source and follow symbols only far enough to determine validity, the smallest complete change, affected paths, and focused validation.
-3. Reject technically incorrect requests with a well-supported no-code rationale rather than changing code merely to agree.
-4. Group comments when they share one root cause, require one coherent edit, or request the same sibling-module change. Separate them when grouping would obscure review or validation.
-5. Persist every batch with `plan`, including comment IDs, label, paths, and validation.
-6. Process every planned batch in order without waiting for user approval.
+3. Treat CI logs and generated report artifacts for the exact pinned PR head as first-class evidence. Inspect them when they can confirm or reject a candidate more directly than local reproduction; never use results from another head.
+4. Reject technically incorrect requests with a well-supported no-code rationale rather than changing code merely to agree.
+5. Group comments when they share one root cause, require one coherent edit, or request the same sibling-module change. Separate them when grouping would obscure review or validation.
+6. Persist every batch with `plan`, including comment IDs, label, every affected path, and validation. Pass all paths after one `--paths` flag or repeat the flag; the helper retains every value.
+7. Process every planned batch in order without waiting for user approval.
 
 ## Batch Execution
 
