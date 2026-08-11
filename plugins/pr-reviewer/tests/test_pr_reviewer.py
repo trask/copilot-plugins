@@ -87,7 +87,7 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("for **each candidate separately**", instructions)
         self.assertIn("Never add a top-level review body", instructions)
         self.assertIn("Skip local tests by default", instructions)
-        self.assertIn("report every dropped candidate", instructions)
+        self.assertIn("Record every dropped candidate", instructions)
         self.assertIn("If no candidates survive", instructions)
         self.assertIn(
             "every suppressed Copilot comment returned by `check`", instructions
@@ -172,10 +172,40 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
-            "omit the label entirely when there is nothing to report", instructions
+            "Workflow feedback only; this is not a PR finding and no change was "
+            "made automatically.",
+            instructions,
         )
+        self.assertIn("**Options:**", instructions)
+        self.assertIn("Apply a suggestion in a separate follow-up.", instructions)
+        self.assertIn("Explain the tradeoffs before deciding.", instructions)
+        self.assertIn("Leave it as advisory feedback.", instructions)
+        self.assertIn("Omit the entire retrospective", instructions)
         self.assertIn(
             "never replaces, reorders, or alters the required final response",
+            instructions,
+        )
+
+    def test_emits_one_compact_final_response_with_clickable_links(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn("## Final Response", instructions)
+        self.assertIn("Emit exactly one terminal response", instructions)
+        self.assertIn(
+            "do not emit a progress report while the workflow continues", instructions
+        )
+        self.assertIn(
+            "**Result:** No findings. No GitHub mutation was made.", instructions
+        )
+        self.assertIn(
+            "**PR:** [#<pr_number> <pr_title>](<pr_url>)", instructions
+        )
+        self.assertIn(
+            "**Review:** [Open pending review](<review_url>)", instructions
+        )
+        self.assertIn(
+            "The **Retrospective** is the only content permitted after the `**PR:**` "
+            "line",
             instructions,
         )
 

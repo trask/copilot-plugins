@@ -79,15 +79,38 @@ It emits deterministic JSON. `check <target>` resolves the PR and authenticated 
 5. Before any GitHub mutation, launch a fresh independent subagent for **each candidate separately** using model **GPT-5.6 Sol** with reasoning effort **max**. Never combine candidates in one evaluation. This applies equally to candidates discovered directly and candidates derived from suppressed Copilot comments. Give that evaluator the PR's stated scope, the relevant authoritative diff and context, and exactly one candidate; when it came from a suppressed comment, include that original lead as untrusted evidence. Require two independent decisions with evidence:
    - Is the candidate factually correct and demonstrated by this PR?
    - Is it actionable and worth fixing within the PR's stated scope?
-6. Drop the candidate if either decision fails or is uncertain. Before posting, report every dropped candidate and its concrete reason. If no candidates survive, state that there are no findings and stop without invoking `post` or making any GitHub mutation.
+6. Drop the candidate if either decision fails or is uncertain. Record every dropped candidate and its concrete reason privately for the final response; do not emit a progress report while the workflow continues. If no candidates survive, proceed directly to **Final Response** without invoking `post` or making any GitHub mutation.
 7. Rewrite every surviving comment to **Comment Style**, then recheck it for a valid changed-line anchor, correct `LEFT`/`RIGHT` side, and an actionable suggestion. Write the structured array to a short-lived local file or pass it on standard input.
 8. Run `post <target> --expected-head <recorded-head_sha> --comments <file-or->` exactly once. If a pending review appeared meanwhile, stop and return the helper's existing `review_url`. If the helper reports that the head changed, abort, discard all findings and evaluator results from the old snapshot, and restart the entire review from `check`; never translate or re-anchor old findings onto the new diff. On any other error except the created-but-unverified case in step 9, report it exactly; do not claim success or attempt a second mutation.
 9. A `post` error saying the review `was created but verification failed` means the mutation already landed. Never re-run `post` and never make any other mutation, because a second `post` would create a duplicate review. Instead inspect the created review read-only with `gh api` to establish what actually landed, then report its `review_url`, the findings that are confirmed present, and exactly what the helper could not verify. This branch is subordinate to the rule that a run makes at most one mutation.
-10. Require a `created_pending_review` result, or the created-but-unverified branch above. Return the verified `review_url`, a concise list of submitted findings, the previously reported dropped-candidate reasons, and any **Model Gate** override. Do not submit the review; it must remain pending.
+10. Require a `created_pending_review` result, or the created-but-unverified branch above. Then proceed directly to **Final Response** with the verified `review_url`, a concise list of submitted findings, the recorded dropped-candidate reasons, and any **Model Gate** override. Do not submit the review; it must remain pending.
+
+## Final Response
+
+Emit exactly one terminal response. Do not print an analysis or completion report and then repeat it in a second summary. Apart from a required user decision such as the **Model Gate** override, keep investigation, verification details, and candidate tracking private until this response.
+
+Render ordinary Markdown, never a fenced code block. Lead with exactly one result line:
+
+- `**Result:** No findings. No GitHub mutation was made.`
+- `**Result:** Created a pending review with <n> finding(s).`
+- `**Result:** An existing pending review was found; no new review was created.`
+- `**Result:** <exact stop or error condition>.`
+
+After the result, include only the applicable submitted findings, dropped candidates, **Model Gate** override, or created-but-unverified details required by the workflow. State each fact and rationale once. Do not repeat a file-by-file review narrative, successful checks, or the same no-findings conclusion in multiple forms.
+
+Whenever `check` resolved the pull request, end the main response with its canonical clickable pull request link:
+
+`**PR:** [#<pr_number> <pr_title>](<pr_url>)`
+
+When a pending review exists or was created, add its clickable link immediately before the PR line:
+
+`**Review:** [Open pending review](<review_url>)`
+
+Never print a bare PR number, PR URL, review ID, or review URL when the corresponding Markdown link can be rendered. The **Retrospective** is the only content permitted after the `**PR:**` line.
 
 ## Retrospective
 
-Close every run by reflecting on how the run itself went and reporting only concrete friction worth fixing. Silence is the normal outcome, and a run that went smoothly reports nothing.
+Close every run by reflecting on how the review workflow itself went and reporting only concrete friction worth fixing. This is process feedback about the agent, helper, instructions, or repository guidance; it is not a finding about the pull request. Silence is the normal outcome, and a run that went smoothly reports nothing.
 
 Produce the retrospective on every terminal outcome, including `existing_pending_review`, a review with no findings, a helper error, and a failed **Model Gate**. An early stop is where friction is most visible.
 
@@ -106,4 +129,14 @@ Apply these rules:
 - Do not relitigate a deliberate design decision such as the **Model Gate** or the independent evaluator. A rule that was genuinely ambiguous or expensive to follow is a finding; a rule you merely disagree with is not.
 - The retrospective is advisory and chat-only. Never edit an agent definition, helper script, instruction file, or repository instruction because of it, never open an issue for it, and never turn it into a review comment or any other GitHub mutation.
 
-Render it after the final response under a bold `**Retrospective**` label as a plain Markdown list, and omit the label entirely when there is nothing to report. The retrospective never replaces, reorders, or alters the required final response.
+When there is friction to report, render it after the `**PR:**` line in this order:
+
+1. A bold `**Retrospective**` label.
+2. The sentence `Workflow feedback only; this is not a PR finding and no change was made automatically.`
+3. A plain Markdown list of categorized suggestions.
+4. A bold `**Options:**` label followed by this numbered list:
+   1. `Apply a suggestion in a separate follow-up.`
+   2. `Explain the tradeoffs before deciding.`
+   3. `Leave it as advisory feedback.`
+
+Omit the entire retrospective, including its explanation and options, when there is nothing to report. The retrospective never replaces, reorders, or alters the required final response.
