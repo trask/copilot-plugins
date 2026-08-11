@@ -174,6 +174,47 @@ def fetch_reviews(pr: dict[str, Any]) -> list[dict[str, Any]]:
     )
 
 
+def fetch_issue_comments(pr: dict[str, Any]) -> list[dict[str, Any]]:
+    comments = gh_paginated(
+        f"repos/{pr['repo_name']}/issues/{pr['number']}/comments?per_page=100"
+    )
+    normalized: list[dict[str, Any]] = []
+    for index, comment in enumerate(comments):
+        comment_id = comment.get("id")
+        url = comment.get("html_url")
+        body = comment.get("body")
+        author = (comment.get("user") or {}).get("login")
+        author_association = comment.get("author_association")
+        created_at = comment.get("created_at")
+        updated_at = comment.get("updated_at")
+        if isinstance(comment_id, bool) or not isinstance(comment_id, int):
+            raise WorkflowError(f"PR issue comment {index} has no numeric ID")
+        if not isinstance(url, str) or not url:
+            raise WorkflowError(f"PR issue comment {comment_id} has no URL")
+        if not isinstance(body, str):
+            raise WorkflowError(f"PR issue comment {comment_id} has no body")
+        if author is not None and not isinstance(author, str):
+            raise WorkflowError(f"PR issue comment {comment_id} has an invalid author")
+        if not isinstance(author_association, str):
+            raise WorkflowError(
+                f"PR issue comment {comment_id} has no author association"
+            )
+        if not isinstance(created_at, str) or not isinstance(updated_at, str):
+            raise WorkflowError(f"PR issue comment {comment_id} has invalid timestamps")
+        normalized.append(
+            {
+                "id": comment_id,
+                "url": url,
+                "author": author,
+                "author_association": author_association,
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "body": body,
+            }
+        )
+    return normalized
+
+
 def find_pending_review(
     reviews: list[dict[str, Any]], viewer: str
 ) -> dict[str, Any] | None:
@@ -588,12 +629,15 @@ def verify_created_review(
 def preflight(
     target_value: str,
     expected_head: str | None = None,
+    *,
+    include_issue_comments: bool = False,
 ) -> tuple[
     dict[str, Any],
     str,
     dict[str, dict[str, dict[int, int]]],
     str | None,
     dict[str, Any] | None,
+    list[dict[str, Any]],
     list[dict[str, Any]],
 ]:
     pr = resolve_pr(parse_target(target_value))
@@ -603,21 +647,36 @@ def preflight(
     reviews = fetch_reviews(pr)
     pending = find_pending_review(reviews, viewer)
     if pending is not None:
-        return pr, viewer, {}, review_url(pr, pending), None, []
+        return pr, viewer, {}, review_url(pr, pending), None, [], []
     anchors = parse_unified_diff(fetch_authoritative_diff(pr))
     copilot_review, suppressed_comments = suppressed_comments_for_head(
         reviews, pr["head_sha"]
     )
+    issue_comments = fetch_issue_comments(pr) if include_issue_comments else []
     ensure_head_unchanged(
-        pr, "after fetching and parsing the authoritative diff and Copilot review"
+        pr, "after fetching the authoritative diff and review context"
     )
-    return pr, viewer, anchors, None, copilot_review, suppressed_comments
+    return (
+        pr,
+        viewer,
+        anchors,
+        None,
+        copilot_review,
+        suppressed_comments,
+        issue_comments,
+    )
 
 
 def command_check(args: argparse.Namespace) -> None:
-    pr, viewer, anchors, pending_url, copilot_review, suppressed_comments = preflight(
-        args.target
-    )
+    (
+        pr,
+        viewer,
+        anchors,
+        pending_url,
+        copilot_review,
+        suppressed_comments,
+        issue_comments,
+    ) = preflight(args.target, include_issue_comments=True)
     if pending_url:
         emit({"result": "existing_pending_review", "review_url": pending_url})
         return
@@ -632,12 +691,15 @@ def command_check(args: argparse.Namespace) -> None:
             "changed_files": sorted(anchors),
             "copilot_review": copilot_review,
             "suppressed_comments": suppressed_comments,
+            "issue_comments": issue_comments,
         }
     )
 
 
 def command_post(args: argparse.Namespace) -> None:
-    pr, viewer, anchors, pending_url, _, _ = preflight(args.target, args.expected_head)
+    pr, viewer, anchors, pending_url, _, _, _ = preflight(
+        args.target, args.expected_head
+    )
     ensure_expected_head(pr, args.expected_head)
     if pending_url:
         emit({"result": "existing_pending_review", "review_url": pending_url})

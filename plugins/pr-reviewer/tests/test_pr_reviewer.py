@@ -82,6 +82,15 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("user-invocable: true", instructions)
         self.assertIn("disable-model-invocation: true", instructions)
         self.assertIn("gh pr diff", instructions)
+        self.assertIn(
+            "more specific than generic peer-review context or workspace "
+            "`<pr_diff_instructions>`",
+            instructions,
+        )
+        self.assertIn(
+            "If a higher-priority instruction forbids it, stop and report the conflict",
+            instructions,
+        )
         self.assertIn("GPT-5.6 Sol", instructions)
         self.assertIn("reasoning effort **max**", instructions)
         self.assertIn("for **each candidate separately**", instructions)
@@ -93,7 +102,7 @@ class AgentInstructionsTest(unittest.TestCase):
             "every suppressed Copilot comment returned by `check`", instructions
         )
         self.assertIn("latest completed, non-dismissed Copilot review", instructions)
-        self.assertIn("investigate every entry in `suppressed_comments`", instructions)
+        self.assertIn("every entry in `suppressed_comments`", instructions)
         self.assertIn("Deduplicate candidates", instructions)
         self.assertIn(
             "applies equally to candidates discovered directly and candidates derived "
@@ -126,6 +135,19 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn(
             "State explicitly when the targeted search found no plausible related "
             "open pull request",
+            instructions,
+        )
+        self.assertIn("the `issue_comments` returned by `check`", instructions)
+        self.assertIn(
+            "do not promote it to a candidate or spend an evaluator run on it",
+            instructions,
+        )
+        self.assertIn(
+            "Permit the evaluator to consult live GitHub state read-only", instructions
+        )
+        self.assertIn(
+            "Treat such newly discovered evidence as provisional until you verify it "
+            "read-only",
             instructions,
         )
 
@@ -674,6 +696,42 @@ class PendingReviewTest(unittest.TestCase):
             "repos/owner/repo/pulls/42/reviews?per_page=100"
         )
 
+    def test_fetches_and_normalizes_paginated_issue_comments(self):
+        pr = {"repo_name": "owner/repo", "number": 42}
+        comment = {
+            "id": 17,
+            "html_url": "https://github.com/owner/repo/pull/42#issuecomment-17",
+            "body": "Please split this into a follow-up.",
+            "user": {"login": "maintainer"},
+            "author_association": "MEMBER",
+            "created_at": "2026-08-11T12:00:00Z",
+            "updated_at": "2026-08-11T12:01:00Z",
+            "ignored": "value",
+        }
+
+        with mock.patch.object(
+            MODULE, "gh_paginated", return_value=[comment]
+        ) as paginated:
+            result = MODULE.fetch_issue_comments(pr)
+
+        paginated.assert_called_once_with(
+            "repos/owner/repo/issues/42/comments?per_page=100"
+        )
+        self.assertEqual(
+            result,
+            [
+                {
+                    "id": 17,
+                    "url": comment["html_url"],
+                    "author": "maintainer",
+                    "author_association": "MEMBER",
+                    "created_at": "2026-08-11T12:00:00Z",
+                    "updated_at": "2026-08-11T12:01:00Z",
+                    "body": "Please split this into a follow-up.",
+                }
+            ],
+        )
+
     def test_check_returns_existing_pending_review_without_fetching_diff(self):
         pr = {
             "repo_name": "owner/repo",
@@ -687,7 +745,7 @@ class PendingReviewTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "preflight",
-                return_value=(pr, "viewer", {}, pending_url, None, []),
+                return_value=(pr, "viewer", {}, pending_url, None, [], []),
             ),
             mock.patch.object(MODULE, "emit") as emit,
         ):
@@ -726,8 +784,19 @@ class PendingReviewTest(unittest.TestCase):
                             "body": "Preserve the old behavior.",
                         }
                     ],
+                    [
+                        {
+                            "id": 17,
+                            "url": "https://example.test/comment/17",
+                            "author": "maintainer",
+                            "author_association": "MEMBER",
+                            "created_at": "2026-08-11T12:00:00Z",
+                            "updated_at": "2026-08-11T12:01:00Z",
+                            "body": "Please split this into a follow-up.",
+                        }
+                    ],
                 ),
-            ),
+            ) as preflight,
             mock.patch.object(MODULE, "emit") as emit,
         ):
             MODULE.command_check(SimpleNamespace(target=pr["pr_url"]))
@@ -739,6 +808,10 @@ class PendingReviewTest(unittest.TestCase):
         self.assertEqual(payload["pr_title"], "Fix the reviewer")
         self.assertEqual(payload["copilot_review"]["id"], 10)
         self.assertEqual(payload["suppressed_comments"][0]["path"], "src/one.py")
+        self.assertEqual(payload["issue_comments"][0]["author"], "maintainer")
+        preflight.assert_called_once_with(
+            pr["pr_url"], include_issue_comments=True
+        )
 
     def test_check_ready_emits_empty_suppressed_fields_without_copilot_review(self):
         pr = {
@@ -754,7 +827,7 @@ class PendingReviewTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "preflight",
-                return_value=(pr, "viewer", anchors, None, None, []),
+                return_value=(pr, "viewer", anchors, None, None, [], []),
             ),
             mock.patch.object(MODULE, "emit") as emit,
         ):
@@ -763,6 +836,7 @@ class PendingReviewTest(unittest.TestCase):
         payload = emit.call_args.args[0]
         self.assertIsNone(payload["copilot_review"])
         self.assertEqual(payload["suppressed_comments"], [])
+        self.assertEqual(payload["issue_comments"], [])
 
 
 class ResolvePrTest(unittest.TestCase):
@@ -822,8 +896,7 @@ class HeadStabilityTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 MODULE.WorkflowError,
-                "PR head changed after fetching and parsing the authoritative diff "
-                "and Copilot review",
+                "PR head changed after fetching the authoritative diff and review context",
             ):
                 MODULE.preflight(self.pr["pr_url"])
 
@@ -885,7 +958,7 @@ class PostingTest(unittest.TestCase):
                 mock.patch.object(
                     MODULE,
                     "preflight",
-                    return_value=(self.pr, "viewer", self.anchors, None, None, []),
+                    return_value=(self.pr, "viewer", self.anchors, None, None, [], []),
                 ) as preflight,
                 mock.patch.object(MODULE, "gh_json", return_value=created) as gh_json,
                 mock.patch.object(
@@ -928,7 +1001,7 @@ class PostingTest(unittest.TestCase):
                 mock.patch.object(
                     MODULE,
                     "preflight",
-                    return_value=(self.pr, "viewer", self.anchors, None, None, []),
+                    return_value=(self.pr, "viewer", self.anchors, None, None, [], []),
                 ),
                 mock.patch.object(MODULE, "gh_json", return_value=created),
                 mock.patch.object(
@@ -957,7 +1030,7 @@ class PostingTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "preflight",
-                return_value=(self.pr, "viewer", self.anchors, None, None, []),
+                return_value=(self.pr, "viewer", self.anchors, None, None, [], []),
             ),
             mock.patch.object(MODULE, "load_comments", return_value=self.comments),
             mock.patch.object(
@@ -989,7 +1062,7 @@ class PostingTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "preflight",
-                return_value=(changed, "viewer", self.anchors, None, None, []),
+                return_value=(changed, "viewer", self.anchors, None, None, [], []),
             ),
             mock.patch.object(MODULE, "load_comments") as load_comments,
             mock.patch.object(MODULE, "gh_json") as gh_json,
