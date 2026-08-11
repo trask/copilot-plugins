@@ -496,7 +496,7 @@ class HeadVerificationTest(unittest.TestCase):
 class StateCommandTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.directory = Path(self.temporary.name)
+        self.directory = Path(self.temporary.name).resolve()
         self.addCleanup(self.temporary.cleanup)
         self.emitted = []
         patcher = mock.patch.object(MODULE, "emit", self.emitted.append)
@@ -707,7 +707,7 @@ class StateCommandTest(unittest.TestCase):
 class PublishTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.directory = Path(self.temporary.name)
+        self.directory = Path(self.temporary.name).resolve()
         self.addCleanup(self.temporary.cleanup)
         self.emitted = []
         patcher = mock.patch.object(MODULE, "emit", self.emitted.append)
@@ -915,7 +915,7 @@ class PublishTest(unittest.TestCase):
 class PreflightTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.directory = Path(self.temporary.name)
+        self.directory = Path(self.temporary.name).resolve()
         self.addCleanup(self.temporary.cleanup)
         self.emitted = []
         patcher = mock.patch.object(MODULE, "emit", self.emitted.append)
@@ -1092,7 +1092,7 @@ class PreflightTest(unittest.TestCase):
 class StatusTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.directory = Path(self.temporary.name)
+        self.directory = Path(self.temporary.name).resolve()
         self.addCleanup(self.temporary.cleanup)
         self.emitted = []
         patcher = mock.patch.object(MODULE, "emit", self.emitted.append)
