@@ -334,13 +334,21 @@ def decode_diff_path(value: str) -> str | None:
     return value
 
 
-def parse_unified_diff(diff_text: str) -> dict[str, dict[str, set[int]]]:
-    anchors: dict[str, dict[str, set[int]]] = {}
+def parse_unified_diff(diff_text: str) -> dict[str, dict[str, dict[int, int]]]:
+    """Map every changed line to its 1-based position in the file's unified diff.
+
+    GitHub counts positions down from a file's first ``@@`` header, which itself
+    is position 0, and every later line in that file counts, including
+    subsequent ``@@`` headers and ``\\ No newline`` markers.
+    """
+    anchors: dict[str, dict[str, dict[int, int]]] = {}
     old_path: str | None = None
     new_path: str | None = None
     path: str | None = None
     old_line = new_line = 0
     old_remaining = new_remaining = 0
+    position = 0
+    seen_hunk = False
     in_hunk = False
 
     def finish_hunk() -> None:
@@ -354,6 +362,8 @@ def parse_unified_diff(diff_text: str) -> dict[str, dict[str, set[int]]]:
         if raw_line.startswith("diff --git "):
             finish_hunk()
             old_path = new_path = path = None
+            position = 0
+            seen_hunk = False
             continue
         if not in_hunk and raw_line.startswith("--- "):
             old_path = decode_diff_path(raw_line[4:])
@@ -363,7 +373,7 @@ def parse_unified_diff(diff_text: str) -> dict[str, dict[str, set[int]]]:
             path = new_path or old_path
             if path is None:
                 raise WorkflowError("PR diff file has no usable path")
-            anchors.setdefault(path, {"LEFT": set(), "RIGHT": set()})
+            anchors.setdefault(path, {"LEFT": {}, "RIGHT": {}})
             continue
 
         hunk = HUNK_PATTERN.match(raw_line)
@@ -375,18 +385,22 @@ def parse_unified_diff(diff_text: str) -> dict[str, dict[str, set[int]]]:
             new_line = int(hunk.group("new"))
             old_remaining = int(hunk.group("old_count") or 1)
             new_remaining = int(hunk.group("new_count") or 1)
+            if seen_hunk:
+                position += 1
+            seen_hunk = True
             in_hunk = True
             continue
         if not in_hunk:
             continue
+        position += 1
         if raw_line.startswith("\\"):
             continue
         if raw_line.startswith("+"):
-            anchors[path]["RIGHT"].add(new_line)
+            anchors[path]["RIGHT"].setdefault(new_line, position)
             new_line += 1
             new_remaining -= 1
         elif raw_line.startswith("-"):
-            anchors[path]["LEFT"].add(old_line)
+            anchors[path]["LEFT"].setdefault(old_line, position)
             old_line += 1
             old_remaining -= 1
         elif raw_line.startswith(" "):
@@ -403,6 +417,17 @@ def parse_unified_diff(diff_text: str) -> dict[str, dict[str, set[int]]]:
 
     finish_hunk()
     return anchors
+
+
+def positions_by_path(
+    anchors: dict[str, dict[str, dict[int, int]]],
+) -> dict[str, dict[int, tuple[str, int]]]:
+    resolved: dict[str, dict[int, tuple[str, int]]] = {}
+    for path, sides in anchors.items():
+        for side, lines in sides.items():
+            for line, position in lines.items():
+                resolved.setdefault(path, {})[position] = (side, line)
+    return resolved
 
 
 def fetch_authoritative_diff(pr: dict[str, Any]) -> str:
@@ -429,7 +454,7 @@ def load_comments(path_value: str) -> list[dict[str, Any]]:
 
 def validate_comments(
     comments: list[dict[str, Any]],
-    anchors: dict[str, dict[str, set[int]]],
+    anchors: dict[str, dict[str, dict[int, int]]],
 ) -> list[dict[str, Any]]:
     if not comments:
         raise WorkflowError("at least one inline comment is required")
@@ -464,13 +489,60 @@ def validate_comments(
     return normalized
 
 
+def normalize_body(value: Any) -> str:
+    """Normalize only line endings, which GitHub may rewrite in transit.
+
+    Nothing else is normalized, because trailing spaces are Markdown hard breaks
+    and leading indentation can define a code block, so stripping either could
+    hide a comment that did not land as written.
+    """
+    return str(value).replace("\r\n", "\n").replace("\r", "\n")
+
+
 def comment_signature(comment: dict[str, Any]) -> tuple[str, int, str, str]:
     return (
         str(comment.get("path")),
         int(comment.get("line") or 0),
         str(comment.get("side")),
-        str(comment.get("body")),
+        normalize_body(comment.get("body")),
     )
+
+
+def resolve_actual_comment(
+    comment: dict[str, Any],
+    positions: dict[str, dict[int, tuple[str, int]]],
+) -> dict[str, Any]:
+    """Fill in ``line`` and ``side`` for a comment GitHub locates only by position.
+
+    ``GET /repos/{owner}/{repo}/pulls/{n}/reviews/{id}/comments`` returns the
+    legacy comment shape, which carries ``position`` but no ``line`` or ``side``
+    at all, so a review's own comments can only be located through the diff.
+    """
+    line = comment.get("line")
+    side = comment.get("side")
+    if (
+        not isinstance(line, bool)
+        and isinstance(line, int)
+        and isinstance(side, str)
+        and side in {"LEFT", "RIGHT"}
+    ):
+        return comment
+    path = str(comment.get("path"))
+    position = comment.get("position")
+    if position is None:
+        position = comment.get("original_position")
+    if isinstance(position, bool) or not isinstance(position, int):
+        raise WorkflowError(
+            f"comment on {path} reports neither a line and side nor a diff position"
+        )
+    resolved = positions.get(path, {}).get(position)
+    if resolved is None:
+        raise WorkflowError(
+            f"comment on {path} has diff position {position}, "
+            "which is not a changed line in the authoritative diff"
+        )
+    resolved_side, resolved_line = resolved
+    return {**comment, "line": resolved_line, "side": resolved_side}
 
 
 def verify_created_review(
@@ -478,6 +550,7 @@ def verify_created_review(
     viewer: str,
     review_id: int,
     expected_comments: list[dict[str, Any]],
+    anchors: dict[str, dict[str, dict[int, int]]],
 ) -> dict[str, Any]:
     endpoint = f"repos/{pr['repo_name']}/pulls/{pr['number']}/reviews/{review_id}"
     review = gh_json(["api", endpoint])
@@ -496,7 +569,11 @@ def verify_created_review(
         raise WorkflowError(
             f"created review {review_id} is not a viewer-owned PENDING review"
         )
-    actual_comments = gh_paginated(f"{endpoint}/comments?per_page=100")
+    positions = positions_by_path(anchors)
+    actual_comments = [
+        resolve_actual_comment(comment, positions)
+        for comment in gh_paginated(f"{endpoint}/comments?per_page=100")
+    ]
     expected = Counter(comment_signature(comment) for comment in expected_comments)
     actual = Counter(comment_signature(comment) for comment in actual_comments)
     if actual != expected:
@@ -514,7 +591,7 @@ def preflight(
 ) -> tuple[
     dict[str, Any],
     str,
-    dict[str, dict[str, set[int]]],
+    dict[str, dict[str, dict[int, int]]],
     str | None,
     dict[str, Any] | None,
     list[dict[str, Any]],
@@ -577,7 +654,7 @@ def command_post(args: argparse.Namespace) -> None:
     if isinstance(review_id, bool) or not isinstance(review_id, int):
         raise WorkflowError("review creation returned no numeric review ID")
     try:
-        verified = verify_created_review(pr, viewer, review_id, comments)
+        verified = verify_created_review(pr, viewer, review_id, comments, anchors)
     except WorkflowError as error:
         created_url = review_url(pr, created)
         raise WorkflowError(
