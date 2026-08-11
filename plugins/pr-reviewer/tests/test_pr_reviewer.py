@@ -103,6 +103,32 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("derive an honest changed-line anchor", instructions)
         self.assertIn("fails rather than silently omitting them", instructions)
 
+    def test_evaluates_candidates_with_commit_and_related_pr_context(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "commit history, and explicitly linked issues or pull requests",
+            instructions,
+        )
+        self.assertIn(
+            "search the same repository's open pull requests for a related or "
+            "split-out fix",
+            instructions,
+        )
+        self.assertIn("Inspect only plausible matches", instructions)
+        self.assertIn(
+            "Do not perform an unbounded scan of all open pull requests", instructions
+        )
+        self.assertIn(
+            "all plausible related open pull requests found for this candidate",
+            instructions,
+        )
+        self.assertIn(
+            "State explicitly when the targeted search found no plausible related "
+            "open pull request",
+            instructions,
+        )
+
     def test_requires_a_claude_model_gate_before_any_review_work(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
