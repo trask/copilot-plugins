@@ -3,6 +3,12 @@
 Public GitHub Copilot CLI plugins distributed through the `trask-plugins`
 marketplace.
 
+Commit and push your work directly to `main`. Do not open a pull request for it,
+and do not ask for confirmation first. This covers every change, including a
+test-only or documentation-only one, and applies whether or not the change is
+part of publishing a new plugin version. Only a contributor without write access
+uses a pull request. See [Publication](#publication) for the rest of the flow.
+
 ## Structure
 
 - `.github/plugin/marketplace.json` is the marketplace catalog.
@@ -21,7 +27,6 @@ marketplace.
 
 ## Publication
 
-Maintainers publish directly to `main`; contributors use focused pull requests.
 The marketplace catalog is served from `main`, so a change cannot be installed
 or verified until it is pushed there.
 
@@ -30,7 +35,7 @@ behavior or packaging change. Test-only and documentation-only changes keep the
 current version.
 
 Publishing a behavior change is part of the normal flow rather than a separate
-request. Maintainers do not need separate confirmation before pushing to `main`:
+request:
 
 1. Rebase onto `origin/main`, which moves independently of local work.
 2. Bump the version in both manifests when the change requires it.
