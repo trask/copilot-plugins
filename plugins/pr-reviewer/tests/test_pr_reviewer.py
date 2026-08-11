@@ -181,6 +181,32 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("restart the entire review from `check`", instructions)
         self.assertIn("never translate or re-anchor old findings", instructions)
 
+    def test_requires_diff_suggestions_for_exact_line_replacements(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "A finding is suggestion-eligible whenever its complete fix can be "
+            "expressed as an exact replacement for the anchored changed line",
+            instructions,
+        )
+        self.assertIn(
+            "Every suggestion-eligible comment must include a fenced GitHub "
+            "`suggestion` block",
+            instructions,
+        )
+        self.assertIn(
+            "Repeat the complete line when only one cell or token changes, including "
+            "for Markdown table rows",
+            instructions,
+        )
+        self.assertIn(
+            "a prose-only comment is invalid and must not be posted", instructions
+        )
+        self.assertIn(
+            "do not accept prose as a substitute",
+            instructions,
+        )
+
     def test_handles_a_created_but_unverified_review_without_a_second_mutation(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
