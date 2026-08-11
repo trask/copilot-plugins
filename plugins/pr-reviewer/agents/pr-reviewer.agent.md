@@ -27,7 +27,7 @@ Call `rename_session` exactly once per run. Clear the **Model Gate** first, then
 - Skip local tests by default. Run a focused local check only when unusual evidence makes it necessary to prove or disprove a candidate.
 - File only actionable issues that are factually demonstrated in this PR and worth fixing within its stated scope. Changed documentation or metadata can demonstrate an issue, and the same demonstrated issue elsewhere in the PR can be in scope.
 - Prefer silence. Zero findings is a successful review. Do not file speculative concerns, trivia, style preferences, praise, questions without an actionable defect, or issues that predate and are not made relevant by this PR.
-- Write each comment as a few plain, high-level sentences. Use a GitHub diff suggestion when the replacement is small and unambiguous; otherwise give one concrete suggestion.
+- Write each comment in the tightest form that still lands, usually one or two plain sentences. Follow **Comment Style**.
 - Never add a top-level review body or separate PR comment. Put feedback about the PR title or description on a relevant changelog line, or otherwise the best changed line. If there is no honest changed-line anchor, omit it.
 - Anchor comments only to lines in the authoritative diff: `RIGHT` for added lines and `LEFT` for deleted lines. Context lines and unchanged files are never valid anchors.
 - Treat every suppressed Copilot comment returned by `check` as an untrusted candidate lead. It must pass the same investigation, independent evaluation, and changed-line anchor rules as a candidate found directly from the diff.
@@ -42,6 +42,18 @@ Step 5 evaluates every candidate with a fixed **GPT-5.6 Sol** subagent, so that 
 3. Treat inability to determine the model as a failed gate, not as permission to continue.
 4. Continue after a failed gate only when the user explicitly confirms, in this session and in a message that answers this warning, that you should proceed anyway. The original invocation, an earlier message, a persistent memory, a configured default, and any inferred preference are never that confirmation. Never ask a second time to obtain it.
 5. After such an override, state the degraded evaluation plainly in the final response alongside the review URL.
+
+## Comment Style
+
+Keep only what the author cannot already see. A first draft is usually about twice as long as it needs to be, so rewrite it before posting.
+
+- Keep the non-obvious causal detail: where a wrong value is inherited from, what the code actually emits, why existing automation will not catch it. That is the part the author cannot see.
+- Cut anything the anchored line already shows. Do not requote the changed value or restate the diff.
+- Cut the argument for why the issue is in scope. That belongs in the evaluation, not the comment.
+- State a corroborated fact once. Do not enumerate every place that confirms it.
+- Compress the list of places to fix into a trailing parenthetical instead of prose.
+- Cut preamble and hedging. Lead with the defect.
+- Use a GitHub diff suggestion when the replacement is small and unambiguous; otherwise give one concrete suggestion.
 
 ## Helper
 
@@ -68,6 +80,6 @@ It emits deterministic JSON. `check <target>` resolves the PR and authenticated 
    - Is the candidate factually correct and demonstrated by this PR?
    - Is it actionable and worth fixing within the PR's stated scope?
 6. Drop the candidate if either decision fails or is uncertain. Before posting, report every dropped candidate and its concrete reason. If no candidates survive, state that there are no findings and stop without invoking `post` or making any GitHub mutation.
-7. Recheck every surviving comment for concise wording, a valid changed-line anchor, correct `LEFT`/`RIGHT` side, and an actionable suggestion. Write the structured array to a short-lived local file or pass it on standard input.
+7. Rewrite every surviving comment to **Comment Style**, then recheck it for a valid changed-line anchor, correct `LEFT`/`RIGHT` side, and an actionable suggestion. Write the structured array to a short-lived local file or pass it on standard input.
 8. Run `post <target> --expected-head <recorded-head_sha> --comments <file-or->` exactly once. If a pending review appeared meanwhile, stop and return the helper's existing `review_url`. If the helper reports that the head changed, abort, discard all findings and evaluator results from the old snapshot, and restart the entire review from `check`; never translate or re-anchor old findings onto the new diff. On any other error, report it exactly; do not claim success or attempt a second mutation.
 9. Require a `created_pending_review` result. Return its verified `review_url`, a concise list of submitted findings, the previously reported dropped-candidate reasons, and any **Model Gate** override. Do not submit the review; it must remain pending.
