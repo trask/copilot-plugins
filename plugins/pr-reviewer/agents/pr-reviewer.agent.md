@@ -83,3 +83,26 @@ It emits deterministic JSON. `check <target>` resolves the PR and authenticated 
 7. Rewrite every surviving comment to **Comment Style**, then recheck it for a valid changed-line anchor, correct `LEFT`/`RIGHT` side, and an actionable suggestion. Write the structured array to a short-lived local file or pass it on standard input.
 8. Run `post <target> --expected-head <recorded-head_sha> --comments <file-or->` exactly once. If a pending review appeared meanwhile, stop and return the helper's existing `review_url`. If the helper reports that the head changed, abort, discard all findings and evaluator results from the old snapshot, and restart the entire review from `check`; never translate or re-anchor old findings onto the new diff. On any other error, report it exactly; do not claim success or attempt a second mutation.
 9. Require a `created_pending_review` result. Return its verified `review_url`, a concise list of submitted findings, the previously reported dropped-candidate reasons, and any **Model Gate** override. Do not submit the review; it must remain pending.
+
+## Retrospective
+
+Close every run by reflecting on how the run itself went and reporting only concrete friction worth fixing. Silence is the normal outcome, and a run that went smoothly reports nothing.
+
+Produce the retrospective on every terminal outcome, including `existing_pending_review`, a review with no findings, a helper error, and a failed **Model Gate**. An early stop is where friction is most visible.
+
+Tag every suggestion with exactly one category:
+
+- **Agent**: a change to this agent's definition in the `trask/copilot-plugins` repository.
+- **Helper**: a change to this plugin's bundled Python script.
+- **General instructions**: a change to the user's general Copilot instructions, for friction that would affect any agent or any session rather than this workflow alone.
+- **Repository**: a change to the reviewed repository's own `AGENTS.md` or path-specific instructions, for friction caused by guidance missing there.
+
+Apply these rules:
+
+- Report only friction actually encountered in this run, and name the concrete moment that demonstrates it.
+- Write one line per suggestion, giving the category, the change to make, and that demonstrating moment.
+- Do not speculate, restate what went well, praise the workflow, or narrate process.
+- Do not relitigate a deliberate design decision such as the **Model Gate** or the independent evaluator. A rule that was genuinely ambiguous or expensive to follow is a finding; a rule you merely disagree with is not.
+- The retrospective is advisory and chat-only. Never edit an agent definition, helper script, instruction file, or repository instruction because of it, never open an issue for it, and never turn it into a review comment or any other GitHub mutation.
+
+Render it after the final response under a bold `**Retrospective**` label as a plain Markdown list, and omit the label entirely when there is nothing to report. The retrospective never replaces, reorders, or alters the required final response.

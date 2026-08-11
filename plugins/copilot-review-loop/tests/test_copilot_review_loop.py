@@ -264,6 +264,46 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
 
+    def test_closes_every_run_with_a_categorized_retrospective(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn("## Retrospective", instructions)
+        self.assertIn(
+            "Silence is the normal outcome, and a run that went smoothly reports "
+            "nothing",
+            instructions,
+        )
+        self.assertIn(
+            "Produce the retrospective on every terminal outcome, including a clean "
+            "loop, an unfixable validation stop, `max_iterations_reached`, "
+            "`no_copilot_comments`, a helper error, and any watcher stop condition "
+            "such as `head_changed` or `review_dismissed`",
+            instructions,
+        )
+        for category in (
+            "- **Agent**:",
+            "- **Helper**:",
+            "- **General instructions**:",
+            "- **Repository**:",
+        ):
+            self.assertIn(category, instructions)
+        self.assertIn(
+            "Report only friction actually encountered in this run", instructions
+        )
+        self.assertIn(
+            "The **Retrospective** is the only content permitted after the "
+            "`**Outcome:**` line",
+            instructions,
+        )
+        self.assertIn("The retrospective is advisory and chat-only", instructions)
+        self.assertIn(
+            "never turn it into a thread reply, commit, or any other GitHub mutation",
+            instructions,
+        )
+        self.assertIn(
+            "omit the label entirely when there is nothing to report", instructions
+        )
+
 
 class ParseTargetTest(unittest.TestCase):
     def test_ignores_a_pasted_review_fragment(self):

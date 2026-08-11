@@ -127,6 +127,44 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("restart the entire review from `check`", instructions)
         self.assertIn("never translate or re-anchor old findings", instructions)
 
+    def test_closes_every_run_with_a_categorized_retrospective(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn("## Retrospective", instructions)
+        self.assertIn(
+            "Silence is the normal outcome, and a run that went smoothly reports "
+            "nothing",
+            instructions,
+        )
+        self.assertIn(
+            "Produce the retrospective on every terminal outcome, including "
+            "`existing_pending_review`, a review with no findings, a helper error, "
+            "and a failed **Model Gate**",
+            instructions,
+        )
+        for category in (
+            "- **Agent**:",
+            "- **Helper**:",
+            "- **General instructions**:",
+            "- **Repository**:",
+        ):
+            self.assertIn(category, instructions)
+        self.assertIn(
+            "Report only friction actually encountered in this run", instructions
+        )
+        self.assertIn("The retrospective is advisory and chat-only", instructions)
+        self.assertIn(
+            "never turn it into a review comment or any other GitHub mutation",
+            instructions,
+        )
+        self.assertIn(
+            "omit the label entirely when there is nothing to report", instructions
+        )
+        self.assertIn(
+            "never replaces, reorders, or alters the required final response",
+            instructions,
+        )
+
 
 class ParseTargetTest(unittest.TestCase):
     def test_parses_url_and_short_target(self):

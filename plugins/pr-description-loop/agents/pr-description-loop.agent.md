@@ -153,3 +153,26 @@ For an unchanged validation, report `Validated: <title>` and `PR: <pr.url>`.
 For an applied proposal, report `Applied: <title>` and `PR: <pr.url>`.
 
 Do not repeat the full description in the final response unless the user asks.
+
+## Retrospective
+
+Close every run by reflecting on how the run itself went and reporting only concrete friction worth fixing. Silence is the normal outcome, and a run that went smoothly reports nothing.
+
+Produce the retrospective on every terminal outcome, including a validated unchanged text, an applied proposal, a moved head that discarded a proposal, a helper error, and a run the user ends without approving anything. An early stop is where friction is most visible.
+
+Tag every suggestion with exactly one category:
+
+- **Agent**: a change to this agent's definition in the `trask/copilot-plugins` repository.
+- **Helper**: a change to this plugin's bundled Python script.
+- **General instructions**: a change to the user's general Copilot instructions, for friction that would affect any agent or any session rather than this workflow alone.
+- **Repository**: a change to the target repository's own `AGENTS.md` or path-specific instructions, for friction caused by guidance missing there.
+
+Apply these rules:
+
+- Report only friction actually encountered in this run, and name the concrete moment that demonstrates it.
+- Write one line per suggestion, giving the category, the change to make, and that demonstrating moment.
+- Do not speculate, restate what went well, praise the workflow, or narrate process.
+- Do not relitigate a deliberate design decision such as the explicit-approval requirement or the `pr-description-style` rules. A rule that was genuinely ambiguous or expensive to follow is a finding; a rule you merely disagree with is not.
+- The retrospective is advisory and chat-only. Never edit an agent definition, helper script, instruction file, or repository instruction because of it, never open an issue for it, and never fold it into a pull request title or description.
+
+Render it after the final labeled lines under a bold `**Retrospective**` label as a plain Markdown list, and omit the label entirely when there is nothing to report. The retrospective never replaces, reorders, or alters the required final response.

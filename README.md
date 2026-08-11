@@ -58,6 +58,16 @@ when the user approves, or iterates on a focused replacement and applies it only
 after explicit approval. Every accepted outcome is verified against the pinned
 pull request head and exact live text.
 
+## Retrospectives
+
+Every agent closes a run by reflecting on how the run itself went and reporting
+concrete friction that could be removed, tagged as a change to the agent
+definition, the bundled helper script, the user's general Copilot instructions,
+or the target repository's own instructions. Suggestions are advisory and
+chat-only, they are based solely on friction actually encountered in that run,
+and a run that went smoothly reports nothing. A run that stopped early still
+reports, because that is where friction is most visible.
+
 ## Update
 
 ```bash

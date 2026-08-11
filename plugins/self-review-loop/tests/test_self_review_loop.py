@@ -194,6 +194,42 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
+    def test_closes_every_run_with_a_categorized_retrospective(self):
+        self.assertIn("## Retrospective", self.instructions)
+        self.assertIn(
+            "Silence is the normal outcome, and a run that went smoothly reports "
+            "nothing",
+            self.instructions,
+        )
+        self.assertIn(
+            "Produce the retrospective on every terminal outcome, including a clean "
+            "pass, an unfixable validation stop, `max_iterations_reached`, "
+            "`nothing_to_publish`, a helper error, and a failed **Model Gate**",
+            self.instructions,
+        )
+        for category in (
+            "- **Agent**:",
+            "- **Helper**:",
+            "- **General instructions**:",
+            "- **Repository**:",
+        ):
+            self.assertIn(category, self.instructions)
+        self.assertIn(
+            "Report only friction actually encountered in this run", self.instructions
+        )
+        self.assertIn(
+            "The **Retrospective** is the only content permitted after the `**PR:**` "
+            "line",
+            self.instructions,
+        )
+        self.assertIn("The retrospective is advisory and chat-only", self.instructions)
+        self.assertIn(
+            "never commit it or push it as part of this loop", self.instructions
+        )
+        self.assertIn(
+            "omit the label entirely when there is nothing to report", self.instructions
+        )
+
 
 class TargetParsingTest(unittest.TestCase):
     def test_accepts_urls_and_short_targets(self):

@@ -190,4 +190,27 @@ Keep chat as a compact index because reasoning lives in git. Render ordinary Mar
 
 The backticks above delimit templates only; do not include them in the final response. For a preflight-only clean exit, build the same link from `head_review_id` and `head_review_url`. Never print a bare review ID when its URL is available. For a capped or interrupted run, use `**Outcome:** <exact stop condition> after <n> iteration(s).` and append the same review link when the terminal helper result includes a review ID and URL. Mention uncommitted work only for an unfixable validation stop. Do not repeat Copilot comments, analysis, upsides, downsides, validation success, or publication mechanics in chat.
 
-In every outcome, `<n>` is the run-local iteration counter, not the helper's cumulative persisted iteration count. A run that exits clean during its first preflight reports `0 iterations`; a run that begins with four persisted iterations and publishes once reports `1 iteration`.
+In every outcome, `<n>` is the run-local iteration counter, not the helper's cumulative persisted iteration count. A run that exits clean during its first preflight reports `0 iterations`; a run that begins with four persisted iterations and publishes once reports `1 iteration`. The **Retrospective** is the only content permitted after the `**Outcome:**` line.
+
+## Retrospective
+
+Close every run by reflecting on how the run itself went and reporting only concrete friction worth fixing. Silence is the normal outcome, and a run that went smoothly reports nothing.
+
+Produce the retrospective on every terminal outcome, including a clean loop, an unfixable validation stop, `max_iterations_reached`, `no_copilot_comments`, a helper error, and any watcher stop condition such as `head_changed` or `review_dismissed`. An early stop is where friction is most visible.
+
+Tag every suggestion with exactly one category:
+
+- **Agent**: a change to this agent's definition in the `trask/copilot-plugins` repository.
+- **Helper**: a change to this plugin's bundled Python script.
+- **General instructions**: a change to the user's general Copilot instructions, for friction that would affect any agent or any session rather than this workflow alone.
+- **Repository**: a change to the reviewed repository's own `AGENTS.md` or path-specific instructions, for friction caused by guidance missing there.
+
+Apply these rules:
+
+- Report only friction actually encountered in this run, and name the concrete moment that demonstrates it.
+- Write one line per suggestion, giving the category, the change to make, and that demonstrating moment.
+- Do not speculate, restate what went well, praise the workflow, or narrate process.
+- Do not relitigate a deliberate design decision such as the iteration cap or the synchronous watcher. A rule that was genuinely ambiguous or expensive to follow is a finding; a rule you merely disagree with is not.
+- The retrospective is advisory and chat-only. Never edit an agent definition, helper script, instruction file, or repository instruction because of it, never open an issue for it, and never turn it into a thread reply, commit, or any other GitHub mutation.
+
+Render it after the final response under a bold `**Retrospective**` label as a plain Markdown list, and omit the label entirely when there is nothing to report. The retrospective never replaces, reorders, or alters the required final compact index.

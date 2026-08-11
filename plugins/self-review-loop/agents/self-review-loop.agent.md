@@ -164,4 +164,27 @@ Keep chat as a compact index because the reasoning lives in git. Render ordinary
 - `**Outcome:** clean after <n> iteration(s).`
 - `**PR:** [#<pr.number> <pr.title>](<pr.pr_url>)`
 
-The backticks above delimit templates only; do not include them in the final response. For a capped or interrupted run, use `**Outcome:** <exact stop condition> after <n> iteration(s).` Always end with the linked `**PR:**` line so the pull request is directly accessible. Mention uncommitted work only for an unfixable validation stop. Report dropped candidates only as a count unless the user asks for detail, and do not repeat findings, analysis, upsides, downsides, validation success, or publication mechanics in chat.
+The backticks above delimit templates only; do not include them in the final response. For a capped or interrupted run, use `**Outcome:** <exact stop condition> after <n> iteration(s).` Always end with the linked `**PR:**` line so the pull request is directly accessible. Mention uncommitted work only for an unfixable validation stop. Report dropped candidates only as a count unless the user asks for detail, and do not repeat findings, analysis, upsides, downsides, validation success, or publication mechanics in chat. The **Retrospective** is the only content permitted after the `**PR:**` line.
+
+## Retrospective
+
+Close every run by reflecting on how the run itself went and reporting only concrete friction worth fixing. Silence is the normal outcome, and a run that went smoothly reports nothing.
+
+Produce the retrospective on every terminal outcome, including a clean pass, an unfixable validation stop, `max_iterations_reached`, `nothing_to_publish`, a helper error, and a failed **Model Gate**. An early stop is where friction is most visible.
+
+Tag every suggestion with exactly one category:
+
+- **Agent**: a change to this agent's definition in the `trask/copilot-plugins` repository.
+- **Helper**: a change to this plugin's bundled Python script.
+- **General instructions**: a change to the user's general Copilot instructions, for friction that would affect any agent or any session rather than this workflow alone.
+- **Repository**: a change to the reviewed repository's own `AGENTS.md` or path-specific instructions, for friction caused by guidance missing there.
+
+Apply these rules:
+
+- Report only friction actually encountered in this run, and name the concrete moment that demonstrates it.
+- Write one line per suggestion, giving the category, the change to make, and that demonstrating moment.
+- Do not speculate, restate what went well, praise the workflow, or narrate process.
+- Do not relitigate a deliberate design decision such as the **Model Gate** or the independent evaluator. A rule that was genuinely ambiguous or expensive to follow is a finding; a rule you merely disagree with is not.
+- The retrospective is advisory and chat-only. Never edit an agent definition, helper script, instruction file, or repository instruction because of it, never open an issue for it, and never commit it or push it as part of this loop.
+
+Render it after the final response under a bold `**Retrospective**` label as a plain Markdown list, and omit the label entirely when there is nothing to report. The retrospective never replaces, reorders, or alters the required final response.
