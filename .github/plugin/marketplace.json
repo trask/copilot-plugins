@@ -17,7 +17,7 @@
     {
       "name": "copilot-review-loop",
       "description": "Address Copilot pull request review comments, publish fixes, and repeat until the review is clean.",
-      "version": "1.0.16",
+      "version": "1.0.17",
       "source": "./plugins/copilot-review-loop"
     },
     {

@@ -23,7 +23,7 @@ This agent handles Copilot review comments only. Comments from human reviewers a
 
 - Never wait for `next`, `commit`, `looks good`, `publish`, or `push etc`. Run the autonomous loop continuously until it is clean, the iteration cap is reached, or a stop condition fires.
 - The loop is `preflight -> investigate -> batch -> commit -> publish -> watch`, repeated for each new Copilot review.
-- The maximum is 5 iterations. Respect `max_iterations_reached` before editing; do not bypass it.
+- The maximum is 5 iterations per invocation. Respect `max_iterations_reached` before editing; do not bypass it.
 - Initialize a run-local iteration counter to 0 before the first preflight. Increment it once after each successful `publish` in this invocation. Never initialize it from or replace it with the helper's persisted PR-scoped iteration count.
 - Group comments that share one root cause into one batch and one commit. Keep unrelated causes in separate commits even when they are close together.
 - Every code-change commit must durably record the original comment, technical analysis, and concrete upsides and downsides using **Commit And Reply Content**.
@@ -51,7 +51,7 @@ Never pass a `~`-prefixed helper path to native Windows Python from Git Bash.
 
 The deterministic, JSON-only helper provides:
 
-- `preflight [target] [--max-iterations 5]`: resolve and check out the PR, require a clean worktree, verify its head, fetch thread and suppressed comments, enforce the iteration cap, and initialize external state
+- `preflight [target] [--max-iterations 5] [--completed-run-iterations <n>]`: resolve and check out the PR, require a clean worktree, verify its head, fetch thread and suppressed comments, enforce the per-invocation iteration cap, and initialize external state
 - `plan`, `refresh`, `record`, and `skip`: maintain batch and comment state
 - `status --current --repo-root <workspace>`: return only the workflow state attached to the current branch's PR
 - `publish`: push only when needed, post each thread reply idempotently as its own published comment, resolve thread comments, request Copilot even without a new commit, and verify publication
@@ -72,7 +72,7 @@ The workflow always covers the entire Copilot queue for one pull request. A past
 2. For a targetless `watch`, `resume`, or `continue`, run `status --current --repo-root <workspace>`. If monitoring is `requested` or `running`, resume `watch` with that state. If monitoring completed with comments, run `preflight` for that same PR. If no resumable state exists, report it; do not fall back to another PR.
 3. For any other targetless request, run `preflight --repo-root <workspace>` with no target so the helper resolves the PR attached to the currently checked-out branch.
 4. If a watcher belongs to a different requested PR, use `cancel-watch` and wait for cancellation before starting over.
-5. Run `preflight` once. Stop on its exact error; never stash, reset, discard, or force local work to make it pass.
+5. Run `preflight --completed-run-iterations <n>` once, where `<n>` is the run-local iteration counter. Pass the current counter on every later preflight in the same invocation. Stop on its exact error; never stash, reset, discard, or force local work to make it pass.
 6. Handle results as follows:
    - `ready`: continue immediately with investigation and batching.
    - `review_required`: the queue is empty but the current head has no clean Copilot review. Run `publish --state <path> --no-comments` immediately, then continue with the normal synchronous `watch` flow.
@@ -179,7 +179,7 @@ After all batches in the iteration are recorded:
    - `review_comments`: run `preflight` on the same PR and begin the next iteration immediately.
    - `head_changed`, `request_cancelled`, `review_dismissed`, `cancelled_locally`, or `stopped`: stop and include that exact outcome in the final compact index.
 
-The helper increments the persisted iteration count only after successful publication. A later preflight stops before iteration 6.
+The helper increments the persisted total iteration count only after successful publication for workflow history. It enforces the cap from `--completed-run-iterations`, so persisted iterations from earlier invocations never consume the current invocation's five-iteration budget.
 
 ## Final Response
 

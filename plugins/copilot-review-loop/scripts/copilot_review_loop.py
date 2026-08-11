@@ -820,9 +820,10 @@ def command_preflight(args: argparse.Namespace) -> None:
         state["copilot_bot_id"] = bot_id
     save_state(state_path, state)
     max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
-    iteration = state["iterations"] + 1
+    completed_run_iterations = getattr(args, "completed_run_iterations", 0)
+    iteration = completed_run_iterations + 1
     review_required = not comments and not head_review_clean
-    if (comments or review_required) and state["iterations"] >= max_iterations:
+    if (comments or review_required) and completed_run_iterations >= max_iterations:
         result = "max_iterations_reached"
     elif comments:
         result = "ready"
@@ -846,7 +847,9 @@ def command_preflight(args: argparse.Namespace) -> None:
             "head_review_url": head_review.get("html_url") if head_review else None,
             "head_review_clean": head_review_clean,
             "iteration": iteration,
+            "completed_run_iterations": completed_run_iterations,
             "max_iterations": max_iterations,
+            "total_iterations": state["iterations"],
             "pr": metadata,
         }
     )
@@ -1623,6 +1626,7 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument(
         "--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS
     )
+    preflight.add_argument("--completed-run-iterations", type=int, default=0)
     preflight.set_defaults(function=command_preflight)
 
     plan = subparsers.add_parser("plan", help="record one planned review batch")

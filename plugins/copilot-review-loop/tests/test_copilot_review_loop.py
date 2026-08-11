@@ -136,7 +136,7 @@ class AgentInstructionsTest(unittest.TestCase):
             "preflight -> investigate -> batch -> commit -> publish -> watch",
             instructions,
         )
-        self.assertIn("maximum is 5 iterations", instructions)
+        self.assertIn("maximum is 5 iterations per invocation", instructions)
         self.assertNotIn("## Approval And Advancement", instructions)
         self.assertNotIn("## Revision, Revert, And Skip", instructions)
 
@@ -219,6 +219,14 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn(
             "begins with four persisted iterations and publishes once reports `1 iteration`",
+            instructions,
+        )
+        self.assertIn(
+            "`preflight --completed-run-iterations <n>`", instructions
+        )
+        self.assertIn(
+            "persisted iterations from earlier invocations never consume the current "
+            "invocation's five-iteration budget",
             instructions,
         )
 
@@ -1751,6 +1759,7 @@ class PreflightTargetTest(unittest.TestCase):
         threads=None,
         reviews=None,
         iterations=0,
+        completed_run_iterations=0,
         max_iterations=5,
         local_branch="branch",
         checked_out_branch=True,
@@ -1781,6 +1790,7 @@ class PreflightTargetTest(unittest.TestCase):
                 repo_root=directory,
                 state=str(path),
                 max_iterations=max_iterations,
+                completed_run_iterations=completed_run_iterations,
             )
 
             with (
@@ -2044,12 +2054,25 @@ class PreflightTargetTest(unittest.TestCase):
         self.assertEqual(payload["skipped_authors"], ["reviewer"])
         self.assertEqual(payload["queue"]["comments"], [])
 
-    def test_preflight_caps_empty_review_required_iteration(self):
+    def test_preflight_ignores_persisted_iterations_for_run_cap(self):
         payload = self.run_preflight(iterations=5, max_iterations=5)
+
+        self.assertEqual(payload["result"], "review_required")
+        self.assertEqual(payload["iteration"], 1)
+        self.assertEqual(payload["completed_run_iterations"], 0)
+        self.assertEqual(payload["max_iterations"], 5)
+        self.assertEqual(payload["total_iterations"], 5)
+
+    def test_preflight_caps_empty_review_required_iteration_for_current_run(self):
+        payload = self.run_preflight(
+            iterations=12, completed_run_iterations=5, max_iterations=5
+        )
 
         self.assertEqual(payload["result"], "max_iterations_reached")
         self.assertEqual(payload["iteration"], 6)
+        self.assertEqual(payload["completed_run_iterations"], 5)
         self.assertEqual(payload["max_iterations"], 5)
+        self.assertEqual(payload["total_iterations"], 12)
 
     def test_preflight_stops_at_the_iteration_cap(self):
         metadata = {"head_branch": "branch", "head_sha": "head"}
@@ -2097,6 +2120,7 @@ class PreflightTargetTest(unittest.TestCase):
                 repo_root=directory,
                 state=str(path),
                 max_iterations=5,
+                completed_run_iterations=5,
             )
 
             with (
@@ -2114,6 +2138,7 @@ class PreflightTargetTest(unittest.TestCase):
         payload = emit.call_args.args[0]
         self.assertEqual(payload["result"], "max_iterations_reached")
         self.assertEqual(payload["iteration"], 6)
+        self.assertEqual(payload["completed_run_iterations"], 5)
         self.assertEqual(payload["max_iterations"], 5)
 
 
