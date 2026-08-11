@@ -89,12 +89,27 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("disable-model-invocation: true", instructions)
         self.assertIn("gh pr diff", instructions)
         self.assertIn(
-            "more specific than generic peer-review context or workspace "
-            "`<pr_diff_instructions>`",
+            "The authoritative changeset is the helper `check` result's "
+            "`authoritative_diff`",
             instructions,
         )
         self.assertIn(
-            "If a higher-priority instruction forbids it, stop and report the conflict",
+            "Never invoke `gh pr diff` separately",
+            instructions,
+        )
+        self.assertIn("`get_changes_overview`", instructions)
+        self.assertIn(
+            "Use `authoritative_diff` from the same `check` result as the complete "
+            "patch",
+            instructions,
+        )
+        self.assertIn("do not fetch the diff again through any tool", instructions)
+        self.assertIn(
+            "capturing its complete JSON result in a short-lived local file",
+            instructions,
+        )
+        self.assertIn(
+            "cannot be lost to terminal-output truncation",
             instructions,
         )
         self.assertIn("GPT-5.6 Sol", instructions)
@@ -868,7 +883,7 @@ class PendingReviewTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "preflight",
-                return_value=(pr, "viewer", {}, pending_url, None, [], []),
+                return_value=(pr, "viewer", {}, pending_url, None, [], [], None),
             ),
             mock.patch.object(MODULE, "emit") as emit,
         ):
@@ -918,6 +933,7 @@ class PendingReviewTest(unittest.TestCase):
                             "body": "Please split this into a follow-up.",
                         }
                     ],
+                    DIFF,
                 ),
             ) as preflight,
             mock.patch.object(MODULE, "emit") as emit,
@@ -929,6 +945,7 @@ class PendingReviewTest(unittest.TestCase):
         self.assertEqual(payload["head_sha"], "abc123")
         self.assertEqual(payload["pr_number"], 42)
         self.assertEqual(payload["pr_title"], "Fix the reviewer")
+        self.assertEqual(payload["authoritative_diff"], DIFF)
         self.assertEqual(payload["copilot_review"]["id"], 10)
         self.assertEqual(payload["suppressed_comments"][0]["path"], "src/one.py")
         self.assertEqual(payload["issue_comments"][0]["author"], "maintainer")
@@ -950,7 +967,7 @@ class PendingReviewTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "preflight",
-                return_value=(pr, "viewer", anchors, None, None, [], []),
+                return_value=(pr, "viewer", anchors, None, None, [], [], DIFF),
             ),
             mock.patch.object(MODULE, "emit") as emit,
         ):
@@ -960,6 +977,7 @@ class PendingReviewTest(unittest.TestCase):
         self.assertIsNone(payload["copilot_review"])
         self.assertEqual(payload["suppressed_comments"], [])
         self.assertEqual(payload["issue_comments"], [])
+        self.assertEqual(payload["authoritative_diff"], DIFF)
 
 
 class ResolvePrTest(unittest.TestCase):
@@ -1023,6 +1041,23 @@ class HeadStabilityTest(unittest.TestCase):
             ):
                 MODULE.preflight(self.pr["pr_url"])
 
+    def test_preflight_returns_the_exact_authoritative_diff(self):
+        with (
+            mock.patch.object(
+                MODULE, "resolve_pr", side_effect=[self.pr, self.pr]
+            ),
+            mock.patch.object(MODULE, "resolve_viewer", return_value="viewer"),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
+            mock.patch.object(MODULE, "find_pending_review", return_value=None),
+            mock.patch.object(
+                MODULE, "fetch_authoritative_diff", return_value=DIFF
+            ) as fetch_diff,
+        ):
+            result = MODULE.preflight(self.pr["pr_url"])
+
+        self.assertEqual(result[-1], DIFF)
+        fetch_diff.assert_called_once_with(self.pr)
+
     def test_post_preflight_rejects_head_changed_since_check_before_other_calls(self):
         changed = {**self.pr, "head_sha": "def456"}
         with (
@@ -1081,7 +1116,16 @@ class PostingTest(unittest.TestCase):
                 mock.patch.object(
                     MODULE,
                     "preflight",
-                    return_value=(self.pr, "viewer", self.anchors, None, None, [], []),
+                    return_value=(
+                        self.pr,
+                        "viewer",
+                        self.anchors,
+                        None,
+                        None,
+                        [],
+                        [],
+                        DIFF,
+                    ),
                 ) as preflight,
                 mock.patch.object(MODULE, "gh_json", return_value=created) as gh_json,
                 mock.patch.object(
@@ -1124,7 +1168,16 @@ class PostingTest(unittest.TestCase):
                 mock.patch.object(
                     MODULE,
                     "preflight",
-                    return_value=(self.pr, "viewer", self.anchors, None, None, [], []),
+                    return_value=(
+                        self.pr,
+                        "viewer",
+                        self.anchors,
+                        None,
+                        None,
+                        [],
+                        [],
+                        DIFF,
+                    ),
                 ),
                 mock.patch.object(MODULE, "gh_json", return_value=created),
                 mock.patch.object(
@@ -1153,7 +1206,16 @@ class PostingTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "preflight",
-                return_value=(self.pr, "viewer", self.anchors, None, None, [], []),
+                return_value=(
+                    self.pr,
+                    "viewer",
+                    self.anchors,
+                    None,
+                    None,
+                    [],
+                    [],
+                    DIFF,
+                ),
             ),
             mock.patch.object(MODULE, "load_comments", return_value=self.comments),
             mock.patch.object(
@@ -1185,7 +1247,16 @@ class PostingTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "preflight",
-                return_value=(changed, "viewer", self.anchors, None, None, [], []),
+                return_value=(
+                    changed,
+                    "viewer",
+                    self.anchors,
+                    None,
+                    None,
+                    [],
+                    [],
+                    DIFF,
+                ),
             ),
             mock.patch.object(MODULE, "load_comments") as load_comments,
             mock.patch.object(MODULE, "gh_json") as gh_json,

@@ -751,6 +751,7 @@ def preflight(
     dict[str, Any] | None,
     list[dict[str, Any]],
     list[dict[str, Any]],
+    str | None,
 ]:
     pr = resolve_pr(parse_target(target_value))
     if expected_head is not None:
@@ -759,8 +760,9 @@ def preflight(
     reviews = fetch_reviews(pr)
     pending = find_pending_review(reviews, viewer)
     if pending is not None:
-        return pr, viewer, {}, review_url(pr, pending), None, [], []
-    anchors = parse_unified_diff(fetch_authoritative_diff(pr))
+        return pr, viewer, {}, review_url(pr, pending), None, [], [], None
+    authoritative_diff = fetch_authoritative_diff(pr)
+    anchors = parse_unified_diff(authoritative_diff)
     copilot_review, suppressed_comments = suppressed_comments_for_head(
         reviews, pr["head_sha"]
     )
@@ -776,6 +778,7 @@ def preflight(
         copilot_review,
         suppressed_comments,
         issue_comments,
+        authoritative_diff,
     )
 
 
@@ -788,6 +791,7 @@ def command_check(args: argparse.Namespace) -> None:
         copilot_review,
         suppressed_comments,
         issue_comments,
+        authoritative_diff,
     ) = preflight(args.target, include_issue_comments=True)
     if pending_url:
         emit({"result": "existing_pending_review", "review_url": pending_url})
@@ -801,6 +805,7 @@ def command_check(args: argparse.Namespace) -> None:
             "head_sha": pr["head_sha"],
             "viewer": viewer,
             "changed_files": sorted(anchors),
+            "authoritative_diff": authoritative_diff,
             "copilot_review": copilot_review,
             "suppressed_comments": suppressed_comments,
             "issue_comments": issue_comments,
@@ -809,7 +814,7 @@ def command_check(args: argparse.Namespace) -> None:
 
 
 def command_post(args: argparse.Namespace) -> None:
-    pr, viewer, anchors, pending_url, _, _, _ = preflight(
+    pr, viewer, anchors, pending_url, _, _, _, _ = preflight(
         args.target, args.expected_head
     )
     ensure_expected_head(pr, args.expected_head)
