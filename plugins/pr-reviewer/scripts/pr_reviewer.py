@@ -376,7 +376,7 @@ def decode_diff_path(value: str) -> str | None:
 
 
 def parse_unified_diff(diff_text: str) -> dict[str, dict[str, dict[int, int]]]:
-    """Map every changed line to its 1-based position in the file's unified diff.
+    """Map changed lines to positions and all hunk lines to their hunk IDs.
 
     GitHub counts positions down from a file's first ``@@`` header, which itself
     is position 0, and every later line in that file counts, including
@@ -391,6 +391,7 @@ def parse_unified_diff(diff_text: str) -> dict[str, dict[str, dict[int, int]]]:
     position = 0
     seen_hunk = False
     in_hunk = False
+    hunk_id = 0
 
     def finish_hunk() -> None:
         nonlocal in_hunk
@@ -405,6 +406,7 @@ def parse_unified_diff(diff_text: str) -> dict[str, dict[str, dict[int, int]]]:
             old_path = new_path = path = None
             position = 0
             seen_hunk = False
+            hunk_id = 0
             continue
         if not in_hunk and raw_line.startswith("--- "):
             old_path = decode_diff_path(raw_line[4:])
@@ -414,7 +416,15 @@ def parse_unified_diff(diff_text: str) -> dict[str, dict[str, dict[int, int]]]:
             path = new_path or old_path
             if path is None:
                 raise WorkflowError("PR diff file has no usable path")
-            anchors.setdefault(path, {"LEFT": {}, "RIGHT": {}})
+            anchors.setdefault(
+                path,
+                {
+                    "LEFT": {},
+                    "RIGHT": {},
+                    "LEFT_LINES": {},
+                    "RIGHT_LINES": {},
+                },
+            )
             continue
 
         hunk = HUNK_PATTERN.match(raw_line)
@@ -429,6 +439,7 @@ def parse_unified_diff(diff_text: str) -> dict[str, dict[str, dict[int, int]]]:
             if seen_hunk:
                 position += 1
             seen_hunk = True
+            hunk_id += 1
             in_hunk = True
             continue
         if not in_hunk:
@@ -438,13 +449,17 @@ def parse_unified_diff(diff_text: str) -> dict[str, dict[str, dict[int, int]]]:
             continue
         if raw_line.startswith("+"):
             anchors[path]["RIGHT"].setdefault(new_line, position)
+            anchors[path]["RIGHT_LINES"].setdefault(new_line, hunk_id)
             new_line += 1
             new_remaining -= 1
         elif raw_line.startswith("-"):
             anchors[path]["LEFT"].setdefault(old_line, position)
+            anchors[path]["LEFT_LINES"].setdefault(old_line, hunk_id)
             old_line += 1
             old_remaining -= 1
         elif raw_line.startswith(" "):
+            anchors[path]["LEFT_LINES"].setdefault(old_line, hunk_id)
+            anchors[path]["RIGHT_LINES"].setdefault(new_line, hunk_id)
             old_line += 1
             new_line += 1
             old_remaining -= 1
@@ -465,7 +480,8 @@ def positions_by_path(
 ) -> dict[str, dict[int, tuple[str, int]]]:
     resolved: dict[str, dict[int, tuple[str, int]]] = {}
     for path, sides in anchors.items():
-        for side, lines in sides.items():
+        for side in ("LEFT", "RIGHT"):
+            lines = sides[side]
             for line, position in lines.items():
                 resolved.setdefault(path, {})[position] = (side, line)
     return resolved
@@ -500,20 +516,24 @@ def validate_comments(
     if not comments:
         raise WorkflowError("at least one inline comment is required")
     normalized: list[dict[str, Any]] = []
-    expected_keys = {"path", "line", "side", "body"}
+    required_keys = {"path", "line", "side", "body"}
+    optional_keys = {"start_line", "start_side"}
     for index, comment in enumerate(comments):
         if not isinstance(comment, dict):
             raise WorkflowError(f"comment {index} must be an object")
-        unknown = set(comment) - expected_keys
-        missing = expected_keys - set(comment)
+        unknown = set(comment) - required_keys - optional_keys
+        missing = required_keys - set(comment)
         if unknown or missing:
             raise WorkflowError(
-                f"comment {index} must contain exactly path, line, side, and body"
+                f"comment {index} must contain path, line, side, and body, "
+                "with optional start_line and start_side"
             )
         path = comment["path"]
         line = comment["line"]
         side = comment["side"]
         body = comment["body"]
+        has_start_line = "start_line" in comment
+        has_start_side = "start_side" in comment
         if not isinstance(path, str) or not path:
             raise WorkflowError(f"comment {index} has an invalid path")
         if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
@@ -522,11 +542,70 @@ def validate_comments(
             raise WorkflowError(f"comment {index} side must be LEFT or RIGHT")
         if not isinstance(body, str) or not body.strip():
             raise WorkflowError(f"comment {index} body must not be empty")
-        if path not in anchors or line not in anchors[path][side]:
+        if has_start_line != has_start_side:
+            raise WorkflowError(
+                f"comment {index} must provide start_line and start_side together"
+            )
+        if path not in anchors:
             raise WorkflowError(
                 f"comment {index} anchor is not a changed {side} line: {path}:{line}"
             )
-        normalized.append({"path": path, "line": line, "side": side, "body": body})
+        if not has_start_line:
+            if line not in anchors[path][side]:
+                raise WorkflowError(
+                    f"comment {index} anchor is not a changed {side} line: "
+                    f"{path}:{line}"
+                )
+            normalized.append(
+                {"path": path, "line": line, "side": side, "body": body}
+            )
+            continue
+
+        start_line = comment["start_line"]
+        start_side = comment["start_side"]
+        if (
+            isinstance(start_line, bool)
+            or not isinstance(start_line, int)
+            or start_line <= 0
+        ):
+            raise WorkflowError(f"comment {index} has an invalid start_line")
+        if not isinstance(start_side, str) or start_side not in {"LEFT", "RIGHT"}:
+            raise WorkflowError(
+                f"comment {index} start_side must be LEFT or RIGHT"
+            )
+        if start_side != side:
+            raise WorkflowError(
+                f"comment {index} range must stay on the same diff side"
+            )
+        if start_line >= line:
+            raise WorkflowError(
+                f"comment {index} start_line must be less than line"
+            )
+        hunk_lines = anchors[path][f"{side}_LINES"]
+        start_hunk = hunk_lines.get(start_line)
+        end_hunk = hunk_lines.get(line)
+        if start_hunk is None or end_hunk is None or start_hunk != end_hunk:
+            raise WorkflowError(
+                f"comment {index} range must be within one {side} diff hunk"
+            )
+        changed_lines = anchors[path][side]
+        if not any(
+            changed_line in changed_lines
+            for changed_line in range(start_line, line + 1)
+        ):
+            raise WorkflowError(
+                f"comment {index} range contains no changed {side} line"
+            )
+        normalized.append(
+            {
+                "path": path,
+                "start_line": start_line,
+                "start_side": start_side,
+                "line": line,
+                "side": side,
+                "body": body,
+            }
+        )
     return normalized
 
 
@@ -540,9 +619,19 @@ def normalize_body(value: Any) -> str:
     return str(value).replace("\r\n", "\n").replace("\r", "\n")
 
 
-def comment_signature(comment: dict[str, Any]) -> tuple[str, int, str, str]:
+def comment_signature(
+    comment: dict[str, Any],
+) -> tuple[str, int | None, str | None, int, str, str]:
+    start_line = comment.get("start_line")
+    start_side = comment.get("start_side")
     return (
         str(comment.get("path")),
+        (
+            start_line
+            if isinstance(start_line, int) and not isinstance(start_line, bool)
+            else None
+        ),
+        start_side if isinstance(start_side, str) else None,
         int(comment.get("line") or 0),
         str(comment.get("side")),
         normalize_body(comment.get("body")),
@@ -561,29 +650,52 @@ def resolve_actual_comment(
     """
     line = comment.get("line")
     side = comment.get("side")
-    if (
+    has_line_location = (
         not isinstance(line, bool)
         and isinstance(line, int)
         and isinstance(side, str)
         and side in {"LEFT", "RIGHT"}
-    ):
-        return comment
+    )
     path = str(comment.get("path"))
-    position = comment.get("position")
-    if position is None:
-        position = comment.get("original_position")
-    if isinstance(position, bool) or not isinstance(position, int):
-        raise WorkflowError(
-            f"comment on {path} reports neither a line and side nor a diff position"
-        )
-    resolved = positions.get(path, {}).get(position)
-    if resolved is None:
-        raise WorkflowError(
-            f"comment on {path} has diff position {position}, "
-            "which is not a changed line in the authoritative diff"
-        )
-    resolved_side, resolved_line = resolved
-    return {**comment, "line": resolved_line, "side": resolved_side}
+    if not has_line_location:
+        position = comment.get("position")
+        if position is None:
+            position = comment.get("original_position")
+        if isinstance(position, bool) or not isinstance(position, int):
+            raise WorkflowError(
+                f"comment on {path} reports neither a line and side nor a diff position"
+            )
+        resolved = positions.get(path, {}).get(position)
+        if resolved is None:
+            raise WorkflowError(
+                f"comment on {path} has diff position {position}, "
+                "which is not a changed line in the authoritative diff"
+            )
+        side, line = resolved
+
+    start_line = comment.get("start_line")
+    if start_line is None:
+        start_line = comment.get("original_start_line")
+    if start_line is None:
+        return {
+            **comment,
+            "line": line,
+            "side": side,
+            "start_line": None,
+            "start_side": None,
+        }
+    if isinstance(start_line, bool) or not isinstance(start_line, int):
+        raise WorkflowError(f"comment on {path} has an invalid start line")
+    start_side = comment.get("start_side")
+    if not isinstance(start_side, str) or start_side not in {"LEFT", "RIGHT"}:
+        start_side = side
+    return {
+        **comment,
+        "line": line,
+        "side": side,
+        "start_line": start_line,
+        "start_side": start_side,
+    }
 
 
 def verify_created_review(

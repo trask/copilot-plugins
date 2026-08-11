@@ -115,7 +115,7 @@ class AgentInstructionsTest(unittest.TestCase):
             "from suppressed Copilot comments",
             instructions,
         )
-        self.assertIn("derive an honest changed-line anchor", instructions)
+        self.assertIn("derive an honest single-line or range anchor", instructions)
         self.assertIn("fails rather than silently omitting them", instructions)
 
     def test_evaluates_candidates_with_commit_and_related_pr_context(self):
@@ -181,29 +181,37 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("restart the entire review from `check`", instructions)
         self.assertIn("never translate or re-anchor old findings", instructions)
 
-    def test_requires_diff_suggestions_for_exact_line_replacements(self):
+    def test_prefers_contiguous_diff_suggestions_without_a_hard_line_limit(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn(
-            "A finding is suggestion-eligible whenever its complete fix can be "
-            "expressed as an exact replacement for the anchored changed line",
+            "whenever the complete fix can be expressed confidently as one contiguous "
+            "replacement in the PR diff",
             instructions,
         )
         self.assertIn(
-            "Every suggestion-eligible comment must include a fenced GitHub "
-            "`suggestion` block",
+            "There is no fixed line limit",
             instructions,
         )
         self.assertIn(
-            "Repeat the complete line when only one cell or token changes, including "
-            "for Markdown table rows",
+            "Suggestions of 10 lines or fewer are presumed appropriate",
             instructions,
         )
         self.assertIn(
-            "a prose-only comment is invalid and must not be posted", instructions
+            "longer suggestions remain preferred when the replacement is mechanical, "
+            "localized, and unambiguous",
+            instructions,
         )
         self.assertIn(
-            "do not accept prose as a substitute",
+            "Use prose only when the fix requires an author decision, affects disjoint "
+            "locations, depends on unavailable context, or cannot be represented "
+            "safely as one contiguous replacement",
+            instructions,
+        )
+        self.assertIn("use separate suggestions for independent ranges", instructions)
+        self.assertIn("`start_line` plus `start_side`", instructions)
+        self.assertIn(
+            "do not accept prose as a substitute or impose a hard line cap",
             instructions,
         )
 
@@ -447,6 +455,89 @@ class CommentValidationTest(unittest.TestCase):
         ]
 
         self.assertEqual(MODULE.validate_comments(comments, self.anchors), comments)
+
+    def test_accepts_a_multi_line_range_with_context_in_one_hunk(self):
+        comment = {
+            "path": "src/one.py",
+            "start_line": 2,
+            "start_side": "RIGHT",
+            "line": 4,
+            "side": "RIGHT",
+            "body": "Use this instead.\n```suggestion\nreplacement\n```",
+        }
+
+        self.assertEqual(
+            MODULE.validate_comments([comment], self.anchors),
+            [comment],
+        )
+
+    def test_rejects_an_incomplete_or_cross_side_range(self):
+        incomplete = {
+            "path": "src/one.py",
+            "start_line": 2,
+            "line": 4,
+            "side": "RIGHT",
+            "body": "Missing start side.",
+        }
+        cross_side = {
+            **incomplete,
+            "start_side": "LEFT",
+        }
+
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "provide start_line and start_side"
+        ):
+            MODULE.validate_comments([incomplete], self.anchors)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "same diff side"):
+            MODULE.validate_comments([cross_side], self.anchors)
+
+    def test_rejects_a_reversed_or_cross_hunk_range(self):
+        reversed_range = {
+            "path": "src/one.py",
+            "start_line": 4,
+            "start_side": "RIGHT",
+            "line": 2,
+            "side": "RIGHT",
+            "body": "Backwards.",
+        }
+        cross_hunk = {
+            **reversed_range,
+            "start_line": 4,
+            "line": 21,
+        }
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "less than line"):
+            MODULE.validate_comments([reversed_range], self.anchors)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "within one RIGHT diff hunk"):
+            MODULE.validate_comments([cross_hunk], self.anchors)
+
+    def test_rejects_a_range_without_a_changed_line(self):
+        anchors = MODULE.parse_unified_diff(
+            """\
+diff --git a/file.py b/file.py
+--- a/file.py
++++ b/file.py
+@@ -1,4 +1,4 @@
+ context one
+ context two
+-old
++new
+ context four
+"""
+        )
+        comment = {
+            "path": "file.py",
+            "start_line": 1,
+            "start_side": "RIGHT",
+            "line": 2,
+            "side": "RIGHT",
+            "body": "Only context.",
+        }
+
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "contains no changed RIGHT line"
+        ):
+            MODULE.validate_comments([comment], anchors)
 
     def test_rejects_context_anchor(self):
         comment = {
@@ -1225,6 +1316,65 @@ class PostingTest(unittest.TestCase):
 
         self.assertEqual(result, review)
         resolve_pr.assert_called_once_with(self.pr)
+
+    def test_review_verification_accepts_a_multi_line_pending_comment(self):
+        review = {
+            "id": 9,
+            "commit_id": self.pr["head_sha"],
+            "state": "PENDING",
+            "html_url": f"{self.pr['pr_url']}#pullrequestreview-9",
+            "user": {"login": "viewer"},
+        }
+        comment = {
+            "path": "src/one.py",
+            "start_line": 2,
+            "start_side": "RIGHT",
+            "line": 4,
+            "side": "RIGHT",
+            "body": "Use this.\n```suggestion\nreplacement\n```",
+        }
+        actual = [{**comment, "position": 5, "original_position": 5}]
+
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value=review),
+            mock.patch.object(MODULE, "gh_paginated", return_value=actual),
+            mock.patch.object(MODULE, "ensure_head_unchanged"),
+        ):
+            result = MODULE.verify_created_review(
+                self.pr, "viewer", review["id"], [comment], self.anchors
+            )
+
+        self.assertEqual(result, review)
+
+    def test_review_verification_rejects_a_different_multi_line_start(self):
+        review = {
+            "id": 9,
+            "commit_id": self.pr["head_sha"],
+            "state": "PENDING",
+            "html_url": f"{self.pr['pr_url']}#pullrequestreview-9",
+            "user": {"login": "viewer"},
+        }
+        expected = {
+            "path": "src/one.py",
+            "start_line": 2,
+            "start_side": "RIGHT",
+            "line": 4,
+            "side": "RIGHT",
+            "body": "Use this.\n```suggestion\nreplacement\n```",
+        }
+        actual = [{**expected, "start_line": 3}]
+
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value=review),
+            mock.patch.object(MODULE, "gh_paginated", return_value=actual),
+            mock.patch.object(MODULE, "ensure_head_unchanged"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "inline comments failed verification"
+            ):
+                MODULE.verify_created_review(
+                    self.pr, "viewer", review["id"], [expected], self.anchors
+                )
 
     def test_review_verification_accepts_position_only_pending_comments(self):
         # A review's own comments endpoint returns the legacy shape, which omits
