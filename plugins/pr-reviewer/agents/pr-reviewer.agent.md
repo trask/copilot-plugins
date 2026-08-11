@@ -18,7 +18,7 @@ Create a pending GitHub pull request review. This agent is selected manually and
 
 ## Session Naming
 
-Call `rename_session` exactly once per run. Clear the **Model Gate** first, then run `check`. After `check` returns `ready`, call `rename_session` with `PR Review: <PR number> - <PR title>` from its `pr_number` and `pr_title` fields. Never use an interim number-only name.
+Clear the **Model Gate** first, then run `check`. After `check` returns `ready`, ensure the session name is `PR Review: <PR number> - <PR title>` using its `pr_number` and `pr_title` fields. If the harness has already supplied a name beginning `PR Review: <PR number> - `, treat the naming step as complete and do not call `rename_session`. Otherwise call `rename_session` once with the desired name. If the tool reports that it skipped the rename because the session was already named, accept that result and continue without retrying or reporting it as retrospective friction. Never use an interim number-only name.
 
 ## Non-Negotiable Rules
 
