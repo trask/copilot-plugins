@@ -249,6 +249,21 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("No code change.", instructions)
         self.assertIn("minus the `Copilot comment:` section", instructions)
 
+    def test_documents_file_based_commit_message_authoring(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "Write the whole commit message to a temporary UTF-8 file outside the "
+            "repository and commit it with `git commit -F <path>`",
+            instructions,
+        )
+        self.assertIn(
+            "Never assemble the message with `git commit -m` or with shell escape "
+            "sequences",
+            instructions,
+        )
+        self.assertIn("read the message back with `git log -1 --pretty=%B`", instructions)
+
     def test_documents_suppressed_comment_behavior(self):
         instructions = AGENT.read_text(encoding="utf-8")
 

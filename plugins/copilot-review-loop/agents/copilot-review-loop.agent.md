@@ -135,6 +135,8 @@ Downsides: <concrete costs, risks, or "No material downside identified">
 
 Record each original comment verbatim under its own `Copilot comment:` label, without adding path attribution. For a multi-comment batch, repeat the label and comment block for each original comment. Preserve any repository-required commit trailers.
 
+Write the whole commit message to a temporary UTF-8 file outside the repository and commit it with `git commit -F <path>`, then remove the file. Never assemble the message with `git commit -m` or with shell escape sequences such as `` `n `` or `\n`, which the shell frequently leaves in the message as literal text. After committing, read the message back with `git log -1 --pretty=%B` and amend it before recording the batch when a blank line, a verbatim comment, or a trailer is wrong.
+
 The reply file contains the same text minus the `Copilot comment:` section because the original comment is already visible in the thread:
 
 ```text

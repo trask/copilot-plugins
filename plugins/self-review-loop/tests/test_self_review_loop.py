@@ -144,6 +144,21 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("No material downside identified", self.instructions)
         self.assertNotIn("Copilot comment:", self.instructions)
 
+    def test_documents_file_based_commit_message_authoring(self):
+        self.assertIn(
+            "Write the whole commit message to a temporary UTF-8 file outside the "
+            "repository and commit it with `git commit -F <path>`",
+            self.instructions,
+        )
+        self.assertIn(
+            "Never assemble the message with `git commit -m` or with shell escape "
+            "sequences",
+            self.instructions,
+        )
+        self.assertIn(
+            "read the message back with `git log -1 --pretty=%B`", self.instructions
+        )
+
     def test_documents_the_capped_autonomous_loop(self):
         self.assertIn(
             "The loop is `preflight -> review -> evaluate -> batch -> commit -> publish`",

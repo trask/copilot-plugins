@@ -141,6 +141,8 @@ Downsides: <concrete costs, risks, or "No material downside identified">
 
 Record each original finding verbatim under its own `Review finding:` label, without adding path attribution. For a multi-candidate batch, repeat the label and finding block for each original finding. Preserve any repository-required commit trailers.
 
+Write the whole commit message to a temporary UTF-8 file outside the repository and commit it with `git commit -F <path>`, then remove the file. Never assemble the message with `git commit -m` or with shell escape sequences such as `` `n `` or `\n`, which the shell frequently leaves in the message as literal text. After committing, read the message back with `git log -1 --pretty=%B` and amend it before recording the batch when a blank line, a verbatim finding, or a trailer is wrong.
+
 The short `--summary` is only the compact final-index label; it never replaces the commit body.
 
 ## Publishing And The Next Iteration
