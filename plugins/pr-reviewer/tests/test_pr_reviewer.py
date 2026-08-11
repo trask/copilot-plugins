@@ -229,6 +229,19 @@ class AgentInstructionsTest(unittest.TestCase):
             "do not accept prose as a substitute or impose a hard line cap",
             instructions,
         )
+        self.assertIn(
+            "Write each body verbatim to its own short-lived UTF-8 text file",
+            instructions,
+        )
+        self.assertIn(
+            "serialize the array with a real JSON serializer", instructions
+        )
+        self.assertIn("Python `json.dump`", instructions)
+        self.assertIn("PowerShell `ConvertTo-Json`", instructions)
+        self.assertIn("Never hand-author JSON text", instructions)
+        self.assertIn(
+            "double apostrophes for a literal here-string", instructions
+        )
 
     def test_handles_a_created_but_unverified_review_without_a_second_mutation(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -1413,6 +1426,86 @@ class PostingTest(unittest.TestCase):
         ):
             result = MODULE.verify_created_review(
                 self.pr, "viewer", review["id"], [comment], self.anchors
+            )
+
+        self.assertEqual(result, review)
+
+    def test_enriches_a_legacy_comment_range_from_graphql(self):
+        legacy = {
+            "id": 17,
+            "node_id": "PRRC_test",
+            "path": "src/one.py",
+            "position": 5,
+            "body": "Use this.",
+        }
+        graphql = {
+            "data": {
+                "node": {
+                    "databaseId": 17,
+                    "line": 4,
+                    "startLine": 2,
+                    "originalLine": 4,
+                    "originalStartLine": 2,
+                }
+            }
+        }
+
+        with mock.patch.object(
+            MODULE, "gh_json", return_value=graphql
+        ) as gh_json:
+            result = MODULE.enrich_legacy_comment_location(legacy)
+
+        self.assertEqual(result["line"], 4)
+        self.assertEqual(result["start_line"], 2)
+        arguments = gh_json.call_args.args[0]
+        self.assertEqual(arguments[:2], ["api", "graphql"])
+        self.assertIn("id=PRRC_test", arguments)
+
+    def test_review_verification_recovers_a_legacy_multi_line_range(self):
+        review = {
+            "id": 9,
+            "commit_id": self.pr["head_sha"],
+            "state": "PENDING",
+            "html_url": f"{self.pr['pr_url']}#pullrequestreview-9",
+            "user": {"login": "viewer"},
+        }
+        expected = {
+            "path": "src/one.py",
+            "start_line": 2,
+            "start_side": "RIGHT",
+            "line": 4,
+            "side": "RIGHT",
+            "body": "Use this.\n```suggestion\nreplacement\n```",
+        }
+        legacy = {
+            "id": 17,
+            "node_id": "PRRC_test",
+            "path": "src/one.py",
+            "position": 5,
+            "original_position": 5,
+            "body": expected["body"],
+        }
+        graphql = {
+            "data": {
+                "node": {
+                    "databaseId": 17,
+                    "line": 4,
+                    "startLine": 2,
+                    "originalLine": 4,
+                    "originalStartLine": 2,
+                }
+            }
+        }
+
+        with (
+            mock.patch.object(
+                MODULE, "gh_json", side_effect=[review, graphql]
+            ),
+            mock.patch.object(MODULE, "gh_paginated", return_value=[legacy]),
+            mock.patch.object(MODULE, "ensure_head_unchanged"),
+        ):
+            result = MODULE.verify_created_review(
+                self.pr, "viewer", review["id"], [expected], self.anchors
             )
 
         self.assertEqual(result, review)

@@ -698,6 +698,57 @@ def resolve_actual_comment(
     }
 
 
+def enrich_legacy_comment_location(comment: dict[str, Any]) -> dict[str, Any]:
+    line = comment.get("line")
+    side = comment.get("side")
+    if (
+        not isinstance(line, bool)
+        and isinstance(line, int)
+        and isinstance(side, str)
+        and side in {"LEFT", "RIGHT"}
+    ):
+        return comment
+    node_id = comment.get("node_id")
+    if not isinstance(node_id, str) or not node_id:
+        return comment
+    query = (
+        "query($id:ID!){node(id:$id){... on PullRequestReviewComment{"
+        "databaseId line startLine originalLine originalStartLine}}}"
+    )
+    payload = gh_json(
+        ["api", "graphql", "-f", f"query={query}", "-F", f"id={node_id}"]
+    )
+    data = payload.get("data") if isinstance(payload, dict) else None
+    node = data.get("node") if isinstance(data, dict) else None
+    if not isinstance(node, dict):
+        raise WorkflowError(
+            f"could not resolve line details for review comment node {node_id}"
+        )
+    comment_id = comment.get("id")
+    database_id = node.get("databaseId")
+    if (
+        not isinstance(comment_id, bool)
+        and isinstance(comment_id, int)
+        and database_id != comment_id
+    ):
+        raise WorkflowError(
+            f"review comment node {node_id} resolved to unexpected database ID "
+            f"{database_id!r}"
+        )
+    enriched = dict(comment)
+    resolved_line = node.get("line")
+    if resolved_line is None:
+        resolved_line = node.get("originalLine")
+    if not isinstance(resolved_line, bool) and isinstance(resolved_line, int):
+        enriched["line"] = resolved_line
+    resolved_start = node.get("startLine")
+    if resolved_start is None:
+        resolved_start = node.get("originalStartLine")
+    if not isinstance(resolved_start, bool) and isinstance(resolved_start, int):
+        enriched["start_line"] = resolved_start
+    return enriched
+
+
 def verify_created_review(
     pr: dict[str, Any],
     viewer: str,
@@ -724,7 +775,7 @@ def verify_created_review(
         )
     positions = positions_by_path(anchors)
     actual_comments = [
-        resolve_actual_comment(comment, positions)
+        resolve_actual_comment(enrich_legacy_comment_location(comment), positions)
         for comment in gh_paginated(f"{endpoint}/comments?per_page=100")
     ]
     expected = Counter(comment_signature(comment) for comment in expected_comments)
