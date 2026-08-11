@@ -127,6 +127,20 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("restart the entire review from `check`", instructions)
         self.assertIn("never translate or re-anchor old findings", instructions)
 
+    def test_handles_a_created_but_unverified_review_without_a_second_mutation(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn("was created but verification failed", instructions)
+        self.assertIn("Never re-run `post`", instructions)
+        self.assertIn("would create a duplicate review", instructions)
+        self.assertIn("inspect the created review read-only with `gh api`", instructions)
+        self.assertIn("exactly what the helper could not verify", instructions)
+        self.assertIn(
+            "subordinate to the rule that a run makes at most one mutation",
+            instructions,
+        )
+        self.assertIn("Read-only `gh api` inspection is always allowed", instructions)
+
     def test_closes_every_run_with_a_categorized_retrospective(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
@@ -192,10 +206,52 @@ class UnifiedDiffTest(unittest.TestCase):
         anchors = MODULE.parse_unified_diff(DIFF)
 
         self.assertEqual(set(anchors), {"src/one.py", "docs/two.md"})
-        self.assertEqual(anchors["src/one.py"]["RIGHT"], {2, 4, 21})
-        self.assertEqual(anchors["src/one.py"]["LEFT"], {2, 20})
-        self.assertEqual(anchors["docs/two.md"]["LEFT"], {11})
-        self.assertEqual(anchors["docs/two.md"]["RIGHT"], set())
+        self.assertEqual(anchors["src/one.py"]["RIGHT"], {2: 3, 4: 5, 21: 9})
+        self.assertEqual(anchors["src/one.py"]["LEFT"], {2: 2, 20: 8})
+        self.assertEqual(anchors["docs/two.md"]["LEFT"], {11: 2})
+        self.assertEqual(anchors["docs/two.md"]["RIGHT"], {})
+
+    def test_positions_skip_the_first_hunk_header_and_count_later_ones(self):
+        anchors = MODULE.parse_unified_diff(DIFF)
+
+        # The line right below the first "@@" is position 1, and each later
+        # "@@" header consumes a position of its own.
+        self.assertEqual(anchors["src/one.py"]["LEFT"][2], 2)
+        self.assertEqual(anchors["src/one.py"]["LEFT"][20], 8)
+
+    def test_positions_count_a_no_newline_marker_inside_a_hunk(self):
+        # A trailing marker after a hunk's counts are exhausted marks end of
+        # file, so no later position in that file can depend on it.
+        diff = """\
+diff --git a/data.txt b/data.txt
+--- a/data.txt
++++ b/data.txt
+@@ -1,2 +1,2 @@
+ context
+-old
++new
+@@ -10,2 +10,2 @@
+ tail
+-later old
+\\ No newline at end of file
++later new
+\\ No newline at end of file
+"""
+
+        anchors = MODULE.parse_unified_diff(diff)
+
+        self.assertEqual(anchors["data.txt"]["LEFT"], {2: 2, 11: 6})
+        self.assertEqual(anchors["data.txt"]["RIGHT"], {2: 3, 11: 8})
+
+    def test_positions_reverse_map_to_a_single_changed_line(self):
+        anchors = MODULE.parse_unified_diff(DIFF)
+
+        positions = MODULE.positions_by_path(anchors)
+
+        self.assertEqual(positions["src/one.py"][3], ("RIGHT", 2))
+        self.assertEqual(positions["src/one.py"][8], ("LEFT", 20))
+        self.assertEqual(positions["docs/two.md"][2], ("LEFT", 11))
+        self.assertNotIn(1, positions["src/one.py"])
 
     def test_parses_added_and_deleted_files(self):
         diff = """\
@@ -215,8 +271,8 @@ diff --git a/old.txt b/old.txt
 
         anchors = MODULE.parse_unified_diff(diff)
 
-        self.assertEqual(anchors["new.txt"]["RIGHT"], {1, 2})
-        self.assertEqual(anchors["old.txt"]["LEFT"], {1, 2})
+        self.assertEqual(anchors["new.txt"]["RIGHT"], {1: 1, 2: 2})
+        self.assertEqual(anchors["old.txt"]["LEFT"], {1: 1, 2: 2})
 
     def test_fetches_the_authoritative_gh_pr_diff(self):
         pr = {
@@ -251,7 +307,7 @@ diff --git "a/docs/\\303\\251.md" "b/docs/\\303\\251.md"
 
         anchors = MODULE.parse_unified_diff(diff)
 
-        self.assertEqual(anchors["docs/é.md"]["RIGHT"], {1})
+        self.assertEqual(anchors["docs/é.md"]["RIGHT"], {1: 1})
 
     def test_unicode_line_separator_stays_within_changed_line(self):
         diff = (
@@ -266,8 +322,8 @@ diff --git "a/docs/\\303\\251.md" "b/docs/\\303\\251.md"
 
         anchors = MODULE.parse_unified_diff(diff)
 
-        self.assertEqual(anchors["data.txt"]["LEFT"], {1})
-        self.assertEqual(anchors["data.txt"]["RIGHT"], {1, 2})
+        self.assertEqual(anchors["data.txt"]["LEFT"], {1: 1})
+        self.assertEqual(anchors["data.txt"]["RIGHT"], {1: 2, 2: 3})
 
 
 class CommentValidationTest(unittest.TestCase):
@@ -796,7 +852,9 @@ class PostingTest(unittest.TestCase):
         self.assertNotIn("event", payload)
         self.assertEqual(payload["commit_id"], "abc123")
         self.assertEqual(payload["comments"], self.comments)
-        verify.assert_called_once_with(self.pr, "viewer", 9, self.comments)
+        verify.assert_called_once_with(
+            self.pr, "viewer", 9, self.comments, self.anchors
+        )
         ensure_head.assert_called_once_with(
             self.pr, "immediately before creating the review"
         )
@@ -932,7 +990,7 @@ class PostingTest(unittest.TestCase):
                 MODULE.WorkflowError, "commit does not match expected PR head"
             ):
                 MODULE.verify_created_review(
-                    self.pr, "viewer", review["id"], self.comments
+                    self.pr, "viewer", review["id"], self.comments, self.anchors
                 )
 
         gh_paginated.assert_not_called()
@@ -961,7 +1019,7 @@ class PostingTest(unittest.TestCase):
                 MODULE.WorkflowError, "PR head changed during final verification"
             ):
                 MODULE.verify_created_review(
-                    self.pr, "viewer", review["id"], self.comments
+                    self.pr, "viewer", review["id"], self.comments, self.anchors
                 )
 
     def test_review_verification_rejects_comment_mismatch(self):
@@ -983,7 +1041,7 @@ class PostingTest(unittest.TestCase):
                 MODULE.WorkflowError, "inline comments failed verification"
             ):
                 MODULE.verify_created_review(
-                    self.pr, "viewer", review["id"], self.comments
+                    self.pr, "viewer", review["id"], self.comments, self.anchors
                 )
 
     def test_review_verification_accepts_exact_pending_review(self):
@@ -1001,11 +1059,204 @@ class PostingTest(unittest.TestCase):
             mock.patch.object(MODULE, "resolve_pr", return_value=self.pr) as resolve_pr,
         ):
             result = MODULE.verify_created_review(
-                self.pr, "viewer", review["id"], self.comments
+                self.pr, "viewer", review["id"], self.comments, self.anchors
             )
 
         self.assertEqual(result, review)
         resolve_pr.assert_called_once_with(self.pr)
+
+    def test_review_verification_accepts_position_only_pending_comments(self):
+        # A review's own comments endpoint returns the legacy shape, which omits
+        # line and side and locates each comment only by its diff position.
+        review = {
+            "id": 9,
+            "commit_id": self.pr["head_sha"],
+            "state": "PENDING",
+            "html_url": f"{self.pr['pr_url']}#pullrequestreview-9",
+            "user": {"login": "viewer"},
+        }
+        pending = [
+            {
+                "path": "src/one.py",
+                "position": 3,
+                "original_position": 3,
+                "body": self.comments[0]["body"],
+            }
+        ]
+
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value=review),
+            mock.patch.object(MODULE, "gh_paginated", return_value=pending),
+            mock.patch.object(MODULE, "ensure_head_unchanged"),
+        ):
+            result = MODULE.verify_created_review(
+                self.pr, "viewer", review["id"], self.comments, self.anchors
+            )
+
+        self.assertEqual(result, review)
+
+    def test_review_verification_rejects_position_pointing_elsewhere(self):
+        review = {
+            "id": 9,
+            "commit_id": self.pr["head_sha"],
+            "state": "PENDING",
+            "html_url": f"{self.pr['pr_url']}#pullrequestreview-9",
+            "user": {"login": "viewer"},
+        }
+        # Position 5 is RIGHT line 4, not the RIGHT line 2 that was posted.
+        pending = [
+            {
+                "path": "src/one.py",
+                "position": 5,
+                "body": self.comments[0]["body"],
+            }
+        ]
+
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value=review),
+            mock.patch.object(MODULE, "gh_paginated", return_value=pending),
+            mock.patch.object(MODULE, "ensure_head_unchanged"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "inline comments failed verification"
+            ):
+                MODULE.verify_created_review(
+                    self.pr, "viewer", review["id"], self.comments, self.anchors
+                )
+
+    def test_review_verification_falls_back_to_original_position(self):
+        review = {
+            "id": 9,
+            "commit_id": self.pr["head_sha"],
+            "state": "PENDING",
+            "html_url": f"{self.pr['pr_url']}#pullrequestreview-9",
+            "user": {"login": "viewer"},
+        }
+        pending = [
+            {
+                "path": "src/one.py",
+                "position": None,
+                "original_position": 3,
+                "body": self.comments[0]["body"],
+            }
+        ]
+
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value=review),
+            mock.patch.object(MODULE, "gh_paginated", return_value=pending),
+            mock.patch.object(MODULE, "ensure_head_unchanged"),
+        ):
+            result = MODULE.verify_created_review(
+                self.pr, "viewer", review["id"], self.comments, self.anchors
+            )
+
+        self.assertEqual(result, review)
+
+    def test_review_verification_rejects_unlocatable_comment(self):
+        review = {
+            "id": 9,
+            "commit_id": self.pr["head_sha"],
+            "state": "PENDING",
+            "html_url": f"{self.pr['pr_url']}#pullrequestreview-9",
+            "user": {"login": "viewer"},
+        }
+        pending = [{"path": "src/one.py", "body": "x"}]
+
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value=review),
+            mock.patch.object(MODULE, "gh_paginated", return_value=pending),
+            mock.patch.object(MODULE, "ensure_head_unchanged"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "reports neither a line and side nor a diff position",
+            ):
+                MODULE.verify_created_review(
+                    self.pr, "viewer", review["id"], self.comments, self.anchors
+                )
+
+    def test_review_verification_rejects_position_off_a_changed_line(self):
+        review = {
+            "id": 9,
+            "commit_id": self.pr["head_sha"],
+            "state": "PENDING",
+            "html_url": f"{self.pr['pr_url']}#pullrequestreview-9",
+            "user": {"login": "viewer"},
+        }
+        # Position 1 in src/one.py is a context line, never a valid anchor.
+        pending = [{"path": "src/one.py", "position": 1, "body": "x"}]
+
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value=review),
+            mock.patch.object(MODULE, "gh_paginated", return_value=pending),
+            mock.patch.object(MODULE, "ensure_head_unchanged"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "which is not a changed line"
+            ):
+                MODULE.verify_created_review(
+                    self.pr, "viewer", review["id"], self.comments, self.anchors
+                )
+
+    def test_review_verification_ignores_body_line_ending_differences(self):
+        review = {
+            "id": 9,
+            "commit_id": self.pr["head_sha"],
+            "state": "PENDING",
+            "html_url": f"{self.pr['pr_url']}#pullrequestreview-9",
+            "user": {"login": "viewer"},
+        }
+        expected = [{**self.comments[0], "body": "First line.\nSecond line."}]
+        pending = [
+            {
+                "path": "src/one.py",
+                "position": 3,
+                "body": "First line.\r\nSecond line.",
+            }
+        ]
+
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value=review),
+            mock.patch.object(MODULE, "gh_paginated", return_value=pending),
+            mock.patch.object(MODULE, "ensure_head_unchanged"),
+        ):
+            result = MODULE.verify_created_review(
+                self.pr, "viewer", review["id"], expected, self.anchors
+            )
+
+        self.assertEqual(result, review)
+
+    def test_review_verification_still_rejects_meaningful_whitespace_changes(self):
+        # Trailing spaces are Markdown hard breaks and leading indentation can
+        # define a code block, so neither may be normalized away.
+        review = {
+            "id": 9,
+            "commit_id": self.pr["head_sha"],
+            "state": "PENDING",
+            "html_url": f"{self.pr['pr_url']}#pullrequestreview-9",
+            "user": {"login": "viewer"},
+        }
+        for posted, returned in (
+            ("Hard break.  \nNext line.", "Hard break.\nNext line."),
+            ("    indented code", "indented code"),
+            ("Body.\n", "Body."),
+        ):
+            with self.subTest(posted=posted):
+                expected = [{**self.comments[0], "body": posted}]
+                pending = [
+                    {"path": "src/one.py", "position": 3, "body": returned}
+                ]
+                with (
+                    mock.patch.object(MODULE, "gh_json", return_value=review),
+                    mock.patch.object(MODULE, "gh_paginated", return_value=pending),
+                    mock.patch.object(MODULE, "ensure_head_unchanged"),
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.WorkflowError, "inline comments failed verification"
+                    ):
+                        MODULE.verify_created_review(
+                            self.pr, "viewer", review["id"], expected, self.anchors
+                        )
 
 
 if __name__ == "__main__":
