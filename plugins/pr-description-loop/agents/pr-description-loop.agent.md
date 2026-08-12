@@ -119,7 +119,7 @@ Feedback, a rejection, or a request for improvement is not permission to mutate.
 
 ## Proposal Development
 
-1. Use the authoritative diff already read to understand the complete change and apply the `pr-description-style` requirements:
+1. Use the authoritative diff already read to understand the complete change and apply these PR description style requirements:
    - The entire body is the summary; never add `Summary`, `Details`, or `Testing` headers.
    - Open with a short, unheaded paragraph that states the user-visible outcome. Lead with what changes and why it matters, not implementation mechanics.
    - Treat configuration as a user-facing public interface. When the pull request changes configuration, put concise before-and-after configuration examples immediately after the opening paragraph. Use actual keys and representative values for each materially distinct configuration surface, but do not enumerate equivalent variants that add no understanding.
@@ -186,7 +186,7 @@ Apply these rules:
 - Report only friction actually encountered in this run, and name the concrete moment that demonstrates it.
 - Write one line per suggestion, giving the category, the change to make, and that demonstrating moment.
 - Do not speculate, restate what went well, praise the workflow, or narrate process.
-- Do not relitigate a deliberate design decision such as the explicit-approval requirement or the `pr-description-style` rules. A rule that was genuinely ambiguous or expensive to follow is a finding; a rule you merely disagree with is not.
+- Do not relitigate a deliberate design decision such as the explicit-approval requirement or the PR description style rules. A rule that was genuinely ambiguous or expensive to follow is a finding; a rule you merely disagree with is not.
 - The retrospective is advisory and chat-only. Never edit an agent definition, helper script, instruction file, or repository instruction because of it, never open an issue for it, and never fold it into a pull request title or description.
 
 Render it after the final labeled lines under a bold `**PR Description Loop Agent Retrospective**` label as a plain Markdown list, and omit the label entirely when there is nothing to report. The retrospective never replaces, reorders, or alters the required final response. When present, it must be the absolute final block: after its last list item, stop immediately. Never append or repeat proposal details, summaries, outcomes, links, or any other content after it, and never emit a preliminary final response followed by a fuller report.
