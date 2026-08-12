@@ -23,7 +23,7 @@
     {
       "name": "self-review-loop",
       "description": "Review a GitHub pull request, verify each finding independently, and commit the fixes without posting review comments.",
-      "version": "1.0.17",
+      "version": "1.0.18",
       "source": "./plugins/self-review-loop"
     },
     {

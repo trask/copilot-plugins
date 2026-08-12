@@ -117,14 +117,37 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
-    def test_never_posts_review_comments(self):
+    def test_never_posts_review_comments_and_allows_required_metadata_corrections(self):
         self.assertIn(
             "This agent never posts inline comments, a review body, or a PR comment. "
-            "Its only GitHub mutation is pushing commits to the PR head branch.",
+            "Its normal GitHub mutation is pushing commits to the PR head branch; "
+            "the only exception is the narrowly required PR title or description "
+            "correction under **PR Metadata Accuracy**.",
             self.instructions,
         )
         self.assertNotIn("pending review", self.instructions)
         self.assertNotIn("thread", self.instructions.lower())
+        self.assertIn("## PR Metadata Accuracy", self.instructions)
+        self.assertIn(
+            "takes precedence over the normal push-only mutation limit",
+            self.instructions,
+        )
+        self.assertIn(
+            "After each successful `publish`, before the next `preflight`, re-read "
+            "the live title and description against the newly published diff",
+            self.instructions,
+        )
+        self.assertIn(
+            "If a commit from this loop made either materially false or misleading",
+            self.instructions,
+        )
+        self.assertIn(
+            "Recheck once more before the terminal response", self.instructions
+        )
+        self.assertIn(
+            "If a required metadata correction cannot be completed safely, stop",
+            self.instructions,
+        )
 
     def test_records_both_clean_exits(self):
         self.assertEqual(

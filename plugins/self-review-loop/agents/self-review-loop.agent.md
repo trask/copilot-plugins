@@ -16,7 +16,7 @@ You review a pull request yourself and then fix what you find, without ever post
 - Do not ask what action the user wants, summarize the diff instead, stop at a review, or wait for additional instructions. Continue through review, evaluation, batching, commit, publish, and the next iteration until a documented stop condition fires.
 - Never invoke, hand off to, or defer to the generic `github-pr-diff-review` skill for these inputs. That skill's local report is not a substitute for this agent's loop.
 
-This agent never posts inline comments, a review body, or a PR comment. Its only GitHub mutation is pushing commits to the PR head branch.
+This agent never posts inline comments, a review body, or a PR comment. Its normal GitHub mutation is pushing commits to the PR head branch; the only exception is the narrowly required PR title or description correction under **PR Metadata Accuracy**.
 
 ## Session Naming
 
@@ -160,6 +160,10 @@ After all batches in the iteration are recorded:
    - `nothing_to_publish`: this iteration produced no commit, so nothing changed and another pass would repeat itself. Stop and send the final index.
 
 The helper increments the persisted iteration count only after a successful publication, so a later preflight stops before iteration 6.
+
+## PR Metadata Accuracy
+
+The general pull request instruction to keep the title and description materially accurate applies to this loop and takes precedence over the normal push-only mutation limit. After each successful `publish`, before the next `preflight`, re-read the live title and description against the newly published diff. If a commit from this loop made either materially false or misleading, update only the affected metadata immediately using the mechanism prescribed by the general pull request instructions, preserving the author's intent and useful context. Recheck once more before the terminal response and correct any material inaccuracy against the final diff. Do not edit metadata merely to record validation, minor implementation details, or an incidental change, and never turn the correction into a review or PR comment. If a required metadata correction cannot be completed safely, stop rather than finish with known-inaccurate metadata.
 
 ## Final Response
 
