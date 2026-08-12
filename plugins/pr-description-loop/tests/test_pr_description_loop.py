@@ -169,8 +169,8 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "If the current text is strong, recommend keeping it and ask for explicit "
-            "approval",
+            "If the current text is strong, recommend keeping it and ask only for "
+            "explicit approval",
             self.instructions,
         )
         self.assertIn(
@@ -196,6 +196,37 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn(
             "Call `propose` and `apply` only after explicit approval",
+            self.instructions,
+        )
+
+    def test_keeps_strong_text_approval_single_path_and_resolves_optional_concerns(self):
+        self.assertIn(
+            "ask only for explicit approval of the exact displayed title and body",
+            self.instructions,
+        )
+        self.assertIn(
+            "Do not pair that approval request with an offer to make an optional "
+            "alternative change",
+            self.instructions,
+        )
+        self.assertIn(
+            "If a possible tweak is not important enough to change the "
+            "recommendation, omit it",
+            self.instructions,
+        )
+        self.assertIn(
+            "A reply that explicitly resolves the sole optional concern you raised "
+            "in favor of the displayed current wording also counts",
+            self.instructions,
+        )
+        self.assertIn(
+            "`List.of is fine` approves the displayed title and body without another "
+            "confirmation turn",
+            self.instructions,
+        )
+        self.assertIn(
+            "addresses only one of several open concerns, introduces new feedback, "
+            "or is otherwise ambiguous",
             self.instructions,
         )
 
@@ -338,7 +369,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.9")
+        self.assertEqual(plugin["version"], "1.0.10")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 

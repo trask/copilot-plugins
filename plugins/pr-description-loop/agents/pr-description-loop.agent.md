@@ -15,7 +15,7 @@ You run a human-in-the-middle loop for one pull request's title and description.
 - Use the helper for preflight, proposal persistence, application, validation, status, and cleanup. Do not reproduce those state transitions with ad hoc commands.
 - After preflight, read the authoritative pull request diff, then show the current title and current description before your evaluation or any proposal, following "Displaying Title And Description".
 - Immediately evaluate the current text against the diff for clarity, concision, consistency, and scope. Never insert a neutral "does this look good?" turn before giving your judgment.
-- If the current text is strong, recommend keeping it and ask for explicit approval of the exact displayed title and body. If it is weak, explain why briefly and immediately show a complete replacement for explicit approval.
+- If the current text is strong, recommend keeping it and ask only for explicit approval of the exact displayed title and body. Do not pair that approval request with an offer to make an optional alternative change. If it is weak, explain why briefly and immediately show a complete replacement for explicit approval.
 - Never mutate GitHub unless the user explicitly approves the exact title and exact body in this session. Silence, lack of objection, earlier instructions, prior approval of different text, persistent memory, and inferred intent are not approval.
 - If the current text is explicitly approved, validate it with `validate --no-change`; do not run `propose` or `apply`.
 - If replacement text is needed, iterate with the user without a cap. Every revision requires a new display of the complete title and complete body under "Displaying Title And Description", a new `**What changed**` summary, and a new request for approval.
@@ -99,9 +99,11 @@ Stop on exact helper errors. Never work around a head mismatch or stale title/bo
 If the current title and description are strong:
 
 1. Say clearly that you recommend keeping them.
-2. Ask for explicit approval of the exact displayed current title and description.
+2. Ask only for explicit approval of the exact displayed current title and description. Do not offer a competing optional rewrite or ask whether the user would prefer an alternative in the same turn. If a possible tweak is not important enough to change the recommendation, omit it.
 
-Only an explicit affirmative answer about the displayed current title and description counts as approval. When the user explicitly approves:
+Only an explicit affirmative answer about the displayed current title and description counts as approval. A reply that explicitly resolves the sole optional concern you raised in favor of the displayed current wording also counts when you already recommended keeping the full text and no other choice or feedback remains. For example, if the displayed text uses `List.of` and you unnecessarily offered to replace it, `List.of is fine` approves the displayed title and body without another confirmation turn. Do not apply this exception when the reply could select multiple displayed choices, addresses only one of several open concerns, introduces new feedback, or is otherwise ambiguous.
+
+When the user explicitly approves:
 
 1. Run `validate --state <path> --expected-head <head_sha> --expected-run-id <run_id> --no-change`.
 2. If validation reports a moved head or changed text, do not treat the prior answer as approval. Restart from preflight and show the new current values.
