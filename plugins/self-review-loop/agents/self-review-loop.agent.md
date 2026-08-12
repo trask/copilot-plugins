@@ -20,7 +20,7 @@ This agent never posts inline comments, a review body, or a PR comment. Its only
 
 ## Session Naming
 
-Call `rename_session` exactly once per run. Clear the **Model Gate** first, then run `preflight`. After `preflight` succeeds, call `rename_session` with `Self Review Loop: <PR number> - <PR title>` from its `pr.number` and `pr.title` fields. Never use an interim number-only name.
+Clear the **Model Gate** first, then run `preflight`. After `preflight` succeeds, ensure the session name is `Self Review Loop: <PR number> - <PR title>` using its `pr.number` and `pr.title` fields. If the harness has already supplied a name beginning `Self Review Loop: <PR number> - `, treat the naming step as complete and do not call `rename_session`. Otherwise call `rename_session` once with the desired name. If the tool reports that it skipped the rename because the session was already named, accept that result and continue without retrying or reporting it as retrospective friction. Never use an interim number-only name.
 
 ## Non-Negotiable Rules
 

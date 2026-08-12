@@ -70,22 +70,29 @@ class AgentInstructionsTest(unittest.TestCase):
     def setUp(self):
         self.instructions = AGENT.read_text(encoding="utf-8")
 
-    def test_renames_the_session_from_preflight_metadata(self):
+    def test_names_the_session_from_preflight_metadata_idempotently(self):
         self.assertIn(
             "tools: [read, edit, search, execute, agent, todo, rename_session]",
             self.instructions,
         )
         self.assertIn("## Session Naming", self.instructions)
         self.assertIn(
-            "Call `rename_session` exactly once per run", self.instructions
+            "ensure the session name is `Self Review Loop: <PR number> - <PR title>`",
+            self.instructions,
         )
         self.assertIn(
-            "call `rename_session` with `Self Review Loop: <PR number> - <PR title>` "
-            "from its `pr.number` and `pr.title` fields",
+            "If the harness has already supplied a name beginning "
+            "`Self Review Loop: <PR number> - `",
+            self.instructions,
+        )
+        self.assertIn("do not call `rename_session`", self.instructions)
+        self.assertIn("Otherwise call `rename_session` once", self.instructions)
+        self.assertIn(
+            "accept that result and continue without retrying or reporting it as "
+            "retrospective friction",
             self.instructions,
         )
         self.assertIn("Never use an interim number-only name", self.instructions)
-        # rename_session only replaces an auto-generated name; a second call is skipped.
         self.assertNotIn("call `rename_session` again", self.instructions)
         self.assertNotIn("immediately call `rename_session`", self.instructions)
 
