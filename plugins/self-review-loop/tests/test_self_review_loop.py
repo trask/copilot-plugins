@@ -159,7 +159,16 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("## Model Gate", self.instructions)
         self.assertIn("Run only on a Claude model.", self.instructions)
         self.assertIn(
-            "using model **GPT-5.6 Sol** with reasoning effort **max**",
+            "using agent type **general-purpose**, model **GPT-5.6 Sol**, and "
+            "reasoning effort **max**",
+            self.instructions,
+        )
+        self.assertIn(
+            "The agent type is required even when setting the model override",
+            self.instructions,
+        )
+        self.assertIn(
+            "do not substitute an explore, task, review, or other specialized agent",
             self.instructions,
         )
         self.assertIn(
@@ -357,8 +366,46 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
+            "Before retaining a candidate that asserts a semantic or convention "
+            "violation",
+            self.instructions,
+        )
+        self.assertIn(
+            "read the implementation or authoritative documentation of any shared "
+            "helper that defines that contract",
+            self.instructions,
+        )
+        self.assertIn(
+            "do not send an assumption to the evaluator when one direct helper read "
+            "can disprove it",
+            self.instructions,
+        )
+        self.assertIn(
             "refuse to publish a skipped batch, require the commits sitting on the "
             "pinned head to be exactly the recorded ones",
+            self.instructions,
+        )
+
+    def test_isolates_validation_failures_owned_by_another_pending_batch(self):
+        self.assertIn(
+            "When evidence shows the failure is caused solely by a different "
+            "still-pending candidate assigned to another batch",
+            self.instructions,
+        )
+        self.assertIn(
+            "focused validation that isolates the current batch", self.instructions
+        )
+        self.assertIn(
+            "if that batch's own relevant checks pass, record it normally",
+            self.instructions,
+        )
+        self.assertIn(
+            "preserve the other failure, and handle that candidate in its own batch",
+            self.instructions,
+        )
+        self.assertIn(
+            "Never use this exception for an unexplained failure, a shared root cause, "
+            "or a failure introduced by the current batch",
             self.instructions,
         )
 
