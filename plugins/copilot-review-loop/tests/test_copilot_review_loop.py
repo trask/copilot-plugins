@@ -305,7 +305,12 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_closes_every_run_with_a_categorized_retrospective(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn("## Retrospective", instructions)
+        self.assertIn(
+            "## Copilot Review Loop Agent Retrospective", instructions
+        )
+        self.assertIn(
+            "**Copilot Review Loop Agent Retrospective**", instructions
+        )
         self.assertIn(
             "Silence is the normal outcome, and a run that went smoothly reports "
             "nothing",
@@ -329,8 +334,8 @@ class AgentInstructionsTest(unittest.TestCase):
             "Report only friction actually encountered in this run", instructions
         )
         self.assertIn(
-            "The **Retrospective** is the only content permitted after the "
-            "`**Outcome:**` line",
+            "The **Copilot Review Loop Agent Retrospective** is the only content "
+            "permitted after the `**Outcome:**` line",
             instructions,
         )
         self.assertIn("The retrospective is advisory and chat-only", instructions)

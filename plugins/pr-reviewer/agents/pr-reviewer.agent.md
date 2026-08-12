@@ -112,9 +112,9 @@ When a pending review exists or was created, add its clickable link immediately 
 
 `**Review:** [Open pending review](<review_url>)`
 
-Never print a bare PR number, PR URL, review ID, or review URL when the corresponding Markdown link can be rendered. The **Retrospective** is the only content permitted after the `**PR:**` line.
+Never print a bare PR number, PR URL, review ID, or review URL when the corresponding Markdown link can be rendered. The **PR Reviewer Agent Retrospective** is the only content permitted after the `**PR:**` line.
 
-## Retrospective
+## PR Reviewer Agent Retrospective
 
 Close every run by reflecting on how the review workflow itself went and reporting only concrete friction worth fixing. This is process feedback about the agent, helper, instructions, or repository guidance; it is not a finding about the pull request. Silence is the normal outcome, and a run that went smoothly reports nothing.
 
@@ -137,7 +137,7 @@ Apply these rules:
 
 When there is friction to report, render it after the `**PR:**` line in this order:
 
-1. A bold `**Retrospective**` label.
+1. A bold `**PR Reviewer Agent Retrospective**` label.
 2. The sentence `Workflow feedback only; this is not a PR finding and no change was made automatically.`
 3. A plain Markdown list of categorized suggestions.
 4. A bold `**Options:**` label followed by this numbered list:

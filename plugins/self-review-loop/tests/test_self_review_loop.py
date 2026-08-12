@@ -217,7 +217,12 @@ class AgentInstructionsTest(unittest.TestCase):
         )
 
     def test_closes_every_run_with_a_categorized_retrospective(self):
-        self.assertIn("## Retrospective", self.instructions)
+        self.assertIn(
+            "## Self Review Loop Agent Retrospective", self.instructions
+        )
+        self.assertIn(
+            "**Self Review Loop Agent Retrospective**", self.instructions
+        )
         self.assertIn(
             "Silence is the normal outcome, and a run that went smoothly reports "
             "nothing",
@@ -240,8 +245,8 @@ class AgentInstructionsTest(unittest.TestCase):
             "Report only friction actually encountered in this run", self.instructions
         )
         self.assertIn(
-            "The **Retrospective** is the only content permitted after the `**PR:**` "
-            "line",
+            "The **Self Review Loop Agent Retrospective** is the only content "
+            "permitted after the `**PR:**` line",
             self.instructions,
         )
         self.assertIn("The retrospective is advisory and chat-only", self.instructions)
@@ -922,16 +927,57 @@ class PublishTest(unittest.TestCase):
                 MODULE, "git", side_effect=lambda root, *args: git_results[args]
             ),
             mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
-            mock.patch.object(MODULE, "remote_head", return_value="newhead"),
+            mock.patch.object(
+                MODULE, "remote_head", side_effect=["oldhead", "newhead"]
+            ),
             mock.patch.object(
                 MODULE, "metadata_for", return_value={"head_sha": "otherhead"}
-            ),
+            ) as metadata,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
             mock.patch.object(MODULE, "run"),
         ):
             with self.assertRaises(MODULE.WorkflowError) as error:
                 MODULE.command_publish(SimpleNamespace(state=str(path)))
 
         self.assertIn("PR head mismatch", str(error.exception))
+        self.assertEqual(metadata.call_count, 2)
+        sleep.assert_called_once_with(MODULE.PR_HEAD_LAG_RETRY_DELAY)
+
+    def test_retries_a_stale_pr_head_after_confirming_the_pushed_ref(self):
+        path = self.state_with([self.candidate()])
+        git_results = {
+            ("status", "--porcelain=v1"): "",
+            ("rev-parse", "HEAD"): "newhead",
+            ("rev-list", "head1..HEAD"): "newhead",
+        }
+
+        with (
+            mock.patch.object(
+                MODULE, "git", side_effect=lambda root, *args: git_results[args]
+            ),
+            mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
+            mock.patch.object(
+                MODULE, "remote_head", side_effect=["oldhead", "newhead"]
+            ),
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                side_effect=[
+                    {"head_sha": "oldhead"},
+                    {"head_sha": "newhead"},
+                ],
+            ) as metadata,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+            mock.patch.object(MODULE, "run") as run,
+        ):
+            MODULE.command_publish(SimpleNamespace(state=str(path)))
+
+        self.assertEqual(
+            run.call_args.args[0][-3:], ["push", "origin", "HEAD:feature"]
+        )
+        self.assertEqual(metadata.call_count, 2)
+        sleep.assert_called_once_with(MODULE.PR_HEAD_LAG_RETRY_DELAY)
+        self.assertEqual(self.emitted[-1]["result"], "published")
 
 
 class PreflightTest(unittest.TestCase):

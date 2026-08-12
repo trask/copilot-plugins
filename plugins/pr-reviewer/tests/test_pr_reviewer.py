@@ -266,7 +266,8 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_closes_every_run_with_a_categorized_retrospective(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn("## Retrospective", instructions)
+        self.assertIn("## PR Reviewer Agent Retrospective", instructions)
+        self.assertIn("**PR Reviewer Agent Retrospective**", instructions)
         self.assertIn(
             "Silence is the normal outcome, and a run that went smoothly reports "
             "nothing",
@@ -326,8 +327,8 @@ class AgentInstructionsTest(unittest.TestCase):
             "**Review:** [Open pending review](<review_url>)", instructions
         )
         self.assertIn(
-            "The **Retrospective** is the only content permitted after the `**PR:**` "
-            "line",
+            "The **PR Reviewer Agent Retrospective** is the only content permitted "
+            "after the `**PR:**` line",
             instructions,
         )
 

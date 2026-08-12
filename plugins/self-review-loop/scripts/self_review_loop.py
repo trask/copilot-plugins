@@ -14,11 +14,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Iterable
 
 
 STATE_VERSION = 1
 DEFAULT_MAX_ITERATIONS = 5
+PR_HEAD_LAG_RETRY_DELAY = 1
 IS_WINDOWS = os.name == "nt"
 PR_URL_PATTERN = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
@@ -1021,6 +1023,9 @@ def command_publish(args: argparse.Namespace) -> None:
     if pushed_head != local_head:
         raise WorkflowError(f"fork ref mismatch: local {local_head}, remote {pushed_head}")
     pr_head = metadata_for(parse_target(pr["pr_url"]))["head_sha"]
+    if pr_head != local_head:
+        time.sleep(PR_HEAD_LAG_RETRY_DELAY)
+        pr_head = metadata_for(parse_target(pr["pr_url"]))["head_sha"]
     if pr_head != local_head:
         raise WorkflowError(f"PR head mismatch: local {local_head}, PR head {pr_head}")
 

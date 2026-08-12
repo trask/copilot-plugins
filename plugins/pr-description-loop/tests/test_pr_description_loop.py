@@ -285,7 +285,12 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("twice immediately before a direct REST `PATCH`", self.instructions)
 
     def test_closes_every_run_with_a_categorized_retrospective(self):
-        self.assertIn("## Retrospective", self.instructions)
+        self.assertIn(
+            "## PR Description Loop Agent Retrospective", self.instructions
+        )
+        self.assertIn(
+            "**PR Description Loop Agent Retrospective**", self.instructions
+        )
         self.assertIn(
             "Silence is the normal outcome, and a run that went smoothly reports "
             "nothing",
@@ -326,7 +331,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.7")
+        self.assertEqual(plugin["version"], "1.0.8")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 
