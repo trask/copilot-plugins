@@ -1261,6 +1261,95 @@ class RemoteParsingTest(unittest.TestCase):
         self.assertEqual(sleep.call_count, len(MODULE.REMOTE_REF_LAG_RETRY_DELAYS))
 
 
+class RecordCommitTest(unittest.TestCase):
+    def test_requires_the_recorded_sha_to_resolve_to_a_commit(self):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "repo_root": "repo",
+            "queue": {
+                "status": "active",
+                "comments": [{"id": 10, "status": "pending"}],
+                "batches": [{"id": "batch-1", "status": "planned"}],
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            reply_path = Path(directory) / "reply.txt"
+            MODULE.save_state(state_path, state)
+            reply_path.write_text("Applied the fix.", encoding="utf-8")
+            args = SimpleNamespace(
+                state=str(state_path),
+                comments=[10],
+                reply_file=str(reply_path),
+                commit="f" * 40,
+                batch="batch-1",
+                rationale=None,
+                summary="Fix the issue",
+            )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "git",
+                    side_effect=MODULE.WorkflowError("unknown revision"),
+                ) as git,
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    f"recorded commit does not exist or is not a commit: {'f' * 40}",
+                ),
+            ):
+                MODULE.command_record(args)
+
+            saved = MODULE.load_state(state_path)
+
+        git.assert_called_once_with(
+            Path("repo"),
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            f"{'f' * 40}^{{commit}}",
+        )
+        self.assertEqual(saved["queue"]["comments"][0]["status"], "pending")
+        self.assertEqual(saved["queue"]["batches"][0]["status"], "planned")
+
+    def test_records_the_canonical_verified_commit_sha(self):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "repo_root": "repo",
+            "queue": {
+                "status": "active",
+                "comments": [{"id": 10, "status": "pending"}],
+                "batches": [{"id": "batch-1", "status": "planned"}],
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            reply_path = Path(directory) / "reply.txt"
+            MODULE.save_state(state_path, state)
+            reply_path.write_text("Applied the fix.", encoding="utf-8")
+            args = SimpleNamespace(
+                state=str(state_path),
+                comments=[10],
+                reply_file=str(reply_path),
+                commit="HEAD",
+                batch="batch-1",
+                rationale=None,
+                summary="Fix the issue",
+            )
+
+            with (
+                mock.patch.object(MODULE, "git", return_value="a" * 40),
+                mock.patch.object(MODULE, "emit"),
+            ):
+                MODULE.command_record(args)
+
+            saved = MODULE.load_state(state_path)
+
+        self.assertEqual(saved["queue"]["comments"][0]["commit"], "a" * 40)
+
+
 class ParserTest(unittest.TestCase):
     def test_plan_accumulates_repeated_path_flags(self):
         args = MODULE.build_parser().parse_args(
@@ -1776,6 +1865,39 @@ class VerifyPublishTest(unittest.TestCase):
             MODULE.WorkflowError, "publishing verification failed"
         ):
             self.run_verify([10])
+
+    def test_retries_pr_head_verification_after_publication(self):
+        with (
+            mock.patch.object(
+                MODULE,
+                "gh_json",
+                side_effect=[
+                    {"head": {"sha": "old-head"}},
+                    {"head": {"sha": "abc123"}},
+                ],
+            ) as gh_json,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            payload = MODULE.wait_for_pr_head(dict(self.STATE), "abc123")
+
+        self.assertEqual(payload["head"]["sha"], "abc123")
+        self.assertEqual(gh_json.call_count, 2)
+        sleep.assert_called_once_with(MODULE.PR_HEAD_LAG_RETRY_DELAYS[0])
+
+    def test_stops_retrying_pr_head_after_the_propagation_budget(self):
+        with (
+            mock.patch.object(
+                MODULE, "gh_json", return_value={"head": {"sha": "old-head"}}
+            ) as gh_json,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            payload = MODULE.wait_for_pr_head(dict(self.STATE), "abc123")
+
+        self.assertEqual(payload["head"]["sha"], "old-head")
+        self.assertEqual(
+            gh_json.call_count, len(MODULE.PR_HEAD_LAG_RETRY_DELAYS) + 1
+        )
+        self.assertEqual(sleep.call_count, len(MODULE.PR_HEAD_LAG_RETRY_DELAYS))
 
 
 class RequestCopilotTest(unittest.TestCase):

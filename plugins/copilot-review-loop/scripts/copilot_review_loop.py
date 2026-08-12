@@ -947,7 +947,19 @@ def command_record(args: argparse.Namespace) -> None:
         raise WorkflowError("reply file is empty")
     commit = args.commit
     if commit:
-        commit = git(Path(state["repo_root"]), "rev-parse", commit)
+        revision = f"{commit}^{{commit}}"
+        try:
+            commit = git(
+                Path(state["repo_root"]),
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                revision,
+            )
+        except WorkflowError as error:
+            raise WorkflowError(
+                f"recorded commit does not exist or is not a commit: {commit}"
+            ) from error
     for comment in comments:
         comment.update(
             {
@@ -1067,6 +1079,21 @@ def wait_for_remote_head(
         time.sleep(delay)
         actual_head = remote_head(owner, repo, branch)
     return actual_head
+
+
+def wait_for_pr_head(state: dict[str, Any], expected_head: str) -> dict[str, Any]:
+    pr = state["pr"]
+    arguments = [
+        "api",
+        f"repos/{pr['upstream_owner']}/{pr['upstream_repo']}/pulls/{pr['number']}",
+    ]
+    payload = gh_json(arguments)
+    for delay in PR_HEAD_LAG_RETRY_DELAYS:
+        if payload["head"]["sha"] == expected_head:
+            break
+        time.sleep(delay)
+        payload = gh_json(arguments)
+    return payload
 
 
 def emit_head_changed(
@@ -1316,12 +1343,7 @@ mutation($pullRequest:ID!,$bot:ID!){
 def verify_publish(state: dict[str, Any], comments: list[dict[str, Any]]) -> dict[str, Any]:
     pr = state["pr"]
     local_head = git(Path(state["repo_root"]), "rev-parse", "HEAD")
-    head_payload = gh_json(
-        [
-            "api",
-            f"repos/{pr['upstream_owner']}/{pr['upstream_repo']}/pulls/{pr['number']}",
-        ]
-    )
+    head_payload = wait_for_pr_head(state, local_head)
     thread_comments = [
         comment for comment in comments if comment.get("source", "thread") == "thread"
     ]
