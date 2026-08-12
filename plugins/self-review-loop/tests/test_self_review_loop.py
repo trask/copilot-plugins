@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -200,6 +202,17 @@ class AgentInstructionsTest(unittest.TestCase):
             "**PR:** [#<pr.number> <pr.title>](<pr.pr_url>)", self.instructions
         )
         self.assertNotIn("PR: <pr.pr_url>", self.instructions)
+        self.assertIn(
+            "For a clean pass with zero commits and no no-code outcomes",
+            self.instructions,
+        )
+        self.assertIn(
+            "render exactly the `**Outcome:**` line followed by the `**PR:**` line",
+            self.instructions,
+        )
+        self.assertIn(
+            "Do not invent a commit, no-code, or narrative line", self.instructions
+        )
 
     def test_reads_the_pinned_diff_from_the_helper_snapshot(self):
         self.assertIn(
@@ -367,6 +380,18 @@ class CandidateValidationTest(unittest.TestCase):
             with self.subTest(candidates=candidates):
                 with self.assertRaises(MODULE.WorkflowError):
                     MODULE.validate_candidates(candidates, self.anchors)
+
+    def test_candidates_help_documents_the_required_object_schema(self):
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit):
+            MODULE.build_parser().parse_args(["candidates", "--help"])
+
+        help_text = " ".join(output.getvalue().split())
+        self.assertIn("each object must contain exactly path (string)", help_text)
+        self.assertIn("line (integer)", help_text)
+        self.assertIn("side (LEFT or RIGHT)", help_text)
+        self.assertIn("body (string)", help_text)
 
 
 class HistoryTest(unittest.TestCase):

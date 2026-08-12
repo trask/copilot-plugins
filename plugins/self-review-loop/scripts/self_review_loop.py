@@ -1107,7 +1107,15 @@ def build_parser() -> argparse.ArgumentParser:
         "candidates", help="register this iteration's candidate findings"
     )
     candidates.add_argument("--state", required=True)
-    candidates.add_argument("--input", required=True, help="JSON file, or - for standard input")
+    candidates.add_argument(
+        "--input",
+        required=True,
+        help=(
+            "JSON array file, or - for standard input; each object must contain "
+            "exactly path (string), line (integer), side (LEFT or RIGHT), and "
+            "body (string)"
+        ),
+    )
     candidates.set_defaults(function=command_candidates)
 
     drop = subparsers.add_parser("drop", help="record evaluator-rejected candidates")

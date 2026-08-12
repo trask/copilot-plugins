@@ -166,6 +166,8 @@ Keep chat as a compact index because the reasoning lives in git. Emit exactly on
 - `**Outcome:** clean after <n> iteration(s).`
 - `**PR:** [#<pr.number> <pr.title>](<pr.pr_url>)`
 
+For a clean pass with zero commits and no no-code outcomes, omit the first two line types and render exactly the `**Outcome:**` line followed by the `**PR:**` line. Do not invent a commit, no-code, or narrative line merely to fill the space above `**Outcome:**`.
+
 The backticks above delimit templates only; do not include them in the final response. For a capped or interrupted run, use `**Outcome:** <exact stop condition> after <n> iteration(s).` Always end with the linked `**PR:**` line so the pull request is directly accessible. Mention uncommitted work only for an unfixable validation stop. Report dropped candidates only as a count unless the user asks for detail, and do not repeat findings, analysis, upsides, downsides, validation success, or publication mechanics in chat. The **Self Review Loop Agent Retrospective** is the only content permitted after the `**PR:**` line.
 
 ## Self Review Loop Agent Retrospective
