@@ -146,7 +146,7 @@ After explicit approval of the exact displayed proposal:
 
 ## Final Response
 
-Close with plain labeled lines, not a code block.
+Emit exactly one terminal response and close with plain labeled lines, not a code block.
 
 For an unchanged validation, report `Validated: <title>` and `PR: <pr.url>`.
 
@@ -175,4 +175,4 @@ Apply these rules:
 - Do not relitigate a deliberate design decision such as the explicit-approval requirement or the `pr-description-style` rules. A rule that was genuinely ambiguous or expensive to follow is a finding; a rule you merely disagree with is not.
 - The retrospective is advisory and chat-only. Never edit an agent definition, helper script, instruction file, or repository instruction because of it, never open an issue for it, and never fold it into a pull request title or description.
 
-Render it after the final labeled lines under a bold `**PR Description Loop Agent Retrospective**` label as a plain Markdown list, and omit the label entirely when there is nothing to report. The retrospective never replaces, reorders, or alters the required final response.
+Render it after the final labeled lines under a bold `**PR Description Loop Agent Retrospective**` label as a plain Markdown list, and omit the label entirely when there is nothing to report. The retrospective never replaces, reorders, or alters the required final response. When present, it must be the absolute final block: after its last list item, stop immediately. Never append or repeat proposal details, summaries, outcomes, links, or any other content after it, and never emit a preliminary final response followed by a fuller report.

@@ -159,7 +159,7 @@ The helper increments the persisted iteration count only after a successful publ
 
 ## Final Response
 
-Keep chat as a compact index because the reasoning lives in git. Render ordinary Markdown, never a fenced code block. Emit one linked list item per commit, then any no-code outcome, one loop-outcome line, and finally the canonical pull request link from the most recent preflight result's `pr.pr_url`:
+Keep chat as a compact index because the reasoning lives in git. Emit exactly one terminal response. Render ordinary Markdown, never a fenced code block. Emit one linked list item per commit, then any no-code outcome, one loop-outcome line, and finally the canonical pull request link from the most recent preflight result's `pr.pr_url`:
 
 - `[<short-sha> <short batch summary>](<pr.pr_url>/changes/<full-sha>)`
 - `No code change: <short summary> - <one-line rationale>`
@@ -189,4 +189,4 @@ Apply these rules:
 - Do not relitigate a deliberate design decision such as the **Model Gate** or the independent evaluator. A rule that was genuinely ambiguous or expensive to follow is a finding; a rule you merely disagree with is not.
 - The retrospective is advisory and chat-only. Never edit an agent definition, helper script, instruction file, or repository instruction because of it, never open an issue for it, and never commit it or push it as part of this loop.
 
-Render it after the final response under a bold `**Self Review Loop Agent Retrospective**` label as a plain Markdown list, and omit the label entirely when there is nothing to report. The retrospective never replaces, reorders, or alters the required final response.
+Render it after the final response under a bold `**Self Review Loop Agent Retrospective**` label as a plain Markdown list, and omit the label entirely when there is nothing to report. The retrospective never replaces, reorders, or alters the required final response. When present, it must be the absolute final block: after its last list item, stop immediately. Never append or repeat findings, summaries, outcomes, links, or any other content after it, and never emit a preliminary final response followed by a fuller report.

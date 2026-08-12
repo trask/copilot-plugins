@@ -256,6 +256,13 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn(
             "omit the label entirely when there is nothing to report", self.instructions
         )
+        self.assertIn("Emit exactly one terminal response", self.instructions)
+        self.assertIn("must be the absolute final block", self.instructions)
+        self.assertIn("after its last list item, stop immediately", self.instructions)
+        self.assertIn(
+            "never emit a preliminary final response followed by a fuller report",
+            self.instructions,
+        )
 
 
 class TargetParsingTest(unittest.TestCase):

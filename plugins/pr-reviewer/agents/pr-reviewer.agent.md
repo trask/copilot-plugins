@@ -145,4 +145,4 @@ When there is friction to report, render it after the `**PR:**` line in this ord
    2. `Explain the tradeoffs before deciding.`
    3. `Leave it as advisory feedback.`
 
-Omit the entire retrospective, including its explanation and options, when there is nothing to report. The retrospective never replaces, reorders, or alters the required final response.
+Omit the entire retrospective, including its explanation and options, when there is nothing to report. The retrospective never replaces, reorders, or alters the required final response. When present, it must be the absolute final block: after the last options item, stop immediately. Never append or repeat findings, summaries, results, links, or any other content after it, and never emit a preliminary final response followed by a fuller report.

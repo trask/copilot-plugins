@@ -291,6 +291,13 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn(
             "**PR Description Loop Agent Retrospective**", self.instructions
         )
+        self.assertIn("Emit exactly one terminal response", self.instructions)
+        self.assertIn("must be the absolute final block", self.instructions)
+        self.assertIn("after its last list item, stop immediately", self.instructions)
+        self.assertIn(
+            "never emit a preliminary final response followed by a fuller report",
+            self.instructions,
+        )
         self.assertIn(
             "Silence is the normal outcome, and a run that went smoothly reports "
             "nothing",
@@ -331,7 +338,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.8")
+        self.assertEqual(plugin["version"], "1.0.9")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 

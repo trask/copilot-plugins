@@ -304,6 +304,12 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("Explain the tradeoffs before deciding.", instructions)
         self.assertIn("Leave it as advisory feedback.", instructions)
         self.assertIn("Omit the entire retrospective", instructions)
+        self.assertIn("must be the absolute final block", instructions)
+        self.assertIn("after the last options item, stop immediately", instructions)
+        self.assertIn(
+            "never emit a preliminary final response followed by a fuller report",
+            instructions,
+        )
         self.assertIn(
             "never replaces, reorders, or alters the required final response",
             instructions,
