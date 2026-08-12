@@ -135,6 +135,39 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertNotIn("```text", self.instructions)
         self.assertNotIn("\n***\n", self.instructions)
 
+    def test_inspects_the_pinned_body_for_actual_newline_characters(self):
+        self.assertIn(
+            "Treat the pinned preflight `body` as the exact stored string",
+            self.instructions,
+        )
+        self.assertIn(
+            "JSON escaping, terminal wrapping, and renderer wrapping do not prove "
+            "that the value contains line breaks",
+            self.instructions,
+        )
+        self.assertIn(
+            "inspect the decoded string for actual `\\r` and `\\n` characters",
+            self.instructions,
+        )
+        self.assertIn(
+            "inspect only the pinned run state's body with a local JSON parser",
+            self.instructions,
+        )
+        self.assertIn(
+            "do not issue a separate `gh pr view`, normalize the string, or infer "
+            "missing boundaries from prose",
+            self.instructions,
+        )
+        self.assertIn(
+            "Inspect the decoded `body` for its real newline characters before "
+            "evaluating its structure",
+            self.instructions,
+        )
+        self.assertIn(
+            "never trust the visual formatting of serialized JSON",
+            self.instructions,
+        )
+
     def test_summarizes_how_a_proposal_differs_from_the_current_text(self):
         self.assertIn("## Summarizing What Changed", self.instructions)
         self.assertIn(
@@ -389,7 +422,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.12")
+        self.assertEqual(plugin["version"], "1.0.13")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 

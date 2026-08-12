@@ -34,6 +34,7 @@ Every display of a current or proposed title or description follows these rules:
 
 - Never use a fenced code block, inline code span, or any other verbatim wrapper around the title or the description. A never-hard-wrapped description inside a code block scrolls horizontally and is unreadable.
 - Render the description as ordinary markdown so the interface wraps it and its own markdown renders. Rendering is presentation only; the characters inside the blockquote are exactly the characters that are or would be stored on GitHub.
+- Treat the pinned preflight `body` as the exact stored string, not as the visual layout of the helper's JSON output. JSON escaping, terminal wrapping, and renderer wrapping do not prove that the value contains line breaks. Before judging paragraph, list, heading, or hard-wrapping structure, inspect the decoded string for actual `\r` and `\n` characters. If the displayed JSON is ambiguous, inspect only the pinned run state's body with a local JSON parser or derive its line count and newline positions from that exact value; do not issue a separate `gh pr view`, normalize the string, or infer missing boundaries from prose.
 - Reproduce the exact value. Never summarize, normalize, reflow, hard wrap, re-indent, or silently repair either value.
 - Introduce each value with a bold label on its own line, then a blank line, then the value as a blockquote. Do not add horizontal rules around it; the blockquote is the boundary.
 - Prefix every line of the value with `> `, including blank lines within a description, so the whole value stays inside one indented block. The `> ` prefix is presentation only and is never part of the stored value.
@@ -89,7 +90,7 @@ Stop on exact helper errors. Never work around a head mismatch or stale title/bo
 
 1. Run `preflight` once for the requested target. Pass a supplied PR URL, bare PR number, or `owner/repo#number` exactly; omit the target to use the current branch's PR.
 2. After preflight succeeds, call `rename_session` exactly once with `PR Description Loop: <number> - <title>` from the returned `pr.number` and `pr.title`. Never use an interim name and never rename again during this run.
-3. Retain the returned `state`, `run_id`, `head_sha`, `pr.url`, `pr.repo_name`, `title`, and `body`. Never switch to the stable `index_state` for proposal or apply operations.
+3. Retain the returned `state`, `run_id`, `head_sha`, `pr.url`, `pr.repo_name`, `title`, and exact stored `body`. Inspect the decoded `body` for its real newline characters before evaluating its structure; never trust the visual formatting of serialized JSON. Never switch to the stable `index_state` for proposal or apply operations.
 4. Read the authoritative pull request diff with `gh pr diff <pr.url> --repo <pr.repo_name>`. The preflight `head_sha` is the immutable head for this evaluation and any proposal; a later `validate` or `apply` verifies that the live head still matches it.
 5. Retain the exact diff bytes for this run so a later head move can be compared byte-for-byte without reconstructing or normalizing either diff.
 6. In your first response after gathering the diff, present the current title and description first, including an empty description, following "Displaying Title And Description".
