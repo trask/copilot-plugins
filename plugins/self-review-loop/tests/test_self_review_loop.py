@@ -203,6 +203,29 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
+    def test_documents_shell_safe_drop_and_evaluator_improved_fixes(self):
+        self.assertIn(
+            "--rationale-file <file-or->", self.instructions
+        )
+        self.assertIn(
+            "prefer a temporary UTF-8 `--rationale-file` for model-authored text",
+            self.instructions,
+        )
+        self.assertIn(
+            "The registered anchor identifies the defect, not the maximum edit range",
+            self.instructions,
+        )
+        self.assertIn(
+            "including lines already changed by the PR", self.instructions
+        )
+        self.assertIn(
+            "Do not absorb a distinct defect merely because the evaluator noticed it",
+            self.instructions,
+        )
+        self.assertIn(
+            "expand the planned paths before editing", self.instructions
+        )
+
     def test_final_response_renders_commit_dropped_candidate_and_pr_links(self):
         self.assertIn(
             "canonical pull request link from the most recent preflight result's "
@@ -740,6 +763,63 @@ class StateCommandTest(unittest.TestCase):
                     paths=["app.py"],
                     validation=None,
                 )
+            )
+
+    def test_drop_reads_shell_sensitive_rationale_from_utf8_file(self):
+        path = write_state(self.directory)
+        self.register(
+            path, [{"path": "app.py", "line": 3, "side": "RIGHT", "body": "Fix it."}]
+        )
+        rationale_path = self.directory / "rationale.txt"
+        rationale_path.write_text(
+            'Rejected: use isRegisteredWithDestination() ("already guarded").',
+            encoding="utf-8",
+        )
+
+        MODULE.command_drop(
+            SimpleNamespace(
+                state=str(path),
+                candidates=[1],
+                rationale=None,
+                rationale_file=str(rationale_path),
+            )
+        )
+
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        expected = (
+            'Rejected: use isRegisteredWithDestination() ("already guarded").'
+        )
+        self.assertEqual(saved["review"]["candidates"][0]["rationale"], expected)
+        self.assertEqual(self.emitted[-1]["rationale"], expected)
+
+    def test_drop_reads_rationale_from_stdin(self):
+        path = write_state(self.directory)
+        self.register(
+            path, [{"path": "app.py", "line": 3, "side": "RIGHT", "body": "Fix it."}]
+        )
+
+        with mock.patch.object(MODULE.sys, "stdin", io.StringIO("reason (from stdin)")):
+            MODULE.command_drop(
+                SimpleNamespace(
+                    state=str(path),
+                    candidates=[1],
+                    rationale=None,
+                    rationale_file="-",
+                )
+            )
+
+        self.assertEqual(self.emitted[-1]["rationale"], "reason (from stdin)")
+
+    def test_drop_parser_requires_one_rationale_source(self):
+        parser = MODULE.build_parser()
+        common = ["drop", "--state", "state.json", "--candidates", "1"]
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args(common)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                common
+                + ["--rationale", "inline", "--rationale-file", "rationale.txt"]
             )
 
     def test_rejects_unregistered_candidate_identifiers(self):

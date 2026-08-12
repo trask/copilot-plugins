@@ -612,6 +612,20 @@ def load_candidate_input(path_value: str) -> list[dict[str, Any]]:
     return payload
 
 
+def load_text_input(path_value: str, label: str) -> str:
+    try:
+        text = (
+            sys.stdin.read()
+            if path_value == "-"
+            else cli_path(path_value).read_text(encoding="utf-8")
+        )
+    except OSError as error:
+        raise WorkflowError(f"could not read {label}: {error}") from error
+    if not text.strip():
+        raise WorkflowError(f"{label} must not be empty")
+    return text.strip()
+
+
 def validate_candidates(
     candidates: list[dict[str, Any]],
     anchors: dict[str, dict[str, list[int]]],
@@ -818,15 +832,23 @@ def command_drop(args: argparse.Namespace) -> None:
     state = load_state(path)
     review = active_review(state)
     candidates = find_candidates(review, args.candidates)
+    rationale_file = getattr(args, "rationale_file", None)
+    rationale = (
+        load_text_input(rationale_file, "drop rationale")
+        if rationale_file
+        else args.rationale.strip()
+    )
+    if not rationale:
+        raise WorkflowError("drop rationale must not be empty")
     for candidate in candidates:
-        candidate.update({"status": "dropped", "rationale": args.rationale})
+        candidate.update({"status": "dropped", "rationale": rationale})
     save_state(path, state)
     emit(
         {
             "result": "dropped",
             "state": str(path),
             "candidate_ids": args.candidates,
-            "rationale": args.rationale,
+            "rationale": rationale,
         }
     )
 
@@ -1165,7 +1187,12 @@ def build_parser() -> argparse.ArgumentParser:
     drop = subparsers.add_parser("drop", help="record evaluator-rejected candidates")
     drop.add_argument("--state", required=True)
     drop.add_argument("--candidates", type=int, nargs="+", required=True)
-    drop.add_argument("--rationale", required=True)
+    drop_rationale = drop.add_mutually_exclusive_group(required=True)
+    drop_rationale.add_argument("--rationale")
+    drop_rationale.add_argument(
+        "--rationale-file",
+        help="UTF-8 rationale file, or - for standard input",
+    )
     drop.set_defaults(function=command_drop)
 
     plan = subparsers.add_parser("plan", help="record one planned fix batch")

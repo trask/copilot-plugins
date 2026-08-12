@@ -70,7 +70,7 @@ The deterministic, JSON-only helper provides:
 
 - `preflight [target] [--repo-root <workspace>] [--max-iterations 5]`: resolve and check out the PR, require a clean worktree, safely realign a force-pushed PR branch only when `git cherry` proves the local commits have no unique patches, require the local head to equal the PR head, fetch and parse the authoritative diff, confirm the head did not move around that fetch, enforce the iteration cap, archive the previous iteration, and return `head_sha`, `diff_path`, `changed_files`, and the carried-forward `history`
 - `candidates --state <path> --input <file-or->`: register this iteration's full candidate list as a JSON array whose objects contain exactly `path`, `line`, `side`, and `body`, and reject any candidate that is not anchored to a changed line of the pinned diff
-- `drop --state <path> --candidates <ids...> --rationale <text>`: record evaluator-rejected candidates
+- `drop --state <path> --candidates <ids...> (--rationale <text> | --rationale-file <file-or->)`: record evaluator-rejected candidates; prefer a temporary UTF-8 `--rationale-file` for model-authored text so shell quoting cannot alter it
 - `plan --state <path> --batch <id> --candidates <ids...> --label <label> [--paths <paths...>] [--validation <command>]`: persist one planned fix batch
 - `record` and `skip`: maintain completed or validation-blocked batch state
 - `resolve --state <path> --outcome clean`: require no candidates or only dropped candidates, verify the live PR head still matches the pin, and durably mark the active review clean
@@ -105,12 +105,13 @@ For each iteration, before editing anything:
 6. Launch a fresh independent subagent for **each candidate separately** using model **GPT-5.6 Sol** with reasoning effort **max**. Never combine candidates in one evaluation. Give that evaluator the PR's stated scope, the relevant diff and context, and exactly one candidate. Require two independent decisions with evidence:
    - Is the candidate factually correct and demonstrated by this PR?
    - Is it actionable and worth fixing within the PR's stated scope?
-7. Run `drop` for any candidate whose either decision fails or is uncertain, recording the evaluator's concrete reason. Retain each dropped candidate's original problem statement, location, and concrete evaluator reason for the final response. If every candidate is dropped, run `resolve --state <path> --outcome clean`, then stop without editing or publishing and send the final index.
+7. Run `drop` for any candidate whose either decision fails or is uncertain, recording the evaluator's concrete reason. Write that model-authored rationale to a temporary UTF-8 file outside the repository, pass it with `--rationale-file`, and remove it afterward; never force parentheses, quotes, or multiline text through a shell argument. Retain each dropped candidate's original problem statement, location, and concrete evaluator reason for the final response. If every candidate is dropped, run `resolve --state <path> --outcome clean`, then stop without editing or publishing and send the final index.
+8. An evaluator may improve the proposed fix without requiring a new candidate when the registered defect remains factually correct and the improved implementation addresses that same demonstrated root cause. The registered anchor identifies the defect, not the maximum edit range. The improved fix may update additional lines or files, including lines already changed by the PR, only when each edit is directly necessary for that root cause and remains within the PR's scope. Do not absorb a distinct defect merely because the evaluator noticed it; drop or defer that separate issue instead.
 
 ## Batching And Batch Execution
 
 1. Group surviving candidates when they share one root cause, require one coherent edit, or request the same sibling-module change. Separate them when grouping would obscure review or validation.
-2. Persist every batch with `plan`, including candidate IDs, label, paths, and validation.
+2. Persist every batch with `plan`, including candidate IDs, label, every path required by the final evaluator-informed fix, and validation. If the evaluator improves the implementation, expand the planned paths before editing; never let the eventual dirty paths exceed the persisted batch.
 3. Process every planned batch in order without waiting for user approval.
 
 For each batch:
