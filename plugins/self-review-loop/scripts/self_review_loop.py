@@ -374,7 +374,7 @@ def resolve_target(value: str | None, repo_root: Path) -> dict[str, Any]:
 def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     fields = (
         "number,title,url,headRefName,headRefOid,headRepositoryOwner,headRepository,"
-        "baseRefName,baseRefOid"
+        "baseRefName,baseRefOid,commits"
     )
     metadata = gh_json(
         [
@@ -415,6 +415,20 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     title = metadata.get("title")
     if not isinstance(title, str) or not title.strip():
         raise WorkflowError("resolved PR metadata has no title")
+    raw_commits = metadata.get("commits")
+    if not isinstance(raw_commits, list):
+        raise WorkflowError("resolved PR metadata has no commit list")
+    commits = []
+    for index, commit in enumerate(raw_commits):
+        if not isinstance(commit, dict):
+            raise WorkflowError(f"resolved PR commit {index} is not an object")
+        sha = commit.get("oid")
+        headline = commit.get("messageHeadline")
+        if not isinstance(sha, str) or not sha:
+            raise WorkflowError(f"resolved PR commit {index} has no OID")
+        if not isinstance(headline, str):
+            raise WorkflowError(f"resolved PR commit {index} has no message headline")
+        commits.append({"sha": sha, "message": headline.strip()})
     return {
         "number": target["number"],
         "title": title.strip(),
@@ -428,7 +442,33 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
         "head_sha": head_sha,
         "base_branch": metadata["baseRefName"],
         "base_sha": metadata["baseRefOid"],
+        "commits": commits,
     }
+
+
+def commit_provenance(
+    repo_root: Path, commits: list[dict[str, str]]
+) -> list[dict[str, Any]]:
+    provenance = []
+    for commit in commits:
+        files = sorted(
+            {
+                line
+                for line in git(
+                    repo_root,
+                    "diff-tree",
+                    "--root",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    "-m",
+                    commit["sha"],
+                ).splitlines()
+                if line
+            }
+        )
+        provenance.append({**commit, "files": files})
+    return provenance
 
 
 def require_checkout_head(local_head: str, pr_head: str) -> None:
@@ -779,6 +819,11 @@ def command_preflight(args: argparse.Namespace) -> None:
             "PR head changed while the authoritative diff was fetched: expected "
             f"{metadata['head_sha']}, got {refreshed['head_sha']}"
         )
+    pr_commits = commit_provenance(repo_root, metadata["commits"])
+    pr_authored_files = sorted(
+        {file for commit in pr_commits for file in commit["files"]}
+    )
+    diff_only_files = sorted(set(anchors) - set(pr_authored_files))
 
     if state is None:
         state = {
@@ -806,6 +851,9 @@ def command_preflight(args: argparse.Namespace) -> None:
                 "iteration": iteration,
                 "head_sha": metadata["head_sha"],
                 "diff_path": str(diff_path),
+                "pr_commits": pr_commits,
+                "pr_authored_files": pr_authored_files,
+                "diff_only_files": diff_only_files,
                 "anchors": serialize_anchors(anchors),
                 "candidates": [],
                 "batches": [],
@@ -822,6 +870,9 @@ def command_preflight(args: argparse.Namespace) -> None:
             "head_sha": metadata["head_sha"],
             "diff_path": str(diff_path),
             "changed_files": sorted(anchors),
+            "pr_commits": pr_commits,
+            "pr_authored_files": pr_authored_files,
+            "diff_only_files": diff_only_files,
             "history": state["history"],
             "iteration": iteration,
             "max_iterations": max_iterations,

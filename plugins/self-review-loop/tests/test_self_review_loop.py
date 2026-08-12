@@ -416,6 +416,28 @@ class AgentInstructionsTest(unittest.TestCase):
             "pinned head to be exactly the recorded ones",
             self.instructions,
         )
+        self.assertIn(
+            "GitHub's ordered `pr_commits` with each commit's touched `files`",
+            self.instructions,
+        )
+        self.assertIn(
+            "Use `pr_commits`, `pr_authored_files`, and `diff_only_files` to classify "
+            "scope when the PR base has drifted",
+            self.instructions,
+        )
+        self.assertIn(
+            "treat them as base-drift context rather than PR-authored work",
+            self.instructions,
+        )
+        self.assertIn(
+            "provenance narrows attribution, not the authoritative changeset",
+            self.instructions,
+        )
+        self.assertIn(
+            "Do not manually compare against `origin/main`, derive another merge-base "
+            "range, or replace the helper's provenance with `git log` or `git show`",
+            self.instructions,
+        )
 
     def test_isolates_validation_failures_owned_by_another_pending_batch(self):
         self.assertIn(
@@ -578,6 +600,38 @@ class TargetParsingTest(unittest.TestCase):
             MODULE.github_repo_from_remote("https://github.com/fork/repo"), "fork/repo"
         )
         self.assertIsNone(MODULE.github_repo_from_remote("https://example.com/fork/repo"))
+
+
+class PullRequestMetadataTest(unittest.TestCase):
+    def test_includes_githubs_ordered_pr_commit_list(self):
+        target = MODULE.parse_target("https://github.com/owner/repo/pull/7")
+        payload = {
+            "number": 7,
+            "title": "Add a thing",
+            "url": "https://github.com/owner/repo/pull/7",
+            "headRefName": "feature",
+            "headRefOid": "head",
+            "headRepositoryOwner": {"login": "fork"},
+            "headRepository": {"name": "repo"},
+            "baseRefName": "main",
+            "baseRefOid": "base",
+            "commits": [
+                {"oid": "one", "messageHeadline": "First change"},
+                {"oid": "two", "messageHeadline": "Second change"},
+            ],
+        }
+
+        with mock.patch.object(MODULE, "gh_json", return_value=payload) as gh_json:
+            metadata = MODULE.metadata_for(target)
+
+        self.assertEqual(
+            metadata["commits"],
+            [
+                {"sha": "one", "message": "First change"},
+                {"sha": "two", "message": "Second change"},
+            ],
+        )
+        self.assertIn("commits", gh_json.call_args.args[0][-1])
 
 
 class DiffAnchorTest(unittest.TestCase):
@@ -946,6 +1000,58 @@ class HeadVerificationTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(MODULE.WorkflowError, "authentication failed"):
                 MODULE.checkout_pr(Path("repo"), target, metadata)
+
+
+class CommitProvenanceTest(unittest.TestCase):
+    def test_returns_each_pr_commit_with_its_sorted_unique_file_set(self):
+        commits = [
+            {"sha": "one", "message": "First"},
+            {"sha": "two", "message": "Second"},
+        ]
+
+        with mock.patch.object(
+            MODULE,
+            "git",
+            side_effect=["z.py\na.py\nz.py\n", "docs/readme.md\n"],
+        ) as git:
+            result = MODULE.commit_provenance(Path("repo"), commits)
+
+        self.assertEqual(
+            result,
+            [
+                {"sha": "one", "message": "First", "files": ["a.py", "z.py"]},
+                {
+                    "sha": "two",
+                    "message": "Second",
+                    "files": ["docs/readme.md"],
+                },
+            ],
+        )
+        self.assertEqual(
+            git.call_args_list,
+            [
+                mock.call(
+                    Path("repo"),
+                    "diff-tree",
+                    "--root",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    "-m",
+                    "one",
+                ),
+                mock.call(
+                    Path("repo"),
+                    "diff-tree",
+                    "--root",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    "-m",
+                    "two",
+                ),
+            ],
+        )
 
 
 class StateCommandTest(unittest.TestCase):
@@ -1487,6 +1593,7 @@ class PreflightTest(unittest.TestCase):
             "head_sha": "head1",
             "base_branch": "main",
             "base_sha": "base1",
+            "commits": [{"sha": "commit1", "message": "Change app"}],
         }
         self.git_results = {
             ("status", "--porcelain=v1"): "",
@@ -1501,6 +1608,7 @@ class PreflightTest(unittest.TestCase):
         metadata_sequence=None,
         max_iterations=5,
         checked_out_branch=True,
+        provenance=None,
     ):
         arguments = SimpleNamespace(
             target="owner/repo#7",
@@ -1509,6 +1617,13 @@ class PreflightTest(unittest.TestCase):
             max_iterations=max_iterations,
         )
         metadata_sequence = metadata_sequence or [self.metadata, self.metadata]
+        provenance = provenance or [
+            {
+                "sha": "commit1",
+                "message": "Change app",
+                "files": ["app.py"],
+            }
+        ]
         with (
             mock.patch.object(MODULE, "require_tools"),
             mock.patch.object(
@@ -1522,6 +1637,11 @@ class PreflightTest(unittest.TestCase):
                 MODULE, "checkout_pr", return_value=checked_out_branch
             ),
             mock.patch.object(MODULE, "fetch_authoritative_diff", return_value=DIFF),
+            mock.patch.object(
+                MODULE,
+                "commit_provenance",
+                return_value=provenance,
+            ),
             mock.patch.object(MODULE, "run"),
         ):
             MODULE.command_preflight(arguments)
@@ -1535,6 +1655,12 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(result["result"], "ready")
         self.assertEqual(result["head_sha"], "head1")
         self.assertEqual(result["changed_files"], ["app.py"])
+        self.assertEqual(
+            result["pr_commits"],
+            [{"sha": "commit1", "message": "Change app", "files": ["app.py"]}],
+        )
+        self.assertEqual(result["pr_authored_files"], ["app.py"])
+        self.assertEqual(result["diff_only_files"], [])
         self.assertEqual(result["iteration"], 1)
         self.assertEqual(result["history"], [])
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -1546,6 +1672,21 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(diff_path, MODULE.diff_path_for(state_path))
         self.assertEqual(state["review"]["diff_path"], str(diff_path))
         self.assertEqual(diff_path.read_text(encoding="utf-8"), DIFF)
+
+    def test_reports_diff_files_absent_from_all_pr_commits(self):
+        result = self.preflight(
+            self.directory / "state.json",
+            provenance=[
+                {
+                    "sha": "commit1",
+                    "message": "Change docs",
+                    "files": ["docs/readme.md"],
+                }
+            ],
+        )
+
+        self.assertEqual(result["pr_authored_files"], ["docs/readme.md"])
+        self.assertEqual(result["diff_only_files"], ["app.py"])
 
     def test_accepts_detached_checkout_from_another_branch(self):
         self.git_results[("branch", "--show-current")] = ""

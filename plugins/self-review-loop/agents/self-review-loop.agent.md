@@ -70,7 +70,7 @@ Never pass a `~`-prefixed helper path to native Windows Python from Git Bash.
 
 The deterministic, JSON-only helper provides:
 
-- `preflight [target] [--repo-root <workspace>] [--max-iterations 5]`: resolve and check out the PR, require a clean worktree, safely realign a force-pushed PR branch only when `git cherry` proves the local commits have no unique patches, require the local head to equal the PR head, fetch and parse the authoritative diff, confirm the head did not move around that fetch, enforce the iteration cap, archive the previous iteration, and return `head_sha`, `diff_path`, `changed_files`, and the carried-forward `history`
+- `preflight [target] [--repo-root <workspace>] [--max-iterations 5]`: resolve and check out the PR, require a clean worktree, safely realign a force-pushed PR branch only when `git cherry` proves the local commits have no unique patches, require the local head to equal the PR head, fetch and parse the authoritative diff, confirm the head did not move around that fetch, enforce the iteration cap, archive the previous iteration, and return `head_sha`, `diff_path`, `changed_files`, GitHub's ordered `pr_commits` with each commit's touched `files`, their `pr_authored_files` union, `diff_only_files`, and the carried-forward `history`
 - `candidates --state <path> --input <file-or->`: register this iteration's full candidate list as a JSON array whose objects contain exactly `path`, `line`, `side`, and `body`, and reject any candidate that is not anchored to a changed line of the pinned diff
 - `drop --state <path> --candidates <ids...> (--rationale <text> | --rationale-file <file-or->)`: record evaluator-rejected candidates; prefer a temporary UTF-8 `--rationale-file` for model-authored text so shell quoting cannot alter it
 - `plan --state <path> --batch <id> --candidates <ids...> --label <label> [--paths <paths...>] [--validation <command>]`: persist one planned fix batch
@@ -94,6 +94,8 @@ The workflow always covers one entire pull request. A pasted review or discussio
    - `max_iterations_reached`: stop before editing and report the cap in the final commit index.
 
 Record the returned `head_sha` as the immutable snapshot for this iteration and do not replace or refresh it. Read the pinned diff only from the returned `diff_path`, which is the exact text the helper fetched and validated at that head; never re-run `gh pr diff` or reconstruct the changeset another way. Treat the returned `history` as authoritative about everything earlier iterations already decided.
+
+Use `pr_commits`, `pr_authored_files`, and `diff_only_files` to classify scope when the PR base has drifted. `diff_only_files` are present in the authoritative PR diff but absent from every commit GitHub lists for the PR, so treat them as base-drift context rather than PR-authored work unless a PR commit, interaction, or stated scope makes them relevant. Do not raise pre-existing defects merely because drift exposes them. Still review the entire pinned diff: provenance narrows attribution, not the authoritative changeset, and files in both sets may contain interacting or mixed changes. Do not manually compare against `origin/main`, derive another merge-base range, or replace the helper's provenance with `git log` or `git show`.
 
 ## Review And Evaluation
 
