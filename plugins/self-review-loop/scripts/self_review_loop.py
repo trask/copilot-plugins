@@ -21,6 +21,7 @@ from typing import Any, Iterable
 STATE_VERSION = 1
 DEFAULT_MAX_ITERATIONS = 5
 PR_HEAD_LAG_RETRY_DELAY = 1
+REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
 IS_WINDOWS = os.name == "nt"
 PR_URL_PATTERN = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
@@ -995,6 +996,18 @@ def remote_head(owner: str, repo: str, branch: str) -> str | None:
     return json.loads(process.stdout)["object"]["sha"]
 
 
+def wait_for_remote_head(
+    owner: str, repo: str, branch: str, expected_head: str
+) -> str | None:
+    actual_head = remote_head(owner, repo, branch)
+    for delay in REMOTE_REF_LAG_RETRY_DELAYS:
+        if actual_head == expected_head:
+            break
+        time.sleep(delay)
+        actual_head = remote_head(owner, repo, branch)
+    return actual_head
+
+
 def require_fork_head(pr: dict[str, Any]) -> None:
     upstream = f"{pr['upstream_owner']}/{pr['upstream_repo']}".lower()
     head = f"{pr['head_owner']}/{pr['head_repo']}".lower()
@@ -1085,7 +1098,9 @@ def command_publish(args: argparse.Namespace) -> None:
     remote = find_push_remote(repo_root, pr["head_owner"], pr["head_repo"])
     if remote_head(pr["head_owner"], pr["head_repo"], pr["head_branch"]) != local_head:
         run(["git", "-C", str(repo_root), "push", remote, f"HEAD:{pr['head_branch']}"])
-    pushed_head = remote_head(pr["head_owner"], pr["head_repo"], pr["head_branch"])
+    pushed_head = wait_for_remote_head(
+        pr["head_owner"], pr["head_repo"], pr["head_branch"], local_head
+    )
     if pushed_head != local_head:
         raise WorkflowError(f"fork ref mismatch: local {local_head}, remote {pushed_head}")
     pr_head = metadata_for(parse_target(pr["pr_url"]))["head_sha"]

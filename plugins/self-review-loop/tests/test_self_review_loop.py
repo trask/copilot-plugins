@@ -226,6 +226,29 @@ class AgentInstructionsTest(unittest.TestCase):
             "expand the planned paths before editing", self.instructions
         )
 
+    def test_routes_plausible_unresolved_candidates_to_the_evaluator(self):
+        self.assertIn(
+            '"Prefer silence" governs the final finding threshold, not evaluator access',
+            self.instructions,
+        )
+        self.assertIn(
+            "register a candidate when it presents a concrete, plausible defect",
+            self.instructions,
+        )
+        self.assertIn(
+            "factuality or actionability remains genuinely unresolved",
+            self.instructions,
+        )
+        self.assertIn(
+            "Self-drop a lead before registration only when direct evidence already "
+            "disproves it",
+            self.instructions,
+        )
+        self.assertIn(
+            "do not self-drop them merely because they may prove to be no-ops",
+            self.instructions,
+        )
+
     def test_final_response_renders_commit_dropped_candidate_and_pr_links(self):
         self.assertIn(
             "canonical pull request link from the most recent preflight result's "
@@ -582,6 +605,46 @@ class HeadVerificationTest(unittest.TestCase):
             MODULE.require_fork_head(pr)
 
         remote_head.assert_not_called()
+
+    def test_waits_for_the_pushed_ref_to_propagate(self):
+        with (
+            mock.patch.object(
+                MODULE,
+                "remote_head",
+                side_effect=["old-head", "old-head", "new-head"],
+            ) as remote_head,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            result = MODULE.wait_for_remote_head(
+                "owner", "repo", "branch", "new-head"
+            )
+
+        self.assertEqual(result, "new-head")
+        self.assertEqual(remote_head.call_count, 3)
+        self.assertEqual(
+            sleep.call_args_list,
+            [
+                mock.call(MODULE.REMOTE_REF_LAG_RETRY_DELAYS[0]),
+                mock.call(MODULE.REMOTE_REF_LAG_RETRY_DELAYS[1]),
+            ],
+        )
+
+    def test_stops_waiting_after_the_remote_ref_retry_budget(self):
+        with (
+            mock.patch.object(
+                MODULE, "remote_head", return_value="old-head"
+            ) as remote_head,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            result = MODULE.wait_for_remote_head(
+                "owner", "repo", "branch", "new-head"
+            )
+
+        self.assertEqual(result, "old-head")
+        self.assertEqual(
+            remote_head.call_count, len(MODULE.REMOTE_REF_LAG_RETRY_DELAYS) + 1
+        )
+        self.assertEqual(sleep.call_count, len(MODULE.REMOTE_REF_LAG_RETRY_DELAYS))
 
     def test_keeps_the_existing_pr_branch_checked_out(self):
         target = {"pr_url": "https://github.com/owner/repo/pull/7"}

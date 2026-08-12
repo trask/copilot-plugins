@@ -32,6 +32,7 @@ Clear the **Model Gate** first, then run `preflight`. After `preflight` succeeds
 - Skip local tests during review. Run a focused local check only when unusual evidence makes it necessary to prove or disprove a candidate, and always run focused validation for an edit you make.
 - Raise only actionable issues that are factually demonstrated in this PR and worth fixing within its stated scope. Changed documentation or metadata can demonstrate an issue, and the same demonstrated issue elsewhere in the PR can be in scope.
 - Prefer silence. Zero candidates is a successful review. Never invent work to justify a commit, and never file speculative concerns, trivia, style preferences, praise, or issues that predate and are not made relevant by this PR.
+- "Prefer silence" governs the final finding threshold, not evaluator access. After reasonable investigation, register a candidate when it presents a concrete, plausible defect demonstrated by the PR but factuality or actionability remains genuinely unresolved; the independent evaluator exists to adjudicate that uncertainty. Self-drop a lead before registration only when direct evidence already disproves it, makes it clearly non-actionable, or leaves no concrete demonstrated defect. Do not register a concern that is merely imaginable.
 - Never re-raise a finding the carried-forward `history` already records as `dropped`, `addressed`, or `no_code`.
 - Group findings that share one root cause into one batch and one commit. Keep unrelated causes in separate commits even when they are close together.
 - Every code-change commit must durably record the original finding, technical analysis, and concrete upsides and downsides using **Commit Content**.
@@ -101,7 +102,7 @@ For each iteration, before editing anything:
 2. Review the entire pinned diff read from `diff_path`, including commits this loop created in earlier iterations. Build a private candidate list, each with exact path, changed line, `LEFT` for a deleted line or `RIGHT` for an added line, demonstrated impact, and a plain few-sentence description of the problem and one concrete fix.
 3. Discard anything the carried-forward `history` already resolved.
 4. If no candidates remain, run `resolve --state <path> --outcome clean`, then stop without registering candidates, editing, or publishing, and send the final index.
-5. Otherwise register the full surviving list with `candidates`, which also proves every anchor is a genuinely changed line.
+5. Otherwise register the full surviving list with `candidates`, which also proves every anchor is a genuinely changed line. Include concrete plausible candidates whose factuality or actionability remains unresolved after reasonable investigation; do not self-drop them merely because they may prove to be no-ops.
 6. Launch a fresh independent subagent for **each candidate separately** using model **GPT-5.6 Sol** with reasoning effort **max**. Never combine candidates in one evaluation. Give that evaluator the PR's stated scope, the relevant diff and context, and exactly one candidate. Require two independent decisions with evidence:
    - Is the candidate factually correct and demonstrated by this PR?
    - Is it actionable and worth fixing within the PR's stated scope?
