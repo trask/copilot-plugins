@@ -140,6 +140,19 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertNotIn("## Approval And Advancement", instructions)
         self.assertNotIn("## Revision, Revert, And Skip", instructions)
 
+    def test_publish_detects_remote_head_divergence_before_push(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "compare the live remote PR head with the preflight pin immediately "
+            "before pushing",
+            instructions,
+        )
+        self.assertIn(
+            "If `publish` returns `head_changed`, stop without retrying or pushing",
+            instructions,
+        )
+
     def test_empty_queue_without_clean_head_review_requests_review(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
@@ -1184,7 +1197,7 @@ class RemoteParsingTest(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(MODULE.WorkflowError, "refusing to push"):
-            MODULE.require_fork_head(pr)
+            MODULE.require_fork_head(pr, "abc123")
 
     def test_allows_upstream_owned_pr_head_when_branch_exists(self):
         pr = {
@@ -1195,8 +1208,7 @@ class RemoteParsingTest(unittest.TestCase):
             "head_branch": "topic",
         }
 
-        with mock.patch.object(MODULE, "remote_head", return_value="abc123"):
-            MODULE.require_fork_head(pr)
+        MODULE.require_fork_head(pr, "abc123")
 
     def test_rejects_upstream_owned_pr_head_when_branch_missing(self):
         pr = {
@@ -1207,9 +1219,8 @@ class RemoteParsingTest(unittest.TestCase):
             "head_branch": "topic",
         }
 
-        with mock.patch.object(MODULE, "remote_head", return_value=None):
-            with self.assertRaisesRegex(MODULE.WorkflowError, "refusing to push"):
-                MODULE.require_fork_head(pr)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "refusing to push"):
+            MODULE.require_fork_head(pr, None)
 
     def test_waits_for_the_pushed_ref_to_propagate(self):
         with (
@@ -1458,6 +1469,7 @@ class ReplyPublishingTest(unittest.TestCase):
                 "head_owner": "author",
                 "head_repo": "repo",
                 "head_branch": "branch",
+                "head_sha": "old-head",
             },
             "queue": {
                 "id": "pr-42",
@@ -1509,6 +1521,126 @@ class ReplyPublishingTest(unittest.TestCase):
         resolve_threads.assert_not_called()
         self.assertEqual(emit.call_args.args[0]["reply_ids"], {})
 
+    def test_reports_remote_head_divergence_without_pushing(self):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "repo_root": "repo",
+            "pr": {
+                "head_owner": "author",
+                "head_repo": "repo",
+                "head_branch": "branch",
+                "head_sha": "old-head",
+            },
+            "queue": {
+                "id": "pr-42",
+                "comments": [],
+                "status": "active",
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            MODULE.save_state(state_path, state)
+            args = SimpleNamespace(state=str(state_path), no_comments=True)
+
+            def fake_git(repo_root, *arguments):
+                del repo_root
+                return {
+                    ("status", "--porcelain=v1"): "",
+                    ("rev-parse", "HEAD"): "local-head",
+                }[arguments]
+
+            with (
+                mock.patch.object(MODULE, "git", side_effect=fake_git),
+                mock.patch.object(MODULE, "require_fork_head"),
+                mock.patch.object(
+                    MODULE, "find_push_remote", return_value="origin"
+                ) as find_remote,
+                mock.patch.object(
+                    MODULE, "remote_head", return_value="force-updated-head"
+                ),
+                mock.patch.object(MODULE, "run") as run,
+                mock.patch.object(MODULE, "post_missing_replies") as post_replies,
+                mock.patch.object(MODULE, "request_copilot") as request_copilot,
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_publish(args)
+
+        run.assert_not_called()
+        find_remote.assert_not_called()
+        post_replies.assert_not_called()
+        request_copilot.assert_not_called()
+        emit.assert_called_once_with(
+            {
+                "result": "head_changed",
+                "state": str(state_path.resolve()),
+                "expected_head": "old-head",
+                "actual_head": "force-updated-head",
+                "local_head": "local-head",
+            }
+        )
+
+    def test_reports_divergence_when_remote_moves_during_push(self):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "repo_root": "repo",
+            "pr": {
+                "head_owner": "author",
+                "head_repo": "repo",
+                "head_branch": "branch",
+                "head_sha": "old-head",
+            },
+            "queue": {
+                "id": "pr-42",
+                "comments": [],
+                "status": "active",
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            MODULE.save_state(state_path, state)
+            args = SimpleNamespace(state=str(state_path), no_comments=True)
+
+            def fake_git(repo_root, *arguments):
+                del repo_root
+                return {
+                    ("status", "--porcelain=v1"): "",
+                    ("rev-parse", "HEAD"): "local-head",
+                }[arguments]
+
+            with (
+                mock.patch.object(MODULE, "git", side_effect=fake_git),
+                mock.patch.object(MODULE, "require_fork_head"),
+                mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
+                mock.patch.object(
+                    MODULE,
+                    "remote_head",
+                    side_effect=["old-head", "force-updated-head"],
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "run",
+                    side_effect=MODULE.WorkflowError("fetch first"),
+                ),
+                mock.patch.object(MODULE, "post_missing_replies") as post_replies,
+                mock.patch.object(MODULE, "request_copilot") as request_copilot,
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_publish(args)
+
+        post_replies.assert_not_called()
+        request_copilot.assert_not_called()
+        emit.assert_called_once_with(
+            {
+                "result": "head_changed",
+                "state": str(state_path.resolve()),
+                "expected_head": "old-head",
+                "actual_head": "force-updated-head",
+                "local_head": "local-head",
+            }
+        )
+
     def test_publishes_a_suppressed_only_queue(self):
         state = {
             "version": MODULE.STATE_VERSION,
@@ -1518,6 +1650,7 @@ class ReplyPublishingTest(unittest.TestCase):
                 "head_owner": "author",
                 "head_repo": "repo",
                 "head_branch": "branch",
+                "head_sha": "same-head",
             },
             "queue": {
                 "id": "pr-42",

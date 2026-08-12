@@ -1032,15 +1032,13 @@ def find_push_remote(repo_root: Path, owner: str, repo: str) -> str:
     raise WorkflowError(f"no git remote points to PR head repository {owner}/{repo}")
 
 
-def require_fork_head(pr: dict[str, Any]) -> None:
+def require_fork_head(pr: dict[str, Any], actual_head: str | None) -> None:
     upstream = f"{pr['upstream_owner']}/{pr['upstream_repo']}".lower()
     head = f"{pr['head_owner']}/{pr['head_repo']}".lower()
     if head != upstream:
         return
     # Some repositories host PR branches upstream; pushing to an existing one creates nothing new.
-    if not pr.get("head_branch") or remote_head(
-        pr["head_owner"], pr["head_repo"], pr["head_branch"]
-    ) is None:
+    if not pr.get("head_branch") or actual_head is None:
         raise WorkflowError(
             "PR head repository is the upstream repository and the head branch does not exist; "
             "refusing to push directly upstream"
@@ -1069,6 +1067,20 @@ def wait_for_remote_head(
         time.sleep(delay)
         actual_head = remote_head(owner, repo, branch)
     return actual_head
+
+
+def emit_head_changed(
+    path: Path, expected_head: str, actual_head: str | None, local_head: str
+) -> None:
+    emit(
+        {
+            "result": "head_changed",
+            "state": str(path),
+            "expected_head": expected_head,
+            "actual_head": actual_head,
+            "local_head": local_head,
+        }
+    )
 
 
 def is_copilot(user: dict[str, Any] | None, bot_id: str | None = None) -> bool:
@@ -1407,13 +1419,38 @@ def command_publish(args: argparse.Namespace) -> None:
         raise WorkflowError(f"handled comments lack publish data: {incomplete}")
 
     pr = state["pr"]
-    require_fork_head(pr)
     local_head = git(repo_root, "rev-parse", "HEAD")
-    remote = find_push_remote(repo_root, pr["head_owner"], pr["head_repo"])
-    if remote_head(pr["head_owner"], pr["head_repo"], pr["head_branch"]) != local_head:
-        run(
-            ["git", "-C", str(repo_root), "push", remote, f"HEAD:{pr['head_branch']}"]
-        )
+    remote_before_push = remote_head(
+        pr["head_owner"], pr["head_repo"], pr["head_branch"]
+    )
+    require_fork_head(pr, remote_before_push)
+    expected_remote_head = pr["head_sha"]
+    if remote_before_push not in {expected_remote_head, local_head}:
+        emit_head_changed(path, expected_remote_head, remote_before_push, local_head)
+        return
+    if remote_before_push != local_head:
+        remote = find_push_remote(repo_root, pr["head_owner"], pr["head_repo"])
+        try:
+            run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_root),
+                    "push",
+                    remote,
+                    f"HEAD:{pr['head_branch']}",
+                ]
+            )
+        except WorkflowError:
+            remote_after_failure = remote_head(
+                pr["head_owner"], pr["head_repo"], pr["head_branch"]
+            )
+            if remote_after_failure not in {expected_remote_head, local_head}:
+                emit_head_changed(
+                    path, expected_remote_head, remote_after_failure, local_head
+                )
+                return
+            raise
     pushed_head = wait_for_remote_head(
         pr["head_owner"], pr["head_repo"], pr["head_branch"], local_head
     )
