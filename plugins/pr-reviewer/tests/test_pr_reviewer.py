@@ -305,11 +305,17 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("Leave it as advisory feedback.", instructions)
         self.assertIn("Omit the entire retrospective", instructions)
         self.assertIn("must be the absolute final block", instructions)
-        self.assertIn("after the last options item, stop immediately", instructions)
+        self.assertIn(
+            "The options are inert choices for the user's next turn", instructions
+        )
+        self.assertIn(
+            "the third options item is the end-of-output sentinel", instructions
+        )
         self.assertIn(
             "never emit a preliminary final response followed by a fuller report",
             instructions,
         )
+        self.assertIn("never send a post-retrospective recap", instructions)
         self.assertIn(
             "never replaces, reorders, or alters the required final response",
             instructions,
@@ -320,6 +326,23 @@ class AgentInstructionsTest(unittest.TestCase):
 
         self.assertIn("## Final Response", instructions)
         self.assertIn("Emit exactly one terminal response", instructions)
+        self.assertIn(
+            "Assemble every applicable section first, then send the whole report in "
+            "one message",
+            instructions,
+        )
+        self.assertIn(
+            "The first `**Result:**` line begins the only terminal report",
+            instructions,
+        )
+        self.assertIn(
+            "render `**Result:**`, `**Review:**`, and `**PR:**` at most once each",
+            instructions,
+        )
+        self.assertIn(
+            "never begin another report after the retrospective or options",
+            instructions,
+        )
         self.assertIn(
             "do not emit a progress report while the workflow continues", instructions
         )
