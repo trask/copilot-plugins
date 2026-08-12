@@ -176,6 +176,37 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
+    def test_allows_focused_runtime_evidence_without_duplicating_ci(self):
+        self.assertIn(
+            "Skip local test suites and other checks whose purpose is merely to "
+            "duplicate CI during review",
+            self.instructions,
+        )
+        self.assertIn(
+            "CI owns routine build, lint, and test validation before this loop edits "
+            "anything",
+            self.instructions,
+        )
+        self.assertIn(
+            "This does not prohibit focused local execution used as evidence",
+            self.instructions,
+        )
+        self.assertIn(
+            "run the smallest throwaway probe that directly establishes the relevant "
+            "repository, shared-helper, dependency, or third-party runtime semantics",
+            self.instructions,
+        )
+        self.assertIn(
+            "Reuse already available dependencies and caches", self.instructions
+        )
+        self.assertIn(
+            "keep generated artifacts outside the repository, clean them up afterward",
+            self.instructions,
+        )
+        self.assertIn(
+            "do not broaden the probe into general validation", self.instructions
+        )
+
     def test_commit_body_uses_the_review_finding_label(self):
         self.assertIn("## Commit Content", self.instructions)
         self.assertIn("Address review finding: <short summary>", self.instructions)
