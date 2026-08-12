@@ -415,6 +415,44 @@ class AgentInstructionsTest(unittest.TestCase):
             "never replaces, reorders, or alters the required final response",
             self.instructions,
         )
+        self.assertIn("never send a post-retrospective recap", self.instructions)
+
+    def test_sends_the_terminal_response_as_the_last_message(self):
+        self.assertIn(
+            "The terminal response is the run's last message", self.instructions
+        )
+        self.assertIn(
+            "send it in a message that calls no tool, and never follow it with a "
+            "recap or a second summary",
+            self.instructions,
+        )
+        self.assertIn(
+            "Emit exactly one terminal response and make it the last message of the "
+            "run",
+            self.instructions,
+        )
+        self.assertIn("Finish every tool call the run needs", self.instructions)
+        self.assertIn(
+            "then send the whole thing in one message that calls no tool",
+            self.instructions,
+        )
+        self.assertIn(
+            "attach any part of it to a message that also calls a tool",
+            self.instructions,
+        )
+        self.assertIn("Once it is sent the run is over", self.instructions)
+        self.assertIn(
+            "never send another message because a tool result, reminder, or turn "
+            "boundary invites one",
+            self.instructions,
+        )
+        self.assertIn(
+            "never open with a narrative recap of what the run did", self.instructions
+        )
+        self.assertIn(
+            "render the `Validated:`, `Applied:`, and `PR:` lines at most once each",
+            self.instructions,
+        )
 
     def test_manifest_and_marketplace_versions_match(self):
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
@@ -422,7 +460,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.13")
+        self.assertEqual(plugin["version"], "1.0.14")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 

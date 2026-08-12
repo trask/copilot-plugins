@@ -34,6 +34,7 @@ This agent handles Copilot review comments only. Comments from human reviewers a
 - On targetless requests, `current` always means the PR attached to the currently checked-out branch. Never enumerate, rank, or select saved state files by watcher status, timestamp, filename, or any other heuristic.
 - Use the bundled Python helper for every supported GitHub or workflow-state operation. Do not reconstruct its `gh api`, reply, resolution, verification, or watcher logic in shell commands.
 - Give progress updates only at meaningful boundaries. Do not stop the autonomous loop merely to report progress.
+- The terminal response is the run's last message. Finish every tool call before composing it, send it in a message that calls no tool, and never follow it with a recap or a second summary.
 
 ## Mechanical Helper
 
@@ -187,10 +188,14 @@ The helper increments the persisted total iteration count only after successful 
 
 ## Final Response
 
-Keep chat as a compact index because reasoning lives in git. Emit exactly one terminal response. Render ordinary Markdown, never a fenced code block. Emit one linked list item per commit using the canonical pull request URL from the most recent preflight result's `pr.url`, then one loop-outcome line:
+Keep chat as a compact index because reasoning lives in git. Emit exactly one terminal response and make it the last message of the run. Render ordinary Markdown, never a fenced code block. Emit one linked list item per commit using the canonical pull request URL from the most recent preflight result's `pr.url`, then one loop-outcome line:
 
 - `[<short-sha> <short batch summary>](<pr.url>/changes/<full-sha>)`
 - `**Outcome:** clean after <n> iteration(s), [Copilot review <id>](<review-url>).`
+
+Finish every tool call the run needs, including the final publish, watcher, and cleanup steps, before composing this response. Assemble every applicable section, including the retrospective, then send the whole thing in one message that calls no tool. Never attach any part of it to a message that also calls a tool, because the tool result then forces you to speak again. Once it is sent the run is over: never restate, condense, expand, or re-render it, and never send another message because a tool result, reminder, or turn boundary invites one.
+
+Begin with the first applicable required line and never open with a narrative recap of what the run did. The first commit link or `**Outcome:**` line begins the only report of the run, so render the `**Outcome:**` line at most once and never begin a second report after it or after the retrospective.
 
 The backticks above delimit templates only; do not include them in the final response. For a preflight-only clean exit, build the same link from `head_review_id` and `head_review_url`. Never print a bare review ID when its URL is available. For a capped or interrupted run, use `**Outcome:** <exact stop condition> after <n> iteration(s).` and append the same review link when the terminal helper result includes a review ID and URL. Mention uncommitted work only for an unfixable validation stop. Do not repeat Copilot comments, analysis, upsides, downsides, validation success, or publication mechanics in chat.
 
@@ -217,4 +222,4 @@ Apply these rules:
 - Do not relitigate a deliberate design decision such as the iteration cap or the synchronous watcher. A rule that was genuinely ambiguous or expensive to follow is a finding; a rule you merely disagree with is not.
 - The retrospective is advisory and chat-only. Never edit an agent definition, helper script, instruction file, or repository instruction because of it, never open an issue for it, and never turn it into a thread reply, commit, or any other GitHub mutation.
 
-Render it after the final response under a bold `**Copilot Review Loop Agent Retrospective**` label as a plain Markdown list, and omit the label entirely when there is nothing to report. The retrospective never replaces, reorders, or alters the required final compact index. When present, it must be the absolute final block: after its last list item, stop immediately. Never append or repeat findings, summaries, outcomes, links, or any other content after it, and never emit a preliminary final response followed by a fuller report.
+Render it after the final response under a bold `**Copilot Review Loop Agent Retrospective**` label as a plain Markdown list, and omit the label entirely when there is nothing to report. The retrospective never replaces, reorders, or alters the required final compact index. When present, it must be the absolute final block: after its last list item, stop immediately. Never append or repeat findings, summaries, outcomes, links, or any other content after it, never emit a preliminary final response followed by a fuller report, and never send a post-retrospective recap.

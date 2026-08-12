@@ -27,6 +27,7 @@ You run a human-in-the-middle loop for one pull request's title and description.
 - Never hard wrap a pull request description. Preserve intentional paragraph and list boundaries.
 - Never wrap a displayed title or description in a fenced code block or inline code span. Display every such value as a blockquote under "Displaying Title And Description".
 - Do not use persistent user memories as workflow instructions. This file and the user's explicit messages in this session are the source of truth.
+- The terminal response is the run's last message. Finish every tool call before composing it, send it in a message that calls no tool, and never follow it with a recap or a second summary.
 
 ## Displaying Title And Description
 
@@ -161,7 +162,11 @@ When `validate` or `apply` reports a moved head, do not immediately ask the user
 
 ## Final Response
 
-Emit exactly one terminal response and close with plain labeled lines, not a code block.
+Emit exactly one terminal response and make it the last message of the run, closing with plain labeled lines, not a code block.
+
+Finish every tool call the run needs, including the final `validate` or apply step and any cleanup, before composing this response. Assemble every applicable section, including the retrospective, then send the whole thing in one message that calls no tool. Never attach any part of it to a message that also calls a tool, because the tool result then forces you to speak again. Once it is sent the run is over: never restate, condense, expand, or re-render it, and never send another message because a tool result, reminder, or turn boundary invites one.
+
+Begin with the first applicable labeled line and never open with a narrative recap of what the run did. That line begins the only report of the run, so render the `Validated:`, `Applied:`, and `PR:` lines at most once each and never begin a second report after them or after the retrospective.
 
 For an unchanged validation, report `Validated: <title>` and `PR: <pr.url>`.
 
@@ -190,4 +195,4 @@ Apply these rules:
 - Do not relitigate a deliberate design decision such as the explicit-approval requirement or the PR description style rules. A rule that was genuinely ambiguous or expensive to follow is a finding; a rule you merely disagree with is not.
 - The retrospective is advisory and chat-only. Never edit an agent definition, helper script, instruction file, or repository instruction because of it, never open an issue for it, and never fold it into a pull request title or description.
 
-Render it after the final labeled lines under a bold `**PR Description Loop Agent Retrospective**` label as a plain Markdown list, and omit the label entirely when there is nothing to report. The retrospective never replaces, reorders, or alters the required final response. When present, it must be the absolute final block: after its last list item, stop immediately. Never append or repeat proposal details, summaries, outcomes, links, or any other content after it, and never emit a preliminary final response followed by a fuller report.
+Render it after the final labeled lines under a bold `**PR Description Loop Agent Retrospective**` label as a plain Markdown list, and omit the label entirely when there is nothing to report. The retrospective never replaces, reorders, or alters the required final response. When present, it must be the absolute final block: after its last list item, stop immediately. Never append or repeat proposal details, summaries, outcomes, links, or any other content after it, never emit a preliminary final response followed by a fuller report, and never send a post-retrospective recap.

@@ -42,6 +42,7 @@ Clear the **Model Gate** first, then run `preflight`. After `preflight` succeeds
 - On targetless requests, `current` always means the PR attached to the currently checked-out branch. Never enumerate, rank, or select saved state files by timestamp, filename, or any other heuristic.
 - Use the bundled helper for every supported GitHub or workflow-state operation. Do not reconstruct its checkout, diff, anchor validation, push, or verification logic in shell commands.
 - Give progress updates only at meaningful boundaries. Do not stop the autonomous loop merely to report progress.
+- The terminal response is the run's last message. Finish every tool call before composing it, send it in a message that calls no tool, and never follow it with a recap or a second summary.
 
 ## Model Gate
 
@@ -167,7 +168,7 @@ The general pull request instruction to keep the title and description materiall
 
 ## Final Response
 
-Keep chat as a compact index because the reasoning for accepted findings lives in git. Emit exactly one terminal response. Render ordinary Markdown, never a fenced code block. Emit one linked list item per commit, then any no-code outcome, one loop-outcome line, an optional dropped-candidate block, and finally the canonical pull request link from the most recent preflight result's `pr.pr_url`:
+Keep chat as a compact index because the reasoning for accepted findings lives in git. Emit exactly one terminal response and make it the last message of the run. Render ordinary Markdown, never a fenced code block. Emit one linked list item per commit, then any no-code outcome, one loop-outcome line, an optional dropped-candidate block, and finally the canonical pull request link from the most recent preflight result's `pr.pr_url`:
 
 - `[<short-sha> <short batch summary>](<pr.pr_url>/changes/<full-sha>)`
 - `No code change: <short summary> - <one-line rationale>`
@@ -175,6 +176,10 @@ Keep chat as a compact index because the reasoning for accepted findings lives i
 - `**Dropped candidates:**`
 - `- \`<path>:<line>\` - <concise candidate problem>: <concrete evaluator reason>`
 - `**PR:** [#<pr.number> <pr.title>](<pr.pr_url>)`
+
+Finish every tool call the run needs, including the final `resolve` or `publish`, the PR metadata recheck, and any temporary-file removal, before composing this response. Assemble every applicable section, including the retrospective, then send the whole thing in one message that calls no tool. Never attach any part of it to a message that also calls a tool, because the tool result then forces you to speak again. Once it is sent the run is over: never restate, condense, expand, or re-render it, and never send another message because a tool result, reminder, or turn boundary invites one.
+
+Begin with the first applicable required line and never open with a narrative recap of what the run did. The first `**Outcome:**` line begins the only report of the run, so render the `**Outcome:**`, `**Dropped candidates:**`, and `**PR:**` lines at most once each and never begin a second report after them or after the retrospective.
 
 Include the dropped-candidate block only when this run dropped candidates, after `**Outcome:**` so the primary result remains first and immediately before `**PR:**` so the canonical link remains the end of the main response. List every dropped candidate separately with its original problem and the evaluator's concrete reason; do not collapse them into a count. Report only candidates evaluated and dropped during this run, not dropped entries carried forward in `history`.
 
@@ -203,4 +208,4 @@ Apply these rules:
 - Do not relitigate a deliberate design decision such as the **Model Gate** or the independent evaluator. A rule that was genuinely ambiguous or expensive to follow is a finding; a rule you merely disagree with is not.
 - The retrospective is advisory and chat-only. Never edit an agent definition, helper script, instruction file, or repository instruction because of it, never open an issue for it, and never commit it or push it as part of this loop.
 
-Render it after the final response under a bold `**Self Review Loop Agent Retrospective**` label as a plain Markdown list, and omit the label entirely when there is nothing to report. The retrospective never replaces, reorders, or alters the required final response. When present, it must be the absolute final block: after its last list item, stop immediately. Never append or repeat findings, summaries, outcomes, links, or any other content after it, and never emit a preliminary final response followed by a fuller report.
+Render it after the final response under a bold `**Self Review Loop Agent Retrospective**` label as a plain Markdown list, and omit the label entirely when there is nothing to report. The retrospective never replaces, reorders, or alters the required final response. When present, it must be the absolute final block: after its last list item, stop immediately. Never append or repeat findings, summaries, outcomes, links, or any other content after it, never emit a preliminary final response followed by a fuller report, and never send a post-retrospective recap.

@@ -487,6 +487,49 @@ class AgentInstructionsTest(unittest.TestCase):
             "never emit a preliminary final response followed by a fuller report",
             self.instructions,
         )
+        self.assertIn("never send a post-retrospective recap", self.instructions)
+
+    def test_sends_the_terminal_response_as_the_last_message(self):
+        self.assertIn(
+            "The terminal response is the run's last message", self.instructions
+        )
+        self.assertIn(
+            "send it in a message that calls no tool, and never follow it with a "
+            "recap or a second summary",
+            self.instructions,
+        )
+        self.assertIn(
+            "Emit exactly one terminal response and make it the last message of the "
+            "run",
+            self.instructions,
+        )
+        self.assertIn(
+            "including the final `resolve` or `publish`, the PR metadata recheck, and "
+            "any temporary-file removal, before composing this response",
+            self.instructions,
+        )
+        self.assertIn(
+            "then send the whole thing in one message that calls no tool",
+            self.instructions,
+        )
+        self.assertIn(
+            "attach any part of it to a message that also calls a tool",
+            self.instructions,
+        )
+        self.assertIn("Once it is sent the run is over", self.instructions)
+        self.assertIn(
+            "never send another message because a tool result, reminder, or turn "
+            "boundary invites one",
+            self.instructions,
+        )
+        self.assertIn(
+            "never open with a narrative recap of what the run did", self.instructions
+        )
+        self.assertIn(
+            "render the `**Outcome:**`, `**Dropped candidates:**`, and `**PR:**` "
+            "lines at most once each",
+            self.instructions,
+        )
 
 
 class TargetParsingTest(unittest.TestCase):
