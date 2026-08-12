@@ -45,7 +45,9 @@ REPO_NAME_PATTERN = re.compile(r"^(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)$")
 
 
 class WorkflowError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.details = details or {}
 
 
 def run(
@@ -830,7 +832,13 @@ def require_live_snapshot(
     if live["head_sha"] != expected_head:
         raise WorkflowError(
             f"PR head moved: expected {expected_head}, got {live['head_sha']}; "
-            "no mutation was performed"
+            "no mutation was performed",
+            details={
+                "expected_head": expected_head,
+                "live_head": live["head_sha"],
+                "live_title": live["title"],
+                "live_body": live["body"],
+            },
         )
     if (
         live["title"] != snapshot.get("title")
@@ -1029,7 +1037,13 @@ def command_apply(args: argparse.Namespace) -> None:
         raise WorkflowError(
             f"PR head moved while applying the proposal: expected {pinned_head}, "
             f"got {verified['head_sha']}; the update may already have been applied; "
-            f"{RESIDUAL_UPDATE_RACE}"
+            f"{RESIDUAL_UPDATE_RACE}",
+            details={
+                "expected_head": pinned_head,
+                "live_head": verified["head_sha"],
+                "live_title": verified["title"],
+                "live_body": verified["body"],
+            },
         )
     if verified["title"] != title or verified["body"] != body:
         raise WorkflowError(
@@ -1264,7 +1278,10 @@ def main() -> int:
         args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:
-        emit({"result": "error", "error": str(error)})
+        payload = {"result": "error", "error": str(error)}
+        if isinstance(error, WorkflowError):
+            payload.update(error.details)
+        emit(payload)
         return 1
 
 

@@ -21,7 +21,7 @@ You run a human-in-the-middle loop for one pull request's title and description.
 - If replacement text is needed, iterate with the user without a cap. Every revision requires a new display of the complete title and complete body under "Displaying Title And Description", a new `**What changed**` summary, and a new request for approval.
 - Every time you display a proposal, follow it with a `**What changed**` summary of how that proposal differs from the current title and description, before asking for approval.
 - Call `propose` and `apply` only after explicit approval of that exact proposal.
-- If the pull request head changes at any point, discard the stale proposal, run preflight again, show the newly pinned current title and description under "Displaying Title And Description", and obtain fresh approval.
+- If the pull request head changes, use the bounded approval-reuse procedure in "Head Moves After Approval". Reuse approval only after a fresh preflight proves that the relevant title, body, and authoritative diff bytes are unchanged; otherwise discard the stale proposal, display the newly pinned text, and obtain fresh approval.
 - Treat the returned `run_id` and `proposal_token` as capabilities for this session only. Always pass their exact values back to the helper and never substitute values from another run, status result, memory, or user.
 - GitHub's pull request update endpoint does not support conditional unsafe requests. The helper reduces, but cannot eliminate, the final race by reading and comparing the exact pinned head, title, and body twice immediately before a direct REST `PATCH`, then verifying the result. Never describe this as an atomic compare-and-swap: an external writer in the final check-to-`PATCH` window can still be overwritten.
 - Never hard wrap a pull request description. Preserve intentional paragraph and list boundaries.
@@ -79,7 +79,7 @@ The helper provides:
 
 - `preflight [target] [--repo-root <workspace>] [--state <path>]`: resolve a PR URL, `owner/repo#number`, bare PR number in repository context, or the current branch's PR; fetch the current number, title, body, URL, head, and draft status; pin the head and current text in a unique run state; update the stable PR index; and return `run_id`
 - `propose --state <path> --expected-run-id <run_id> --title <literal-title> --body-file <path>`: persist an approved proposal bound to this run's exact pinned head, title, and body; increment its durable proposal counter; and return `proposal_token`
-- `apply --state <path> --expected-head <head_sha> --expected-run-id <run_id> --expected-proposal-token <proposal_token>`: require the run and proposal capabilities, compare the exact live snapshot twice immediately before the REST update, apply the stored proposal, re-read it, and record validation only after the live head, title, and body match exactly
+- `apply --state <path> --expected-head <head_sha> --expected-run-id <run_id> --expected-proposal-token <proposal_token>`: require the run and proposal capabilities, compare the exact live snapshot twice immediately before the REST update, include `live_head`, `live_title`, and `live_body` in a head-mismatch error, apply the stored proposal, re-read it, and record validation only after the live head, title, and body match exactly
 - `validate --state <path> --expected-head <head_sha> --expected-run-id <run_id> --no-change`: verify the unchanged live title and body at the pinned head and record validation without mutation
 - `status [--state <path> | --current --repo-root <workspace>]` and `cleanup --state <path>`
 
@@ -91,8 +91,9 @@ Stop on exact helper errors. Never work around a head mismatch or stale title/bo
 2. After preflight succeeds, call `rename_session` exactly once with `PR Description Loop: <number> - <title>` from the returned `pr.number` and `pr.title`. Never use an interim name and never rename again during this run.
 3. Retain the returned `state`, `run_id`, `head_sha`, `pr.url`, `pr.repo_name`, `title`, and `body`. Never switch to the stable `index_state` for proposal or apply operations.
 4. Read the authoritative pull request diff with `gh pr diff <pr.url> --repo <pr.repo_name>`. The preflight `head_sha` is the immutable head for this evaluation and any proposal; a later `validate` or `apply` verifies that the live head still matches it.
-5. In your first response after gathering the diff, present the current title and description first, including an empty description, following "Displaying Title And Description".
-6. Immediately follow the verbatim text with your evaluation of its clarity, concision, consistency with the diff, and coverage of the pull request's actual final scope.
+5. Retain the exact diff bytes for this run so a later head move can be compared byte-for-byte without reconstructing or normalizing either diff.
+6. In your first response after gathering the diff, present the current title and description first, including an empty description, following "Displaying Title And Description".
+7. Immediately follow the verbatim text with your evaluation of its clarity, concision, consistency with the diff, and coverage of the pull request's actual final scope.
 
 ## Current Text Evaluation And Approval
 
@@ -143,8 +144,19 @@ After explicit approval of the exact displayed proposal:
 2. Run `propose --state <path> --expected-run-id <run_id> --title <exact-title> --body-file <external-path>` and retain its exact `proposal_token`.
 3. Run `apply --state <path> --expected-head <head_sha> --expected-run-id <run_id> --expected-proposal-token <proposal_token>` immediately.
 4. Delete the external body file after `propose` has read it, whether `apply` succeeds or fails.
-5. If either command reports that the head or pinned text changed, discard the stale proposal and restart from preflight. The earlier approval does not carry forward.
+5. If either command reports that the head or pinned text changed, continue with "Head Moves After Approval". Approval carries forward only when every exact reuse condition there succeeds.
 6. On success, report the applied title and canonical pull request URL concisely.
+
+## Head Moves After Approval
+
+When `validate` or `apply` reports a moved head, do not immediately ask the user to approve identical text again:
+
+1. Read the helper's structured `live_title` and `live_body` fields to identify whether PR metadata changed at the detected head. Do not issue a separate metadata query merely to recover those values.
+2. Run a fresh `preflight` for the same pull request and fetch its authoritative diff using the same `gh pr diff` command.
+3. Compare the new diff bytes exactly with the retained bytes from the approved run. Do not compare rendered, normalized, summarized, or reconstructed diffs.
+4. Reuse the prior approval without redisplaying the text or asking again only when the fresh current title and body equal the prior approved current text, the prior proposal's exact base title and body, or the exact approved destination title and body; the fresh diff is byte-identical; and the approved destination has not changed.
+5. If the approved destination title and body are already the fresh current values, run `validate --no-change` with the fresh run's capabilities. Otherwise persist the same approved destination with `propose` in the fresh run and apply it using the new head, run ID, and proposal token.
+6. If the fresh current title or body differs from both approved cases, the diff bytes differ, or any comparison is unavailable or uncertain, display the newly pinned current text and obtain fresh approval. Never carry approval across an actual content change.
 
 ## Final Response
 

@@ -297,11 +297,31 @@ class AgentInstructionsTest(unittest.TestCase):
 
     def test_restarts_on_head_change_and_uses_external_body_file(self):
         self.assertIn(
-            "discard the stale proposal, run preflight again", self.instructions
+            "## Head Moves After Approval", self.instructions
         )
-        self.assertIn("The earlier approval does not carry forward", self.instructions)
         self.assertIn(
             "UTF-8 to a body file outside the repository", self.instructions
+        )
+        self.assertIn(
+            "include `live_head`, `live_title`, and `live_body` in a head-mismatch "
+            "error",
+            self.instructions,
+        )
+        self.assertIn(
+            "Compare the new diff bytes exactly with the retained bytes",
+            self.instructions,
+        )
+        self.assertIn(
+            "Reuse the prior approval without redisplaying the text or asking again",
+            self.instructions,
+        )
+        self.assertIn(
+            "If the approved destination title and body are already the fresh current "
+            "values, run `validate --no-change`",
+            self.instructions,
+        )
+        self.assertIn(
+            "Never carry approval across an actual content change", self.instructions
         )
 
     def test_documents_run_capabilities_and_residual_update_race(self):
@@ -369,7 +389,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.10")
+        self.assertEqual(plugin["version"], "1.0.11")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 
@@ -875,17 +895,62 @@ class ApplyTest(unittest.TestCase):
     def test_rejects_a_moved_live_head_before_mutation(self):
         path = self.state_with_proposal()
 
-        with (
-            mock.patch.object(
-                MODULE, "metadata_for", return_value=pr_metadata(head_sha="head2")
+        with mock.patch.object(
+            MODULE,
+            "metadata_for",
+            return_value=pr_metadata(
+                head_sha="head2", title="Live title", body="Live body"
             ),
-            mock.patch.object(MODULE, "update_pr") as update_pr,
-            self.assertRaisesRegex(MODULE.WorkflowError, "PR head moved"),
-        ):
-            self.apply(path)
+        ), mock.patch.object(MODULE, "update_pr") as update_pr:
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "PR head moved"
+            ) as raised:
+                self.apply(path)
 
         update_pr.assert_not_called()
+        self.assertEqual(
+            raised.exception.details,
+            {
+                "expected_head": "head1",
+                "live_head": "head2",
+                "live_title": "Live title",
+                "live_body": "Live body",
+            },
+        )
         self.assertNotIn("validated_head_sha", MODULE.load_state(path))
+
+    def test_main_emits_live_metadata_from_a_head_mismatch(self):
+        error = MODULE.WorkflowError(
+            "PR head moved",
+            details={
+                "expected_head": "head1",
+                "live_head": "head2",
+                "live_title": "Live title",
+                "live_body": "Live body",
+            },
+        )
+        parser = mock.Mock()
+        parser.parse_args.return_value = SimpleNamespace(
+            function=mock.Mock(side_effect=error)
+        )
+
+        with (
+            mock.patch.object(MODULE, "build_parser", return_value=parser),
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            result = MODULE.main()
+
+        self.assertEqual(result, 1)
+        emit.assert_called_once_with(
+            {
+                "result": "error",
+                "error": "PR head moved",
+                "expected_head": "head1",
+                "live_head": "head2",
+                "live_title": "Live title",
+                "live_body": "Live body",
+            }
+        )
 
     def test_rejects_live_text_that_changed_after_preflight(self):
         path = self.state_with_proposal()
