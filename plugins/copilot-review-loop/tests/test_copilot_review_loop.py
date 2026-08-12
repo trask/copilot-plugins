@@ -1211,6 +1211,44 @@ class RemoteParsingTest(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.WorkflowError, "refusing to push"):
                 MODULE.require_fork_head(pr)
 
+    def test_waits_for_the_pushed_ref_to_propagate(self):
+        with (
+            mock.patch.object(
+                MODULE,
+                "remote_head",
+                side_effect=["old-head", "old-head", "new-head"],
+            ) as remote_head,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            result = MODULE.wait_for_remote_head(
+                "owner", "repo", "branch", "new-head"
+            )
+
+        self.assertEqual(result, "new-head")
+        self.assertEqual(remote_head.call_count, 3)
+        self.assertEqual(
+            sleep.call_args_list,
+            [
+                mock.call(MODULE.REMOTE_REF_LAG_RETRY_DELAYS[0]),
+                mock.call(MODULE.REMOTE_REF_LAG_RETRY_DELAYS[1]),
+            ],
+        )
+
+    def test_stops_waiting_after_the_remote_ref_retry_budget(self):
+        with (
+            mock.patch.object(MODULE, "remote_head", return_value="old-head") as remote_head,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            result = MODULE.wait_for_remote_head(
+                "owner", "repo", "branch", "new-head"
+            )
+
+        self.assertEqual(result, "old-head")
+        self.assertEqual(
+            remote_head.call_count, len(MODULE.REMOTE_REF_LAG_RETRY_DELAYS) + 1
+        )
+        self.assertEqual(sleep.call_count, len(MODULE.REMOTE_REF_LAG_RETRY_DELAYS))
+
 
 class ParserTest(unittest.TestCase):
     def test_plan_accumulates_repeated_path_flags(self):
@@ -1445,8 +1483,11 @@ class ReplyPublishingTest(unittest.TestCase):
                 mock.patch.object(MODULE, "require_fork_head"),
                 mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
                 mock.patch.object(
-                    MODULE, "remote_head", side_effect=["old-head", "new-head"]
+                    MODULE,
+                    "remote_head",
+                    side_effect=["old-head", "old-head", "new-head"],
                 ),
+                mock.patch.object(MODULE.time, "sleep") as sleep,
                 mock.patch.object(MODULE, "run") as run,
                 mock.patch.object(MODULE, "post_missing_replies") as post_replies,
                 mock.patch.object(MODULE, "resolve_threads") as resolve_threads,
@@ -1463,6 +1504,7 @@ class ReplyPublishingTest(unittest.TestCase):
         run.assert_called_once_with(
             ["git", "-C", "repo", "push", "origin", "HEAD:branch"]
         )
+        sleep.assert_called_once_with(MODULE.REMOTE_REF_LAG_RETRY_DELAYS[0])
         post_replies.assert_not_called()
         resolve_threads.assert_not_called()
         self.assertEqual(emit.call_args.args[0]["reply_ids"], {})

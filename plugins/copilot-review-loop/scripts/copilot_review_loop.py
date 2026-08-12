@@ -24,6 +24,7 @@ COPILOT_LOGINS = {
 STATE_VERSION = 3
 DEFAULT_MAX_ITERATIONS = 5
 PR_HEAD_LAG_RETRY_DELAYS = (1, 2, 4)
+REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
 IS_WINDOWS = os.name == "nt"
 # A pasted review or comment fragment is accepted and ignored: the queue is always
 # every unresolved Copilot comment on the pull request.
@@ -1058,6 +1059,18 @@ def remote_head(owner: str, repo: str, branch: str) -> str | None:
     return json.loads(process.stdout)["object"]["sha"]
 
 
+def wait_for_remote_head(
+    owner: str, repo: str, branch: str, expected_head: str
+) -> str | None:
+    actual_head = remote_head(owner, repo, branch)
+    for delay in REMOTE_REF_LAG_RETRY_DELAYS:
+        if actual_head == expected_head:
+            break
+        time.sleep(delay)
+        actual_head = remote_head(owner, repo, branch)
+    return actual_head
+
+
 def is_copilot(user: dict[str, Any] | None, bot_id: str | None = None) -> bool:
     if not user:
         return False
@@ -1401,7 +1414,9 @@ def command_publish(args: argparse.Namespace) -> None:
         run(
             ["git", "-C", str(repo_root), "push", remote, f"HEAD:{pr['head_branch']}"]
         )
-    pushed_head = remote_head(pr["head_owner"], pr["head_repo"], pr["head_branch"])
+    pushed_head = wait_for_remote_head(
+        pr["head_owner"], pr["head_repo"], pr["head_branch"], local_head
+    )
     if pushed_head != local_head:
         raise WorkflowError(f"fork ref mismatch: local {local_head}, remote {pushed_head}")
 
