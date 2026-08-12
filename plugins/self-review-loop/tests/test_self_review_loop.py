@@ -331,6 +331,32 @@ class AgentInstructionsTest(unittest.TestCase):
             "Review the entire pinned diff read from `diff_path`", self.instructions
         )
         self.assertIn(
+            "whenever the head contains any change not published by this run, read "
+            "the whole pinned diff",
+            self.instructions,
+        )
+        self.assertIn(
+            "the new preflight head equals the head returned by the preceding `publish`",
+            self.instructions,
+        )
+        self.assertIn(
+            "the only new commits were this loop's recorded commits",
+            self.instructions,
+        )
+        self.assertIn(
+            "carry forward the prior full review and re-review only those newly "
+            "published commits in their current pinned-diff context",
+            self.instructions,
+        )
+        self.assertIn(
+            "unchanged hunks do not need to be read again", self.instructions
+        )
+        self.assertIn(
+            "the prior review plus the exact proven delta covers every line of the "
+            "current pin",
+            self.instructions,
+        )
+        self.assertIn(
             "refuse to publish a skipped batch, require the commits sitting on the "
             "pinned head to be exactly the recorded ones",
             self.instructions,

@@ -1,7 +1,7 @@
 {
   "name": "self-review-loop",
   "description": "Review a GitHub pull request, verify each finding independently, and commit the fixes without posting review comments.",
-  "version": "1.0.18",
+  "version": "1.0.19",
   "author": {
     "name": "Trask Stalnaker"
   },
