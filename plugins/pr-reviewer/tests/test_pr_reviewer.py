@@ -126,6 +126,12 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("every entry in `suppressed_comments`", instructions)
         self.assertIn("Deduplicate candidates", instructions)
         self.assertIn(
+            "every resolved or unresolved entry in `review_threads`", instructions
+        )
+        self.assertIn(
+            "Use existing inline threads to avoid duplicate feedback", instructions
+        )
+        self.assertIn(
             "applies equally to candidates discovered directly and candidates derived "
             "from suppressed Copilot comments",
             instructions,
@@ -883,6 +889,104 @@ class PendingReviewTest(unittest.TestCase):
             ],
         )
 
+    def test_fetches_and_normalizes_paginated_review_threads(self):
+        pr = {"owner": "owner", "repo": "repo", "number": 42}
+
+        def comment(comment_id, *, line=None, original_line=None):
+            return {
+                "databaseId": comment_id,
+                "url": f"https://example.test/comment/{comment_id}",
+                "author": {"login": "maintainer"},
+                "authorAssociation": "MEMBER",
+                "createdAt": "2026-08-11T12:00:00Z",
+                "updatedAt": "2026-08-11T12:01:00Z",
+                "path": "src/app.py",
+                "line": line,
+                "originalLine": original_line,
+                "startLine": None,
+                "originalStartLine": None,
+                "body": f"Comment {comment_id}",
+            }
+
+        first_page = {
+            "repository": {
+                "pullRequest": {
+                    "reviewThreads": {
+                        "nodes": [
+                            {
+                                "id": "THREAD_1",
+                                "isResolved": True,
+                                "comments": {
+                                    "nodes": [comment(1, original_line=7)],
+                                    "pageInfo": {
+                                        "hasNextPage": True,
+                                        "endCursor": "COMMENT_CURSOR",
+                                    },
+                                },
+                            }
+                        ],
+                        "pageInfo": {
+                            "hasNextPage": True,
+                            "endCursor": "THREAD_CURSOR",
+                        },
+                    }
+                }
+            }
+        }
+        more_comments = {
+            "node": {
+                "comments": {
+                    "nodes": [comment(2, line=8)],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                }
+            }
+        }
+        more_threads = {
+            "repository": {
+                "pullRequest": {
+                    "reviewThreads": {
+                        "nodes": [
+                            {
+                                "id": "THREAD_2",
+                                "isResolved": False,
+                                "comments": {
+                                    "nodes": [comment(3, line=9)],
+                                    "pageInfo": {
+                                        "hasNextPage": False,
+                                        "endCursor": None,
+                                    },
+                                },
+                            }
+                        ],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            }
+        }
+
+        with mock.patch.object(
+            MODULE,
+            "graphql_data",
+            side_effect=[first_page, more_comments, more_threads],
+        ) as graphql:
+            result = MODULE.fetch_review_threads(pr)
+
+        self.assertEqual([thread["id"] for thread in result], ["THREAD_1", "THREAD_2"])
+        self.assertTrue(result[0]["resolved"])
+        self.assertFalse(result[1]["resolved"])
+        self.assertEqual(
+            [item["line"] for item in result[0]["comments"]],
+            [7, 8],
+        )
+        self.assertEqual(result[0]["comments"][0]["author"], "maintainer")
+        self.assertEqual(
+            graphql.call_args_list[1].args[1],
+            {"id": "THREAD_1", "cursor": "COMMENT_CURSOR"},
+        )
+        self.assertEqual(
+            graphql.call_args_list[2].args[1]["cursor"], "THREAD_CURSOR"
+        )
+
     def test_check_returns_existing_pending_review_without_fetching_diff(self):
         pr = {
             "repo_name": "owner/repo",
@@ -949,6 +1053,26 @@ class PendingReviewTest(unittest.TestCase):
                     DIFF,
                 ),
             ) as preflight,
+            mock.patch.object(
+                MODULE,
+                "fetch_review_threads",
+                return_value=[
+                    {
+                        "id": "THREAD_1",
+                        "resolved": True,
+                        "comments": [
+                            {
+                                "id": 20,
+                                "author": "maintainer",
+                                "path": "src/one.py",
+                                "line": 2,
+                                "body": "Already raised.",
+                            }
+                        ],
+                    }
+                ],
+            ),
+            mock.patch.object(MODULE, "ensure_head_unchanged"),
             mock.patch.object(MODULE, "emit") as emit,
         ):
             MODULE.command_check(SimpleNamespace(target=pr["pr_url"]))
@@ -962,6 +1086,7 @@ class PendingReviewTest(unittest.TestCase):
         self.assertEqual(payload["copilot_review"]["id"], 10)
         self.assertEqual(payload["suppressed_comments"][0]["path"], "src/one.py")
         self.assertEqual(payload["issue_comments"][0]["author"], "maintainer")
+        self.assertEqual(payload["review_threads"][0]["id"], "THREAD_1")
         preflight.assert_called_once_with(
             pr["pr_url"], include_issue_comments=True
         )
@@ -982,6 +1107,8 @@ class PendingReviewTest(unittest.TestCase):
                 "preflight",
                 return_value=(pr, "viewer", anchors, None, None, [], [], DIFF),
             ),
+            mock.patch.object(MODULE, "fetch_review_threads", return_value=[]),
+            mock.patch.object(MODULE, "ensure_head_unchanged"),
             mock.patch.object(MODULE, "emit") as emit,
         ):
             MODULE.command_check(SimpleNamespace(target=pr["pr_url"]))
@@ -990,6 +1117,7 @@ class PendingReviewTest(unittest.TestCase):
         self.assertIsNone(payload["copilot_review"])
         self.assertEqual(payload["suppressed_comments"], [])
         self.assertEqual(payload["issue_comments"], [])
+        self.assertEqual(payload["review_threads"], [])
         self.assertEqual(payload["authoritative_diff"], DIFF)
 
 

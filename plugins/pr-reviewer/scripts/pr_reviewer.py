@@ -215,6 +215,169 @@ def fetch_issue_comments(pr: dict[str, Any]) -> list[dict[str, Any]]:
     return normalized
 
 
+def graphql_data(query: str, variables: dict[str, str | int | None]) -> dict[str, Any]:
+    arguments = ["api", "graphql", "-f", f"query={query}"]
+    for name, value in variables.items():
+        if value is None:
+            continue
+        flag = "-F" if isinstance(value, int) else "-f"
+        arguments.extend([flag, f"{name}={value}"])
+    payload = gh_json(arguments)
+    if not isinstance(payload, dict):
+        raise WorkflowError("GitHub GraphQL returned no response object")
+    errors = payload.get("errors")
+    if errors:
+        raise WorkflowError(f"GitHub GraphQL failed: {json.dumps(errors)}")
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise WorkflowError("GitHub GraphQL returned no data object")
+    return data
+
+
+def normalize_review_thread_comment(
+    comment: dict[str, Any], thread_id: str
+) -> dict[str, Any]:
+    comment_id = comment.get("databaseId")
+    url = comment.get("url")
+    body = comment.get("body")
+    author = (comment.get("author") or {}).get("login")
+    author_association = comment.get("authorAssociation")
+    created_at = comment.get("createdAt")
+    updated_at = comment.get("updatedAt")
+    path = comment.get("path")
+    line = comment.get("line")
+    if line is None:
+        line = comment.get("originalLine")
+    start_line = comment.get("startLine")
+    if start_line is None:
+        start_line = comment.get("originalStartLine")
+    if isinstance(comment_id, bool) or not isinstance(comment_id, int):
+        raise WorkflowError(f"review thread {thread_id} has a comment without a numeric ID")
+    if not isinstance(url, str) or not url:
+        raise WorkflowError(f"review comment {comment_id} has no URL")
+    if not isinstance(body, str):
+        raise WorkflowError(f"review comment {comment_id} has no body")
+    if author is not None and not isinstance(author, str):
+        raise WorkflowError(f"review comment {comment_id} has an invalid author")
+    if not isinstance(author_association, str):
+        raise WorkflowError(f"review comment {comment_id} has no author association")
+    if not isinstance(created_at, str) or not isinstance(updated_at, str):
+        raise WorkflowError(f"review comment {comment_id} has invalid timestamps")
+    if not isinstance(path, str) or not path:
+        raise WorkflowError(f"review comment {comment_id} has no path")
+    if line is not None and (isinstance(line, bool) or not isinstance(line, int)):
+        raise WorkflowError(f"review comment {comment_id} has an invalid line")
+    if start_line is not None and (
+        isinstance(start_line, bool) or not isinstance(start_line, int)
+    ):
+        raise WorkflowError(f"review comment {comment_id} has an invalid start line")
+    return {
+        "id": comment_id,
+        "url": url,
+        "author": author,
+        "author_association": author_association,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "path": path,
+        "line": line,
+        "start_line": start_line,
+        "body": body,
+    }
+
+
+def fetch_review_threads(pr: dict[str, Any]) -> list[dict[str, Any]]:
+    comment_fields = (
+        "databaseId url author{login} authorAssociation createdAt updatedAt "
+        "path line originalLine startLine originalStartLine body"
+    )
+    thread_query = (
+        "query($owner:String!,$repo:String!,$number:Int!,$cursor:String){"
+        "repository(owner:$owner,name:$repo){pullRequest(number:$number){"
+        "reviewThreads(first:100,after:$cursor){nodes{id isResolved "
+        f"comments(first:100){{nodes{{{comment_fields}}}"
+        "pageInfo{hasNextPage endCursor}}}"
+        "pageInfo{hasNextPage endCursor}}}}}"
+    )
+    comment_query = (
+        "query($id:ID!,$cursor:String){node(id:$id){"
+        "... on PullRequestReviewThread{comments(first:100,after:$cursor){"
+        f"nodes{{{comment_fields}}}pageInfo{{hasNextPage endCursor}}"
+        "}}}}"
+    )
+    variables = {
+        "owner": pr["owner"],
+        "repo": pr["repo"],
+        "number": pr["number"],
+        "cursor": None,
+    }
+    normalized: list[dict[str, Any]] = []
+    while True:
+        data = graphql_data(thread_query, variables)
+        repository = data.get("repository")
+        pull_request = repository.get("pullRequest") if isinstance(repository, dict) else None
+        connection = (
+            pull_request.get("reviewThreads")
+            if isinstance(pull_request, dict)
+            else None
+        )
+        if not isinstance(connection, dict):
+            raise WorkflowError("GitHub GraphQL returned no review thread connection")
+        nodes = connection.get("nodes")
+        if not isinstance(nodes, list):
+            raise WorkflowError("GitHub GraphQL returned invalid review thread nodes")
+        for thread in nodes:
+            thread_id = thread.get("id") if isinstance(thread, dict) else None
+            resolved = thread.get("isResolved") if isinstance(thread, dict) else None
+            comments = thread.get("comments") if isinstance(thread, dict) else None
+            if not isinstance(thread_id, str) or not thread_id:
+                raise WorkflowError("review thread has no node ID")
+            if not isinstance(resolved, bool):
+                raise WorkflowError(f"review thread {thread_id} has no resolved state")
+            if not isinstance(comments, dict):
+                raise WorkflowError(f"review thread {thread_id} has no comments")
+            comment_nodes = comments.get("nodes")
+            if not isinstance(comment_nodes, list):
+                raise WorkflowError(f"review thread {thread_id} has invalid comments")
+            all_comments = list(comment_nodes)
+            comment_page = comments.get("pageInfo")
+            while isinstance(comment_page, dict) and comment_page.get("hasNextPage"):
+                cursor = comment_page.get("endCursor")
+                if not isinstance(cursor, str) or not cursor:
+                    raise WorkflowError(
+                        f"review thread {thread_id} comments have no pagination cursor"
+                    )
+                comment_data = graphql_data(
+                    comment_query, {"id": thread_id, "cursor": cursor}
+                )
+                node = comment_data.get("node")
+                next_comments = node.get("comments") if isinstance(node, dict) else None
+                if not isinstance(next_comments, dict) or not isinstance(
+                    next_comments.get("nodes"), list
+                ):
+                    raise WorkflowError(
+                        f"GitHub GraphQL returned invalid comments for thread {thread_id}"
+                    )
+                all_comments.extend(next_comments["nodes"])
+                comment_page = next_comments.get("pageInfo")
+            normalized.append(
+                {
+                    "id": thread_id,
+                    "resolved": resolved,
+                    "comments": [
+                        normalize_review_thread_comment(comment, thread_id)
+                        for comment in all_comments
+                    ],
+                }
+            )
+        page_info = connection.get("pageInfo")
+        if not isinstance(page_info, dict) or not page_info.get("hasNextPage"):
+            return normalized
+        cursor = page_info.get("endCursor")
+        if not isinstance(cursor, str) or not cursor:
+            raise WorkflowError("review threads have no pagination cursor")
+        variables["cursor"] = cursor
+
+
 def find_pending_review(
     reviews: list[dict[str, Any]], viewer: str
 ) -> dict[str, Any] | None:
@@ -847,6 +1010,8 @@ def command_check(args: argparse.Namespace) -> None:
     if pending_url:
         emit({"result": "existing_pending_review", "review_url": pending_url})
         return
+    review_threads = fetch_review_threads(pr)
+    ensure_head_unchanged(pr, "after fetching existing review threads")
     emit(
         {
             "result": "ready",
@@ -860,6 +1025,7 @@ def command_check(args: argparse.Namespace) -> None:
             "copilot_review": copilot_review,
             "suppressed_comments": suppressed_comments,
             "issue_comments": issue_comments,
+            "review_threads": review_threads,
         }
     )
 
