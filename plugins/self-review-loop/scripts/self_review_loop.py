@@ -661,9 +661,31 @@ def validate_candidates(
             raise WorkflowError(f"candidate {index} side must be LEFT or RIGHT")
         if not isinstance(body, str) or not body.strip():
             raise WorkflowError(f"candidate {index} body must not be empty")
-        if path not in anchors or line not in set(anchors[path][side]):
+        if path not in anchors:
             raise WorkflowError(
-                f"candidate {index} anchor is not a changed {side} line: {path}:{line}"
+                f"candidate {index} anchor path is not in the pinned diff: {path}; "
+                f"changed paths: {', '.join(sorted(anchors))}"
+            )
+        accepted_lines = anchors[path][side]
+        if line not in set(accepted_lines):
+            if accepted_lines:
+                nearest = min(accepted_lines, key=lambda value: (abs(value - line), value))
+                guidance = (
+                    f"nearest valid {side} line: {nearest}; "
+                    f"accepted {side} lines: {', '.join(map(str, accepted_lines))}"
+                )
+            else:
+                other_side = "LEFT" if side == "RIGHT" else "RIGHT"
+                other_lines = anchors[path][other_side]
+                guidance = f"{path} has no changed {side} lines"
+                if other_lines:
+                    guidance += (
+                        f"; accepted {other_side} lines: "
+                        f"{', '.join(map(str, other_lines))}"
+                    )
+            raise WorkflowError(
+                f"candidate {index} anchor is not a changed {side} line: "
+                f"{path}:{line}; {guidance}"
             )
         normalized.append({"path": path, "line": line, "side": side, "body": body.strip()})
     return normalized

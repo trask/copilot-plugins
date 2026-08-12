@@ -561,6 +561,38 @@ class CandidateValidationTest(unittest.TestCase):
                 with self.assertRaises(MODULE.WorkflowError):
                     MODULE.validate_candidates(candidates, self.anchors)
 
+    def test_invalid_anchor_reports_nearest_and_accepted_lines(self):
+        with self.assertRaises(MODULE.WorkflowError) as error:
+            MODULE.validate_candidates(
+                [{"path": "app.py", "line": 4, "side": "RIGHT", "body": "Fix it."}],
+                self.anchors,
+            )
+
+        self.assertIn("nearest valid RIGHT line: 3", str(error.exception))
+        self.assertIn("accepted RIGHT lines: 2, 3", str(error.exception))
+
+    def test_invalid_side_reports_the_other_sides_accepted_lines(self):
+        anchors = {"app.py": {"LEFT": [7, 8], "RIGHT": []}}
+
+        with self.assertRaises(MODULE.WorkflowError) as error:
+            MODULE.validate_candidates(
+                [{"path": "app.py", "line": 8, "side": "RIGHT", "body": "Fix it."}],
+                anchors,
+            )
+
+        self.assertIn("app.py has no changed RIGHT lines", str(error.exception))
+        self.assertIn("accepted LEFT lines: 7, 8", str(error.exception))
+
+    def test_invalid_anchor_path_reports_changed_paths(self):
+        with self.assertRaises(MODULE.WorkflowError) as error:
+            MODULE.validate_candidates(
+                [{"path": "other.py", "line": 3, "side": "RIGHT", "body": "Fix it."}],
+                self.anchors,
+            )
+
+        self.assertIn("anchor path is not in the pinned diff: other.py", str(error.exception))
+        self.assertIn("changed paths: app.py", str(error.exception))
+
     def test_candidates_help_documents_the_required_object_schema(self):
         output = io.StringIO()
 
