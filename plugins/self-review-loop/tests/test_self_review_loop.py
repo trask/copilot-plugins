@@ -184,6 +184,25 @@ class AgentInstructionsTest(unittest.TestCase):
             "run `preflight --repo-root <workspace>` with no target", self.instructions
         )
 
+    def test_documents_force_push_recovery_and_helper_inputs(self):
+        self.assertIn(
+            "safely realign a force-pushed PR branch only when `git cherry` proves "
+            "the local commits have no unique patches",
+            self.instructions,
+        )
+        self.assertIn(
+            "If it reports `head_moved`, stop on that exact error", self.instructions
+        )
+        self.assertIn(
+            "objects contain exactly `path`, `line`, `side`, and `body`",
+            self.instructions,
+        )
+        self.assertIn(
+            "`plan --state <path> --batch <id> --candidates <ids...> "
+            "--label <label>",
+            self.instructions,
+        )
+
     def test_final_response_renders_commit_dropped_candidate_and_pr_links(self):
         self.assertIn(
             "canonical pull request link from the most recent preflight result's "
@@ -412,6 +431,27 @@ class CandidateValidationTest(unittest.TestCase):
         self.assertIn("side (LEFT or RIGHT)", help_text)
         self.assertIn("body (string)", help_text)
 
+    def test_candidate_key_error_names_unexpected_and_missing_keys(self):
+        with self.assertRaises(MODULE.WorkflowError) as error:
+            MODULE.validate_candidates(
+                [
+                    {
+                        "id": 1,
+                        "title": "Fix it",
+                        "path": "app.py",
+                        "line": 3,
+                        "side": "RIGHT",
+                    }
+                ],
+                self.anchors,
+            )
+
+        self.assertIn("unexpected keys: id, title", str(error.exception))
+        self.assertIn("missing keys: body", str(error.exception))
+        self.assertIn(
+            "expected exactly: path, line, side, body", str(error.exception)
+        )
+
 
 class HistoryTest(unittest.TestCase):
     def test_maps_candidate_status_to_history_outcome(self):
@@ -538,6 +578,55 @@ class HeadVerificationTest(unittest.TestCase):
                 cwd=Path("repo"),
             ),
         )
+
+    def test_realigns_equivalent_rebased_commits_after_force_push(self):
+        target = {"pr_url": "https://github.com/owner/repo/pull/7"}
+        metadata = {"head_branch": "feature", "head_sha": "remote"}
+        checkout_error = MODULE.WorkflowError(
+            "gh pr checkout failed: fatal: Not possible to fast-forward, aborting."
+        )
+
+        with (
+            mock.patch.object(MODULE, "run", side_effect=checkout_error),
+            mock.patch.object(
+                MODULE,
+                "git",
+                side_effect=["feature", "local", "", "- local", ""],
+            ) as git,
+        ):
+            checked_out_branch = MODULE.checkout_pr(Path("repo"), target, metadata)
+
+        self.assertTrue(checked_out_branch)
+        self.assertEqual(
+            git.call_args_list,
+            [
+                mock.call(Path("repo"), "branch", "--show-current"),
+                mock.call(Path("repo"), "rev-parse", "HEAD"),
+                mock.call(Path("repo"), "rev-list", "--merges", "remote..local"),
+                mock.call(Path("repo"), "cherry", "remote", "local"),
+                mock.call(Path("repo"), "reset", "--hard", "remote"),
+            ],
+        )
+
+    def test_reports_head_moved_when_force_push_leaves_unique_work(self):
+        target = {"pr_url": "https://github.com/owner/repo/pull/7"}
+        metadata = {"head_branch": "feature", "head_sha": "remote"}
+        checkout_error = MODULE.WorkflowError(
+            "gh pr checkout failed: fatal: Not possible to fast-forward, aborting."
+        )
+
+        with (
+            mock.patch.object(MODULE, "run", side_effect=checkout_error),
+            mock.patch.object(
+                MODULE,
+                "git",
+                side_effect=["feature", "local", "", "+ unique"],
+            ),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "head_moved.*unique work.*unique"
+            ):
+                MODULE.checkout_pr(Path("repo"), target, metadata)
 
     def test_checks_out_the_remote_pr_head_when_on_another_branch(self):
         target = {"pr_url": "https://github.com/owner/repo/pull/7"}

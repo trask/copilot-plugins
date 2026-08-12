@@ -34,6 +34,7 @@ HUNK_PATTERN = re.compile(
     r"\+(?P<new>\d+)(?:,(?P<new_count>\d+))? @@"
 )
 CANDIDATE_KEYS = {"path", "line", "side", "body"}
+NON_FAST_FORWARD_PATTERN = re.compile(r"fast[- ]forward|divergent", re.IGNORECASE)
 
 
 class WorkflowError(RuntimeError):
@@ -446,8 +447,45 @@ def checkout_pr(
     command = ["gh", "pr", "checkout", target["pr_url"]]
     if not on_pr_branch:
         command.append("--detach")
-    run(command, cwd=repo_root)
+    try:
+        run(command, cwd=repo_root)
+    except WorkflowError as checkout_error:
+        if not on_pr_branch or not NON_FAST_FORWARD_PATTERN.search(str(checkout_error)):
+            raise
+        reconcile_equivalent_local_head(repo_root, metadata, checkout_error)
     return on_pr_branch
+
+
+def reconcile_equivalent_local_head(
+    repo_root: Path,
+    metadata: dict[str, Any],
+    checkout_error: WorkflowError,
+) -> None:
+    local_head = git(repo_root, "rev-parse", "HEAD")
+    pr_head = metadata["head_sha"]
+    if local_head == pr_head:
+        raise checkout_error
+
+    try:
+        unique_merges = git(repo_root, "rev-list", "--merges", f"{pr_head}..{local_head}")
+        cherry = git(repo_root, "cherry", pr_head, local_head)
+    except WorkflowError:
+        raise checkout_error
+
+    unique_commits = [
+        line[2:].strip()
+        for line in cherry.splitlines()
+        if line.startswith("+ ") and line[2:].strip()
+    ]
+    if unique_merges or unique_commits:
+        unique = [line for line in unique_merges.splitlines() if line] + unique_commits
+        raise WorkflowError(
+            "head_moved: the PR branch was force-pushed and the clean local branch "
+            f"still has unique work ({', '.join(unique)}); local {local_head}, "
+            f"PR head {pr_head}"
+        ) from checkout_error
+
+    git(repo_root, "reset", "--hard", pr_head)
 
 
 def decode_diff_path(value: str) -> str | None:
@@ -587,8 +625,14 @@ def validate_candidates(
         unknown = set(candidate) - CANDIDATE_KEYS
         missing = CANDIDATE_KEYS - set(candidate)
         if unknown or missing:
+            details = []
+            if unknown:
+                details.append(f"unexpected keys: {', '.join(sorted(unknown))}")
+            if missing:
+                details.append(f"missing keys: {', '.join(sorted(missing))}")
             raise WorkflowError(
-                f"candidate {index} must contain exactly path, line, side, and body"
+                f"candidate {index} has invalid keys ({'; '.join(details)}); "
+                "expected exactly: path, line, side, body"
             )
         path = candidate["path"]
         line = candidate["line"]

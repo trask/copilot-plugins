@@ -68,9 +68,11 @@ Never pass a `~`-prefixed helper path to native Windows Python from Git Bash.
 
 The deterministic, JSON-only helper provides:
 
-- `preflight [target] [--repo-root <workspace>] [--max-iterations 5]`: resolve and check out the PR, require a clean worktree, require the local head to equal the PR head, fetch and parse the authoritative diff, confirm the head did not move around that fetch, enforce the iteration cap, archive the previous iteration, and return `head_sha`, `diff_path`, `changed_files`, and the carried-forward `history`
-- `candidates --state <path> --input <file-or->`: register this iteration's full candidate list and reject any candidate that is not anchored to a changed line of the pinned diff
-- `drop`, `plan`, `record`, and `skip`: maintain candidate and batch state
+- `preflight [target] [--repo-root <workspace>] [--max-iterations 5]`: resolve and check out the PR, require a clean worktree, safely realign a force-pushed PR branch only when `git cherry` proves the local commits have no unique patches, require the local head to equal the PR head, fetch and parse the authoritative diff, confirm the head did not move around that fetch, enforce the iteration cap, archive the previous iteration, and return `head_sha`, `diff_path`, `changed_files`, and the carried-forward `history`
+- `candidates --state <path> --input <file-or->`: register this iteration's full candidate list as a JSON array whose objects contain exactly `path`, `line`, `side`, and `body`, and reject any candidate that is not anchored to a changed line of the pinned diff
+- `drop --state <path> --candidates <ids...> --rationale <text>`: record evaluator-rejected candidates
+- `plan --state <path> --batch <id> --candidates <ids...> --label <label> [--paths <paths...>] [--validation <command>]`: persist one planned fix batch
+- `record` and `skip`: maintain completed or validation-blocked batch state
 - `resolve --state <path> --outcome clean`: require no candidates or only dropped candidates, verify the live PR head still matches the pin, and durably mark the active review clean
 - `publish --state <path>`: require a clean worktree and complete records, refuse to publish a skipped batch, require the commits sitting on the pinned head to be exactly the recorded ones, push only when needed, and verify that the remote branch and the PR head both match the local head
 - `status [--state <path> | --current --repo-root <workspace>]` and `cleanup --state <path>`
@@ -84,7 +86,7 @@ The workflow always covers one entire pull request. A pasted review or discussio
 1. If the user supplied a PR URL or `owner/repo#number`, use it exactly. For a bare PR number, combine it with the current workspace's GitHub repository as `owner/repo#number`. This supports a PR branch that is not checked out yet.
 2. For a targetless `resume` or `continue`, run `status --current --repo-root <workspace>` first and report what it finds; do not fall back to another PR.
 3. For any other targetless request, run `preflight --repo-root <workspace>` with no target so the helper resolves the PR attached to the currently checked-out branch.
-4. Run `preflight` once per iteration. Stop on its exact error; never stash, reset, discard, or force local work to make it pass.
+4. Run `preflight` once per iteration. The helper may realign the clean PR branch after a force-push only when it proves the local commits have no unique patches. If it reports `head_moved`, stop on that exact error. Never manually stash, reset, discard, or force local work to make preflight pass.
 5. Handle results as follows:
    - `ready`: continue immediately with the review.
    - `max_iterations_reached`: stop before editing and report the cap in the final commit index.
