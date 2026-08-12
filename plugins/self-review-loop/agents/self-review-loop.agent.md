@@ -103,7 +103,7 @@ For each iteration, before editing anything:
 6. Launch a fresh independent subagent for **each candidate separately** using model **GPT-5.6 Sol** with reasoning effort **max**. Never combine candidates in one evaluation. Give that evaluator the PR's stated scope, the relevant diff and context, and exactly one candidate. Require two independent decisions with evidence:
    - Is the candidate factually correct and demonstrated by this PR?
    - Is it actionable and worth fixing within the PR's stated scope?
-7. Run `drop` for any candidate whose either decision fails or is uncertain, recording the evaluator's concrete reason. If every candidate is dropped, run `resolve --state <path> --outcome clean`, then stop without editing or publishing and send the final index.
+7. Run `drop` for any candidate whose either decision fails or is uncertain, recording the evaluator's concrete reason. Retain each dropped candidate's original problem statement, location, and concrete evaluator reason for the final response. If every candidate is dropped, run `resolve --state <path> --outcome clean`, then stop without editing or publishing and send the final index.
 
 ## Batching And Batch Execution
 
@@ -159,16 +159,20 @@ The helper increments the persisted iteration count only after a successful publ
 
 ## Final Response
 
-Keep chat as a compact index because the reasoning lives in git. Emit exactly one terminal response. Render ordinary Markdown, never a fenced code block. Emit one linked list item per commit, then any no-code outcome, one loop-outcome line, and finally the canonical pull request link from the most recent preflight result's `pr.pr_url`:
+Keep chat as a compact index because the reasoning for accepted findings lives in git. Emit exactly one terminal response. Render ordinary Markdown, never a fenced code block. Emit one linked list item per commit, then any no-code outcome, one loop-outcome line, an optional dropped-candidate block, and finally the canonical pull request link from the most recent preflight result's `pr.pr_url`:
 
 - `[<short-sha> <short batch summary>](<pr.pr_url>/changes/<full-sha>)`
 - `No code change: <short summary> - <one-line rationale>`
 - `**Outcome:** clean after <n> iteration(s).`
+- `**Dropped candidates:**`
+- `- \`<path>:<line>\` - <concise candidate problem>: <concrete evaluator reason>`
 - `**PR:** [#<pr.number> <pr.title>](<pr.pr_url>)`
 
-For a clean pass with zero commits and no no-code outcomes, omit the first two line types and render exactly the `**Outcome:**` line followed by the `**PR:**` line. Do not invent a commit, no-code, or narrative line merely to fill the space above `**Outcome:**`.
+Include the dropped-candidate block only when this run dropped candidates, after `**Outcome:**` so the primary result remains first and immediately before `**PR:**` so the canonical link remains the end of the main response. List every dropped candidate separately with its original problem and the evaluator's concrete reason; do not collapse them into a count. Report only candidates evaluated and dropped during this run, not dropped entries carried forward in `history`.
 
-The backticks above delimit templates only; do not include them in the final response. For a capped or interrupted run, use `**Outcome:** <exact stop condition> after <n> iteration(s).` Always end with the linked `**PR:**` line so the pull request is directly accessible. Mention uncommitted work only for an unfixable validation stop. Report dropped candidates only as a count unless the user asks for detail, and do not repeat findings, analysis, upsides, downsides, validation success, or publication mechanics in chat. The **Self Review Loop Agent Retrospective** is the only content permitted after the `**PR:**` line.
+For a clean pass with zero commits and no no-code outcomes, omit the first two line types. With no dropped candidates, render exactly the `**Outcome:**` line followed by the `**PR:**` line. With dropped candidates, render the outcome, dropped-candidate block, and PR line in that order. Do not invent a commit, no-code, or narrative line merely to fill the space above `**Outcome:**`.
+
+The backticks above delimit templates only; do not include them in the final response except for the dropped candidate's inline-code location. For a capped or interrupted run, use `**Outcome:** <exact stop condition> after <n> iteration(s).` Always end with the linked `**PR:**` line so the pull request is directly accessible. Mention uncommitted work only for an unfixable validation stop. Do not repeat accepted findings, analysis, upsides, downsides, validation success, or publication mechanics in chat. The **Self Review Loop Agent Retrospective** is the only content permitted after the `**PR:**` line.
 
 ## Self Review Loop Agent Retrospective
 

@@ -184,7 +184,7 @@ class AgentInstructionsTest(unittest.TestCase):
             "run `preflight --repo-root <workspace>` with no target", self.instructions
         )
 
-    def test_final_response_renders_commit_and_pull_request_links(self):
+    def test_final_response_renders_commit_dropped_candidate_and_pr_links(self):
         self.assertIn(
             "canonical pull request link from the most recent preflight result's "
             "`pr.pr_url`",
@@ -207,8 +207,27 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "render exactly the `**Outcome:**` line followed by the `**PR:**` line",
+            "With no dropped candidates, render exactly the `**Outcome:**` line "
+            "followed by the `**PR:**` line",
             self.instructions,
+        )
+        self.assertIn(
+            "after `**Outcome:**` so the primary result remains first and immediately "
+            "before `**PR:**`",
+            self.instructions,
+        )
+        self.assertIn("`**Dropped candidates:**`", self.instructions)
+        self.assertIn(
+            "List every dropped candidate separately with its original problem and "
+            "the evaluator's concrete reason; do not collapse them into a count",
+            self.instructions,
+        )
+        self.assertIn(
+            "Report only candidates evaluated and dropped during this run",
+            self.instructions,
+        )
+        self.assertNotIn(
+            "Report dropped candidates only as a count", self.instructions
         )
         self.assertIn(
             "Do not invent a commit, no-code, or narrative line", self.instructions
