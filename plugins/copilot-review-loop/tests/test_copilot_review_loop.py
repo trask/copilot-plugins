@@ -181,6 +181,27 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
 
+    def test_documents_plans_required_batch_and_comment_flags(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+        invocation = (
+            "`plan --state <path> --batch <id> --comments <ids...> --label <label> "
+            "[--paths <paths...>] [--validation <command>]`"
+        )
+
+        self.assertGreaterEqual(instructions.count(invocation), 2)
+        self.assertIn(
+            "`--batch` and `--comments` are required option names",
+            instructions,
+        )
+        self.assertIn(
+            "Always spell the required `--batch` and `--comments` flags",
+            instructions,
+        )
+        self.assertIn(
+            "never pass the batch ID or comment IDs positionally",
+            instructions,
+        )
+
     def test_watcher_runs_synchronously_without_terminal_notification_handoff(self):
         instructions = AGENT.read_text(encoding="utf-8")
 

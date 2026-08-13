@@ -53,7 +53,8 @@ Never pass a `~`-prefixed helper path to native Windows Python from Git Bash.
 The deterministic, JSON-only helper provides:
 
 - `preflight [target] [--max-iterations 5] [--completed-run-iterations <n>]`: resolve and check out the PR, require a clean worktree, verify its head, fetch thread and suppressed comments, enforce the per-invocation iteration cap, and initialize external state
-- `plan`, `refresh`, `record`, and `skip`: maintain batch and comment state
+- `plan --state <path> --batch <id> --comments <ids...> --label <label> [--paths <paths...>] [--validation <command>]`: persist one planned batch; `--batch` and `--comments` are required option names, not positional values
+- `refresh`, `record`, and `skip`: maintain comment and completed-batch state
 - `status --current --repo-root <workspace>`: return only the workflow state attached to the current branch's PR
 - `publish`: compare the live remote PR head with the preflight pin immediately before pushing, return `head_changed` instead of invoking a divergent push, push only when needed, post each thread reply idempotently as its own published comment, resolve thread comments, request Copilot even without a new commit, and verify publication
 - `watch`: synchronously monitor exactly the requested Copilot review
@@ -101,7 +102,7 @@ Before editing an iteration:
 3. Treat CI logs and generated report artifacts for the exact pinned PR head as first-class evidence. Inspect them when they can confirm or reject a candidate more directly than local reproduction; never use results from another head.
 4. Reject technically incorrect requests with a well-supported no-code rationale rather than changing code merely to agree.
 5. Group comments when they share one root cause, require one coherent edit, or request the same sibling-module change. Separate them when grouping would obscure review or validation.
-6. Persist every batch with `plan`, including comment IDs, label, every affected path, and validation. Pass all paths after one `--paths` flag or repeat the flag; the helper retains every value.
+6. Persist every batch with `plan --state <path> --batch <id> --comments <ids...> --label <label> [--paths <paths...>] [--validation <command>]`. Always spell the required `--batch` and `--comments` flags; never pass the batch ID or comment IDs positionally. Pass all paths after one `--paths` flag or repeat the flag; the helper retains every value.
 7. Process every planned batch in order without waiting for user approval.
 
 ## Batch Execution
