@@ -754,9 +754,22 @@ def command_preflight(args: argparse.Namespace) -> None:
         if cancellation_result:
             save_state(state_path, prior_state)
             if cancellation_result == "cancel_requested":
-                raise WorkflowError(
-                    "active watcher cancellation requested; wait for its terminal result, then rerun preflight"
+                emit(
+                    {
+                        "result": "watcher_cancellation_pending",
+                        "state": str(state_path),
+                        "watcher_pid": prior_state["monitoring"].get("pid"),
+                        "wait_action": {
+                            "command": "await-watch",
+                            "state": str(state_path),
+                        },
+                        "cancel_action": {
+                            "command": "cancel-watch",
+                            "state": str(state_path),
+                        },
+                    }
                 )
+                return
 
     dirty = git(repo_root, "status", "--porcelain=v1")
     if dirty:
@@ -1509,6 +1522,41 @@ def command_cancel_watch(args: argparse.Namespace) -> None:
     emit({"result": result, "state": str(path)})
 
 
+def command_await_watch(args: argparse.Namespace) -> None:
+    path = cli_path(args.state)
+    while True:
+        state = load_state(path)
+        monitoring = state.get("monitoring") or {}
+        if monitoring.get("status") == "completed":
+            result = monitoring.get("result")
+            if not isinstance(result, dict):
+                raise WorkflowError("completed watcher state has no terminal result")
+            emit(
+                {
+                    "result": "watcher_completed",
+                    "state": str(path),
+                    "watcher_result": result,
+                }
+            )
+            return
+        if monitoring.get("status") == "running" and not process_is_running(
+            monitoring.get("pid")
+        ):
+            result = watcher_result(state, {"result": "cancelled_locally"})
+            save_state(path, state)
+            emit(
+                {
+                    "result": "watcher_completed",
+                    "state": str(path),
+                    "watcher_result": result,
+                }
+            )
+            return
+        if monitoring.get("status") != "running":
+            raise WorkflowError("state has no active watcher to await")
+        time.sleep(args.interval)
+
+
 def matching_review(
     reviews: list[dict[str, Any]], monitoring: dict[str, Any]
 ) -> dict[str, Any] | None:
@@ -1773,6 +1821,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cancel.add_argument("--state", required=True)
     cancel.set_defaults(function=command_cancel_watch)
+
+    await_watch = subparsers.add_parser(
+        "await-watch", help="wait for an active watcher to persist its terminal result"
+    )
+    await_watch.add_argument("--state", required=True)
+    await_watch.add_argument("--interval", type=float, default=1.0)
+    await_watch.set_defaults(function=command_await_watch)
 
     status = subparsers.add_parser("status", help="print compact workflow state")
     status_source = status.add_mutually_exclusive_group(required=True)

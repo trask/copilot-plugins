@@ -202,6 +202,27 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
 
+    def test_documents_deterministic_active_watcher_handling(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "`await-watch --state <path>`: deterministically wait for an "
+            "already-running watcher",
+            instructions,
+        )
+        self.assertIn("`watcher_cancellation_pending`", instructions)
+        self.assertIn(
+            "run the exact `wait_action` (`await-watch --state <path>`)",
+            instructions,
+        )
+        self.assertIn(
+            "The returned `cancel_action` is idempotent", instructions
+        )
+        self.assertIn(
+            "Never blindly retry preflight while the watcher is active",
+            instructions,
+        )
+
     def test_watcher_runs_synchronously_without_terminal_notification_handoff(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
@@ -2174,6 +2195,131 @@ class WatcherStateTest(unittest.TestCase):
         self.assertEqual(result, "cancel_requested")
         self.assertEqual(state["monitoring"]["status"], "running")
         self.assertTrue(state["monitoring"]["cancel_requested"])
+
+    def test_preflight_reports_the_active_watcher_state_and_actions(self):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "monitoring": {
+                "status": "running",
+                "pid": 123,
+                "cancel_requested": False,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(path, state)
+            args = SimpleNamespace(
+                target="owner/repo#1",
+                repo_root=directory,
+                state=str(path),
+            )
+
+            with (
+                mock.patch.object(MODULE, "require_tools"),
+                mock.patch.object(MODULE, "process_is_running", return_value=True),
+                mock.patch.object(MODULE, "resolve_repo_root") as resolve_repo_root,
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_preflight(args)
+
+            saved = MODULE.load_state(path)
+
+        resolve_repo_root.assert_called_once_with(directory)
+        self.assertTrue(saved["monitoring"]["cancel_requested"])
+        emit.assert_called_once_with(
+            {
+                "result": "watcher_cancellation_pending",
+                "state": str(path.resolve()),
+                "watcher_pid": 123,
+                "wait_action": {
+                    "command": "await-watch",
+                    "state": str(path.resolve()),
+                },
+                "cancel_action": {
+                    "command": "cancel-watch",
+                    "state": str(path.resolve()),
+                },
+            }
+        )
+
+    def test_await_watch_returns_the_persisted_terminal_result(self):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "monitoring": {
+                "status": "running",
+                "pid": 123,
+                "cancel_requested": True,
+            },
+        }
+        completed = {
+            **state,
+            "monitoring": {
+                "status": "completed",
+                "result": {"result": "cancelled_locally"},
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(path, state)
+            args = SimpleNamespace(state=str(path), interval=0.25)
+
+            with (
+                mock.patch.object(
+                    MODULE, "load_state", side_effect=[state, completed]
+                ),
+                mock.patch.object(MODULE, "process_is_running", return_value=True),
+                mock.patch.object(MODULE.time, "sleep") as sleep,
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_await_watch(args)
+
+        sleep.assert_called_once_with(0.25)
+        emit.assert_called_once_with(
+            {
+                "result": "watcher_completed",
+                "state": str(path.resolve()),
+                "watcher_result": {"result": "cancelled_locally"},
+            }
+        )
+
+    def test_await_watch_completes_a_stale_running_watcher(self):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "monitoring": {
+                "status": "running",
+                "pid": 123,
+                "cancel_requested": True,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(path, state)
+            args = SimpleNamespace(state=str(path), interval=0.25)
+
+            with (
+                mock.patch.object(MODULE, "process_is_running", return_value=False),
+                mock.patch.object(MODULE.time, "sleep") as sleep,
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_await_watch(args)
+
+            saved = MODULE.load_state(path)
+
+        sleep.assert_not_called()
+        self.assertEqual(saved["monitoring"]["status"], "completed")
+        self.assertEqual(
+            saved["monitoring"]["result"], {"result": "cancelled_locally"}
+        )
+        emit.assert_called_once_with(
+            {
+                "result": "watcher_completed",
+                "state": str(path.resolve()),
+                "watcher_result": {"result": "cancelled_locally"},
+            }
+        )
 
     def test_watch_rejects_duplicate_live_process(self):
         state = {

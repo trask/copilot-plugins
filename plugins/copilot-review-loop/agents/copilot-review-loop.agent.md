@@ -59,6 +59,7 @@ The deterministic, JSON-only helper provides:
 - `publish`: compare the live remote PR head with the preflight pin immediately before pushing, return `head_changed` instead of invoking a divergent push, push only when needed, post each thread reply idempotently as its own published comment, resolve thread comments, request Copilot even without a new commit, and verify publication
 - `watch`: synchronously monitor exactly the requested Copilot review
 - `cancel-watch`: preempt stale or superseded monitoring
+- `await-watch --state <path>`: deterministically wait for an already-running watcher to persist and return its terminal result
 
 If an operation partially fails, preserve its state and retry that same operation after fixing only the reported blocker.
 
@@ -73,10 +74,11 @@ The workflow always covers the entire Copilot queue for one pull request. A past
 1. If the user supplied a PR URL or `owner/repo#number`, use it exactly. For a bare PR number, combine it with the current workspace's GitHub repository as `owner/repo#number`. This supports a PR branch that is not checked out yet.
 2. For a targetless `watch`, `resume`, or `continue`, run `status --current --repo-root <workspace>`. If monitoring is `requested` or `running`, resume `watch` with that state. If monitoring completed with comments, run `preflight` for that same PR. If no resumable state exists, report it; do not fall back to another PR.
 3. For any other targetless request, run `preflight --repo-root <workspace>` with no target so the helper resolves the PR attached to the currently checked-out branch.
-4. If a watcher belongs to a different requested PR, use `cancel-watch` and wait for cancellation before starting over.
+4. If a watcher belongs to a different requested PR, use `cancel-watch --state <path>`, then `await-watch --state <path>` before starting over.
 5. Run `preflight --completed-run-iterations <n>` once, where `<n>` is the run-local iteration counter. Pass the current counter on every later preflight in the same invocation. Stop on its exact error; never stash, reset, discard, or force local work to make it pass.
 6. Handle results as follows:
    - `ready`: continue immediately with investigation and batching.
+   - `watcher_cancellation_pending`: use the returned `state` and run the exact `wait_action` (`await-watch --state <path>`); after it returns `watcher_completed`, rerun preflight. The returned `cancel_action` is idempotent if cancellation must be requested again. Never blindly retry preflight while the watcher is active.
    - `review_required`: the queue is empty but the current head has no clean Copilot review. Run `publish --state <path> --no-comments` immediately, then continue with the normal synchronous `watch` flow.
    - `no_unresolved_comments`: the loop is clean; send the final compact index.
    - `no_copilot_comments`: only the authors in `skipped_authors` have unresolved threads; send the final compact index without touching them.
