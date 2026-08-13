@@ -132,6 +132,15 @@ class AgentInstructionsTest(unittest.TestCase):
             "Use existing inline threads to avoid duplicate feedback", instructions
         )
         self.assertIn(
+            "top-level `path`, `line`, `side`, `start_line`, `start_side`, "
+            "`is_resolved`, and `is_outdated` fields",
+            instructions,
+        )
+        self.assertIn("classify it as **resolved-by-code**", instructions)
+        self.assertIn(
+            "even if GitHub still reports the thread unresolved", instructions
+        )
+        self.assertIn(
             "applies equally to candidates discovered directly and candidates derived "
             "from suppressed Copilot comments",
             instructions,
@@ -976,6 +985,12 @@ class PendingReviewTest(unittest.TestCase):
                             {
                                 "id": "THREAD_1",
                                 "isResolved": True,
+                                "isOutdated": True,
+                                "path": "src/app.py",
+                                "line": None,
+                                "diffSide": "RIGHT",
+                                "startLine": None,
+                                "startDiffSide": None,
                                 "comments": {
                                     "nodes": [comment(1, original_line=7)],
                                     "pageInfo": {
@@ -1009,6 +1024,12 @@ class PendingReviewTest(unittest.TestCase):
                             {
                                 "id": "THREAD_2",
                                 "isResolved": False,
+                                "isOutdated": False,
+                                "path": "src/app.py",
+                                "line": 9,
+                                "diffSide": "RIGHT",
+                                "startLine": 8,
+                                "startDiffSide": "RIGHT",
                                 "comments": {
                                     "nodes": [comment(3, line=9)],
                                     "pageInfo": {
@@ -1034,6 +1055,17 @@ class PendingReviewTest(unittest.TestCase):
         self.assertEqual([thread["id"] for thread in result], ["THREAD_1", "THREAD_2"])
         self.assertTrue(result[0]["resolved"])
         self.assertFalse(result[1]["resolved"])
+        self.assertTrue(result[0]["is_resolved"])
+        self.assertTrue(result[0]["is_outdated"])
+        self.assertEqual(result[0]["path"], "src/app.py")
+        self.assertIsNone(result[0]["line"])
+        self.assertEqual(result[0]["side"], "RIGHT")
+        self.assertFalse(result[1]["is_resolved"])
+        self.assertFalse(result[1]["is_outdated"])
+        self.assertEqual(result[1]["line"], 9)
+        self.assertEqual(result[1]["side"], "RIGHT")
+        self.assertEqual(result[1]["start_line"], 8)
+        self.assertEqual(result[1]["start_side"], "RIGHT")
         self.assertEqual(
             [item["line"] for item in result[0]["comments"]],
             [7, 8],
@@ -1119,6 +1151,13 @@ class PendingReviewTest(unittest.TestCase):
                 return_value=[
                     {
                         "id": "THREAD_1",
+                        "path": "src/one.py",
+                        "line": 2,
+                        "side": "RIGHT",
+                        "start_line": None,
+                        "start_side": None,
+                        "is_resolved": True,
+                        "is_outdated": False,
                         "resolved": True,
                         "comments": [
                             {
@@ -1147,6 +1186,10 @@ class PendingReviewTest(unittest.TestCase):
         self.assertEqual(payload["suppressed_comments"][0]["path"], "src/one.py")
         self.assertEqual(payload["issue_comments"][0]["author"], "maintainer")
         self.assertEqual(payload["review_threads"][0]["id"], "THREAD_1")
+        self.assertEqual(payload["review_threads"][0]["path"], "src/one.py")
+        self.assertEqual(payload["review_threads"][0]["line"], 2)
+        self.assertEqual(payload["review_threads"][0]["side"], "RIGHT")
+        self.assertTrue(payload["review_threads"][0]["is_resolved"])
         preflight.assert_called_once_with(
             pr["pr_url"], include_issue_comments=True
         )

@@ -265,7 +265,9 @@ def normalize_review_thread_comment(
         raise WorkflowError(f"review comment {comment_id} has invalid timestamps")
     if not isinstance(path, str) or not path:
         raise WorkflowError(f"review comment {comment_id} has no path")
-    if line is not None and (isinstance(line, bool) or not isinstance(line, int)):
+    if line is not None and (
+        isinstance(line, bool) or not isinstance(line, int)
+    ):
         raise WorkflowError(f"review comment {comment_id} has an invalid line")
     if start_line is not None and (
         isinstance(start_line, bool) or not isinstance(start_line, int)
@@ -293,7 +295,8 @@ def fetch_review_threads(pr: dict[str, Any]) -> list[dict[str, Any]]:
     thread_query = (
         "query($owner:String!,$repo:String!,$number:Int!,$cursor:String){"
         "repository(owner:$owner,name:$repo){pullRequest(number:$number){"
-        "reviewThreads(first:100,after:$cursor){nodes{id isResolved "
+        "reviewThreads(first:100,after:$cursor){nodes{"
+        "id isResolved isOutdated path line diffSide startLine startDiffSide "
         f"comments(first:100){{nodes{{{comment_fields}}}"
         "pageInfo{hasNextPage endCursor}}}"
         "pageInfo{hasNextPage endCursor}}}}}"
@@ -328,11 +331,37 @@ def fetch_review_threads(pr: dict[str, Any]) -> list[dict[str, Any]]:
         for thread in nodes:
             thread_id = thread.get("id") if isinstance(thread, dict) else None
             resolved = thread.get("isResolved") if isinstance(thread, dict) else None
+            outdated = thread.get("isOutdated") if isinstance(thread, dict) else None
+            path = thread.get("path") if isinstance(thread, dict) else None
+            line = thread.get("line") if isinstance(thread, dict) else None
+            side = thread.get("diffSide") if isinstance(thread, dict) else None
+            start_line = thread.get("startLine") if isinstance(thread, dict) else None
+            start_side = (
+                thread.get("startDiffSide") if isinstance(thread, dict) else None
+            )
             comments = thread.get("comments") if isinstance(thread, dict) else None
             if not isinstance(thread_id, str) or not thread_id:
                 raise WorkflowError("review thread has no node ID")
             if not isinstance(resolved, bool):
                 raise WorkflowError(f"review thread {thread_id} has no resolved state")
+            if not isinstance(outdated, bool):
+                raise WorkflowError(f"review thread {thread_id} has no outdated state")
+            if not isinstance(path, str) or not path:
+                raise WorkflowError(f"review thread {thread_id} has no path")
+            if line is not None and (isinstance(line, bool) or not isinstance(line, int)):
+                raise WorkflowError(f"review thread {thread_id} has an invalid line")
+            if side not in {"LEFT", "RIGHT"}:
+                raise WorkflowError(f"review thread {thread_id} has an invalid side")
+            if start_line is not None and (
+                isinstance(start_line, bool) or not isinstance(start_line, int)
+            ):
+                raise WorkflowError(
+                    f"review thread {thread_id} has an invalid start line"
+                )
+            if start_side is not None and start_side not in {"LEFT", "RIGHT"}:
+                raise WorkflowError(
+                    f"review thread {thread_id} has an invalid start side"
+                )
             if not isinstance(comments, dict):
                 raise WorkflowError(f"review thread {thread_id} has no comments")
             comment_nodes = comments.get("nodes")
@@ -362,6 +391,13 @@ def fetch_review_threads(pr: dict[str, Any]) -> list[dict[str, Any]]:
             normalized.append(
                 {
                     "id": thread_id,
+                    "path": path,
+                    "line": line,
+                    "side": side,
+                    "start_line": start_line,
+                    "start_side": start_side,
+                    "is_resolved": resolved,
+                    "is_outdated": outdated,
                     "resolved": resolved,
                     "comments": [
                         normalize_review_thread_comment(comment, thread_id)
