@@ -89,8 +89,8 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("disable-model-invocation: true", instructions)
         self.assertIn("gh pr diff", instructions)
         self.assertIn(
-            "The authoritative changeset is the helper `check` result's "
-            "`authoritative_diff`",
+            "The authoritative changeset is the diff the helper's `check` result "
+            "captured",
             instructions,
         )
         self.assertIn(
@@ -99,17 +99,25 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn("`get_changes_overview`", instructions)
         self.assertIn(
-            "Use `authoritative_diff` from the same `check` result as the complete "
-            "patch",
+            "Use the diff at `authoritative_diff_path` from the same `check` result "
+            "as the complete patch",
             instructions,
         )
         self.assertIn("do not fetch the diff again through any tool", instructions)
+        self.assertIn(
+            "`check <target> --diff-file <short-lived-path>`",
+            instructions,
+        )
         self.assertIn(
             "capturing its complete JSON result in a short-lived local file",
             instructions,
         )
         self.assertIn(
-            "cannot be lost to terminal-output truncation",
+            "no field is lost to terminal-output truncation",
+            instructions,
+        )
+        self.assertIn(
+            "Delete both captured files after the review is posted",
             instructions,
         )
         self.assertIn("GPT-5.6 Sol", instructions)
@@ -1096,7 +1104,7 @@ class PendingReviewTest(unittest.TestCase):
             ),
             mock.patch.object(MODULE, "emit") as emit,
         ):
-            MODULE.command_check(SimpleNamespace(target=pr["pr_url"]))
+            MODULE.command_check(SimpleNamespace(target=pr["pr_url"], diff_file=None))
 
         self.assertEqual(emit.call_args.args[0]["result"], "existing_pending_review")
         self.assertEqual(
@@ -1174,7 +1182,7 @@ class PendingReviewTest(unittest.TestCase):
             mock.patch.object(MODULE, "ensure_head_unchanged"),
             mock.patch.object(MODULE, "emit") as emit,
         ):
-            MODULE.command_check(SimpleNamespace(target=pr["pr_url"]))
+            MODULE.command_check(SimpleNamespace(target=pr["pr_url"], diff_file=None))
 
         payload = emit.call_args.args[0]
         self.assertEqual(payload["result"], "ready")
@@ -1214,7 +1222,7 @@ class PendingReviewTest(unittest.TestCase):
             mock.patch.object(MODULE, "ensure_head_unchanged"),
             mock.patch.object(MODULE, "emit") as emit,
         ):
-            MODULE.command_check(SimpleNamespace(target=pr["pr_url"]))
+            MODULE.command_check(SimpleNamespace(target=pr["pr_url"], diff_file=None))
 
         payload = emit.call_args.args[0]
         self.assertIsNone(payload["copilot_review"])
@@ -1222,6 +1230,97 @@ class PendingReviewTest(unittest.TestCase):
         self.assertEqual(payload["issue_comments"], [])
         self.assertEqual(payload["review_threads"], [])
         self.assertEqual(payload["authoritative_diff"], DIFF)
+        self.assertNotIn("authoritative_diff_path", payload)
+
+    def test_check_writes_the_diff_to_the_requested_file(self):
+        pr = {
+            "repo_name": "owner/repo",
+            "number": 42,
+            "title": "Fix the reviewer",
+            "pr_url": "https://github.com/owner/repo/pull/42",
+            "head_sha": "abc123",
+        }
+        anchors = MODULE.parse_unified_diff(DIFF)
+
+        with tempfile.TemporaryDirectory() as directory:
+            target_path = Path(directory) / "nested" / "diff.patch"
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "preflight",
+                    return_value=(pr, "viewer", anchors, None, None, [], [], DIFF),
+                ),
+                mock.patch.object(MODULE, "fetch_review_threads", return_value=[]),
+                mock.patch.object(MODULE, "ensure_head_unchanged"),
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_check(
+                    SimpleNamespace(target=pr["pr_url"], diff_file=str(target_path))
+                )
+
+            payload = emit.call_args.args[0]
+            self.assertEqual(payload["result"], "ready")
+            self.assertNotIn("authoritative_diff", payload)
+            self.assertEqual(
+                payload["authoritative_diff_path"], str(target_path.resolve())
+            )
+            self.assertEqual(
+                payload["authoritative_diff_bytes"], len(DIFF.encode("utf-8"))
+            )
+            self.assertEqual(payload["head_sha"], "abc123")
+            self.assertEqual(payload["changed_files"], sorted(anchors))
+            self.assertEqual(
+                target_path.read_text(encoding="utf-8", newline=""), DIFF
+            )
+            self.assertNotIn(DIFF, json.dumps(payload))
+
+    def test_check_fails_when_the_diff_file_cannot_be_written(self):
+        pr = {
+            "repo_name": "owner/repo",
+            "number": 42,
+            "title": "Fix the reviewer",
+            "pr_url": "https://github.com/owner/repo/pull/42",
+            "head_sha": "abc123",
+        }
+        anchors = MODULE.parse_unified_diff(DIFF)
+
+        with tempfile.TemporaryDirectory() as directory:
+            blocker = Path(directory) / "blocker"
+            blocker.write_text("not a directory", encoding="utf-8")
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "preflight",
+                    return_value=(pr, "viewer", anchors, None, None, [], [], DIFF),
+                ),
+                mock.patch.object(MODULE, "fetch_review_threads", return_value=[]),
+                mock.patch.object(MODULE, "ensure_head_unchanged"),
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError, "could not write the authoritative diff file"
+                ):
+                    MODULE.command_check(
+                        SimpleNamespace(
+                            target=pr["pr_url"],
+                            diff_file=str(blocker / "diff.patch"),
+                        )
+                    )
+
+            emit.assert_not_called()
+
+    def test_check_parser_defaults_the_diff_file_to_none(self):
+        parser = MODULE.build_parser()
+
+        self.assertIsNone(
+            parser.parse_args(["check", "owner/repo#42"]).diff_file
+        )
+        self.assertEqual(
+            parser.parse_args(
+                ["check", "owner/repo#42", "--diff-file", "out.patch"]
+            ).diff_file,
+            "out.patch",
+        )
 
 
 class ResolvePrTest(unittest.TestCase):

@@ -692,6 +692,18 @@ def fetch_authoritative_diff(pr: dict[str, Any]) -> str:
     ).stdout
 
 
+def write_diff_file(path_value: str, diff: str) -> str:
+    path = Path(path_value).expanduser()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(diff, encoding="utf-8", newline="")
+    except OSError as error:
+        raise WorkflowError(
+            f"could not write the authoritative diff file: {error}"
+        ) from error
+    return str(path.resolve())
+
+
 def load_comments(path_value: str) -> list[dict[str, Any]]:
     try:
         text = sys.stdin.read() if path_value == "-" else Path(path_value).read_text(
@@ -1048,22 +1060,27 @@ def command_check(args: argparse.Namespace) -> None:
         return
     review_threads = fetch_review_threads(pr)
     ensure_head_unchanged(pr, "after fetching existing review threads")
-    emit(
-        {
-            "result": "ready",
-            "pr_url": pr["pr_url"],
-            "pr_number": pr["number"],
-            "pr_title": pr["title"],
-            "head_sha": pr["head_sha"],
-            "viewer": viewer,
-            "changed_files": sorted(anchors),
-            "authoritative_diff": authoritative_diff,
-            "copilot_review": copilot_review,
-            "suppressed_comments": suppressed_comments,
-            "issue_comments": issue_comments,
-            "review_threads": review_threads,
-        }
-    )
+    payload = {
+        "result": "ready",
+        "pr_url": pr["pr_url"],
+        "pr_number": pr["number"],
+        "pr_title": pr["title"],
+        "head_sha": pr["head_sha"],
+        "viewer": viewer,
+        "changed_files": sorted(anchors),
+        "copilot_review": copilot_review,
+        "suppressed_comments": suppressed_comments,
+        "issue_comments": issue_comments,
+        "review_threads": review_threads,
+    }
+    if args.diff_file:
+        payload["authoritative_diff_path"] = write_diff_file(
+            args.diff_file, authoritative_diff
+        )
+        payload["authoritative_diff_bytes"] = len(authoritative_diff.encode("utf-8"))
+    else:
+        payload["authoritative_diff"] = authoritative_diff
+    emit(payload)
 
 
 def command_post(args: argparse.Namespace) -> None:
@@ -1106,6 +1123,13 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     check = subparsers.add_parser("check", help="check for a pending review and parse the PR diff")
     check.add_argument("target")
+    check.add_argument(
+        "--diff-file",
+        help=(
+            "write the authoritative diff to this path and return "
+            "authoritative_diff_path instead of the inline diff text"
+        ),
+    )
     check.set_defaults(function=command_check)
     post = subparsers.add_parser("post", help="create and verify one pending review")
     post.add_argument("target")
