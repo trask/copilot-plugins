@@ -692,16 +692,25 @@ def fetch_authoritative_diff(pr: dict[str, Any]) -> str:
     ).stdout
 
 
-def write_diff_file(path_value: str, diff: str) -> str:
+def write_output_file(path_value: str, text: str, description: str) -> str:
     path = Path(path_value).expanduser()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(diff, encoding="utf-8", newline="")
+        path.write_text(text, encoding="utf-8", newline="")
     except OSError as error:
         raise WorkflowError(
-            f"could not write the authoritative diff file: {error}"
+            f"could not write the {description} file: {error}"
         ) from error
     return str(path.resolve())
+
+
+def write_diff_file(path_value: str, diff: str) -> str:
+    return write_output_file(path_value, diff, "authoritative diff")
+
+
+def write_context_file(path_value: str, context: dict[str, Any]) -> str:
+    text = json.dumps(context, indent=2, sort_keys=True) + "\n"
+    return write_output_file(path_value, text, "review context")
 
 
 def load_comments(path_value: str) -> list[dict[str, Any]]:
@@ -1060,6 +1069,12 @@ def command_check(args: argparse.Namespace) -> None:
         return
     review_threads = fetch_review_threads(pr)
     ensure_head_unchanged(pr, "after fetching existing review threads")
+    context = {
+        "copilot_review": copilot_review,
+        "suppressed_comments": suppressed_comments,
+        "issue_comments": issue_comments,
+        "review_threads": review_threads,
+    }
     payload = {
         "result": "ready",
         "pr_url": pr["pr_url"],
@@ -1068,11 +1083,17 @@ def command_check(args: argparse.Namespace) -> None:
         "head_sha": pr["head_sha"],
         "viewer": viewer,
         "changed_files": sorted(anchors),
-        "copilot_review": copilot_review,
-        "suppressed_comments": suppressed_comments,
-        "issue_comments": issue_comments,
-        "review_threads": review_threads,
     }
+    if args.context_file:
+        payload["context_path"] = write_context_file(args.context_file, context)
+        payload["context_counts"] = {
+            "copilot_review": 1 if copilot_review else 0,
+            "issue_comments": len(issue_comments),
+            "review_threads": len(review_threads),
+            "suppressed_comments": len(suppressed_comments),
+        }
+    else:
+        payload.update(context)
     if args.diff_file:
         payload["authoritative_diff_path"] = write_diff_file(
             args.diff_file, authoritative_diff
@@ -1128,6 +1149,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "write the authoritative diff to this path and return "
             "authoritative_diff_path instead of the inline diff text"
+        ),
+    )
+    check.add_argument(
+        "--context-file",
+        help=(
+            "write the Copilot review, suppressed comments, issue comments, and "
+            "review threads to this path as JSON and return context_path with "
+            "context_counts instead of those inline fields"
         ),
     )
     check.set_defaults(function=command_check)

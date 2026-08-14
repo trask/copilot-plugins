@@ -98,6 +98,8 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn("`get_changes_overview`", instructions)
+        self.assertIn("`<pr_diff_instructions>`", instructions)
+        self.assertIn("This agent explicitly supersedes that block", instructions)
         self.assertIn(
             "Use the diff at `authoritative_diff_path` from the same `check` result "
             "as the complete patch",
@@ -105,19 +107,24 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn("do not fetch the diff again through any tool", instructions)
         self.assertIn(
-            "`check <target> --diff-file <short-lived-path>`",
+            "`check <target> --diff-file <short-lived-diff-path> "
+            "--context-file <short-lived-context-path>`",
             instructions,
         )
         self.assertIn(
-            "capturing its complete JSON result in a short-lived local file",
+            "read that envelope directly from the command output",
             instructions,
         )
         self.assertIn(
-            "no field is lost to terminal-output truncation",
+            "the review context from `context_path`",
             instructions,
         )
         self.assertIn(
-            "Delete both captured files after the review is posted",
+            "reconcile what you read against `context_counts`",
+            instructions,
+        )
+        self.assertIn(
+            "Delete both written files after the review is posted",
             instructions,
         )
         self.assertIn("GPT-5.6 Sol", instructions)
@@ -1104,7 +1111,9 @@ class PendingReviewTest(unittest.TestCase):
             ),
             mock.patch.object(MODULE, "emit") as emit,
         ):
-            MODULE.command_check(SimpleNamespace(target=pr["pr_url"], diff_file=None))
+            MODULE.command_check(SimpleNamespace(
+                target=pr["pr_url"], diff_file=None, context_file=None
+            ))
 
         self.assertEqual(emit.call_args.args[0]["result"], "existing_pending_review")
         self.assertEqual(
@@ -1182,7 +1191,9 @@ class PendingReviewTest(unittest.TestCase):
             mock.patch.object(MODULE, "ensure_head_unchanged"),
             mock.patch.object(MODULE, "emit") as emit,
         ):
-            MODULE.command_check(SimpleNamespace(target=pr["pr_url"], diff_file=None))
+            MODULE.command_check(SimpleNamespace(
+                target=pr["pr_url"], diff_file=None, context_file=None
+            ))
 
         payload = emit.call_args.args[0]
         self.assertEqual(payload["result"], "ready")
@@ -1222,7 +1233,9 @@ class PendingReviewTest(unittest.TestCase):
             mock.patch.object(MODULE, "ensure_head_unchanged"),
             mock.patch.object(MODULE, "emit") as emit,
         ):
-            MODULE.command_check(SimpleNamespace(target=pr["pr_url"], diff_file=None))
+            MODULE.command_check(SimpleNamespace(
+                target=pr["pr_url"], diff_file=None, context_file=None
+            ))
 
         payload = emit.call_args.args[0]
         self.assertIsNone(payload["copilot_review"])
@@ -1255,7 +1268,11 @@ class PendingReviewTest(unittest.TestCase):
                 mock.patch.object(MODULE, "emit") as emit,
             ):
                 MODULE.command_check(
-                    SimpleNamespace(target=pr["pr_url"], diff_file=str(target_path))
+                    SimpleNamespace(
+                        target=pr["pr_url"],
+                        diff_file=str(target_path),
+                        context_file=None,
+                    )
                 )
 
             payload = emit.call_args.args[0]
@@ -1304,6 +1321,154 @@ class PendingReviewTest(unittest.TestCase):
                         SimpleNamespace(
                             target=pr["pr_url"],
                             diff_file=str(blocker / "diff.patch"),
+                            context_file=None,
+                        )
+                    )
+
+            emit.assert_not_called()
+
+    def test_check_writes_the_review_context_to_the_requested_file(self):
+        pr = {
+            "repo_name": "owner/repo",
+            "number": 42,
+            "title": "Fix the reviewer",
+            "pr_url": "https://github.com/owner/repo/pull/42",
+            "head_sha": "abc123",
+        }
+        anchors = MODULE.parse_unified_diff(DIFF)
+        copilot_review = {"id": 10, "url": "https://example.test/review/10"}
+        suppressed = [{"path": "src/one.py", "line": 2, "body": "Lead."}]
+        issue_comments = [{"author": "maintainer", "body": "Deferred."}]
+        threads = [{"id": "THREAD_1", "path": "src/one.py", "line": 2}]
+
+        with tempfile.TemporaryDirectory() as directory:
+            context_path = Path(directory) / "nested" / "context.json"
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "preflight",
+                    return_value=(
+                        pr,
+                        "viewer",
+                        anchors,
+                        None,
+                        copilot_review,
+                        suppressed,
+                        issue_comments,
+                        DIFF,
+                    ),
+                ),
+                mock.patch.object(
+                    MODULE, "fetch_review_threads", return_value=threads
+                ),
+                mock.patch.object(MODULE, "ensure_head_unchanged"),
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_check(
+                    SimpleNamespace(
+                        target=pr["pr_url"],
+                        diff_file=None,
+                        context_file=str(context_path),
+                    )
+                )
+
+            payload = emit.call_args.args[0]
+            self.assertEqual(payload["result"], "ready")
+            self.assertEqual(payload["context_path"], str(context_path.resolve()))
+            self.assertEqual(
+                payload["context_counts"],
+                {
+                    "copilot_review": 1,
+                    "issue_comments": 1,
+                    "review_threads": 1,
+                    "suppressed_comments": 1,
+                },
+            )
+            for field in (
+                "copilot_review",
+                "suppressed_comments",
+                "issue_comments",
+                "review_threads",
+            ):
+                self.assertNotIn(field, payload)
+            self.assertEqual(payload["authoritative_diff"], DIFF)
+            context = json.loads(context_path.read_text(encoding="utf-8"))
+            self.assertEqual(context["copilot_review"], copilot_review)
+            self.assertEqual(context["suppressed_comments"], suppressed)
+            self.assertEqual(context["issue_comments"], issue_comments)
+            self.assertEqual(context["review_threads"], threads)
+
+    def test_check_counts_an_absent_copilot_review_as_zero(self):
+        pr = {
+            "repo_name": "owner/repo",
+            "number": 42,
+            "title": "Fix the reviewer",
+            "pr_url": "https://github.com/owner/repo/pull/42",
+            "head_sha": "abc123",
+        }
+        anchors = MODULE.parse_unified_diff(DIFF)
+
+        with tempfile.TemporaryDirectory() as directory:
+            context_path = Path(directory) / "context.json"
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "preflight",
+                    return_value=(pr, "viewer", anchors, None, None, [], [], DIFF),
+                ),
+                mock.patch.object(MODULE, "fetch_review_threads", return_value=[]),
+                mock.patch.object(MODULE, "ensure_head_unchanged"),
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_check(
+                    SimpleNamespace(
+                        target=pr["pr_url"],
+                        diff_file=None,
+                        context_file=str(context_path),
+                    )
+                )
+
+            self.assertEqual(
+                emit.call_args.args[0]["context_counts"],
+                {
+                    "copilot_review": 0,
+                    "issue_comments": 0,
+                    "review_threads": 0,
+                    "suppressed_comments": 0,
+                },
+            )
+
+    def test_check_fails_when_the_context_file_cannot_be_written(self):
+        pr = {
+            "repo_name": "owner/repo",
+            "number": 42,
+            "title": "Fix the reviewer",
+            "pr_url": "https://github.com/owner/repo/pull/42",
+            "head_sha": "abc123",
+        }
+        anchors = MODULE.parse_unified_diff(DIFF)
+
+        with tempfile.TemporaryDirectory() as directory:
+            blocker = Path(directory) / "blocker"
+            blocker.write_text("not a directory", encoding="utf-8")
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "preflight",
+                    return_value=(pr, "viewer", anchors, None, None, [], [], DIFF),
+                ),
+                mock.patch.object(MODULE, "fetch_review_threads", return_value=[]),
+                mock.patch.object(MODULE, "ensure_head_unchanged"),
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError, "could not write the review context file"
+                ):
+                    MODULE.command_check(
+                        SimpleNamespace(
+                            target=pr["pr_url"],
+                            diff_file=None,
+                            context_file=str(blocker / "context.json"),
                         )
                     )
 
@@ -1320,6 +1485,19 @@ class PendingReviewTest(unittest.TestCase):
                 ["check", "owner/repo#42", "--diff-file", "out.patch"]
             ).diff_file,
             "out.patch",
+        )
+
+    def test_check_parser_defaults_the_context_file_to_none(self):
+        parser = MODULE.build_parser()
+
+        self.assertIsNone(
+            parser.parse_args(["check", "owner/repo#42"]).context_file
+        )
+        self.assertEqual(
+            parser.parse_args(
+                ["check", "owner/repo#42", "--context-file", "context.json"]
+            ).context_file,
+            "context.json",
         )
 
 
