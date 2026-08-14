@@ -145,6 +145,24 @@ def diff_path_for(state_path: Path) -> Path:
     return state_path.parent / f"{state_path.name}.diff"
 
 
+def preflight_path_for(state_path: Path) -> Path:
+    return state_path.parent / f"{state_path.name}.preflight.json"
+
+
+def write_preflight_file(path: Path, payload: dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+    except OSError as error:
+        raise WorkflowError(
+            f"could not write the preflight result file: {error}"
+        ) from error
+
+
 def load_state(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise WorkflowError(f"state file does not exist: {path}")
@@ -861,19 +879,48 @@ def command_preflight(args: argparse.Namespace) -> None:
         }
     )
     save_state(state_path, state)
+    changed_files = sorted(anchors)
+    preflight_path = preflight_path_for(state_path)
+    payload = {
+        "result": result,
+        "state": str(state_path),
+        "repo_root": str(repo_root),
+        "pr": metadata,
+        "head_sha": metadata["head_sha"],
+        "diff_path": str(diff_path),
+        "changed_files": changed_files,
+        "pr_commits": pr_commits,
+        "pr_authored_files": pr_authored_files,
+        "diff_only_files": diff_only_files,
+        "history": state["history"],
+        "iteration": iteration,
+        "max_iterations": max_iterations,
+    }
+    write_preflight_file(preflight_path, payload)
     emit(
         {
             "result": result,
             "state": str(state_path),
+            "preflight_path": str(preflight_path),
             "repo_root": str(repo_root),
-            "pr": metadata,
+            "pr": {
+                "number": metadata["number"],
+                "title": metadata["title"],
+                "pr_url": metadata["pr_url"],
+                "repo_name": metadata["repo_name"],
+                "head_branch": metadata["head_branch"],
+                "base_branch": metadata["base_branch"],
+            },
             "head_sha": metadata["head_sha"],
             "diff_path": str(diff_path),
-            "changed_files": sorted(anchors),
-            "pr_commits": pr_commits,
-            "pr_authored_files": pr_authored_files,
-            "diff_only_files": diff_only_files,
-            "history": state["history"],
+            "diff_bytes": len(diff_text.encode("utf-8")),
+            "counts": {
+                "changed_files": len(changed_files),
+                "diff_only_files": len(diff_only_files),
+                "history": len(state["history"]),
+                "pr_authored_files": len(pr_authored_files),
+                "pr_commits": len(pr_commits),
+            },
             "iteration": iteration,
             "max_iterations": max_iterations,
         }
@@ -1236,6 +1283,7 @@ def command_cleanup(args: argparse.Namespace) -> None:
     load_state(path)
     path.unlink()
     diff_path_for(path).unlink(missing_ok=True)
+    preflight_path_for(path).unlink(missing_ok=True)
     emit({"result": "cleaned_up", "state": str(path)})
 
 

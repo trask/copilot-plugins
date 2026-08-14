@@ -361,6 +361,23 @@ class AgentInstructionsTest(unittest.TestCase):
             "Do not invent a commit, no-code, or narrative line", self.instructions
         )
 
+    def test_reads_the_preflight_result_from_the_helper_file(self):
+        self.assertIn("write its complete result to `preflight_path`", self.instructions)
+        self.assertIn(
+            "print only a compact envelope carrying `result`, `state`, "
+            "`preflight_path`",
+            self.instructions,
+        )
+        self.assertIn(
+            "Read `changed_files`, `pr_commits`, `pr_authored_files`, and `history` "
+            "from the complete result at `preflight_path`",
+            self.instructions,
+        )
+        self.assertIn(
+            "reconcile what you read against the envelope's `counts`",
+            self.instructions,
+        )
+
     def test_reads_the_pinned_diff_from_the_helper_snapshot(self):
         self.assertIn(
             "Read the pinned diff only from the returned `diff_path`",
@@ -1647,13 +1664,44 @@ class PreflightTest(unittest.TestCase):
             MODULE.command_preflight(arguments)
         return self.emitted[-1]
 
+    def full_result(self, envelope):
+        return json.loads(
+            Path(envelope["preflight_path"]).read_text(encoding="utf-8")
+        )
+
     def test_pins_the_diff_snapshot_and_starts_the_first_iteration(self):
         state_path = self.directory / "state.json"
 
-        result = self.preflight(state_path)
+        envelope = self.preflight(state_path)
+        result = self.full_result(envelope)
 
+        self.assertEqual(envelope["result"], "ready")
+        self.assertEqual(envelope["head_sha"], "head1")
+        self.assertEqual(envelope["pr"]["number"], 7)
+        self.assertEqual(envelope["pr"]["title"], "Add a thing")
+        self.assertEqual(
+            envelope["pr"]["pr_url"], "https://github.com/owner/repo/pull/7"
+        )
+        self.assertEqual(envelope["diff_bytes"], len(DIFF.encode("utf-8")))
+        self.assertEqual(
+            envelope["counts"],
+            {
+                "changed_files": 1,
+                "diff_only_files": 0,
+                "history": 0,
+                "pr_authored_files": 1,
+                "pr_commits": 1,
+            },
+        )
+        for field in ("changed_files", "pr_commits", "history"):
+            self.assertNotIn(field, envelope)
+        self.assertEqual(
+            Path(envelope["preflight_path"]),
+            MODULE.preflight_path_for(state_path),
+        )
         self.assertEqual(result["result"], "ready")
         self.assertEqual(result["head_sha"], "head1")
+        self.assertEqual(result["pr"], self.metadata)
         self.assertEqual(result["changed_files"], ["app.py"])
         self.assertEqual(
             result["pr_commits"],
@@ -1668,21 +1716,23 @@ class PreflightTest(unittest.TestCase):
             state["review"]["anchors"], {"app.py": {"LEFT": [2], "RIGHT": [2, 3]}}
         )
         self.assertEqual(state["review"]["candidates"], [])
-        diff_path = Path(result["diff_path"])
+        diff_path = Path(envelope["diff_path"])
         self.assertEqual(diff_path, MODULE.diff_path_for(state_path))
         self.assertEqual(state["review"]["diff_path"], str(diff_path))
         self.assertEqual(diff_path.read_text(encoding="utf-8"), DIFF)
 
     def test_reports_diff_files_absent_from_all_pr_commits(self):
-        result = self.preflight(
-            self.directory / "state.json",
-            provenance=[
-                {
-                    "sha": "commit1",
-                    "message": "Change docs",
-                    "files": ["docs/readme.md"],
-                }
-            ],
+        result = self.full_result(
+            self.preflight(
+                self.directory / "state.json",
+                provenance=[
+                    {
+                        "sha": "commit1",
+                        "message": "Change docs",
+                        "files": ["docs/readme.md"],
+                    }
+                ],
+            )
         )
 
         self.assertEqual(result["pr_authored_files"], ["docs/readme.md"])
@@ -1760,10 +1810,12 @@ class PreflightTest(unittest.TestCase):
             },
         )
 
-        result = self.preflight(state_path)
+        envelope = self.preflight(state_path)
+        result = self.full_result(envelope)
 
-        self.assertEqual(result["result"], "ready")
-        self.assertEqual(result["iteration"], 2)
+        self.assertEqual(envelope["result"], "ready")
+        self.assertEqual(envelope["iteration"], 2)
+        self.assertEqual(envelope["counts"]["history"], 2)
         self.assertEqual(
             [(entry["id"], entry["outcome"]) for entry in result["history"]],
             [(1, "addressed"), (2, "dropped")],
@@ -1833,11 +1885,14 @@ class StatusTest(unittest.TestCase):
         path = write_state(self.directory)
         diff_path = MODULE.diff_path_for(path)
         diff_path.write_text(DIFF, encoding="utf-8")
+        preflight_path = MODULE.preflight_path_for(path)
+        preflight_path.write_text("{}", encoding="utf-8")
 
         MODULE.command_cleanup(SimpleNamespace(state=str(path)))
 
         self.assertFalse(path.exists())
         self.assertFalse(diff_path.exists())
+        self.assertFalse(preflight_path.exists())
         self.assertEqual(self.emitted[-1]["result"], "cleaned_up")
 
     def test_cleanup_tolerates_a_missing_diff_snapshot(self):
