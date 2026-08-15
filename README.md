@@ -58,6 +58,16 @@ when the user approves, or iterates on a focused replacement and applies it only
 after explicit approval. Every accepted outcome is verified against the pinned
 pull request head and exact live text.
 
+### Optional PR Flight State Sharing
+
+Self Review Loop and PR Description Loop can mirror the small completion facts
+used by the PR Flight canvas to a private GitHub repository, allowing those
+stages to stay consistent across machines. Set
+`COPILOT_PR_FLIGHT_STATE_REPO=owner/repo`, or install a PR Flight extension that
+provides `~/.copilot/extensions/pr-flight/state-repo.json` with a `repository`
+value. An explicitly empty environment variable disables sharing, and sharing
+failures produce warnings without failing either workflow.
+
 ## Retrospectives
 
 Every agent closes a run by reflecting on how the run itself went and reporting

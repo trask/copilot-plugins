@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -460,7 +461,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.14")
+        self.assertEqual(plugin["version"], "1.0.15")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 
@@ -591,6 +592,127 @@ class TargetParsingTest(unittest.TestCase):
         )
 
 
+class SharedStateBackendTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temporary.name).resolve()
+        self.addCleanup(self.temporary.cleanup)
+
+    def process(self, returncode=0, stdout="", stderr=""):
+        return SimpleNamespace(
+            returncode=returncode, stdout=stdout, stderr=stderr
+        )
+
+    def response_for(self, document, sha="blob-sha"):
+        content = MODULE.shared_state_bytes(document)
+        return self.process(
+            stdout=json.dumps(
+                {
+                    "content": MODULE.base64.b64encode(content).decode("ascii"),
+                    "sha": sha,
+                }
+            )
+        )
+
+    def test_404_starts_with_an_empty_document(self):
+        not_found = self.process(returncode=1, stderr="gh: Not Found (HTTP 404)")
+        with mock.patch.object(MODULE, "run", return_value=not_found):
+            document, content, sha = MODULE.read_shared_state(
+                "state/repo", "owner/repo"
+            )
+
+        self.assertEqual(
+            document,
+            {
+                "version": 1,
+                "repository": "owner/repo",
+                "pull_requests": {},
+            },
+        )
+        self.assertEqual(content, b"")
+        self.assertIsNone(sha)
+
+    def test_publish_from_404_creates_description_without_a_sha(self):
+        not_found = self.process(returncode=1, stderr="gh: Not Found (HTTP 404)")
+        with (
+            mock.patch.object(
+                MODULE, "resolve_shared_state_repo", return_value="state/repo"
+            ),
+            mock.patch.object(
+                MODULE, "run", side_effect=[not_found, self.process()]
+            ) as run,
+        ):
+            MODULE.publish_shared_state(
+                {"repo_name": "owner/repo", "number": 7},
+                section="description",
+                field="validated_head_sha",
+                value="head1",
+                updated_at="2026-01-02T00:00:00Z",
+            )
+
+        payload = json.loads(run.call_args_list[1].kwargs["input_text"])
+        self.assertNotIn("sha", payload)
+        published = json.loads(
+            MODULE.base64.b64decode(payload["content"]).decode("utf-8")
+        )
+        self.assertEqual(
+            published["pull_requests"]["7"]["description"],
+            {
+                "validated_head_sha": "head1",
+                "updated_at": "2026-01-02T00:00:00Z",
+            },
+        )
+
+    def test_conflict_reloads_and_retries_without_clobbering(self):
+        first = {
+            "version": 1,
+            "repository": "owner/repo",
+            "pull_requests": {"8": {"first": True}},
+        }
+        second = {
+            "version": 1,
+            "repository": "owner/repo",
+            "pull_requests": {
+                "8": {"first": True},
+                "9": {"concurrent": True},
+            },
+        }
+        conflict = self.process(
+            returncode=1, stderr="gh: conflict (HTTP 409)"
+        )
+        with (
+            mock.patch.object(
+                MODULE, "resolve_shared_state_repo", return_value="state/repo"
+            ),
+            mock.patch.object(
+                MODULE,
+                "run",
+                side_effect=[
+                    self.response_for(first, "sha-1"),
+                    conflict,
+                    self.response_for(second, "sha-2"),
+                    self.process(),
+                ],
+            ) as run,
+        ):
+            MODULE.publish_shared_state(
+                {"repo_name": "owner/repo", "number": 7},
+                section="description",
+                field="validated_head_sha",
+                value="head1",
+                updated_at="2026-01-02T00:00:00Z",
+            )
+
+        payload = json.loads(run.call_args_list[3].kwargs["input_text"])
+        published = json.loads(
+            MODULE.base64.b64decode(payload["content"]).decode("utf-8")
+        )
+        self.assertEqual(payload["sha"], "sha-2")
+        self.assertEqual(
+            published["pull_requests"]["9"], {"concurrent": True}
+        )
+
+
 class StatePersistenceTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -600,6 +722,11 @@ class StatePersistenceTest(unittest.TestCase):
         patcher = mock.patch.object(MODULE, "emit", self.emitted.append)
         patcher.start()
         self.addCleanup(patcher.stop)
+        environment = mock.patch.dict(
+            MODULE.os.environ, {MODULE.SHARED_STATE_ENV: ""}, clear=False
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def test_atomically_round_trips_state(self):
         path = write_state(self.directory)
@@ -1183,6 +1310,11 @@ class NoChangeValidationTest(unittest.TestCase):
         patcher = mock.patch.object(MODULE, "emit", self.emitted.append)
         patcher.start()
         self.addCleanup(patcher.stop)
+        environment = mock.patch.dict(
+            MODULE.os.environ, {MODULE.SHARED_STATE_ENV: ""}, clear=False
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def validate(self, path, expected_head="head1", no_change=True):
         MODULE.command_validate(
@@ -1241,8 +1373,11 @@ class NoChangeValidationTest(unittest.TestCase):
         index_path = self.directory / "index.json"
         path = write_state(self.directory, index_path=str(index_path))
 
-        with mock.patch.object(
-            MODULE, "metadata_for", return_value=pr_metadata()
+        with (
+            mock.patch.object(
+                MODULE, "metadata_for", return_value=pr_metadata()
+            ),
+            mock.patch.object(MODULE, "publish_shared_state") as publish,
         ):
             self.validate(path)
 
@@ -1256,6 +1391,42 @@ class NoChangeValidationTest(unittest.TestCase):
         self.assertEqual(index["validated_head_sha"], "head1")
         self.assertEqual(index["validation"]["run_id"], "run-1")
         self.assertEqual(self.emitted[-1]["result"], "validated")
+        publish.assert_called_once_with(
+            index["pr"],
+            section="description",
+            field="validated_head_sha",
+            value="head1",
+            updated_at=index["updated_at"],
+        )
+
+    def test_publish_failure_does_not_fail_validation(self):
+        index_path = self.directory / "index.json"
+        path = write_state(self.directory, index_path=str(index_path))
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                MODULE, "metadata_for", return_value=pr_metadata()
+            ),
+            mock.patch.dict(
+                MODULE.os.environ,
+                {MODULE.SHARED_STATE_ENV: "state/repo"},
+                clear=False,
+            ),
+            mock.patch.object(
+                MODULE,
+                "read_shared_state",
+                side_effect=MODULE.WorkflowError("state repository unavailable"),
+            ),
+            mock.patch.object(MODULE.sys, "stderr", stderr),
+        ):
+            self.validate(path)
+
+        self.assertEqual(MODULE.load_state(path)["validated_head_sha"], "head1")
+        self.assertEqual(
+            MODULE.load_state(index_path)["validated_head_sha"], "head1"
+        )
+        self.assertEqual(self.emitted[-1]["result"], "validated")
+        self.assertIn("state repository unavailable", stderr.getvalue())
 
 
 class IndexLockTest(unittest.TestCase):
@@ -1264,6 +1435,11 @@ class IndexLockTest(unittest.TestCase):
         self.directory = Path(self.temporary.name).resolve()
         self.addCleanup(self.temporary.cleanup)
         self.index_path = self.directory / "owner--repo--7.json"
+        environment = mock.patch.dict(
+            MODULE.os.environ, {MODULE.SHARED_STATE_ENV: ""}, clear=False
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def state_for(self, run_id, updated_at, *, validation=None):
         state = {
@@ -1318,6 +1494,22 @@ class IndexLockTest(unittest.TestCase):
         self.assertEqual(index["latest_run_id"], "run-19")
         self.assertEqual(index["pr"]["title"], "Title run-19")
 
+    def test_first_unvalidated_index_publishes_null_for_cross_machine_retraction(self):
+        state = self.state_for("new", "2026-01-01T00:00:01Z")
+        with mock.patch.object(MODULE, "publish_shared_state") as publish:
+            MODULE.update_run_index(
+                self.index_path, self.directory / "new.json", state
+            )
+
+        index = MODULE.load_state(self.index_path)
+        publish.assert_called_once_with(
+            index["pr"],
+            section="description",
+            field="validated_head_sha",
+            value=None,
+            updated_at=index["updated_at"],
+        )
+
     def test_older_writer_cannot_revert_newer_validation_or_current_state(self):
         newer = self.state_for(
             "newer",
@@ -1345,6 +1537,35 @@ class IndexLockTest(unittest.TestCase):
         self.assertEqual(index["pr"]["title"], "Title newer")
         self.assertEqual(index["validation"]["run_id"], "newer")
         self.assertEqual(index["validated_head_sha"], "head1")
+
+    def test_newer_unvalidated_run_publishes_null_retraction(self):
+        validated = self.state_for(
+            "validated",
+            "2026-01-01T00:00:01Z",
+            validation="2026-01-01T00:00:01Z",
+        )
+        unvalidated = self.state_for(
+            "unvalidated", "2026-01-01T00:00:02Z"
+        )
+        with mock.patch.object(MODULE, "publish_shared_state") as publish:
+            MODULE.update_run_index(
+                self.index_path, self.directory / "validated.json", validated
+            )
+            MODULE.update_run_index(
+                self.index_path, self.directory / "unvalidated.json", unvalidated
+            )
+
+        index = MODULE.load_state(self.index_path)
+        self.assertIsNone(index["validated_head_sha"])
+        self.assertNotIn("validation", index)
+        self.assertEqual(publish.call_count, 2)
+        publish.assert_called_with(
+            index["pr"],
+            section="description",
+            field="validated_head_sha",
+            value=None,
+            updated_at=index["updated_at"],
+        )
 
     def test_reclaims_an_old_lock_only_after_owner_is_dead(self):
         stale = {

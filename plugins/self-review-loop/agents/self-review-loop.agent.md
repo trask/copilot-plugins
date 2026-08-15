@@ -39,6 +39,7 @@ Clear the **Model Gate** first, then run `preflight`. After `preflight` succeeds
 - A validation failure you cannot fix stops the entire run immediately. Record it with `skip`, leave the worktree intact for inspection, and do not publish partial work.
 - Do not use persistent user memories as workflow instructions. This file is the source of truth.
 - Keep mutable candidate, batch, commit, iteration, and history state in the Python helper's PR-scoped JSON file outside the repository.
+- When `COPILOT_PR_FLIGHT_STATE_REPO` names an `owner/repo`, or the PR Flight extension provides `~/.copilot/extensions/pr-flight/state-repo.json`, the helper mirrors only the clean-at-head result to that private repository after saving local state. This integration is optional, and a warning from it never changes or fails the local review workflow.
 - On targetless requests, `current` always means the PR attached to the currently checked-out branch. Never enumerate, rank, or select saved state files by timestamp, filename, or any other heuristic.
 - Use the bundled helper for every supported GitHub or workflow-state operation. Do not reconstruct its checkout, diff, anchor validation, push, or verification logic in shell commands.
 - Give progress updates only at meaningful boundaries. Do not stop the autonomous loop merely to report progress.

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import datetime as dt
 import json
 import os
@@ -36,6 +37,13 @@ HUNK_PATTERN = re.compile(
 )
 CANDIDATE_KEYS = {"path", "line", "side", "body"}
 NON_FAST_FORWARD_PATTERN = re.compile(r"fast[- ]forward|divergent", re.IGNORECASE)
+SHARED_STATE_REPOSITORY_PATTERN = re.compile(
+    r"^(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)$"
+)
+SHARED_STATE_ENV = "COPILOT_PR_FLIGHT_STATE_REPO"
+SHARED_STATE_CONFIG = Path(".copilot/extensions/pr-flight/state-repo.json")
+SHARED_STATE_VERSION = 1
+SHARED_STATE_MAX_ATTEMPTS = 3
 
 
 class WorkflowError(RuntimeError):
@@ -189,6 +197,205 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def warn_shared_state(message: str) -> None:
+    print(f"warning: could not publish PR Flight state: {message}", file=sys.stderr)
+
+
+def resolve_shared_state_repo() -> str | None:
+    if SHARED_STATE_ENV in os.environ:
+        value = os.environ[SHARED_STATE_ENV].strip()
+        if not value:
+            return None
+    else:
+        path = Path.home() / SHARED_STATE_CONFIG
+        if not path.is_file():
+            return None
+        try:
+            config = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            warn_shared_state(f"invalid config file {path}: {error}")
+            return None
+        value = config.get("repository") if isinstance(config, dict) else None
+        if not isinstance(value, str):
+            warn_shared_state(f"invalid repository in config file {path}")
+            return None
+        value = value.strip()
+    if not SHARED_STATE_REPOSITORY_PATTERN.fullmatch(value):
+        warn_shared_state(f"invalid repository name {value!r}; expected owner/repo")
+        return None
+    return value
+
+
+def shared_state_bytes(document: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+
+
+def shared_state_timestamp(value: str) -> dt.datetime:
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise WorkflowError(f"invalid shared state timestamp {value!r}") from error
+    if parsed.tzinfo is None:
+        raise WorkflowError(f"invalid shared state timestamp {value!r}")
+    return parsed
+
+
+def gh_failure_status(process: subprocess.CompletedProcess[str]) -> int | None:
+    detail = f"{process.stderr}\n{process.stdout}"
+    match = re.search(r"\bHTTP\s+(\d{3})\b", detail, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def read_shared_state(
+    state_repo: str, repository: str
+) -> tuple[dict[str, Any], bytes, str | None]:
+    owner, repo = repository.split("/", 1)
+    endpoint = f"repos/{state_repo}/contents/prs/{owner}/{repo}.json"
+    process = run(
+        ["gh", "api", "--method", "GET", endpoint, "-f", "ref=main"],
+        check=False,
+    )
+    if process.returncode != 0:
+        if gh_failure_status(process) == 404:
+            return (
+                {
+                    "version": SHARED_STATE_VERSION,
+                    "repository": repository,
+                    "pull_requests": {},
+                },
+                b"",
+                None,
+            )
+        detail = process.stderr.strip() or process.stdout.strip() or "no output"
+        raise WorkflowError(f"shared state read failed: {detail}")
+    try:
+        response = json.loads(process.stdout)
+        encoded = response["content"]
+        sha = response["sha"]
+        content = base64.b64decode(encoded)
+        document = json.loads(content.decode("utf-8"))
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise WorkflowError(f"shared state response is invalid: {error}") from error
+    if (
+        not isinstance(document, dict)
+        or document.get("version") != SHARED_STATE_VERSION
+        or document.get("repository") != repository
+        or not isinstance(document.get("pull_requests"), dict)
+        or not isinstance(sha, str)
+    ):
+        raise WorkflowError("shared state document has an unsupported shape")
+    return document, content, sha
+
+
+def merge_shared_state(
+    document: dict[str, Any],
+    *,
+    number: int,
+    section: str,
+    field: str,
+    value: str | None,
+    updated_at: str,
+) -> None:
+    pull_requests = document["pull_requests"]
+    key = str(number)
+    entry = pull_requests.setdefault(key, {})
+    if not isinstance(entry, dict):
+        raise WorkflowError(f"shared state pull request entry {key} is invalid")
+    existing = entry.get(section)
+    if existing is not None:
+        existing_updated_at = (
+            existing.get("updated_at") if isinstance(existing, dict) else None
+        )
+        if not isinstance(existing_updated_at, str):
+            raise WorkflowError(
+                f"shared state pull request section {key}.{section} is invalid"
+            )
+        if shared_state_timestamp(existing_updated_at) >= shared_state_timestamp(
+            updated_at
+        ):
+            return
+    entry[section] = {field: value, "updated_at": updated_at}
+
+
+def write_shared_state(
+    state_repo: str,
+    repository: str,
+    number: int,
+    content: bytes,
+    sha: str | None,
+) -> subprocess.CompletedProcess[str]:
+    owner, repo = repository.split("/", 1)
+    payload = {
+        "message": f"Update PR Flight state for {repository}#{number}",
+        "content": base64.b64encode(content).decode("ascii"),
+    }
+    if sha is not None:
+        payload["sha"] = sha
+    return run(
+        [
+            "gh",
+            "api",
+            "--method",
+            "PUT",
+            f"repos/{state_repo}/contents/prs/{owner}/{repo}.json",
+            "--input",
+            "-",
+        ],
+        input_text=json.dumps(payload, sort_keys=True),
+        check=False,
+    )
+
+
+def publish_shared_state(
+    pr: dict[str, Any],
+    *,
+    section: str,
+    field: str,
+    value: str | None,
+    updated_at: str,
+) -> None:
+    state_repo = resolve_shared_state_repo()
+    if state_repo is None:
+        return
+    repository = pr["repo_name"]
+    number = pr["number"]
+    try:
+        for attempt in range(SHARED_STATE_MAX_ATTEMPTS):
+            document, previous, sha = read_shared_state(state_repo, repository)
+            merge_shared_state(
+                document,
+                number=number,
+                section=section,
+                field=field,
+                value=value,
+                updated_at=updated_at,
+            )
+            content = shared_state_bytes(document)
+            if content == previous:
+                return
+            process = write_shared_state(
+                state_repo, repository, number, content, sha
+            )
+            if process.returncode == 0:
+                return
+            status = gh_failure_status(process)
+            if status in {409, 422} and attempt + 1 < SHARED_STATE_MAX_ATTEMPTS:
+                continue
+            detail = process.stderr.strip() or process.stdout.strip() or "no output"
+            raise WorkflowError(f"shared state write failed: {detail}")
+        raise WorkflowError("shared state write exhausted conflict retries")
+    except (OSError, WorkflowError) as error:
+        warn_shared_state(str(error))
 
 
 def resolve_repo_root(value: str | None) -> Path:
@@ -815,6 +1022,10 @@ def command_preflight(args: argparse.Namespace) -> None:
     target = resolve_target(args.target, repo_root)
     state_path = cli_path(args.state) if args.state else default_state_path(target)
     state = load_state(state_path) if state_path.is_file() else None
+    is_new_state = state is None
+    previous_clean_at_head_sha = (
+        (state.get("review") or {}).get("clean_at_head_sha") if state else None
+    )
 
     dirty = git(repo_root, "status", "--porcelain=v1")
     if dirty:
@@ -879,6 +1090,14 @@ def command_preflight(args: argparse.Namespace) -> None:
         }
     )
     save_state(state_path, state)
+    if is_new_state or previous_clean_at_head_sha is not None:
+        publish_shared_state(
+            state["pr"],
+            section="self_review",
+            field="clean_at_head_sha",
+            value=None,
+            updated_at=state["updated_at"],
+        )
     changed_files = sorted(anchors)
     preflight_path = preflight_path_for(state_path)
     payload = {
@@ -1082,8 +1301,17 @@ def command_resolve(args: argparse.Namespace) -> None:
             f"got {live_head}"
         )
     review["outcome"] = args.outcome
+    previous_clean_at_head_sha = review.get("clean_at_head_sha")
     review["clean_at_head_sha"] = review["head_sha"]
     save_state(path, state)
+    if previous_clean_at_head_sha != review["clean_at_head_sha"]:
+        publish_shared_state(
+            state["pr"],
+            section="self_review",
+            field="clean_at_head_sha",
+            value=review["clean_at_head_sha"],
+            updated_at=state["updated_at"],
+        )
     emit(
         {
             "result": "resolved",

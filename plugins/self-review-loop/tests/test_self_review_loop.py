@@ -619,6 +619,211 @@ class TargetParsingTest(unittest.TestCase):
         self.assertIsNone(MODULE.github_repo_from_remote("https://example.com/fork/repo"))
 
 
+class SharedStateBackendTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.home = Path(self.temporary.name).resolve()
+        self.addCleanup(self.temporary.cleanup)
+
+    def process(self, returncode=0, stdout="", stderr=""):
+        return SimpleNamespace(
+            returncode=returncode, stdout=stdout, stderr=stderr
+        )
+
+    def response_for(self, document, sha="blob-sha"):
+        content = MODULE.shared_state_bytes(document)
+        return self.process(
+            stdout=json.dumps(
+                {
+                    "content": MODULE.base64.b64encode(content).decode("ascii"),
+                    "sha": sha,
+                }
+            )
+        )
+
+    def test_shared_state_is_off_by_default_without_config(self):
+        with (
+            mock.patch.dict(MODULE.os.environ, {}, clear=True),
+            mock.patch.object(MODULE.Path, "home", return_value=self.home),
+            mock.patch.object(MODULE, "run") as run,
+        ):
+            MODULE.publish_shared_state(
+                {"repo_name": "owner/repo", "number": 7},
+                section="self_review",
+                field="clean_at_head_sha",
+                value="head1",
+                updated_at="2026-01-01T00:00:00Z",
+            )
+
+        run.assert_not_called()
+
+    def test_environment_override_and_empty_force_off(self):
+        config_path = self.home / MODULE.SHARED_STATE_CONFIG
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
+            json.dumps({"repository": "config/state"}), encoding="utf-8"
+        )
+        with (
+            mock.patch.object(MODULE.Path, "home", return_value=self.home),
+            mock.patch.dict(
+                MODULE.os.environ,
+                {MODULE.SHARED_STATE_ENV: " env/state "},
+                clear=True,
+            ),
+        ):
+            self.assertEqual(MODULE.resolve_shared_state_repo(), "env/state")
+        with (
+            mock.patch.object(MODULE.Path, "home", return_value=self.home),
+            mock.patch.dict(
+                MODULE.os.environ, {MODULE.SHARED_STATE_ENV: "  "}, clear=True
+            ),
+        ):
+            self.assertIsNone(MODULE.resolve_shared_state_repo())
+
+    def test_resolves_config_and_warns_for_malformed_config(self):
+        config_path = self.home / MODULE.SHARED_STATE_CONFIG
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
+            json.dumps({"repository": "config/state"}), encoding="utf-8"
+        )
+        with (
+            mock.patch.dict(MODULE.os.environ, {}, clear=True),
+            mock.patch.object(MODULE.Path, "home", return_value=self.home),
+        ):
+            self.assertEqual(MODULE.resolve_shared_state_repo(), "config/state")
+
+        config_path.write_text("{", encoding="utf-8")
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(MODULE.os.environ, {}, clear=True),
+            mock.patch.object(MODULE.Path, "home", return_value=self.home),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertIsNone(MODULE.resolve_shared_state_repo())
+        self.assertIn("invalid config file", stderr.getvalue())
+
+        config_path.write_text(
+            json.dumps({"repository": "not-a-repository"}), encoding="utf-8"
+        )
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(MODULE.os.environ, {}, clear=True),
+            mock.patch.object(MODULE.Path, "home", return_value=self.home),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertIsNone(MODULE.resolve_shared_state_repo())
+        self.assertIn("expected owner/repo", stderr.getvalue())
+
+    def test_publish_preserves_other_entries_and_owned_sections(self):
+        document = {
+            "version": 1,
+            "repository": "owner/repo",
+            "pull_requests": {
+                "7": {
+                    "description": {
+                        "validated_head_sha": "other",
+                        "updated_at": "2026-01-01T00:00:00Z",
+                    }
+                },
+                "8": {"custom": {"kept": True}},
+            },
+        }
+        with (
+            mock.patch.object(
+                MODULE, "resolve_shared_state_repo", return_value="state/repo"
+            ),
+            mock.patch.object(
+                MODULE, "run", side_effect=[self.response_for(document), self.process()]
+            ) as run,
+        ):
+            MODULE.publish_shared_state(
+                {"repo_name": "owner/repo", "number": 7},
+                section="self_review",
+                field="clean_at_head_sha",
+                value="head1",
+                updated_at="2026-01-02T00:00:00Z",
+            )
+
+        payload = json.loads(run.call_args_list[1].kwargs["input_text"])
+        published = json.loads(
+            MODULE.base64.b64decode(payload["content"]).decode("utf-8")
+        )
+        self.assertEqual(published["pull_requests"]["8"], {"custom": {"kept": True}})
+        self.assertEqual(
+            published["pull_requests"]["7"]["description"],
+            document["pull_requests"]["7"]["description"],
+        )
+        self.assertEqual(
+            published["pull_requests"]["7"]["self_review"],
+            {
+                "clean_at_head_sha": "head1",
+                "updated_at": "2026-01-02T00:00:00Z",
+            },
+        )
+
+    def test_skips_write_when_merged_document_is_unchanged(self):
+        document = {
+            "version": 1,
+            "repository": "owner/repo",
+            "pull_requests": {
+                "7": {
+                    "self_review": {
+                        "clean_at_head_sha": "head1",
+                        "updated_at": "2026-01-02T00:00:00Z",
+                    }
+                }
+            },
+        }
+        with (
+            mock.patch.object(
+                MODULE, "resolve_shared_state_repo", return_value="state/repo"
+            ),
+            mock.patch.object(
+                MODULE, "run", return_value=self.response_for(document)
+            ) as run,
+        ):
+            MODULE.publish_shared_state(
+                {"repo_name": "owner/repo", "number": 7},
+                section="self_review",
+                field="clean_at_head_sha",
+                value="head1",
+                updated_at="2026-01-02T00:00:00Z",
+            )
+
+        run.assert_called_once()
+
+    def test_does_not_replace_a_newer_shared_fact(self):
+        document = {
+            "version": 1,
+            "repository": "owner/repo",
+            "pull_requests": {
+                "7": {
+                    "self_review": {
+                        "clean_at_head_sha": None,
+                        "updated_at": "2026-01-03T00:00:00Z",
+                    }
+                }
+            },
+        }
+        with (
+            mock.patch.object(
+                MODULE, "resolve_shared_state_repo", return_value="state/repo"
+            ),
+            mock.patch.object(
+                MODULE, "run", return_value=self.response_for(document)
+            ) as run,
+        ):
+            MODULE.publish_shared_state(
+                {"repo_name": "owner/repo", "number": 7},
+                section="self_review",
+                field="clean_at_head_sha",
+                value="older-head",
+                updated_at="2026-01-02T00:00:00Z",
+            )
+
+        run.assert_called_once()
+
+
 class PullRequestMetadataTest(unittest.TestCase):
     def test_includes_githubs_ordered_pr_commit_list(self):
         target = MODULE.parse_target("https://github.com/owner/repo/pull/7")
@@ -1080,6 +1285,11 @@ class StateCommandTest(unittest.TestCase):
         patcher = mock.patch.object(MODULE, "emit", self.emitted.append)
         patcher.start()
         self.addCleanup(patcher.stop)
+        environment = mock.patch.dict(
+            MODULE.os.environ, {MODULE.SHARED_STATE_ENV: ""}, clear=False
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def register(self, path, candidates):
         source = self.directory / "candidates.json"
@@ -1277,8 +1487,11 @@ class StateCommandTest(unittest.TestCase):
     def test_resolve_marks_the_active_review_clean_at_its_pinned_head(self):
         path = write_state(self.directory)
 
-        with mock.patch.object(
-            MODULE, "metadata_for", return_value={"head_sha": "head1"}
+        with (
+            mock.patch.object(
+                MODULE, "metadata_for", return_value={"head_sha": "head1"}
+            ),
+            mock.patch.object(MODULE, "publish_shared_state") as publish,
         ):
             MODULE.command_resolve(SimpleNamespace(state=str(path), outcome="clean"))
 
@@ -1287,6 +1500,39 @@ class StateCommandTest(unittest.TestCase):
         self.assertEqual(state["review"]["clean_at_head_sha"], "head1")
         self.assertEqual(self.emitted[-1]["result"], "resolved")
         self.assertEqual(self.emitted[-1]["clean_at_head_sha"], "head1")
+        publish.assert_called_once_with(
+            state["pr"],
+            section="self_review",
+            field="clean_at_head_sha",
+            value="head1",
+            updated_at=state["updated_at"],
+        )
+
+    def test_publish_failure_is_non_fatal_after_clean_state_is_saved(self):
+        path = write_state(self.directory)
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                MODULE, "metadata_for", return_value={"head_sha": "head1"}
+            ),
+            mock.patch.dict(
+                MODULE.os.environ,
+                {MODULE.SHARED_STATE_ENV: "state/repo"},
+                clear=False,
+            ),
+            mock.patch.object(
+                MODULE,
+                "read_shared_state",
+                side_effect=MODULE.WorkflowError("network unavailable"),
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            MODULE.command_resolve(SimpleNamespace(state=str(path), outcome="clean"))
+
+        state = MODULE.load_state(path)
+        self.assertEqual(state["review"]["clean_at_head_sha"], "head1")
+        self.assertEqual(self.emitted[-1]["result"], "resolved")
+        self.assertIn("network unavailable", stderr.getvalue())
 
     def test_resolve_refuses_a_stale_live_pr_head(self):
         path = write_state(self.directory)
@@ -1597,6 +1843,11 @@ class PreflightTest(unittest.TestCase):
         patcher = mock.patch.object(MODULE, "emit", self.emitted.append)
         patcher.start()
         self.addCleanup(patcher.stop)
+        environment = mock.patch.dict(
+            MODULE.os.environ, {MODULE.SHARED_STATE_ENV: ""}, clear=False
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
         self.metadata = {
             "number": 7,
             "title": "Add a thing",
@@ -1720,6 +1971,40 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(diff_path, MODULE.diff_path_for(state_path))
         self.assertEqual(state["review"]["diff_path"], str(diff_path))
         self.assertEqual(diff_path.read_text(encoding="utf-8"), DIFF)
+
+    def test_fresh_review_publishes_null_to_retract_a_clean_review(self):
+        state_path = write_state(self.directory)
+        state = MODULE.load_state(state_path)
+        state["review"]["clean_at_head_sha"] = "head1"
+        MODULE.save_state(state_path, state)
+
+        with mock.patch.object(MODULE, "publish_shared_state") as publish:
+            self.preflight(state_path)
+
+        saved = MODULE.load_state(state_path)
+        self.assertNotIn("clean_at_head_sha", saved["review"])
+        publish.assert_called_once_with(
+            saved["pr"],
+            section="self_review",
+            field="clean_at_head_sha",
+            value=None,
+            updated_at=saved["updated_at"],
+        )
+
+    def test_first_local_review_publishes_null_for_cross_machine_retraction(self):
+        state_path = self.directory / "new-state.json"
+
+        with mock.patch.object(MODULE, "publish_shared_state") as publish:
+            self.preflight(state_path)
+
+        saved = MODULE.load_state(state_path)
+        publish.assert_called_once_with(
+            saved["pr"],
+            section="self_review",
+            field="clean_at_head_sha",
+            value=None,
+            updated_at=saved["updated_at"],
+        )
 
     def test_reports_diff_files_absent_from_all_pr_commits(self):
         result = self.full_result(
