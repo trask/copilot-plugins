@@ -58,15 +58,17 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
-            "is an explicit request to run the full Copilot Review Loop",
+            "asks you to run the full Copilot Review Loop",
             instructions,
         )
         self.assertIn(
-            "Immediately choose the bundled helper command and start its `preflight` workflow",
+            "Choose the bundled helper command at once and start its `preflight` "
+            "workflow",
             instructions,
         )
         self.assertIn(
-            "Never invoke, hand off to, or defer to the generic `github-pr-diff-review` skill",
+            "Never defer to the generic `github-pr-diff-review` skill for these "
+            "inputs, and never call it or pass the work to it",
             instructions,
         )
 
@@ -79,11 +81,11 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
-            "the PR attached to the currently checked-out branch",
+            "the PR attached to the branch that is checked out",
             instructions,
         )
         self.assertIn(
-            "Never enumerate, rank, or select saved state files",
+            "Never list, rank, or pick saved state files",
             instructions,
         )
         self.assertIn(
@@ -149,8 +151,8 @@ class AgentInstructionsTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn(
-            "compare the live remote PR head with the preflight pin immediately "
-            "before pushing",
+            "compare the live remote PR head with the preflight pin directly before it "
+            "pushes",
             instructions,
         )
         self.assertIn(
@@ -162,7 +164,8 @@ class AgentInstructionsTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn(
-            "`review_required`: the queue is empty but the current head has no clean Copilot review",
+            "`review_required`: the queue is empty, but the current head has no clean "
+            "Copilot review",
             instructions,
         )
         self.assertIn("`publish --state <path> --no-comments`", instructions)
@@ -175,14 +178,14 @@ class AgentInstructionsTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn(
-            "CI logs and generated report artifacts for the exact pinned PR head "
-            "as first-class evidence",
+            "a CI log and a generated report file for the exact pinned PR head as "
+            "first-class evidence",
             instructions,
         )
-        self.assertIn("never use results from another head", instructions)
+        self.assertIn("never use a result from another head", instructions)
         self.assertIn(
-            "Pass all paths after one `--paths` flag or repeat the flag; the helper "
-            "retains every value",
+            "Pass all paths after one `--paths` flag, or repeat the flag; the helper "
+            "keeps every value",
             instructions,
         )
 
@@ -199,11 +202,11 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
-            "Always spell the required `--batch` and `--comments` flags",
+            "Always spell out the required `--batch` and `--comments` flags",
             instructions,
         )
         self.assertIn(
-            "never pass the batch ID or comment IDs positionally",
+            "never pass the batch ID or a comment ID positionally",
             instructions,
         )
 
@@ -211,8 +214,8 @@ class AgentInstructionsTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn(
-            "`await-watch --state <path>`: deterministically wait for an "
-            "already-running watcher",
+            "`await-watch --state <path>`: wait deterministically for an already "
+            "running watcher",
             instructions,
         )
         self.assertIn("`watcher_cancellation_pending`", instructions)
@@ -221,10 +224,10 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
-            "The returned `cancel_action` is idempotent", instructions
+            "You can safely run the returned `cancel_action` again", instructions
         )
         self.assertIn(
-            "Never blindly retry preflight while the watcher is active",
+            "Never retry preflight blindly while the watcher is active",
             instructions,
         )
 
@@ -232,7 +235,8 @@ class AgentInstructionsTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn(
-            "terminal parameter `mode: sync`; omit both `timeout` and `isBackground` entirely",
+            "terminal parameter `mode: sync`; leave out both `timeout` and "
+            "`isBackground` entirely",
             instructions,
         )
         self.assertIn(
@@ -276,16 +280,16 @@ class AgentInstructionsTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn(
-            "Initialize a run-local iteration counter to 0 before the first preflight",
+            "Set a run-local iteration counter to 0 before the first preflight",
             instructions,
         )
         self.assertIn(
-            "After `published`, increment the run-local iteration counter exactly once",
+            "After `published`, add exactly one to the run-local iteration counter",
             instructions,
         )
         self.assertIn(
             "`<n>` is the run-local iteration counter, not the helper's cumulative "
-            "persisted iteration count",
+            "stored iteration count",
             instructions,
         )
         self.assertIn(
@@ -293,14 +297,15 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
-            "begins with four persisted iterations and publishes once reports `1 iteration`",
+            "begins with four stored iterations and publishes once reports `1 "
+            "iteration`",
             instructions,
         )
         self.assertIn(
             "`preflight --completed-run-iterations <n>`", instructions
         )
         self.assertIn(
-            "persisted iterations from earlier invocations never consume the current "
+            "a stored iteration from an earlier invocation never uses up the current "
             "invocation's five-iteration budget",
             instructions,
         )
@@ -313,16 +318,16 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
-            "repeat the label and comment block for each original comment",
+            "repeat the label and the comment block for each original comment",
             instructions,
         )
-        self.assertIn("without adding path attribution", instructions)
+        self.assertIn("do not add path attribution", instructions)
         self.assertIn("Analysis: <technical analysis and rationale>", instructions)
         self.assertIn("Upsides: <concrete benefits>", instructions)
         self.assertIn("Downsides: <concrete costs", instructions)
         self.assertIn("Addressed in <sha>.", instructions)
         self.assertIn("No code change.", instructions)
-        self.assertIn("minus the `Copilot comment:` section", instructions)
+        self.assertIn("without the `Copilot comment:` section", instructions)
 
     def test_documents_file_based_commit_message_authoring(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -333,8 +338,8 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
-            "Never assemble the message with `git commit -m` or with shell escape "
-            "sequences",
+            "Never build the message with `git commit -m`, and never use a shell "
+            "escape sequence",
             instructions,
         )
         self.assertIn("read the message back with `git log -1 --pretty=%B`", instructions)
@@ -343,14 +348,14 @@ class AgentInstructionsTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn("latest Copilot review", instructions)
-        self.assertIn("Suppressed comments are never replied to or resolved", instructions)
-        self.assertIn("re-derived on every iteration", instructions)
+        self.assertIn("Never reply to or resolve a suppressed comment", instructions)
+        self.assertIn("Derive them again on every iteration", instructions)
 
     def test_documents_independent_reply_publication(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn(
-            "post each thread reply idempotently as its own published comment",
+            "post each thread reply as its own published comment and never twice",
             instructions,
         )
         self.assertIn(
@@ -358,7 +363,7 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
-            "verification fails if any reply is left in an unsubmitted review",
+            "verification fails when any reply is left in a review nobody submitted",
             instructions,
         )
 
@@ -378,7 +383,7 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn(
             "Produce the retrospective on every terminal outcome, including a clean "
-            "loop, an unfixable validation stop, `max_iterations_reached`, "
+            "loop, a validation stop you could not fix, `max_iterations_reached`, "
             "`no_copilot_comments`, a helper error, and any watcher stop condition "
             "such as `head_changed` or `review_dismissed`",
             instructions,
@@ -391,29 +396,29 @@ class AgentInstructionsTest(unittest.TestCase):
         ):
             self.assertIn(category, instructions)
         self.assertIn(
-            "Report only friction actually encountered in this run", instructions
+            "Report only friction you actually hit in this run", instructions
         )
         self.assertIn(
             "The **Copilot Review Loop Agent Retrospective** is the only content "
-            "permitted after the `**Outcome:**` line",
+            "allowed after the `**Outcome:**` line",
             instructions,
         )
-        self.assertIn("The retrospective is advisory and chat-only", instructions)
+        self.assertIn("The retrospective is advice, and it belongs in chat only", instructions)
         self.assertIn(
-            "never turn it into a thread reply, commit, or any other GitHub mutation",
+            "never turn it into a thread reply, a commit, or any other change to GitHub",
             instructions,
         )
         self.assertIn(
-            "omit the label entirely when there is nothing to report", instructions
+            "leave the label out entirely when there is nothing to report", instructions
         )
         self.assertIn("Emit exactly one terminal response", instructions)
-        self.assertIn("must be the absolute final block", instructions)
-        self.assertIn("after its last list item, stop immediately", instructions)
+        self.assertIn("must be the very last block", instructions)
+        self.assertIn("stop immediately after its last list item", instructions)
         self.assertIn(
-            "never emit a preliminary final response followed by a fuller report",
+            "never emit a short final response and then a fuller report",
             instructions,
         )
-        self.assertIn("never send a post-retrospective recap", instructions)
+        self.assertIn("never send a recap after the retrospective", instructions)
 
     def test_sends_the_terminal_response_as_the_last_message(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -440,9 +445,9 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn(
             "attach any part of it to a message that also calls a tool", instructions
         )
-        self.assertIn("Once it is sent the run is over", instructions)
+        self.assertIn("Once you send it the run is over", instructions)
         self.assertIn(
-            "never send another message because a tool result, reminder, or turn "
+            "never send another message because a tool result, a reminder, or a turn "
             "boundary invites one",
             instructions,
         )
@@ -450,7 +455,7 @@ class AgentInstructionsTest(unittest.TestCase):
             "never open with a narrative recap of what the run did", instructions
         )
         self.assertIn(
-            "render the `**Outcome:**` line at most once and never begin a second "
+            "render the `**Outcome:**` line at most once, and never begin a second "
             "report",
             instructions,
         )

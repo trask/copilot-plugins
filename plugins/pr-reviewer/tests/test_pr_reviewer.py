@@ -99,20 +99,20 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn("`get_changes_overview`", instructions)
         self.assertIn("`<pr_diff_instructions>`", instructions)
-        self.assertIn("This agent explicitly supersedes that block", instructions)
+        self.assertIn("This agent overrides that block", instructions)
         self.assertIn(
             "Use the diff at `authoritative_diff_path` from the same `check` result "
             "as the complete patch",
             instructions,
         )
-        self.assertIn("do not fetch the diff again through any tool", instructions)
+        self.assertIn("Do not fetch the diff again with any tool", instructions)
         self.assertIn(
             "`check <target> --diff-file <short-lived-diff-path> "
             "--context-file <short-lived-context-path>`",
             instructions,
         )
         self.assertIn(
-            "read that envelope directly from the command output",
+            "read that envelope straight from the command output",
             instructions,
         )
         self.assertIn(
@@ -120,11 +120,11 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
-            "reconcile what you read against `context_counts`",
+            "check what you read against `context_counts`",
             instructions,
         )
         self.assertIn(
-            "Delete both written files after the review is posted",
+            "Delete both written files after you post the review",
             instructions,
         )
         self.assertIn("GPT-5.6 Sol", instructions)
@@ -133,18 +133,18 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("Never add a top-level review body", instructions)
         self.assertIn("Skip local tests by default", instructions)
         self.assertIn("Record every dropped candidate", instructions)
-        self.assertIn("If no candidates survive", instructions)
+        self.assertIn("If no candidate survives", instructions)
         self.assertIn(
-            "every suppressed Copilot comment returned by `check`", instructions
+            "every suppressed Copilot comment that `check` returns", instructions
         )
         self.assertIn("latest completed, non-dismissed Copilot review", instructions)
         self.assertIn("every entry in `suppressed_comments`", instructions)
-        self.assertIn("Deduplicate candidates", instructions)
+        self.assertIn("Merge candidates that demonstrate the same defect", instructions)
         self.assertIn(
-            "every resolved or unresolved entry in `review_threads`", instructions
+            "every entry in `review_threads`, whether resolved or not", instructions
         )
         self.assertIn(
-            "Use existing inline threads to avoid duplicate feedback", instructions
+            "Use existing inline threads to avoid repeating feedback", instructions
         )
         self.assertIn(
             "top-level `path`, `line`, `side`, `start_line`, `start_side`, "
@@ -153,15 +153,15 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn("classify it as **resolved-by-code**", instructions)
         self.assertIn(
-            "even if GitHub still reports the thread unresolved", instructions
+            "even while GitHub still reports the thread unresolved", instructions
         )
         self.assertIn(
-            "applies equally to candidates discovered directly and candidates derived "
-            "from suppressed Copilot comments",
+            "applies to a candidate you found yourself and to a candidate you "
+            "derived from a suppressed Copilot comment",
             instructions,
         )
         self.assertIn("derive an honest single-line or range anchor", instructions)
-        self.assertIn("fails rather than silently omitting them", instructions)
+        self.assertIn("fails instead of dropping them without saying so", instructions)
 
     def test_evaluates_candidates_with_commit_and_related_pr_context(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -175,30 +175,30 @@ class AgentInstructionsTest(unittest.TestCase):
             "split-out fix",
             instructions,
         )
-        self.assertIn("Inspect only plausible matches", instructions)
+        self.assertIn("Inspect only the matches that look plausible", instructions)
         self.assertIn(
-            "Do not perform an unbounded scan of all open pull requests", instructions
+            "Do not scan every open pull request without limit", instructions
         )
         self.assertIn(
-            "all plausible related open pull requests found for this candidate",
+            "every plausible related open pull request you found for this candidate",
             instructions,
         )
         self.assertIn(
-            "State explicitly when the targeted search found no plausible related "
+            "Say so explicitly when the targeted search found no plausible related "
             "open pull request",
             instructions,
         )
-        self.assertIn("the `issue_comments` returned by `check`", instructions)
+        self.assertIn("the `issue_comments` that `check` returned", instructions)
         self.assertIn(
             "do not promote it to a candidate or spend an evaluator run on it",
             instructions,
         )
         self.assertIn(
-            "Permit the evaluator to consult live GitHub state read-only", instructions
+            "Let the evaluator read live GitHub state", instructions
         )
         self.assertIn(
-            "Treat such newly discovered evidence as provisional until you verify it "
-            "read-only",
+            "Treat that new evidence as provisional until you read it yourself, "
+            "without changing anything",
             instructions,
         )
 
@@ -212,40 +212,41 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn(
             "Launch each candidate's evaluator with the task tool in "
-            "`mode: background`, keeping at most **5 evaluators in flight**",
+            "`mode: background`, and keep at most **5 evaluators in flight**",
             instructions,
         )
         self.assertIn(
-            "supersedes the general guidance against launching a background agent "
+            "overrides the general guidance against launching a background agent "
             "and then reading its result",
             instructions,
         )
         self.assertIn(
-            "Concurrency never relaxes the isolation invariant", instructions
+            "Running evaluators at the same time never relaxes the isolation rule", instructions
         )
-        self.assertIn("Evaluators are read-only.", instructions)
+        self.assertIn("Evaluators only read.", instructions)
         self.assertIn(
-            "no evaluator may mutate GitHub, edit a file, or run a git mutation",
+            "no evaluator may change GitHub, edit a file, or run a git command "
+            "that writes",
             instructions,
         )
         self.assertIn(
-            "Consume the collected verdicts in candidate order regardless of the "
-            "order they complete",
+            "Consume the collected verdicts in candidate order whatever order they "
+            "finish in",
             instructions,
         )
         self.assertIn(
-            "Re-run an evaluator alone for its own candidate when it fails, times "
-            "out, or returns an unusable verdict",
+            "Run an evaluator again, alone and for its own candidate, when it "
+            "fails, times out, or returns a verdict you cannot use",
             instructions,
         )
         self.assertIn(
-            "never let a missing verdict default to keeping or dropping the "
+            "never let a missing verdict decide by default to keep or drop the "
             "candidate",
             instructions,
         )
         self.assertIn(
-            "The run's single `post` mutation still happens in this agent, after "
-            "every verdict is collected",
+            "The run's single `post` still happens in this agent, after you "
+            "collect every verdict",
             instructions,
         )
 
@@ -255,10 +256,10 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("## Model Gate", instructions)
         self.assertIn("Run only on a Claude model", instructions)
         self.assertIn("Clear the **Model Gate**", instructions)
-        self.assertIn("positively a Claude model", instructions)
-        self.assertIn("before `check` and before fetching any pull request data", instructions)
-        self.assertIn("inability to determine the model as a failed gate", instructions)
-        self.assertIn("only when the user explicitly confirms", instructions)
+        self.assertIn("definitely a Claude model", instructions)
+        self.assertIn("before `check` and before you fetch any pull request data", instructions)
+        self.assertIn("If you cannot work out which model you run as, the gate has failed", instructions)
+        self.assertIn("only when the user explicitly tells you to proceed anyway", instructions)
         self.assertIn("are never that confirmation", instructions)
 
     def test_requires_one_recorded_head_snapshot_for_analysis_and_posting(self):
@@ -270,8 +271,8 @@ class AgentInstructionsTest(unittest.TestCase):
             "`post <target> --expected-head <recorded-head_sha> --comments <file-or->`",
             instructions,
         )
-        self.assertIn("restart the entire review from `check`", instructions)
-        self.assertIn("never translate or re-anchor old findings", instructions)
+        self.assertIn("start the entire review again from `check`", instructions)
+        self.assertIn("never move or re-anchor old findings", instructions)
 
     def test_prefers_contiguous_diff_suggestions_without_a_hard_line_limit(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -286,28 +287,28 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
-            "Suggestions of 10 lines or fewer are presumed appropriate",
+            "Assume a suggestion of 10 lines or fewer is appropriate",
             instructions,
         )
         self.assertIn(
-            "longer suggestions remain preferred when the replacement is mechanical, "
-            "localized, and unambiguous",
+            "still prefer a longer suggestion when the replacement is mechanical, "
+            "local, and unambiguous",
             instructions,
         )
         self.assertIn(
-            "Use prose only when the fix requires an author decision, affects disjoint "
-            "locations, depends on unavailable context, or cannot be represented "
-            "safely as one contiguous replacement",
+            "Use prose only when the fix needs the author to decide something, "
+            "touches places that do not adjoin, depends on context you do not "
+            "have, or cannot be written safely as one contiguous replacement",
             instructions,
         )
-        self.assertIn("use separate suggestions for independent ranges", instructions)
+        self.assertIn("write separate suggestions for ranges that do not adjoin", instructions)
         self.assertIn("`start_line` plus `start_side`", instructions)
         self.assertIn(
-            "do not accept prose as a substitute or impose a hard line cap",
+            "do not accept prose in its place and do not impose a hard line cap",
             instructions,
         )
         self.assertIn(
-            "Write each body verbatim to its own short-lived UTF-8 text file",
+            "Write each body exactly as UTF-8 to its own short-lived text file",
             instructions,
         )
         self.assertIn(
@@ -315,7 +316,7 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn("Python `json.dump`", instructions)
         self.assertIn("PowerShell `ConvertTo-Json`", instructions)
-        self.assertIn("Never hand-author JSON text", instructions)
+        self.assertIn("Never write JSON text by hand", instructions)
         self.assertIn(
             "double apostrophes for a literal here-string", instructions
         )
@@ -326,13 +327,13 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("was created but verification failed", instructions)
         self.assertIn("Never re-run `post`", instructions)
         self.assertIn("would create a duplicate review", instructions)
-        self.assertIn("inspect the created review read-only with `gh api`", instructions)
+        self.assertIn("read the created review with `gh api`, without changing it", instructions)
         self.assertIn("exactly what the helper could not verify", instructions)
         self.assertIn(
-            "subordinate to the rule that a run makes at most one mutation",
+            "sits under the rule that a run changes GitHub at most once",
             instructions,
         )
-        self.assertIn("Read-only `gh api` inspection is always allowed", instructions)
+        self.assertIn("You may always read GitHub with `gh api`", instructions)
 
     def test_closes_every_run_with_a_categorized_retrospective(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -358,9 +359,9 @@ class AgentInstructionsTest(unittest.TestCase):
         ):
             self.assertIn(category, instructions)
         self.assertIn(
-            "Report only friction actually encountered in this run", instructions
+            "Report only friction you actually hit in this run", instructions
         )
-        self.assertIn("The retrospective is advisory and chat-only", instructions)
+        self.assertIn("The retrospective is advice, and it belongs in chat only", instructions)
         self.assertIn(
             "never turn it into a review comment or any other GitHub mutation",
             instructions,
@@ -375,18 +376,18 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("Explain the tradeoffs before deciding.", instructions)
         self.assertIn("Leave it as advisory feedback.", instructions)
         self.assertIn("Omit the entire retrospective", instructions)
-        self.assertIn("must be the absolute final block", instructions)
+        self.assertIn("must be the very last block", instructions)
         self.assertIn(
             "The options are inert choices for the user's next turn", instructions
         )
         self.assertIn(
-            "the third options item is the end-of-output sentinel", instructions
+            "the third options item marks the end of the output", instructions
         )
         self.assertIn(
-            "never emit a preliminary final response followed by a fuller report",
+            "never emit a short final response and then a fuller report",
             instructions,
         )
-        self.assertIn("never send a post-retrospective recap", instructions)
+        self.assertIn("never send a recap after the retrospective", instructions)
         self.assertIn(
             "never replaces, reorders, or alters the required final response",
             instructions,
@@ -411,11 +412,11 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
-            "never begin another report after the retrospective or options",
+            "never begin another report after the retrospective or the options",
             instructions,
         )
         self.assertIn(
-            "do not emit a progress report while the workflow continues", instructions
+            "do not report progress while the workflow continues", instructions
         )
         self.assertIn(
             "**Result:** No findings. No GitHub mutation was made.", instructions
@@ -427,7 +428,7 @@ class AgentInstructionsTest(unittest.TestCase):
             "**Review:** [Open pending review](<review_url>)", instructions
         )
         self.assertIn(
-            "The **PR Reviewer Agent Retrospective** is the only content permitted "
+            "The **PR Reviewer Agent Retrospective** is the only content allowed "
             "after the `**PR:**` line",
             instructions,
         )
@@ -452,10 +453,10 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn(
             "attach any part of it to a message that also calls a tool", instructions
         )
-        self.assertIn("Once it is sent the run is over", instructions)
+        self.assertIn("Once you send it the run is over", instructions)
         self.assertIn(
-            "never send another message because a tool result, reminder, or turn "
-            "boundary invites one",
+            "never send another message because a tool result, a reminder, or a "
+            "turn boundary invites one",
             instructions,
         )
         self.assertIn(

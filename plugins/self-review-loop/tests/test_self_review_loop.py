@@ -109,43 +109,43 @@ class AgentInstructionsTest(unittest.TestCase):
             "## Activation: Bare PR References Run The Full Loop", self.instructions
         )
         self.assertIn(
-            "is an explicit request to run the full Self Review Loop", self.instructions
+            "asks you to run the full Self Review Loop", self.instructions
         )
         self.assertIn(
-            "Never invoke, hand off to, or defer to the generic "
-            "`github-pr-diff-review` skill",
+            "Never defer to the generic `github-pr-diff-review` skill for these "
+            "inputs, and never call it or pass the work to it",
             self.instructions,
         )
 
     def test_never_posts_review_comments_and_allows_required_metadata_corrections(self):
         self.assertIn(
-            "This agent never posts inline comments, a review body, or a PR comment. "
-            "Its normal GitHub mutation is pushing commits to the PR head branch; "
-            "the only exception is the narrowly required PR title or description "
-            "correction under **PR Metadata Accuracy**.",
+            "This agent never posts an inline comment, a review body, or a PR comment. "
+            "Its normal change to GitHub is pushing commits to the PR head branch. The "
+            "only exception is the narrow title or description correction that **PR "
+            "Metadata Accuracy** requires.",
             self.instructions,
         )
         self.assertNotIn("pending review", self.instructions)
         self.assertNotIn("thread", self.instructions.lower())
         self.assertIn("## PR Metadata Accuracy", self.instructions)
         self.assertIn(
-            "takes precedence over the normal push-only mutation limit",
+            "takes precedence over the normal push-only limit on changes",
             self.instructions,
         )
         self.assertIn(
-            "After each successful `publish`, before the next `preflight`, re-read "
-            "the live title and description against the newly published diff",
+            "After each successful `publish`, and before the next `preflight`, read "
+            "the live title and description again against the newly published diff",
             self.instructions,
         )
         self.assertIn(
-            "If a commit from this loop made either materially false or misleading",
+            "If a commit from this loop made either one materially false or misleading",
             self.instructions,
         )
         self.assertIn(
-            "Recheck once more before the terminal response", self.instructions
+            "Check once more before the terminal response", self.instructions
         )
         self.assertIn(
-            "If a required metadata correction cannot be completed safely, stop",
+            "If you cannot make a required metadata correction safely, stop",
             self.instructions,
         )
 
@@ -164,7 +164,7 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "The agent type is required even when setting the model override",
+            "The agent type is required even when you set the model override",
             self.instructions,
         )
         self.assertIn(
@@ -183,73 +183,73 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "Launch each candidate's evaluator with the task tool in "
-            "`mode: background`, keeping at most **5 evaluators in flight**",
+            "Launch each candidate's evaluator with the task tool in `mode: "
+            "background`, and keep at most **5 evaluators in flight**",
             self.instructions,
         )
         self.assertIn(
-            "supersedes the general guidance against launching a background agent "
-            "and then reading its result",
+            "overrides the general guidance against launching a background agent and "
+            "then reading its result",
             self.instructions,
         )
         self.assertIn(
-            "Concurrency never relaxes the isolation invariant", self.instructions
+            "Running evaluators at the same time never relaxes the isolation rule", self.instructions
         )
-        self.assertIn("Evaluators are read-only.", self.instructions)
+        self.assertIn("Evaluators only read.", self.instructions)
         self.assertIn(
             "write any artifact outside the repository under its own unique "
             "temporary location",
             self.instructions,
         )
         self.assertIn(
-            "Consume the collected verdicts in candidate ID order regardless of the "
-            "order they complete",
+            "Consume the collected verdicts in candidate ID order whatever order they "
+            "finish in",
             self.instructions,
         )
         self.assertIn(
-            "Re-run an evaluator alone for its own candidate when it fails, times "
-            "out, or returns an unusable verdict",
+            "Run an evaluator again, alone and for its own candidate, when it fails, "
+            "times out, or returns a verdict you cannot use",
             self.instructions,
         )
         self.assertIn(
-            "never let a missing verdict default to keeping or dropping the "
+            "never let a missing verdict decide by default to keep or drop the "
             "candidate",
             self.instructions,
         )
         self.assertIn(
-            "Parallelism is confined to this evaluation phase of a single iteration",
+            "Only this evaluation phase of a single iteration runs in parallel",
             self.instructions,
         )
 
     def test_allows_focused_runtime_evidence_without_duplicating_ci(self):
         self.assertIn(
-            "Skip local test suites and other checks whose purpose is merely to "
-            "duplicate CI during review",
+            "Skip a local test suite, and any other check whose only purpose is to "
+            "repeat CI during review",
             self.instructions,
         )
         self.assertIn(
-            "CI owns routine build, lint, and test validation before this loop edits "
-            "anything",
+            "CI owns the routine build, lint, and test validation before this loop "
+            "edits anything",
             self.instructions,
         )
         self.assertIn(
-            "This does not prohibit focused local execution used as evidence",
+            "This does not forbid running something locally as evidence",
             self.instructions,
         )
         self.assertIn(
-            "run the smallest throwaway probe that directly establishes the relevant "
-            "repository, shared-helper, dependency, or third-party runtime semantics",
+            "run the smallest throwaway probe that establishes the relevant "
+            "repository, shared-helper, dependency, or third-party runtime behavior",
             self.instructions,
         )
         self.assertIn(
-            "Reuse already available dependencies and caches", self.instructions
+            "Reuse the dependencies and caches you already have", self.instructions
         )
         self.assertIn(
-            "keep generated artifacts outside the repository, clean them up afterward",
+            "keep generated files outside the repository, delete them afterward",
             self.instructions,
         )
         self.assertIn(
-            "do not broaden the probe into general validation", self.instructions
+            "do not widen the probe into general validation", self.instructions
         )
 
     def test_commit_body_uses_the_review_finding_label(self):
@@ -268,8 +268,8 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "Never assemble the message with `git commit -m` or with shell escape "
-            "sequences",
+            "Never build the message with `git commit -m`, and never use a shell "
+            "escape sequence",
             self.instructions,
         )
         self.assertIn(
@@ -285,7 +285,8 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("`max_iterations_reached`", self.instructions)
         self.assertIn("`nothing_to_publish`", self.instructions)
         self.assertIn(
-            "Never re-raise a finding the carried-forward `history` already records",
+            "Never raise a finding again when the carried-forward `history` already "
+            "records it",
             self.instructions,
         )
         self.assertIn(
@@ -294,15 +295,15 @@ class AgentInstructionsTest(unittest.TestCase):
 
     def test_documents_force_push_recovery_and_helper_inputs(self):
         self.assertIn(
-            "safely realign a force-pushed PR branch only when `git cherry` proves "
-            "the local commits have no unique patches",
+            "realign a force-pushed PR branch safely and only when `git cherry` proves "
+            "the local commits hold no unique patches",
             self.instructions,
         )
         self.assertIn(
             "If it reports `head_moved`, stop on that exact error", self.instructions
         )
         self.assertIn(
-            "objects contain exactly `path`, `line`, `side`, and `body`",
+            "objects hold exactly `path`, `line`, `side`, and `body`",
             self.instructions,
         )
         self.assertIn(
@@ -316,27 +317,29 @@ class AgentInstructionsTest(unittest.TestCase):
             "--rationale-file <file-or->", self.instructions
         )
         self.assertIn(
-            "prefer a temporary UTF-8 `--rationale-file` for model-authored text",
+            "prefer a temporary UTF-8 `--rationale-file` for text a model wrote",
             self.instructions,
         )
         self.assertIn(
-            "The registered anchor identifies the defect, not the maximum edit range",
+            "The registered anchor identifies the defect, not the largest edit you may "
+            "make",
             self.instructions,
         )
         self.assertIn(
-            "including lines already changed by the PR", self.instructions
+            "including lines the PR already changed", self.instructions
         )
         self.assertIn(
-            "Do not absorb a distinct defect merely because the evaluator noticed it",
+            "Do not absorb a separate defect just because the evaluator noticed it",
             self.instructions,
         )
         self.assertIn(
-            "expand the planned paths before editing", self.instructions
+            "widen the planned paths before you edit", self.instructions
         )
 
     def test_routes_plausible_unresolved_candidates_to_the_evaluator(self):
         self.assertIn(
-            '"Prefer silence" governs the final finding threshold, not evaluator access',
+            "\"Prefer silence\" sets the bar for a final finding, not for reaching the "
+            "evaluator",
             self.instructions,
         )
         self.assertIn(
@@ -344,16 +347,16 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "factuality or actionability remains genuinely unresolved",
+            "you still cannot settle whether it is factual or worth acting on",
             self.instructions,
         )
         self.assertIn(
-            "Self-drop a lead before registration only when direct evidence already "
-            "disproves it",
+            "Drop a lead yourself, before you register it, only when direct evidence "
+            "already disproves it",
             self.instructions,
         )
         self.assertIn(
-            "do not self-drop them merely because they may prove to be no-ops",
+            "Do not drop it yourself just because it may turn out to change nothing",
             self.instructions,
         )
 
@@ -376,7 +379,7 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertNotIn("PR: <pr.pr_url>", self.instructions)
         self.assertIn(
-            "For a clean pass with zero commits and no no-code outcomes",
+            "For a clean pass with no commits and no no-code outcomes",
             self.instructions,
         )
         self.assertIn(
@@ -385,7 +388,7 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "after `**Outcome:**` so the primary result remains first and immediately "
+            "after `**Outcome:**` so the main result stays first, and immediately "
             "before `**PR:**`",
             self.instructions,
         )
@@ -401,12 +404,12 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "An earlier iteration's drop still belongs in the block after `preflight` "
-            "folds it into `history`",
+            "A drop from an earlier iteration still belongs in the block after "
+            "`preflight` folds it into `history`",
             self.instructions,
         )
         self.assertIn(
-            "Exclude only entries `history` carried in from a previous run",
+            "Leave out only an entry `history` carried in from a previous run",
             self.instructions,
         )
         self.assertNotIn(
@@ -416,7 +419,7 @@ class AgentInstructionsTest(unittest.TestCase):
             "Report dropped candidates only as a count", self.instructions
         )
         self.assertIn(
-            "Do not invent a commit, no-code, or narrative line", self.instructions
+            "Do not invent a commit, a no-code line, or a narrative line", self.instructions
         )
 
     def test_reads_the_preflight_result_from_the_helper_file(self):
@@ -432,7 +435,7 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "reconcile what you read against the envelope's `counts`",
+            "check what you read against the envelope's `counts`",
             self.instructions,
         )
 
@@ -451,17 +454,17 @@ class AgentInstructionsTest(unittest.TestCase):
             "Read the pinned diff only from the returned `diff_path`",
             self.instructions,
         )
-        self.assertIn("never re-run `gh pr diff`", self.instructions)
+        self.assertIn("Never run `gh pr diff` again", self.instructions)
         self.assertIn(
-            "Review the entire pinned diff read from `diff_path`", self.instructions
+            "Review the whole pinned diff read from `diff_path`", self.instructions
         )
         self.assertIn(
-            "whenever the head contains any change not published by this run, read "
-            "the whole pinned diff",
+            "Read the whole pinned diff on the first iteration, and whenever the head "
+            "holds any change this run did not publish",
             self.instructions,
         )
         self.assertIn(
-            "the new preflight head equals the head returned by the preceding `publish`",
+            "the new preflight head equals the head the preceding `publish` returned",
             self.instructions,
         )
         self.assertIn(
@@ -469,31 +472,30 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "carry forward the prior full review and re-review only those newly "
+            "carry the earlier full review forward and review only those newly "
             "published commits in their current pinned-diff context",
             self.instructions,
         )
         self.assertIn(
-            "unchanged hunks do not need to be read again", self.instructions
+            "you do not need to read unchanged hunks again", self.instructions
         )
         self.assertIn(
-            "the prior review plus the exact proven delta covers every line of the "
+            "the earlier review plus the exact proven delta covers every line of the "
             "current pin",
             self.instructions,
         )
         self.assertIn(
-            "Before retaining a candidate that asserts a semantic or convention "
-            "violation",
+            "Before you keep a candidate that claims a semantic or convention violation",
             self.instructions,
         )
         self.assertIn(
-            "read the implementation or authoritative documentation of any shared "
+            "read the implementation or the authoritative documentation of any shared "
             "helper that defines that contract",
             self.instructions,
         )
         self.assertIn(
-            "do not send an assumption to the evaluator when one direct helper read "
-            "can disprove it",
+            "Do not send an assumption to the evaluator when one direct read of that "
+            "helper can disprove it",
             self.instructions,
         )
         self.assertIn(
@@ -506,44 +508,46 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "Use `pr_commits`, `pr_authored_files`, and `diff_only_files` to classify "
+            "Use `pr_commits`, `pr_authored_files`, and `diff_only_files` to work out "
             "scope when the PR base has drifted",
             self.instructions,
         )
         self.assertIn(
-            "treat them as base-drift context rather than PR-authored work",
+            "treat it as context from base drift rather than as work the PR authored",
             self.instructions,
         )
         self.assertIn(
-            "provenance narrows attribution, not the authoritative changeset",
+            "knowing where a change came from narrows who owns it, not what the "
+            "authoritative changeset is",
             self.instructions,
         )
         self.assertIn(
-            "Do not manually compare against `origin/main`, derive another merge-base "
-            "range, or replace the helper's provenance with `git log` or `git show`",
+            "Do not compare against `origin/main` by hand, do not work out another "
+            "merge-base range, and do not replace the helper's provenance with `git "
+            "log` or `git show`",
             self.instructions,
         )
 
     def test_isolates_validation_failures_owned_by_another_pending_batch(self):
         self.assertIn(
-            "When evidence shows the failure is caused solely by a different "
-            "still-pending candidate assigned to another batch",
+            "When the evidence shows that a different candidate, still pending in "
+            "another batch, is the only cause",
             self.instructions,
         )
         self.assertIn(
             "focused validation that isolates the current batch", self.instructions
         )
         self.assertIn(
-            "if that batch's own relevant checks pass, record it normally",
+            "if that batch's own relevant checks pass, record it as normal",
             self.instructions,
         )
         self.assertIn(
-            "preserve the other failure, and handle that candidate in its own batch",
+            "keep the other failure, and handle that candidate in its own batch",
             self.instructions,
         )
         self.assertIn(
-            "Never use this exception for an unexplained failure, a shared root cause, "
-            "or a failure introduced by the current batch",
+            "Never use this exception for a failure you cannot explain, for a shared "
+            "root cause, or for a failure the current batch introduced",
             self.instructions,
         )
 
@@ -561,7 +565,7 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn(
             "Produce the retrospective on every terminal outcome, including a clean "
-            "pass, an unfixable validation stop, `max_iterations_reached`, "
+            "pass, a validation stop you could not fix, `max_iterations_reached`, "
             "`nothing_to_publish`, a helper error, and a failed **Model Gate**",
             self.instructions,
         )
@@ -573,28 +577,28 @@ class AgentInstructionsTest(unittest.TestCase):
         ):
             self.assertIn(category, self.instructions)
         self.assertIn(
-            "Report only friction actually encountered in this run", self.instructions
+            "Report only friction you actually hit in this run", self.instructions
         )
         self.assertIn(
-            "The **Self Review Loop Agent Retrospective** is the only content "
-            "permitted after the `**PR:**` line",
+            "The **Self Review Loop Agent Retrospective** is the only content allowed "
+            "after the `**PR:**` line",
             self.instructions,
         )
-        self.assertIn("The retrospective is advisory and chat-only", self.instructions)
+        self.assertIn("The retrospective is advice, and it belongs in chat only", self.instructions)
         self.assertIn(
             "never commit it or push it as part of this loop", self.instructions
         )
         self.assertIn(
-            "omit the label entirely when there is nothing to report", self.instructions
+            "leave the label out entirely when there is nothing to report", self.instructions
         )
         self.assertIn("Emit exactly one terminal response", self.instructions)
-        self.assertIn("must be the absolute final block", self.instructions)
-        self.assertIn("after its last list item, stop immediately", self.instructions)
+        self.assertIn("must be the very last block", self.instructions)
+        self.assertIn("stop immediately after its last list item", self.instructions)
         self.assertIn(
-            "never emit a preliminary final response followed by a fuller report",
+            "never emit a short final response and then a fuller report",
             self.instructions,
         )
-        self.assertIn("never send a post-retrospective recap", self.instructions)
+        self.assertIn("never send a recap after the retrospective", self.instructions)
 
     def test_sends_the_terminal_response_as_the_last_message(self):
         self.assertIn(
@@ -612,7 +616,7 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn(
             "including the final `resolve` or `publish`, the PR metadata recheck, and "
-            "any temporary-file removal, before composing this response",
+            "the deletion of any temporary file, before you compose this response",
             self.instructions,
         )
         self.assertIn(
@@ -623,9 +627,9 @@ class AgentInstructionsTest(unittest.TestCase):
             "attach any part of it to a message that also calls a tool",
             self.instructions,
         )
-        self.assertIn("Once it is sent the run is over", self.instructions)
+        self.assertIn("Once you send it the run is over", self.instructions)
         self.assertIn(
-            "never send another message because a tool result, reminder, or turn "
+            "never send another message because a tool result, a reminder, or a turn "
             "boundary invites one",
             self.instructions,
         )

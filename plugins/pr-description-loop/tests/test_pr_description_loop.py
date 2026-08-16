@@ -66,7 +66,7 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_is_manually_selected_and_user_invocable(self):
         self.assertIn("user-invocable: true", self.instructions)
         self.assertIn("disable-model-invocation: true", self.instructions)
-        self.assertIn("This agent is manually selected and user-invocable", self.instructions)
+        self.assertIn("The user selects this agent by hand", self.instructions)
 
     def test_renames_once_after_preflight(self):
         self.assertIn("tools: [read, search, execute, todo, rename_session]", self.instructions)
@@ -76,8 +76,8 @@ class AgentInstructionsTest(unittest.TestCase):
 
     def test_always_shows_current_text_before_evaluating_or_proposing(self):
         self.assertIn(
-            "show the current title and current description before your "
-            "evaluation or any proposal",
+            "show the current title and current description before your evaluation and "
+            "before any proposal",
             self.instructions,
         )
         self.assertIn(
@@ -89,22 +89,22 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_renders_title_and_description_without_code_blocks(self):
         self.assertIn("## Displaying Title And Description", self.instructions)
         self.assertIn(
-            "Never wrap a displayed title or description in a fenced code block "
-            "or inline code span",
+            "Never wrap a displayed title or description in a fenced code block or an "
+            "inline code span",
             self.instructions,
         )
         self.assertIn(
-            "Never use a fenced code block, inline code span, or any other "
-            "verbatim wrapper around the title or the description",
+            "Never put a fenced code block, an inline code span, or any other verbatim "
+            "wrapper around the title or the description",
             self.instructions,
         )
         self.assertIn(
-            "Render the description as ordinary markdown so the interface wraps it",
+            "Render the description as ordinary Markdown so the interface wraps it",
             self.instructions,
         )
         self.assertIn(
-            "Never summarize, normalize, reflow, hard wrap, re-indent, or "
-            "silently repair either value",
+            "Never summarize, normalize, reflow, hard wrap, re-indent, or quietly "
+            "repair either value",
             self.instructions,
         )
         self.assertIn(
@@ -113,7 +113,8 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "Prefix every line of the value with `> `, including blank lines",
+            "Prefix every line of the value with `> `, including a blank line inside a "
+            "description",
             self.instructions,
         )
         self.assertIn(
@@ -122,7 +123,7 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "Do not add horizontal rules around it; the blockquote is the boundary",
+            "Do not add horizontal rules around it. The blockquote is the boundary",
             self.instructions,
         )
         for label in (
@@ -147,39 +148,39 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "inspect the decoded string for actual `\\r` and `\\n` characters",
+            "look at the decoded string for real `\\r` and `\\n` characters",
             self.instructions,
         )
         self.assertIn(
-            "inspect only the pinned run state's body with a local JSON parser",
+            "read only the pinned run state's body with a local JSON parser",
             self.instructions,
         )
         self.assertIn(
-            "do not issue a separate `gh pr view`, normalize the string, or infer "
-            "missing boundaries from prose",
+            "Do not issue a separate `gh pr view`, do not normalize the string, and do "
+            "not infer a boundary that is missing",
             self.instructions,
         )
         self.assertIn(
-            "Inspect the decoded `body` for its real newline characters before "
-            "evaluating its structure",
+            "Look at the decoded `body` for its real newline characters before you "
+            "judge its structure",
             self.instructions,
         )
         self.assertIn(
-            "never trust the visual formatting of serialized JSON",
+            "never trust how serialized JSON looks",
             self.instructions,
         )
 
     def test_summarizes_how_a_proposal_differs_from_the_current_text(self):
         self.assertIn("## Summarizing What Changed", self.instructions)
         self.assertIn(
-            "Every time you display a proposal, follow it with a "
-            "`**What changed**` summary of how that proposal differs from the "
-            "current title and description, before asking for approval",
+            "Every time you display a proposal, follow it with a `**What changed**` "
+            "summary that says how that proposal differs from the current title and "
+            "description, before you ask for approval",
             self.instructions,
         )
         self.assertIn(
-            "Describe the differences only. Never restate the full proposed "
-            "title or body",
+            "Describe only the differences. Never restate the full proposed title or "
+            "body",
             self.instructions,
         )
         self.assertIn(
@@ -194,7 +195,7 @@ class AgentInstructionsTest(unittest.TestCase):
 
     def test_immediately_evaluates_and_recommends_a_decision(self):
         self.assertIn(
-            "Immediately evaluate the current text against the diff for clarity, "
+            "Evaluate the current text against the diff at once, for clarity, "
             "concision, consistency, and scope",
             self.instructions,
         )
@@ -208,8 +209,7 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "If it is weak, explain why briefly and immediately show a complete "
-            "replacement",
+            "If the text is weak, explain briefly why and show a complete replacement",
             self.instructions,
         )
         self.assertIn(
@@ -219,38 +219,37 @@ class AgentInstructionsTest(unittest.TestCase):
 
     def test_requires_explicit_session_approval(self):
         self.assertIn(
-            "Never mutate GitHub unless the user explicitly approves the exact title "
-            "and exact body in this session",
+            "Never change GitHub unless the user explicitly approves the exact title "
+            "and the exact body in this session",
             self.instructions,
         )
         self.assertIn(
-            "Silence, lack of objection, earlier instructions, prior approval of "
-            "different text, persistent memory, and inferred intent are not approval",
+            "Silence, absence of objection, earlier instructions, approval of "
+            "different text, a stored memory, and intent you infer are not approval",
             self.instructions,
         )
         self.assertIn(
-            "Call `propose` and `apply` only after explicit approval",
+            "Call `propose` and `apply` only after the user explicitly approves that "
+            "exact proposal",
             self.instructions,
         )
 
     def test_keeps_strong_text_approval_single_path_and_resolves_optional_concerns(self):
         self.assertIn(
-            "ask only for explicit approval of the exact displayed title and body",
+            "ask only for explicit approval of the exact title and body you displayed",
             self.instructions,
         )
         self.assertIn(
-            "Do not pair that approval request with an offer to make an optional "
-            "alternative change",
+            "Do not pair that request with an offer to make an optional extra change",
             self.instructions,
         )
         self.assertIn(
-            "If a possible tweak is not important enough to change the "
-            "recommendation, omit it",
+            "If a possible tweak does not change your recommendation, leave it out",
             self.instructions,
         )
         self.assertIn(
-            "A reply that explicitly resolves the sole optional concern you raised "
-            "in favor of the displayed current wording also counts",
+            "A reply also counts when it explicitly settles the one optional concern "
+            "you raised in favor of the displayed wording",
             self.instructions,
         )
         self.assertIn(
@@ -259,8 +258,8 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "addresses only one of several open concerns, introduces new feedback, "
-            "or is otherwise ambiguous",
+            "answers only one of several open concerns, raises new feedback, or is "
+            "unclear in any other way",
             self.instructions,
         )
 
@@ -270,7 +269,7 @@ class AgentInstructionsTest(unittest.TestCase):
             "--expected-run-id <run_id> --no-change`",
             self.instructions,
         )
-        self.assertIn("do not run `propose` or `apply`", self.instructions)
+        self.assertIn("Do not run `propose` or `apply`", self.instructions)
 
     def test_documents_description_style_and_diff_source(self):
         self.assertIn(
@@ -281,7 +280,8 @@ class AgentInstructionsTest(unittest.TestCase):
             self.assertIn(forbidden_header, self.instructions)
         self.assertIn("Do not include validation lists", self.instructions)
         self.assertIn(
-            "Default to short, single-idea paragraphs", self.instructions
+            "Default to short paragraphs of roughly one to three sentences, each "
+            "covering one idea", self.instructions
         )
         self.assertIn(
             "Split a paragraph as soon as it starts covering more than one idea",
@@ -291,19 +291,18 @@ class AgentInstructionsTest(unittest.TestCase):
 
     def test_prioritizes_user_facing_examples_and_skimmable_structure(self):
         self.assertIn(
-            "Open with a short, unheaded paragraph that states the user-visible "
-            "outcome",
+            "Open with a short paragraph that has no heading and states the "
+            "user-visible outcome",
             self.instructions,
         )
         self.assertIn(
-            "When the pull request changes configuration, put concise "
-            "before-and-after configuration examples immediately after the opening "
-            "paragraph",
+            "When the pull request changes configuration, put short before-and-after "
+            "configuration examples right after the opening paragraph",
             self.instructions,
         )
         self.assertIn(
-            "Use actual keys and representative values for each materially distinct "
-            "configuration surface",
+            "Use the real keys and representative values for each configuration "
+            "surface that differs in a way that matters",
             self.instructions,
         )
         self.assertIn(
@@ -312,20 +311,20 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "use before-and-after examples when callers must migrate from existing "
-            "API usage",
+            "use before-and-after examples when callers have to change how they call it",
             self.instructions,
         )
         self.assertIn(
-            "give distinct substantial ideas descriptive, topic-specific headings",
+            "give each substantial idea its own descriptive heading so readers can "
+            "scan the explanation",
             self.instructions,
         )
         self.assertIn(
-            "Do not add headings to a short or single-idea body",
+            "Do not add a heading to a short or single-idea body",
             self.instructions,
         )
         self.assertIn(
-            "Do not turn the body into an exhaustive change log",
+            "Do not turn the body into a full change log",
             self.instructions,
         )
 
@@ -337,10 +336,10 @@ class AgentInstructionsTest(unittest.TestCase):
             "UTF-8 to a body file outside the repository", self.instructions
         )
         self.assertIn(
-            "the helper normalizes CRLF and CR to LF", self.instructions
+            "the helper turns CRLF and CR into LF", self.instructions
         )
         self.assertIn(
-            "Never inspect the helper's source to choose a line ending",
+            "Never read the helper's source to choose a line ending",
             self.instructions,
         )
         self.assertIn(
@@ -349,11 +348,13 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "Compare the new diff bytes exactly with the retained bytes",
+            "Compare the new diff bytes exactly against the bytes you kept from the "
+            "approved run",
             self.instructions,
         )
         self.assertIn(
-            "Reuse the prior approval without redisplaying the text or asking again",
+            "Reuse the earlier approval, without displaying the text again and without "
+            "asking again",
             self.instructions,
         )
         self.assertIn(
@@ -362,7 +363,7 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "Never carry approval across an actual content change", self.instructions
+            "Never carry an approval across a real change to the content", self.instructions
         )
 
     def test_documents_run_capabilities_and_residual_update_race(self):
@@ -373,7 +374,7 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn(
             "does not support conditional unsafe requests", self.instructions
         )
-        self.assertIn("Never describe this as an atomic compare-and-swap", self.instructions)
+        self.assertIn("Never call this an atomic compare-and-swap", self.instructions)
         self.assertIn("twice immediately before a direct REST `PATCH`", self.instructions)
 
     def test_closes_every_run_with_a_categorized_retrospective(self):
@@ -384,10 +385,10 @@ class AgentInstructionsTest(unittest.TestCase):
             "**PR Description Loop Agent Retrospective**", self.instructions
         )
         self.assertIn("Emit exactly one terminal response", self.instructions)
-        self.assertIn("must be the absolute final block", self.instructions)
-        self.assertIn("after its last list item, stop immediately", self.instructions)
+        self.assertIn("must be the very last block", self.instructions)
+        self.assertIn("stop immediately after its last list item", self.instructions)
         self.assertIn(
-            "never emit a preliminary final response followed by a fuller report",
+            "never emit a short final response and then a fuller report",
             self.instructions,
         )
         self.assertIn(
@@ -410,20 +411,20 @@ class AgentInstructionsTest(unittest.TestCase):
         ):
             self.assertIn(category, self.instructions)
         self.assertIn(
-            "Report only friction actually encountered in this run", self.instructions
+            "Report only friction you actually hit in this run", self.instructions
         )
-        self.assertIn("The retrospective is advisory and chat-only", self.instructions)
+        self.assertIn("The retrospective is advice, and it belongs in chat only", self.instructions)
         self.assertIn(
             "never fold it into a pull request title or description", self.instructions
         )
         self.assertIn(
-            "omit the label entirely when there is nothing to report", self.instructions
+            "leave the label out entirely when there is nothing to report", self.instructions
         )
         self.assertIn(
             "never replaces, reorders, or alters the required final response",
             self.instructions,
         )
-        self.assertIn("never send a post-retrospective recap", self.instructions)
+        self.assertIn("never send a recap after the retrospective", self.instructions)
 
     def test_sends_the_terminal_response_as_the_last_message(self):
         self.assertIn(
@@ -448,9 +449,9 @@ class AgentInstructionsTest(unittest.TestCase):
             "attach any part of it to a message that also calls a tool",
             self.instructions,
         )
-        self.assertIn("Once it is sent the run is over", self.instructions)
+        self.assertIn("Once you send it the run is over", self.instructions)
         self.assertIn(
-            "never send another message because a tool result, reminder, or turn "
+            "never send another message because a tool result, a reminder, or a turn "
             "boundary invites one",
             self.instructions,
         )
@@ -468,7 +469,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.16")
+        self.assertEqual(plugin["version"], "1.0.17")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 
