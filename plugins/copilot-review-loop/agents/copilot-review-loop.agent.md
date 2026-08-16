@@ -132,10 +132,10 @@ For each batch:
 1. Run `refresh` for its comments. GitHub supplies fresh thread positions, and a suppressed entry keeps its preflight snapshot.
 2. Apply the smallest complete edit that addresses the whole batch, or choose a no-code outcome and give a precise technical reason.
 3. Run the cheapest existing validation that can disprove the batch. Reuse an earlier successful result only when no relevant source, test, dependency, or configuration changed.
-4. If validation fails, investigate, find the cause, fix it, and run validation again. If you cannot fix it safely, run `skip` with the failure rationale, leave every local change in place, stop the whole loop, and report the stop condition.
+4. If validation fails, investigate, find the cause, fix it, and run validation again. If you cannot fix it safely, run `skip --state <path> --batch <id> --comments <ids...> --rationale <text>` with the failure rationale, leave every local change in place, stop the whole loop, and report the stop condition.
 5. Confirm that the dirty paths belong only to the current batch. Stop rather than include an unrelated change.
 6. For a code change, stage only the paths this batch owns and create one commit using **Commit And Reply Content**. Do not squash batches.
-7. Write the model-authored GitHub reply content to a temporary UTF-8 file outside the repository. Run `record --reply-file <path>` with the batch IDs, a short `--summary`, and either the commit SHA or the no-code `--rationale`. Delete the temporary file afterward.
+7. Write the model-authored GitHub reply content to a temporary UTF-8 file outside the repository. Run `record --state <path> --batch <id> --comments <ids...> --summary <summary> --reply-file <path>`, with either `--commit <sha>` or the no-code `--rationale <text>`. Always spell out the required `--batch` and `--comments` flags, and never pass the batch ID or a comment ID positionally. Delete the temporary file afterward.
 8. Continue straight to the next batch.
 
 Follow the repository's own validation rules. Apply the project's formatter directly rather than running a check-only task first.

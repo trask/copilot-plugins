@@ -210,6 +210,20 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
 
+    def test_documents_records_required_batch_and_comment_flags(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "`record --state <path> --batch <id> --comments <ids...> "
+            "--summary <summary> --reply-file <path>`",
+            instructions,
+        )
+        self.assertIn("either `--commit <sha>` or the no-code `--rationale <text>`", instructions)
+        self.assertIn(
+            "`skip --state <path> --batch <id> --comments <ids...> --rationale <text>`",
+            instructions,
+        )
+
     def test_documents_deterministic_active_watcher_handling(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
