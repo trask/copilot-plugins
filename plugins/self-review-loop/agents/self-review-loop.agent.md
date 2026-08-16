@@ -108,11 +108,23 @@ For each iteration, before editing anything:
 3. Discard anything the carried-forward `history` already resolved.
 4. If no candidates remain, run `resolve --state <path> --outcome clean`, then stop without registering candidates, editing, or publishing, and send the final index.
 5. Otherwise register the full surviving list with `candidates`, which also proves every anchor is a genuinely changed line. Include concrete plausible candidates whose factuality or actionability remains unresolved after reasonable investigation; do not self-drop them merely because they may prove to be no-ops.
-6. Launch a fresh independent subagent for **each candidate separately** using agent type **general-purpose**, model **GPT-5.6 Sol**, and reasoning effort **max**. The agent type is required even when setting the model override; do not substitute an explore, task, review, or other specialized agent. Never combine candidates in one evaluation. Give that evaluator the PR's stated scope, the relevant diff and context, and exactly one candidate. Require two independent decisions with evidence:
+6. Launch a fresh independent subagent for **each candidate separately** using agent type **general-purpose**, model **GPT-5.6 Sol**, and reasoning effort **max**. The agent type is required even when setting the model override; do not substitute an explore, task, review, or other specialized agent. Never combine candidates in one evaluation. Run those evaluations concurrently under **Parallel Evaluation**. Give that evaluator the PR's stated scope, the relevant diff and context, and exactly one candidate. Require two independent decisions with evidence:
    - Is the candidate factually correct and demonstrated by this PR?
    - Is it actionable and worth fixing within the PR's stated scope?
 7. Run `drop` for any candidate whose either decision fails or is uncertain, recording the evaluator's concrete reason. Write that model-authored rationale to a temporary UTF-8 file outside the repository, pass it with `--rationale-file`, and remove it afterward; never force parentheses, quotes, or multiline text through a shell argument. Retain each dropped candidate's original problem statement, location, and concrete evaluator reason for the final response, including across the run's later iterations. If every candidate is dropped, run `resolve --state <path> --outcome clean`, then stop without editing or publishing and send the final index.
 8. An evaluator may improve the proposed fix without requiring a new candidate when the registered defect remains factually correct and the improved implementation addresses that same demonstrated root cause. The registered anchor identifies the defect, not the maximum edit range. The improved fix may update additional lines or files, including lines already changed by the PR, only when each edit is directly necessary for that root cause and remains within the PR's scope. Do not absorb a distinct defect merely because the evaluator noticed it; drop or defer that separate issue instead.
+
+## Parallel Evaluation
+
+Candidate evaluations are independent of one another, so run them concurrently rather than one at a time.
+
+- Launch each candidate's evaluator with the task tool in `mode: background`, keeping at most **5 evaluators in flight**. As each one finishes, launch the next until every registered candidate has been evaluated.
+- Waiting on those evaluators is the run's only remaining work, so this supersedes the general guidance against launching a background agent and then reading its result. Collect every verdict with `read_agent`.
+- Concurrency never relaxes the isolation invariant: one candidate per evaluator, a fresh agent for each, and no shared context between them. Never widen a running evaluator to cover a second candidate.
+- Evaluators are read-only. They must not edit a file, run a git mutation, stage, commit, push, or mutate GitHub. A focused probe must read only, write any artifact outside the repository under its own unique temporary location, and clean that location up, so concurrent evaluators cannot collide in this shared worktree.
+- Only this agent invokes the helper. Consume the collected verdicts in candidate ID order regardless of the order they complete, so `drop` rationales, batching, commits, and the dropped-candidate block stay deterministic.
+- Re-run an evaluator alone for its own candidate when it fails, times out, or returns an unusable verdict. Never reuse another candidate's verdict, never infer one from silence, and never let a missing verdict default to keeping or dropping the candidate.
+- Parallelism is confined to this evaluation phase of a single iteration. Preflight, batching, editing, validation, committing, and publishing remain strictly sequential and never overlap an in-flight evaluator.
 
 ## Batching And Batch Execution
 

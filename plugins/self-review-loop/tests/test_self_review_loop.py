@@ -176,6 +176,51 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
+    def test_runs_candidate_evaluations_in_parallel(self):
+        self.assertIn("## Parallel Evaluation", self.instructions)
+        self.assertIn(
+            "Run those evaluations concurrently under **Parallel Evaluation**",
+            self.instructions,
+        )
+        self.assertIn(
+            "Launch each candidate's evaluator with the task tool in "
+            "`mode: background`, keeping at most **5 evaluators in flight**",
+            self.instructions,
+        )
+        self.assertIn(
+            "supersedes the general guidance against launching a background agent "
+            "and then reading its result",
+            self.instructions,
+        )
+        self.assertIn(
+            "Concurrency never relaxes the isolation invariant", self.instructions
+        )
+        self.assertIn("Evaluators are read-only.", self.instructions)
+        self.assertIn(
+            "write any artifact outside the repository under its own unique "
+            "temporary location",
+            self.instructions,
+        )
+        self.assertIn(
+            "Consume the collected verdicts in candidate ID order regardless of the "
+            "order they complete",
+            self.instructions,
+        )
+        self.assertIn(
+            "Re-run an evaluator alone for its own candidate when it fails, times "
+            "out, or returns an unusable verdict",
+            self.instructions,
+        )
+        self.assertIn(
+            "never let a missing verdict default to keeping or dropping the "
+            "candidate",
+            self.instructions,
+        )
+        self.assertIn(
+            "Parallelism is confined to this evaluation phase of a single iteration",
+            self.instructions,
+        )
+
     def test_allows_focused_runtime_evidence_without_duplicating_ci(self):
         self.assertIn(
             "Skip local test suites and other checks whose purpose is merely to "

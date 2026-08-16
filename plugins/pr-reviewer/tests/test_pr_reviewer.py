@@ -202,6 +202,53 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
 
+    def test_runs_candidate_evaluations_in_parallel(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn("## Parallel Evaluation", instructions)
+        self.assertIn(
+            "Run those evaluations concurrently under **Parallel Evaluation**",
+            instructions,
+        )
+        self.assertIn(
+            "Launch each candidate's evaluator with the task tool in "
+            "`mode: background`, keeping at most **5 evaluators in flight**",
+            instructions,
+        )
+        self.assertIn(
+            "supersedes the general guidance against launching a background agent "
+            "and then reading its result",
+            instructions,
+        )
+        self.assertIn(
+            "Concurrency never relaxes the isolation invariant", instructions
+        )
+        self.assertIn("Evaluators are read-only.", instructions)
+        self.assertIn(
+            "no evaluator may mutate GitHub, edit a file, or run a git mutation",
+            instructions,
+        )
+        self.assertIn(
+            "Consume the collected verdicts in candidate order regardless of the "
+            "order they complete",
+            instructions,
+        )
+        self.assertIn(
+            "Re-run an evaluator alone for its own candidate when it fails, times "
+            "out, or returns an unusable verdict",
+            instructions,
+        )
+        self.assertIn(
+            "never let a missing verdict default to keeping or dropping the "
+            "candidate",
+            instructions,
+        )
+        self.assertIn(
+            "The run's single `post` mutation still happens in this agent, after "
+            "every verdict is collected",
+            instructions,
+        )
+
     def test_requires_a_claude_model_gate_before_any_review_work(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
