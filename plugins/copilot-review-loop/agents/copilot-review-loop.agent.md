@@ -65,7 +65,7 @@ If an operation partially fails, preserve its state and retry that same operatio
 
 ## Session Naming
 
-Call `rename_session` exactly once per run. Run `preflight` first so the canonical PR metadata is available. After `preflight` succeeds, call `rename_session` with `Copilot Review Loop: <PR number> - <PR title>` from its `pr.number` and `pr.title` fields. Never use an interim number-only name.
+Run `preflight` first so the canonical PR metadata is available. After `preflight` succeeds, ensure the session name is `Copilot Review Loop: <PR number> - <PR title>` using its `pr.number` and `pr.title` fields. If the harness has already supplied that exact name, treat the naming step as complete and do not call `rename_session`. Otherwise call `rename_session` once with the desired name. If the tool reports that it skipped the rename because the session was already named, accept that result and continue without retrying or reporting it as retrospective friction. Never use an interim number-only name.
 
 ## Target And Preflight
 
