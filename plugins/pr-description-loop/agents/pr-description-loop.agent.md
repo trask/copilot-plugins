@@ -81,7 +81,7 @@ Never pass a `~`-prefixed helper path to native Windows Python from Git Bash.
 The helper provides:
 
 - `preflight [target] [--repo-root <workspace>] [--state <path>]`: resolve a PR URL, `owner/repo#number`, bare PR number in repository context, or the current branch's PR; fetch the current number, title, body, URL, head, and draft status; pin the head and current text in a unique run state; update the stable PR index; and return `run_id`
-- `propose --state <path> --expected-run-id <run_id> --title <literal-title> --body-file <path>`: persist an approved proposal bound to this run's exact pinned head, title, and body; increment its durable proposal counter; and return `proposal_token`
+- `propose --state <path> --expected-run-id <run_id> --title <literal-title> --body-file <path>`: persist an approved proposal bound to this run's exact pinned head, title, and body; normalize the body file's CRLF or CR line endings to LF; increment its durable proposal counter; and return `proposal_token`, the `body_newline` convention it will send, and whether the body file was normalized
 - `apply --state <path> --expected-head <head_sha> --expected-run-id <run_id> --expected-proposal-token <proposal_token>`: require the run and proposal capabilities, compare the exact live snapshot twice immediately before the REST update, include `live_head`, `live_title`, and `live_body` in a head-mismatch error, apply the stored proposal, re-read it, and record validation only after the live head, title, and body match exactly
 - `validate --state <path> --expected-head <head_sha> --expected-run-id <run_id> --no-change`: verify the unchanged live title and body at the pinned head and record validation without mutation
 - `status [--state <path> | --current --repo-root <workspace>]` and `cleanup --state <path>`
@@ -143,7 +143,7 @@ Feedback, a rejection, or a request for improvement is not permission to mutate.
 
 After explicit approval of the exact displayed proposal:
 
-1. Write the approved body exactly as UTF-8 to a body file outside the repository, alongside the helper's external state file. Do not use a repository file.
+1. Write the approved body exactly as UTF-8 to a body file outside the repository, alongside the helper's external state file. Do not use a repository file. Use whichever line ending your shell writes naturally; the helper normalizes CRLF and CR to LF, so the applied body always uses LF even when the pinned body uses CRLF. Never inspect the helper's source to choose a line ending.
 2. Run `propose --state <path> --expected-run-id <run_id> --title <exact-title> --body-file <external-path>` and retain its exact `proposal_token`.
 3. Run `apply --state <path> --expected-head <head_sha> --expected-run-id <run_id> --expected-proposal-token <proposal_token>` immediately.
 4. Delete the external body file after `propose` has read it, whether `apply` succeeds or fails.

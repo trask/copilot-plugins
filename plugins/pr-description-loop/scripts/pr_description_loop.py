@@ -31,6 +31,7 @@ RESIDUAL_UPDATE_RACE = (
     "requests. Another writer can still change metadata between the helper's final "
     "exact snapshot check and the PATCH request."
 )
+BODY_NEWLINE = "lf"
 INDEX_LOCK_TIMEOUT_SECONDS = 10.0
 INDEX_LOCK_STALE_SECONDS = 120.0
 INDEX_LOCK_POLL_SECONDS = 0.05
@@ -1137,11 +1138,19 @@ def command_preflight(args: argparse.Namespace) -> None:
 
 def read_utf8(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as error:
-        raise WorkflowError(f"body file is not valid UTF-8: {path}") from error
+        raw = path.read_bytes()
     except OSError as error:
         raise WorkflowError(f"could not read body file {path}: {error}") from error
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise WorkflowError(f"body file is not valid UTF-8: {path}") from error
+
+
+def normalize_newlines(value: str) -> str:
+    # The body file's line endings never decide what reaches GitHub: CRLF and CR
+    # are folded to LF so a proposal written on any platform sends the same bytes.
+    return value.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def command_propose(args: argparse.Namespace) -> None:
@@ -1151,7 +1160,8 @@ def command_propose(args: argparse.Namespace) -> None:
     state = load_run_state(path)
     run_id = require_run_id(state, args.expected_run_id)
     body_path = cli_path(args.body_file)
-    body = read_utf8(body_path)
+    raw_body = read_utf8(body_path)
+    body = normalize_newlines(raw_body)
     count = proposal_count(state) + 1
     proposal = {
         "number": count,
@@ -1181,6 +1191,8 @@ def command_propose(args: argparse.Namespace) -> None:
             "proposal": proposal,
             "proposal_count": count,
             "proposal_token": proposal["token"],
+            "body_newline": BODY_NEWLINE,
+            "body_normalized": body != raw_body,
             "run_id": run_id,
         }
     )
@@ -1461,7 +1473,15 @@ def build_parser() -> argparse.ArgumentParser:
     propose.add_argument("--state", required=True)
     propose.add_argument("--expected-run-id", required=True)
     propose.add_argument("--title", required=True)
-    propose.add_argument("--body-file", required=True)
+    propose.add_argument(
+        "--body-file",
+        required=True,
+        help=(
+            "UTF-8 file holding the approved body; CRLF and CR line endings are "
+            "normalized to LF, so the stored proposal and the body sent to GitHub "
+            "always use LF regardless of how the file was written"
+        ),
+    )
     propose.set_defaults(function=command_propose)
 
     apply = subparsers.add_parser(

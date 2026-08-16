@@ -337,6 +337,13 @@ class AgentInstructionsTest(unittest.TestCase):
             "UTF-8 to a body file outside the repository", self.instructions
         )
         self.assertIn(
+            "the helper normalizes CRLF and CR to LF", self.instructions
+        )
+        self.assertIn(
+            "Never inspect the helper's source to choose a line ending",
+            self.instructions,
+        )
+        self.assertIn(
             "include `live_head`, `live_title`, and `live_body` in a head-mismatch "
             "error",
             self.instructions,
@@ -461,7 +468,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.15")
+        self.assertEqual(plugin["version"], "1.0.16")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 
@@ -931,6 +938,61 @@ class StatePersistenceTest(unittest.TestCase):
         self.assertEqual(
             state["proposal"]["body"], "First paragraph.\n\n- One\n- Two"
         )
+
+    def test_propose_normalizes_crlf_and_reports_the_newline_convention(self):
+        path = write_state(self.directory)
+        body_path = self.directory / "body.md"
+        body_path.write_bytes(b"First paragraph.\r\n\r\n- One\r- Two")
+
+        MODULE.command_propose(
+            SimpleNamespace(
+                state=str(path),
+                expected_run_id="run-1",
+                title="Title",
+                body_file=str(body_path),
+            )
+        )
+
+        state = MODULE.load_state(path)
+        self.assertEqual(
+            state["proposal"]["body"], "First paragraph.\n\n- One\n- Two"
+        )
+        self.assertEqual(self.emitted[-1]["body_newline"], "lf")
+        self.assertTrue(self.emitted[-1]["body_normalized"])
+
+    def test_propose_reports_an_lf_body_as_unnormalized(self):
+        path = write_state(self.directory)
+        body_path = self.directory / "body.md"
+        body_path.write_bytes(b"First paragraph.\n\n- One\n- Two")
+
+        MODULE.command_propose(
+            SimpleNamespace(
+                state=str(path),
+                expected_run_id="run-1",
+                title="Title",
+                body_file=str(body_path),
+            )
+        )
+
+        self.assertEqual(self.emitted[-1]["body_newline"], "lf")
+        self.assertFalse(self.emitted[-1]["body_normalized"])
+
+    def test_propose_rejects_a_body_file_that_is_not_utf8(self):
+        path = write_state(self.directory)
+        body_path = self.directory / "body.md"
+        body_path.write_bytes(b"Body \xff")
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "not valid UTF-8"):
+            MODULE.command_propose(
+                SimpleNamespace(
+                    state=str(path),
+                    expected_run_id="run-1",
+                    title="Title",
+                    body_file=str(body_path),
+                )
+            )
+
+        self.assertEqual(MODULE.load_state(path)["proposal_count"], 0)
 
     def test_propose_rejects_a_blank_title_without_changing_state(self):
         path = write_state(self.directory)
