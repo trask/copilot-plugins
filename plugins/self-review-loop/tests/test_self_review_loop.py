@@ -391,6 +391,16 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
+    def test_reads_the_status_result_from_the_helper_file(self):
+        self.assertIn(
+            "write the complete state snapshot to `status_path` as JSON",
+            self.instructions,
+        )
+        self.assertIn(
+            "open the complete result at `status_path` only when you need",
+            self.instructions,
+        )
+
     def test_reads_the_pinned_diff_from_the_helper_snapshot(self):
         self.assertIn(
             "Read the pinned diff only from the returned `diff_path`",
@@ -2150,10 +2160,71 @@ class StatusTest(unittest.TestCase):
             SimpleNamespace(state=str(path), current=False, repo_root=None)
         )
 
-        result = self.emitted[-1]
+        envelope = self.emitted[-1]
+        self.assertEqual(envelope["result"], "ready")
+        self.assertEqual(envelope["pr"]["number"], 7)
+        self.assertEqual(envelope["iterations"], 2)
+
+    def test_writes_the_complete_state_snapshot_and_emits_a_compact_envelope(self):
+        review = {
+            "id": "pr-7-iteration-1",
+            "status": "active",
+            "iteration": 1,
+            "head_sha": "head1",
+            "diff_path": str(self.directory / "state.json.diff"),
+            "anchors": {"app.py": {"LEFT": [2], "RIGHT": [2, 3]}},
+            "pr_commits": [{"sha": "commit1", "message": "Change app", "files": []}],
+            "diff_only_files": [],
+            "candidates": [
+                {"id": 1, "status": "pending", "path": "app.py", "body": "x" * 4096},
+                {"id": 2, "status": "dropped", "path": "app.py", "body": "y" * 4096},
+                {"id": 3, "status": "dropped", "path": "app.py", "body": "z" * 4096},
+            ],
+            "batches": [{"id": "batch-1", "status": "planned"}],
+        }
+        path = write_state(
+            self.directory,
+            iterations=1,
+            review=review,
+            history=[{"id": 9, "body": "w" * 4096}],
+        )
+
+        MODULE.command_status(
+            SimpleNamespace(state=str(path), current=False, repo_root=None)
+        )
+
+        envelope = self.emitted[-1]
+        status_path = MODULE.status_path_for(path)
+        self.assertEqual(Path(envelope["status_path"]), status_path)
+        self.assertNotIn("history", envelope)
+        self.assertEqual(
+            set(envelope["pr"]),
+            {"number", "title", "pr_url", "repo_name", "head_branch", "base_branch"},
+        )
+        self.assertEqual(
+            envelope["review"]["candidate_statuses"], {"pending": 1, "dropped": 2}
+        )
+        self.assertEqual(envelope["review"]["batch_statuses"], {"planned": 1})
+        self.assertNotIn("anchors", envelope["review"])
+        self.assertNotIn("candidates", envelope["review"])
+        self.assertEqual(
+            envelope["counts"],
+            {
+                "batches": 1,
+                "candidates": 3,
+                "changed_files": 1,
+                "diff_only_files": 0,
+                "history": 1,
+                "pr_commits": 1,
+            },
+        )
+        self.assertLess(len(json.dumps(envelope)), 2048)
+
+        result = json.loads(status_path.read_text(encoding="utf-8"))
         self.assertEqual(result["result"], "ready")
-        self.assertEqual(result["pr"]["number"], 7)
-        self.assertEqual(result["iterations"], 2)
+        self.assertEqual(result["review"], review)
+        self.assertEqual(result["history"], [{"id": 9, "body": "w" * 4096}])
+        self.assertEqual(result["iterations"], 1)
 
     def test_reports_no_state_for_the_current_branch_pr(self):
         target = MODULE.parse_target("owner/repo#7")
@@ -2178,6 +2249,10 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(result["result"], "no_state")
         self.assertEqual(result["pr"]["number"], 7)
         self.assertIsNone(result["review"])
+        self.assertNotIn("status_path", result)
+        self.assertFalse(
+            MODULE.status_path_for(self.directory / "missing.json").exists()
+        )
 
     def test_cleanup_removes_the_state_file(self):
         path = write_state(self.directory)
@@ -2185,12 +2260,15 @@ class StatusTest(unittest.TestCase):
         diff_path.write_text(DIFF, encoding="utf-8")
         preflight_path = MODULE.preflight_path_for(path)
         preflight_path.write_text("{}", encoding="utf-8")
+        status_path = MODULE.status_path_for(path)
+        status_path.write_text("{}", encoding="utf-8")
 
         MODULE.command_cleanup(SimpleNamespace(state=str(path)))
 
         self.assertFalse(path.exists())
         self.assertFalse(diff_path.exists())
         self.assertFalse(preflight_path.exists())
+        self.assertFalse(status_path.exists())
         self.assertEqual(self.emitted[-1]["result"], "cleaned_up")
 
     def test_cleanup_tolerates_a_missing_diff_snapshot(self):

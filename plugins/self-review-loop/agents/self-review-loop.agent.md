@@ -78,7 +78,8 @@ The deterministic, JSON-only helper provides:
 - `record` and `skip`: maintain completed or validation-blocked batch state
 - `resolve --state <path> --outcome clean`: require no candidates or only dropped candidates, verify the live PR head still matches the pin, and durably mark the active review clean
 - `publish --state <path>`: require a clean worktree and complete records, refuse to publish a skipped batch, require the commits sitting on the pinned head to be exactly the recorded ones, push only when needed, and verify that the remote branch and the PR head both match the local head
-- `status [--state <path> | --current --repo-root <workspace>]` and `cleanup --state <path>`
+- `status [--state <path> | --current --repo-root <workspace>]`: write the complete state snapshot to `status_path` as JSON and print only a compact envelope carrying `result`, `state`, `status_path`, PR identity, an active-review summary with `candidate_statuses` and `batch_statuses`, `counts`, and `iterations`. The complete result at `status_path` adds full `pr` metadata, the whole `review` with its anchors, candidates, and batches, and the carried-forward `history`. A `no_state` result writes no file.
+- `cleanup --state <path>`: delete the state file along with its diff, preflight, and status files
 
 If an operation partially fails, preserve its state and retry that same operation after fixing only the reported blocker.
 
@@ -87,7 +88,7 @@ If an operation partially fails, preserve its state and retry that same operatio
 The workflow always covers one entire pull request. A pasted review or discussion fragment is accepted but does not narrow the review.
 
 1. If the user supplied a PR URL or `owner/repo#number`, use it exactly. For a bare PR number, combine it with the current workspace's GitHub repository as `owner/repo#number`. This supports a PR branch that is not checked out yet.
-2. For a targetless `resume` or `continue`, run `status --current --repo-root <workspace>` first and report what it finds; do not fall back to another PR.
+2. For a targetless `resume` or `continue`, run `status --current --repo-root <workspace>` first and report what it finds; do not fall back to another PR. Read the returned envelope, and open the complete result at `status_path` only when you need the candidate, batch, or history detail it summarizes.
 3. For any other targetless request, run `preflight --repo-root <workspace>` with no target so the helper resolves the PR attached to the currently checked-out branch.
 4. Run `preflight` once per iteration. The helper may realign the clean PR branch after a force-push only when it proves the local commits have no unique patches. If it reports `head_moved`, stop on that exact error. Never manually stash, reset, discard, or force local work to make preflight pass.
 5. Handle results as follows:

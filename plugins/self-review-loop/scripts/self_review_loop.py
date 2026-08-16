@@ -157,7 +157,11 @@ def preflight_path_for(state_path: Path) -> Path:
     return state_path.parent / f"{state_path.name}.preflight.json"
 
 
-def write_preflight_file(path: Path, payload: dict[str, Any]) -> None:
+def status_path_for(state_path: Path) -> Path:
+    return state_path.parent / f"{state_path.name}.status.json"
+
+
+def write_result_file(path: Path, payload: dict[str, Any], label: str) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -167,8 +171,16 @@ def write_preflight_file(path: Path, payload: dict[str, Any]) -> None:
         )
     except OSError as error:
         raise WorkflowError(
-            f"could not write the preflight result file: {error}"
+            f"could not write the {label} result file: {error}"
         ) from error
+
+
+def count_by_status(items: list[dict[str, Any]] | None) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items or []:
+        status = str(item.get("status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    return counts
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -1115,7 +1127,7 @@ def command_preflight(args: argparse.Namespace) -> None:
         "iteration": iteration,
         "max_iterations": max_iterations,
     }
-    write_preflight_file(preflight_path, payload)
+    write_result_file(preflight_path, payload, "preflight")
     emit(
         {
             "result": result,
@@ -1494,13 +1506,53 @@ def command_status(args: argparse.Namespace) -> None:
     else:
         path = cli_path(args.state)
     state = load_state(path)
+    pr = state["pr"]
+    review = state.get("review")
+    history = state.get("history") or []
+    payload = {
+        "result": "ready",
+        "state": str(path),
+        "pr": pr,
+        "review": review,
+        "history": history,
+        "iterations": int(state.get("iterations", 0)),
+    }
+    status_path = status_path_for(path)
+    write_result_file(status_path, payload, "status")
     emit(
         {
             "result": "ready",
             "state": str(path),
-            "pr": state["pr"],
-            "review": state.get("review"),
-            "history": state.get("history") or [],
+            "status_path": str(status_path),
+            "pr": {
+                "number": pr["number"],
+                "title": pr["title"],
+                "pr_url": pr["pr_url"],
+                "repo_name": pr["repo_name"],
+                "head_branch": pr["head_branch"],
+                "base_branch": pr["base_branch"],
+            },
+            "review": None
+            if review is None
+            else {
+                "id": review.get("id"),
+                "status": review.get("status"),
+                "iteration": review.get("iteration"),
+                "head_sha": review.get("head_sha"),
+                "diff_path": review.get("diff_path"),
+                "outcome": review.get("outcome"),
+                "clean_at_head_sha": review.get("clean_at_head_sha"),
+                "candidate_statuses": count_by_status(review.get("candidates")),
+                "batch_statuses": count_by_status(review.get("batches")),
+            },
+            "counts": {
+                "batches": len(((review or {}).get("batches")) or []),
+                "candidates": len(((review or {}).get("candidates")) or []),
+                "changed_files": len(((review or {}).get("anchors")) or {}),
+                "diff_only_files": len(((review or {}).get("diff_only_files")) or []),
+                "history": len(history),
+                "pr_commits": len(((review or {}).get("pr_commits")) or []),
+            },
             "iterations": int(state.get("iterations", 0)),
         }
     )
@@ -1512,6 +1564,7 @@ def command_cleanup(args: argparse.Namespace) -> None:
     path.unlink()
     diff_path_for(path).unlink(missing_ok=True)
     preflight_path_for(path).unlink(missing_ok=True)
+    status_path_for(path).unlink(missing_ok=True)
     emit({"result": "cleaned_up", "state": str(path)})
 
 
