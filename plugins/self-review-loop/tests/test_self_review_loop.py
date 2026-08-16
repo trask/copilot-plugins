@@ -351,8 +351,21 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "Report only candidates evaluated and dropped during this run",
+            "Report every candidate this run evaluated and dropped in any of its "
+            "iterations",
             self.instructions,
+        )
+        self.assertIn(
+            "An earlier iteration's drop still belongs in the block after `preflight` "
+            "folds it into `history`",
+            self.instructions,
+        )
+        self.assertIn(
+            "Exclude only entries `history` carried in from a previous run",
+            self.instructions,
+        )
+        self.assertNotIn(
+            "not dropped entries carried forward in `history`", self.instructions
         )
         self.assertNotIn(
             "Report dropped candidates only as a count", self.instructions
