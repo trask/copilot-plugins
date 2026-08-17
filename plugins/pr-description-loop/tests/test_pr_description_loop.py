@@ -276,6 +276,11 @@ class AgentInstructionsTest(unittest.TestCase):
             "`gh pr diff <pr.url> --repo <pr.repo_name>`",
             self.instructions,
         )
+        self.assertIn(
+            "If the command output is too large for one tool read and the tool "
+            "saves it to a file, read the authoritative diff from that saved file",
+            self.instructions,
+        )
         for forbidden_header in ("`Summary`", "`Details`", "`Testing`"):
             self.assertIn(forbidden_header, self.instructions)
         self.assertIn("Do not include validation lists", self.instructions)
@@ -469,7 +474,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.17")
+        self.assertEqual(plugin["version"], "1.0.18")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 
