@@ -159,6 +159,11 @@ class AgentInstructionsTest(unittest.TestCase):
             "If `publish` returns `head_changed`, stop without retrying or pushing",
             instructions,
         )
+        self.assertIn(
+            "the run stopped to avoid overwriting the newer update",
+            instructions,
+        )
+        self.assertIn("run the review loop again from the latest head", instructions)
 
     def test_empty_queue_without_clean_head_review_requests_review(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -471,6 +476,14 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn(
             "render the `**Outcome:**` line at most once, and never begin a second "
             "report",
+            instructions,
+        )
+        self.assertIn(
+            "**Outcome:** \\`head_changed\\` after <n> iteration(s): the pull request "
+            "changed during publishing from expected head \\`<expected-head>\\` to "
+            "actual head \\`<actual-head>\\`. This run stopped without pushing to "
+            "avoid overwriting the newer update. Run the review loop again from the "
+            "latest head.",
             instructions,
         )
 
