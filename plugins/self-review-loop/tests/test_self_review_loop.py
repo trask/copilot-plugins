@@ -285,8 +285,12 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("`max_iterations_reached`", self.instructions)
         self.assertIn("`nothing_to_publish`", self.instructions)
         self.assertIn(
-            "Never raise a finding again when the carried-forward `history` already "
-            "records it",
+            "A missing history commit is not enough to raise the finding again",
+            self.instructions,
+        )
+        self.assertIn(
+            "Raise it again only when the pinned diff and current code show that the "
+            "fix was removed",
             self.instructions,
         )
         self.assertIn(
@@ -430,12 +434,21 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "Read `changed_files`, `pr_commits`, `pr_authored_files`, and `history` "
-            "from the complete result at `preflight_path`",
+            "Read `changed_files`, `pr_commits`, `pr_authored_files`, `history`, and "
+            "`history_commit_presence` from the complete result at `preflight_path`",
             self.instructions,
         )
         self.assertIn(
             "check what you read against the envelope's `counts`",
+            self.instructions,
+        )
+        self.assertIn(
+            "The envelope's `counts.history_commits_missing` reports how many recorded "
+            "commits no longer appear",
+            self.instructions,
+        )
+        self.assertIn(
+            "Do not compare the history and PR commit lists by hand",
             self.instructions,
         )
 
@@ -1115,6 +1128,25 @@ class HistoryTest(unittest.TestCase):
         self.assertEqual(state["history"][0]["commit"], "abc")
         self.assertEqual(state["history"][1]["outcome"], "dropped")
         self.assertEqual(state["history"][1]["detail"], "not demonstrated")
+
+    def test_compares_only_recorded_history_commits_with_current_pr_commits(self):
+        history = [
+            {"id": 1, "commit": "old"},
+            {"id": 2, "commit": "current"},
+            {"id": 3, "commit": None},
+            {"id": 4},
+        ]
+
+        self.assertEqual(
+            MODULE.compare_history_commits(
+                history,
+                [{"sha": "current"}, {"sha": "other"}],
+            ),
+            [
+                {"history_id": 1, "commit": "old", "in_pr_commits": False},
+                {"history_id": 2, "commit": "current", "in_pr_commits": True},
+            ],
+        )
 
 
 class HeadVerificationTest(unittest.TestCase):
@@ -2012,6 +2044,7 @@ class PreflightTest(unittest.TestCase):
                 "changed_files": 1,
                 "diff_only_files": 0,
                 "history": 0,
+                "history_commits_missing": 0,
                 "pr_authored_files": 1,
                 "pr_commits": 1,
             },
@@ -2032,6 +2065,7 @@ class PreflightTest(unittest.TestCase):
         )
         self.assertEqual(result["pr_authored_files"], ["app.py"])
         self.assertEqual(result["diff_only_files"], [])
+        self.assertEqual(result["history_commit_presence"], [])
         self.assertEqual(result["iteration"], 1)
         self.assertEqual(result["history"], [])
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -2181,6 +2215,33 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(state["next_candidate_id"], 3)
         self.assertEqual(state["review"]["id"], "pr-7-iteration-2")
         self.assertEqual(state["review"]["status"], "active")
+
+    def test_reports_history_commits_missing_from_current_pr(self):
+        state_path = write_state(
+            self.directory,
+            history=[
+                {"id": 1, "outcome": "addressed", "commit": "old"},
+                {"id": 2, "outcome": "addressed", "commit": "commit1"},
+                {"id": 3, "outcome": "dropped", "commit": None},
+            ],
+        )
+
+        envelope = self.preflight(state_path)
+        result = self.full_result(envelope)
+
+        self.assertEqual(envelope["counts"]["history_commits_missing"], 1)
+        self.assertEqual(
+            result["history_commit_presence"],
+            [
+                {"history_id": 1, "commit": "old", "in_pr_commits": False},
+                {"history_id": 2, "commit": "commit1", "in_pr_commits": True},
+            ],
+        )
+        state = MODULE.load_state(state_path)
+        self.assertEqual(
+            state["review"]["history_commit_presence"],
+            result["history_commit_presence"],
+        )
 
     def test_stops_at_the_iteration_cap(self):
         state_path = write_state(self.directory, iterations=5)

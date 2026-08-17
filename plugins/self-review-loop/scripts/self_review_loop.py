@@ -1028,6 +1028,21 @@ def archive_review(state: dict[str, Any]) -> None:
         )
 
 
+def compare_history_commits(
+    history: list[dict[str, Any]], pr_commits: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    pr_commit_shas = {commit["sha"] for commit in pr_commits}
+    return [
+        {
+            "history_id": entry["id"],
+            "commit": entry["commit"],
+            "in_pr_commits": entry["commit"] in pr_commit_shas,
+        }
+        for entry in history
+        if entry.get("commit")
+    ]
+
+
 def command_preflight(args: argparse.Namespace) -> None:
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
@@ -1076,6 +1091,10 @@ def command_preflight(args: argparse.Namespace) -> None:
         }
     archive_review(state)
     state["iterations"] = int(state.get("iterations", 0))
+    history_commit_presence = compare_history_commits(state["history"], pr_commits)
+    history_commits_missing = sum(
+        not entry["in_pr_commits"] for entry in history_commit_presence
+    )
     max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
     iteration = state["iterations"] + 1
     result = "max_iterations_reached" if state["iterations"] >= max_iterations else "ready"
@@ -1095,6 +1114,7 @@ def command_preflight(args: argparse.Namespace) -> None:
                 "pr_commits": pr_commits,
                 "pr_authored_files": pr_authored_files,
                 "diff_only_files": diff_only_files,
+                "history_commit_presence": history_commit_presence,
                 "anchors": serialize_anchors(anchors),
                 "candidates": [],
                 "batches": [],
@@ -1124,6 +1144,7 @@ def command_preflight(args: argparse.Namespace) -> None:
         "pr_authored_files": pr_authored_files,
         "diff_only_files": diff_only_files,
         "history": state["history"],
+        "history_commit_presence": history_commit_presence,
         "iteration": iteration,
         "max_iterations": max_iterations,
     }
@@ -1149,6 +1170,7 @@ def command_preflight(args: argparse.Namespace) -> None:
                 "changed_files": len(changed_files),
                 "diff_only_files": len(diff_only_files),
                 "history": len(state["history"]),
+                "history_commits_missing": history_commits_missing,
                 "pr_authored_files": len(pr_authored_files),
                 "pr_commits": len(pr_commits),
             },
