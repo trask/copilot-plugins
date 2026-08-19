@@ -21,6 +21,7 @@ STATE_VERSION = 1
 DEFAULT_MAX_ITERATIONS = 2
 NO_PROGRESS_LIMIT = 2
 MERGEABLE_RETRY_DELAYS = (2, 4, 8)
+CHECK_COVERAGE_GRACE_SECONDS = 180
 IS_WINDOWS = os.name == "nt"
 PR_URL_PATTERN = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
@@ -204,6 +205,31 @@ def graphql(query: str, variables: dict[str, str | int | None]) -> Any:
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_utc(value: Any) -> dt.datetime | None:
+    """Read one of this helper's own timestamps back, or give up quietly."""
+
+    if not isinstance(value, str) or not value:
+        return None
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def elapsed_seconds(start: Any, end: Any) -> float | None:
+    """Seconds between two recorded timestamps, or ``None`` if either is unreadable."""
+
+    first = parse_utc(start)
+    second = parse_utc(end)
+    if first is None or second is None:
+        return None
+    return max((second - first).total_seconds(), 0.0)
 
 
 def require_tools() -> None:
@@ -553,8 +579,120 @@ def resolve_target(value: str | None, repo_root: Path) -> dict[str, Any]:
     return parse_target(value, repo_name_for(repo_root))
 
 
-def observe_pull_request(target: dict[str, Any]) -> dict[str, Any]:
-    """Read every live GitHub fact the stage decisions depend on."""
+def corroborate_mergeability(
+    mergeable: Any, merge_state_status: Any
+) -> dict[str, Any]:
+    """Judge whether GitHub's two mergeability fields agree with each other.
+
+    GitHub computes mergeability in the background, and the result lags the head
+    the pull request already reports. One response can therefore carry a fresh
+    ``headRefOid`` beside a settled ``MERGEABLE`` or ``CONFLICTING`` computed
+    against the head it replaced. ``UNKNOWN`` covers only the interval while
+    GitHub recomputes, so waiting for ``UNKNOWN`` to clear does not rule that
+    out.
+
+    ``mergeStateStatus`` comes from the same computation, so it is a consistency
+    cross-check rather than a second witness. It cannot confirm a fresh answer,
+    but a response whose two fields contradict each other is positive evidence
+    not to trust that response at all. ``DIRTY`` is GitHub's word for a pull
+    request with conflicts, and it never yields green.
+    """
+
+    mergeable_value = str(mergeable or "").strip().upper()
+    status_value = str(merge_state_status or "").strip().upper()
+    fields = {
+        "mergeable": mergeable_value or None,
+        "merge_state_status": status_value or None,
+    }
+    unsettled_status = status_value in ("", "UNKNOWN")
+
+    if status_value == "DIRTY":
+        if mergeable_value == "CONFLICTING":
+            return {
+                **fields,
+                "state": "conflicting",
+                "settled": True,
+                "reason": "corroborated",
+            }
+        if mergeable_value in ("", "UNKNOWN"):
+            return {
+                **fields,
+                "state": "conflicting",
+                "settled": False,
+                "reason": "mergeable_unknown",
+            }
+        return {
+            **fields,
+            "state": "conflicting",
+            "settled": False,
+            "reason": "disagreed",
+        }
+
+    if mergeable_value == "CONFLICTING":
+        return {
+            **fields,
+            "state": "conflicting",
+            "settled": False,
+            "reason": "merge_state_unknown" if unsettled_status else "disagreed",
+        }
+
+    if mergeable_value == "MERGEABLE":
+        if unsettled_status:
+            return {
+                **fields,
+                "state": "unsettled",
+                "settled": False,
+                "reason": "merge_state_unknown",
+            }
+        return {
+            **fields,
+            "state": "mergeable",
+            "settled": True,
+            "reason": "corroborated",
+        }
+
+    return {
+        **fields,
+        "state": "unsettled",
+        "settled": False,
+        "reason": (
+            "mergeable_unknown"
+            if mergeable_value in ("", "UNKNOWN")
+            else "unrecognized"
+        ),
+    }
+
+
+def observe_pull_request(
+    target: dict[str, Any], *, known_head_sha: str | None = None
+) -> dict[str, Any]:
+    """Read every live GitHub fact the stage decisions depend on.
+
+    Two of these facts are not simply true when GitHub returns them, and this
+    reads more than once for both.
+
+    Mergeability is computed in the background and lags the head the pull
+    request already reports, so a response can carry a fresh ``headRefOid``
+    beside an answer computed against the head it replaced. A response taken
+    right after the head moved is therefore refused and asked again after a
+    delay, and so is one whose two mergeability fields contradict each other.
+
+    The check rollup is not stale in that way. Each check run belongs to a
+    commit, so the rollup genuinely describes this head. It can still be
+    *incomplete*: right after a push, GitHub may have registered only the
+    quickest workflows, and a rollup with two passing entries and nothing else
+    yet looks exactly like a finished green one. The first read after a push is
+    refused for that reason too, and ``summarize_checks`` compares the names
+    against the base commit's.
+
+    This narrows both windows; it closes neither. No GitHub field states which
+    commit a mergeability answer was computed at, so no caller can prove that a
+    response *about* a head holds an answer computed *at* it, and no field
+    states how many checks a commit will eventually run. What the pipeline
+    promises is only the safe direction: an answer it cannot corroborate leaves
+    the stage not green, which costs one stage run that reads a real answer and
+    stops.
+    """
 
     fields = (
         "number,title,url,state,isDraft,mergeable,mergeStateStatus,headRefName,"
@@ -562,7 +700,12 @@ def observe_pull_request(target: dict[str, Any]) -> dict[str, Any]:
         "statusCheckRollup"
     )
     payload: dict[str, Any] = {}
-    for attempt, delay in enumerate((*MERGEABLE_RETRY_DELAYS, None)):
+    mergeability: dict[str, Any] = {}
+    previous_head = known_head_sha
+    head_moved = False
+    moved = False
+    attempts = 0
+    for delay in (*MERGEABLE_RETRY_DELAYS, None):
         raw = gh_json(
             [
                 "pr",
@@ -577,10 +720,25 @@ def observe_pull_request(target: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(raw, dict):
             raise WorkflowError("gh pr view did not return PR metadata")
         payload = raw
-        if payload.get("mergeable") != "UNKNOWN" or delay is None:
+        attempts += 1
+        observed_head = payload.get("headRefOid")
+        moved = bool(previous_head) and observed_head != previous_head
+        head_moved = head_moved or moved
+        previous_head = observed_head
+        mergeability = corroborate_mergeability(
+            payload.get("mergeable"), payload.get("mergeStateStatus")
+        )
+        if delay is None:
             break
-        # GitHub computes mergeability in the background and reports UNKNOWN until
-        # it finishes. Asking again is the only way to turn that into a fact.
+        if moved:
+            # The head changed under the pipeline. This response's mergeability
+            # may predate the commit it arrived with, and its rollup may hold
+            # only the checks that registered first. Ask again rather than
+            # accept either on the first read after a push.
+            time.sleep(delay)
+            continue
+        if mergeability["settled"]:
+            break
         time.sleep(delay)
 
     head_sha = payload.get("headRefOid")
@@ -600,6 +758,7 @@ def observe_pull_request(target: dict[str, Any]) -> dict[str, Any]:
         raise WorkflowError(
             "pull request head repository is unavailable; it may have been deleted"
         )
+    base_sha = payload.get("baseRefOid")
     return {
         "pr": {
             "number": target["number"],
@@ -616,10 +775,16 @@ def observe_pull_request(target: dict[str, Any]) -> dict[str, Any]:
         },
         "state": payload.get("state"),
         "head_sha": head_sha,
-        "base_sha": payload.get("baseRefOid"),
+        "base_sha": base_sha,
         "mergeable": payload.get("mergeable"),
         "merge_state_status": payload.get("mergeStateStatus"),
+        "mergeability": mergeability,
         "checks": summarize_checks(payload.get("statusCheckRollup")),
+        "reads": {
+            "attempts": attempts,
+            "head_moved": head_moved,
+            "head_moved_on_last_read": moved,
+        },
     }
 
 
@@ -647,18 +812,29 @@ def summarize_checks(rollup: Any) -> dict[str, Any]:
 
     An empty rollup is reported as ``none`` rather than as success. A repository
     with no applicable checks must never look like a passing pipeline.
+
+    The names are kept because a rollup can be complete in shape and incomplete
+    in coverage. Right after a push GitHub may have registered only the quickest
+    workflows, and a rollup holding two passing entries with nothing failing and
+    nothing pending is indistinguishable here from a finished green one. Judging
+    that needs an expectation of what this pull request runs, which lives in the
+    pipeline state rather than in one response. ``judge_check_coverage`` applies
+    it.
     """
 
     nodes = rollup if isinstance(rollup, list) else []
     counts: dict[str, int] = {}
     failing: list[dict[str, str]] = []
     pending: list[dict[str, str]] = []
+    names: set[str] = set()
     for node in nodes:
         conclusion = check_conclusion(node)
         counts[conclusion] = counts.get(conclusion, 0) + 1
         name = ""
         if isinstance(node, dict):
             name = str(node.get("name") or node.get("context") or "")
+        if name:
+            names.add(name)
         if conclusion in CHECK_FAILURE_STATES:
             failing.append({"name": name, "state": conclusion})
         elif conclusion not in CHECK_SUCCESS_STATES:
@@ -678,10 +854,136 @@ def summarize_checks(rollup: Any) -> dict[str, Any]:
         "counts": counts,
         "failing": failing,
         "pending": pending,
+        "names": sorted(names),
+        "coverage": {"state": "unverified", "reason": "not_judged", "missing": []},
         "action_required": [
             entry for entry in failing if entry["state"] == "ACTION_REQUIRED"
         ],
     }
+
+
+def judge_check_coverage(
+    names: set[str],
+    expected: Any,
+    *,
+    waited_seconds: float | None,
+    grace_seconds: int = CHECK_COVERAGE_GRACE_SECONDS,
+) -> dict[str, Any]:
+    """Judge whether this head's rollup has finished registering.
+
+    The expectation is the set of check names *this pull request* ran at its
+    previous head. That is the only sound reference available. The base commit's
+    checks are not one: the base and the head are reached by different triggers,
+    so a ``pull_request`` workflow runs only for the head and a ``push``
+    workflow may run only for the base. Comparing against the base would fire
+    never on some repositories and forever on others.
+
+    A strict subset of the previous head's set means checks are still
+    registering, and the honest state is ``pending`` rather than success.
+
+    The wait is bounded, because a commit may legitimately drop checks: a
+    docs-only change really does run fewer workflows when a path filter excludes
+    them. Once ``grace_seconds`` have passed with no new check name appearing at
+    this head, the smaller set is accepted as complete and the stage may go
+    green. A guard that can never stop firing is a deadlock rather than a
+    conservative failure, so this one always has a way out.
+    """
+
+    expected_names = set()
+    if isinstance(expected, dict):
+        expected_names = {name for name in expected.get("names") or [] if name}
+    if not expected_names:
+        return {"state": "unverified", "reason": "no_earlier_head", "missing": []}
+    if not names < expected_names:
+        return {
+            "state": "complete",
+            "reason": "covers_earlier_checks",
+            "missing": [],
+            "expected_head_sha": (expected or {}).get("head_sha"),
+        }
+    missing = sorted(expected_names - names)
+    if waited_seconds is None:
+        return {
+            "state": "complete",
+            "reason": "wait_not_measurable",
+            "missing": missing,
+            "expected_head_sha": (expected or {}).get("head_sha"),
+        }
+    waited = float(waited_seconds)
+    if waited >= grace_seconds:
+        return {
+            "state": "complete",
+            "reason": "settled_smaller",
+            "missing": missing,
+            "waited_seconds": waited,
+            "grace_seconds": grace_seconds,
+            "expected_head_sha": (expected or {}).get("head_sha"),
+        }
+    return {
+        "state": "incomplete",
+        "reason": "missing_earlier_checks",
+        "missing": missing,
+        "waited_seconds": waited,
+        "grace_seconds": grace_seconds,
+        "expected_head_sha": (expected or {}).get("head_sha"),
+    }
+
+
+def apply_check_coverage(
+    state: dict[str, Any], observation: dict[str, Any]
+) -> dict[str, Any]:
+    """Record which checks this head has run, and judge the rollup's coverage.
+
+    Two records are kept. ``checks_seen`` holds the current head, every check
+    name seen at it so far, and when that set last grew; the growth timestamp is
+    what bounds the wait. ``checks_expected`` holds the head before it, which is
+    the expectation the current rollup is measured against.
+    """
+
+    head_sha = observation["head_sha"]
+    checks = observation.setdefault("checks", {})
+    names = {name for name in checks.get("names") or [] if name}
+    now = utc_now()
+
+    seen = state.get("checks_seen")
+    if isinstance(seen, dict) and seen.get("head_sha") == head_sha:
+        known = {name for name in seen.get("names") or [] if name}
+        merged = known | names
+        changed_at = seen.get("changed_at") if merged == known else now
+        seen = {
+            "head_sha": head_sha,
+            "names": sorted(merged),
+            "first_seen_at": seen.get("first_seen_at") or now,
+            "changed_at": changed_at or now,
+        }
+    else:
+        if isinstance(seen, dict) and seen.get("head_sha"):
+            state["checks_expected"] = {
+                "head_sha": seen.get("head_sha"),
+                "names": sorted(
+                    {name for name in seen.get("names") or [] if name}
+                ),
+            }
+        seen = {
+            "head_sha": head_sha,
+            "names": sorted(names),
+            "first_seen_at": now,
+            "changed_at": now,
+        }
+    state["checks_seen"] = seen
+
+    expected = state.get("checks_expected")
+    if isinstance(expected, dict) and expected.get("head_sha") == head_sha:
+        expected = None
+    coverage = judge_check_coverage(
+        {name for name in seen["names"]},
+        expected,
+        waited_seconds=elapsed_seconds(seen.get("changed_at"), now),
+    )
+    checks["coverage"] = coverage
+    if checks.get("state") == "success" and coverage["state"] == "incomplete":
+        checks["state"] = "pending"
+    return coverage
 
 
 def run_stage_status(
@@ -927,21 +1229,52 @@ def stage_green(
             return {"green": True, "evidence": "helper", "clean_at_head_sha": clean}
         return {"green": False, "evidence": "helper", "clean_at_head_sha": clean}
 
+    fresh = observation.get("reads") or {}
+    stale_read = bool(fresh.get("head_moved_on_last_read"))
+
     if entry["stage"] == STAGE_CONFLICT:
-        mergeable = observation.get("mergeable")
+        mergeability = observation.get("mergeability")
+        if not isinstance(mergeability, dict):
+            mergeability = {
+                "state": "unsettled",
+                "settled": False,
+                "reason": "not_observed",
+                "mergeable": observation.get("mergeable"),
+                "merge_state_status": observation.get("merge_state_status"),
+            }
+        green = mergeability.get("settled") and mergeability.get("state") == "mergeable"
+        reason = mergeability.get("reason")
+        if green and stale_read:
+            green = False
+            reason = "head_moved"
         return {
-            "green": mergeable == "MERGEABLE",
+            "green": bool(green),
             "evidence": "github",
-            "mergeable": mergeable,
+            "mergeable": mergeability.get("mergeable"),
+            "merge_state_status": mergeability.get("merge_state_status"),
+            "mergeability": mergeability.get("state"),
+            "settled": bool(mergeability.get("settled")),
+            "reason": None if green else reason,
             "recorded_at_head_sha": recorded,
         }
 
     if entry["stage"] == STAGE_CI:
         checks = observation.get("checks") or {}
+        coverage = checks.get("coverage") or {}
+        green = checks.get("state") == "success"
+        reason = None if green else checks.get("state")
+        if not green and coverage.get("state") == "incomplete":
+            reason = "checks_incomplete"
+        if green and stale_read:
+            green = False
+            reason = "head_moved"
         return {
-            "green": checks.get("state") == "success",
+            "green": bool(green),
             "evidence": "github",
             "checks": checks.get("state"),
+            "coverage": coverage.get("state"),
+            "missing_checks": coverage.get("missing") or [],
+            "reason": reason,
             "recorded_at_head_sha": recorded,
         }
 
@@ -1246,13 +1579,17 @@ def new_state(
         "history": [],
         "escalation": None,
         "completed": None,
+        "observed_head_sha": observation.get("head_sha"),
     }
 
 
 def collect_observation(
-    target: dict[str, Any], *, with_markers: bool = True
+    target: dict[str, Any],
+    *,
+    with_markers: bool = True,
+    known_head_sha: str | None = None,
 ) -> dict[str, Any]:
-    observation = observe_pull_request(target)
+    observation = observe_pull_request(target, known_head_sha=known_head_sha)
     markers: dict[str, Any] = {}
     if with_markers:
         for entry in STAGES:
@@ -1299,15 +1636,19 @@ def command_preflight(args: argparse.Namespace) -> None:
     path = cli_path(args.state) if args.state else default_state_path(target)
     max_iterations = max(1, int(args.max_iterations))
 
-    observation = collect_observation(target)
+    existing = load_state(path) if path.is_file() else None
+    observation = collect_observation(
+        target,
+        known_head_sha=(existing or {}).get("observed_head_sha"),
+    )
     if observation.get("state") != "OPEN":
         raise WorkflowError(
             f"pull request {target['pr_url']} is {observation.get('state')}; "
             "the pipeline only drives an open pull request"
         )
 
-    if path.is_file():
-        state = load_state(path)
+    if existing is not None:
+        state = existing
         if state["pr"]["pr_url"] != observation["pr"]["pr_url"]:
             raise WorkflowError(
                 f"state file {path} belongs to {state['pr']['pr_url']}"
@@ -1319,6 +1660,8 @@ def command_preflight(args: argparse.Namespace) -> None:
     else:
         state = new_state(target, observation, repo_root, max_iterations)
         resumed = False
+    state["observed_head_sha"] = observation["head_sha"]
+    apply_check_coverage(state, observation)
 
     for assignment in args.stage_model or []:
         stage, separator, model = assignment.partition("=")
@@ -1362,7 +1705,11 @@ def command_next(args: argparse.Namespace) -> None:
     target = build_target(
         state["pr"]["owner"], state["pr"]["repo"], state["pr"]["number"]
     )
-    observation = collect_observation(target)
+    observation = collect_observation(
+        target, known_head_sha=state.get("observed_head_sha")
+    )
+    state["observed_head_sha"] = observation["head_sha"]
+    apply_check_coverage(state, observation)
     decision = decide_next(state, observation)
 
     if decision["result"] == "run_stage":
@@ -1377,6 +1724,7 @@ def command_next(args: argparse.Namespace) -> None:
                 "stage_states": decision["stage_states"],
                 "checks": observation["checks"],
                 "mergeable": observation["mergeable"],
+                "mergeability": observation.get("mergeability"),
                 "cleared": state.get("cleared") or {},
             }
         )
@@ -1393,6 +1741,7 @@ def command_next(args: argparse.Namespace) -> None:
                 "state": str(path),
                 "checks": observation["checks"],
                 "mergeable": observation["mergeable"],
+                "mergeability": observation.get("mergeability"),
                 "cleared": state.get("cleared") or {},
                 "reminder": (
                     "The pipeline never marks a pull request ready for review and "
@@ -1404,7 +1753,7 @@ def command_next(args: argparse.Namespace) -> None:
 
     if not decision.get("recorded"):
         record_escalation(state, decision)
-        save_state(path, state)
+    save_state(path, state)
     emit(
         {
             **decision,

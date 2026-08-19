@@ -70,11 +70,14 @@ def observation(
     *,
     head_sha: str = HEAD,
     mergeable: str = "MERGEABLE",
+    merge_state_status: str | None = None,
     checks: str = "success",
+    coverage: dict | None = None,
     self_review: str | None = None,
     copilot_review: str | None = None,
     description: str | None = None,
     state: str = "OPEN",
+    head_moved_on_last_read: bool = False,
     unavailable: dict | None = None,
 ) -> dict:
     markers = {
@@ -105,14 +108,36 @@ def observation(
     }
     for stage, marker in (unavailable or {}).items():
         markers[stage] = marker
+    if merge_state_status is None:
+        merge_state_status = {"MERGEABLE": "CLEAN", "CONFLICTING": "DIRTY"}.get(
+            mergeable, "UNKNOWN"
+        )
     return {
         "pr": base_pr(),
         "state": state,
         "head_sha": head_sha,
         "base_sha": "base1",
         "mergeable": mergeable,
-        "merge_state_status": "CLEAN",
-        "checks": {"state": checks, "total": 3, "counts": {}, "failing": [], "pending": []},
+        "merge_state_status": merge_state_status,
+        "mergeability": MODULE.corroborate_mergeability(mergeable, merge_state_status),
+        "checks": {
+            "state": checks,
+            "total": 3,
+            "counts": {},
+            "failing": [],
+            "pending": [],
+            "coverage": coverage
+            or {
+                "state": "complete",
+                "reason": "covers_earlier_checks",
+                "missing": [],
+            },
+        },
+        "reads": {
+            "attempts": 1,
+            "head_moved": head_moved_on_last_read,
+            "head_moved_on_last_read": head_moved_on_last_read,
+        },
         "stage_markers": markers,
     }
 
@@ -565,6 +590,361 @@ class CheckSummaryTest(unittest.TestCase):
         summary = MODULE.summarize_checks([{"name": "mystery"}])
         self.assertEqual("pending", summary["state"])
         self.assertEqual("UNKNOWN", MODULE.check_conclusion({"name": "mystery"}))
+
+
+class CheckCoverageTest(unittest.TestCase):
+    def expected(self, *names: str, head_sha: str = HEAD) -> dict:
+        return {"head_sha": head_sha, "names": sorted(names)}
+
+    def judge(self, names, expected, *, waited=0.0, grace=180):
+        return MODULE.judge_check_coverage(
+            set(names), expected, waited_seconds=waited, grace_seconds=grace
+        )
+
+    def test_a_rollup_missing_an_earlier_check_is_not_finished(self):
+        coverage = self.judge({"build"}, self.expected("build", "test", "lint"))
+        self.assertEqual("incomplete", coverage["state"])
+        self.assertEqual(["lint", "test"], coverage["missing"])
+        self.assertEqual("missing_earlier_checks", coverage["reason"])
+
+    def test_a_rollup_holding_every_earlier_check_is_finished(self):
+        coverage = self.judge({"build", "test"}, self.expected("build", "test"))
+        self.assertEqual("complete", coverage["state"])
+        self.assertEqual("covers_earlier_checks", coverage["reason"])
+
+    def test_a_rollup_that_adds_a_check_is_not_a_subset(self):
+        coverage = self.judge({"build", "extra"}, self.expected("build", "test"))
+        self.assertEqual("complete", coverage["state"])
+
+    def test_the_first_head_has_no_expectation_to_measure_against(self):
+        for expected in (None, {}, {"head_sha": "old", "names": []}):
+            with self.subTest(expected=expected):
+                coverage = self.judge({"build"}, expected)
+                self.assertEqual("unverified", coverage["state"])
+                self.assertEqual("no_earlier_head", coverage["reason"])
+
+    def test_the_wait_for_missing_checks_is_bounded(self):
+        coverage = self.judge(
+            {"build"}, self.expected("build", "test"), waited=181, grace=180
+        )
+        self.assertEqual("complete", coverage["state"])
+        self.assertEqual("settled_smaller", coverage["reason"])
+        self.assertEqual(["test"], coverage["missing"])
+
+    def test_a_wait_that_cannot_be_measured_does_not_deadlock(self):
+        coverage = MODULE.judge_check_coverage(
+            {"build"}, self.expected("build", "test"), waited_seconds=None
+        )
+        self.assertEqual("complete", coverage["state"])
+        self.assertEqual("wait_not_measurable", coverage["reason"])
+
+
+class ApplyCheckCoverageTest(unittest.TestCase):
+    def rollup(self, *names: str) -> list[dict]:
+        return [
+            {"name": name, "status": "COMPLETED", "conclusion": "SUCCESS"}
+            for name in names
+        ]
+
+    def observe(self, state, head_sha, *names, now="2024-01-01T00:00:00Z"):
+        seen = {
+            "pr": base_pr(),
+            "head_sha": head_sha,
+            "checks": MODULE.summarize_checks(self.rollup(*names)),
+        }
+        with mock.patch.object(MODULE, "utc_now", return_value=now):
+            MODULE.apply_check_coverage(state, seen)
+        return seen
+
+    def test_the_first_head_seen_is_only_recorded(self):
+        state: dict = {}
+        seen = self.observe(state, HEAD, "build", "test")
+        self.assertEqual("success", seen["checks"]["state"])
+        self.assertEqual("unverified", seen["checks"]["coverage"]["state"])
+        self.assertEqual(HEAD, state["checks_seen"]["head_sha"])
+        self.assertEqual(["build", "test"], state["checks_seen"]["names"])
+        self.assertNotIn("checks_expected", state)
+
+    def test_a_partial_rollup_at_a_new_head_reports_pending(self):
+        state: dict = {}
+        self.observe(state, HEAD, "build", "test")
+        seen = self.observe(state, NEXT_HEAD, "build", now="2024-01-01T00:00:10Z")
+        self.assertEqual("pending", seen["checks"]["state"])
+        self.assertEqual("incomplete", seen["checks"]["coverage"]["state"])
+        self.assertEqual(["test"], seen["checks"]["coverage"]["missing"])
+        self.assertEqual(HEAD, state["checks_expected"]["head_sha"])
+
+    def test_a_complete_rollup_at_a_new_head_stays_success(self):
+        state: dict = {}
+        self.observe(state, HEAD, "build", "test")
+        seen = self.observe(
+            state, NEXT_HEAD, "build", "test", now="2024-01-01T00:00:10Z"
+        )
+        self.assertEqual("success", seen["checks"]["state"])
+        self.assertEqual("complete", seen["checks"]["coverage"]["state"])
+
+    def test_a_smaller_set_is_accepted_once_the_wait_is_spent(self):
+        state: dict = {}
+        self.observe(state, HEAD, "build", "test")
+        self.observe(state, NEXT_HEAD, "build", now="2024-01-01T00:00:10Z")
+        seen = self.observe(state, NEXT_HEAD, "build", now="2024-01-01T01:00:00Z")
+        self.assertEqual("success", seen["checks"]["state"])
+        self.assertEqual("settled_smaller", seen["checks"]["coverage"]["reason"])
+
+    def test_a_check_appearing_late_restarts_the_wait(self):
+        state: dict = {}
+        self.observe(state, HEAD, "build", "test", "lint")
+        self.observe(state, NEXT_HEAD, "build", now="2024-01-01T00:00:10Z")
+        self.observe(state, NEXT_HEAD, "build", "test", now="2024-01-01T01:00:00Z")
+        self.assertEqual("2024-01-01T01:00:00Z", state["checks_seen"]["changed_at"])
+        seen = self.observe(
+            state, NEXT_HEAD, "build", "test", now="2024-01-01T01:00:30Z"
+        )
+        self.assertEqual("pending", seen["checks"]["state"])
+        self.assertEqual(["lint"], seen["checks"]["coverage"]["missing"])
+
+    def test_names_seen_at_one_head_are_remembered_across_reads(self):
+        state: dict = {}
+        self.observe(state, HEAD, "build")
+        self.observe(state, HEAD, "test", now="2024-01-01T00:00:10Z")
+        self.assertEqual(["build", "test"], state["checks_seen"]["names"])
+
+    def test_coverage_never_turns_a_failure_into_something_softer(self):
+        state: dict = {}
+        self.observe(state, HEAD, "build", "test")
+        seen = {
+            "pr": base_pr(),
+            "head_sha": NEXT_HEAD,
+            "checks": MODULE.summarize_checks(
+                [{"name": "build", "status": "COMPLETED", "conclusion": "FAILURE"}]
+            ),
+        }
+        with mock.patch.object(MODULE, "utc_now", return_value="2024-01-01T00:00:10Z"):
+            MODULE.apply_check_coverage(state, seen)
+        self.assertEqual("failing", seen["checks"]["state"])
+
+    def test_an_empty_rollup_is_still_none_and_not_pending(self):
+        state: dict = {}
+        self.observe(state, HEAD, "build")
+        seen = self.observe(state, NEXT_HEAD, now="2024-01-01T00:00:10Z")
+        self.assertEqual("none", seen["checks"]["state"])
+
+    def test_the_base_commit_is_never_consulted(self):
+        self.assertFalse(hasattr(MODULE, "base_check_names"))
+
+
+class CorroborateMergeabilityTest(unittest.TestCase):
+    def test_the_two_fields_agreeing_on_mergeable_settles_it(self):
+        verdict = MODULE.corroborate_mergeability("MERGEABLE", "CLEAN")
+        self.assertTrue(verdict["settled"])
+        self.assertEqual("mergeable", verdict["state"])
+        self.assertEqual("corroborated", verdict["reason"])
+
+    def test_a_merge_blocked_by_review_is_still_free_of_conflicts(self):
+        verdict = MODULE.corroborate_mergeability("MERGEABLE", "BLOCKED")
+        self.assertTrue(verdict["settled"])
+        self.assertEqual("mergeable", verdict["state"])
+
+    def test_the_two_fields_agreeing_on_a_conflict_settles_it(self):
+        verdict = MODULE.corroborate_mergeability("CONFLICTING", "DIRTY")
+        self.assertTrue(verdict["settled"])
+        self.assertEqual("conflicting", verdict["state"])
+
+    def test_a_dirty_state_never_reads_as_mergeable(self):
+        verdict = MODULE.corroborate_mergeability("MERGEABLE", "DIRTY")
+        self.assertFalse(verdict["settled"])
+        self.assertEqual("conflicting", verdict["state"])
+        self.assertEqual("disagreed", verdict["reason"])
+
+    def test_an_unknown_merge_state_settles_nothing(self):
+        for status in ("UNKNOWN", "", None):
+            with self.subTest(status=status):
+                verdict = MODULE.corroborate_mergeability("MERGEABLE", status)
+                self.assertFalse(verdict["settled"])
+                self.assertEqual("merge_state_unknown", verdict["reason"])
+
+    def test_an_unknown_mergeable_settles_nothing(self):
+        verdict = MODULE.corroborate_mergeability("UNKNOWN", "CLEAN")
+        self.assertFalse(verdict["settled"])
+        self.assertEqual("unsettled", verdict["state"])
+        self.assertEqual("mergeable_unknown", verdict["reason"])
+
+    def test_a_conflict_the_merge_state_denies_settles_nothing(self):
+        verdict = MODULE.corroborate_mergeability("CONFLICTING", "CLEAN")
+        self.assertFalse(verdict["settled"])
+        self.assertEqual("disagreed", verdict["reason"])
+
+    def test_a_dirty_state_beside_an_unknown_mergeable_is_still_not_green(self):
+        verdict = MODULE.corroborate_mergeability(None, "DIRTY")
+        self.assertFalse(verdict["settled"])
+        self.assertEqual("conflicting", verdict["state"])
+        self.assertEqual("mergeable_unknown", verdict["reason"])
+
+    def test_a_value_nobody_recognises_settles_nothing(self):
+        verdict = MODULE.corroborate_mergeability("SOMEDAY", "CLEAN")
+        self.assertFalse(verdict["settled"])
+        self.assertEqual("unrecognized", verdict["reason"])
+
+    def test_the_fields_are_read_case_insensitively(self):
+        verdict = MODULE.corroborate_mergeability("mergeable", "clean")
+        self.assertTrue(verdict["settled"])
+
+
+class ObservePullRequestTest(unittest.TestCase):
+    def payload(self, *, head: str = HEAD, mergeable: str, status: str) -> dict:
+        return {
+            "number": 7,
+            "title": "A pull request",
+            "state": "OPEN",
+            "isDraft": True,
+            "mergeable": mergeable,
+            "mergeStateStatus": status,
+            "headRefName": "topic",
+            "headRefOid": head,
+            "headRepositoryOwner": {"login": "owner"},
+            "headRepository": {"name": "repo"},
+            "baseRefName": "main",
+            "baseRefOid": "base1",
+            "statusCheckRollup": [
+                {"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"}
+            ],
+        }
+
+    def observe(self, *responses, known_head_sha: str | None = None):
+        self.sleeps: list[float] = []
+        with mock.patch.object(MODULE, "gh_json", side_effect=list(responses)) as reader:
+            with mock.patch.object(MODULE, "time") as clock:
+                clock.sleep = self.sleeps.append
+                result = MODULE.observe_pull_request(
+                    MODULE.build_target("owner", "repo", 7),
+                    known_head_sha=known_head_sha,
+                )
+        self.reads = reader.call_count
+        return result
+
+    def test_a_corroborated_answer_is_taken_on_the_first_read(self):
+        result = self.observe(self.payload(mergeable="MERGEABLE", status="CLEAN"))
+        self.assertEqual(1, self.reads)
+        self.assertTrue(result["mergeability"]["settled"])
+        self.assertFalse(result["reads"]["head_moved_on_last_read"])
+
+    def test_an_unknown_answer_is_asked_again_until_the_delays_run_out(self):
+        unknown = self.payload(mergeable="UNKNOWN", status="UNKNOWN")
+        result = self.observe(*[unknown] * (len(MODULE.MERGEABLE_RETRY_DELAYS) + 1))
+        self.assertEqual(len(MODULE.MERGEABLE_RETRY_DELAYS) + 1, self.reads)
+        self.assertFalse(result["mergeability"]["settled"])
+
+    def test_two_fields_that_disagree_are_asked_again(self):
+        result = self.observe(
+            self.payload(mergeable="MERGEABLE", status="DIRTY"),
+            self.payload(mergeable="CONFLICTING", status="DIRTY"),
+        )
+        self.assertEqual(2, self.reads)
+        self.assertEqual("conflicting", result["mergeability"]["state"])
+
+    def test_the_first_answer_after_a_push_is_never_taken(self):
+        result = self.observe(
+            self.payload(head=NEXT_HEAD, mergeable="MERGEABLE", status="CLEAN"),
+            self.payload(head=NEXT_HEAD, mergeable="CONFLICTING", status="DIRTY"),
+            known_head_sha=HEAD,
+        )
+        self.assertEqual(2, self.reads)
+        self.assertEqual("conflicting", result["mergeability"]["state"])
+        self.assertTrue(result["reads"]["head_moved"])
+        self.assertFalse(result["reads"]["head_moved_on_last_read"])
+
+    def test_a_head_moving_on_every_read_leaves_the_last_one_uncorroborated(self):
+        result = self.observe(
+            *[
+                self.payload(head=f"sha{index}", mergeable="MERGEABLE", status="CLEAN")
+                for index in range(len(MODULE.MERGEABLE_RETRY_DELAYS) + 1)
+            ],
+            known_head_sha=HEAD,
+        )
+        self.assertTrue(result["reads"]["head_moved_on_last_read"])
+
+    def test_a_first_read_with_no_earlier_head_is_not_a_push(self):
+        result = self.observe(self.payload(mergeable="MERGEABLE", status="CLEAN"))
+        self.assertFalse(result["reads"]["head_moved"])
+
+    def test_the_rollup_names_reach_the_summary_unjudged(self):
+        result = self.observe(self.payload(mergeable="MERGEABLE", status="CLEAN"))
+        self.assertEqual(["build"], result["checks"]["names"])
+        self.assertEqual("unverified", result["checks"]["coverage"]["state"])
+        self.assertEqual("not_judged", result["checks"]["coverage"]["reason"])
+
+
+class GithubEvidenceTest(unittest.TestCase):
+    def verdict(self, stage: str, observed: dict) -> dict:
+        return MODULE.stage_green(
+            MODULE.STAGE_BY_NAME[stage],
+            head_sha=HEAD,
+            cleared={},
+            marker=observed["stage_markers"][stage],
+            observation=observed,
+        )
+
+    def test_a_corroborated_mergeable_clears_the_conflict_stage(self):
+        verdict = self.verdict(MODULE.STAGE_CONFLICT, observation())
+        self.assertTrue(verdict["green"])
+
+    def test_an_uncorroborated_mergeable_does_not_clear_it(self):
+        verdict = self.verdict(
+            MODULE.STAGE_CONFLICT,
+            observation(mergeable="MERGEABLE", merge_state_status="UNKNOWN"),
+        )
+        self.assertFalse(verdict["green"])
+        self.assertEqual("merge_state_unknown", verdict["reason"])
+
+    def test_a_mergeable_answer_read_right_after_a_push_does_not_clear_it(self):
+        verdict = self.verdict(
+            MODULE.STAGE_CONFLICT, observation(head_moved_on_last_read=True)
+        )
+        self.assertFalse(verdict["green"])
+        self.assertEqual("head_moved", verdict["reason"])
+
+    def test_an_observation_with_no_mergeability_at_all_does_not_clear_it(self):
+        observed = observation()
+        observed.pop("mergeability")
+        verdict = self.verdict(MODULE.STAGE_CONFLICT, observed)
+        self.assertFalse(verdict["green"])
+        self.assertEqual("not_observed", verdict["reason"])
+
+    def test_a_passing_rollup_clears_the_check_stage(self):
+        verdict = self.verdict(MODULE.STAGE_CI, observation())
+        self.assertTrue(verdict["green"])
+
+    def test_a_passing_rollup_read_right_after_a_push_does_not_clear_it(self):
+        verdict = self.verdict(
+            MODULE.STAGE_CI, observation(head_moved_on_last_read=True)
+        )
+        self.assertFalse(verdict["green"])
+        self.assertEqual("head_moved", verdict["reason"])
+
+    def test_an_incomplete_rollup_sends_the_check_stage_round_again(self):
+        observed = observation(
+            checks="pending",
+            coverage={
+                "state": "incomplete",
+                "reason": "missing_earlier_checks",
+                "missing": ["test"],
+            },
+            self_review=HEAD,
+            copilot_review=HEAD,
+            description=HEAD,
+        )
+        decision = MODULE.decide_next(build_state(), observed)
+        self.assertEqual("run_stage", decision["result"])
+        self.assertEqual(MODULE.STAGE_CI, decision["stage"])
+        self.assertEqual(
+            ["test"], decision["stage_states"][MODULE.STAGE_CI]["missing_checks"]
+        )
+
+    def test_a_conflict_the_two_fields_disagree_about_sends_the_stage_round_again(self):
+        observed = observation(mergeable="MERGEABLE", merge_state_status="DIRTY")
+        decision = MODULE.decide_next(build_state(), observed)
+        self.assertEqual("run_stage", decision["result"])
+        self.assertEqual(MODULE.STAGE_CONFLICT, decision["stage"])
 
 
 class StageMarkerTest(unittest.TestCase):
@@ -1461,8 +1841,19 @@ class NextCommandTest(CommandTestCase):
         with mock.patch.object(MODULE, "require_tools"):
             with mock.patch.object(
                 MODULE, "collect_observation", return_value=observed
-            ):
+            ) as collector:
                 MODULE.command_next(self.args(state=str(path), effort="high"))
+        self.collector = collector
+
+    def test_the_head_it_last_saw_is_carried_into_the_next_look(self):
+        path = write_state(self.root, observed_head_sha=HEAD)
+        self.call_next(path, observation(head_sha=NEXT_HEAD))
+        self.assertEqual(HEAD, self.collector.call_args.kwargs["known_head_sha"])
+
+    def test_the_head_it_just_saw_is_remembered_for_the_next_look(self):
+        path = write_state(self.root)
+        self.call_next(path, observation(head_sha=NEXT_HEAD))
+        self.assertEqual(NEXT_HEAD, MODULE.load_state(path)["observed_head_sha"])
 
     def test_a_runnable_stage_returns_a_launch_plan(self):
         path = write_state(self.root)
@@ -1706,6 +2097,32 @@ class PreflightCommandTest(CommandTestCase):
         self.call_preflight(observation())
         self.call_preflight(observation())
         self.assertTrue(self.emitted[-1]["resumed"])
+
+    def test_a_fresh_run_remembers_the_head_it_saw(self):
+        self.call_preflight(observation(head_sha=NEXT_HEAD))
+        state = MODULE.load_state(self.root / "pipeline.json")
+        self.assertEqual(NEXT_HEAD, state["observed_head_sha"])
+
+    def test_a_resumed_run_carries_the_head_it_last_saw_into_the_look(self):
+        self.call_preflight(observation())
+        with mock.patch.object(MODULE, "require_tools"):
+            with mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=self.root
+            ):
+                with mock.patch.object(
+                    MODULE, "collect_observation", return_value=observation()
+                ) as collector:
+                    MODULE.command_preflight(
+                        self.args(
+                            target="owner/repo#7",
+                            repo_root=str(self.root),
+                            state=str(self.root / "pipeline.json"),
+                            max_iterations=2,
+                            stage_model=None,
+                            no_pin=False,
+                        )
+                    )
+        self.assertEqual(HEAD, collector.call_args.kwargs["known_head_sha"])
 
     def test_a_closed_pull_request_is_refused(self):
         with self.assertRaises(MODULE.WorkflowError) as error:
@@ -2003,6 +2420,45 @@ class AgentInstructionsTest(unittest.TestCase):
             "A stage saying how its own run ended is not evidence of greenness.",
             self.instructions,
         )
+
+    def test_it_says_an_uncorroborated_answer_leaves_a_stage_not_green(self):
+        self.assertIn(
+            "an answer it cannot corroborate leaves the stage **not green**",
+            self.instructions,
+        )
+        self.assertIn("Mergeability lags the head.", self.instructions)
+        self.assertIn("A check rollup can be incomplete.", self.instructions)
+
+    def test_it_admits_the_guards_are_not_proofs(self):
+        self.assertIn(
+            "Neither guard is a proof, and neither is written as one.",
+            self.instructions,
+        )
+        self.assertIn(
+            "no GitHub field says which commit a mergeability answer was computed "
+            "at",
+            self.instructions.replace("No GitHub field", "no GitHub field"),
+        )
+
+    def test_it_rules_out_the_base_commit_as_a_coverage_reference(self):
+        self.assertIn(
+            "The previous head of the same pull request is the only sound reference",
+            self.instructions,
+        )
+        self.assertIn(
+            "The base branch commit is not one, because the base and the head are "
+            "reached by different triggers",
+            self.instructions,
+        )
+
+    def test_it_says_every_guard_has_a_way_out(self):
+        self.assertIn(
+            "Every one of these guards has a way out, because a stage held not "
+            "green by something that can never clear is a deadlock rather than a "
+            "conservative failure.",
+            self.instructions,
+        )
+        self.assertIn("the wait for missing checks is bounded", self.instructions)
 
     def test_it_names_every_stage_plugin_qualified(self):
         self.assertIn(

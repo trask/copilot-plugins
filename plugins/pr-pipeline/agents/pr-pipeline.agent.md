@@ -100,8 +100,19 @@ A stage is green only at the current head commit. New commits on the head branch
 
 Two kinds of evidence exist, and the helper picks the right one:
 
-- **Live GitHub facts.** The conflict stage is green when `mergeable` is `MERGEABLE`, and the check stage is green when the rollup at the current head passes. GitHub already states these facts, so the helper clears those stages from live evidence without launching an agent that would have nothing to do. An empty rollup counts as `none`, never as success, so a repository with no applicable checks still runs the check stage and gets a note rather than a silent pass.
+- **Live GitHub facts.** The conflict stage is green when GitHub says the pull request merges cleanly, and the check stage is green when the rollup at the current head passes. GitHub already states these facts, so the helper clears those stages from live evidence without launching an agent that would have nothing to do. An empty rollup counts as `none`, never as success, so a repository with no applicable checks still runs the check stage and gets a note rather than a silent pass.
 - **On-disk judgments.** The three review and description stages produce judgments with no GitHub representation. Their own `status` subcommands hold the only truth, so those stages are green only when their helper recorded a clean result at this exact head.
+
+Neither GitHub fact is simply true the moment GitHub returns it, and the helper corroborates both before it calls a stage green:
+
+- **Mergeability lags the head.** GitHub computes it in the background, so one response can carry a fresh head commit beside an answer computed against the head it replaced. `UNKNOWN` covers only the interval while GitHub recomputes, so waiting for `UNKNOWN` to clear does not rule that out. The helper refuses the first answer after the head moved, refuses an answer whose `mergeable` and `mergeStateStatus` contradict each other, and treats `DIRTY` as conflicting.
+- **A check rollup can be incomplete.** Each check run belongs to a commit, so the rollup is never about the wrong commit, but right after a push GitHub may have registered only the quickest workflows. A rollup with two passing entries and nothing pending looks exactly like a finished green one. The helper refuses the first rollup after the head moved, and compares the check names against the set this same pull request ran at its previous head: a strict subset means the run is still registering, and the honest state is `pending`.
+
+Neither guard is a proof, and neither is written as one. No GitHub field says which commit a mergeability answer was computed at, and none says how many checks a commit will eventually run. What the helper guarantees is the direction of the doubt: an answer it cannot corroborate leaves the stage **not green**. That costs one run of a stage that reads a real answer and stops. The opposite mistake reports a broken pull request as finished.
+
+The previous head of the same pull request is the only sound reference for that comparison. The base branch commit is not one, because the base and the head are reached by different triggers: a `pull_request` workflow runs for the head and never for the base, and a `push` workflow may run for the base and never for the head. Measuring the head against the base would fire never on some repositories and forever on others.
+
+Every one of these guards has a way out, because a stage held not green by something that can never clear is a deadlock rather than a conservative failure. A commit may legitimately run fewer checks than the one before it, since a path filter really does exclude a workflow from a docs-only change. So the wait for missing checks is bounded: once a few minutes pass with no new check name appearing at this head, the helper accepts the smaller set as complete and the stage may go green.
 
 A stage saying how its own run ended is not evidence of greenness. A stage that reports `cleared` still does not make a GitHub-evidence stage green, because GitHub is the only thing that may retract that fact.
 
