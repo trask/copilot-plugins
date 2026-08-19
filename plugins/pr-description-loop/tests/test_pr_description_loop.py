@@ -226,16 +226,42 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "If the current text is strong, recommend keeping it and ask only for "
-            "explicit approval",
+            "Keep the current title and description only when they are already "
+            "essentially ideal",
             self.instructions,
         )
         self.assertIn(
-            "If the text is weak, explain briefly why and show a complete replacement",
+            '"Good enough," broadly accurate, or easy to improve does not meet this '
+            "threshold",
+            self.instructions,
+        )
+        self.assertIn(
+            "If a fresh draft would be meaningfully clearer, shorter, more complete, "
+            "or easier to scan, replace the current text",
             self.instructions,
         )
         self.assertIn(
             "Do not first ask whether the current text looks good",
+            self.instructions,
+        )
+
+    def test_redrafts_replacements_from_the_authoritative_diff(self):
+        self.assertIn(
+            "Build every replacement from scratch from the authoritative diff",
+            self.instructions,
+        )
+        self.assertIn(
+            "Do not incrementally edit the current body, preserve its outline, or "
+            "treat its wording as the draft you must improve",
+            self.instructions,
+        )
+        self.assertIn(
+            "Independently choose the shortest scan-friendly structure and wording",
+            self.instructions,
+        )
+        self.assertIn(
+            "Retain an essential fact or exact example from the current text only "
+            "when the diff supports it and the fresh proposal needs it",
             self.instructions,
         )
 
@@ -256,13 +282,14 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
-    def test_keeps_strong_text_approval_single_path_and_resolves_optional_concerns(self):
+    def test_keeps_ideal_text_approval_single_path_and_resolves_optional_concerns(self):
         self.assertIn(
-            "ask only for explicit approval of the exact title and body you displayed",
+            "Ask only for explicit approval of the exact current title and description "
+            "you displayed",
             self.instructions,
         )
         self.assertIn(
-            "Do not pair that request with an offer to make an optional extra change",
+            "Do not offer a competing optional rewrite",
             self.instructions,
         )
         self.assertIn(
@@ -509,7 +536,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.20")
+        self.assertEqual(plugin["version"], "1.0.21")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 

@@ -15,7 +15,8 @@ You work with the user on one pull request's title and description. Always show 
 - Use the helper to run preflight, to store a proposal, to apply it, to validate, to report status, and to clean up. Do not rebuild those state changes with commands of your own.
 - After preflight, read the authoritative pull request diff. Then show the current title and current description before your evaluation and before any proposal, following "Displaying Title And Description".
 - Evaluate the current text against the diff at once, for clarity, concision, consistency, and scope. Never insert a neutral "does this look good?" turn before you give your judgment.
-- If the current text is strong, recommend keeping it and ask only for explicit approval of the exact title and body you displayed. Do not pair that request with an offer to make an optional extra change. If the text is weak, explain briefly why and show a complete replacement for explicit approval in the same response.
+- Keep the current title and description only when they are already essentially ideal: accurate, complete, concise, scan-friendly, and shaped as well as a fresh draft would be. Otherwise explain the concrete problem briefly and show a complete replacement for explicit approval in the same response.
+- Build every replacement from scratch from the authoritative diff. Do not incrementally edit the current body, preserve its outline, or treat its wording as the draft you must improve. Independently choose the shortest scan-friendly structure and wording. You may retain an essential fact or exact example from the current text only when the diff supports it and it belongs in the best fresh proposal.
 - Before you display any replacement title or description, invoke the globally installed `unslop` skill with the `skill` tool and apply its process to the complete candidate title and body. Repeat this before every revised proposal. Once you display a proposal, do not run `unslop` again or change either value before approval and apply. Any later wording change is a new revision that needs another complete display and fresh approval.
 - Never change GitHub unless the user explicitly approves the exact title and the exact body in this session. Silence, absence of objection, earlier instructions, approval of different text, a stored memory, and intent you infer are not approval.
 - If the user explicitly approves the current text, validate it with `validate --no-change`. Do not run `propose` or `apply`.
@@ -101,7 +102,9 @@ Stop on the exact helper error. Never work around a head mismatch or a stale tit
 
 ## Current Text Evaluation And Approval
 
-If the current title and description are strong:
+Keep the current title and description only when they are already essentially ideal. "Good enough," broadly accurate, or easy to improve does not meet this threshold. Compare them with the best fresh title and body you can derive from the authoritative diff. If a fresh draft would be meaningfully clearer, shorter, more complete, or easier to scan, replace the current text.
+
+If the current title and description are essentially ideal:
 
 1. Say clearly that you recommend keeping them.
 2. Ask only for explicit approval of the exact current title and description you displayed. Do not offer a competing optional rewrite, and do not ask in the same turn whether the user would prefer an alternative. If a possible tweak does not change your recommendation, leave it out.
@@ -114,10 +117,10 @@ When the user explicitly approves:
 2. If validation reports that the head moved or the text changed, do not treat the earlier answer as approval. Start again from preflight and show the new current values.
 3. On success, stop and report the validated title and the canonical pull request URL briefly.
 
-If the current title or description is weak:
+Otherwise:
 
-1. Explain the concrete problem briefly, in terms of clarity, concision, consistency, or scope.
-2. Continue straight to proposal development and present a complete replacement, with its `**What changed**` summary, in the same response. Do not first ask whether the current text looks good.
+1. Explain the concrete problem briefly, in terms of clarity, concision, consistency, scope, or structure.
+2. Continue straight to proposal development and present a complete replacement, with its `**What changed**` summary, in the same response. Do not first ask whether the current text looks good, and do not ask whether the user wants a rewrite.
 
 Feedback, a rejection, or a request for improvement is not permission to change anything.
 
@@ -140,7 +143,7 @@ These rules govern the wording of everything you write for a person to read: pul
 
 ## Proposal Development
 
-1. Use the authoritative diff you already read to understand the whole change. Write the wording of both values under **Plain Language**, and give the description this shape:
+1. Use the authoritative diff you already read to understand the whole change. Draft a fresh, complete title and body from that diff rather than editing the current text. Do not preserve the current body's structure by default, work through it section by section, or use it as the outline for the proposal. Independently choose the shortest scan-friendly structure and wording. Retain an essential fact or exact example from the current text only when the diff supports it and the fresh proposal needs it. Write both values under **Plain Language**, and give the description this shape:
    - Be aggressive about cutting the body. Assume the first draft is at least twice as long as it needs to be, then make every sentence earn its place. Prefer the shortest body that preserves the context a user needs.
    - The entire body is the summary; never add a `Summary`, `Details`, or `Testing` header.
    - Open with a short paragraph that has no heading and states the user-visible outcome. Lead with what changes and why it matters, not with how it works inside.
