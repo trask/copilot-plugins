@@ -87,6 +87,7 @@ FAILED_BASELINE_CONCLUSIONS = {
 PASSED_BASELINE_CONCLUSIONS = {"SUCCESS"}
 APPROVAL_RUN_STATES = {"ACTION_REQUIRED", "WAITING"}
 VERDICTS = ("pr_caused", "pre_existing", "flake")
+WORKING_ACTIONS = ("attribute", "rerun", "fix")
 ESCALATION_REASONS = (
     "approval_required",
     "checks_never_started",
@@ -1279,6 +1280,20 @@ def next_action(state: dict[str, Any], decision: dict[str, Any]) -> dict[str, An
     }
 
 
+def charge_iteration(state: dict[str, Any], run_state: dict[str, Any]) -> bool:
+    """Spend an iteration on the current run, once, when it has real work to do.
+
+    A launch that reads the checks and finds nothing to fix costs nothing. Only a
+    run that reaches attribution, a re-run, or a fix spends one, so relaunching the
+    loop at a head whose checks already passed can never exhaust the cap.
+    """
+    if run_state.get("charged"):
+        return False
+    run_state["charged"] = True
+    state["iterations"] = int(state.get("iterations", 0)) + 1
+    return True
+
+
 def parse_run_reference(url: Any) -> dict[str, int] | None:
     """Pull the Actions run and job identifiers out of a check's details URL."""
     if not isinstance(url, str) or not url:
@@ -1474,9 +1489,15 @@ def command_preflight(args: argparse.Namespace) -> None:
                 "batches": [],
                 "tracking": {},
                 "decision": None,
+                "charged": False,
             },
         }
     )
+    # A relaunch reads the checks again from GitHub, which is the only thing that
+    # states whether they pass and the only thing that may retract it. Drop the
+    # outcome the previous run recorded so nothing reports a stale clearance.
+    state["outcome"] = None
+    state["clean_at_head_sha"] = None
     if result == "max_iterations_reached":
         state["escalation"] = {
             "reason": "max_iterations_reached",
@@ -1490,9 +1511,7 @@ def command_preflight(args: argparse.Namespace) -> None:
             "recorded_at": utc_now(),
         }
     else:
-        # The cap counts iterations this loop started, so an iteration that
-        # escalates without publishing still spends one.
-        state["iterations"] = iteration
+        state["escalation"] = None
     save_state(state_path, state)
 
     preflight_path = preflight_path_for(state_path)
@@ -1644,6 +1663,8 @@ def command_checks(args: argparse.Namespace) -> None:
         "action": action["action"],
         "observed_at": utc_now(),
     }
+    if action["action"] in WORKING_ACTIONS:
+        charge_iteration(state, run_state)
     if action["action"] == "escalate":
         state["escalation"] = {
             "reason": action["reason"],
@@ -2144,6 +2165,23 @@ def command_publish(args: argparse.Namespace) -> None:
     )
 
 
+def stage_outcome(state: dict[str, Any]) -> str:
+    """Name this run's ending in the vocabulary an orchestrator records.
+
+    A pipeline reads greenness from GitHub rather than from here, so this states
+    only how the loop itself ended: `skipped` when the head ran no applicable
+    checks, `no_progress` when it neither cleared nor escalated nor moved the head.
+    """
+    if state.get("escalation"):
+        return "escalated"
+    outcome = state.get("outcome")
+    if outcome == "no_checks":
+        return "skipped"
+    if outcome == "green":
+        return "cleared"
+    return "no_progress"
+
+
 def status_payload(state: dict[str, Any], path: Path) -> dict[str, Any]:
     pr = state["pr"]
     run_state = state.get("run") or {}
@@ -2156,6 +2194,7 @@ def status_payload(state: dict[str, Any], path: Path) -> dict[str, Any]:
         "reruns": state.get("reruns") or {},
         "escalation": state.get("escalation"),
         "outcome": state.get("outcome"),
+        "stage_outcome": stage_outcome(state),
         "clean_at_head_sha": state.get("clean_at_head_sha"),
         "skip_note": state.get("skip_note"),
         "iterations": int(state.get("iterations", 0)),
@@ -2177,6 +2216,7 @@ def command_status(args: argparse.Namespace) -> None:
                     "run": None,
                     "escalation": None,
                     "outcome": None,
+                    "stage_outcome": "no_progress",
                     "clean_at_head_sha": None,
                     "history": [],
                 }
@@ -2217,6 +2257,7 @@ def command_status(args: argparse.Namespace) -> None:
                 "batch_statuses": count_by_status(run_state.get("batches")),
             },
             "outcome": state.get("outcome"),
+            "stage_outcome": stage_outcome(state),
             "clean_at_head_sha": state.get("clean_at_head_sha"),
             "skip_note": state.get("skip_note"),
             "escalation": state.get("escalation"),

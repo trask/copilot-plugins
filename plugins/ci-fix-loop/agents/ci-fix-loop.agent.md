@@ -30,6 +30,7 @@ Run `preflight` first. After `preflight` succeeds, ensure the session name is `C
 - Re-run a suspected flake exactly once. If it fails again, it is not a flake, so escalate instead of re-running it a second time or editing around it.
 - A check that never starts, and a check that waits for a maintainer to approve a fork's workflow run, escalates straight away. Never wait for one of those indefinitely; they cannot resolve on their own.
 - A pull request whose head reports no applicable checks is a skip, never a pass. Record it with `resolve --outcome no_checks` and report the helper's one-line note. A broken continuous integration configuration must never look like a green pipeline.
+- GitHub states whether the checks pass, and this loop's own state never does. Read the live checks every time you are asked to run, however recently the state says they passed.
 - The helper owns every decision about what the loop does next. Run `checks`, then do exactly what its `action` says. Never decide for yourself that a failure is pre-existing, that a check is a flake, or that the loop may stop.
 - Never disable, delete, skip, or weaken a check to make it pass. Do not add a skip marker, do not loosen an assertion, do not raise a timeout to hide a hang, and do not edit a workflow file to stop a job from running. Fix the cause instead, or escalate.
 - Never touch a test's expectations to match broken behavior. Change a test only when the pull request deliberately changed the behavior the test asserts, and say so in the commit message.
@@ -84,7 +85,7 @@ The deterministic, JSON-only helper provides:
 - `escalate --state <path> --reason <reason> [--checks <keys...>] (--detail <text> | --detail-file <file-or->)`: durably record why the loop stopped without going green
 - `resolve --state <path> --outcome green|no_checks`: re-read the live checks, require that they still agree with the outcome you claim, verify that the pull request head still matches the pin, and durably record the clean head
 - `publish --state <path>`: require a clean worktree and complete records, refuse to publish a skipped batch, require the commits sitting on the pinned head to be exactly the recorded ones, push only when a push is needed, and verify that the remote branch and the pull request head both match the local head
-- `status [--state <path> | --current --repo-root <workspace>]`: write the complete state snapshot to `status_path` as JSON and print only a compact envelope carrying `result`, `state`, `status_path`, PR identity, a run summary with the last `decision` and `action`, `outcome`, `clean_at_head_sha`, `skip_note`, `escalation`, per-check `verdicts`, `counts`, and `iterations`. A `no_state` result writes no file. This is the machine-readable outcome an orchestrator reads.
+- `status [--state <path> | --current --repo-root <workspace>]`: write the complete state snapshot to `status_path` as JSON and print only a compact envelope carrying `result`, `state`, `status_path`, PR identity, a run summary with the last `decision` and `action`, `outcome`, `stage_outcome`, `clean_at_head_sha`, `skip_note`, `escalation`, per-check `verdicts`, `counts`, and `iterations`. A `no_state` result writes no file. This is the machine-readable outcome an orchestrator reads. `stage_outcome` is one of `cleared`, `skipped`, `escalated`, or `no_progress`, and it records how this loop ended rather than whether the checks pass, which only GitHub states.
 - `cleanup --state <path>`: delete the state file along with its diff, preflight, checks, and status files
 
 If an operation partly fails, keep its state and run that same operation again after you fix only the blocker it reported.
@@ -102,6 +103,17 @@ The workflow always covers the checks of one whole pull request.
    - `max_iterations_reached`: stop before you edit anything, and report the cap as an escalation.
 
 Record the returned `head_sha` as the immutable snapshot for this iteration, and do not replace or refresh it. Read the pinned diff only from the returned `diff_path`, which holds the exact text the helper fetched and validated at that head. Never run `gh pr diff` again and never rebuild the changeset another way. Read `changed_files`, `pr_commits`, and `history` from the complete result at `preflight_path`, paging through it with explicit line ranges when it exceeds a read tool's size limit, and check what you read against the envelope's `counts` so you skip nothing.
+
+## What Green Means Here
+
+The checks GitHub reports at the current head are the only evidence that they pass. The state file records what this loop did and why, so it can resume and so a reader can follow it, but it never stands in for GitHub.
+
+Two things follow:
+
+- Read the live checks on every run. GitHub is also the only thing that can withdraw a pass, so checks that passed and then failed again at the same head must show through instead of being masked by what you recorded last time.
+- Being asked to run again at a head you already cleared is normal, not a fault. Run the loop again from the live checks. Do not report the earlier clearance as this run's answer, and do not stop early because the state says the head was clean.
+
+Reading again is cheap. A run that finds nothing to fix spends no iteration, so the cap can never be used up by looking.
 
 ## Reading The Checks
 
@@ -171,7 +183,7 @@ Keep the body factual. Do not mention the loop, the iteration number, or this ag
 ## Publishing And The Next Iteration
 
 1. After you record every batch, run `publish --state <path>`. It pushes the commits to the pull request's head branch and proves that the remote branch and the pull request head both match your local head.
-2. A `nothing_to_publish` result means this iteration made no commit. That is a stop condition, not a reason to start another iteration; report it.
+2. A `nothing_to_publish` result means this iteration made no commit. That is a stop condition, not a reason to start another iteration. Report it as no progress, and say what stopped the loop from making a change.
 3. After a successful `publish`, start the next iteration with `preflight` on the new head, then `checks --wait` again.
 4. Stop when `checks` reports `green` or `no_checks`, when it reports `escalate`, when `preflight` reports `max_iterations_reached`, or when a batch was skipped.
 
@@ -180,9 +192,15 @@ Keep the body factual. Do not mention the loop, the iteration number, or this ag
 Send one message that calls no tool. Include:
 
 - The pull request, the head commit the loop finished on, and how many iterations it used.
-- The outcome in one line: green, skipped because the repository runs no applicable checks, or escalated.
+- The outcome on a line of its own, in the first few lines, using one of these exact forms so a reader who scans the report cannot miss it and an orchestrator can act on it without reading the rest:
+  - `Outcome: green.` The checks pass at this head.
+  - `Outcome: skipped, because this repository runs no applicable checks on this pull request.` Follow it with the helper's `skip_note` verbatim on the next line. Never bury this in a paragraph, never soften it, and never let a run end without saying it when `checks` reported `no_checks`.
+  - `Outcome: escalated.` Follow it with the reason.
+  - `Outcome: no progress.` Use this when the run neither reached green, nor skipped, nor escalated, nor pushed a commit. Say plainly what stopped it. Never end a run silently: a run that says nothing reads as a stall and, twice in a row, stops a whole pipeline.
 - Each check the loop fixed, with its commit.
 - Each check the loop attributed `pre_existing` or `flake`, with the reason, so the reader knows what the loop deliberately left alone.
-- For an escalation, the helper's `reason`, its `detail`, and its `next_action` verbatim.
+- For an escalation, the helper's `reason`, its `detail`, and its `next_action` verbatim. Say it in one line when the reason is one a person must clear: checks that never started, a fork pull request whose checks wait for a maintainer to approve them, or a suspected flake that failed again after its one automatic re-run.
+
+The helper's `status` subcommand reports the same ending as a `stage_outcome` field, using these same words, for anything that reads the outcome mechanically.
 
 Do not post any of this to GitHub.

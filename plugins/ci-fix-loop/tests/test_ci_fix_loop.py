@@ -279,6 +279,7 @@ class AgentInstructionsTest(unittest.TestCase):
             "## Non-Negotiable Rules",
             "## Plain Language",
             "## Target And Preflight",
+            "## What Green Means Here",
             "## Reading The Checks",
             "## Attributing A Failure",
             "## Fixing A Failure",
@@ -287,6 +288,50 @@ class AgentInstructionsTest(unittest.TestCase):
             "## Final Report",
         ):
             self.assertIn(heading, self.instructions)
+
+    def test_reads_greenness_from_github_rather_than_from_its_own_state(self):
+        self.assertIn(
+            "GitHub states whether the checks pass, and this loop's own state never "
+            "does.",
+            self.instructions,
+        )
+        self.assertIn(
+            "checks that passed and then failed again at the same head must show "
+            "through",
+            self.instructions,
+        )
+
+    def test_treats_a_relaunch_at_a_cleared_head_as_ordinary(self):
+        self.assertIn(
+            "Being asked to run again at a head you already cleared is normal, not a "
+            "fault.",
+            self.instructions,
+        )
+        self.assertIn(
+            "A run that finds nothing to fix spends no iteration", self.instructions
+        )
+
+    def test_states_a_skip_an_orchestrator_cannot_miss(self):
+        self.assertIn(
+            "`Outcome: skipped, because this repository runs no applicable checks on "
+            "this pull request.`",
+            self.instructions,
+        )
+        self.assertIn("the helper's `skip_note` verbatim", self.instructions)
+        self.assertIn(
+            "never let a run end without saying it when `checks` reported "
+            "`no_checks`",
+            self.instructions,
+        )
+
+    def test_never_ends_a_run_silently(self):
+        self.assertIn("`Outcome: no progress.`", self.instructions)
+        self.assertIn(
+            "a run that says nothing reads as a stall and, twice in a row, stops a "
+            "whole pipeline",
+            self.instructions,
+        )
+        self.assertIn("Report it as no progress", self.instructions)
 
     def test_ends_the_run_with_a_single_terminal_response(self):
         self.assertIn(
@@ -1521,6 +1566,28 @@ class ChecksCommandTest(unittest.TestCase):
         self.assertIn("not_started_since", run_state["tracking"]["check:a"])
         self.assertEqual("waiting", run_state["decision"]["decision"])
 
+    def test_spends_an_iteration_only_on_a_run_with_work_to_do(self):
+        for rollup, baseline, expected in (
+            ([check("check:a", klass="passed")], None, 0),
+            ([], None, 0),
+            ([check("check:a", klass="running")], None, 0),
+            ([check("check:a", name="build")], {"build": "FAILURE"}, 0),
+            ([check("check:a", name="build")], None, 1),
+            ([check("check:a", name="build")], {"build": "SUCCESS"}, 1),
+        ):
+            with self.subTest(expected=expected):
+                path = write_state(self.root, iterations=0)
+                self.read(path, ("head1", rollup), baseline)
+                self.assertEqual(expected, MODULE.load_state(path)["iterations"])
+
+    def test_charges_one_iteration_however_often_it_reads_the_checks(self):
+        path = write_state(self.root, iterations=0)
+        for _ in range(3):
+            self.read(
+                path, ("head1", [check("check:a", name="build")]), {"build": "SUCCESS"}
+            )
+        self.assertEqual(1, MODULE.load_state(path)["iterations"])
+
 
 class PublishCommandTest(unittest.TestCase):
     def setUp(self):
@@ -1739,6 +1806,63 @@ class StatusCommandTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             run_arguments("status")
 
+    def test_names_the_ending_in_the_vocabulary_an_orchestrator_records(self):
+        for overrides, expected in (
+            ({"outcome": "green"}, "cleared"),
+            ({"outcome": "no_checks", "skip_note": "no applicable checks"}, "skipped"),
+            ({"escalation": {"reason": "timeout"}}, "escalated"),
+            ({"outcome": "green", "escalation": {"reason": "timeout"}}, "escalated"),
+            ({}, "no_progress"),
+            ({"outcome": None}, "no_progress"),
+        ):
+            with self.subTest(expected=expected):
+                path = write_state(self.root, **overrides)
+                payload = call("status", "--state", str(path))
+                self.assertEqual(expected, payload["stage_outcome"])
+
+    def test_reports_the_skip_note_a_reader_cannot_mistake_for_a_pass(self):
+        path = write_state(
+            self.root,
+            outcome="no_checks",
+            skip_note=(
+                "CI Fix Loop skipped owner/repo#7: the pull request head reports no "
+                "applicable checks, so this repository ran no CI on it."
+            ),
+        )
+        payload = call("status", "--state", str(path))
+        self.assertEqual("skipped", payload["stage_outcome"])
+        self.assertIn("no applicable checks", payload["skip_note"])
+        self.assertIsNone(payload["clean_at_head_sha"])
+
+
+class StageOutcomeTest(unittest.TestCase):
+    def test_a_run_that_did_nothing_is_never_reported_as_clear(self):
+        self.assertEqual("no_progress", MODULE.stage_outcome({}))
+        self.assertEqual(
+            "no_progress", MODULE.stage_outcome({"clean_at_head_sha": "head1"})
+        )
+
+    def test_an_escalation_outranks_a_recorded_clearance(self):
+        state = {"outcome": "green", "escalation": {"reason": "head_changed"}}
+        self.assertEqual("escalated", MODULE.stage_outcome(state))
+
+
+class ChargeIterationTest(unittest.TestCase):
+    def test_spends_one_iteration_for_a_run_however_often_it_is_called(self):
+        state = {"iterations": 2}
+        run_state = {}
+        self.assertTrue(MODULE.charge_iteration(state, run_state))
+        self.assertFalse(MODULE.charge_iteration(state, run_state))
+        self.assertFalse(MODULE.charge_iteration(state, run_state))
+        self.assertEqual(3, state["iterations"])
+        self.assertTrue(run_state["charged"])
+
+    def test_each_run_spends_its_own_iteration(self):
+        state = {"iterations": 0}
+        for _ in range(3):
+            MODULE.charge_iteration(state, {})
+        self.assertEqual(3, state["iterations"])
+
 
 class CleanupCommandTest(unittest.TestCase):
     def test_deletes_the_state_and_every_side_file(self):
@@ -1843,20 +1967,35 @@ class PreflightCommandTest(unittest.TestCase):
                 self.preflight(stack, head="other1")
         self.assertIn("HEAD mismatch", str(error.exception))
 
-    def test_counts_every_iteration_it_starts(self):
+    def test_reading_the_checks_again_spends_no_iteration(self):
         path = self.root / "state.json"
-        for expected in (1, 2, 3):
+        for _ in range(3):
             with contextlib.ExitStack() as stack:
                 payload = self.preflight(stack, state_path=path)
-            self.assertEqual(expected, payload["iteration"])
+            self.assertEqual(1, payload["iteration"])
             self.assertEqual("ready", payload["result"])
-        self.assertEqual(3, MODULE.load_state(path)["iterations"])
+        self.assertEqual(0, MODULE.load_state(path)["iterations"])
+
+    def test_forgets_the_outcome_the_previous_run_recorded(self):
+        path = write_state(
+            self.root, outcome="green", clean_at_head_sha="head1", iterations=1
+        )
+        with contextlib.ExitStack() as stack:
+            payload = self.preflight(stack, state_path=path)
+        self.assertEqual("ready", payload["result"])
+        state = MODULE.load_state(path)
+        self.assertIsNone(state["outcome"])
+        self.assertIsNone(state["clean_at_head_sha"])
+        self.assertEqual("no_progress", MODULE.stage_outcome(state))
 
     def test_stops_at_the_iteration_cap(self):
         path = self.root / "state.json"
         for _ in range(MODULE.DEFAULT_MAX_ITERATIONS):
             with contextlib.ExitStack() as stack:
                 self.preflight(stack, state_path=path)
+            state = MODULE.load_state(path)
+            MODULE.charge_iteration(state, state["run"])
+            MODULE.save_state(path, state)
         with contextlib.ExitStack() as stack:
             payload = self.preflight(stack, state_path=path)
         self.assertEqual("max_iterations_reached", payload["result"])
