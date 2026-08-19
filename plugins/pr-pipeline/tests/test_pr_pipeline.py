@@ -78,21 +78,28 @@ def observation(
     unavailable: dict | None = None,
 ) -> dict:
     markers = {
-        MODULE.STAGE_CONFLICT: {"source": "github", "available": True},
-        MODULE.STAGE_CI: {"source": "github", "available": True},
+        MODULE.STAGE_CONFLICT: {
+            "source": "github",
+            "available": True,
+            "installed": True,
+        },
+        MODULE.STAGE_CI: {"source": "github", "available": True, "installed": True},
         MODULE.STAGE_SELF_REVIEW: {
             "source": "helper",
             "available": True,
+            "installed": True,
             "clean_at_head_sha": self_review,
         },
         MODULE.STAGE_COPILOT_REVIEW: {
             "source": "helper",
             "available": True,
+            "installed": True,
             "clean_at_head_sha": copilot_review,
         },
         MODULE.STAGE_DESCRIPTION: {
             "source": "helper",
             "available": True,
+            "installed": True,
             "clean_at_head_sha": description,
         },
     }
@@ -117,6 +124,24 @@ def all_green(head: str = HEAD) -> dict:
         copilot_review=head,
         description=head,
     )
+
+
+def install_stage_script(root: Path, *stages: str, body: str = "") -> Path:
+    """Lay out a fake COPILOT_HOME holding one or more stage helper scripts."""
+
+    for stage in stages:
+        entry = MODULE.STAGE_BY_NAME[stage]
+        script = (
+            root
+            / "installed-plugins"
+            / "trask-plugins"
+            / entry["plugin"]
+            / "scripts"
+            / f"{entry['module']}.py"
+        )
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text(body, encoding="utf-8")
+    return root
 
 
 class StageOrderTest(unittest.TestCase):
@@ -272,6 +297,7 @@ class DecideNextTest(unittest.TestCase):
                     MODULE.STAGE_SELF_REVIEW: {
                         "source": "helper",
                         "available": False,
+                        "installed": False,
                         "reason": "helper_missing",
                     }
                 }
@@ -279,6 +305,81 @@ class DecideNextTest(unittest.TestCase):
         )
         self.assertEqual("escalate", decision["result"])
         self.assertEqual("helper_missing", decision["reason"])
+        self.assertEqual(MODULE.STAGE_SELF_REVIEW, decision["stage"])
+
+    def test_a_missing_github_backed_plugin_escalates_instead_of_launching(self):
+        decision = MODULE.decide_next(
+            build_state(),
+            observation(
+                mergeable="CONFLICTING",
+                unavailable={
+                    MODULE.STAGE_CONFLICT: {
+                        "source": "github",
+                        "available": True,
+                        "installed": False,
+                    }
+                },
+            ),
+        )
+        self.assertEqual("escalate", decision["result"])
+        self.assertEqual("helper_missing", decision["reason"])
+        self.assertEqual(MODULE.STAGE_CONFLICT, decision["stage"])
+        self.assertIn("conflict-fix-loop:conflict-fix-loop", decision["detail"])
+
+    def test_a_missing_check_plugin_escalates_instead_of_launching(self):
+        decision = MODULE.decide_next(
+            build_state(),
+            observation(
+                self_review=HEAD,
+                copilot_review=HEAD,
+                checks="failing",
+                unavailable={
+                    MODULE.STAGE_CI: {
+                        "source": "github",
+                        "available": True,
+                        "installed": False,
+                    }
+                },
+            ),
+        )
+        self.assertEqual("escalate", decision["result"])
+        self.assertEqual("helper_missing", decision["reason"])
+        self.assertEqual(MODULE.STAGE_CI, decision["stage"])
+        self.assertEqual(
+            MODULE.ESCALATION_ACTIONS["helper_missing"], decision["next_action"]
+        )
+
+    def test_a_missing_plugin_whose_stage_is_green_stops_nothing(self):
+        decision = MODULE.decide_next(
+            build_state(),
+            observation(
+                unavailable={
+                    MODULE.STAGE_CONFLICT: {
+                        "source": "github",
+                        "available": True,
+                        "installed": False,
+                    }
+                }
+            ),
+        )
+        self.assertEqual("run_stage", decision["result"])
+        self.assertEqual(MODULE.STAGE_SELF_REVIEW, decision["stage"])
+
+    def test_a_missing_later_plugin_does_not_stop_an_earlier_stage(self):
+        decision = MODULE.decide_next(
+            build_state(),
+            observation(
+                checks="failing",
+                unavailable={
+                    MODULE.STAGE_CI: {
+                        "source": "github",
+                        "available": True,
+                        "installed": False,
+                    }
+                },
+            ),
+        )
+        self.assertEqual("run_stage", decision["result"])
         self.assertEqual(MODULE.STAGE_SELF_REVIEW, decision["stage"])
 
     def test_a_missing_later_helper_does_not_stop_an_earlier_stage(self):
@@ -289,6 +390,7 @@ class DecideNextTest(unittest.TestCase):
                     MODULE.STAGE_DESCRIPTION: {
                         "source": "helper",
                         "available": False,
+                        "installed": False,
                         "reason": "helper_missing",
                     }
                 }
@@ -534,12 +636,38 @@ class StageMarkerTest(unittest.TestCase):
         )
 
     def test_a_github_backed_stage_needs_no_helper_lookup(self):
-        marker = MODULE.read_stage_marker(
-            MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
-            MODULE.build_target("owner", "repo", 7),
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = install_stage_script(Path(directory), MODULE.STAGE_CI)
+            with mock.patch.object(MODULE, "copilot_home", return_value=root):
+                marker = MODULE.read_stage_marker(
+                    MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
+                    MODULE.build_target("owner", "repo", 7),
+                )
         self.assertEqual("github", marker["source"])
         self.assertTrue(marker["available"])
+        self.assertTrue(marker["installed"])
+
+    def test_a_github_backed_stage_reports_a_plugin_that_is_not_installed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(MODULE, "copilot_home", return_value=Path(directory)):
+                marker = MODULE.read_stage_marker(
+                    MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT],
+                    MODULE.build_target("owner", "repo", 7),
+                )
+        self.assertEqual("github", marker["source"])
+        self.assertFalse(marker["installed"])
+
+    def test_every_stage_reports_whether_its_plugin_is_installed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(MODULE, "copilot_home", return_value=Path(directory)):
+                for stage in MODULE.STAGE_NAMES:
+                    with self.subTest(stage=stage):
+                        marker = MODULE.read_stage_marker(
+                            MODULE.STAGE_BY_NAME[stage],
+                            MODULE.build_target("owner", "repo", 7),
+                        )
+                        self.assertIn("installed", marker)
+                        self.assertFalse(marker["installed"])
 
     def test_a_stage_whose_helper_is_not_installed_is_unavailable(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -708,9 +836,66 @@ class ModelGateTest(unittest.TestCase):
 
     def test_stage_models_fall_back_to_the_default(self):
         models = MODULE.stage_models(build_state(stage_models={}))
-        self.assertEqual(
-            {stage: MODULE.DEFAULT_STAGE_MODEL for stage in MODULE.STAGE_NAMES}, models
+        self.assertEqual(MODULE.default_stage_models(), models)
+
+    def test_a_stage_without_its_own_model_uses_the_uniform_default(self):
+        for entry in MODULE.STAGES:
+            if entry.get("model"):
+                continue
+            with self.subTest(stage=entry["stage"]):
+                self.assertEqual(
+                    MODULE.DEFAULT_STAGE_MODEL, MODULE.stage_default_model(entry)
+                )
+
+    def test_a_stage_may_carry_its_own_default_model(self):
+        entry = {**MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT], "model": "gpt-5.6-sol"}
+        self.assertEqual("gpt-5.6-sol", MODULE.stage_default_model(entry))
+
+    def test_a_blank_per_stage_model_falls_back_to_the_default(self):
+        entry = {**MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT], "model": "   "}
+        self.assertEqual(MODULE.DEFAULT_STAGE_MODEL, MODULE.stage_default_model(entry))
+
+    def test_a_per_stage_default_seeds_the_model_map(self):
+        stage = MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT]
+        patched = tuple(
+            {**entry, "model": "gpt-5.6-sol"} if entry is stage else entry
+            for entry in MODULE.STAGES
         )
+        with mock.patch.object(MODULE, "STAGES", patched):
+            models = MODULE.stage_models(build_state(stage_models={}))
+        self.assertEqual("gpt-5.6-sol", models[MODULE.STAGE_CONFLICT])
+        self.assertEqual(
+            MODULE.DEFAULT_STAGE_MODEL, models[MODULE.STAGE_COPILOT_REVIEW]
+        )
+
+    def test_an_explicit_override_beats_a_per_stage_default(self):
+        stage = MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT]
+        patched = tuple(
+            {**entry, "model": "gpt-5.6-sol"} if entry is stage else entry
+            for entry in MODULE.STAGES
+        )
+        with mock.patch.object(MODULE, "STAGES", patched):
+            models = MODULE.stage_models(
+                build_state(stage_models={MODULE.STAGE_CONFLICT: "claude-opus-4.8"})
+            )
+        self.assertEqual("claude-opus-4.8", models[MODULE.STAGE_CONFLICT])
+
+    def test_the_family_gate_still_judges_a_per_stage_default(self):
+        stage = MODULE.STAGE_BY_NAME[MODULE.STAGE_SELF_REVIEW]
+        patched = tuple(
+            {**entry, "model": "gpt-5.6-sol"} if entry is stage else entry
+            for entry in MODULE.STAGES
+        )
+        with mock.patch.object(MODULE, "STAGES", patched):
+            gate = MODULE.gate_stage_models(
+                MODULE.default_stage_models(), can_pin=True
+            )
+        self.assertEqual("blocked", gate["result"])
+        self.assertEqual([MODULE.STAGE_SELF_REVIEW], gate["blocked"])
+
+    def test_no_stage_ships_a_model_its_family_gate_would_block(self):
+        gate = MODULE.gate_stage_models(MODULE.default_stage_models(), can_pin=True)
+        self.assertEqual("ready", gate["result"])
 
     def test_an_unknown_stage_model_override_is_ignored(self):
         models = MODULE.stage_models(
@@ -1215,7 +1400,7 @@ class CleanupCommandTest(CommandTestCase):
 
 
 class PreflightCommandTest(CommandTestCase):
-    def call_preflight(self, observed: dict, **values):
+    def call_preflight(self, observed: dict, *, installed=(), **values):
         arguments = {
             "target": "owner/repo#7",
             "repo_root": str(self.root),
@@ -1225,6 +1410,9 @@ class PreflightCommandTest(CommandTestCase):
             "no_pin": False,
         }
         arguments.update(values)
+        home = self.root / "home"
+        home.mkdir(exist_ok=True)
+        install_stage_script(home, *installed)
         with mock.patch.object(MODULE, "require_tools"):
             with mock.patch.object(
                 MODULE, "resolve_repo_root", return_value=self.root
@@ -1232,18 +1420,35 @@ class PreflightCommandTest(CommandTestCase):
                 with mock.patch.object(
                     MODULE, "collect_observation", return_value=observed
                 ):
-                    MODULE.command_preflight(self.args(**arguments))
+                    with mock.patch.object(
+                        MODULE, "copilot_home", return_value=home
+                    ):
+                        MODULE.command_preflight(self.args(**arguments))
 
     def test_a_fresh_run_creates_the_state(self):
-        self.call_preflight(observation())
+        self.call_preflight(observation(), installed=MODULE.STAGE_NAMES)
         payload = self.emitted[-1]
         self.assertEqual("ready", payload["result"])
         self.assertFalse(payload["resumed"])
         self.assertEqual(1, payload["iteration"])
         self.assertEqual(2, payload["max_iterations"])
         self.assertEqual(list(MODULE.STAGE_NAMES), payload["stages"])
+        self.assertEqual([], payload["missing_plugins"])
         state = MODULE.load_state(self.root / "pipeline.json")
         self.assertEqual("owner/repo", state["pr"]["repo_name"])
+
+    def test_preflight_names_the_plugins_that_are_not_installed(self):
+        self.call_preflight(observation(), installed=[MODULE.STAGE_SELF_REVIEW])
+        payload = self.emitted[-1]
+        self.assertNotIn(MODULE.STAGE_SELF_REVIEW, payload["missing_plugins"])
+        self.assertIn(MODULE.STAGE_CI, payload["missing_plugins"])
+
+    def test_a_plugin_that_is_not_installed_does_not_block_preflight(self):
+        self.call_preflight(observation())
+        self.assertEqual("ready", self.emitted[-1]["result"])
+        self.assertEqual(
+            list(MODULE.STAGE_NAMES), self.emitted[-1]["missing_plugins"]
+        )
 
     def test_a_second_run_resumes_the_same_state(self):
         self.call_preflight(observation())
@@ -1310,11 +1515,29 @@ class ModelsCommandTest(CommandTestCase):
 class PlanCommandTest(CommandTestCase):
     def test_plan_prints_one_stage(self):
         path = write_state(self.root)
-        MODULE.command_plan(
-            self.args(state=str(path), stage=MODULE.STAGE_CONFLICT, effort="high")
-        )
+        home = install_stage_script(self.root / "home", MODULE.STAGE_CONFLICT)
+        with mock.patch.object(MODULE, "copilot_home", return_value=home):
+            MODULE.command_plan(
+                self.args(state=str(path), stage=MODULE.STAGE_CONFLICT, effort="high")
+            )
         payload = self.emitted[-1]
+        self.assertEqual("ready", payload["result"])
         self.assertEqual("conflict-fix-loop:conflict-fix-loop", payload["agent"])
+
+    def test_plan_refuses_a_stage_whose_plugin_is_not_installed(self):
+        path = write_state(self.root)
+        empty = self.root / "empty-home"
+        empty.mkdir()
+        with mock.patch.object(MODULE, "copilot_home", return_value=empty):
+            MODULE.command_plan(
+                self.args(state=str(path), stage=MODULE.STAGE_CI, effort="high")
+            )
+        payload = self.emitted[-1]
+        self.assertEqual("not_installed", payload["result"])
+        self.assertNotIn("command", payload)
+        self.assertEqual(
+            MODULE.ESCALATION_ACTIONS["helper_missing"], payload["next_action"]
+        )
 
     def test_plan_refuses_an_unknown_stage(self):
         path = write_state(self.root)
@@ -1523,6 +1746,28 @@ class AgentInstructionsTest(unittest.TestCase):
             self.assertIn(f"{position}. `{stage}`", self.instructions)
         self.assertIn(
             "The pipeline stops when the description stage goes green.",
+            self.instructions,
+        )
+
+    def test_it_requires_every_stage_plugin_to_be_installed(self):
+        self.assertIn(
+            "Every stage needs its plugin installed before it can run, whatever "
+            "kind of evidence makes it green.",
+            self.instructions,
+        )
+        self.assertIn(
+            "A missing plugin whose stage is already green stops nothing",
+            self.instructions,
+        )
+        self.assertIn("The plugin a stage needs is not installed.", self.instructions)
+
+    def test_it_documents_the_per_stage_default_model(self):
+        self.assertIn(
+            "Each stage carries its own default model", self.instructions
+        )
+        self.assertIn(
+            "A `--stage-model <stage>=<model>` pin at `preflight` beats the "
+            "stage's default",
             self.instructions,
         )
 

@@ -67,13 +67,13 @@ Never pass a `~`-prefixed helper path to native Windows Python from Git Bash.
 
 The deterministic, JSON-only helper provides:
 
-- `preflight [target] [--repo-root <workspace>] [--state <path>] [--max-iterations 2] [--stage-model <stage>=<model>] [--no-pin]`: resolve the pull request, refuse anything that is not open, create or resume the pipeline state, apply any per-stage model pin, and report the pull request identity, the current head, the iteration, the cleared map, and the model gate.
+- `preflight [target] [--repo-root <workspace>] [--state <path>] [--max-iterations 2] [--stage-model <stage>=<model>] [--no-pin]`: resolve the pull request, refuse anything that is not open, create or resume the pipeline state, apply any per-stage model pin, and report the pull request identity, the current head, the iteration, the cleared map, the model gate, and any stage plugin that is not installed.
 - `next --state <path> [--effort high]`: the whole control flow. It reads the live head, the live `mergeable` field, the live check rollup, and each review stage's own `status` subcommand, then returns `run_stage`, `complete`, or `escalate`. On `run_stage` it also returns a `plan` holding the plugin-qualified `agent`, the pinned `model`, the `target`, a suggested `session_name`, and the exact `command` for a subprocess launch.
 - `start --state <path> --stage <name> --head <sha> --launch session|subprocess [--session <id>] [--process <id>]`: record that a stage began, and charge it to an iteration. This is where a loop-back increments the iteration, and where the cap is enforced.
 - `finish --state <path> --stage <name> --outcome cleared|skipped|no_progress|escalated [--head <sha>] [--detail <text>] [--session <id>]`: record how the stage ended, append the durable history entry, keep the no-progress streak, and escalate when the stage escalated or stalled twice. Its `keep_session` field tells you whether to keep the child session.
 - `escalate --state <path> --reason <code> --detail <text> [--stage <name>] [--next-action <text>] [--head <sha>]`: stop the pipeline for a reason no stage reported.
 - `models [--state <path>] [--pipeline-model <id>] [--no-pin]`: report the pinned per-stage model for every stage and whether each stage's family requirement is met.
-- `plan --state <path> --stage <name> [--effort high]`: print one stage's launch instructions on their own.
+- `plan --state <path> --stage <name> [--effort high]`: print one stage's launch instructions on their own. It returns `not_installed` instead of a launch command when that stage's plugin is missing.
 - `status [--state <path> | --current --repo-root <workspace>]`: print the pipeline state and write the complete snapshot to `status_path`.
 - `cleanup --state <path> [--force]`: delete the pipeline state.
 
@@ -91,6 +91,8 @@ The helper owns this order, and it is deliberately not the bottleneck chain a da
 
 The pipeline stops when the description stage goes green.
 
+Every stage needs its plugin installed before it can run, whatever kind of evidence makes it green. Being installed and being green are separate facts, and `next` checks both. A stage the pipeline is about to run whose plugin is missing escalates as `helper_missing`, because an agent name that cannot be resolved falls back to the default agent and reports no error. A missing plugin whose stage is already green stops nothing, since that stage never runs.
+
 ## How A Stage Goes Green
 
 A stage is green only at the current head commit. New commits on the head branch invalidate the stages that already cleared, and `next` loops back on its own. Description-only edits push no commits, so they never cause a loop-back.
@@ -103,6 +105,8 @@ Two kinds of evidence exist, and the helper picks the right one:
 ## Model Gate
 
 No `model:` frontmatter key exists, so the launcher pins a model for every stage. This is a correctness constraint. `self-review-loop` runs a fixed GPT-5.6 Sol evaluator and needs a Claude model so the evaluator stays in a different model family. A stage that inherited your model would silently grade its own findings or refuse to run.
+
+Each stage carries its own default model, and a stage that names none runs on the pipeline default. A `--stage-model <stage>=<model>` pin at `preflight` beats the stage's default, and the family gate judges whichever model the stage ends up with.
 
 1. Before any other work, run `models --pipeline-model <the model you run as>`.
 2. Continue when the result is `ready`.
@@ -156,11 +160,12 @@ Escalate rather than continue when:
 - A stage hits its internal iteration cap.
 - A stage makes no progress twice in a row.
 - The pipeline would start an iteration past its cap of 2.
+- The plugin a stage needs is not installed.
 - Checks never start, or a fork pull request has checks blocked awaiting maintainer approval.
 - A suspected flake fails a second time after one automatic re-run.
 - A conflict resolution needs a choice between two genuinely contradictory changes.
 
-The helper records the first three itself, through `finish` and `start`. Record the rest with `escalate`, naming the stage and giving one plain sentence of detail.
+The helper reports the first four itself, through `next`, `start`, and `finish`. Record the rest with `escalate`, naming the stage and giving one plain sentence of detail.
 
 When the pipeline escalates, stop. Do not run another stage, do not retry the failed one, and do not wait for instruction.
 

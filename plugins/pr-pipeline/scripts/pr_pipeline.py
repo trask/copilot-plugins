@@ -47,6 +47,11 @@ DEFAULT_EFFORT = "high"
 # coherent diff. The CI stage trails both review stages because those stages push
 # commits and checks are slow, so fixing checks earlier would fix a head that no
 # longer exists.
+#
+# ``model`` names the model this stage runs best on. A stage that leaves it None
+# runs on DEFAULT_STAGE_MODEL. It is a starting point rather than a rule: a
+# ``--stage-model`` override at preflight beats it, and the ``requires_family``
+# gate still checks whatever model the stage ends up with.
 STAGES: tuple[dict[str, Any], ...] = (
     {
         "stage": STAGE_CONFLICT,
@@ -55,6 +60,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "module": "conflict_fix_loop",
         "evidence": "github",
         "requires_family": None,
+        "model": None,
         "summary": "resolve merge conflicts with the base branch",
     },
     {
@@ -64,6 +70,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "module": "self_review_loop",
         "evidence": "helper",
         "requires_family": CLAUDE_FAMILY,
+        "model": None,
         "summary": "review the diff and commit the verified fixes",
     },
     {
@@ -73,6 +80,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "module": "copilot_review_loop",
         "evidence": "helper",
         "requires_family": None,
+        "model": None,
         "summary": "address the Copilot review comments",
     },
     {
@@ -82,6 +90,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "module": "ci_fix_loop",
         "evidence": "github",
         "requires_family": None,
+        "model": None,
         "summary": "fix the failing checks this pull request caused",
     },
     {
@@ -91,6 +100,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "module": "pr_description",
         "evidence": "helper",
         "requires_family": None,
+        "model": None,
         "summary": "validate or replace the title and description",
     },
 )
@@ -268,6 +278,20 @@ def stage_script_path(entry: dict[str, Any]) -> Path:
         / "scripts"
         / f"{entry['module']}.py"
     )
+
+
+def stage_installed(entry: dict[str, Any]) -> bool:
+    """Report whether a stage's plugin is installed.
+
+    Every stage needs this, including the two whose greenness comes from GitHub.
+    Being installed and being green are separate facts: a passing check rollup
+    says nothing about whether the agent that fixes checks can be launched. An
+    unresolvable plugin-qualified agent name falls back to the default agent
+    without an error, so a stage that is not installed has to stop the pipeline
+    rather than launch a general-purpose agent against a real pull request.
+    """
+
+    return stage_script_path(entry).is_file()
 
 
 def status_path_for(state_path: Path) -> Path:
@@ -667,17 +691,30 @@ def read_stage_marker(entry: dict[str, Any], target: dict[str, Any]) -> dict[str
     judgment leaves the only durable record of that judgment in its own state
     file, so the helper that owns the file is the only thing that may interpret
     it.
+
+    Every marker carries ``installed``, including the markers of the stages whose
+    greenness GitHub already states. Those stages need no helper lookup, but they
+    still need their plugin present before the pipeline may launch them.
     """
 
+    script = stage_script_path(entry)
+    installed = script.is_file()
+
     if entry["evidence"] != "helper":
-        return {"source": "github", "available": True, "clean_at_head_sha": None}
+        return {
+            "source": "github",
+            "available": True,
+            "installed": installed,
+            "script": str(script),
+            "clean_at_head_sha": None,
+        }
 
     state_path = stage_state_path(entry["plugin"], target)
-    script = stage_script_path(entry)
-    if not script.is_file():
+    if not installed:
         return {
             "source": "helper",
             "available": False,
+            "installed": False,
             "reason": "helper_missing",
             "script": str(script),
             "clean_at_head_sha": None,
@@ -686,6 +723,7 @@ def read_stage_marker(entry: dict[str, Any], target: dict[str, Any]) -> dict[str
         return {
             "source": "helper",
             "available": True,
+            "installed": True,
             "reason": "no_state",
             "state": str(state_path),
             "clean_at_head_sha": None,
@@ -699,6 +737,7 @@ def read_stage_marker(entry: dict[str, Any], target: dict[str, Any]) -> dict[str
         return {
             "source": "helper",
             "available": False,
+            "installed": True,
             "reason": "status_failed",
             "state": str(state_path),
             "detail": detail,
@@ -710,6 +749,7 @@ def read_stage_marker(entry: dict[str, Any], target: dict[str, Any]) -> dict[str
         return {
             "source": "helper",
             "available": False,
+            "installed": True,
             "reason": "invalid_status_json",
             "state": str(state_path),
             "detail": str(error),
@@ -718,6 +758,7 @@ def read_stage_marker(entry: dict[str, Any], target: dict[str, Any]) -> dict[str
     return {
         "source": "helper",
         "available": True,
+        "installed": True,
         "state": str(state_path),
         "clean_at_head_sha": extract_clean_at_head_sha(entry["stage"], payload),
         "status_result": payload.get("result") if isinstance(payload, dict) else None,
@@ -921,6 +962,25 @@ def decide_next(state: dict[str, Any], observation: dict[str, Any]) -> dict[str,
 
     stage = next_entry["stage"]
     verdict = stage_states[stage]
+    marker = markers.get(stage) or {}
+
+    # Installation is checked for every stage, whatever its evidence kind. A
+    # stage green from GitHub never gets this far, so the check costs nothing
+    # when the plugin is absent but unneeded.
+    if marker.get("installed") is False:
+        return {
+            "result": "escalate",
+            "stage": stage,
+            "reason": "helper_missing",
+            "detail": (
+                f"the {next_entry['plugin']} plugin is not installed, so the "
+                f"pipeline cannot launch {next_entry['agent']}"
+            ),
+            "next_action": ESCALATION_ACTIONS["helper_missing"],
+            "head_sha": head_sha,
+            "recorded": False,
+        }
+
     if verdict.get("evidence") == "helper_unavailable":
         reason = verdict.get("reason") or "helper_missing"
         detail = (
@@ -979,9 +1039,20 @@ def decide_next(state: dict[str, Any], observation: dict[str, Any]) -> dict[str,
     }
 
 
+def stage_default_model(entry: dict[str, Any]) -> str:
+    model = entry.get("model")
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    return DEFAULT_STAGE_MODEL
+
+
+def default_stage_models() -> dict[str, str]:
+    return {entry["stage"]: stage_default_model(entry) for entry in STAGES}
+
+
 def stage_models(state: dict[str, Any]) -> dict[str, str]:
     configured = state.get("stage_models")
-    models = {entry["stage"]: DEFAULT_STAGE_MODEL for entry in STAGES}
+    models = default_stage_models()
     if isinstance(configured, dict):
         for stage, model in configured.items():
             if stage in models and isinstance(model, str) and model.strip():
@@ -1087,7 +1158,7 @@ def new_state(
         "max_iterations": max_iterations,
         "iteration": 1,
         "stage_high_water": None,
-        "stage_models": {entry["stage"]: DEFAULT_STAGE_MODEL for entry in STAGES},
+        "stage_models": default_stage_models(),
         "cleared": {},
         "no_progress": {},
         "running": None,
@@ -1178,6 +1249,12 @@ def command_preflight(args: argparse.Namespace) -> None:
 
     save_state(path, state)
     gate = gate_stage_models(stage_models(state), can_pin=not args.no_pin)
+    # Reported rather than fatal. A stage that is green from GitHub never
+    # launches, so a missing plugin only stops the run once that stage is the
+    # one to run, and ``next`` escalates there.
+    missing = [
+        entry["stage"] for entry in STAGES if not stage_installed(entry)
+    ]
     emit(
         {
             "result": "blocked" if gate["result"] == "blocked" else "ready",
@@ -1192,6 +1269,7 @@ def command_preflight(args: argparse.Namespace) -> None:
             "cleared": state.get("cleared") or {},
             "model_gate": gate,
             "stages": list(STAGE_NAMES),
+            "missing_plugins": missing,
         }
     )
 
@@ -1430,7 +1508,7 @@ def command_models(args: argparse.Namespace) -> None:
         state = load_state(cli_path(args.state))
         models = stage_models(state)
     else:
-        models = {entry["stage"]: DEFAULT_STAGE_MODEL for entry in STAGES}
+        models = default_stage_models()
     gate = gate_stage_models(models, can_pin=not args.no_pin)
     payload = {**gate, "pipeline_model": args.pipeline_model}
     if args.pipeline_model:
@@ -1444,6 +1522,23 @@ def command_plan(args: argparse.Namespace) -> None:
     state = load_state(cli_path(args.state))
     if args.stage not in STAGE_BY_NAME:
         raise WorkflowError(f"unknown stage: {args.stage}")
+    entry = STAGE_BY_NAME[args.stage]
+    if not stage_installed(entry):
+        emit(
+            {
+                "result": "not_installed",
+                "stage": args.stage,
+                "plugin": entry["plugin"],
+                "agent": entry["agent"],
+                "script": str(stage_script_path(entry)),
+                "detail": (
+                    f"the {entry['plugin']} plugin is not installed, so the "
+                    f"pipeline cannot launch {entry['agent']}"
+                ),
+                "next_action": ESCALATION_ACTIONS["helper_missing"],
+            }
+        )
+        return
     emit({"result": "ready", **launch_plan(state, args.stage, effort=args.effort)})
 
 
