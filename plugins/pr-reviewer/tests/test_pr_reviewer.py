@@ -1334,9 +1334,8 @@ class PendingReviewTest(unittest.TestCase):
             )
             self.assertEqual(payload["head_sha"], "abc123")
             self.assertEqual(payload["changed_files"], sorted(anchors))
-            self.assertEqual(
-                target_path.read_text(encoding="utf-8", newline=""), DIFF
-            )
+            with target_path.open(encoding="utf-8", newline="") as handle:
+                self.assertEqual(handle.read(), DIFF)
             self.assertNotIn(DIFF, json.dumps(payload))
 
     def test_check_fails_when_the_diff_file_cannot_be_written(self):
