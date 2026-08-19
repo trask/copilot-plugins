@@ -1941,10 +1941,13 @@ def resolve_finish_outcome(
 ) -> dict[str, Any]:
     """Settle how a stage ended, preferring the stage's own answer.
 
-    The stage that just ran is the only thing that watched itself run, so its own
-    name for the ending outranks the one the caller reported. The caller's answer
-    is kept in the history either way, which is what makes a disagreement
-    visible instead of silent.
+    Both answers are evidence, and neither is a view of the run itself. The
+    stage's word is read from a state file. The caller's word is the agent's
+    reading of its own run. The stage's is preferred because the stage contract
+    guarantees it is a record of an ending a command wrote, rather than a word
+    inferred from the shape of that state, so it cannot be misread out of prose.
+    The caller's answer is kept in the history either way, which is what makes a
+    disagreement visible instead of silent.
 
     That precedence has one limit, and it is the reason a head is passed in. A
     stage whose greenness is a judgment records that judgment in a state file
