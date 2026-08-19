@@ -17,6 +17,7 @@ copilot plugin install pr-reviewer@trask-plugins
 copilot plugin install copilot-review-loop@trask-plugins
 copilot plugin install self-review-loop@trask-plugins
 copilot plugin install pr-description@trask-plugins
+copilot plugin install conflict-fix-loop@trask-plugins
 ```
 
 Restart Copilot after you install or update a plugin.
@@ -59,6 +60,15 @@ validates ideal text unchanged or automatically applies a better title and
 description. It checks every outcome against the pinned pull request head and
 the exact live text.
 
+### Conflict Fix Loop
+
+Resolves the merge conflicts on a pull request and repeats until GitHub reports
+it mergeable. It reads the history behind each conflicted file first, then keeps
+what both sides meant to do rather than picking a side, and records why in the
+merge commit. It stops and reports when the two sides genuinely contradict each
+other, and it refuses to push when another open pull request stacks on the
+branch. It never posts anything to GitHub.
+
 ### Optional PR Flight State Sharing
 
 Self Review Loop and PR Description can copy the few completion facts that
@@ -87,6 +97,7 @@ copilot plugin update pr-reviewer
 copilot plugin update copilot-review-loop
 copilot plugin update self-review-loop
 copilot plugin update pr-description
+copilot plugin update conflict-fix-loop
 ```
 
 ## Requirements
