@@ -2220,18 +2220,25 @@ def command_publish(args: argparse.Namespace) -> None:
     )
 
 
-def stage_outcome(state: dict[str, Any]) -> str:
+def stage_outcome(state: dict[str, Any]) -> str | None:
     """Name this run's ending in the vocabulary an orchestrator records.
 
     A pipeline reads greenness from GitHub rather than from here, so this states
-    only how the loop itself ended: `skipped` when the head ran no applicable
-    checks, `no_progress` when it neither cleared nor escalated nor moved the head.
+    only how the loop itself ended: `cleared` when it recorded green, `skipped`
+    when the head ran no applicable checks, `escalated` when it handed the pull
+    request back to a person.
 
-    Every value here describes a run that happened. Call this only for loaded
-    state, and leave the field out of a payload that describes no run at all,
-    such as a missing state file. A reader is entitled to take any value it finds
-    at face value, and `no_progress` on a stage that never ran, or that cleared
-    and cleaned up after itself, would be a false report of a wasted run.
+    Returning `None` means this state supports no claim about an ending, and the
+    field is then left out so a reader sees an absent answer rather than a
+    manufactured one. State exists from the moment `preflight` writes it, so a
+    run killed before it decided anything leaves exactly the same absence as a
+    run still in flight. Neither is `no_progress`, which asserts that a run ran
+    to completion and achieved nothing. Only the agent can support that claim,
+    because only a live agent can report on a run it saw end, and it says so in
+    its own report instead.
+
+    A reader is entitled to take any value it finds at face value, so a value
+    this function cannot support must not appear at all.
     """
     if state.get("escalation"):
         return "escalated"
@@ -2240,7 +2247,13 @@ def stage_outcome(state: dict[str, Any]) -> str:
         return "skipped"
     if outcome == "green":
         return "cleared"
-    return "no_progress"
+    return None
+
+
+def stage_outcome_fields(state: dict[str, Any]) -> dict[str, str]:
+    """Carry the stage outcome only when the state supports naming one."""
+    outcome = stage_outcome(state)
+    return {"stage_outcome": outcome} if outcome else {}
 
 
 def status_payload(state: dict[str, Any], path: Path) -> dict[str, Any]:
@@ -2255,7 +2268,7 @@ def status_payload(state: dict[str, Any], path: Path) -> dict[str, Any]:
         "reruns": state.get("reruns") or {},
         "escalation": state.get("escalation"),
         "outcome": state.get("outcome"),
-        "stage_outcome": stage_outcome(state),
+        **stage_outcome_fields(state),
         "clean_at_head_sha": state.get("clean_at_head_sha"),
         "skip_note": state.get("skip_note"),
         "iterations": int(state.get("iterations", 0)),
@@ -2317,7 +2330,7 @@ def command_status(args: argparse.Namespace) -> None:
                 "batch_statuses": count_by_status(run_state.get("batches")),
             },
             "outcome": state.get("outcome"),
-            "stage_outcome": stage_outcome(state),
+            **stage_outcome_fields(state),
             "clean_at_head_sha": state.get("clean_at_head_sha"),
             "skip_note": state.get("skip_note"),
             "escalation": state.get("escalation"),

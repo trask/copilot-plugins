@@ -203,6 +203,8 @@ Send one message that calls no tool. Include:
 - Each check the loop attributed `pre_existing` or `flake`, with the reason, so the reader knows what the loop deliberately left alone.
 - For an escalation, the helper's `reason`, its `detail`, and its `next_action` verbatim. Say it in one line when the reason is one a person must clear: checks that never started, a fork pull request whose checks wait for a maintainer to approve them, or a suspected flake that failed again after its one automatic re-run.
 
-The helper's `status` subcommand reports the same ending as a `stage_outcome` field, using these same words, for anything that reads the outcome mechanically.
+The helper's `status` subcommand reports the same ending as a `stage_outcome` field, using these same words, for anything that reads the outcome mechanically. It reports `cleared`, `skipped`, and `escalated`, and it leaves the field out entirely when the state names no ending.
+
+No progress is the one ending only you can report. The helper writes state before the run does any work, so a run killed part way through leaves state that looks exactly like a run still going, and the helper refuses to call either one an ending. You are the only thing that knows a run finished, so say `Outcome: no progress.` in your own report and let the missing field mean what it says.
 
 Do not post any of this to GitHub.

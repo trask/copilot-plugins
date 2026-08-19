@@ -151,6 +151,21 @@ class AgentInstructionsTest(unittest.TestCase):
         frontmatter = self.instructions.split("---")[1]
         self.assertNotIn("\nmodel:", frontmatter)
 
+    def test_tells_the_agent_that_no_progress_is_its_claim_to_make(self):
+        self.assertIn(
+            "It reports `cleared`, `skipped`, and `escalated`, and it leaves the "
+            "field out entirely when the state names no ending.",
+            self.instructions,
+        )
+        self.assertIn(
+            "No progress is the one ending only you can report.", self.instructions
+        )
+        self.assertIn(
+            "a run killed part way through leaves state that looks exactly like a "
+            "run still going",
+            self.instructions,
+        )
+
     def test_runs_the_whole_loop_from_a_bare_reference(self):
         self.assertIn("## Activation: Bare PR References Run The Full Loop", self.instructions)
         self.assertIn(
@@ -2017,13 +2032,30 @@ class StatusCommandTest(unittest.TestCase):
             ({"outcome": "no_checks", "skip_note": "no applicable checks"}, "skipped"),
             ({"escalation": {"reason": "timeout"}}, "escalated"),
             ({"outcome": "green", "escalation": {"reason": "timeout"}}, "escalated"),
-            ({}, "no_progress"),
-            ({"outcome": None}, "no_progress"),
         ):
             with self.subTest(expected=expected):
                 path = write_state(self.root, **overrides)
                 payload = call("status", "--state", str(path))
                 self.assertEqual(expected, payload["stage_outcome"])
+
+    def test_omits_the_stage_outcome_while_a_run_has_decided_nothing(self):
+        """State exists from preflight on, so its bare presence names no ending.
+
+        A run killed before it decided anything leaves the same state a run still
+        in flight leaves. Reporting `no_progress` for either would assert that a
+        run completed and achieved nothing, and two of those in a row escalate the
+        whole pipeline, so a crash could escalate a healthy pull request.
+        """
+        for overrides in ({}, {"outcome": None}, {"clean_at_head_sha": "head1"}):
+            with self.subTest(overrides=overrides):
+                path = write_state(self.root, **overrides)
+                payload = call("status", "--state", str(path))
+                self.assertNotIn("stage_outcome", payload)
+                self.assertNotIn(
+                    "no_progress",
+                    json.dumps(payload),
+                    "no payload field may claim a run ended",
+                )
 
     def test_reports_the_skip_note_a_reader_cannot_mistake_for_a_pass(self):
         path = write_state(
@@ -2042,9 +2074,25 @@ class StatusCommandTest(unittest.TestCase):
 
 class StageOutcomeTest(unittest.TestCase):
     def test_a_run_that_did_nothing_is_never_reported_as_clear(self):
-        self.assertEqual("no_progress", MODULE.stage_outcome({}))
+        self.assertIsNone(MODULE.stage_outcome({}))
+        self.assertIsNone(MODULE.stage_outcome({"clean_at_head_sha": "head1"}))
+
+    def test_never_manufactures_an_ending_the_state_cannot_support(self):
+        """`no_progress` is the agent's claim to make, never the helper's.
+
+        Only a live agent can report that a run ran to completion and achieved
+        nothing. The helper reads state that a killed run leaves looking exactly
+        like a run still in flight, so it withholds the field instead.
+        """
+        for state in ({}, {"outcome": None}, {"run": {"status": "active"}}):
+            with self.subTest(state=state):
+                self.assertIsNone(MODULE.stage_outcome(state))
+                self.assertEqual({}, MODULE.stage_outcome_fields(state))
+
+    def test_carries_the_field_only_for_an_ending_it_can_name(self):
         self.assertEqual(
-            "no_progress", MODULE.stage_outcome({"clean_at_head_sha": "head1"})
+            {"stage_outcome": "cleared"},
+            MODULE.stage_outcome_fields({"outcome": "green"}),
         )
 
     def test_an_escalation_outranks_a_recorded_clearance(self):
@@ -2191,7 +2239,7 @@ class PreflightCommandTest(unittest.TestCase):
         state = MODULE.load_state(path)
         self.assertIsNone(state["outcome"])
         self.assertIsNone(state["clean_at_head_sha"])
-        self.assertEqual("no_progress", MODULE.stage_outcome(state))
+        self.assertIsNone(MODULE.stage_outcome(state))
 
     def test_stops_at_the_iteration_cap(self):
         path = self.root / "state.json"
