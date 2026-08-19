@@ -2077,7 +2077,7 @@ def command_publish(args: argparse.Namespace) -> None:
     )
 
 
-def stage_outcome(state: dict[str, Any] | None) -> str:
+def stage_outcome(state: dict[str, Any] | None) -> str | None:
     """Name how a run ended, in the vocabulary an orchestrator reads.
 
     This says how the run ended. It is never a claim that the pull request merges.
@@ -2089,9 +2089,15 @@ def stage_outcome(state: dict[str, Any] | None) -> str:
     repeating one is reported as escalated. An escalation costs a person's attention
     once, while a wrong clearance lets a caller move on from a stage that did not do
     its job, and nothing downstream catches that.
+
+    With no state there is no run to describe, so this answers None and the caller
+    leaves the field out. A stage that was never launched, and one that finished and
+    cleaned up after itself, both look like this, and neither of them made no
+    progress. Saying nothing is the honest answer, and a reader that does not know to
+    distrust a word here would believe the wrong one.
     """
     if not state:
-        return "escalated"
+        return None
     escalation = state.get("escalation")
     if escalation:
         return "no_progress" if escalation.get("kind") == "no_progress" else "escalated"
@@ -2108,6 +2114,14 @@ def stage_outcome(state: dict[str, Any] | None) -> str:
     return "escalated"
 
 
+def with_stage_outcome(payload: dict[str, Any], state: dict[str, Any] | None) -> dict[str, Any]:
+    """Add the run's outcome to a payload, and only when there is a run to describe."""
+    outcome = stage_outcome(state)
+    if outcome is not None:
+        payload["stage_outcome"] = outcome
+    return payload
+
+
 def command_status(args: argparse.Namespace) -> None:
     if args.current:
         require_tools()
@@ -2116,15 +2130,17 @@ def command_status(args: argparse.Namespace) -> None:
         path = default_state_path(target)
         if not path.is_file():
             emit(
-                {
-                    "result": "no_state",
-                    "state": str(path),
-                    "stage_outcome": stage_outcome(None),
-                    "pr": {"number": target["number"], "url": target["pr_url"]},
-                    "attempt": None,
-                    "escalation": None,
-                    "history": [],
-                }
+                with_stage_outcome(
+                    {
+                        "result": "no_state",
+                        "state": str(path),
+                        "pr": {"number": target["number"], "url": target["pr_url"]},
+                        "attempt": None,
+                        "escalation": None,
+                        "history": [],
+                    },
+                    None,
+                )
             )
             return
     else:
@@ -2133,47 +2149,50 @@ def command_status(args: argparse.Namespace) -> None:
     pr = state["pr"]
     attempt = state.get("attempt")
     history = state.get("history") or []
-    outcome = stage_outcome(state)
-    payload = {
-        "result": "ready",
-        "state": str(path),
-        "stage_outcome": outcome,
-        "pr": pr,
-        "attempt": attempt,
-        "relations": state.get("relations"),
-        "merge_methods": state.get("merge_methods"),
-        "escalation": state.get("escalation"),
-        "history": history,
-        "iterations": int(state.get("iterations", 0)),
-    }
-    status_path = status_path_for(path)
-    write_result_file(status_path, payload, "status")
-    emit(
+    payload = with_stage_outcome(
         {
             "result": "ready",
             "state": str(path),
-            "stage_outcome": outcome,
-            "status_path": str(status_path),
-            "pr": {
-                "number": pr["number"],
-                "title": pr["title"],
-                "pr_url": pr["pr_url"],
-                "repo_name": pr["repo_name"],
-                "head_branch": pr["head_branch"],
-                "base_branch": pr["base_branch"],
-            },
-            "attempt": attempt_summary(attempt),
+            "pr": pr,
+            "attempt": attempt,
+            "relations": state.get("relations"),
+            "merge_methods": state.get("merge_methods"),
             "escalation": state.get("escalation"),
-            "mergeable_at_head_sha": (attempt or {}).get("mergeable_at_head_sha"),
-            "counts": {
-                "conflicts": len(((attempt or {}).get("conflicts")) or []),
-                "dependents": len(
-                    ((state.get("relations") or {}).get("dependents")) or []
-                ),
-                "history": len(history),
-            },
+            "history": history,
             "iterations": int(state.get("iterations", 0)),
-        }
+        },
+        state,
+    )
+    status_path = status_path_for(path)
+    write_result_file(status_path, payload, "status")
+    emit(
+        with_stage_outcome(
+            {
+                "result": "ready",
+                "state": str(path),
+                "status_path": str(status_path),
+                "pr": {
+                    "number": pr["number"],
+                    "title": pr["title"],
+                    "pr_url": pr["pr_url"],
+                    "repo_name": pr["repo_name"],
+                    "head_branch": pr["head_branch"],
+                    "base_branch": pr["base_branch"],
+                },
+                "attempt": attempt_summary(attempt),
+                "escalation": state.get("escalation"),
+                "mergeable_at_head_sha": (attempt or {}).get("mergeable_at_head_sha"),
+                "counts": {
+                    "conflicts": len(((attempt or {}).get("conflicts")) or []),
+                    "dependents": len(
+                        ((state.get("relations") or {}).get("dependents")) or []
+                    ),
+                    "history": len(history),
+                },
+                "iterations": int(state.get("iterations", 0)),
+            },
+            state,
+        )
     )
 
 

@@ -76,7 +76,7 @@ The deterministic, JSON-only helper provides:
 - `abort --state <path>`: undo the in-progress merge or rebase and end the attempt.
 - `escalate --state <path> --kind <kind> (--reason <text> | --reason-file <file-or->) [--recommended-action <text>]`: record why this run stopped and needs a person.
 - `publish --state <path>`: require a resolved attempt, a clean worktree, and the head branch checked out, re-check the stacking guards, verify the push range before pushing, push only the head branch, prove the base branch and every dependent pull request did not move, wait for the pull request head to match, and read mergeability live again.
-- `status [--state <path> | --current --repo-root <workspace>]`: write the complete snapshot to `status_path` and print a compact envelope carrying `result`, `stage_outcome`, `attempt`, `escalation`, `mergeable_at_head_sha`, `counts`, and `iterations`.
+- `status [--state <path> | --current --repo-root <workspace>]`: write the complete snapshot to `status_path` and print a compact envelope carrying `result`, `stage_outcome` when there is a run to describe, `attempt`, `escalation`, `mergeable_at_head_sha`, `counts`, and `iterations`.
 - `cleanup --state <path>`: delete the state file along with its preflight, conflicts, and status files.
 
 If an operation partly fails, keep its state and run that same operation again after you fix only the blocker it reported.
@@ -197,6 +197,8 @@ Stop and send the final report when any of these holds:
 ## Final Report
 
 Before you write the report, run `status` and read its `stage_outcome`. That field is how a caller reads this run mechanically, and it is one of `cleared`, `skipped`, `no_progress`, and `escalated`. It says how the run ended; it never says the stage is green. Whether this stage is green is decided from GitHub's live mergeability, so if your prose and that field ever disagree, the field is right about the run and neither of you is right about greenness. Do not describe a run as finished when `stage_outcome` is `escalated`.
+
+When `status` reports `no_state` the field is absent, because there is no run to describe. That is not a failure and it is not `no_progress`. Say what `status` actually found instead of reaching for one of the four words.
 
 Send one message that calls no tool. Keep it compact.
 

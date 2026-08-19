@@ -338,6 +338,11 @@ class AgentInstructionsTest(unittest.TestCase):
             self.assertIn(word, self.instructions)
         self.assertIn("it never says the stage is green", self.instructions)
 
+    def test_an_absent_outcome_is_not_read_as_a_failed_run(self):
+        self.assertIn("the field is absent", self.instructions)
+        self.assertIn("there is no run to describe", self.instructions)
+        self.assertIn("it is not `no_progress`", self.instructions)
+
     def test_closes_every_run_with_a_tagged_retrospective(self):
         self.assertIn("## Conflict Fix Loop Agent Retrospective", self.instructions)
         for category in (
@@ -2857,10 +2862,24 @@ class StageOutcomeTest(unittest.TestCase):
                 )
                 self.assertEqual("escalated", outcome)
 
-    def test_a_missing_state_escalates(self):
-        for state in (None, {}, self.state()):
+    def test_a_missing_state_describes_no_run_at_all(self):
+        for state in (None, {}):
             with self.subTest(state=state):
-                self.assertEqual("escalated", MODULE.stage_outcome(state))
+                self.assertIsNone(MODULE.stage_outcome(state))
+
+    def test_a_payload_with_no_run_to_describe_carries_no_outcome(self):
+        payload = MODULE.with_stage_outcome({"result": "no_state"}, None)
+        self.assertNotIn("stage_outcome", payload)
+
+    def test_a_payload_describing_a_run_carries_its_outcome(self):
+        payload = MODULE.with_stage_outcome(
+            {"result": "ready"}, self.state(attempt=attempt_record(status="mergeable"))
+        )
+        self.assertEqual("cleared", payload["stage_outcome"])
+
+    def test_a_loaded_state_always_has_something_to_say(self):
+        outcome = MODULE.stage_outcome(self.state())
+        self.assertEqual("escalated", outcome)
 
     def test_the_stage_never_reports_skipped(self):
         for status in ("mergeable", "published", "planned", "conflicted", None):
@@ -2946,6 +2965,19 @@ class StatusCommandTest(unittest.TestCase):
         self.assertEqual(0, payload["counts"]["conflicts"])
         self.assertIsNone(payload["mergeable_at_head_sha"])
 
+    def test_an_outcome_never_travels_without_a_ready_payload(self):
+        for overrides in (
+            {},
+            {"attempt": None},
+            {"escalation": {"kind": "contradiction", "reason": "r"}},
+            {"attempt": attempt_record(status="mergeable")},
+        ):
+            with self.subTest(overrides=overrides):
+                payload = self.status(**overrides)
+                if "stage_outcome" in payload:
+                    self.assertEqual("ready", payload["result"])
+                    self.assertIn(payload["stage_outcome"], MODULE.STAGE_OUTCOMES)
+
     def test_the_current_branch_can_be_looked_up_without_a_state_path(self):
         state_path = write_state(self.directory)
         args = SimpleNamespace(state=None, current=True, repo_root=None)
@@ -2971,7 +3003,7 @@ class StatusCommandTest(unittest.TestCase):
             MODULE.command_status(args)
         payload = emitted(emit)
         self.assertEqual("no_state", payload["result"])
-        self.assertEqual("escalated", payload["stage_outcome"])
+        self.assertNotIn("stage_outcome", payload)
         self.assertEqual(7, payload["pr"]["number"])
         self.assertIsNone(payload["attempt"])
         self.assertEqual([], payload["history"])
