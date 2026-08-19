@@ -1977,6 +1977,36 @@ class StatusCommandTest(unittest.TestCase):
         self.assertEqual("no_state", payload["result"])
         self.assertIsNone(payload["escalation"])
 
+    def test_omits_the_stage_outcome_when_no_run_happened(self):
+        """A missing state file is not a run that ended, so it names no ending.
+
+        Emitting `no_progress` here would tell any reader that the stage ran and
+        accomplished nothing, which is false both for a stage that was never
+        launched and for one that cleared and then cleaned up after itself.
+        """
+        target = MODULE.parse_target("owner/repo#404")
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(MODULE, "require_tools"))
+            stack.enter_context(
+                mock.patch.object(MODULE, "resolve_repo_root", return_value=self.root)
+            )
+            stack.enter_context(
+                mock.patch.object(MODULE, "current_pr_target", return_value=target)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE,
+                    "default_state_path",
+                    return_value=self.root / "missing.json",
+                )
+            )
+            payload = call("status", "--current", "--repo-root", str(self.root))
+        self.assertEqual("no_state", payload["result"])
+        self.assertNotIn("stage_outcome", payload)
+        self.assertNotIn(
+            "no_progress", json.dumps(payload), "no payload field may claim a run ended"
+        )
+
     def test_requires_a_state_or_the_current_flag(self):
         with self.assertRaises(SystemExit):
             run_arguments("status")

@@ -1,7 +1,7 @@
 {
   "name": "ci-fix-loop",
   "description": "Fix the failing continuous integration checks a pull request caused, re-run a suspected flake once, and push the fixes until the checks are green.",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "author": {
     "name": "Trask Stalnaker"
   },

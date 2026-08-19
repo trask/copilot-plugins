@@ -2226,6 +2226,12 @@ def stage_outcome(state: dict[str, Any]) -> str:
     A pipeline reads greenness from GitHub rather than from here, so this states
     only how the loop itself ended: `skipped` when the head ran no applicable
     checks, `no_progress` when it neither cleared nor escalated nor moved the head.
+
+    Every value here describes a run that happened. Call this only for loaded
+    state, and leave the field out of a payload that describes no run at all,
+    such as a missing state file. A reader is entitled to take any value it finds
+    at face value, and `no_progress` on a stage that never ran, or that cleared
+    and cleaned up after itself, would be a false report of a wasted run.
     """
     if state.get("escalation"):
         return "escalated"
@@ -2271,7 +2277,6 @@ def command_status(args: argparse.Namespace) -> None:
                     "run": None,
                     "escalation": None,
                     "outcome": None,
-                    "stage_outcome": "no_progress",
                     "clean_at_head_sha": None,
                     "history": [],
                 }
