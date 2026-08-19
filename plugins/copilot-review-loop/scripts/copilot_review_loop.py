@@ -748,18 +748,24 @@ def process_is_running(pid: Any) -> bool:
     return True
 
 
-def stage_outcome(state: dict[str, Any]) -> str:
+def stage_outcome(state: dict[str, Any]) -> str | None:
     """Say how the last run ended, in an external orchestrator's vocabulary.
 
     ``cleared`` is read straight off ``clean_at_head_sha`` rather than decided
     again here, so this can never become a second, softer route to a clearance.
-    A run that ended some other way is described from the result the run
-    recorded, and anything unrecognized escalates.
+
+    Every word this returns is a claim about a run that happened. A state that
+    recorded no ending supports no such claim, so it answers nothing at all and
+    a reader falls back to the report. An ending nobody recognizes is different:
+    a run did end, and one nobody can describe is worth a person's attention.
     """
 
     if state.get("clean_at_head_sha"):
         return "cleared"
-    return STAGE_OUTCOME_BY_RESULT.get(state.get("last_result"), "escalated")
+    last_result = state.get("last_result")
+    if not last_result:
+        return None
+    return STAGE_OUTCOME_BY_RESULT.get(last_result, "escalated")
 
 
 def watcher_result(state: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
@@ -1875,24 +1881,24 @@ def command_status(args: argparse.Namespace) -> None:
                     "queue": None,
                     "monitoring": None,
                     "clean_at_head_sha": None,
-                    "stage_outcome": None,
                 }
             )
             return
     else:
         path = cli_path(args.state)
     state = load_state(path)
-    emit(
-        {
-            "result": "ready",
-            "state": str(path),
-            "pr": state["pr"],
-            "queue": state.get("queue"),
-            "monitoring": state.get("monitoring"),
-            "clean_at_head_sha": state.get("clean_at_head_sha"),
-            "stage_outcome": stage_outcome(state),
-        }
-    )
+    outcome = stage_outcome(state)
+    payload = {
+        "result": "ready",
+        "state": str(path),
+        "pr": state["pr"],
+        "queue": state.get("queue"),
+        "monitoring": state.get("monitoring"),
+        "clean_at_head_sha": state.get("clean_at_head_sha"),
+    }
+    if outcome:
+        payload["stage_outcome"] = outcome
+    emit(payload)
 
 
 def command_cleanup(args: argparse.Namespace) -> None:

@@ -194,6 +194,11 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn(
             "do not set, quote, or work around either one", instructions
         )
+        self.assertIn(
+            "the field is left out entirely when there is no state or no recorded "
+            "ending",
+            instructions,
+        )
 
     def test_accepts_a_pr_target_for_an_unchecked_out_branch(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -2733,7 +2738,7 @@ class CleanAtHeadShaTest(unittest.TestCase):
         payload = emit.call_args.args[0]
         self.assertEqual(payload["result"], "no_state")
         self.assertIsNone(payload["clean_at_head_sha"])
-        self.assertIsNone(payload["stage_outcome"])
+        self.assertNotIn("stage_outcome", payload)
 
 
 class StageOutcomeTest(unittest.TestCase):
@@ -2785,10 +2790,23 @@ class StageOutcomeTest(unittest.TestCase):
                     MODULE.stage_outcome({"last_result": result}), "no_progress"
                 )
 
-    def test_an_unrecognized_or_missing_result_escalates(self):
-        self.assertEqual(MODULE.stage_outcome({}), "escalated")
-        self.assertEqual(MODULE.stage_outcome({"last_result": None}), "escalated")
+    def test_an_unrecognized_ending_still_escalates(self):
+        """A run did end here. Nobody can describe it, which is worth a person."""
         self.assertEqual(MODULE.stage_outcome({"last_result": "surprise"}), "escalated")
+
+    def test_a_state_that_recorded_no_ending_answers_nothing(self):
+        """Absence of evidence is not evidence of absence.
+
+        A state file written before this field existed, or one from a run that
+        never recorded an ending, supports no claim about how a run went. It must
+        not be dressed up as one, not even a conservative one.
+        """
+        self.assertIsNone(MODULE.stage_outcome({}))
+        self.assertIsNone(MODULE.stage_outcome({"last_result": None}))
+        self.assertIsNone(MODULE.stage_outcome({"last_result": ""}))
+        self.assertIsNone(
+            MODULE.stage_outcome({"clean_at_head_sha": None, "queue": {"id": "pr-42"}})
+        )
 
     def test_every_mapped_outcome_uses_the_exact_pipeline_spelling(self):
         """A near miss like `green` or `clean` is silently ignored by the reader."""
@@ -2831,6 +2849,58 @@ class StageOutcomeTest(unittest.TestCase):
         self.assertEqual(payload["result"], "ready")
         self.assertEqual(payload["stage_outcome"], "no_progress")
         self.assertIsNone(payload["clean_at_head_sha"])
+
+    def test_a_no_state_payload_never_carries_an_outcome_word(self):
+        """A stage that was never launched has not made no progress. It has not run.
+
+        Pinned because a later edit will be tempted to make the key unconditional
+        for tidiness, which would assert a run that never happened.
+        """
+        target = MODULE.parse_target("https://github.com/owner/repo/pull/42")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "missing.json"
+            args = SimpleNamespace(current=True, state=None, repo_root="repo")
+
+            with (
+                mock.patch.object(MODULE, "require_tools"),
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=Path(directory)
+                ),
+                mock.patch.object(MODULE, "current_pr_target", return_value=target),
+                mock.patch.object(
+                    MODULE, "default_state_path", return_value=state_path
+                ),
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_status(args)
+
+        payload = emit.call_args.args[0]
+        self.assertEqual(payload["result"], "no_state")
+        self.assertNotIn("stage_outcome", payload)
+        for value in MODULE.STAGE_OUTCOME_BY_RESULT.values():
+            self.assertNotIn(value, json.dumps(payload))
+
+    def test_status_omits_the_outcome_for_a_state_that_recorded_no_ending(self):
+        """A state file from before this field existed must not gain an ending."""
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "pr": {"number": 42},
+            "queue": {"id": "pr-42"},
+            "monitoring": {"status": "completed"},
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(path, state)
+            args = SimpleNamespace(current=False, state=str(path), repo_root=None)
+
+            with mock.patch.object(MODULE, "emit") as emit:
+                MODULE.command_status(args)
+
+        payload = emit.call_args.args[0]
+        self.assertEqual(payload["result"], "ready")
+        self.assertNotIn("stage_outcome", payload)
 
 
 class CopilotReviewTest(unittest.TestCase):
