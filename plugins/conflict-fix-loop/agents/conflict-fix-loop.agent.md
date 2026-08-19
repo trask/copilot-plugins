@@ -200,6 +200,8 @@ Before you write the report, run `status` and read its `stage_outcome`. That fie
 
 When `status` reports `no_state` the field is absent, because there is no run to describe. That is not a failure and it is not `no_progress`. Say what `status` actually found instead of reaching for one of the four words.
 
+The field is also absent while a run is still going, because a state written mid-flight looks the same whether the run is still working or was killed, and the helper will not guess between them. If you see no field on a run you just finished, finish it properly — `publish`, `abort`, or `escalate` — and read `status` again. Absence there means no command recorded an ending, which usually means you skipped one.
+
 Send one message that calls no tool. Keep it compact.
 
 Open with one line that names the outcome, and never let an escalated run read like an uneventful one. An orchestrator decides from this line whether the stage stopped for a person or merely made no progress, and relaunching this stage against a contradiction it cannot resolve is the most expensive mistake it can make.

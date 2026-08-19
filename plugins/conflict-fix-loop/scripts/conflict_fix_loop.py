@@ -61,6 +61,7 @@ ESCALATION_KINDS = (
     "other",
 )
 STAGE_OUTCOMES = ("cleared", "skipped", "no_progress", "escalated")
+RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 
 class WorkflowError(RuntimeError):
@@ -2077,6 +2078,28 @@ def command_publish(args: argparse.Namespace) -> None:
     )
 
 
+def cleared_head_sha(state: dict[str, Any] | None) -> str | None:
+    """The commit a run cleared the pull request at, or None when no run cleared one.
+
+    A clearance is only worth reporting alongside the commit it was read at, so this
+    is the single fact behind both. A reader that cannot tie the clearance to a head
+    cannot check it against the head being recorded, and an unattached clearance
+    defeats that check without looking like it did.
+    """
+    if not state or state.get("escalation"):
+        return None
+    attempt = state.get("attempt") or {}
+    marker = attempt.get("mergeable_at_head_sha")
+    if not marker:
+        return None
+    status = attempt.get("status")
+    if status == "mergeable":
+        return marker
+    if status == "published" and marker == attempt.get("published_head_sha"):
+        return marker
+    return None
+
+
 def stage_outcome(state: dict[str, Any] | None) -> str | None:
     """Name how a run ended, in the vocabulary an orchestrator reads.
 
@@ -2085,40 +2108,48 @@ def stage_outcome(state: dict[str, Any] | None) -> str | None:
     disagreement between the two is this field being wrong rather than the live
     answer being wrong.
 
-    Anything that is not plainly a finished, published, mergeable run or a plainly
-    repeating one is reported as escalated. An escalation costs a person's attention
-    once, while a wrong clearance lets a caller move on from a stage that did not do
-    its job, and nothing downstream catches that.
+    Only an ending some command actually recorded gets a word. Nothing here is
+    inferred from the shape of the state, because `preflight` writes the state before
+    any work happens, so a run killed at any point leaves a state byte-identical to
+    one still going. Reading a mid-flight state as a failed run is not detecting a
+    crash; the information to tell those apart was never written.
 
-    With no state there is no run to describe, so this answers None and the caller
-    leaves the field out. A stage that was never launched, and one that finished and
-    cleaned up after itself, both look like this, and neither of them made no
-    progress. Saying nothing is the honest answer, and a reader that does not know to
-    distrust a word here would believe the wrong one.
+    That distinction decides who wins a disagreement. A caller prefers this word over
+    its own reading, on the grounds that the run watched itself. That holds for a
+    record and inverts for a guess: a guess made from a state file would outrank the
+    live agent that actually watched the run, so a guess must be absence instead.
+
+    An ending that was recorded but is not one of the recognized ones still reports
+    escalated. That is evidence of an ending nobody can describe, which is worth a
+    person's attention, and not the same as having no evidence at all.
+
+    With no state at all there is likewise no run to describe. A stage that was never
+    launched and one that finished and cleaned up after itself both look like this,
+    and neither of them made no progress.
     """
     if not state:
         return None
     escalation = state.get("escalation")
     if escalation:
         return "no_progress" if escalation.get("kind") == "no_progress" else "escalated"
-    attempt = state.get("attempt") or {}
-    status = attempt.get("status")
-    if status == "mergeable":
-        return "cleared"
-    if (
-        status == "published"
-        and attempt.get("published_head_sha")
-        and attempt.get("mergeable_at_head_sha") == attempt.get("published_head_sha")
-    ):
-        return "cleared"
-    return "escalated"
+    status = (state.get("attempt") or {}).get("status")
+    if status not in RECORDED_ENDINGS:
+        return None
+    return "cleared" if cleared_head_sha(state) else "escalated"
 
 
 def with_stage_outcome(payload: dict[str, Any], state: dict[str, Any] | None) -> dict[str, Any]:
-    """Add the run's outcome to a payload, and only when there is a run to describe."""
+    """Add the run's outcome to a payload, and only when a command recorded one.
+
+    A cleared run carries the commit it cleared at in the same payload, so a reader
+    never has one without the other.
+    """
     outcome = stage_outcome(state)
-    if outcome is not None:
-        payload["stage_outcome"] = outcome
+    if outcome is None:
+        return payload
+    payload["stage_outcome"] = outcome
+    if outcome == "cleared":
+        payload["mergeable_at_head_sha"] = cleared_head_sha(state)
     return payload
 
 

@@ -343,6 +343,10 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("there is no run to describe", self.instructions)
         self.assertIn("it is not `no_progress`", self.instructions)
 
+    def test_an_unfinished_run_is_finished_rather_than_guessed_at(self):
+        self.assertIn("absent while a run is still going", self.instructions)
+        self.assertIn("no command recorded an ending", self.instructions)
+
     def test_closes_every_run_with_a_tagged_retrospective(self):
         self.assertIn("## Conflict Fix Loop Agent Retrospective", self.instructions)
         for category in (
@@ -2785,7 +2789,11 @@ class StageOutcomeTest(unittest.TestCase):
 
     def test_a_pull_request_already_mergeable_cleared_the_stage(self):
         outcome = MODULE.stage_outcome(
-            self.state(attempt=attempt_record(status="mergeable"))
+            self.state(
+                attempt=attempt_record(
+                    status="mergeable", mergeable_at_head_sha="head1"
+                )
+            )
         )
         self.assertEqual("cleared", outcome)
 
@@ -2825,6 +2833,14 @@ class StageOutcomeTest(unittest.TestCase):
         )
         self.assertEqual("escalated", outcome)
 
+    def test_a_clearance_that_names_no_commit_is_not_a_clearance(self):
+        outcome = MODULE.stage_outcome(
+            self.state(
+                attempt=attempt_record(status="mergeable", mergeable_at_head_sha=None)
+            )
+        )
+        self.assertEqual("escalated", outcome)
+
     def test_a_repeating_run_reports_no_progress(self):
         outcome = MODULE.stage_outcome(
             self.state(escalation={"kind": "no_progress", "reason": "same files twice"})
@@ -2854,16 +2870,47 @@ class StageOutcomeTest(unittest.TestCase):
         )
         self.assertEqual("escalated", outcome)
 
-    def test_an_unfinished_run_escalates_rather_than_clearing(self):
-        for status in ("planned", "conflicted", "integrated", "resolved", "aborted"):
+    def test_a_run_still_in_flight_says_nothing_at_all(self):
+        for status in ("planned", "conflicted", "integrated", "resolved"):
+            with self.subTest(status=status):
+                outcome = MODULE.stage_outcome(
+                    self.state(attempt=attempt_record(status=status))
+                )
+                self.assertIsNone(outcome)
+
+    def test_a_killed_run_is_indistinguishable_from_a_running_one(self):
+        running = self.state(attempt=attempt_record(status="conflicted"))
+        killed = json.loads(json.dumps(running))
+        self.assertEqual(running, killed)
+        self.assertIsNone(MODULE.stage_outcome(killed))
+
+    def test_a_recorded_ending_nobody_recognizes_still_escalates(self):
+        for status in ("aborted", "escalated"):
             with self.subTest(status=status):
                 outcome = MODULE.stage_outcome(
                     self.state(attempt=attempt_record(status=status))
                 )
                 self.assertEqual("escalated", outcome)
 
+    def test_only_a_recorded_ending_earns_a_word(self):
+        for status in MODULE.RECORDED_ENDINGS:
+            with self.subTest(status=status, recorded=True):
+                outcome = MODULE.stage_outcome(
+                    self.state(attempt=attempt_record(status=status))
+                )
+                self.assertIn(outcome, MODULE.STAGE_OUTCOMES)
+        for status in ("planned", "conflicted", "integrated", "resolved", None):
+            with self.subTest(status=status, recorded=False):
+                self.assertNotIn(status, MODULE.RECORDED_ENDINGS)
+                outcome = MODULE.stage_outcome(
+                    self.state(
+                        attempt=None if status is None else attempt_record(status=status)
+                    )
+                )
+                self.assertIsNone(outcome)
+
     def test_a_missing_state_describes_no_run_at_all(self):
-        for state in (None, {}):
+        for state in (None, {}, self.state()):
             with self.subTest(state=state):
                 self.assertIsNone(MODULE.stage_outcome(state))
 
@@ -2873,13 +2920,51 @@ class StageOutcomeTest(unittest.TestCase):
 
     def test_a_payload_describing_a_run_carries_its_outcome(self):
         payload = MODULE.with_stage_outcome(
-            {"result": "ready"}, self.state(attempt=attempt_record(status="mergeable"))
+            {"result": "ready"},
+            self.state(
+                attempt=attempt_record(status="mergeable", mergeable_at_head_sha="head1")
+            ),
         )
         self.assertEqual("cleared", payload["stage_outcome"])
 
-    def test_a_loaded_state_always_has_something_to_say(self):
-        outcome = MODULE.stage_outcome(self.state())
-        self.assertEqual("escalated", outcome)
+    def test_a_cleared_payload_always_names_the_commit_it_cleared_at(self):
+        for attempt in (
+            attempt_record(status="mergeable", mergeable_at_head_sha="head1"),
+            attempt_record(
+                status="published",
+                published_head_sha="head2",
+                mergeable_at_head_sha="head2",
+            ),
+        ):
+            with self.subTest(status=attempt["status"]):
+                payload = MODULE.with_stage_outcome(
+                    {"result": "ready"}, self.state(attempt=attempt)
+                )
+                self.assertEqual("cleared", payload["stage_outcome"])
+                self.assertEqual(
+                    attempt["mergeable_at_head_sha"], payload["mergeable_at_head_sha"]
+                )
+
+    def test_no_commit_means_no_clearance(self):
+        for state in (
+            None,
+            {},
+            self.state(attempt=attempt_record(status="conflicted")),
+            self.state(
+                attempt=attempt_record(status="mergeable", mergeable_at_head_sha=None)
+            ),
+            self.state(
+                escalation={"kind": "contradiction", "reason": "r"},
+                attempt=attempt_record(
+                    status="published",
+                    published_head_sha="head2",
+                    mergeable_at_head_sha="head2",
+                ),
+            ),
+        ):
+            with self.subTest(state=state):
+                self.assertIsNone(MODULE.cleared_head_sha(state))
+                self.assertNotEqual("cleared", MODULE.stage_outcome(state))
 
     def test_the_stage_never_reports_skipped(self):
         for status in ("mergeable", "published", "planned", "conflicted", None):
@@ -2889,7 +2974,7 @@ class StageOutcomeTest(unittest.TestCase):
                         attempt=None if status is None else attempt_record(status=status)
                     )
                 )
-                self.assertIn(outcome, MODULE.STAGE_OUTCOMES)
+                self.assertIn(outcome, (None,) + MODULE.STAGE_OUTCOMES)
                 self.assertNotEqual("skipped", outcome)
 
 
@@ -2964,6 +3049,26 @@ class StatusCommandTest(unittest.TestCase):
         self.assertIsNone(payload["attempt"])
         self.assertEqual(0, payload["counts"]["conflicts"])
         self.assertIsNone(payload["mergeable_at_head_sha"])
+
+    def test_a_run_still_in_flight_reports_no_outcome(self):
+        for status in ("planned", "conflicted", "integrated", "resolved"):
+            with self.subTest(status=status):
+                payload = self.status(attempt=attempt_record(status=status))
+                self.assertEqual("ready", payload["result"])
+                self.assertNotIn("stage_outcome", payload)
+
+    def test_a_cleared_answer_always_names_the_commit_it_cleared_at(self):
+        payload = self.status(
+            attempt=attempt_record(
+                status="published",
+                published_head_sha="head2",
+                mergeable_at_head_sha="head2",
+            )
+        )
+        detail = json.loads(Path(payload["status_path"]).read_text(encoding="utf-8"))
+        for answer in (payload, detail):
+            self.assertEqual("cleared", answer["stage_outcome"])
+            self.assertEqual("head2", answer["mergeable_at_head_sha"])
 
     def test_an_outcome_never_travels_without_a_ready_payload(self):
         for overrides in (
