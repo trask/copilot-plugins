@@ -2,7 +2,7 @@
 name: PR Description Loop
 description: "Use when manually selected to review a pull request title and description with the user, then validate them or apply an explicitly approved replacement."
 argument-hint: "PR URL, PR number, or owner/repo#number; omit to use the current branch's PR"
-tools: [read, search, execute, todo, rename_session]
+tools: [read, search, execute, skill, todo, rename_session]
 user-invocable: true
 disable-model-invocation: true
 ---
@@ -16,6 +16,7 @@ You work with the user on one pull request's title and description. Always show 
 - After preflight, read the authoritative pull request diff. Then show the current title and current description before your evaluation and before any proposal, following "Displaying Title And Description".
 - Evaluate the current text against the diff at once, for clarity, concision, consistency, and scope. Never insert a neutral "does this look good?" turn before you give your judgment.
 - If the current text is strong, recommend keeping it and ask only for explicit approval of the exact title and body you displayed. Do not pair that request with an offer to make an optional extra change. If the text is weak, explain briefly why and show a complete replacement for explicit approval in the same response.
+- Before you display any replacement title or description, invoke the globally installed `unslop` skill with the `skill` tool and apply its process to the complete candidate title and body. Repeat this before every revised proposal. Once you display a proposal, do not run `unslop` again or change either value before approval and apply. Any later wording change is a new revision that needs another complete display and fresh approval.
 - Never change GitHub unless the user explicitly approves the exact title and the exact body in this session. Silence, absence of objection, earlier instructions, approval of different text, a stored memory, and intent you infer are not approval.
 - If the user explicitly approves the current text, validate it with `validate --no-change`. Do not run `propose` or `apply`.
 - If the text needs replacing, work with the user for as many rounds as it takes. Every revision needs a new display of the complete title and complete body under "Displaying Title And Description", a new `**What changed**` summary, and a new request for approval.

@@ -69,10 +69,32 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("The user selects this agent by hand", self.instructions)
 
     def test_renames_once_after_preflight(self):
-        self.assertIn("tools: [read, search, execute, todo, rename_session]", self.instructions)
+        self.assertIn(
+            "tools: [read, search, execute, skill, todo, rename_session]",
+            self.instructions,
+        )
         self.assertIn("After preflight succeeds, call `rename_session` exactly once", self.instructions)
         self.assertIn("`PR Description Loop: <number> - <title>`", self.instructions)
         self.assertIn("never rename again during this run", self.instructions)
+
+    def test_unslops_every_replacement_before_display_without_bypassing_approval(self):
+        self.assertIn(
+            "invoke the globally installed `unslop` skill with the `skill` tool",
+            self.instructions,
+        )
+        self.assertIn(
+            "apply its process to the complete candidate title and body",
+            self.instructions,
+        )
+        self.assertIn("Repeat this before every revised proposal", self.instructions)
+        self.assertIn(
+            "do not run `unslop` again or change either value before approval and apply",
+            self.instructions,
+        )
+        self.assertIn(
+            "needs another complete display and fresh approval",
+            self.instructions,
+        )
 
     def test_always_shows_current_text_before_evaluating_or_proposing(self):
         self.assertIn(
@@ -474,7 +496,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.18")
+        self.assertEqual(plugin["version"], "1.0.19")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 
