@@ -2729,8 +2729,100 @@ class CopilotReviewTest(unittest.TestCase):
 
         self.assertEqual(MODULE.matching_review(reviews, monitoring)["id"], 101)
 
+    def test_ignores_an_in_flight_review_of_an_earlier_commit(self):
+        """A review Copilot began before the head moved is not evidence about the head.
 
-class WatcherStateTest(unittest.TestCase):
+        The marker is proof for exactly one SHA, so a review that landed during the
+        watch but describes an older commit must never satisfy the wait.
+        """
+        monitoring = {
+            "baseline_review_id": 100,
+            "head_sha": "abc123",
+            "copilot_bot_id": "BOT_1",
+            "request_start": "2026-05-01T12:00:00Z",
+        }
+        reviews = [
+            {
+                "id": 101,
+                "commit_id": "0ldc0de",
+                "submitted_at": "2026-05-01T12:00:05Z",
+                "user": {
+                    "login": "copilot-pull-request-reviewer[bot]",
+                    "node_id": "BOT_1",
+                },
+            }
+        ]
+
+        self.assertIsNone(MODULE.matching_review(reviews, monitoring))
+
+    def test_watch_records_no_marker_while_only_an_older_commit_was_reviewed(self):
+        """The end-to-end shape of the same hazard, through the watcher itself.
+
+        The only Copilot review present describes an earlier commit, so the watcher
+        must keep waiting rather than conclude the head is clean. Here it leaves the
+        loop because the review request was withdrawn, which proves it never treated
+        the stale review as an answer.
+        """
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "pr": {"upstream_owner": "owner", "upstream_repo": "repo", "number": 7},
+            "monitoring": {
+                "status": "requested",
+                "head_sha": "abc123",
+                "baseline_review_id": 100,
+                "copilot_bot_id": "BOT_1",
+                "request_start": "2026-05-01T12:00:00Z",
+                "cancel_requested": False,
+            },
+        }
+        reviews = [
+            {
+                "id": 101,
+                "commit_id": "0ldc0de",
+                "submitted_at": "2026-05-01T12:00:05Z",
+                "html_url": "https://example.test/review/101",
+                "state": "COMMENTED",
+                "user": {
+                    "login": "copilot-pull-request-reviewer[bot]",
+                    "node_id": "BOT_1",
+                },
+            }
+        ]
+        timeline = [
+            {
+                "event": "review_request_removed",
+                "created_at": "2026-05-01T12:00:06Z",
+                "requested_reviewer": {
+                    "login": "copilot-pull-request-reviewer[bot]",
+                    "node_id": "BOT_1",
+                },
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(path, state)
+            args = SimpleNamespace(
+                state=str(path), interval=0, cancellation_grace=0
+            )
+            with (
+                mock.patch.object(
+                    MODULE, "gh_json", return_value={"head": {"sha": "abc123"}}
+                ),
+                mock.patch.object(MODULE, "fetch_reviews", return_value=reviews),
+                mock.patch.object(MODULE, "fetch_timeline", return_value=timeline),
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_watch(args)
+
+            recorded = MODULE.load_state(path).get("clean_at_head_sha")
+
+        payload = emit.call_args_list[-1].args[0]
+        self.assertEqual(payload["result"], "request_cancelled")
+        self.assertIsNone(payload.get("clean_at_head_sha"))
+        self.assertIsNone(recorded)
+
+
     def test_watch_treats_suppressed_only_review_as_comments(self):
         state = {
             "version": MODULE.STATE_VERSION,
