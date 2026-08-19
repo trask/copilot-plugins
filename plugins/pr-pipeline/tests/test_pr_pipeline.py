@@ -128,9 +128,11 @@ def observation(
             "pending": [],
             "coverage": coverage
             or {
-                "state": "complete",
-                "reason": "covers_earlier_checks",
+                "state": "satisfied",
+                "source": "declared",
+                "reason": "required_contexts_present",
                 "missing": [],
+                "declared": ["build"],
             },
         },
         "reads": {
@@ -592,51 +594,191 @@ class CheckSummaryTest(unittest.TestCase):
         self.assertEqual("UNKNOWN", MODULE.check_conclusion({"name": "mystery"}))
 
 
+class RequiredContextsTest(unittest.TestCase):
+    def target(self) -> dict:
+        return MODULE.build_target("owner", "repo", 7)
+
+    def read(self, response):
+        with mock.patch.object(MODULE, "gh_json", return_value=response):
+            return MODULE.required_contexts(self.target(), "main")
+
+    def rule(self, *contexts: str) -> dict:
+        return {
+            "type": "required_status_checks",
+            "parameters": {
+                "required_status_checks": [{"context": name} for name in contexts]
+            },
+        }
+
+    def test_every_rule_contributes_its_contexts(self):
+        answer = self.read(
+            [
+                self.rule("EasyCLA"),
+                {"type": "pull_request", "parameters": {}},
+                self.rule("build / required-status-check", "gradle-wrapper-validation"),
+            ]
+        )
+        self.assertTrue(answer["available"])
+        self.assertEqual(
+            [
+                "EasyCLA",
+                "build / required-status-check",
+                "gradle-wrapper-validation",
+            ],
+            answer["contexts"],
+        )
+
+    def test_a_branch_with_rules_but_no_required_checks_declares_nothing(self):
+        answer = self.read([{"type": "deletion", "parameters": {}}])
+        self.assertFalse(answer["available"])
+        self.assertEqual("none_declared", answer["reason"])
+
+    def test_a_branch_with_no_rules_declares_nothing(self):
+        answer = self.read([])
+        self.assertFalse(answer["available"])
+        self.assertEqual("none_declared", answer["reason"])
+
+    def test_a_private_repository_on_a_free_plan_is_not_an_error(self):
+        with mock.patch.object(
+            MODULE,
+            "gh_json",
+            side_effect=MODULE.WorkflowError("Upgrade to GitHub Pro (HTTP 403)"),
+        ):
+            answer = MODULE.required_contexts(self.target(), "main")
+        self.assertFalse(answer["available"])
+        self.assertEqual("not_available_here", answer["reason"])
+
+    def test_a_branch_that_is_not_found_is_not_an_error(self):
+        with mock.patch.object(
+            MODULE, "gh_json", side_effect=MODULE.WorkflowError("Not Found (HTTP 404)")
+        ):
+            answer = MODULE.required_contexts(self.target(), "main")
+        self.assertFalse(answer["available"])
+        self.assertEqual("no_rules", answer["reason"])
+
+    def test_any_other_failure_is_still_survivable(self):
+        with mock.patch.object(
+            MODULE, "gh_json", side_effect=MODULE.WorkflowError("gh exploded")
+        ):
+            answer = MODULE.required_contexts(self.target(), "main")
+        self.assertFalse(answer["available"])
+        self.assertEqual("lookup_failed", answer["reason"])
+
+    def test_no_base_branch_reads_nothing(self):
+        with mock.patch.object(MODULE, "gh_json") as reader:
+            answer = MODULE.required_contexts(self.target(), None)
+        reader.assert_not_called()
+        self.assertEqual("no_base_branch", answer["reason"])
+
+    def test_the_classic_protection_endpoint_is_never_called(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("/protection/", source)
+
+    def test_the_answer_is_read_once_per_base_branch(self):
+        state: dict = {}
+        with mock.patch.object(
+            MODULE,
+            "required_contexts",
+            return_value={"available": True, "reason": "declared", "contexts": ["a"]},
+        ) as reader:
+            first = MODULE.cached_required_contexts(state, self.target(), "main")
+            second = MODULE.cached_required_contexts(state, self.target(), "main")
+        self.assertEqual(1, reader.call_count)
+        self.assertEqual(first, second)
+        self.assertEqual("main", state["required_contexts"]["base_branch"])
+
+    def test_a_different_base_branch_is_read_again(self):
+        state: dict = {}
+        with mock.patch.object(
+            MODULE,
+            "required_contexts",
+            return_value={"available": False, "reason": "none_declared", "contexts": []},
+        ) as reader:
+            MODULE.cached_required_contexts(state, self.target(), "main")
+            MODULE.cached_required_contexts(state, self.target(), "release")
+        self.assertEqual(2, reader.call_count)
+
+
 class CheckCoverageTest(unittest.TestCase):
-    def expected(self, *names: str, head_sha: str = HEAD) -> dict:
-        return {"head_sha": head_sha, "names": sorted(names)}
+    def declared(self, *contexts: str) -> dict:
+        return {"available": True, "reason": "declared", "contexts": sorted(contexts)}
 
-    def judge(self, names, expected, *, waited=0.0, grace=180):
+    def judge(self, names, required, *, age=0.0, grace=180, deadline=1800):
         return MODULE.judge_check_coverage(
-            set(names), expected, waited_seconds=waited, grace_seconds=grace
+            set(names),
+            required,
+            head_age_seconds=age,
+            grace_seconds=grace,
+            deadline_seconds=deadline,
         )
 
-    def test_a_rollup_missing_an_earlier_check_is_not_finished(self):
-        coverage = self.judge({"build"}, self.expected("build", "test", "lint"))
-        self.assertEqual("incomplete", coverage["state"])
-        self.assertEqual(["lint", "test"], coverage["missing"])
-        self.assertEqual("missing_earlier_checks", coverage["reason"])
+    def test_every_declared_context_present_satisfies_coverage(self):
+        coverage = self.judge({"build", "test", "extra"}, self.declared("build", "test"))
+        self.assertEqual("satisfied", coverage["state"])
+        self.assertEqual("declared", coverage["source"])
+        self.assertEqual("required_contexts_present", coverage["reason"])
 
-    def test_a_rollup_holding_every_earlier_check_is_finished(self):
-        coverage = self.judge({"build", "test"}, self.expected("build", "test"))
-        self.assertEqual("complete", coverage["state"])
-        self.assertEqual("covers_earlier_checks", coverage["reason"])
-
-    def test_a_rollup_that_adds_a_check_is_not_a_subset(self):
-        coverage = self.judge({"build", "extra"}, self.expected("build", "test"))
-        self.assertEqual("complete", coverage["state"])
-
-    def test_the_first_head_has_no_expectation_to_measure_against(self):
-        for expected in (None, {}, {"head_sha": "old", "names": []}):
-            with self.subTest(expected=expected):
-                coverage = self.judge({"build"}, expected)
-                self.assertEqual("unverified", coverage["state"])
-                self.assertEqual("no_earlier_head", coverage["reason"])
-
-    def test_the_wait_for_missing_checks_is_bounded(self):
-        coverage = self.judge(
-            {"build"}, self.expected("build", "test"), waited=181, grace=180
-        )
-        self.assertEqual("complete", coverage["state"])
-        self.assertEqual("settled_smaller", coverage["reason"])
+    def test_a_declared_context_that_is_missing_holds_coverage(self):
+        coverage = self.judge({"build"}, self.declared("build", "test"))
+        self.assertEqual("unsatisfied", coverage["state"])
         self.assertEqual(["test"], coverage["missing"])
+        self.assertEqual("required_contexts_missing", coverage["reason"])
 
-    def test_a_wait_that_cannot_be_measured_does_not_deadlock(self):
-        coverage = MODULE.judge_check_coverage(
-            {"build"}, self.expected("build", "test"), waited_seconds=None
+    def test_a_declared_context_is_satisfied_immediately_without_waiting(self):
+        coverage = self.judge({"build"}, self.declared("build"), age=0.0)
+        self.assertEqual("satisfied", coverage["state"])
+
+    def test_an_undeclared_check_missing_from_the_rollup_holds_nothing(self):
+        coverage = self.judge({"build"}, self.declared("build"), age=0.0)
+        self.assertEqual([], coverage["missing"])
+
+    def test_a_declared_context_that_never_arrives_becomes_overdue(self):
+        coverage = self.judge(
+            {"build"}, self.declared("build", "test"), age=1801, deadline=1800
         )
-        self.assertEqual("complete", coverage["state"])
-        self.assertEqual("wait_not_measurable", coverage["reason"])
+        self.assertEqual("overdue", coverage["state"])
+        self.assertEqual(["test"], coverage["missing"])
+        self.assertEqual("required_contexts_never_registered", coverage["reason"])
+
+    def test_nothing_declared_falls_back_to_the_head_settling(self):
+        for required in (
+            None,
+            {},
+            {"available": False, "reason": "none_declared", "contexts": []},
+            {"available": False, "reason": "not_available_here", "contexts": []},
+            {"available": False, "reason": "no_rules", "contexts": []},
+            {"available": False, "reason": "lookup_failed", "contexts": []},
+        ):
+            with self.subTest(required=required):
+                fresh = self.judge({"build"}, required, age=0.0, grace=180)
+                self.assertEqual("unsatisfied", fresh["state"])
+                self.assertEqual("head_too_new", fresh["reason"])
+                settled = self.judge({"build"}, required, age=181, grace=180)
+                self.assertEqual("satisfied", settled["state"])
+                self.assertEqual("age", settled["source"])
+                self.assertEqual("head_settled", settled["reason"])
+
+    def test_the_fallback_never_holds_a_stage_forever(self):
+        coverage = self.judge({"build"}, None, age=10**6, grace=180)
+        self.assertEqual("satisfied", coverage["state"])
+
+    def test_an_age_that_cannot_be_measured_does_not_deadlock(self):
+        coverage = MODULE.judge_check_coverage(
+            {"build"}, None, head_age_seconds=None
+        )
+        self.assertEqual("satisfied", coverage["state"])
+        self.assertEqual("age_not_measurable", coverage["reason"])
+
+    def test_an_unmeasurable_age_still_waits_on_a_declared_context(self):
+        coverage = MODULE.judge_check_coverage(
+            {"build"}, self.declared("build", "test"), head_age_seconds=None
+        )
+        self.assertEqual("unsatisfied", coverage["state"])
+
+    def test_no_inferred_expectation_is_ever_consulted(self):
+        for name in ("base_check_names", "checks_expected"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, SCRIPT.read_text(encoding="utf-8"))
 
 
 class ApplyCheckCoverageTest(unittest.TestCase):
@@ -646,91 +788,94 @@ class ApplyCheckCoverageTest(unittest.TestCase):
             for name in names
         ]
 
-    def observe(self, state, head_sha, *names, now="2024-01-01T00:00:00Z"):
+    def declared(self, *contexts: str) -> dict:
+        return {"available": True, "reason": "declared", "contexts": sorted(contexts)}
+
+    def observe(self, state, head_sha, *names, required=None, now="2024-01-01T00:00:00Z"):
         seen = {
             "pr": base_pr(),
             "head_sha": head_sha,
             "checks": MODULE.summarize_checks(self.rollup(*names)),
         }
         with mock.patch.object(MODULE, "utc_now", return_value=now):
-            MODULE.apply_check_coverage(state, seen)
+            MODULE.apply_check_coverage(state, seen, required)
         return seen
 
-    def test_the_first_head_seen_is_only_recorded(self):
+    def test_a_partial_rollup_missing_a_declared_context_reports_pending(self):
         state: dict = {}
-        seen = self.observe(state, HEAD, "build", "test")
-        self.assertEqual("success", seen["checks"]["state"])
-        self.assertEqual("unverified", seen["checks"]["coverage"]["state"])
-        self.assertEqual(HEAD, state["checks_seen"]["head_sha"])
-        self.assertEqual(["build", "test"], state["checks_seen"]["names"])
-        self.assertNotIn("checks_expected", state)
-
-    def test_a_partial_rollup_at_a_new_head_reports_pending(self):
-        state: dict = {}
-        self.observe(state, HEAD, "build", "test")
-        seen = self.observe(state, NEXT_HEAD, "build", now="2024-01-01T00:00:10Z")
+        seen = self.observe(state, HEAD, "build", required=self.declared("build", "test"))
         self.assertEqual("pending", seen["checks"]["state"])
-        self.assertEqual("incomplete", seen["checks"]["coverage"]["state"])
         self.assertEqual(["test"], seen["checks"]["coverage"]["missing"])
-        self.assertEqual(HEAD, state["checks_expected"]["head_sha"])
 
-    def test_a_complete_rollup_at_a_new_head_stays_success(self):
+    def test_a_complete_rollup_reports_success_on_the_very_first_head(self):
         state: dict = {}
-        self.observe(state, HEAD, "build", "test")
         seen = self.observe(
-            state, NEXT_HEAD, "build", "test", now="2024-01-01T00:00:10Z"
+            state, HEAD, "build", "test", required=self.declared("build", "test")
         )
         self.assertEqual("success", seen["checks"]["state"])
-        self.assertEqual("complete", seen["checks"]["coverage"]["state"])
+        self.assertEqual("satisfied", seen["checks"]["coverage"]["state"])
 
-    def test_a_smaller_set_is_accepted_once_the_wait_is_spent(self):
+    def test_a_fresh_head_with_nothing_declared_reports_pending(self):
         state: dict = {}
-        self.observe(state, HEAD, "build", "test")
-        self.observe(state, NEXT_HEAD, "build", now="2024-01-01T00:00:10Z")
-        seen = self.observe(state, NEXT_HEAD, "build", now="2024-01-01T01:00:00Z")
-        self.assertEqual("success", seen["checks"]["state"])
-        self.assertEqual("settled_smaller", seen["checks"]["coverage"]["reason"])
-
-    def test_a_check_appearing_late_restarts_the_wait(self):
-        state: dict = {}
-        self.observe(state, HEAD, "build", "test", "lint")
-        self.observe(state, NEXT_HEAD, "build", now="2024-01-01T00:00:10Z")
-        self.observe(state, NEXT_HEAD, "build", "test", now="2024-01-01T01:00:00Z")
-        self.assertEqual("2024-01-01T01:00:00Z", state["checks_seen"]["changed_at"])
-        seen = self.observe(
-            state, NEXT_HEAD, "build", "test", now="2024-01-01T01:00:30Z"
-        )
+        seen = self.observe(state, HEAD, "build")
         self.assertEqual("pending", seen["checks"]["state"])
-        self.assertEqual(["lint"], seen["checks"]["coverage"]["missing"])
+        self.assertEqual("head_too_new", seen["checks"]["coverage"]["reason"])
 
-    def test_names_seen_at_one_head_are_remembered_across_reads(self):
+    def test_a_settled_head_with_nothing_declared_reports_success(self):
         state: dict = {}
         self.observe(state, HEAD, "build")
-        self.observe(state, HEAD, "test", now="2024-01-01T00:00:10Z")
-        self.assertEqual(["build", "test"], state["checks_seen"]["names"])
+        seen = self.observe(state, HEAD, "build", now="2024-01-01T01:00:00Z")
+        self.assertEqual("success", seen["checks"]["state"])
+        self.assertEqual("head_settled", seen["checks"]["coverage"]["reason"])
+
+    def test_the_settling_clock_restarts_when_the_head_moves(self):
+        state: dict = {}
+        self.observe(state, HEAD, "build")
+        self.observe(state, HEAD, "build", now="2024-01-01T01:00:00Z")
+        seen = self.observe(state, NEXT_HEAD, "build", now="2024-01-01T01:00:05Z")
+        self.assertEqual("pending", seen["checks"]["state"])
+        self.assertEqual(NEXT_HEAD, state["checks_watch"]["head_sha"])
+        self.assertEqual("2024-01-01T01:00:05Z", state["checks_watch"]["first_seen_at"])
+
+    def test_the_clock_does_not_restart_while_the_head_stands_still(self):
+        state: dict = {}
+        self.observe(state, HEAD, "build")
+        self.observe(state, HEAD, "build", "test", now="2024-01-01T00:00:30Z")
+        self.assertEqual("2024-01-01T00:00:00Z", state["checks_watch"]["first_seen_at"])
 
     def test_coverage_never_turns_a_failure_into_something_softer(self):
         state: dict = {}
-        self.observe(state, HEAD, "build", "test")
         seen = {
             "pr": base_pr(),
-            "head_sha": NEXT_HEAD,
+            "head_sha": HEAD,
             "checks": MODULE.summarize_checks(
                 [{"name": "build", "status": "COMPLETED", "conclusion": "FAILURE"}]
             ),
         }
-        with mock.patch.object(MODULE, "utc_now", return_value="2024-01-01T00:00:10Z"):
-            MODULE.apply_check_coverage(state, seen)
+        with mock.patch.object(MODULE, "utc_now", return_value="2024-01-01T00:00:00Z"):
+            MODULE.apply_check_coverage(state, seen, self.declared("build"))
+        self.assertEqual("failing", seen["checks"]["state"])
+
+    def test_a_failing_undeclared_check_still_holds_the_stage(self):
+        state: dict = {}
+        seen = {
+            "pr": base_pr(),
+            "head_sha": HEAD,
+            "checks": MODULE.summarize_checks(
+                [
+                    {"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    {"name": "extra", "status": "COMPLETED", "conclusion": "FAILURE"},
+                ]
+            ),
+        }
+        with mock.patch.object(MODULE, "utc_now", return_value="2024-01-01T00:00:00Z"):
+            MODULE.apply_check_coverage(state, seen, self.declared("build"))
         self.assertEqual("failing", seen["checks"]["state"])
 
     def test_an_empty_rollup_is_still_none_and_not_pending(self):
         state: dict = {}
-        self.observe(state, HEAD, "build")
-        seen = self.observe(state, NEXT_HEAD, now="2024-01-01T00:00:10Z")
+        seen = self.observe(state, HEAD, now="2024-01-01T01:00:00Z")
         self.assertEqual("none", seen["checks"]["state"])
-
-    def test_the_base_commit_is_never_consulted(self):
-        self.assertFalse(hasattr(MODULE, "base_check_names"))
 
 
 class CorroborateMergeabilityTest(unittest.TestCase):
@@ -870,7 +1015,7 @@ class ObservePullRequestTest(unittest.TestCase):
     def test_the_rollup_names_reach_the_summary_unjudged(self):
         result = self.observe(self.payload(mergeable="MERGEABLE", status="CLEAN"))
         self.assertEqual(["build"], result["checks"]["names"])
-        self.assertEqual("unverified", result["checks"]["coverage"]["state"])
+        self.assertEqual("unsatisfied", result["checks"]["coverage"]["state"])
         self.assertEqual("not_judged", result["checks"]["coverage"]["reason"])
 
 
@@ -921,13 +1066,15 @@ class GithubEvidenceTest(unittest.TestCase):
         self.assertFalse(verdict["green"])
         self.assertEqual("head_moved", verdict["reason"])
 
-    def test_an_incomplete_rollup_sends_the_check_stage_round_again(self):
+    def test_a_missing_declared_context_sends_the_check_stage_round_again(self):
         observed = observation(
             checks="pending",
             coverage={
-                "state": "incomplete",
-                "reason": "missing_earlier_checks",
+                "state": "unsatisfied",
+                "source": "declared",
+                "reason": "required_contexts_missing",
                 "missing": ["test"],
+                "declared": ["build", "test"],
             },
             self_review=HEAD,
             copilot_review=HEAD,
@@ -937,8 +1084,48 @@ class GithubEvidenceTest(unittest.TestCase):
         self.assertEqual("run_stage", decision["result"])
         self.assertEqual(MODULE.STAGE_CI, decision["stage"])
         self.assertEqual(
-            ["test"], decision["stage_states"][MODULE.STAGE_CI]["missing_checks"]
+            ["test"], decision["stage_states"][MODULE.STAGE_CI]["missing_contexts"]
         )
+
+    def test_a_passing_rollup_that_is_not_covered_is_not_green(self):
+        verdict = self.verdict(
+            MODULE.STAGE_CI,
+            observation(
+                coverage={
+                    "state": "unsatisfied",
+                    "source": "age",
+                    "reason": "head_too_new",
+                    "missing": [],
+                    "declared": [],
+                }
+            ),
+        )
+        self.assertFalse(verdict["green"])
+        self.assertEqual("head_too_new", verdict["reason"])
+
+    def test_a_declared_context_that_never_registers_escalates(self):
+        observed = observation(
+            checks="pending",
+            coverage={
+                "state": "overdue",
+                "source": "declared",
+                "reason": "required_contexts_never_registered",
+                "missing": ["build / required-status-check"],
+                "declared": ["build / required-status-check"],
+            },
+            self_review=HEAD,
+            copilot_review=HEAD,
+            description=HEAD,
+        )
+        decision = MODULE.decide_next(build_state(), observed)
+        self.assertEqual("escalate", decision["result"])
+        self.assertEqual("checks_never_registered", decision["reason"])
+        self.assertEqual(MODULE.STAGE_CI, decision["stage"])
+        self.assertEqual(
+            ["build / required-status-check"], decision["missing_contexts"]
+        )
+        self.assertIn("build / required-status-check", decision["detail"])
+        self.assertIn("draft", decision["next_action"])
 
     def test_a_conflict_the_two_fields_disagree_about_sends_the_stage_round_again(self):
         observed = observation(mergeable="MERGEABLE", merge_state_status="DIRTY")
@@ -1292,6 +1479,50 @@ class StageOutcomeTest(unittest.TestCase):
         self.assertIn("status", command)
         self.assertIn(str(state), command)
 
+    def test_a_reading_carries_the_head_the_stage_pinned_its_clearance_to(self):
+        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_SELF_REVIEW]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = (
+                root
+                / "installed-plugins"
+                / "trask-plugins"
+                / entry["plugin"]
+                / "scripts"
+                / f"{entry['module']}.py"
+            )
+            script.parent.mkdir(parents=True)
+            script.write_text("", encoding="utf-8")
+            state = root / "state.json"
+            state.write_text("{}", encoding="utf-8")
+            payload = SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "result": "ready",
+                        "stage_outcome": "cleared",
+                        "review": {"outcome": "clean", "clean_at_head_sha": NEXT_HEAD},
+                    }
+                ),
+                stderr="",
+            )
+            with mock.patch.object(MODULE, "copilot_home", return_value=root):
+                with mock.patch.object(MODULE, "stage_state_path", return_value=state):
+                    with mock.patch.object(MODULE, "run", return_value=payload):
+                        reading = MODULE.read_stage_outcome(
+                            entry, MODULE.build_target("owner", "repo", 7)
+                        )
+                        resolution = MODULE.resolve_finish_outcome(
+                            entry,
+                            MODULE.build_target("owner", "repo", 7),
+                            "cleared",
+                            head_sha=HEAD,
+                        )
+        self.assertEqual(NEXT_HEAD, reading["clean_at_head_sha"])
+        self.assertEqual("helper", reading["evidence"])
+        self.assertEqual("no_progress", resolution["outcome"])
+        self.assertEqual("clean_marker_head_mismatch", resolution["outcome_reason"])
+
     def test_an_outcome_never_makes_a_github_backed_stage_green(self):
         state = build_state()
         observed = observation(mergeable="CONFLICTING")
@@ -1309,12 +1540,20 @@ class StageOutcomeTest(unittest.TestCase):
 
 
 class ResolveFinishOutcomeTest(unittest.TestCase):
-    def resolve(self, requested: str, reading: dict) -> dict:
+    def resolve(
+        self,
+        requested: str,
+        reading: dict,
+        *,
+        stage: str = MODULE.STAGE_CI,
+        head: str = HEAD,
+    ) -> dict:
         with mock.patch.object(MODULE, "read_stage_outcome", return_value=reading):
             return MODULE.resolve_finish_outcome(
-                MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
+                MODULE.STAGE_BY_NAME[stage],
                 MODULE.build_target("owner", "repo", 7),
                 requested,
+                head_sha=head,
             )
 
     def test_the_stage_answer_beats_the_reported_one(self):
@@ -1345,6 +1584,73 @@ class ResolveFinishOutcomeTest(unittest.TestCase):
         )
         self.assertEqual("escalated", resolution["outcome"])
         self.assertEqual("reported", resolution["outcome_source"])
+
+    def test_a_clearance_pinned_to_this_head_is_accepted(self):
+        for stage in MODULE.HELPER_EVIDENCE_STAGES:
+            with self.subTest(stage=stage):
+                resolution = self.resolve(
+                    "cleared",
+                    {
+                        "available": True,
+                        "outcome": "cleared",
+                        "clean_at_head_sha": HEAD,
+                    },
+                    stage=stage,
+                )
+                self.assertEqual("cleared", resolution["outcome"])
+                self.assertIsNone(resolution["outcome_reason"])
+
+    def test_a_clearance_marked_at_another_head_is_refused(self):
+        for stage in MODULE.HELPER_EVIDENCE_STAGES:
+            with self.subTest(stage=stage):
+                resolution = self.resolve(
+                    "cleared",
+                    {
+                        "available": True,
+                        "outcome": "cleared",
+                        "clean_at_head_sha": NEXT_HEAD,
+                    },
+                    stage=stage,
+                )
+                self.assertEqual("no_progress", resolution["outcome"])
+                self.assertEqual(
+                    "clean_marker_head_mismatch", resolution["outcome_reason"]
+                )
+                self.assertEqual("cleared", resolution["stage_outcome"])
+                self.assertEqual(NEXT_HEAD, resolution["clean_at_head_sha"])
+
+    def test_a_clearance_with_no_marker_at_all_is_refused(self):
+        resolution = self.resolve(
+            "cleared",
+            {"available": True, "outcome": "cleared", "clean_at_head_sha": None},
+            stage=MODULE.STAGE_SELF_REVIEW,
+        )
+        self.assertEqual("no_progress", resolution["outcome"])
+        self.assertEqual("clean_marker_head_mismatch", resolution["outcome_reason"])
+
+    def test_a_github_backed_stage_is_not_asked_for_a_marker(self):
+        resolution = self.resolve(
+            "cleared",
+            {"available": True, "outcome": "cleared", "clean_at_head_sha": None},
+            stage=MODULE.STAGE_CI,
+        )
+        self.assertEqual("cleared", resolution["outcome"])
+        self.assertIsNone(resolution["outcome_reason"])
+
+    def test_only_a_clearance_needs_a_marker(self):
+        for outcome in ("skipped", "no_progress", "escalated"):
+            with self.subTest(outcome=outcome):
+                resolution = self.resolve(
+                    outcome,
+                    {
+                        "available": True,
+                        "outcome": outcome,
+                        "clean_at_head_sha": None,
+                    },
+                    stage=MODULE.STAGE_SELF_REVIEW,
+                )
+                self.assertEqual(outcome, resolution["outcome"])
+                self.assertIsNone(resolution["outcome_reason"])
 
 
 class ModelGateTest(unittest.TestCase):
@@ -1516,12 +1822,39 @@ class CommandTestCase(unittest.TestCase):
         )
         reader.start()
         self.addCleanup(reader.stop)
+        # No command test may reach the ruleset API, and none re-judges coverage:
+        # the observation fixture already carries the verdict under test. The
+        # wiring that connects the two is asserted on its own.
+        self.required = {
+            "available": False,
+            "reason": "none_declared",
+            "contexts": [],
+            "base_branch": "main",
+        }
+        contexts = mock.patch.object(
+            MODULE, "cached_required_contexts", side_effect=lambda *_: self.required
+        )
+        self.required_reads = contexts.start()
+        self.addCleanup(contexts.stop)
+        coverage = mock.patch.object(
+            MODULE,
+            "apply_check_coverage",
+            side_effect=lambda _state, observed, _required: (
+                (observed.get("checks") or {}).get("coverage")
+            ),
+        )
+        self.coverage_calls = coverage.start()
+        self.addCleanup(coverage.stop)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
 
-    def stage_says(self, outcome: str) -> None:
-        self.stage_reading = {"available": True, "outcome": outcome}
+    def stage_says(self, outcome: str, clean_at_head_sha: str | None = None) -> None:
+        self.stage_reading = {
+            "available": True,
+            "outcome": outcome,
+            "clean_at_head_sha": clean_at_head_sha,
+        }
 
     def args(self, **values) -> SimpleNamespace:
         return SimpleNamespace(**values)
@@ -1755,6 +2088,127 @@ class FinishCommandTest(CommandTestCase):
         state = MODULE.load_state(path)
         self.assertNotIn(MODULE.STAGE_SELF_REVIEW, state["no_progress"])
 
+    def test_repeating_the_same_answer_at_the_same_head_is_not_progress(self):
+        path = self.running_state(
+            MODULE.STAGE_CI,
+            history=[
+                {
+                    "stage": MODULE.STAGE_CI,
+                    "outcome": "cleared",
+                    "head_sha": HEAD,
+                }
+            ],
+        )
+        self.finish(path, MODULE.STAGE_CI, "cleared")
+        state = MODULE.load_state(path)
+        self.assertTrue(state["history"][-1]["repeat"])
+        self.assertEqual(1, state["no_progress"][MODULE.STAGE_CI]["count"])
+        self.assertEqual(HEAD, state["cleared"][MODULE.STAGE_CI])
+
+    def test_a_second_repeat_escalates_rather_than_relaunching_forever(self):
+        path = self.running_state(
+            MODULE.STAGE_CI,
+            history=[
+                {
+                    "stage": MODULE.STAGE_CI,
+                    "outcome": "cleared",
+                    "head_sha": HEAD,
+                }
+            ],
+            no_progress={MODULE.STAGE_CI: {"count": 1, "head_sha": HEAD}},
+        )
+        self.finish(path, MODULE.STAGE_CI, "cleared")
+        state = MODULE.load_state(path)
+        self.assertEqual("no_progress", state["escalation"]["reason"])
+        self.assertIn("repeated its cleared answer", state["escalation"]["detail"])
+
+    def test_the_same_answer_at_a_new_head_is_fresh_evidence(self):
+        path = self.running_state(
+            MODULE.STAGE_CI,
+            history=[
+                {
+                    "stage": MODULE.STAGE_CI,
+                    "outcome": "cleared",
+                    "head_sha": HEAD,
+                }
+            ],
+            no_progress={MODULE.STAGE_CI: {"count": 1, "head_sha": HEAD}},
+        )
+        self.finish(path, MODULE.STAGE_CI, "cleared", NEXT_HEAD)
+        state = MODULE.load_state(path)
+        self.assertFalse(state["history"][-1]["repeat"])
+        self.assertNotIn(MODULE.STAGE_CI, state["no_progress"])
+        self.assertIsNone(state["escalation"])
+
+    def test_a_different_answer_at_the_same_head_is_fresh_evidence(self):
+        path = self.running_state(
+            MODULE.STAGE_CI,
+            history=[
+                {
+                    "stage": MODULE.STAGE_CI,
+                    "outcome": "no_progress",
+                    "head_sha": HEAD,
+                }
+            ],
+        )
+        self.finish(path, MODULE.STAGE_CI, "cleared")
+        state = MODULE.load_state(path)
+        self.assertFalse(state["history"][-1]["repeat"])
+        self.assertNotIn(MODULE.STAGE_CI, state["no_progress"])
+
+    def test_a_repeated_escalation_still_stops_the_pipeline_as_an_escalation(self):
+        path = self.running_state(
+            MODULE.STAGE_CI,
+            history=[
+                {
+                    "stage": MODULE.STAGE_CI,
+                    "outcome": "escalated",
+                    "head_sha": HEAD,
+                }
+            ],
+        )
+        self.finish(path, MODULE.STAGE_CI, "escalated")
+        state = MODULE.load_state(path)
+        self.assertEqual("stage_escalated", state["escalation"]["reason"])
+
+    def test_a_clearance_from_a_marker_at_another_head_records_nothing(self):
+        path = self.running_state(MODULE.STAGE_SELF_REVIEW)
+        self.stage_says("cleared", clean_at_head_sha=NEXT_HEAD)
+        self.finish(path, MODULE.STAGE_SELF_REVIEW, "cleared", HEAD)
+        state = MODULE.load_state(path)
+        self.assertNotIn(MODULE.STAGE_SELF_REVIEW, state["cleared"])
+        entry = state["history"][-1]
+        self.assertEqual("no_progress", entry["outcome"])
+        self.assertEqual("cleared", entry["stage_outcome"])
+        self.assertEqual("clean_marker_head_mismatch", entry["outcome_reason"])
+        self.assertEqual(NEXT_HEAD, entry["clean_at_head_sha"])
+        self.assertEqual(
+            "clean_marker_head_mismatch", self.emitted[-1]["outcome_reason"]
+        )
+
+    def test_a_stale_state_file_cannot_clear_a_stage_the_run_never_reached(self):
+        path = self.running_state(MODULE.STAGE_DESCRIPTION)
+        self.stage_says("cleared", clean_at_head_sha="0" * 40)
+        self.finish(path, MODULE.STAGE_DESCRIPTION, "no_progress", HEAD)
+        state = MODULE.load_state(path)
+        self.assertEqual({}, state["cleared"])
+        self.assertEqual(1, state["no_progress"][MODULE.STAGE_DESCRIPTION]["count"])
+
+    def test_a_clearance_pinned_to_the_recorded_head_still_clears(self):
+        path = self.running_state(MODULE.STAGE_SELF_REVIEW)
+        self.stage_says("cleared", clean_at_head_sha=NEXT_HEAD)
+        self.finish(path, MODULE.STAGE_SELF_REVIEW, "cleared", NEXT_HEAD)
+        state = MODULE.load_state(path)
+        self.assertEqual(NEXT_HEAD, state["cleared"][MODULE.STAGE_SELF_REVIEW])
+        self.assertIsNone(state["history"][-1]["outcome_reason"])
+
+    def test_a_github_backed_stage_clears_without_any_marker(self):
+        path = self.running_state(MODULE.STAGE_CI)
+        self.stage_says("cleared")
+        self.finish(path, MODULE.STAGE_CI, "cleared", HEAD)
+        state = MODULE.load_state(path)
+        self.assertEqual(HEAD, state["cleared"][MODULE.STAGE_CI])
+
     def test_finishing_a_stage_that_never_started_is_refused(self):
         path = write_state(self.root)
         with self.assertRaises(MODULE.WorkflowError) as error:
@@ -1854,6 +2308,12 @@ class NextCommandTest(CommandTestCase):
         path = write_state(self.root)
         self.call_next(path, observation(head_sha=NEXT_HEAD))
         self.assertEqual(NEXT_HEAD, MODULE.load_state(path)["observed_head_sha"])
+
+    def test_the_declared_contexts_are_read_for_the_base_branch_and_judged(self):
+        path = write_state(self.root)
+        self.call_next(path, observation())
+        self.assertEqual("main", self.required_reads.call_args.args[2])
+        self.assertIs(self.required, self.coverage_calls.call_args.args[2])
 
     def test_a_runnable_stage_returns_a_launch_plan(self):
         path = write_state(self.root)
@@ -2067,6 +2527,11 @@ class PreflightCommandTest(CommandTestCase):
                         MODULE, "copilot_home", return_value=home
                     ):
                         MODULE.command_preflight(self.args(**arguments))
+
+    def test_the_declared_contexts_are_read_for_the_base_branch_and_judged(self):
+        self.call_preflight(observation(), installed=MODULE.STAGE_NAMES)
+        self.assertEqual("main", self.required_reads.call_args.args[2])
+        self.assertIs(self.required, self.coverage_calls.call_args.args[2])
 
     def test_a_fresh_run_creates_the_state(self):
         self.call_preflight(observation(), installed=MODULE.STAGE_NAMES)
@@ -2440,14 +2905,33 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions.replace("No GitHub field", "no GitHub field"),
         )
 
-    def test_it_rules_out_the_base_commit_as_a_coverage_reference(self):
+    def test_it_says_a_clearance_must_carry_its_commit(self):
         self.assertIn(
-            "The previous head of the same pull request is the only sound reference",
+            "A clearance has to carry the commit it is about.",
             self.instructions,
         )
         self.assertIn(
-            "The base branch commit is not one, because the base and the head are "
-            "reached by different triggers",
+            "a state file left behind by an earlier run answers `cleared` just as "
+            "readily as one the current run wrote",
+            self.instructions,
+        )
+
+    def test_it_says_a_repeat_is_not_fresh_evidence(self):
+        self.assertIn(
+            "A stage that gives the same answer at the same head it already gave "
+            "there has told the pipeline nothing new.",
+            self.instructions,
+        )
+
+    def test_it_rules_out_every_inferred_coverage_reference(self):
+        self.assertIn(
+            "Absence only means \"has not arrived yet\" for a check that was "
+            "declared.",
+            self.instructions,
+        )
+        self.assertIn(
+            "Neither the base branch commit nor the pull request's own previous "
+            "head says what this head is supposed to produce",
             self.instructions,
         )
 
@@ -2458,7 +2942,10 @@ class AgentInstructionsTest(unittest.TestCase):
             "conservative failure.",
             self.instructions,
         )
-        self.assertIn("the wait for missing checks is bounded", self.instructions)
+        self.assertIn(
+            "the wait ends in an escalation naming them rather than in silence",
+            self.instructions,
+        )
 
     def test_it_names_every_stage_plugin_qualified(self):
         self.assertIn(

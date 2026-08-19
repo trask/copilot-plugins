@@ -21,7 +21,8 @@ STATE_VERSION = 1
 DEFAULT_MAX_ITERATIONS = 2
 NO_PROGRESS_LIMIT = 2
 MERGEABLE_RETRY_DELAYS = (2, 4, 8)
-CHECK_COVERAGE_GRACE_SECONDS = 180
+CHECK_SETTLE_GRACE_SECONDS = 180
+CHECK_COVERAGE_DEADLINE_SECONDS = 1800
 IS_WINDOWS = os.name == "nt"
 PR_URL_PATTERN = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
@@ -108,11 +109,19 @@ STAGES: tuple[dict[str, Any], ...] = (
 STAGE_NAMES = tuple(entry["stage"] for entry in STAGES)
 STAGE_BY_NAME = {entry["stage"]: entry for entry in STAGES}
 STAGE_INDEX = {entry["stage"]: index for index, entry in enumerate(STAGES)}
+HELPER_EVIDENCE_STAGES = tuple(
+    entry["stage"] for entry in STAGES if entry["evidence"] == "helper"
+)
 
 STAGE_OUTCOMES = ("cleared", "skipped", "no_progress", "escalated")
 CLEARING_OUTCOMES = ("cleared", "skipped")
 
 ESCALATION_ACTIONS = {
+    "checks_never_registered": (
+        "Check whether the repository skips these checks on a draft pull "
+        "request. If it does, take the pull request out of draft yourself, or "
+        "start the pipeline again once the checks can run."
+    ),
     "max_iterations_reached": (
         "Read the kept stage transcripts, decide what still needs a human, and "
         "start the remaining stage yourself."
@@ -817,9 +826,9 @@ def summarize_checks(rollup: Any) -> dict[str, Any]:
     in coverage. Right after a push GitHub may have registered only the quickest
     workflows, and a rollup holding two passing entries with nothing failing and
     nothing pending is indistinguishable here from a finished green one. Judging
-    that needs an expectation of what this pull request runs, which lives in the
-    pipeline state rather than in one response. ``judge_check_coverage`` applies
-    it.
+    that needs to know which checks the branch *declares*, which comes from the
+    repository's rulesets rather than from this response.
+    ``judge_check_coverage`` applies it.
     """
 
     nodes = rollup if isinstance(rollup, list) else []
@@ -855,89 +864,192 @@ def summarize_checks(rollup: Any) -> dict[str, Any]:
         "failing": failing,
         "pending": pending,
         "names": sorted(names),
-        "coverage": {"state": "unverified", "reason": "not_judged", "missing": []},
+        "coverage": {
+            "state": "unsatisfied",
+            "source": "none",
+            "reason": "not_judged",
+            "missing": [],
+            "declared": [],
+        },
         "action_required": [
             entry for entry in failing if entry["state"] == "ACTION_REQUIRED"
         ],
     }
 
 
-def judge_check_coverage(
-    names: set[str],
-    expected: Any,
-    *,
-    waited_seconds: float | None,
-    grace_seconds: int = CHECK_COVERAGE_GRACE_SECONDS,
-) -> dict[str, Any]:
-    """Judge whether this head's rollup has finished registering.
+def required_contexts(target: dict[str, Any], base_branch: Any) -> dict[str, Any]:
+    """Read which status checks the base branch *declares* as required.
 
-    The expectation is the set of check names *this pull request* ran at its
-    previous head. That is the only sound reference available. The base commit's
-    checks are not one: the base and the head are reached by different triggers,
-    so a ``pull_request`` workflow runs only for the head and a ``push``
-    workflow may run only for the base. Comparing against the base would fire
-    never on some repositories and forever on others.
+    Absence of a check name only means "has not arrived yet" for a check the
+    repository said would run. An inferred expectation cannot carry that
+    meaning: neither the base commit's checks nor the pull request's previous
+    head tell you what this head is supposed to produce, so a name missing from
+    either is indistinguishable from a name that was never coming.
 
-    A strict subset of the previous head's set means checks are still
-    registering, and the honest state is ``pending`` rather than success.
+    The ruleset endpoint is the one that answers the declared question. It reads
+    with plain read access, and it returns the active rules from every ruleset
+    that applies to the branch, so the required contexts are the union across
+    every ``required_status_checks`` rule rather than the first one found.
 
-    The wait is bounded, because a commit may legitimately drop checks: a
-    docs-only change really does run fewer workflows when a path filter excludes
-    them. Once ``grace_seconds`` have passed with no new check name appearing at
-    this head, the smaller set is accepted as complete and the stage may go
-    green. A guard that can never stop firing is a deadlock rather than a
-    conservative failure, so this one always has a way out.
+    The classic branch-protection endpoint is deliberately not used. A
+    repository governed by rulesets rather than by classic protection answers it
+    with ``404``, which is indistinguishable from an unprotected branch, so it
+    fails quietly and wrongly on exactly the repositories this pipeline runs
+    against most.
+
+    Nothing declared is a normal answer rather than a fault. A private
+    repository on a free plan answers ``403``, a branch with no rules answers
+    ``404`` or an empty list, and a branch with rules may declare no required
+    checks at all. Every one of those leaves the answer unavailable, and
+    coverage falls back to waiting for the head to settle.
     """
 
-    expected_names = set()
-    if isinstance(expected, dict):
-        expected_names = {name for name in expected.get("names") or [] if name}
-    if not expected_names:
-        return {"state": "unverified", "reason": "no_earlier_head", "missing": []}
-    if not names < expected_names:
+    if not isinstance(base_branch, str) or not base_branch:
+        return {"available": False, "reason": "no_base_branch", "contexts": []}
+    try:
+        response = gh_json(
+            [
+                "api",
+                f"repos/{target['repo_name']}/rules/branches/{base_branch}",
+            ]
+        )
+    except WorkflowError as error:
+        detail = str(error)
+        reason = "not_available_here" if "403" in detail else "lookup_failed"
+        if "404" in detail:
+            reason = "no_rules"
         return {
-            "state": "complete",
-            "reason": "covers_earlier_checks",
+            "available": False,
+            "reason": reason,
+            "detail": detail,
+            "contexts": [],
+        }
+
+    contexts: set[str] = set()
+    for rule in response if isinstance(response, list) else []:
+        if not isinstance(rule, dict) or rule.get("type") != "required_status_checks":
+            continue
+        parameters = rule.get("parameters")
+        if not isinstance(parameters, dict):
+            continue
+        for check in parameters.get("required_status_checks") or []:
+            if not isinstance(check, dict):
+                continue
+            context = check.get("context")
+            if isinstance(context, str) and context:
+                contexts.add(context)
+    if not contexts:
+        return {"available": False, "reason": "none_declared", "contexts": []}
+    return {"available": True, "reason": "declared", "contexts": sorted(contexts)}
+
+
+def judge_check_coverage(
+    names: set[str],
+    required: Any,
+    *,
+    head_age_seconds: float | None,
+    grace_seconds: int = CHECK_SETTLE_GRACE_SECONDS,
+    deadline_seconds: int = CHECK_COVERAGE_DEADLINE_SECONDS,
+) -> dict[str, Any]:
+    """Judge whether the head's rollup is complete enough to be believed.
+
+    A rollup can be complete in shape and incomplete in coverage. Right after a
+    push GitHub may have registered only the quickest workflows, and a rollup
+    holding two passing entries with nothing failing and nothing pending looks
+    exactly like a finished green one.
+
+    Where the base branch declares required contexts, coverage is answered
+    exactly: every declared context must appear in the rollup. A declared
+    context that is missing has not registered yet, and its absence is
+    meaningful because the repository said it would be there.
+
+    Where nothing is declared, coverage degrades to a question about time: the
+    head must have been under observation for ``grace_seconds`` before a passing
+    rollup is believed. Time always passes, so this fallback cannot hold a stage
+    forever.
+
+    Comparison against an inferred set is not used in either path, and the
+    absence of a check nobody declared never holds the pipeline. A check that is
+    *present* still counts wherever it came from, so a failing check outside the
+    declared set routes to the check stage as it always did.
+
+    The declared path is bounded too. A repository that skips its checks on
+    draft pull requests would otherwise wait for a context that is never coming,
+    and this pipeline works exclusively on drafts. After
+    ``deadline_seconds`` the missing contexts stop being a wait and become an
+    escalation that names them.
+    """
+
+    declared: set[str] = set()
+    if isinstance(required, dict) and required.get("available"):
+        declared = {name for name in required.get("contexts") or [] if name}
+
+    if declared:
+        missing = sorted(declared - names)
+        if not missing:
+            return {
+                "state": "satisfied",
+                "source": "declared",
+                "reason": "required_contexts_present",
+                "missing": [],
+                "declared": sorted(declared),
+            }
+        age = None if head_age_seconds is None else float(head_age_seconds)
+        if age is not None and age >= deadline_seconds:
+            return {
+                "state": "overdue",
+                "source": "declared",
+                "reason": "required_contexts_never_registered",
+                "missing": missing,
+                "declared": sorted(declared),
+                "head_age_seconds": age,
+                "deadline_seconds": deadline_seconds,
+            }
+        return {
+            "state": "unsatisfied",
+            "source": "declared",
+            "reason": "required_contexts_missing",
+            "missing": missing,
+            "declared": sorted(declared),
+            "head_age_seconds": age,
+            "deadline_seconds": deadline_seconds,
+        }
+
+    reason = "none_declared"
+    if isinstance(required, dict) and required.get("reason"):
+        reason = str(required["reason"])
+    if head_age_seconds is None:
+        return {
+            "state": "satisfied",
+            "source": "age",
+            "reason": "age_not_measurable",
             "missing": [],
-            "expected_head_sha": (expected or {}).get("head_sha"),
+            "declared": [],
+            "required_reason": reason,
         }
-    missing = sorted(expected_names - names)
-    if waited_seconds is None:
-        return {
-            "state": "complete",
-            "reason": "wait_not_measurable",
-            "missing": missing,
-            "expected_head_sha": (expected or {}).get("head_sha"),
-        }
-    waited = float(waited_seconds)
-    if waited >= grace_seconds:
-        return {
-            "state": "complete",
-            "reason": "settled_smaller",
-            "missing": missing,
-            "waited_seconds": waited,
-            "grace_seconds": grace_seconds,
-            "expected_head_sha": (expected or {}).get("head_sha"),
-        }
+    age = float(head_age_seconds)
+    state = "satisfied" if age >= grace_seconds else "unsatisfied"
     return {
-        "state": "incomplete",
-        "reason": "missing_earlier_checks",
-        "missing": missing,
-        "waited_seconds": waited,
+        "state": state,
+        "source": "age",
+        "reason": "head_settled" if state == "satisfied" else "head_too_new",
+        "missing": [],
+        "declared": [],
+        "required_reason": reason,
+        "head_age_seconds": age,
         "grace_seconds": grace_seconds,
-        "expected_head_sha": (expected or {}).get("head_sha"),
     }
 
 
 def apply_check_coverage(
-    state: dict[str, Any], observation: dict[str, Any]
+    state: dict[str, Any], observation: dict[str, Any], required: Any
 ) -> dict[str, Any]:
-    """Record which checks this head has run, and judge the rollup's coverage.
+    """Judge the rollup's coverage and fold the answer into the observation.
 
-    Two records are kept. ``checks_seen`` holds the current head, every check
-    name seen at it so far, and when that set last grew; the growth timestamp is
-    what bounds the wait. ``checks_expected`` holds the head before it, which is
-    the expectation the current rollup is measured against.
+    ``checks_watch`` records when this head first came under observation. That
+    timestamp is what the fallback grace and the declared deadline are both
+    measured from, so a head that has only just arrived is never mistaken for
+    one whose checks have finished registering.
     """
 
     head_sha = observation["head_sha"]
@@ -945,45 +1057,38 @@ def apply_check_coverage(
     names = {name for name in checks.get("names") or [] if name}
     now = utc_now()
 
-    seen = state.get("checks_seen")
-    if isinstance(seen, dict) and seen.get("head_sha") == head_sha:
-        known = {name for name in seen.get("names") or [] if name}
-        merged = known | names
-        changed_at = seen.get("changed_at") if merged == known else now
-        seen = {
-            "head_sha": head_sha,
-            "names": sorted(merged),
-            "first_seen_at": seen.get("first_seen_at") or now,
-            "changed_at": changed_at or now,
-        }
-    else:
-        if isinstance(seen, dict) and seen.get("head_sha"):
-            state["checks_expected"] = {
-                "head_sha": seen.get("head_sha"),
-                "names": sorted(
-                    {name for name in seen.get("names") or [] if name}
-                ),
-            }
-        seen = {
-            "head_sha": head_sha,
-            "names": sorted(names),
-            "first_seen_at": now,
-            "changed_at": now,
-        }
-    state["checks_seen"] = seen
+    watch = state.get("checks_watch")
+    if not isinstance(watch, dict) or watch.get("head_sha") != head_sha:
+        watch = {"head_sha": head_sha, "first_seen_at": now}
+    state["checks_watch"] = watch
 
-    expected = state.get("checks_expected")
-    if isinstance(expected, dict) and expected.get("head_sha") == head_sha:
-        expected = None
     coverage = judge_check_coverage(
-        {name for name in seen["names"]},
-        expected,
-        waited_seconds=elapsed_seconds(seen.get("changed_at"), now),
+        names,
+        required,
+        head_age_seconds=elapsed_seconds(watch.get("first_seen_at"), now),
     )
     checks["coverage"] = coverage
-    if checks.get("state") == "success" and coverage["state"] == "incomplete":
+    if checks.get("state") == "success" and coverage["state"] != "satisfied":
         checks["state"] = "pending"
     return coverage
+
+
+def cached_required_contexts(
+    state: dict[str, Any], target: dict[str, Any], base_branch: Any
+) -> dict[str, Any]:
+    """Read the declared contexts once per base branch and reuse the answer.
+
+    Which checks a branch requires is configuration. It does not change while a
+    pipeline runs, so it must not become a call per poll.
+    """
+
+    cached = state.get("required_contexts")
+    if isinstance(cached, dict) and cached.get("base_branch") == base_branch:
+        return cached
+    answer = required_contexts(target, base_branch)
+    answer = {**answer, "base_branch": base_branch, "read_at": utc_now()}
+    state["required_contexts"] = answer
+    return answer
 
 
 def run_stage_status(
@@ -1156,6 +1261,12 @@ def read_stage_outcome(
         "installed": status["installed"],
         "script": status["script"],
         "state": status["state"],
+        "evidence": entry["evidence"],
+        "clean_at_head_sha": (
+            extract_clean_at_head_sha(entry["stage"], status["payload"])
+            if status.get("ok")
+            else None
+        ),
     }
     if not status.get("ok"):
         return {
@@ -1261,10 +1372,10 @@ def stage_green(
     if entry["stage"] == STAGE_CI:
         checks = observation.get("checks") or {}
         coverage = checks.get("coverage") or {}
-        green = checks.get("state") == "success"
+        green = checks.get("state") == "success" and coverage.get("state") == "satisfied"
         reason = None if green else checks.get("state")
-        if not green and coverage.get("state") == "incomplete":
-            reason = "checks_incomplete"
+        if not green and coverage.get("state") != "satisfied":
+            reason = coverage.get("reason") or "coverage_unsatisfied"
         if green and stale_read:
             green = False
             reason = "head_moved"
@@ -1273,7 +1384,8 @@ def stage_green(
             "evidence": "github",
             "checks": checks.get("state"),
             "coverage": coverage.get("state"),
-            "missing_checks": coverage.get("missing") or [],
+            "coverage_source": coverage.get("source"),
+            "missing_contexts": coverage.get("missing") or [],
             "reason": reason,
             "recorded_at_head_sha": recorded,
         }
@@ -1391,6 +1503,26 @@ def decide_next(state: dict[str, Any], observation: dict[str, Any]) -> dict[str,
                 f"pipeline cannot launch {next_entry['agent']}"
             ),
             "next_action": ESCALATION_ACTIONS["helper_missing"],
+            "head_sha": head_sha,
+            "recorded": False,
+        }
+
+    # A declared context that never registers is not a wait, it is a fault. The
+    # pipeline works exclusively on drafts, so a repository that skips its
+    # checks on a draft would otherwise wait for something that is not coming.
+    if verdict.get("coverage") == "overdue":
+        missing = verdict.get("missing_contexts") or []
+        have = "they have" if len(missing) > 1 else "it has"
+        return {
+            "result": "escalate",
+            "stage": stage,
+            "reason": "checks_never_registered",
+            "detail": (
+                f"the base branch requires {', '.join(missing)} but {have} "
+                f"not registered on {head_sha}"
+            ),
+            "next_action": ESCALATION_ACTIONS["checks_never_registered"],
+            "missing_contexts": missing,
             "head_sha": head_sha,
             "recorded": False,
         }
@@ -1661,7 +1793,11 @@ def command_preflight(args: argparse.Namespace) -> None:
         state = new_state(target, observation, repo_root, max_iterations)
         resumed = False
     state["observed_head_sha"] = observation["head_sha"]
-    apply_check_coverage(state, observation)
+    apply_check_coverage(
+        state,
+        observation,
+        cached_required_contexts(state, target, observation["pr"].get("base_branch")),
+    )
 
     for assignment in args.stage_model or []:
         stage, separator, model = assignment.partition("=")
@@ -1709,7 +1845,11 @@ def command_next(args: argparse.Namespace) -> None:
         target, known_head_sha=state.get("observed_head_sha")
     )
     state["observed_head_sha"] = observation["head_sha"]
-    apply_check_coverage(state, observation)
+    apply_check_coverage(
+        state,
+        observation,
+        cached_required_contexts(state, target, observation["pr"].get("base_branch")),
+    )
     decision = decide_next(state, observation)
 
     if decision["result"] == "run_stage":
@@ -1826,7 +1966,11 @@ def command_start(args: argparse.Namespace) -> None:
 
 
 def resolve_finish_outcome(
-    entry: dict[str, Any], target: dict[str, Any], requested: str
+    entry: dict[str, Any],
+    target: dict[str, Any],
+    requested: str,
+    *,
+    head_sha: str | None = None,
 ) -> dict[str, Any]:
     """Settle how a stage ended, preferring the stage's own answer.
 
@@ -1834,6 +1978,21 @@ def resolve_finish_outcome(
     name for the ending outranks the one the caller reported. The caller's answer
     is kept in the history either way, which is what makes a disagreement
     visible instead of silent.
+
+    That precedence has one limit, and it is the reason a head is passed in. A
+    stage whose greenness is a judgment records that judgment in a state file
+    that outlives the run which wrote it, and its ``status`` reports ``cleared``
+    from the presence of that record. A run that dies before it replaces an
+    older record therefore answers ``cleared`` about a commit it never looked
+    at. The word alone is not evidence about this run: a clearance is accepted
+    only when the stage's own head-pinned marker names the head being recorded.
+    When it does not, the run reached no clearance, and the disagreement is kept
+    rather than quietly rewritten, because a stage answering from a record it
+    did not write is worth seeing afterwards.
+
+    A stage whose truth lives on GitHub is untouched by this. Its clearance is
+    never read from the pipeline's record, so a stale marker cannot speak for
+    it.
 
     A pipeline problem that is not the stage's fault, such as a launch that never
     produced a run, belongs in ``escalate`` rather than here. ``finish`` says how
@@ -1847,12 +2006,25 @@ def resolve_finish_outcome(
             "requested_outcome": requested,
             "outcome_source": "reported",
             "outcome_reason": reading.get("reason"),
+            "clean_at_head_sha": reading.get("clean_at_head_sha"),
+        }
+    outcome = reading["outcome"]
+    marker = sha_or_none(reading.get("clean_at_head_sha"))
+    if entry["evidence"] == "helper" and outcome == "cleared" and marker != head_sha:
+        return {
+            "outcome": "no_progress",
+            "requested_outcome": requested,
+            "outcome_source": "stage_status",
+            "outcome_reason": "clean_marker_head_mismatch",
+            "stage_outcome": outcome,
+            "clean_at_head_sha": marker,
         }
     return {
-        "outcome": reading["outcome"],
+        "outcome": outcome,
         "requested_outcome": requested,
         "outcome_source": "stage_status",
         "outcome_reason": None,
+        "clean_at_head_sha": marker,
     }
 
 
@@ -1907,13 +2079,18 @@ def command_finish(args: argparse.Namespace) -> None:
     target = build_target(
         state["pr"]["owner"], state["pr"]["repo"], state["pr"]["number"]
     )
-    resolution = resolve_finish_outcome(STAGE_BY_NAME[stage], target, args.outcome)
+    resolution = resolve_finish_outcome(
+        STAGE_BY_NAME[stage], target, args.outcome, head_sha=head_sha
+    )
     outcome = resolution["outcome"]
     entry = {
         "stage": stage,
         "outcome": outcome,
         "requested_outcome": resolution["requested_outcome"],
         "outcome_source": resolution["outcome_source"],
+        "outcome_reason": resolution.get("outcome_reason"),
+        "stage_outcome": resolution.get("stage_outcome"),
+        "clean_at_head_sha": resolution.get("clean_at_head_sha"),
         "iteration": running.get("iteration"),
         "started_head_sha": running.get("head_sha"),
         "head_sha": head_sha,
@@ -1925,11 +2102,25 @@ def command_finish(args: argparse.Namespace) -> None:
         "model": running.get("model"),
         "detail": args.detail,
     }
+    # A stage repeating an answer it already gave at this head has told the
+    # pipeline nothing new. Relaunching a stage that has run out of its own road
+    # returns the same result immediately every time, so a repeat must not read
+    # as fresh evidence and must not reset the no-progress streak that is the
+    # only brake on relaunching the same stage forever.
+    repeat = any(
+        isinstance(past, dict)
+        and past.get("stage") == stage
+        and past.get("head_sha") == head_sha
+        and past.get("outcome") == outcome
+        for past in state.get("history") or []
+    )
+    entry["repeat"] = repeat
     state.setdefault("history", []).append(entry)
     state["running"] = None
 
     streaks = state.setdefault("no_progress", {})
-    if outcome == "no_progress":
+    stalled = outcome == "no_progress" or repeat
+    if stalled:
         previous = streaks.get(stage)
         count = int(previous.get("count") or 0) + 1 if isinstance(previous, dict) else 1
         streaks[stage] = {"count": count, "head_sha": head_sha, "at": utc_now()}
@@ -1939,7 +2130,7 @@ def command_finish(args: argparse.Namespace) -> None:
     escalation = None
     if outcome in CLEARING_OUTCOMES and head_sha:
         state.setdefault("cleared", {})[stage] = head_sha
-    elif outcome == "escalated":
+    if outcome == "escalated":
         escalation = record_escalation(
             state,
             {
@@ -1951,17 +2142,21 @@ def command_finish(args: argparse.Namespace) -> None:
                 "head_sha": head_sha,
             },
         )
-    elif outcome == "no_progress":
+    elif stalled:
         count = int((streaks.get(stage) or {}).get("count") or 0)
         if count >= NO_PROGRESS_LIMIT:
+            detail = f"{stage} ran {count} times in a row without changing anything"
+            if repeat:
+                detail = (
+                    f"{stage} repeated its {outcome} answer at {head_sha} without "
+                    "the pipeline being able to act on it"
+                )
             escalation = record_escalation(
                 state,
                 {
                     "stage": stage,
                     "reason": "no_progress",
-                    "detail": (
-                        f"{stage} ran {count} times in a row without changing anything"
-                    ),
+                    "detail": detail,
                     "next_action": ESCALATION_ACTIONS["no_progress"],
                     "head_sha": head_sha,
                 },
@@ -1976,6 +2171,7 @@ def command_finish(args: argparse.Namespace) -> None:
             "outcome": outcome,
             "requested_outcome": resolution["requested_outcome"],
             "outcome_source": resolution["outcome_source"],
+            "outcome_reason": resolution.get("outcome_reason"),
             "entry": entry,
             "cleared": state.get("cleared") or {},
             "no_progress": state.get("no_progress") or {},
