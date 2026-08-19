@@ -73,7 +73,7 @@ The deterministic, JSON-only helper provides:
 - `preflight [target] [--max-iterations 5] [--completed-run-iterations <n>]`: resolve and check out the PR, require a clean worktree, check its head, drop every thread a non-Copilot author started, fetch thread and suppressed comments, enforce the per-invocation iteration cap, record whether the head is clean, and set up external state
 - `plan --state <path> --batch <id> --comments <ids...> --label <label> [--paths <paths...>] [--validation <command>]`: store one planned batch; `--batch` and `--comments` are required option names, not positional values
 - `refresh`, `record`, and `skip`: maintain the state of a comment and of a completed batch
-- `status --current --repo-root <workspace>`: return only the workflow state attached to the current branch's PR, including `clean_at_head_sha`
+- `status --current --repo-root <workspace>`: return only the workflow state attached to the current branch's PR, including `clean_at_head_sha` and `stage_outcome`
 - `publish`: compare the live remote PR head with the preflight pin directly before it pushes, return `head_changed` instead of pushing over a divergence, push only when a push is needed, post each thread reply as its own published comment and never twice, resolve thread comments, request Copilot even without a new commit, request the very first Copilot review when the PR has never had one, and verify the publication
 - `watch`: monitor exactly the requested Copilot review, and wait for it
 - `cancel-watch`: stop monitoring that is stale or superseded
@@ -107,6 +107,8 @@ Preflight adds suppressed comments after thread comments and reports the latest 
 The helper drops every review thread a non-Copilot author started before it builds the queue, so a human's review comment never reaches you. `skipped_authors` names those authors and nothing else. Leave their comments to the user, who reads them before promoting the pull request out of draft.
 
 `preflight`, `watch`, and `status` all report `clean_at_head_sha`. It holds the head SHA that Copilot reviewed with nothing left to address, and it is null whenever this stage is not clean at the current head. Publishing clears it, because the new head has no review yet.
+
+`status` also reports `stage_outcome`, which says how the last run ended in the vocabulary an external orchestrator reads: `cleared`, `skipped`, `no_progress`, or `escalated`. It exists so nobody has to interpret your report to decide what happens next. It never says whether this stage is green, because `clean_at_head_sha` alone says that, and a run that ends any way at all other than clean never reports `cleared`. Both fields are written by the helper, so do not set, quote, or work around either one.
 
 ## Suppressed Comments
 

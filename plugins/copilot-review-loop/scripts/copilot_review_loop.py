@@ -33,6 +33,18 @@ PR_HEAD_LAG_RETRY_DELAYS = (1, 2, 4)
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
 # Preflight results that mean Copilot reviewed the current head and asked for nothing.
 CLEAN_PREFLIGHT_RESULTS = frozenset({"no_copilot_comments", "no_unresolved_comments"})
+# How a run ended, in the vocabulary an external orchestrator reads. This says how a
+# run ended and never whether the stage is green: `clean_at_head_sha` alone says that.
+# A result missing from this table ends up "escalated", because a run nobody can
+# describe is worth a person's attention, and a wrong clearance is not.
+STAGE_OUTCOME_BY_RESULT = {
+    "max_iterations_reached": "escalated",
+    "request_cancelled": "escalated",
+    "review_dismissed": "escalated",
+    "head_changed": "no_progress",
+    "cancelled_locally": "no_progress",
+    "stopped": "no_progress",
+}
 IS_WINDOWS = os.name == "nt"
 # A pasted review or comment fragment is accepted and ignored: the queue is always
 # every unresolved Copilot comment on the pull request.
@@ -736,8 +748,23 @@ def process_is_running(pid: Any) -> bool:
     return True
 
 
+def stage_outcome(state: dict[str, Any]) -> str:
+    """Say how the last run ended, in an external orchestrator's vocabulary.
+
+    ``cleared`` is read straight off ``clean_at_head_sha`` rather than decided
+    again here, so this can never become a second, softer route to a clearance.
+    A run that ended some other way is described from the result the run
+    recorded, and anything unrecognized escalates.
+    """
+
+    if state.get("clean_at_head_sha"):
+        return "cleared"
+    return STAGE_OUTCOME_BY_RESULT.get(state.get("last_result"), "escalated")
+
+
 def watcher_result(state: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     state["monitoring"].update({"status": "completed", "result": result})
+    state["last_result"] = result["result"]
     return result
 
 
@@ -891,6 +918,7 @@ def command_preflight(args: argparse.Namespace) -> None:
         result = "no_unresolved_comments"
     clean_at_head_sha = head if result in CLEAN_PREFLIGHT_RESULTS else None
     state["clean_at_head_sha"] = clean_at_head_sha
+    state["last_result"] = result
     save_state(state_path, state)
     emit(
         {
@@ -1847,6 +1875,7 @@ def command_status(args: argparse.Namespace) -> None:
                     "queue": None,
                     "monitoring": None,
                     "clean_at_head_sha": None,
+                    "stage_outcome": None,
                 }
             )
             return
@@ -1861,6 +1890,7 @@ def command_status(args: argparse.Namespace) -> None:
             "queue": state.get("queue"),
             "monitoring": state.get("monitoring"),
             "clean_at_head_sha": state.get("clean_at_head_sha"),
+            "stage_outcome": stage_outcome(state),
         }
     )
 

@@ -177,6 +177,24 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
 
+    def test_documents_the_stage_outcome_vocabulary(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "`status` also reports `stage_outcome`", instructions
+        )
+        self.assertIn(
+            "`cleared`, `skipped`, `no_progress`, or `escalated`", instructions
+        )
+        self.assertIn(
+            "It never says whether this stage is green, because `clean_at_head_sha` "
+            "alone says that",
+            instructions,
+        )
+        self.assertIn(
+            "do not set, quote, or work around either one", instructions
+        )
+
     def test_accepts_a_pr_target_for_an_unchecked_out_branch(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
@@ -2447,6 +2465,7 @@ class CleanAtHeadShaTest(unittest.TestCase):
         self.assertEqual(payload["result"], "no_unresolved_comments")
         self.assertEqual(payload["clean_at_head_sha"], "head")
         self.assertEqual(saved["clean_at_head_sha"], "head")
+        self.assertEqual(MODULE.stage_outcome(saved), "cleared")
 
     def test_preflight_records_a_clean_head_with_only_human_threads(self):
         review = {
@@ -2483,6 +2502,8 @@ class CleanAtHeadShaTest(unittest.TestCase):
         self.assertEqual(payload["result"], "review_required")
         self.assertIsNone(payload["clean_at_head_sha"])
         self.assertIsNone(saved["clean_at_head_sha"])
+        self.assertEqual(saved["last_result"], "review_required")
+        self.assertEqual(MODULE.stage_outcome(saved), "escalated")
 
     def test_preflight_clears_a_stale_marker_from_an_earlier_clean_head(self):
         thread = {
@@ -2711,6 +2732,104 @@ class CleanAtHeadShaTest(unittest.TestCase):
 
         payload = emit.call_args.args[0]
         self.assertEqual(payload["result"], "no_state")
+        self.assertIsNone(payload["clean_at_head_sha"])
+        self.assertIsNone(payload["stage_outcome"])
+
+
+class StageOutcomeTest(unittest.TestCase):
+    """The vocabulary an external orchestrator reads instead of the prose report."""
+
+    PIPELINE_VOCABULARY = ("cleared", "skipped", "no_progress", "escalated")
+
+    def test_a_clearance_is_read_off_the_marker_and_never_decided_again(self):
+        self.assertEqual(MODULE.stage_outcome({"clean_at_head_sha": "abc123"}), "cleared")
+
+    def test_no_result_can_clear_a_run_the_marker_did_not_clear(self):
+        """`stage_outcome` must never become a second, softer route to green.
+
+        Every result a run can record is checked, including the ones that mean
+        Copilot asked for nothing. Without the marker, none of them clear.
+        """
+        results = [
+            "no_copilot_comments",
+            "no_unresolved_comments",
+            "review_no_comments",
+            "review_comments",
+            "ready",
+            "review_required",
+            "max_iterations_reached",
+            "head_changed",
+            "request_cancelled",
+            "review_dismissed",
+            "cancelled_locally",
+            "stopped",
+            "published",
+        ]
+        for result in results:
+            with self.subTest(result=result):
+                outcome = MODULE.stage_outcome({"last_result": result})
+                self.assertNotEqual(outcome, "cleared")
+                self.assertIn(outcome, self.PIPELINE_VOCABULARY)
+
+    def test_an_absent_review_asks_for_a_person(self):
+        for result in ("request_cancelled", "review_dismissed", "max_iterations_reached"):
+            with self.subTest(result=result):
+                self.assertEqual(
+                    MODULE.stage_outcome({"last_result": result}), "escalated"
+                )
+
+    def test_a_re_runnable_stop_reports_no_progress(self):
+        for result in ("head_changed", "cancelled_locally", "stopped"):
+            with self.subTest(result=result):
+                self.assertEqual(
+                    MODULE.stage_outcome({"last_result": result}), "no_progress"
+                )
+
+    def test_an_unrecognized_or_missing_result_escalates(self):
+        self.assertEqual(MODULE.stage_outcome({}), "escalated")
+        self.assertEqual(MODULE.stage_outcome({"last_result": None}), "escalated")
+        self.assertEqual(MODULE.stage_outcome({"last_result": "surprise"}), "escalated")
+
+    def test_every_mapped_outcome_uses_the_exact_pipeline_spelling(self):
+        """A near miss like `green` or `clean` is silently ignored by the reader."""
+        for result, outcome in MODULE.STAGE_OUTCOME_BY_RESULT.items():
+            with self.subTest(result=result):
+                self.assertIn(outcome, self.PIPELINE_VOCABULARY)
+
+    def test_the_watcher_records_the_result_the_outcome_is_read_from(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(
+                path, {"version": MODULE.STATE_VERSION, "monitoring": {}}
+            )
+            state = MODULE.load_state(path)
+            MODULE.watcher_result(state, {"result": "request_cancelled"})
+            MODULE.save_state(path, state)
+            recorded = MODULE.load_state(path)
+
+        self.assertEqual(recorded["last_result"], "request_cancelled")
+        self.assertEqual(MODULE.stage_outcome(recorded), "escalated")
+
+    def test_status_reports_the_outcome_for_an_external_orchestrator(self):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "pr": {"number": 42},
+            "queue": {"id": "pr-42"},
+            "monitoring": {"status": "completed"},
+            "last_result": "head_changed",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(path, state)
+            args = SimpleNamespace(current=False, state=str(path), repo_root=None)
+
+            with mock.patch.object(MODULE, "emit") as emit:
+                MODULE.command_status(args)
+
+        payload = emit.call_args.args[0]
+        self.assertEqual(payload["result"], "ready")
+        self.assertEqual(payload["stage_outcome"], "no_progress")
         self.assertIsNone(payload["clean_at_head_sha"])
 
 
