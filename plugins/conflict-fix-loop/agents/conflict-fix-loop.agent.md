@@ -178,7 +178,7 @@ Any edit you make after `continue` has already created the merge commit needs it
 
 1. Run `publish`. It re-checks the stacking guards, verifies the push range, pushes only the head branch, and then proves that the base branch and every dependent pull request stayed where they were.
 2. A `unsafe_push` result is an escalation. Report the helper's blockers and stop.
-3. On `published`, read `mergeability`. It describes the commit `publish` pushed and nothing else: an answer that still describes the previous head is reported as `unknown` rather than believed.
+3. On `published`, read `mergeability`. It is reported for the commit `publish` pushed: an answer that still describes the previous head is reported as `unknown` rather than believed. That narrows the stale window rather than closing it, because no GitHub field states the commit a mergeable value was computed against, so treat a single `mergeable` as good evidence rather than proof.
    - `mergeable`: the loop is done. Report success with the new head SHA.
    - `conflicting`: the base moved again, or the resolution was incomplete. Go back to `preflight` for the next iteration.
    - `unknown`: stop and report it. The helper already waited for GitHub.

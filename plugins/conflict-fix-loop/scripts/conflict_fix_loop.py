@@ -533,8 +533,14 @@ def mergeability_settled(
 ) -> bool:
     """Report whether a mergeability read is worth acting on.
 
-    A read is settled once GitHub has finished computing the value and, when an
-    expected head SHA is given, once the answer describes that commit.
+    A read is worth acting on once GitHub has finished computing the value and, when
+    an expected head SHA is given, once the answer describes that commit.
+
+    This narrows the stale window rather than closing it. No GitHub field states the
+    commit a mergeable value was computed against, so an answer that describes the
+    expected head can still carry a value computed just before the push landed. What
+    it does rule out is the larger case, where the pull request has not registered the
+    push at all and the answer is plainly about the previous head.
     """
     if metadata.get("mergeable") == "UNKNOWN":
         return False
@@ -571,6 +577,11 @@ def live_mergeability(
 def classify_mergeability(
     metadata: dict[str, Any], *, expected_head: str | None = None
 ) -> str:
+    """Name the mergeability an answer reports, for the head it describes.
+
+    An answer about any other head is reported as unknown rather than believed, which
+    fails safe: the caller escalates instead of trusting a value it cannot place.
+    """
     if expected_head is not None and metadata.get("head_sha") != expected_head:
         return "unknown"
     mergeable = metadata.get("mergeable")
