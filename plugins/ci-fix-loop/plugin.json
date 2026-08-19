@@ -1,0 +1,17 @@
+{
+  "name": "ci-fix-loop",
+  "description": "Fix the failing continuous integration checks a pull request caused, re-run a suspected flake once, and push the fixes until the checks are green.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Trask Stalnaker"
+  },
+  "repository": "https://github.com/trask/copilot-plugins",
+  "license": "MIT",
+  "keywords": [
+    "github",
+    "pull-request",
+    "ci",
+    "checks"
+  ],
+  "agents": "agents/"
+}

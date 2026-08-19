@@ -43,6 +43,12 @@
       "description": "Resolve merge conflicts on a pull request by keeping both sides' intent, then push and repeat until GitHub reports it mergeable.",
       "version": "1.0.0",
       "source": "./plugins/conflict-fix-loop"
+    },
+    {
+      "name": "ci-fix-loop",
+      "description": "Fix the failing continuous integration checks a pull request caused, re-run a suspected flake once, and push the fixes until the checks are green.",
+      "version": "1.0.0",
+      "source": "./plugins/ci-fix-loop"
     }
   ]
 }
