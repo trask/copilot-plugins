@@ -27,7 +27,7 @@ Run `preflight` first. After `preflight` succeeds, ensure the session name is `C
 - Never wait for `next`, `fix it`, `looks good`, `publish`, or `push`. Run the loop yourself, without stopping, until the checks are green, the repository runs no checks, it reaches the iteration cap, or a stop condition applies.
 - The loop is `preflight -> checks -> attribute -> fix -> publish`, repeated for each new head.
 - The maximum is 5 iterations. Respect `max_iterations_reached` before you edit anything; do not work around it.
-- Re-run a suspected flake exactly once. If it fails again, it is not a flake, so escalate instead of re-running it a second time or editing around it.
+- Re-run a suspected flake exactly once. If it fails again, it is not a flake, so escalate instead of re-running it a second time or editing around it. A failure that was already on record when the re-run was requested is the old one, not a second failure.
 - A check that never starts, and a check that waits for a maintainer to approve a fork's workflow run, escalates straight away. Never wait for one of those indefinitely; they cannot resolve on their own.
 - A pull request whose head reports no applicable checks is a skip, never a pass. Record it with `resolve --outcome no_checks` and report the helper's one-line note. A broken continuous integration configuration must never look like a green pipeline.
 - GitHub states whether the checks pass, and this loop's own state never does. Read the live checks every time you are asked to run, however recently the state says they passed.
@@ -79,7 +79,7 @@ The deterministic, JSON-only helper provides:
 - `preflight [target] [--repo-root <workspace>] [--max-iterations 5]`: resolve and check out the pull request, require a clean worktree, realign a force-pushed branch safely and only when `git cherry` proves the local commits hold no unique patches, require the local head to equal the pull request head, fetch the authoritative diff, confirm the head did not move around that fetch, enforce the iteration cap, archive the previous iteration, write its complete result to `preflight_path` as JSON, and print only a compact envelope carrying `result`, `state`, `preflight_path`, `repo_root`, PR identity, `head_sha`, `base_sha`, `diff_path`, `diff_bytes`, `counts`, `iteration`, and `max_iterations`. The complete result at `preflight_path` adds full `pr` metadata, `changed_files`, GitHub's ordered `pr_commits` with each commit's touched `files`, and the carried-forward `history`.
 - `checks --state <path> [--wait] [--interval 60] [--timeout 5400] [--not-started-grace 900]`: read the live status check rollup at the pinned head, classify every check, compare each failure with how the same check concluded on the base commit, decide what the loop does next, write the complete result to `checks_path` as JSON, and print a compact envelope carrying `result`, `decision`, `reason`, `detail`, `action_checks`, per-class `counts`, and the `failing` list with each failure's current verdict and re-run count. Its `result` is one of `waiting`, `green`, `no_checks`, `attribute`, `rerun`, `fix`, or `escalate`.
 - `attribute --state <path> --check <key> --verdict pr_caused|pre_existing|flake (--rationale <text> | --rationale-file <file-or->)`: record your verdict for one failing check. The helper refuses a verdict the base commit's own result contradicts, so you can never mark a check that already fails on the base branch as caused by this pull request.
-- `rerun --state <path> --check <key>`: ask GitHub to re-run the failed jobs of one suspected flake. The helper allows this once per check per head and refuses a second request.
+- `rerun --state <path> --check <key>`: ask GitHub to re-run the failed jobs of one suspected flake. The helper allows this once per check per head and refuses a second request. It records the moment it asked before it asks, and then ignores that check's failure until GitHub reports one that finished after the request, so the result being replaced can never be read as the re-run's own answer.
 - `plan --state <path> --batch <id> --checks <keys...> --label <label> [--paths <paths...>] [--validation <command>]`: store one planned fix batch. The helper refuses any check that is not attributed `pr_caused`.
 - `record` and `skip`: maintain the state of a completed batch or a batch that an unfixable failure blocked
 - `escalate --state <path> --reason <reason> [--checks <keys...>] (--detail <text> | --detail-file <file-or->)`: durably record why the loop stopped without going green
@@ -115,6 +115,8 @@ Two things follow:
 
 Reading again is cheap. A run that finds nothing to fix spends no iteration, so the cap can never be used up by looking.
 
+Every check the loop credits belongs to the head it pinned. The helper reads the rollup and the commit it belongs to together, and stops with `head_changed` when they disagree, so a check that ran on an earlier commit can never clear this one.
+
 ## Reading The Checks
 
 Run `checks --state <path> --wait` after every successful `preflight` and after every `publish`. Then act on the `result` it returns:
@@ -123,7 +125,7 @@ Run `checks --state <path> --wait` after every successful `preflight` and after 
 - `green`: run `resolve --state <path> --outcome green`, then stop and send the final report.
 - `no_checks`: run `resolve --state <path> --outcome no_checks`, then stop and report the helper's `skip_note` as a single line. Never call this a pass, and never look for another way to prove the pull request is healthy.
 - `attribute`: work through **Attributing A Failure** for each key in `action_checks`, then run `checks` again.
-- `rerun`: run `rerun --state <path> --check <key>` for each key in `action_checks`, then run `checks --wait` again to read the result of that re-run.
+- `rerun`: run `rerun --state <path> --check <key>` for each key in `action_checks`, then run `checks --wait` again to read the result of that re-run. Expect `waiting` first: the old failure sits in the rollup until GitHub re-queues the job, and the helper holds it back rather than count it as a second failure. Let `checks --wait` sit there. Never read the failure still showing just after the request as the re-run's answer.
 - `fix`: work through **Fixing A Failure** for the keys in `action_checks`.
 - `escalate`: stop the loop and report the escalation. The helper has already recorded the reason, the affected checks, and the concrete next action for a person. Do not work around it, and do not retry the same read hoping for a different answer.
 

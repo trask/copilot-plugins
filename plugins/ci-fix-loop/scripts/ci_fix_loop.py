@@ -1057,6 +1057,47 @@ def fetch_rollup(pr: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     return head_sha, normalize_rollup(payload.get("statusCheckRollup"))
 
 
+def rerun_evidence_is_stale(
+    check: dict[str, Any], entry: Any, head_sha: str
+) -> bool:
+    """Say whether a failure was already on record when its re-run was requested.
+
+    A re-run does not change the rollup until GitHub re-queues the job, so the
+    failure sitting there just after the request is the old one. Crediting it
+    would report a flake as having failed twice on the strength of a single run.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("head_sha") != head_sha:
+        return False
+    requested_at = entry.get("requested_at")
+    if not requested_at:
+        return False
+    completed_at = check.get("completed_at")
+    if not completed_at:
+        # Without a completion time there is nothing to prove the failure is
+        # newer than the request, so wait rather than credit it.
+        return True
+    return parse_timestamp(completed_at) <= parse_timestamp(requested_at)
+
+
+def apply_rerun_watermark(
+    checks: list[dict[str, Any]], reruns: Any, head_sha: str
+) -> list[dict[str, Any]]:
+    """Hold back a failure this loop has already asked GitHub to run again."""
+    if not isinstance(reruns, dict) or not reruns:
+        return checks
+    applied = []
+    for check in checks:
+        entry = reruns.get(check["key"])
+        if check["class"] == "failed" and rerun_evidence_is_stale(
+            check, entry, head_sha
+        ):
+            check = {**check, "class": "running", "awaiting_rerun": True}
+        applied.append(check)
+    return applied
+
+
 def baseline_conclusions(pr: dict[str, Any], base_sha: str) -> dict[str, str]:
     """Read how the same checks concluded on the base branch commit.
 
@@ -1600,6 +1641,7 @@ def snapshot_checks(
             "tracking": run_state.get("tracking") or {},
         }
 
+    checks = apply_rerun_watermark(checks, state.get("reruns"), pinned)
     tracking = update_check_tracking(run_state.get("tracking"), checks, now)
     approval_runs: list[dict[str, Any]] = []
     if not checks:
@@ -1821,6 +1863,9 @@ def command_rerun(args: argparse.Namespace) -> None:
         )
         return
     run_id = resolve_run_id(state["pr"], reference)
+    # Stamp the watermark before asking GitHub to re-run, so a run that starts
+    # quickly cannot finish inside the gap and be mistaken for the old result.
+    requested_at = utc_now()
     rerun_failed_jobs(state["pr"], run_id)
     reruns = state.setdefault("reruns", {})
     reruns[args.check] = {
@@ -1828,7 +1873,7 @@ def command_rerun(args: argparse.Namespace) -> None:
         "name": entry["name"],
         "run_id": run_id,
         "head_sha": run_state["head_sha"],
-        "requested_at": utc_now(),
+        "requested_at": requested_at,
     }
     save_state(path, state)
     emit(
@@ -1982,6 +2027,7 @@ def command_resolve(args: argparse.Namespace) -> None:
         if not checks
         else []
     )
+    checks = apply_rerun_watermark(checks, state.get("reruns"), pinned)
     decision = decide(
         checks,
         now=now,

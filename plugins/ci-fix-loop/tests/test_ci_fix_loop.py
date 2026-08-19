@@ -29,7 +29,7 @@ DIFF = """diff --git a/app.py b/app.py
 """
 
 
-def check(key, name=None, klass="failed", url=None):
+def check(key, name=None, klass="failed", url=None, completed_at=None):
     return {
         "kind": "check_run",
         "key": key,
@@ -41,7 +41,7 @@ def check(key, name=None, klass="failed", url=None):
         "class": klass,
         "url": url,
         "started_at": None,
-        "completed_at": None,
+        "completed_at": completed_at,
         "description": None,
     }
 
@@ -332,6 +332,31 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn("Report it as no progress", self.instructions)
+
+    def test_does_not_credit_the_failure_a_rerun_replaces(self):
+        self.assertIn(
+            "It records the moment it asked before it asks", self.instructions
+        )
+        self.assertIn(
+            "Never read the failure still showing just after the request as the "
+            "re-run's answer.",
+            self.instructions,
+        )
+        self.assertIn(
+            "A failure that was already on record when the re-run was requested is "
+            "the old one, not a second failure.",
+            self.instructions,
+        )
+
+    def test_ties_the_evidence_it_credits_to_the_pinned_head(self):
+        self.assertIn(
+            "Every check the loop credits belongs to the head it pinned.",
+            self.instructions,
+        )
+        self.assertIn(
+            "a check that ran on an earlier commit can never clear this one",
+            self.instructions,
+        )
 
     def test_ends_the_run_with_a_single_terminal_response(self):
         self.assertIn(
@@ -1230,6 +1255,119 @@ class RerunCommandTest(unittest.TestCase):
         with self.assertRaises(MODULE.WorkflowError):
             call("rerun", "--state", str(path), "--check", "check:a")
 
+    def test_stamps_the_watermark_before_it_asks_github_to_run_again(self):
+        path = self.state_with()
+        observed = {}
+
+        def request(pr, run_id):
+            observed["reruns"] = dict(MODULE.load_state(path).get("reruns") or {})
+            observed["at"] = MODULE.utc_now()
+
+        with mock.patch.object(MODULE, "rerun_failed_jobs", request):
+            call("rerun", "--state", str(path), "--check", "check:a")
+
+        # The stored watermark must predate the request, so a run that starts
+        # and finishes immediately still counts as newer than the request.
+        self.assertEqual({}, observed["reruns"])
+        requested_at = MODULE.load_state(path)["reruns"]["check:a"]["requested_at"]
+        self.assertLessEqual(
+            MODULE.parse_timestamp(requested_at), MODULE.parse_timestamp(observed["at"])
+        )
+
+    def test_records_the_head_the_rerun_belongs_to(self):
+        path = self.state_with()
+        with mock.patch.object(MODULE, "rerun_failed_jobs"):
+            call("rerun", "--state", str(path), "--check", "check:a")
+        self.assertEqual("head1", MODULE.load_state(path)["reruns"]["check:a"]["head_sha"])
+
+
+class RerunWatermarkTest(unittest.TestCase):
+    def entry(self, minutes_ago=5, head_sha="head1"):
+        return {
+            "count": 1,
+            "name": "build",
+            "run_id": 5,
+            "head_sha": head_sha,
+            "requested_at": stamp(minutes_ago),
+        }
+
+    def test_holds_back_a_failure_recorded_before_the_rerun_was_asked_for(self):
+        stale = check("check:a", completed_at=stamp(10))
+        applied = MODULE.apply_rerun_watermark(
+            [stale], {"check:a": self.entry()}, "head1"
+        )
+        self.assertEqual("running", applied[0]["class"])
+        self.assertTrue(applied[0]["awaiting_rerun"])
+
+    def test_credits_a_failure_that_landed_after_the_rerun_was_asked_for(self):
+        fresh = check("check:a", completed_at=stamp(1))
+        applied = MODULE.apply_rerun_watermark(
+            [fresh], {"check:a": self.entry()}, "head1"
+        )
+        self.assertEqual("failed", applied[0]["class"])
+        self.assertNotIn("awaiting_rerun", applied[0])
+
+    def test_waits_when_a_failure_carries_no_completion_time(self):
+        applied = MODULE.apply_rerun_watermark(
+            [check("check:a")], {"check:a": self.entry()}, "head1"
+        )
+        self.assertEqual("running", applied[0]["class"])
+
+    def test_ignores_a_rerun_recorded_for_a_different_head(self):
+        stale = check("check:a", completed_at=stamp(10))
+        applied = MODULE.apply_rerun_watermark(
+            [stale], {"check:a": self.entry(head_sha="head9")}, "head1"
+        )
+        self.assertEqual("failed", applied[0]["class"])
+
+    def test_leaves_every_other_check_alone(self):
+        checks = [
+            check("check:a", klass="passed", completed_at=stamp(10)),
+            check("check:b", completed_at=stamp(10)),
+        ]
+        applied = MODULE.apply_rerun_watermark(
+            checks, {"check:a": self.entry()}, "head1"
+        )
+        self.assertEqual(["passed", "failed"], [item["class"] for item in applied])
+
+    def test_does_nothing_without_a_recorded_rerun(self):
+        checks = [check("check:a", completed_at=stamp(10))]
+        for reruns in (None, {}, "nonsense"):
+            with self.subTest(reruns=reruns):
+                self.assertEqual(
+                    ["failed"],
+                    [
+                        item["class"]
+                        for item in MODULE.apply_rerun_watermark(
+                            checks, reruns, "head1"
+                        )
+                    ],
+                )
+
+    def test_never_reports_a_flake_as_failing_twice_on_the_old_result(self):
+        state = {
+            "reruns": {"check:a": {"count": 1}},
+            "run": {
+                "attributions": {"check:a": attribution("check:a", "flake")},
+            },
+        }
+        stale = check("check:a", completed_at=stamp(10))
+        applied = MODULE.apply_rerun_watermark(
+            [stale], {"check:a": self.entry()}, "head1"
+        )
+        decision = MODULE.decide(
+            applied,
+            now=NOW,
+            tracking={},
+            not_started_grace=MODULE.DEFAULT_NOT_STARTED_GRACE,
+            deadline_expired=False,
+            approval_runs=[],
+        )
+        self.assertEqual("waiting", decision["decision"])
+        self.assertEqual(
+            "waiting", MODULE.next_action(state, decision)["action"]
+        )
+
 
 class PlanCommandTest(unittest.TestCase):
     def setUp(self):
@@ -1587,6 +1725,43 @@ class ChecksCommandTest(unittest.TestCase):
                 path, ("head1", [check("check:a", name="build")]), {"build": "SUCCESS"}
             )
         self.assertEqual(1, MODULE.load_state(path)["iterations"])
+
+    def rerun_state(self, requested_minutes_ago=5):
+        return write_state(
+            self.root,
+            reruns={
+                "check:a": {
+                    "count": 1,
+                    "name": "build",
+                    "run_id": 5,
+                    "head_sha": "head1",
+                    "requested_at": stamp(requested_minutes_ago),
+                }
+            },
+            run={
+                "attributions": {
+                    "check:a": attribution("check:a", "flake", source="model")
+                }
+            },
+        )
+
+    def test_waits_rather_than_credit_the_failure_its_rerun_replaces(self):
+        path = self.rerun_state()
+        payload = self.read(
+            path,
+            ("head1", [check("check:a", name="build", completed_at=stamp(10))]),
+        )
+        self.assertEqual("waiting", payload["result"])
+        self.assertIsNone(MODULE.load_state(path)["escalation"])
+
+    def test_escalates_once_the_rerun_itself_fails(self):
+        path = self.rerun_state()
+        payload = self.read(
+            path,
+            ("head1", [check("check:a", name="build", completed_at=stamp(1))]),
+        )
+        self.assertEqual("escalate", payload["result"])
+        self.assertEqual("flake_failed_twice", payload["reason"])
 
 
 class PublishCommandTest(unittest.TestCase):
