@@ -70,11 +70,11 @@ Never pass a `~`-prefixed helper path to native Windows Python from Git Bash.
 
 The deterministic, JSON-only helper provides:
 
-- `preflight [target] [--max-iterations 5] [--completed-run-iterations <n>]`: resolve and check out the PR, require a clean worktree, check its head, fetch thread and suppressed comments, enforce the per-invocation iteration cap, and set up external state
+- `preflight [target] [--max-iterations 5] [--completed-run-iterations <n>]`: resolve and check out the PR, require a clean worktree, check its head, drop every thread a non-Copilot author started, fetch thread and suppressed comments, enforce the per-invocation iteration cap, record whether the head is clean, and set up external state
 - `plan --state <path> --batch <id> --comments <ids...> --label <label> [--paths <paths...>] [--validation <command>]`: store one planned batch; `--batch` and `--comments` are required option names, not positional values
 - `refresh`, `record`, and `skip`: maintain the state of a comment and of a completed batch
-- `status --current --repo-root <workspace>`: return only the workflow state attached to the current branch's PR
-- `publish`: compare the live remote PR head with the preflight pin directly before it pushes, return `head_changed` instead of pushing over a divergence, push only when a push is needed, post each thread reply as its own published comment and never twice, resolve thread comments, request Copilot even without a new commit, and verify the publication
+- `status --current --repo-root <workspace>`: return only the workflow state attached to the current branch's PR, including `clean_at_head_sha`
+- `publish`: compare the live remote PR head with the preflight pin directly before it pushes, return `head_changed` instead of pushing over a divergence, push only when a push is needed, post each thread reply as its own published comment and never twice, resolve thread comments, request Copilot even without a new commit, request the very first Copilot review when the PR has never had one, and verify the publication
 - `watch`: monitor exactly the requested Copilot review, and wait for it
 - `cancel-watch`: stop monitoring that is stale or superseded
 - `await-watch --state <path>`: wait deterministically for an already running watcher to store and return its terminal result
@@ -97,12 +97,16 @@ The workflow always covers the whole Copilot queue for one pull request. You may
 6. Handle the results as follows:
    - `ready`: continue with investigation and batching at once.
    - `watcher_cancellation_pending`: use the returned `state` and run the exact `wait_action` (`await-watch --state <path>`); after it returns `watcher_completed`, run preflight again. You can safely run the returned `cancel_action` again if you have to ask for cancellation a second time. Never retry preflight blindly while the watcher is active.
-   - `review_required`: the queue is empty, but the current head has no clean Copilot review. Run `publish --state <path> --no-comments` at once, then continue with the normal `watch` flow that waits for the result.
+   - `review_required`: the queue is empty, but the current head has no clean Copilot review. Run `publish --state <path> --no-comments` at once, then continue with the normal `watch` flow that waits for the result. This is also how a pull request that has never had a Copilot review gets its first one: the helper adds Copilot as a reviewer, checks that GitHub recorded the request, and the watcher then waits for the review.
    - `no_unresolved_comments`: the loop is clean, so send the final compact index.
    - `no_copilot_comments`: only the authors in `skipped_authors` have unresolved threads, so send the final compact index without touching them.
    - `max_iterations_reached`: stop before you edit anything, and report the cap in the final compact index.
 
 Preflight adds suppressed comments after thread comments and reports the latest `suppressed_review_id`. An empty queue is clean only when `head_review_clean` is true for a completed Copilot review on the exact current head. You can safely run preflight again, because it carries over a record you handled but did not publish.
+
+The helper drops every review thread a non-Copilot author started before it builds the queue, so a human's review comment never reaches you. `skipped_authors` names those authors and nothing else. Leave their comments to the user, who reads them before promoting the pull request out of draft.
+
+`preflight`, `watch`, and `status` all report `clean_at_head_sha`. It holds the head SHA that Copilot reviewed with nothing left to address, and it is null whenever this stage is not clean at the current head. Publishing clears it, because the new head has no review yet.
 
 ## Suppressed Comments
 

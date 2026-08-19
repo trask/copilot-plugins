@@ -21,10 +21,18 @@ COPILOT_LOGINS = {
     "copilot-pull-request-reviewer",
     "copilot-pull-request-reviewer[bot]",
 }
+COPILOT_REVIEWER_LOGIN = "copilot-pull-request-reviewer[bot]"
+# The GitHub CLI accepts "@copilot" as a reviewer value from 2.88.0 on. It is not a
+# GitHub username, so an older CLI has to name the bot login through the REST endpoint.
+COPILOT_REVIEWER_ALIAS = "@copilot"
+GH_REVIEWER_ALIAS_VERSION = (2, 88, 0)
+COPILOT_REQUEST_RETRY_DELAYS = (2, 4, 8, 16)
 STATE_VERSION = 3
 DEFAULT_MAX_ITERATIONS = 5
 PR_HEAD_LAG_RETRY_DELAYS = (1, 2, 4)
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
+# Preflight results that mean Copilot reviewed the current head and asked for nothing.
+CLEAN_PREFLIGHT_RESULTS = frozenset({"no_copilot_comments", "no_unresolved_comments"})
 IS_WINDOWS = os.name == "nt"
 # A pasted review or comment fragment is accepted and ignored: the queue is always
 # every unresolved Copilot comment on the pull request.
@@ -401,14 +409,51 @@ def is_copilot_author(author: dict[str, Any] | None) -> bool:
     return bool(author) and author.get("login") in COPILOT_LOGINS
 
 
-def select_queue(threads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
-    """Queue the root comment of every unresolved Copilot review thread.
+def partition_copilot_threads(
+    threads: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Keep the Copilot-authored review threads and name the authors of the rest.
 
-    Also returns the distinct authors of the unresolved threads that were skipped, so a
-    change to Copilot's bot login surfaces as a diagnosable result instead of an empty queue.
+    The author of a thread's root comment owns the thread. A thread another author
+    started is dropped whole, so no human review comment reaches the queue, the
+    suppressed-comment scan, or anything this helper prints. Reading a human's
+    objection would sway the review even when the agent correctly leaves it alone,
+    and triaging human review comments is the user's own job.
+
+    The distinct logins of the dropped threads are returned, so a change to Copilot's
+    bot login surfaces as a diagnosable result instead of an empty queue.
+    """
+    copilot_threads: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    for thread in threads:
+        comments = thread["comments"]["nodes"]
+        if not comments:
+            continue
+        author = comments[0].get("author") or {}
+        if is_copilot_author(author):
+            copilot_threads.append(thread)
+            continue
+        if thread["isResolved"]:
+            continue
+        login = author.get("login") or "unknown"
+        if login not in skipped:
+            skipped.append(login)
+    return copilot_threads, skipped
+
+
+def fetch_copilot_threads(
+    owner: str, repo: str, number: int
+) -> tuple[list[dict[str, Any]], list[str]]:
+    return partition_copilot_threads(fetch_threads(owner, repo, number))
+
+
+def select_queue(threads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Queue the root comment of every unresolved thread.
+
+    The threads must already be the Copilot-authored ones from
+    `partition_copilot_threads`, which owns the rule about who wrote a thread.
     """
     queue: list[dict[str, Any]] = []
-    skipped: list[str] = []
     for thread in threads:
         if thread["isResolved"]:
             continue
@@ -417,11 +462,6 @@ def select_queue(threads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], l
             continue
         comment = comments[0]
         author = comment.get("author") or {}
-        if not is_copilot_author(author):
-            login = author.get("login") or "unknown"
-            if login not in skipped:
-                skipped.append(login)
-            continue
         queue.append(
             {
                 "id": comment["databaseId"],
@@ -446,7 +486,7 @@ def select_queue(threads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], l
                 "resolved": False,
             }
         )
-    return queue, skipped
+    return queue
 
 
 def latest_copilot_review(
@@ -785,8 +825,10 @@ def command_preflight(args: argparse.Namespace) -> None:
         )
     verify_checkout_head(repo_root, head, metadata["head_sha"])
 
-    threads = fetch_threads(target["owner"], target["repo"], target["number"])
-    comments, skipped_authors = select_queue(threads)
+    threads, skipped_authors = fetch_copilot_threads(
+        target["owner"], target["repo"], target["number"]
+    )
+    comments = select_queue(threads)
     known_bot_id = next(
         (comment["author_bot_id"] for comment in comments if comment.get("author_bot_id")),
         (prior_state or {}).get("copilot_bot_id"),
@@ -833,7 +875,6 @@ def command_preflight(args: argparse.Namespace) -> None:
     )
     if bot_id:
         state["copilot_bot_id"] = bot_id
-    save_state(state_path, state)
     max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
     completed_run_iterations = getattr(args, "completed_run_iterations", 0)
     iteration = completed_run_iterations + 1
@@ -848,6 +889,9 @@ def command_preflight(args: argparse.Namespace) -> None:
         result = "no_copilot_comments"
     else:
         result = "no_unresolved_comments"
+    clean_at_head_sha = head if result in CLEAN_PREFLIGHT_RESULTS else None
+    state["clean_at_head_sha"] = clean_at_head_sha
+    save_state(state_path, state)
     emit(
         {
             "result": result,
@@ -861,6 +905,7 @@ def command_preflight(args: argparse.Namespace) -> None:
             "head_review_id": int(head_review["id"]) if head_review else None,
             "head_review_url": head_review.get("html_url") if head_review else None,
             "head_review_clean": head_review_clean,
+            "clean_at_head_sha": clean_at_head_sha,
             "iteration": iteration,
             "completed_run_iterations": completed_run_iterations,
             "max_iterations": max_iterations,
@@ -1148,6 +1193,13 @@ def resolve_copilot_bot(state: dict[str, Any]) -> str:
     if cached:
         return cached
     pr = state["pr"]
+    bot_id = lookup_copilot_bot(pr) or request_first_copilot_review(pr)
+    state["copilot_bot_id"] = bot_id
+    return bot_id
+
+
+def lookup_copilot_bot(pr: dict[str, Any]) -> str | None:
+    """Read the Copilot reviewer bot node ID from what the pull request already shows."""
     query = """
 query($owner:String!,$repo:String!,$number:Int!){
  repository(owner:$owner,name:$repo){pullRequest(number:$number){
@@ -1166,18 +1218,78 @@ query($owner:String!,$repo:String!,$number:Int!){
     for request in requests:
         reviewer = request.get("requestedReviewer") or {}
         if reviewer.get("login") in COPILOT_LOGINS and reviewer.get("id"):
-            state["copilot_bot_id"] = reviewer["id"]
             return reviewer["id"]
     for review in fetch_reviews(pr["upstream_owner"], pr["upstream_repo"], pr["number"]):
         if is_copilot(review.get("user")) and review["user"].get("node_id"):
-            state["copilot_bot_id"] = review["user"]["node_id"]
-            return state["copilot_bot_id"]
+            return review["user"]["node_id"]
     for event in fetch_timeline(pr["upstream_owner"], pr["upstream_repo"], pr["number"]):
         reviewer = event.get("requested_reviewer") or event.get("reviewer")
         if reviewer and is_copilot(reviewer) and reviewer.get("node_id"):
-            state["copilot_bot_id"] = reviewer["node_id"]
-            return state["copilot_bot_id"]
-    raise WorkflowError("could not resolve the Copilot reviewer bot node ID")
+            return reviewer["node_id"]
+    return None
+
+
+def gh_version() -> tuple[int, int, int]:
+    output = run(["gh", "--version"]).stdout
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", output)
+    if not match:
+        raise WorkflowError(
+            f"could not read the GitHub CLI version from: {output.strip() or 'no output'}"
+        )
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)
+
+
+def copilot_request_command(pr: dict[str, Any], *, alias_supported: bool) -> list[str]:
+    repository = f"{pr['upstream_owner']}/{pr['upstream_repo']}"
+    if alias_supported:
+        return [
+            "gh",
+            "pr",
+            "edit",
+            str(pr["number"]),
+            "--repo",
+            repository,
+            "--add-reviewer",
+            COPILOT_REVIEWER_ALIAS,
+        ]
+    return [
+        "gh",
+        "api",
+        "--method",
+        "POST",
+        f"repos/{repository}/pulls/{pr['number']}/requested_reviewers",
+        "-f",
+        f"reviewers[]={COPILOT_REVIEWER_LOGIN}",
+    ]
+
+
+def request_first_copilot_review(pr: dict[str, Any]) -> str:
+    """Ask GitHub for the first Copilot review on a pull request that has never had one.
+
+    A clean exit does not prove GitHub recorded the request, so the request counts only
+    once the Copilot reviewer bot node ID appears on the pull request. That node ID is
+    what the rest of the workflow needs to request and watch every later review.
+    """
+    command = copilot_request_command(
+        pr, alias_supported=gh_version() >= GH_REVIEWER_ALIAS_VERSION
+    )
+    process = run(command, check=False)
+    if process.returncode != 0:
+        detail = process.stderr.strip() or process.stdout.strip() or "no output"
+        raise WorkflowError(f"requesting the first Copilot review failed: {detail}")
+    bot_id = lookup_copilot_bot(pr)
+    for delay in COPILOT_REQUEST_RETRY_DELAYS:
+        if bot_id:
+            return bot_id
+        time.sleep(delay)
+        bot_id = lookup_copilot_bot(pr)
+    if bot_id:
+        return bot_id
+    raise WorkflowError(
+        f"{' '.join(command)} reported success, but the pull request still lists no "
+        "Copilot reviewer and no Copilot review"
+    )
 
 
 def reply_body(comment: dict[str, Any]) -> str:
@@ -1313,11 +1425,22 @@ def request_copilot(
         if existing.get("status") != "requesting":
             return existing
 
-    bot_id = resolve_copilot_bot(state)
-    reviews = fetch_reviews(pr["upstream_owner"], pr["upstream_repo"], pr["number"])
-    copilot_reviews = [review for review in reviews if is_copilot(review.get("user"), bot_id)]
-    baseline = max((int(review["id"]) for review in copilot_reviews), default=0)
+    # Both the timestamp and the baseline come first, because bootstrapping the very
+    # first review already asks GitHub for one. The watcher matches only a review
+    # newer than the baseline and submitted after the timestamp, so a review that
+    # arrives during the request would otherwise never match.
     request_start = utc_now()
+    baseline = max(
+        (
+            int(review["id"])
+            for review in fetch_reviews(
+                pr["upstream_owner"], pr["upstream_repo"], pr["number"]
+            )
+            if is_copilot(review.get("user"), state.get("copilot_bot_id"))
+        ),
+        default=0,
+    )
+    bot_id = resolve_copilot_bot(state)
     monitoring = {
         "status": "requesting",
         "head_sha": local_head,
@@ -1501,6 +1624,7 @@ def command_publish(args: argparse.Namespace) -> None:
     verification = verify_publish(state, comments)
     queue["status"] = "published"
     state["iterations"] = int(state.get("iterations", 0)) + 1
+    state["clean_at_head_sha"] = None
     save_state(path, state)
     emit(
         {
@@ -1650,18 +1774,22 @@ def command_watch(args: argparse.Namespace) -> None:
                         f"{pr['number']}/reviews/{review['id']}/comments?per_page=100"
                     )
                     suppressed = parse_suppressed_comments(review.get("body"))
+                    clean = not comments and not suppressed
+                    if clean:
+                        state["clean_at_head_sha"] = monitoring["head_sha"]
                     result = watcher_result(
                         state,
                         {
                             "result": (
-                                "review_comments"
-                                if comments or suppressed
-                                else "review_no_comments"
+                                "review_no_comments" if clean else "review_comments"
                             ),
                             "review_id": review["id"],
                             "review_url": review["html_url"],
                             "comment_ids": [comment["id"] for comment in comments],
                             "suppressed_comment_count": len(suppressed),
+                            "clean_at_head_sha": (
+                                monitoring["head_sha"] if clean else None
+                            ),
                         },
                     )
                 save_state(path, state)
@@ -1718,6 +1846,7 @@ def command_status(args: argparse.Namespace) -> None:
                     },
                     "queue": None,
                     "monitoring": None,
+                    "clean_at_head_sha": None,
                 }
             )
             return
@@ -1731,6 +1860,7 @@ def command_status(args: argparse.Namespace) -> None:
             "pr": state["pr"],
             "queue": state.get("queue"),
             "monitoring": state.get("monitoring"),
+            "clean_at_head_sha": state.get("clean_at_head_sha"),
         }
     )
 

@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -108,6 +109,45 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertNotIn("push all", instructions)
         self.assertNotIn("--all-queues", instructions)
         self.assertNotIn("Workspace Inline Comments", instructions)
+
+    def test_documents_that_the_helper_drops_human_threads(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "The helper drops every review thread a non-Copilot author started before "
+            "it builds the queue",
+            instructions,
+        )
+        self.assertIn(
+            "Leave their comments to the user",
+            instructions,
+        )
+        self.assertIn(
+            "drop every thread a non-Copilot author started",
+            instructions,
+        )
+
+    def test_documents_the_first_review_bootstrap(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "request the very first Copilot review when the PR has never had one",
+            instructions,
+        )
+        self.assertIn(
+            "the helper adds Copilot as a reviewer, checks that GitHub recorded the "
+            "request",
+            instructions,
+        )
+
+    def test_documents_the_clean_at_head_marker(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "`preflight`, `watch`, and `status` all report `clean_at_head_sha`",
+            instructions,
+        )
+        self.assertIn("Publishing clears it", instructions)
 
     def test_accepts_a_pr_target_for_an_unchecked_out_branch(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -965,7 +1005,8 @@ class QueueSelectionTest(unittest.TestCase):
         ]
 
     def test_selects_only_unresolved_copilot_thread_roots(self):
-        queue, skipped = MODULE.select_queue(self.threads)
+        threads, skipped = MODULE.partition_copilot_threads(self.threads)
+        queue = MODULE.select_queue(threads)
 
         self.assertEqual([comment["id"] for comment in queue], [10])
         self.assertEqual(queue[0]["source"], "thread")
@@ -989,15 +1030,71 @@ class QueueSelectionTest(unittest.TestCase):
             },
         }
 
-        queue, _ = MODULE.select_queue([*self.threads, second_review_thread])
+        threads, _ = MODULE.partition_copilot_threads(
+            [*self.threads, second_review_thread]
+        )
+        queue = MODULE.select_queue(threads)
 
         self.assertEqual([comment["id"] for comment in queue], [10, 40])
         self.assertEqual([comment["review_id"] for comment in queue], [100, 200])
 
     def test_reports_skipped_authors_when_no_copilot_comments_remain(self):
-        queue, skipped = MODULE.select_queue([self.human_thread])
+        threads, skipped = MODULE.partition_copilot_threads([self.human_thread])
 
-        self.assertEqual(queue, [])
+        self.assertEqual(threads, [])
+        self.assertEqual(MODULE.select_queue(threads), [])
+        self.assertEqual(skipped, ["reviewer"])
+
+    def test_drops_every_human_thread_before_the_queue_is_built(self):
+        threads, _ = MODULE.partition_copilot_threads(self.threads)
+
+        self.assertEqual([thread["id"] for thread in threads], ["thread-1", "thread-3"])
+        serialized = json.dumps(threads)
+        self.assertNotIn("human review", serialized)
+        self.assertNotIn("https://example.test/20", serialized)
+
+    def test_keeps_a_human_reply_inside_a_copilot_thread(self):
+        threads, skipped = MODULE.partition_copilot_threads([self.copilot_thread])
+
+        self.assertEqual(threads, [self.copilot_thread])
+        self.assertEqual(skipped, [])
+
+    def test_reports_each_skipped_author_once_and_ignores_resolved_human_threads(self):
+        resolved_human_thread = {
+            "id": "thread-5",
+            "isResolved": True,
+            "comments": {
+                "nodes": [
+                    {"databaseId": 50, "author": {"login": "settled-reviewer"}}
+                ]
+            },
+        }
+        anonymous_thread = {
+            "id": "thread-6",
+            "isResolved": False,
+            "comments": {"nodes": [{"databaseId": 60, "author": None}]},
+        }
+
+        threads, skipped = MODULE.partition_copilot_threads(
+            [
+                self.human_thread,
+                dict(self.human_thread, id="thread-7"),
+                resolved_human_thread,
+                anonymous_thread,
+            ]
+        )
+
+        self.assertEqual(threads, [])
+        self.assertEqual(skipped, ["reviewer", "unknown"])
+
+    def test_fetches_and_filters_threads_together(self):
+        with mock.patch.object(
+            MODULE, "fetch_threads", return_value=self.threads
+        ) as fetch_threads:
+            threads, skipped = MODULE.fetch_copilot_threads("owner", "repo", 7)
+
+        fetch_threads.assert_called_once_with("owner", "repo", 7)
+        self.assertEqual([thread["id"] for thread in threads], ["thread-1", "thread-3"])
         self.assertEqual(skipped, ["reviewer"])
 
     def test_fetches_only_selected_thread_ids(self):
@@ -2087,6 +2184,508 @@ class RequestCopilotTest(unittest.TestCase):
         sleep.assert_not_called()
 
 
+class FirstCopilotReviewTest(unittest.TestCase):
+    PR = {"upstream_owner": "owner", "upstream_repo": "repo", "number": 7}
+
+    def test_uses_the_reviewer_alias_on_a_supported_cli(self):
+        command = MODULE.copilot_request_command(self.PR, alias_supported=True)
+
+        self.assertEqual(
+            command,
+            [
+                "gh",
+                "pr",
+                "edit",
+                "7",
+                "--repo",
+                "owner/repo",
+                "--add-reviewer",
+                "@copilot",
+            ],
+        )
+
+    def test_falls_back_to_the_rest_endpoint_on_an_older_cli(self):
+        command = MODULE.copilot_request_command(self.PR, alias_supported=False)
+
+        self.assertEqual(
+            command,
+            [
+                "gh",
+                "api",
+                "--method",
+                "POST",
+                "repos/owner/repo/pulls/7/requested_reviewers",
+                "-f",
+                "reviewers[]=copilot-pull-request-reviewer[bot]",
+            ],
+        )
+
+    def test_reads_the_cli_version(self):
+        with mock.patch.object(
+            MODULE,
+            "run",
+            return_value=SimpleNamespace(stdout="gh version 2.88.0 (2026-01-01)\n"),
+        ):
+            self.assertEqual(MODULE.gh_version(), (2, 88, 0))
+
+    def test_rejects_an_unreadable_cli_version(self):
+        with (
+            mock.patch.object(MODULE, "run", return_value=SimpleNamespace(stdout="")),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "could not read the GitHub CLI version"
+            ),
+        ):
+            MODULE.gh_version()
+
+    def test_the_alias_boundary_is_the_supported_cli_version(self):
+        self.assertLess((2, 87, 9), MODULE.GH_REVIEWER_ALIAS_VERSION)
+        self.assertGreaterEqual((2, 88, 0), MODULE.GH_REVIEWER_ALIAS_VERSION)
+        self.assertGreaterEqual((3, 0, 0), MODULE.GH_REVIEWER_ALIAS_VERSION)
+
+    def test_requests_the_first_review_when_the_pr_has_none(self):
+        state = {"pr": dict(self.PR)}
+
+        with (
+            mock.patch.object(MODULE, "lookup_copilot_bot", side_effect=[None, "BOT_1"]),
+            mock.patch.object(MODULE, "gh_version", return_value=(2, 88, 0)),
+            mock.patch.object(
+                MODULE, "run", return_value=SimpleNamespace(returncode=0)
+            ) as run,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            bot_id = MODULE.resolve_copilot_bot(state)
+
+        self.assertEqual(bot_id, "BOT_1")
+        self.assertEqual(state["copilot_bot_id"], "BOT_1")
+        self.assertIn("@copilot", run.call_args.args[0])
+        sleep.assert_not_called()
+
+    def test_never_requests_a_review_when_the_bot_is_already_known(self):
+        state = {"pr": dict(self.PR)}
+
+        with (
+            mock.patch.object(MODULE, "lookup_copilot_bot", return_value="BOT_1"),
+            mock.patch.object(MODULE, "run") as run,
+        ):
+            bot_id = MODULE.resolve_copilot_bot(state)
+
+        self.assertEqual(bot_id, "BOT_1")
+        run.assert_not_called()
+
+    def test_waits_for_the_request_to_appear_on_the_pull_request(self):
+        with (
+            mock.patch.object(
+                MODULE, "lookup_copilot_bot", side_effect=[None, None, "BOT_1"]
+            ),
+            mock.patch.object(MODULE, "gh_version", return_value=(2, 88, 0)),
+            mock.patch.object(MODULE, "run", return_value=SimpleNamespace(returncode=0)),
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            bot_id = MODULE.request_first_copilot_review(dict(self.PR))
+
+        self.assertEqual(bot_id, "BOT_1")
+        self.assertEqual(
+            sleep.call_args_list,
+            [
+                mock.call(MODULE.COPILOT_REQUEST_RETRY_DELAYS[0]),
+                mock.call(MODULE.COPILOT_REQUEST_RETRY_DELAYS[1]),
+            ],
+        )
+
+    def test_rejects_a_clean_exit_that_changed_nothing(self):
+        with (
+            mock.patch.object(MODULE, "lookup_copilot_bot", return_value=None),
+            mock.patch.object(MODULE, "gh_version", return_value=(2, 88, 0)),
+            mock.patch.object(MODULE, "run", return_value=SimpleNamespace(returncode=0)),
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "still lists no Copilot reviewer"
+            ),
+        ):
+            MODULE.request_first_copilot_review(dict(self.PR))
+
+        self.assertEqual(sleep.call_count, len(MODULE.COPILOT_REQUEST_RETRY_DELAYS))
+
+    def test_reports_the_failure_detail_when_the_request_is_rejected(self):
+        with (
+            mock.patch.object(MODULE, "lookup_copilot_bot", return_value=None),
+            mock.patch.object(MODULE, "gh_version", return_value=(2, 87, 0)),
+            mock.patch.object(
+                MODULE,
+                "run",
+                return_value=SimpleNamespace(
+                    returncode=1, stderr="HTTP 422: Reviews may only be requested\n", stdout=""
+                ),
+            ),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "requesting the first Copilot review failed: HTTP 422",
+            ),
+        ):
+            MODULE.request_first_copilot_review(dict(self.PR))
+
+    def test_starts_watching_before_the_first_review_is_requested(self):
+        """The baseline and timestamp must precede the bootstrap that triggers a review."""
+        state = {
+            "repo_root": "repo",
+            "pr": {
+                "upstream_owner": "owner",
+                "upstream_repo": "repo",
+                "number": 7,
+                "pr_node_id": "PR_1",
+            },
+        }
+        order: list[str] = []
+        stamps = iter(
+            [f"2026-05-01T12:00:{second:02d}Z" for second in range(30)]
+        )
+
+        def stamp():
+            order.append("utc_now")
+            return next(stamps)
+
+        def fetch(*arguments):
+            del arguments
+            order.append("fetch_reviews")
+            return []
+
+        def resolve(bot_state):
+            order.append("resolve_copilot_bot")
+            bot_state["copilot_bot_id"] = "BOT_1"
+            return "BOT_1"
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            with (
+                mock.patch.object(MODULE, "git", return_value="head"),
+                mock.patch.object(MODULE, "utc_now", side_effect=stamp),
+                mock.patch.object(MODULE, "resolve_copilot_bot", side_effect=resolve),
+                mock.patch.object(MODULE, "fetch_reviews", side_effect=fetch),
+                mock.patch.object(MODULE, "graphql", return_value={"data": {}}),
+            ):
+                monitoring = MODULE.request_copilot(state, path, "head")
+
+        self.assertEqual(monitoring["request_start"], "2026-05-01T12:00:00Z")
+        self.assertEqual(monitoring["baseline_review_id"], 0)
+        self.assertEqual(monitoring["copilot_bot_id"], "BOT_1")
+        self.assertEqual(order[0], "utc_now")
+        self.assertLess(
+            order.index("fetch_reviews"), order.index("resolve_copilot_bot")
+        )
+
+    def test_the_baseline_covers_a_review_from_before_the_bootstrap(self):
+        state = {
+            "repo_root": "repo",
+            "pr": {
+                "upstream_owner": "owner",
+                "upstream_repo": "repo",
+                "number": 7,
+                "pr_node_id": "PR_1",
+            },
+        }
+        reviews = [
+            {"id": 101, "user": {"login": "copilot-pull-request-reviewer[bot]"}},
+            {"id": 102, "user": {"login": "reviewer"}},
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            with (
+                mock.patch.object(MODULE, "git", return_value="head"),
+                mock.patch.object(MODULE, "resolve_copilot_bot", return_value="BOT_1"),
+                mock.patch.object(MODULE, "fetch_reviews", return_value=reviews),
+                mock.patch.object(MODULE, "graphql", return_value={"data": {}}),
+            ):
+                monitoring = MODULE.request_copilot(state, path, "head")
+
+        self.assertEqual(monitoring["baseline_review_id"], 101)
+
+
+class CleanAtHeadShaTest(unittest.TestCase):
+    """The marker an external orchestrator reads to see whether this stage is green."""
+
+    def test_preflight_records_a_clean_head_with_no_unresolved_comments(self):
+        review = {
+            "id": 10,
+            "commit_id": "head",
+            "submitted_at": "2026-08-09T12:00:00Z",
+            "state": "COMMENTED",
+            "body": "No comments.",
+            "user": {"login": "copilot-pull-request-reviewer[bot]"},
+        }
+
+        payload, saved = self.run_preflight(reviews=[review])
+
+        self.assertEqual(payload["result"], "no_unresolved_comments")
+        self.assertEqual(payload["clean_at_head_sha"], "head")
+        self.assertEqual(saved["clean_at_head_sha"], "head")
+
+    def test_preflight_records_a_clean_head_with_only_human_threads(self):
+        review = {
+            "id": 10,
+            "commit_id": "head",
+            "submitted_at": "2026-08-09T12:00:00Z",
+            "state": "COMMENTED",
+            "body": "No comments.",
+            "user": {"login": "copilot-pull-request-reviewer[bot]"},
+        }
+        thread = {
+            "id": "thread-1",
+            "isResolved": False,
+            "comments": {
+                "nodes": [
+                    {
+                        "databaseId": 1,
+                        "author": {"login": "reviewer"},
+                        "pullRequestReview": {"databaseId": 5},
+                    }
+                ]
+            },
+        }
+
+        payload, saved = self.run_preflight(threads=[thread], reviews=[review])
+
+        self.assertEqual(payload["result"], "no_copilot_comments")
+        self.assertEqual(payload["clean_at_head_sha"], "head")
+        self.assertEqual(saved["clean_at_head_sha"], "head")
+
+    def test_preflight_leaves_no_marker_when_the_head_needs_a_review(self):
+        payload, saved = self.run_preflight()
+
+        self.assertEqual(payload["result"], "review_required")
+        self.assertIsNone(payload["clean_at_head_sha"])
+        self.assertIsNone(saved["clean_at_head_sha"])
+
+    def test_preflight_clears_a_stale_marker_from_an_earlier_clean_head(self):
+        thread = {
+            "id": "thread-1",
+            "isResolved": False,
+            "comments": {
+                "nodes": [
+                    {
+                        "databaseId": 1,
+                        "url": "https://example.test/1",
+                        "body": "Fix this.",
+                        "author": {
+                            "login": "copilot-pull-request-reviewer[bot]",
+                            "id": "BOT_1",
+                        },
+                        "pullRequestReview": {"databaseId": 5},
+                    }
+                ]
+            },
+        }
+
+        payload, saved = self.run_preflight(
+            threads=[thread], prior_clean_at_head_sha="older-head"
+        )
+
+        self.assertEqual(payload["result"], "ready")
+        self.assertIsNone(payload["clean_at_head_sha"])
+        self.assertIsNone(saved["clean_at_head_sha"])
+
+    def run_preflight(self, *, threads=None, reviews=None, prior_clean_at_head_sha=None):
+        metadata = {"head_branch": "branch", "head_sha": "head"}
+
+        def fake_git(repo_root, *arguments):
+            del repo_root
+            return {
+                ("status", "--porcelain=v1"): "",
+                ("branch", "--show-current"): "branch",
+                ("rev-parse", "HEAD"): "head",
+            }[arguments]
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            if prior_clean_at_head_sha:
+                MODULE.save_state(
+                    path,
+                    {
+                        "version": MODULE.STATE_VERSION,
+                        "clean_at_head_sha": prior_clean_at_head_sha,
+                        "queue": {"comments": [], "batches": []},
+                    },
+                )
+            args = SimpleNamespace(
+                target="owner/repo#7",
+                repo_root=directory,
+                state=str(path),
+                max_iterations=5,
+                completed_run_iterations=0,
+            )
+
+            with (
+                mock.patch.object(MODULE, "require_tools"),
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=Path(directory)
+                ),
+                mock.patch.object(MODULE, "git", side_effect=fake_git),
+                mock.patch.object(MODULE, "metadata_for", return_value=metadata),
+                mock.patch.object(MODULE, "checkout_pr", return_value=True),
+                mock.patch.object(MODULE, "run"),
+                mock.patch.object(MODULE, "fetch_threads", return_value=threads or []),
+                mock.patch.object(MODULE, "fetch_reviews", return_value=reviews or []),
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_preflight(args)
+
+            return emit.call_args.args[0], MODULE.load_state(path)
+
+    def test_watch_records_a_clean_head_when_the_review_asks_for_nothing(self):
+        payload, saved = self.run_watch(review_comments=[], body="No comments.")
+
+        self.assertEqual(payload["result"], "review_no_comments")
+        self.assertEqual(payload["clean_at_head_sha"], "head")
+        self.assertEqual(saved["clean_at_head_sha"], "head")
+
+    def test_watch_leaves_no_marker_when_the_review_asks_for_something(self):
+        payload, saved = self.run_watch(
+            review_comments=[{"id": 5}], body="No comments."
+        )
+
+        self.assertEqual(payload["result"], "review_comments")
+        self.assertIsNone(payload["clean_at_head_sha"])
+        self.assertIsNone(saved.get("clean_at_head_sha"))
+
+    def test_watch_leaves_no_marker_for_a_suppressed_only_review(self):
+        body = """
+<details><summary>Suppressed comments (1)</summary>
+**a.java:1**
+* Fix this.
+</details>
+"""
+
+        payload, saved = self.run_watch(review_comments=[], body=body)
+
+        self.assertEqual(payload["result"], "review_comments")
+        self.assertIsNone(payload["clean_at_head_sha"])
+        self.assertIsNone(saved.get("clean_at_head_sha"))
+
+    def run_watch(self, *, review_comments, body):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "pr": {"upstream_owner": "owner", "upstream_repo": "repo", "number": 42},
+            "monitoring": {
+                "status": "requested",
+                "head_sha": "head",
+                "baseline_review_id": 100,
+                "copilot_bot_id": "BOT_1",
+                "request_start": "2026-05-01T12:00:00Z",
+                "cancel_requested": False,
+            },
+        }
+        review = {"id": 101, "html_url": "https://example.test/review/101", "body": body}
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(path, state)
+            args = SimpleNamespace(state=str(path), interval=0, cancellation_grace=0)
+
+            with (
+                mock.patch.object(
+                    MODULE, "gh_json", return_value={"head": {"sha": "head"}}
+                ),
+                mock.patch.object(MODULE, "fetch_reviews", return_value=[review]),
+                mock.patch.object(MODULE, "matching_review", return_value=review),
+                mock.patch.object(
+                    MODULE, "gh_paginated", return_value=review_comments
+                ),
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_watch(args)
+
+            return emit.call_args_list[-1].args[0], MODULE.load_state(path)
+
+    def test_publish_clears_the_marker_because_the_new_head_has_no_review(self):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "iterations": 2,
+            "clean_at_head_sha": "same-head",
+            "repo_root": "repo",
+            "pr": {
+                "head_owner": "author",
+                "head_repo": "repo",
+                "head_branch": "branch",
+                "head_sha": "same-head",
+            },
+            "queue": {"id": "pr-42", "comments": [], "status": "active"},
+        }
+
+        def fake_git(repo_root, *arguments):
+            del repo_root
+            return {
+                ("status", "--porcelain=v1"): "",
+                ("rev-parse", "HEAD"): "same-head",
+            }[arguments]
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            MODULE.save_state(state_path, state)
+            args = SimpleNamespace(state=str(state_path), no_comments=True)
+
+            with (
+                mock.patch.object(MODULE, "git", side_effect=fake_git),
+                mock.patch.object(MODULE, "require_fork_head"),
+                mock.patch.object(MODULE, "remote_head", return_value="same-head"),
+                mock.patch.object(MODULE, "run"),
+                mock.patch.object(
+                    MODULE, "request_copilot", return_value={"status": "requested"}
+                ),
+                mock.patch.object(MODULE, "verify_publish", return_value={}),
+                mock.patch.object(MODULE, "emit"),
+            ):
+                MODULE.command_publish(args)
+
+            saved = MODULE.load_state(state_path)
+
+        self.assertIsNone(saved["clean_at_head_sha"])
+
+    def test_status_reports_the_marker_for_an_external_orchestrator(self):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "pr": {"number": 42, "url": "https://github.com/owner/repo/pull/42"},
+            "queue": {"id": "pr-42"},
+            "monitoring": {"status": "completed"},
+            "clean_at_head_sha": "head",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(path, state)
+            args = SimpleNamespace(current=False, state=str(path), repo_root=None)
+
+            with mock.patch.object(MODULE, "emit") as emit:
+                MODULE.command_status(args)
+
+        payload = emit.call_args.args[0]
+        self.assertEqual(payload["result"], "ready")
+        self.assertEqual(payload["clean_at_head_sha"], "head")
+
+    def test_status_reports_no_marker_before_the_stage_has_run(self):
+        target = MODULE.parse_target("https://github.com/owner/repo/pull/42")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "missing.json"
+            args = SimpleNamespace(current=True, state=None, repo_root="repo")
+
+            with (
+                mock.patch.object(MODULE, "require_tools"),
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=Path(directory)
+                ),
+                mock.patch.object(MODULE, "current_pr_target", return_value=target),
+                mock.patch.object(
+                    MODULE, "default_state_path", return_value=state_path
+                ),
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_status(args)
+
+        payload = emit.call_args.args[0]
+        self.assertEqual(payload["result"], "no_state")
+        self.assertIsNone(payload["clean_at_head_sha"])
+
+
 class CopilotReviewTest(unittest.TestCase):
     def test_matches_review_that_completed_immediately(self):
         monitoring = {
@@ -2728,6 +3327,49 @@ class PreflightTargetTest(unittest.TestCase):
         self.assertEqual(payload["result"], "review_required")
         self.assertEqual(payload["skipped_authors"], ["reviewer"])
         self.assertEqual(payload["queue"]["comments"], [])
+
+    def test_preflight_never_reports_what_a_human_reviewer_wrote(self):
+        threads = [
+            {
+                "id": "thread-1",
+                "isResolved": False,
+                "comments": {
+                    "nodes": [
+                        {
+                            "databaseId": 1,
+                            "url": "https://example.test/1",
+                            "body": "This whole approach is wrong.",
+                            "author": {"login": "reviewer"},
+                            "pullRequestReview": {"databaseId": 5},
+                        }
+                    ]
+                },
+            },
+            {
+                "id": "thread-2",
+                "isResolved": False,
+                "comments": {
+                    "nodes": [
+                        {
+                            "databaseId": 2,
+                            "url": "https://example.test/2",
+                            "body": "Rename this variable.",
+                            "author": {
+                                "login": "copilot-pull-request-reviewer[bot]",
+                                "id": "BOT_1",
+                            },
+                            "pullRequestReview": {"databaseId": 6},
+                        }
+                    ]
+                },
+            },
+        ]
+
+        payload = self.run_preflight(threads=threads)
+
+        self.assertEqual(payload["result"], "ready")
+        self.assertEqual([item["id"] for item in payload["queue"]["comments"]], [2])
+        self.assertNotIn("This whole approach is wrong.", json.dumps(payload))
 
     def test_preflight_ignores_persisted_iterations_for_run_cap(self):
         payload = self.run_preflight(iterations=5, max_iterations=5)
