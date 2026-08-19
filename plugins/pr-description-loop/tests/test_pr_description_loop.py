@@ -307,11 +307,24 @@ class AgentInstructionsTest(unittest.TestCase):
             self.assertIn(forbidden_header, self.instructions)
         self.assertIn("Do not include validation lists", self.instructions)
         self.assertIn(
-            "Default to short paragraphs of roughly one to three sentences, each "
-            "covering one idea", self.instructions
+            "Paragraphs should usually contain one or two short sentences and cover "
+            "one idea", self.instructions
         )
         self.assertIn(
-            "Split a paragraph as soon as it starts covering more than one idea",
+            "Readers gloss over large blocks",
+            self.instructions,
+        )
+        self.assertIn(
+            "Assume the first draft is at least twice as long as it needs to be",
+            self.instructions,
+        )
+        self.assertIn(
+            "Cut repeated context, generic transitions, boilerplate, implementation "
+            "narration, obvious diff details, and validation logs",
+            self.instructions,
+        )
+        self.assertIn(
+            "Prefer blank space, concise bullets, and tiny code or configuration examples",
             self.instructions,
         )
         self.assertIn("Never hard wrap prose", self.instructions)
@@ -496,7 +509,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.19")
+        self.assertEqual(plugin["version"], "1.0.20")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description-loop")
 

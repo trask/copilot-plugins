@@ -141,15 +141,18 @@ These rules govern the wording of everything you write for a person to read: pul
 ## Proposal Development
 
 1. Use the authoritative diff you already read to understand the whole change. Write the wording of both values under **Plain Language**, and give the description this shape:
+   - Be aggressive about cutting the body. Assume the first draft is at least twice as long as it needs to be, then make every sentence earn its place. Prefer the shortest body that preserves the context a user needs.
    - The entire body is the summary; never add a `Summary`, `Details`, or `Testing` header.
    - Open with a short paragraph that has no heading and states the user-visible outcome. Lead with what changes and why it matters, not with how it works inside.
    - Treat configuration as a user-facing public interface. When the pull request changes configuration, put short before-and-after configuration examples right after the opening paragraph. Use the real keys and representative values for each configuration surface that differs in a way that matters, but do not list equivalent variants that teach the reader nothing.
    - Treat a public or programmatic API as a user-facing interface too. When the pull request changes one, show a concrete usage example early in the body, and use before-and-after examples when callers have to change how they call it. Do not add an API example for a change that stays internal.
+   - Preserve essential user-facing context, migration steps, compatibility limits, and concrete examples. Cut repeated context, generic transitions, boilerplate, implementation narration, obvious diff details, and validation logs.
+   - Prefer blank space, concise bullets, and tiny code or configuration examples when they replace paragraph prose. Do not explain an example again when the example is clear.
    - In a longer body, give each substantial idea its own descriptive heading so readers can scan the explanation. Do not add a heading to a short or single-idea body, and never use a generic heading such as `Summary` or `Details`.
    - Do not include validation lists, test results, checklists, implementation diaries, or incidental details.
    - Describe how something works inside only when that explains user-visible behavior, compatibility, or an important limit on scope. Do not turn the body into a full change log.
-   - Default to short paragraphs of roughly one to three sentences, each covering one idea, separated by blank lines. Split a paragraph as soon as it starts covering more than one idea.
-   - Use bullets only for content that really is a list. Short paragraphs stay the default shape.
+   - Paragraphs should usually contain one or two short sentences and cover one idea. Readers gloss over large blocks, so split dense prose with blank lines or replace it with a tighter list or example.
+   - Use bullets for facts that scan faster as a list. Do not turn connected prose into decorative bullets.
    - Split because of shape, not length. Never pad, restate, or add words to fill out a paragraph.
    - Never hard wrap prose. Let GitHub wrap the lines.
    - Keep the title short, and make both the title and the body describe the pull request's actual final scope.
