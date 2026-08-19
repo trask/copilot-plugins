@@ -588,77 +588,42 @@ def resolve_target(value: str | None, repo_root: Path) -> dict[str, Any]:
     return parse_target(value, repo_name_for(repo_root))
 
 
-def corroborate_mergeability(
-    mergeable: Any, merge_state_status: Any
-) -> dict[str, Any]:
-    """Judge whether GitHub's two mergeability fields agree with each other.
+def corroborate_mergeability(mergeable: Any) -> dict[str, Any]:
+    """Judge whether GitHub's mergeability answer has settled.
 
     GitHub computes mergeability in the background, and the result lags the head
     the pull request already reports. One response can therefore carry a fresh
     ``headRefOid`` beside a settled ``MERGEABLE`` or ``CONFLICTING`` computed
     against the head it replaced. ``UNKNOWN`` covers only the interval while
     GitHub recomputes, so waiting for ``UNKNOWN`` to clear does not rule that
-    out.
+    out, and nothing here can. The only thing that narrows the window is the
+    caller refusing the first read after the head moved.
 
-    ``mergeStateStatus`` comes from the same computation, so it is a consistency
-    cross-check rather than a second witness. It cannot confirm a fresh answer,
-    but a response whose two fields contradict each other is positive evidence
-    not to trust that response at all. ``DIRTY`` is GitHub's word for a pull
-    request with conflicts, and it never yields green.
+    ``mergeStateStatus`` is deliberately not consulted. It was once required to
+    agree with ``mergeable`` before a mergeable answer could be trusted, on the
+    theory that a self-contradicting response is one to throw away. Measurement
+    killed that theory: across 81 open draft pull requests the two fields agreed
+    every time, with ``CONFLICTING`` always paired with ``DIRTY`` and ``UNKNOWN``
+    always paired with ``UNKNOWN``. They are two views of one asynchronous
+    computation and they go stale together, so requiring agreement cannot catch
+    the stale answer the guard existed to catch. A check that can never fire is
+    worse than no check, because the next reader counts it as a defense that has
+    been holding all along. The field is still recorded; it decides nothing.
+
+    So the residual window is open, and this says so rather than implying
+    otherwise. No GitHub field states which commit a mergeability answer was
+    computed at, so no caller can prove that a response *about* a head carries
+    an answer computed *at* it.
     """
 
     mergeable_value = str(mergeable or "").strip().upper()
-    status_value = str(merge_state_status or "").strip().upper()
-    fields = {
-        "mergeable": mergeable_value or None,
-        "merge_state_status": status_value or None,
-    }
-    unsettled_status = status_value in ("", "UNKNOWN")
-
-    if status_value == "DIRTY":
-        if mergeable_value == "CONFLICTING":
-            return {
-                **fields,
-                "state": "conflicting",
-                "settled": True,
-                "reason": "corroborated",
-            }
-        if mergeable_value in ("", "UNKNOWN"):
-            return {
-                **fields,
-                "state": "conflicting",
-                "settled": False,
-                "reason": "mergeable_unknown",
-            }
-        return {
-            **fields,
-            "state": "conflicting",
-            "settled": False,
-            "reason": "disagreed",
-        }
+    fields = {"mergeable": mergeable_value or None}
 
     if mergeable_value == "CONFLICTING":
-        return {
-            **fields,
-            "state": "conflicting",
-            "settled": False,
-            "reason": "merge_state_unknown" if unsettled_status else "disagreed",
-        }
+        return {**fields, "state": "conflicting", "settled": True, "reason": "settled"}
 
     if mergeable_value == "MERGEABLE":
-        if unsettled_status:
-            return {
-                **fields,
-                "state": "unsettled",
-                "settled": False,
-                "reason": "merge_state_unknown",
-            }
-        return {
-            **fields,
-            "state": "mergeable",
-            "settled": True,
-            "reason": "corroborated",
-        }
+        return {**fields, "state": "mergeable", "settled": True, "reason": "settled"}
 
     return {
         **fields,
@@ -684,15 +649,17 @@ def observe_pull_request(
     request already reports, so a response can carry a fresh ``headRefOid``
     beside an answer computed against the head it replaced. A response taken
     right after the head moved is therefore refused and asked again after a
-    delay, and so is one whose two mergeability fields contradict each other.
+    delay. That is the whole of the defense: the two mergeability fields GitHub
+    returns are two views of one computation and go stale together, so no
+    agreement between them can stand in for freshness.
 
     The check rollup is not stale in that way. Each check run belongs to a
     commit, so the rollup genuinely describes this head. It can still be
     *incomplete*: right after a push, GitHub may have registered only the
     quickest workflows, and a rollup with two passing entries and nothing else
     yet looks exactly like a finished green one. The first read after a push is
-    refused for that reason too, and ``summarize_checks`` compares the names
-    against the base commit's.
+    refused for that reason too, and coverage is judged separately against the
+    contexts the base branch declares as required.
 
     This narrows both windows; it closes neither. No GitHub field states which
     commit a mergeability answer was computed at, so no caller can prove that a
@@ -734,9 +701,7 @@ def observe_pull_request(
         moved = bool(previous_head) and observed_head != previous_head
         head_moved = head_moved or moved
         previous_head = observed_head
-        mergeability = corroborate_mergeability(
-            payload.get("mergeable"), payload.get("mergeStateStatus")
-        )
+        mergeability = corroborate_mergeability(payload.get("mergeable"))
         if delay is None:
             break
         if moved:
@@ -1351,7 +1316,6 @@ def stage_green(
                 "settled": False,
                 "reason": "not_observed",
                 "mergeable": observation.get("mergeable"),
-                "merge_state_status": observation.get("merge_state_status"),
             }
         green = mergeability.get("settled") and mergeability.get("state") == "mergeable"
         reason = mergeability.get("reason")
@@ -1362,7 +1326,10 @@ def stage_green(
             "green": bool(green),
             "evidence": "github",
             "mergeable": mergeability.get("mergeable"),
-            "merge_state_status": mergeability.get("merge_state_status"),
+            # Recorded for the history, and read by nothing. It is a second view
+            # of the same computation ``mergeable`` comes from, so it goes stale
+            # in step with it and can corroborate nothing.
+            "merge_state_status": observation.get("merge_state_status"),
             "mergeability": mergeability.get("state"),
             "settled": bool(mergeability.get("settled")),
             "reason": None if green else reason,

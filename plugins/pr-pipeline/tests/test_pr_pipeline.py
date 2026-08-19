@@ -119,7 +119,7 @@ def observation(
         "base_sha": "base1",
         "mergeable": mergeable,
         "merge_state_status": merge_state_status,
-        "mergeability": MODULE.corroborate_mergeability(mergeable, merge_state_status),
+        "mergeability": MODULE.corroborate_mergeability(mergeable),
         "checks": {
             "state": checks,
             "total": 3,
@@ -879,60 +879,62 @@ class ApplyCheckCoverageTest(unittest.TestCase):
 
 
 class CorroborateMergeabilityTest(unittest.TestCase):
-    def test_the_two_fields_agreeing_on_mergeable_settles_it(self):
-        verdict = MODULE.corroborate_mergeability("MERGEABLE", "CLEAN")
+    def test_a_mergeable_answer_settles(self):
+        verdict = MODULE.corroborate_mergeability("MERGEABLE")
         self.assertTrue(verdict["settled"])
         self.assertEqual("mergeable", verdict["state"])
-        self.assertEqual("corroborated", verdict["reason"])
+        self.assertEqual("settled", verdict["reason"])
 
-    def test_a_merge_blocked_by_review_is_still_free_of_conflicts(self):
-        verdict = MODULE.corroborate_mergeability("MERGEABLE", "BLOCKED")
-        self.assertTrue(verdict["settled"])
-        self.assertEqual("mergeable", verdict["state"])
-
-    def test_the_two_fields_agreeing_on_a_conflict_settles_it(self):
-        verdict = MODULE.corroborate_mergeability("CONFLICTING", "DIRTY")
+    def test_a_conflicting_answer_settles(self):
+        verdict = MODULE.corroborate_mergeability("CONFLICTING")
         self.assertTrue(verdict["settled"])
         self.assertEqual("conflicting", verdict["state"])
-
-    def test_a_dirty_state_never_reads_as_mergeable(self):
-        verdict = MODULE.corroborate_mergeability("MERGEABLE", "DIRTY")
-        self.assertFalse(verdict["settled"])
-        self.assertEqual("conflicting", verdict["state"])
-        self.assertEqual("disagreed", verdict["reason"])
-
-    def test_an_unknown_merge_state_settles_nothing(self):
-        for status in ("UNKNOWN", "", None):
-            with self.subTest(status=status):
-                verdict = MODULE.corroborate_mergeability("MERGEABLE", status)
-                self.assertFalse(verdict["settled"])
-                self.assertEqual("merge_state_unknown", verdict["reason"])
 
     def test_an_unknown_mergeable_settles_nothing(self):
-        verdict = MODULE.corroborate_mergeability("UNKNOWN", "CLEAN")
-        self.assertFalse(verdict["settled"])
-        self.assertEqual("unsettled", verdict["state"])
-        self.assertEqual("mergeable_unknown", verdict["reason"])
-
-    def test_a_conflict_the_merge_state_denies_settles_nothing(self):
-        verdict = MODULE.corroborate_mergeability("CONFLICTING", "CLEAN")
-        self.assertFalse(verdict["settled"])
-        self.assertEqual("disagreed", verdict["reason"])
-
-    def test_a_dirty_state_beside_an_unknown_mergeable_is_still_not_green(self):
-        verdict = MODULE.corroborate_mergeability(None, "DIRTY")
-        self.assertFalse(verdict["settled"])
-        self.assertEqual("conflicting", verdict["state"])
-        self.assertEqual("mergeable_unknown", verdict["reason"])
+        for value in ("UNKNOWN", "", None):
+            with self.subTest(value=value):
+                verdict = MODULE.corroborate_mergeability(value)
+                self.assertFalse(verdict["settled"])
+                self.assertEqual("unsettled", verdict["state"])
+                self.assertEqual("mergeable_unknown", verdict["reason"])
 
     def test_a_value_nobody_recognises_settles_nothing(self):
-        verdict = MODULE.corroborate_mergeability("SOMEDAY", "CLEAN")
+        verdict = MODULE.corroborate_mergeability("SOMEDAY")
         self.assertFalse(verdict["settled"])
         self.assertEqual("unrecognized", verdict["reason"])
 
-    def test_the_fields_are_read_case_insensitively(self):
-        verdict = MODULE.corroborate_mergeability("mergeable", "clean")
-        self.assertTrue(verdict["settled"])
+    def test_the_field_is_read_case_insensitively(self):
+        self.assertTrue(MODULE.corroborate_mergeability("mergeable")["settled"])
+        self.assertEqual(
+            "conflicting", MODULE.corroborate_mergeability("conflicting")["state"]
+        )
+
+    def test_the_merge_state_drives_nothing(self):
+        # Measured across 81 open draft pull requests, the two fields never
+        # disagreed. They are two views of one asynchronous computation, so
+        # requiring agreement cannot catch the stale answer a guard would exist
+        # to catch. A check that can never fire reads as a defense that has been
+        # holding, so the field is recorded and never consulted.
+        source = SCRIPT.read_text(encoding="utf-8")
+        signature = source.split("def corroborate_mergeability(")[1].split(")")[0]
+        self.assertNotIn("merge_state", signature)
+        body = source.split("def corroborate_mergeability(")[1].split("\ndef ")[0]
+        code = body.split('"""')[2]
+        self.assertNotIn("merge_state", code)
+        self.assertNotIn("DIRTY", code)
+
+    def test_the_recorded_merge_state_survives_for_the_history(self):
+        verdict = MODULE.stage_green(
+            MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT],
+            head_sha=HEAD,
+            cleared={},
+            marker={},
+            observation=observation(
+                mergeable="MERGEABLE", merge_state_status="BLOCKED"
+            ),
+        )
+        self.assertTrue(verdict["green"])
+        self.assertEqual("BLOCKED", verdict["merge_state_status"])
 
 
 class ObservePullRequestTest(unittest.TestCase):
@@ -979,13 +981,18 @@ class ObservePullRequestTest(unittest.TestCase):
         self.assertEqual(len(MODULE.MERGEABLE_RETRY_DELAYS) + 1, self.reads)
         self.assertFalse(result["mergeability"]["settled"])
 
-    def test_two_fields_that_disagree_are_asked_again(self):
-        result = self.observe(
-            self.payload(mergeable="MERGEABLE", status="DIRTY"),
-            self.payload(mergeable="CONFLICTING", status="DIRTY"),
-        )
-        self.assertEqual(2, self.reads)
-        self.assertEqual("conflicting", result["mergeability"]["state"])
+    def test_the_merge_state_never_causes_another_read(self):
+        # A response whose two fields disagree was once re-read. Measurement
+        # found they never disagree, so the re-read was unreachable code that
+        # read as a live defense.
+        for status in ("DIRTY", "CLEAN", "UNKNOWN", "BLOCKED"):
+            with self.subTest(status=status):
+                result = self.observe(
+                    self.payload(mergeable="MERGEABLE", status=status)
+                )
+                self.assertEqual(1, self.reads)
+                self.assertEqual("mergeable", result["mergeability"]["state"])
+                self.assertEqual(status, result["merge_state_status"])
 
     def test_the_first_answer_after_a_push_is_never_taken(self):
         result = self.observe(
@@ -1029,17 +1036,26 @@ class GithubEvidenceTest(unittest.TestCase):
             observation=observed,
         )
 
-    def test_a_corroborated_mergeable_clears_the_conflict_stage(self):
+    def test_a_settled_mergeable_clears_the_conflict_stage(self):
         verdict = self.verdict(MODULE.STAGE_CONFLICT, observation())
         self.assertTrue(verdict["green"])
 
-    def test_an_uncorroborated_mergeable_does_not_clear_it(self):
+    def test_an_unsettled_mergeable_does_not_clear_it(self):
         verdict = self.verdict(
-            MODULE.STAGE_CONFLICT,
-            observation(mergeable="MERGEABLE", merge_state_status="UNKNOWN"),
+            MODULE.STAGE_CONFLICT, observation(mergeable="UNKNOWN")
         )
         self.assertFalse(verdict["green"])
-        self.assertEqual("merge_state_unknown", verdict["reason"])
+        self.assertEqual("mergeable_unknown", verdict["reason"])
+
+    def test_the_merge_state_never_changes_the_conflict_verdict(self):
+        for status in ("DIRTY", "CLEAN", "UNKNOWN", "BLOCKED", "BEHIND", "UNSTABLE"):
+            with self.subTest(status=status):
+                verdict = self.verdict(
+                    MODULE.STAGE_CONFLICT,
+                    observation(mergeable="MERGEABLE", merge_state_status=status),
+                )
+                self.assertTrue(verdict["green"])
+                self.assertEqual(status, verdict["merge_state_status"])
 
     def test_a_mergeable_answer_read_right_after_a_push_does_not_clear_it(self):
         verdict = self.verdict(
@@ -1127,11 +1143,16 @@ class GithubEvidenceTest(unittest.TestCase):
         self.assertIn("build / required-status-check", decision["detail"])
         self.assertIn("draft", decision["next_action"])
 
-    def test_a_conflict_the_two_fields_disagree_about_sends_the_stage_round_again(self):
-        observed = observation(mergeable="MERGEABLE", merge_state_status="DIRTY")
+    def test_a_conflicting_answer_sends_the_stage_round_again(self):
+        observed = observation(mergeable="CONFLICTING")
         decision = MODULE.decide_next(build_state(), observed)
         self.assertEqual("run_stage", decision["result"])
         self.assertEqual(MODULE.STAGE_CONFLICT, decision["stage"])
+
+    def test_the_merge_state_alone_never_sends_the_stage_round_again(self):
+        observed = observation(mergeable="MERGEABLE", merge_state_status="DIRTY")
+        decision = MODULE.decide_next(build_state(), observed)
+        self.assertEqual(MODULE.STAGE_SELF_REVIEW, decision["stage"])
 
 
 class StageMarkerTest(unittest.TestCase):
