@@ -326,6 +326,12 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("## Final Report", self.instructions)
         self.assertIn("Send one message that calls no tool", self.instructions)
 
+    def test_an_escalated_run_cannot_read_like_an_uneventful_one(self):
+        self.assertIn("never let an escalated run read like an uneventful one", self.instructions)
+        self.assertIn("names the escalation kind", self.instructions)
+        self.assertIn("a person has to decide", self.instructions)
+        self.assertIn("still conflicted and the branch untouched", self.instructions)
+
     def test_closes_every_run_with_a_tagged_retrospective(self):
         self.assertIn("## Conflict Fix Loop Agent Retrospective", self.instructions)
         for category in (

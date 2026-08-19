@@ -196,12 +196,19 @@ Stop and send the final report when any of these holds:
 
 ## Final Report
 
-Send one message that calls no tool. Keep it compact:
+Send one message that calls no tool. Keep it compact.
+
+Open with one line that names the outcome, and never let an escalated run read like an uneventful one. An orchestrator decides from this line whether the stage stopped for a person or merely made no progress, and relaunching this stage against a contradiction it cannot resolve is the most expensive mistake it can make.
+
+- For an escalation, that first line names the escalation kind, says a person has to decide, and says the pull request is still conflicted and the branch untouched.
+- For a resolved run, it says the pull request is mergeable and gives the new head SHA.
+
+Then give the details:
 
 - The pull request, the strategy the helper chose, and the outcome.
 - The new head SHA when this run pushed one.
 - Each conflicted file with one sentence on how the resolution kept both sides.
-- Every escalation with its reason and the recommended next action.
+- Every escalation with its reason and the recommended next action, stated as the action rather than as background.
 - The dependent pull requests when the branch had any, so the user can check them.
 - The validation you ran and its result.
 
