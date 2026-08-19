@@ -528,25 +528,51 @@ def require_open_pull_request(metadata: dict[str, Any]) -> None:
         )
 
 
+def mergeability_settled(
+    metadata: dict[str, Any], expected_head: str | None = None
+) -> bool:
+    """Report whether a mergeability read is worth acting on.
+
+    A read is settled once GitHub has finished computing the value and, when an
+    expected head SHA is given, once the answer describes that commit.
+    """
+    if metadata.get("mergeable") == "UNKNOWN":
+        return False
+    if expected_head is None:
+        return True
+    return metadata.get("head_sha") == expected_head
+
+
 def live_mergeability(
-    target: dict[str, Any], *, delays: Iterable[float] = MERGEABILITY_RETRY_DELAYS
+    target: dict[str, Any],
+    *,
+    delays: Iterable[float] = MERGEABILITY_RETRY_DELAYS,
+    expected_head: str | None = None,
 ) -> dict[str, Any]:
     """Read mergeability live, waiting while GitHub is still computing it.
 
     GitHub computes the value lazily, so the first read of a freshly pushed head is
     routinely UNKNOWN. Reading it again is what triggers and then observes the
     computation.
+
+    A read taken right after a push can also still describe the previous head, and
+    that stale answer carries a settled mergeable value rather than UNKNOWN. Pass the
+    head SHA the answer has to describe so the wait covers that case too.
     """
     metadata = metadata_for(target)
     for delay in delays:
-        if metadata.get("mergeable") != "UNKNOWN":
+        if mergeability_settled(metadata, expected_head):
             return metadata
         time.sleep(delay)
         metadata = metadata_for(target)
     return metadata
 
 
-def classify_mergeability(metadata: dict[str, Any]) -> str:
+def classify_mergeability(
+    metadata: dict[str, Any], *, expected_head: str | None = None
+) -> str:
+    if expected_head is not None and metadata.get("head_sha") != expected_head:
+        return "unknown"
     mergeable = metadata.get("mergeable")
     if mergeable == "MERGEABLE":
         return "mergeable"
@@ -825,6 +851,48 @@ def read_worktree_text(path: Path) -> str | None:
 
 def normalize_content(data: bytes | None) -> bytes | None:
     return None if data is None else data.replace(b"\r\n", b"\n")
+
+
+def line_endings_in(data: bytes | None) -> set[str]:
+    """Name every line ending a file actually contains."""
+    if not data:
+        return set()
+    crlf = data.count(b"\r\n")
+    lf = data.count(b"\n") - crlf
+    present = set()
+    if crlf:
+        present.add("crlf")
+    if lf:
+        present.add("lf")
+    return present
+
+
+def line_ending_style(data: bytes | None) -> str:
+    """Name the line ending a file uses: lf, crlf, mixed, or none."""
+    present = line_endings_in(data)
+    if len(present) == 2:
+        return "mixed"
+    return present.pop() if present else "none"
+
+
+def introduced_line_ending(
+    resolved: bytes | None, sides: Iterable[bytes | None]
+) -> str | None:
+    """Report a line ending the resolution introduced that neither side contained.
+
+    An editor on Windows can rewrite a whole file as it saves it. Git normalization
+    can then hide that in a diff, so the resolution looks small while every line
+    changed. Comparing against both sides catches it before anything is staged.
+    """
+    existing: set[str] = set()
+    for side in sides:
+        existing |= line_endings_in(side)
+    if not existing:
+        return None
+    introduced = line_endings_in(resolved) - existing
+    if not introduced:
+        return None
+    return introduced.pop()
 
 
 def stage_blobs(repo_root: Path, path: str) -> dict[str, bytes | None]:
@@ -1590,6 +1658,7 @@ def command_resolved(args: argparse.Namespace) -> None:
                 "--accept-deletion together with the reason both sides allow it"
             )
         one_side = None
+        introduced = None
         if not deleted:
             text = read_worktree_text(target)
             if text is not None:
@@ -1604,6 +1673,9 @@ def command_resolved(args: argparse.Namespace) -> None:
                         + "".join(f"; {problem}" for problem in markers["problems"])
                     )
             content = normalize_content(target.read_bytes())
+            introduced = introduced_line_ending(
+                target.read_bytes(), (blobs["head"], blobs["base"])
+            )
             if content is not None and content == normalize_content(blobs["head"]):
                 one_side = "head"
             elif content is not None and content == normalize_content(blobs["base"]):
@@ -1614,6 +1686,14 @@ def command_resolved(args: argparse.Namespace) -> None:
                 "keeps only one side's work; combine both sides, or pass "
                 "--accept-one-side with the reason the other side's change must not "
                 "survive"
+            )
+        if introduced and not args.accept_line_endings:
+            raise WorkflowError(
+                f"{path} now uses {introduced.upper()} line endings, which neither side "
+                "of the conflict used; an editor rewrote the whole file, so every line "
+                "would change and the real resolution would be invisible in the diff; "
+                "restore the original line endings, or pass --accept-line-endings with "
+                "the reason the file has to change style"
             )
         add = git_try(repo_root, "add", "--all", "--", path)
         if add.returncode != 0:
@@ -1957,8 +2037,8 @@ def command_publish(args: argparse.Namespace) -> None:
             f"PR head mismatch: local {local_head}, PR head {refreshed['head_sha']}"
         )
 
-    final = live_mergeability(target)
-    mergeability = classify_mergeability(final)
+    final = live_mergeability(target, expected_head=local_head)
+    mergeability = classify_mergeability(final, expected_head=local_head)
     attempt["status"] = "published"
     attempt["published_head_sha"] = local_head
     attempt["push_verification"] = verification
@@ -2099,6 +2179,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--accept-one-side",
         action="store_true",
         help="allow a resolution that is byte-for-byte one side of the conflict",
+    )
+    resolved.add_argument(
+        "--accept-line-endings",
+        action="store_true",
+        help="allow a resolution that changes the file's line endings",
     )
     resolved.add_argument(
         "--accept-deletion",

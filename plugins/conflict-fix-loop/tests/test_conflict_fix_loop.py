@@ -767,6 +767,42 @@ class MergeabilityTest(unittest.TestCase):
         self.assertEqual("unknown", MODULE.classify_mergeability(result))
         self.assertEqual(3, metadata_for.call_count)
 
+    def test_a_settled_answer_needs_no_expected_head(self):
+        self.assertTrue(MODULE.mergeability_settled(pr_metadata(mergeable="MERGEABLE")))
+        self.assertFalse(MODULE.mergeability_settled(pr_metadata(mergeable="UNKNOWN")))
+
+    def test_an_answer_describing_another_head_has_not_settled(self):
+        metadata = pr_metadata(head_sha="old1", mergeable="CONFLICTING")
+        self.assertFalse(MODULE.mergeability_settled(metadata, "new1"))
+        self.assertTrue(MODULE.mergeability_settled(metadata, "old1"))
+
+    def test_an_answer_for_the_previous_head_is_read_again(self):
+        target = MODULE.parse_target("owner/repo#7")
+        answers = [
+            pr_metadata(head_sha="old1", mergeable="CONFLICTING"),
+            pr_metadata(head_sha="new1", mergeable="UNKNOWN"),
+            pr_metadata(head_sha="new1", mergeable="MERGEABLE"),
+        ]
+        with mock.patch.object(
+            MODULE, "metadata_for", side_effect=answers
+        ) as metadata_for, mock.patch.object(MODULE, "time"):
+            result = MODULE.live_mergeability(
+                target, delays=(0, 0, 0), expected_head="new1"
+            )
+        self.assertEqual("MERGEABLE", result["mergeable"])
+        self.assertEqual("new1", result["head_sha"])
+        self.assertEqual(3, metadata_for.call_count)
+
+    def test_a_stale_answer_is_classified_unknown_rather_than_believed(self):
+        stale = pr_metadata(head_sha="old1", mergeable="MERGEABLE")
+        self.assertEqual("mergeable", MODULE.classify_mergeability(stale))
+        self.assertEqual(
+            "unknown", MODULE.classify_mergeability(stale, expected_head="new1")
+        )
+        self.assertEqual(
+            "mergeable", MODULE.classify_mergeability(stale, expected_head="old1")
+        )
+
     def test_the_default_delays_back_off(self):
         self.assertEqual((2, 4, 8, 16), MODULE.MERGEABILITY_RETRY_DELAYS)
 
@@ -1127,6 +1163,53 @@ class ConflictMarkerTest(unittest.TestCase):
             {"regions": [], "problems": []},
             MODULE.parse_conflict_markers("just some code\n"),
         )
+
+
+class LineEndingTest(unittest.TestCase):
+    def test_the_style_of_a_file_is_named(self):
+        for data, expected in (
+            (b"a\nb\n", "lf"),
+            (b"a\r\nb\r\n", "crlf"),
+            (b"a\r\nb\n", "mixed"),
+            (b"a", "none"),
+            (b"", "none"),
+            (None, "none"),
+        ):
+            with self.subTest(data=data):
+                self.assertEqual(expected, MODULE.line_ending_style(data))
+
+    def test_a_style_neither_side_used_is_reported(self):
+        self.assertEqual(
+            "crlf", MODULE.introduced_line_ending(b"a\r\n", (b"a\n", b"b\n"))
+        )
+        self.assertEqual(
+            "lf", MODULE.introduced_line_ending(b"a\n", (b"a\r\n", b"b\r\n"))
+        )
+        self.assertEqual(
+            "crlf", MODULE.introduced_line_ending(b"a\r\nb\n", (b"a\n", b"b\n"))
+        )
+
+    def test_both_endings_arriving_at_once_are_not_judged(self):
+        self.assertIsNone(MODULE.introduced_line_ending(b"a\r\nb\n", (b"a", b"b")))
+
+    def test_a_style_a_side_already_used_is_not_reported(self):
+        self.assertIsNone(MODULE.introduced_line_ending(b"a\n", (b"a\n", b"b\n")))
+        self.assertIsNone(MODULE.introduced_line_ending(b"a\r\n", (b"a\n", b"b\r\n")))
+        self.assertIsNone(MODULE.introduced_line_ending(b"a\r\n", (b"a\r\nb\n", None)))
+
+    def test_a_mixed_side_permits_either_ending(self):
+        for resolved in (b"a\n", b"a\r\n", b"a\r\nb\n"):
+            with self.subTest(resolved=resolved):
+                self.assertIsNone(
+                    MODULE.introduced_line_ending(resolved, (b"a\r\nb\n", None))
+                )
+
+    def test_a_file_without_a_line_ending_is_not_reported(self):
+        self.assertIsNone(MODULE.introduced_line_ending(b"a", (b"a\n", b"b\n")))
+        self.assertIsNone(MODULE.introduced_line_ending(b"", (b"a\n", b"b\n")))
+
+    def test_a_side_that_carries_no_line_ending_decides_nothing(self):
+        self.assertIsNone(MODULE.introduced_line_ending(b"a\r\n", (b"a", None)))
 
 
 class ConflictEvidenceTest(unittest.TestCase):
@@ -2092,6 +2175,7 @@ class ResolvedTest(unittest.TestCase):
         rationale_file=None,
         accept_one_side=False,
         accept_deletion=False,
+        accept_line_endings=False,
         add=None,
         **state_overrides,
     ):
@@ -2103,6 +2187,7 @@ class ResolvedTest(unittest.TestCase):
             rationale_file=rationale_file,
             accept_one_side=accept_one_side,
             accept_deletion=accept_deletion,
+            accept_line_endings=accept_line_endings,
         )
         with mock.patch.object(
             MODULE, "stage_blobs", return_value=dict(self.blobs)
@@ -2176,6 +2261,24 @@ class ResolvedTest(unittest.TestCase):
         )
         self.assertEqual([{"path": "app.py", "one_side": "head", "deleted": False}], payload["resolved"])
         self.assertEqual("head", self.saved()["attempt"]["conflicts"][0]["one_side"])
+
+    def test_a_whole_file_rewritten_as_crlf_is_refused(self):
+        self.write("app.py", b"ours\r\nboth\r\n")
+        with self.assertRaisesRegex(MODULE.WorkflowError, "now uses CRLF line endings"):
+            self.resolve()
+
+    def test_a_deliberate_line_ending_change_is_allowed(self):
+        self.write("app.py", b"ours\r\nboth\r\n")
+        payload = self.resolve(
+            accept_line_endings=True, rationale="the file is a Windows batch script"
+        )
+        self.assertEqual([{"path": "app.py", "one_side": None, "deleted": False}], payload["resolved"])
+
+    def test_matching_the_line_endings_both_sides_used_is_allowed(self):
+        self.blobs = {"ancestor": None, "head": b"ours\r\n", "base": b"theirs\r\n"}
+        self.write("app.py", b"ours\r\nboth\r\n")
+        payload = self.resolve()
+        self.assertEqual([{"path": "app.py", "one_side": None, "deleted": False}], payload["resolved"])
 
     def test_a_deletion_is_refused_by_default(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "needs --accept-deletion"):
@@ -2414,7 +2517,7 @@ class PublishTest(unittest.TestCase):
             MODULE,
             "live_mergeability",
             return_value=final or pr_metadata(head_sha=local_head, mergeable="MERGEABLE"),
-        ), mock.patch.object(
+        ) as mergeability, mock.patch.object(
             MODULE, "time"
         ), mock.patch.object(
             MODULE, "emit"
@@ -2423,6 +2526,7 @@ class PublishTest(unittest.TestCase):
         self.state_path = state_path
         self.verify = verify
         self.runner = runner
+        self.mergeability = mergeability
         return emitted(emit)
 
     def saved(self):
@@ -2440,6 +2544,15 @@ class PublishTest(unittest.TestCase):
         state = self.saved()
         self.assertEqual("published", state["attempt"]["status"])
         self.assertEqual(1, len(state["history"]))
+
+    def test_mergeability_is_read_for_the_head_that_was_just_pushed(self):
+        self.publish()
+        self.assertEqual("head2", self.mergeability.call_args.kwargs["expected_head"])
+
+    def test_an_answer_describing_the_previous_head_is_not_believed(self):
+        payload = self.publish(final=pr_metadata(head_sha="head1", mergeable="MERGEABLE"))
+        self.assertEqual("unknown", payload["mergeability"])
+        self.assertIsNone(payload["mergeable_at_head_sha"])
 
     def test_the_push_always_names_the_head_branch_explicitly(self):
         self.publish()
@@ -2828,7 +2941,7 @@ class ParserTest(unittest.TestCase):
                 ]
             )
 
-    def test_resolved_takes_several_paths_and_both_override_flags(self):
+    def test_resolved_takes_several_paths_and_every_override_flag(self):
         args = self.parser.parse_args(
             [
                 "resolved",
@@ -2841,11 +2954,21 @@ class ParserTest(unittest.TestCase):
                 "r",
                 "--accept-one-side",
                 "--accept-deletion",
+                "--accept-line-endings",
             ]
         )
         self.assertEqual(["a.py", "b.py"], args.paths)
         self.assertTrue(args.accept_one_side)
         self.assertTrue(args.accept_deletion)
+        self.assertTrue(args.accept_line_endings)
+
+    def test_the_resolved_override_flags_are_off_by_default(self):
+        args = self.parser.parse_args(
+            ["resolved", "--state", "s.json", "--paths", "a.py", "--rationale", "r"]
+        )
+        self.assertFalse(args.accept_one_side)
+        self.assertFalse(args.accept_deletion)
+        self.assertFalse(args.accept_line_endings)
 
     def test_escalate_only_accepts_a_declared_kind(self):
         for kind in MODULE.ESCALATION_KINDS:
@@ -3050,6 +3173,7 @@ class RealGitConflictTest(unittest.TestCase):
                     rationale_file=None,
                     accept_one_side=False,
                     accept_deletion=False,
+                    accept_line_endings=False,
                 )
             )
         self.assertEqual("recorded", emitted(emit)["result"])
@@ -3098,6 +3222,7 @@ class RealGitConflictTest(unittest.TestCase):
                     rationale_file=None,
                     accept_one_side=False,
                     accept_deletion=False,
+                    accept_line_endings=False,
                 )
             )
 
@@ -3124,6 +3249,7 @@ class RealGitConflictTest(unittest.TestCase):
                     rationale_file=None,
                     accept_one_side=False,
                     accept_deletion=False,
+                    accept_line_endings=False,
                 )
             )
 

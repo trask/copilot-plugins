@@ -71,7 +71,7 @@ The deterministic, JSON-only helper provides:
 
 - `preflight [target] [--repo-root <workspace>] [--strategy auto|merge|rebase] [--max-iterations 5]`: resolve the pull request, require a clean worktree with no merge or rebase in progress, check out the head branch itself, require the local head to equal the pull request head, read mergeability live from GitHub and wait out an `UNKNOWN` answer, find the open pull requests that stack on this branch and the one this branch stacks on, read the repository's allowed merge methods, choose the integration strategy, enforce the iteration cap, archive the previous attempt, write its complete result to `preflight_path`, and print a compact envelope.
 - `attempt --state <path>`: fetch the base commit, compute the merge base, record the head branch's original commit subjects, start the merge or rebase, and report every conflicted file with its conflict kind, its conflict-marker regions, which stages exist, and the commits from each side that touched it. The complete detail goes to `conflicts_path`.
-- `resolved --state <path> --paths <files...> (--rationale <text> | --rationale-file <file-or->) [--accept-one-side] [--accept-deletion]`: verify that no conflict marker remains, refuse a resolution that is byte-for-byte one side unless you pass `--accept-one-side`, refuse a resolution that leaves the file deleted unless you pass `--accept-deletion`, stage the files, and record the rationale durably.
+- `resolved --state <path> --paths <files...> (--rationale <text> | --rationale-file <file-or->) [--accept-one-side] [--accept-deletion] [--accept-line-endings]`: verify that no conflict marker remains, refuse a resolution that is byte-for-byte one side unless you pass `--accept-one-side`, refuse a resolution that leaves the file deleted unless you pass `--accept-deletion`, refuse a resolution that introduces a line ending neither side contained unless you pass `--accept-line-endings`, stage the files, and record the rationale durably.
 - `continue --state <path>`: require every conflicted file to be resolved, then create the merge commit or replay the next rebased commit. A rebase can stop again on the next commit, so this may report a fresh conflict set.
 - `abort --state <path>`: undo the in-progress merge or rebase and end the attempt.
 - `escalate --state <path> --kind <kind> (--reason <text> | --reason-file <file-or->) [--recommended-action <text>]`: record why this run stopped and needs a person.
@@ -142,6 +142,8 @@ Record every resolution with `resolved`. Write the rationale to a temporary UTF-
 
 The helper refuses a resolution that is byte-for-byte one side of the conflict. That refusal is usually correct and means you took a side. Pass `--accept-one-side` only when the other side's whole change is genuinely present in the result already, or when the file is generated and one side's copy is simply stale, and say which of those it is in the rationale.
 
+The helper also refuses a resolution that introduces a line ending neither side contained, because an editor that rewrites a whole file on save turns a small resolution into a change on every line while the diff still looks small. Write the file back in the line ending it already used. Pass `--accept-line-endings` only when the file genuinely has to change style, and say why in the rationale.
+
 ## Escalating On A Contradiction
 
 Two sides contradict each other when both cannot hold at the same time. Examples:
@@ -176,7 +178,7 @@ Any edit you make after `continue` has already created the merge commit needs it
 
 1. Run `publish`. It re-checks the stacking guards, verifies the push range, pushes only the head branch, and then proves that the base branch and every dependent pull request stayed where they were.
 2. A `unsafe_push` result is an escalation. Report the helper's blockers and stop.
-3. On `published`, read `mergeability`:
+3. On `published`, read `mergeability`. It describes the commit `publish` pushed and nothing else: an answer that still describes the previous head is reported as `unknown` rather than believed.
    - `mergeable`: the loop is done. Report success with the new head SHA.
    - `conflicting`: the base moved again, or the resolution was incomplete. Go back to `preflight` for the next iteration.
    - `unknown`: stop and report it. The helper already waited for GitHub.
