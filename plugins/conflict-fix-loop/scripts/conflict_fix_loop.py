@@ -60,6 +60,7 @@ ESCALATION_KINDS = (
     "validation",
     "other",
 )
+STAGE_OUTCOMES = ("cleared", "skipped", "no_progress", "escalated")
 
 
 class WorkflowError(RuntimeError):
@@ -2076,6 +2077,37 @@ def command_publish(args: argparse.Namespace) -> None:
     )
 
 
+def stage_outcome(state: dict[str, Any] | None) -> str:
+    """Name how a run ended, in the vocabulary an orchestrator reads.
+
+    This says how the run ended. It is never a claim that the pull request merges.
+    Whether this stage is green is decided from GitHub's live mergeability, and a
+    disagreement between the two is this field being wrong rather than the live
+    answer being wrong.
+
+    Anything that is not plainly a finished, published, mergeable run or a plainly
+    repeating one is reported as escalated. An escalation costs a person's attention
+    once, while a wrong clearance lets a caller move on from a stage that did not do
+    its job, and nothing downstream catches that.
+    """
+    if not state:
+        return "escalated"
+    escalation = state.get("escalation")
+    if escalation:
+        return "no_progress" if escalation.get("kind") == "no_progress" else "escalated"
+    attempt = state.get("attempt") or {}
+    status = attempt.get("status")
+    if status == "mergeable":
+        return "cleared"
+    if (
+        status == "published"
+        and attempt.get("published_head_sha")
+        and attempt.get("mergeable_at_head_sha") == attempt.get("published_head_sha")
+    ):
+        return "cleared"
+    return "escalated"
+
+
 def command_status(args: argparse.Namespace) -> None:
     if args.current:
         require_tools()
@@ -2087,6 +2119,7 @@ def command_status(args: argparse.Namespace) -> None:
                 {
                     "result": "no_state",
                     "state": str(path),
+                    "stage_outcome": stage_outcome(None),
                     "pr": {"number": target["number"], "url": target["pr_url"]},
                     "attempt": None,
                     "escalation": None,
@@ -2100,9 +2133,11 @@ def command_status(args: argparse.Namespace) -> None:
     pr = state["pr"]
     attempt = state.get("attempt")
     history = state.get("history") or []
+    outcome = stage_outcome(state)
     payload = {
         "result": "ready",
         "state": str(path),
+        "stage_outcome": outcome,
         "pr": pr,
         "attempt": attempt,
         "relations": state.get("relations"),
@@ -2117,6 +2152,7 @@ def command_status(args: argparse.Namespace) -> None:
         {
             "result": "ready",
             "state": str(path),
+            "stage_outcome": outcome,
             "status_path": str(status_path),
             "pr": {
                 "number": pr["number"],
