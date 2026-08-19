@@ -149,6 +149,34 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn("Publishing clears it", instructions)
 
+    def test_documents_an_absent_copilot_review_as_needing_a_person(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "the wait ended with no usable Copilot review, so stop and report a run "
+            "that needs a person rather than another attempt",
+            instructions,
+        )
+        self.assertIn(
+            "waited for a Copilot review and none arrived. This needs a person, not "
+            "another attempt.",
+            instructions,
+        )
+        self.assertIn("Do not ask to be run again in that outcome.", instructions)
+        self.assertIn(
+            "never let it read like an ordinary uneventful run", instructions
+        )
+
+    def test_a_user_stopped_watch_is_not_reported_as_needing_a_person(self):
+        """The user is already present, so those outcomes stay ordinary stop conditions."""
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "`head_changed`, `cancelled_locally`, or `stopped`: stop, and include that "
+            "exact outcome in the final compact index.",
+            instructions,
+        )
+
     def test_accepts_a_pr_target_for_an_unchecked_out_branch(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
