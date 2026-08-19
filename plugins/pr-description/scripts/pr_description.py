@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic mechanics for the PR Description Loop custom agent."""
+"""Deterministic mechanics for the PR Description custom agent."""
 
 from __future__ import annotations
 
@@ -173,7 +173,7 @@ def parse_target(target: str, *, repo_name: str | None = None) -> dict[str, Any]
 
 def default_state_path(target: dict[str, Any]) -> Path:
     name = f"{target['owner']}--{target['repo']}--{target['number']}.json"
-    return Path.home() / ".copilot" / "run" / "pr-description-loop" / name
+    return Path.home() / ".copilot" / "run" / "pr-description" / name
 
 
 def run_state_path(index_path: Path, run_id: str) -> Path:
@@ -1068,7 +1068,7 @@ def require_live_snapshot(
         or live["body"] != snapshot.get("body")
     ):
         raise WorkflowError(
-            "live PR title or body no longer matches the exact approved snapshot; "
+            "live PR title or body no longer matches the exact pinned snapshot; "
             "no mutation was performed; run preflight again"
         )
 
@@ -1477,7 +1477,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--body-file",
         required=True,
         help=(
-            "UTF-8 file holding the approved body; CRLF and CR line endings are "
+            "UTF-8 file holding the proposed body; CRLF and CR line endings are "
             "normalized to LF, so the stored proposal and the body sent to GitHub "
             "always use LF regardless of how the file was written"
         ),

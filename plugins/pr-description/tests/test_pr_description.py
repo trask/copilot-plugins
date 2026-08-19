@@ -14,11 +14,11 @@ from unittest import mock
 
 
 ROOT = Path(__file__).parents[1]
-SCRIPT = ROOT / "scripts" / "pr_description_loop.py"
-AGENT = ROOT / "agents" / "pr-description-loop.agent.md"
+SCRIPT = ROOT / "scripts" / "pr_description.py"
+AGENT = ROOT / "agents" / "pr-description.agent.md"
 PLUGIN = ROOT / "plugin.json"
 MARKETPLACE = ROOT.parents[1] / ".github" / "plugin" / "marketplace.json"
-SPEC = importlib.util.spec_from_file_location("pr_description_loop", SCRIPT)
+SPEC = importlib.util.spec_from_file_location("pr_description", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -74,10 +74,10 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn("After preflight succeeds, call `rename_session` exactly once", self.instructions)
-        self.assertIn("`PR Description Loop: <number> - <title>`", self.instructions)
+        self.assertIn("`PR Description: <number> - <title>`", self.instructions)
         self.assertIn("never rename again during this run", self.instructions)
 
-    def test_unslops_every_replacement_before_display_without_bypassing_approval(self):
+    def test_unslops_every_replacement_before_automatic_apply(self):
         self.assertIn(
             "invoke the globally installed `unslop` skill with the `skill` tool",
             self.instructions,
@@ -86,13 +86,13 @@ class AgentInstructionsTest(unittest.TestCase):
             "apply its process to the complete candidate title and body",
             self.instructions,
         )
-        self.assertIn("Repeat this before every revised proposal", self.instructions)
+        self.assertIn(        "Repeat this before every new proposal", self.instructions)
         self.assertIn(
-            "do not run `unslop` again or change either value before approval and apply",
+            "do not run `unslop` again or change either value before apply",
             self.instructions,
         )
         self.assertIn(
-            "needs another complete display and fresh approval",
+            "needs another complete display before apply",
             self.instructions,
         )
 
@@ -195,9 +195,8 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_summarizes_how_a_proposal_differs_from_the_current_text(self):
         self.assertIn("## Summarizing What Changed", self.instructions)
         self.assertIn(
-            "Every time you display a proposal, follow it with a `**What changed**` "
-            "summary that says how that proposal differs from the current title and "
-            "description, before you ask for approval",
+            "Immediately after you display a proposed title and description, and before "
+            "you apply it, add a `**What changed**` summary",
             self.instructions,
         )
         self.assertIn(
@@ -211,7 +210,7 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn(
             "add the `**What changed**` summary from \"Summarizing What "
-            "Changed\", then ask for explicit approval",
+            "Changed\"",
             self.instructions,
         )
 
@@ -241,7 +240,7 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "Do not first ask whether the current text looks good",
+            "Do not ask whether the current text looks good",
             self.instructions,
         )
 
@@ -265,54 +264,49 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
-    def test_requires_explicit_session_approval(self):
+    def test_applies_without_user_approval(self):
         self.assertIn(
-            "Never change GitHub unless the user explicitly approves the exact title "
-            "and the exact body in this session",
+            "Never ask for approval or wait for another user turn",
             self.instructions,
         )
         self.assertIn(
-            "Silence, absence of objection, earlier instructions, approval of "
-            "different text, a stored memory, and intent you infer are not approval",
+            "manual selection of this agent authorizes it to keep ideal text or apply "
+            "the replacement it judges best",
             self.instructions,
         )
         self.assertIn(
-            "Call `propose` and `apply` only after the user explicitly approves that "
-            "exact proposal",
-            self.instructions,
-        )
-
-    def test_keeps_ideal_text_approval_single_path_and_resolves_optional_concerns(self):
-        self.assertIn(
-            "Ask only for explicit approval of the exact current title and description "
-            "you displayed",
-            self.instructions,
-        )
-        self.assertIn(
-            "Do not offer a competing optional rewrite",
-            self.instructions,
-        )
-        self.assertIn(
-            "If a possible tweak does not change your recommendation, leave it out",
-            self.instructions,
-        )
-        self.assertIn(
-            "A reply also counts when it explicitly settles the one optional concern "
-            "you raised in favor of the displayed wording",
-            self.instructions,
-        )
-        self.assertIn(
-            "`List.of is fine` approves the displayed title and body without another "
-            "confirmation turn",
-            self.instructions,
-        )
-        self.assertIn(
-            "answers only one of several open concerns, raises new feedback, or is "
-            "unclear in any other way",
+            "then call `propose` and `apply` immediately",
             self.instructions,
         )
 
-    def test_validates_approved_current_text_without_mutation(self):
+    def test_automatically_validates_ideal_text(self):
+        self.assertIn(
+            "If the current title and description are essentially ideal",
+            self.instructions,
+        )
+        self.assertIn(
+            "Run `validate --state <path> --expected-head <head_sha> "
+            "--expected-run-id <run_id> --no-change` immediately",
+            self.instructions,
+        )
+        self.assertIn(
+            "If validation reports that the head or text changed",
+            self.instructions,
+        )
+        self.assertIn(
+            "continue with \"Metadata Changes Before Apply\"",
+            self.instructions,
+        )
+        self.assertIn(
+            "Do not ask whether the current text looks good",
+            self.instructions,
+        )
+        self.assertIn(
+            "whether the proposal is approved",
+            self.instructions,
+        )
+
+    def test_validates_ideal_current_text_without_mutation(self):
         self.assertIn(
             "`validate --state <path> --expected-head <head_sha> "
             "--expected-run-id <run_id> --no-change`",
@@ -395,9 +389,9 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
-    def test_restarts_on_head_change_and_uses_external_body_file(self):
+    def test_restarts_automatically_on_metadata_change_and_uses_external_body_file(self):
         self.assertIn(
-            "## Head Moves After Approval", self.instructions
+            "## Metadata Changes Before Apply", self.instructions
         )
         self.assertIn(
             "UTF-8 to a body file outside the repository", self.instructions
@@ -415,22 +409,19 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "Compare the new diff bytes exactly against the bytes you kept from the "
-            "approved run",
+            "Run a fresh `preflight` for the same pull request",
             self.instructions,
         )
         self.assertIn(
-            "Reuse the earlier approval, without displaying the text again and without "
-            "asking again",
+            "Display the fresh current title and description",
             self.instructions,
         )
         self.assertIn(
-            "If the approved destination title and body are already the fresh current "
-            "values, run `validate --no-change`",
+            "If the fresh text is ideal, run `validate --no-change`",
             self.instructions,
         )
         self.assertIn(
-            "Never carry an approval across a real change to the content", self.instructions
+            "Never reuse a stale proposal", self.instructions
         )
 
     def test_documents_run_capabilities_and_residual_update_race(self):
@@ -446,10 +437,10 @@ class AgentInstructionsTest(unittest.TestCase):
 
     def test_closes_every_run_with_a_categorized_retrospective(self):
         self.assertIn(
-            "## PR Description Loop Agent Retrospective", self.instructions
+            "## PR Description Agent Retrospective", self.instructions
         )
         self.assertIn(
-            "**PR Description Loop Agent Retrospective**", self.instructions
+            "**PR Description Agent Retrospective**", self.instructions
         )
         self.assertIn("Emit exactly one terminal response", self.instructions)
         self.assertIn("must be the very last block", self.instructions)
@@ -466,8 +457,7 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn(
             "Produce the retrospective on every terminal outcome, including a "
             "validated unchanged text, an applied proposal, a moved head that "
-            "discarded a proposal, a helper error, and a run the user ends without "
-            "approving anything",
+            "discarded a proposal, a helper error, and a run that stops early",
             self.instructions,
         )
         for category in (
@@ -536,12 +526,27 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.21")
+        self.assertEqual(plugin["version"], "1.0.22")
         self.assertEqual(entry["version"], plugin["version"])
-        self.assertEqual(entry["source"], "./plugins/pr-description-loop")
+        self.assertEqual(entry["source"], "./plugins/pr-description")
 
 
 class TargetParsingTest(unittest.TestCase):
+    def test_uses_the_renamed_pr_flight_state_directory(self):
+        target = MODULE.parse_target("owner/repo#7")
+
+        with mock.patch("pathlib.Path.home", return_value=Path("home")):
+            path = MODULE.default_state_path(target)
+
+        self.assertEqual(
+            path,
+            Path("home")
+            / ".copilot"
+            / "run"
+            / "pr-description"
+            / "owner--repo--7.json",
+        )
+
     def test_accepts_urls_short_targets_and_bare_numbers_with_context(self):
         expected = {
             "owner": "owner",

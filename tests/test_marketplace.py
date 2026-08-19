@@ -16,7 +16,7 @@ class MarketplaceTest(unittest.TestCase):
         self.assertEqual(
             {
                 "copilot-review-loop",
-                "pr-description-loop",
+                "pr-description",
                 "pr-reviewer",
                 "self-review-loop",
             },

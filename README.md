@@ -16,7 +16,7 @@ Then install any of the plugins:
 copilot plugin install pr-reviewer@trask-plugins
 copilot plugin install copilot-review-loop@trask-plugins
 copilot plugin install self-review-loop@trask-plugins
-copilot plugin install pr-description-loop@trask-plugins
+copilot plugin install pr-description@trask-plugins
 ```
 
 Restart Copilot after you install or update a plugin.
@@ -52,17 +52,16 @@ it reaches a stop condition.
 Run this agent on a Claude model. It checks its own findings with GPT-5.6 Sol,
 and that check only works when the evaluator comes from another model family.
 
-### PR Description Loop
+### PR Description
 
-Shows the current pull request title and description. It validates them
-unchanged when you approve them as they are. Otherwise it works with you on a
-replacement and applies it only after you approve that exact text. It checks
-every accepted outcome against the pinned pull request head and the exact live
-text.
+Reviews the current pull request title and description against the diff. It
+validates ideal text unchanged or automatically applies a better title and
+description. It checks every outcome against the pinned pull request head and
+the exact live text.
 
 ### Optional PR Flight State Sharing
 
-Self Review Loop and PR Description Loop can copy the few completion facts that
+Self Review Loop and PR Description can copy the few completion facts that
 the PR Flight canvas uses to a private GitHub repository. That keeps those
 stages the same on every machine you use. Set
 `COPILOT_PR_FLIGHT_STATE_REPO=owner/repo`, or install a PR Flight extension that
@@ -87,7 +86,7 @@ copilot plugin marketplace update trask-plugins
 copilot plugin update pr-reviewer
 copilot plugin update copilot-review-loop
 copilot plugin update self-review-loop
-copilot plugin update pr-description-loop
+copilot plugin update pr-description
 ```
 
 ## Requirements

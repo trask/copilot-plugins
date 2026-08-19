@@ -27,10 +27,10 @@
       "source": "./plugins/self-review-loop"
     },
     {
-      "name": "pr-description-loop",
-      "description": "Review and update a pull request title and description with explicit user approval and head verification.",
-      "version": "1.0.21",
-      "source": "./plugins/pr-description-loop"
+      "name": "pr-description",
+      "description": "Review and automatically update a pull request title and description with head verification.",
+      "version": "1.0.22",
+      "source": "./plugins/pr-description"
     }
   ]
 }
