@@ -12,11 +12,12 @@ class MarketplaceTest(unittest.TestCase):
         marketplace = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
 
         self.assertEqual("trask-plugins", marketplace["name"])
-        self.assertEqual(4, len(marketplace["plugins"]))
+        self.assertEqual(5, len(marketplace["plugins"]))
         self.assertEqual(
             {
                 "copilot-review-loop",
                 "pr-description",
+                "pr-pipeline",
                 "pr-reviewer",
                 "self-review-loop",
             },
