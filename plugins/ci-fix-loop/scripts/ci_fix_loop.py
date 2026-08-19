@@ -1103,6 +1103,15 @@ def baseline_conclusions(pr: dict[str, Any], base_sha: str) -> dict[str, str]:
 
     This is the evidence that stops the loop from editing the pull request to
     paper over a breakage the base branch already has.
+
+    The result answers how a named check behaved on the base commit, and it
+    answers nothing about which checks the head ought to run. The base commit
+    and the pull request head are reached by different triggers, so a `push`
+    workflow leaves a name here that never runs on the head, and a
+    `pull_request` workflow runs on the head with no counterpart here. Neither
+    name set contains the other. Read only the names present on both sides, and
+    treat a name missing from this result as an absence of evidence rather than
+    as a check that has yet to register.
     """
     owner = pr["upstream_owner"]
     repo = pr["upstream_repo"]
