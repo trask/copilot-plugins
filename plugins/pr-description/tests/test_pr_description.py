@@ -526,7 +526,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.22")
+        self.assertEqual(plugin["version"], "1.0.23")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -1916,6 +1916,143 @@ class StatusAndCleanupTest(unittest.TestCase):
 
         self.assertFalse(path.exists())
         self.assertEqual(self.emitted[-1]["result"], "cleaned_up")
+
+
+class StageOutcomeTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temporary.name).resolve()
+        self.addCleanup(self.temporary.cleanup)
+        self.emitted = []
+        patcher = mock.patch.object(MODULE, "emit", self.emitted.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_status(self, **overrides):
+        path = write_state(self.directory, **overrides)
+        MODULE.command_status(
+            SimpleNamespace(state=str(path), current=False, repo_root=None)
+        )
+        return self.emitted[-1], MODULE.load_state(path)
+
+    def index_status(self, **overrides):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "kind": MODULE.INDEX_KIND,
+            "created_at": "2026-01-01T00:00:00Z",
+            "pr": pr_metadata(),
+            "runs": [{"run_id": "run-1", "state": str(self.directory / "run.json")}],
+            "latest_run_id": "run-1",
+            "latest_state": str(self.directory / "run.json"),
+        }
+        state.update(overrides)
+        path = self.directory / "index.json"
+        MODULE.save_state(path, state)
+        MODULE.command_status(
+            SimpleNamespace(state=str(path), current=False, repo_root=None)
+        )
+        return self.emitted[-1], MODULE.load_state(path)
+
+    def marker_of(self, state):
+        """Read the validated-at-head marker the way an orchestrator reads it.
+
+        This deliberately repeats the rule rather than calling the helper, so a
+        change that lets `stage_outcome` claim `cleared` on its own still fails.
+        """
+
+        value = state.get("validated_head_sha")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+
+    def test_an_applied_description_cleared(self):
+        envelope, _ = self.run_status(
+            validated_head_sha="head1",
+            validation={"mode": "applied", "head_sha": "head1"},
+        )
+
+        self.assertEqual(envelope["result"], "ready")
+        self.assertEqual(envelope["stage_outcome"], "cleared")
+
+    def test_a_description_confirmed_unchanged_cleared(self):
+        envelope, _ = self.run_status(
+            validated_head_sha="head1",
+            validation={"mode": "no_change", "head_sha": "head1"},
+        )
+
+        self.assertEqual(envelope["stage_outcome"], "cleared")
+
+    def test_a_run_that_settled_nothing_reports_no_progress(self):
+        pinned, _ = self.run_status()
+        proposed, _ = self.run_status(
+            proposal_count=1,
+            proposal={"number": 1, "run_id": "run-1", "title": "New title"},
+        )
+
+        self.assertEqual(pinned["stage_outcome"], "no_progress")
+        self.assertEqual(proposed["stage_outcome"], "no_progress")
+
+    def test_the_index_reports_the_same_ending(self):
+        cleared, _ = self.index_status(validated_head_sha="head1")
+        pending, _ = self.index_status()
+
+        self.assertEqual(cleared["result"], "ready")
+        self.assertEqual(cleared["stage_outcome"], "cleared")
+        self.assertEqual(pending["stage_outcome"], "no_progress")
+
+    def test_a_state_that_holds_no_run_reports_no_outcome(self):
+        target = MODULE.parse_target("owner/repo#7")
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=self.directory
+            ),
+            mock.patch.object(MODULE, "current_pr_target", return_value=target),
+            mock.patch.object(
+                MODULE,
+                "default_state_path",
+                return_value=self.directory / "missing.json",
+            ),
+        ):
+            MODULE.command_status(
+                SimpleNamespace(state=None, current=True, repo_root=None)
+            )
+
+        result = self.emitted[-1]
+        self.assertEqual(result["result"], "no_state")
+        self.assertNotIn("stage_outcome", result)
+
+    def test_cleared_never_outruns_the_recorded_validated_head(self):
+        runs = [
+            {},
+            {"validated_head_sha": None},
+            {"validated_head_sha": "   "},
+            {"proposal": {"number": 1, "run_id": "run-1"}, "proposal_count": 1},
+            {
+                "validation": {"mode": "applied", "head_sha": "head1"},
+                "proposal_count": 1,
+            },
+            {"validated_head_sha": "head1"},
+            {
+                "validated_head_sha": "head1",
+                "validation": {"mode": "no_change", "head_sha": "head1"},
+            },
+        ]
+
+        for overrides in runs:
+            with self.subTest(kind="run", overrides=overrides):
+                envelope, state = self.run_status(**overrides)
+                cleared = self.marker_of(state) is not None
+                self.assertEqual(envelope["stage_outcome"] == "cleared", cleared)
+                self.assertIn(
+                    envelope["stage_outcome"],
+                    {"cleared", "skipped", "no_progress", "escalated"},
+                )
+            with self.subTest(kind="index", overrides=overrides):
+                envelope, state = self.index_status(**overrides)
+                cleared = self.marker_of(state) is not None
+                self.assertEqual(envelope["stage_outcome"] == "cleared", cleared)
 
 
 class ParserShapeTest(unittest.TestCase):

@@ -1354,6 +1354,39 @@ def command_validate(args: argparse.Namespace) -> None:
     )
 
 
+def recorded_validated_head_sha(state: dict[str, Any]) -> str | None:
+    """Return the validated-at-head SHA this state records, or None when it records none.
+
+    `apply` and `validate` are the only commands that write it, and `propose`
+    removes it, so this is the single durable fact that says the description was
+    settled at a known head.
+    """
+
+    value = state.get("validated_head_sha")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def stage_outcome(state: dict[str, Any]) -> str:
+    """Name this run's ending in the vocabulary an orchestrator records.
+
+    This says how the run ended. It never says whether the description is
+    settled: that stays with the recorded validated-at-head SHA, which is where a
+    reader looks for it. So `cleared` is read straight off that record and is
+    never computed a second way. Both endings that set it count, because a
+    description this run replaced and one it confirmed unchanged are equally
+    settled.
+
+    A run that ended without that record settled nothing, whether it stopped
+    before proposing or after, so it is `no_progress`.
+    """
+
+    if recorded_validated_head_sha(state) is not None:
+        return "cleared"
+    return "no_progress"
+
+
 def command_status(args: argparse.Namespace) -> None:
     if args.current:
         require_tools()
@@ -1387,6 +1420,7 @@ def command_status(args: argparse.Namespace) -> None:
                 "runs": state.get("runs") or [],
                 "validated_head_sha": state.get("validated_head_sha"),
                 "validation": state.get("validation"),
+                "stage_outcome": stage_outcome(state),
             }
         )
         return
@@ -1403,6 +1437,7 @@ def command_status(args: argparse.Namespace) -> None:
             "proposal_count": proposal_count(state),
             "validated_head_sha": state.get("validated_head_sha"),
             "validation": state.get("validation"),
+            "stage_outcome": stage_outcome(state),
         }
     )
 

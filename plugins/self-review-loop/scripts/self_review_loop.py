@@ -1104,6 +1104,7 @@ def command_preflight(args: argparse.Namespace) -> None:
     state.update(
         {
             "repo_root": str(repo_root),
+            "max_iterations": max_iterations,
             "pr": metadata,
             "review": {
                 "id": f"pr-{metadata['number']}-iteration-{iteration}",
@@ -1508,6 +1509,65 @@ def command_publish(args: argparse.Namespace) -> None:
     )
 
 
+def recorded_clean_at_head_sha(state: dict[str, Any]) -> str | None:
+    """Return the clean-at-head SHA this state records, or None when it records none.
+
+    `resolve` is the only command that writes this pair, and `preflight` replaces
+    the whole review when the next iteration starts, so the pair is the single
+    durable fact that says a review came out clean at a known head.
+    """
+
+    review = state.get("review")
+    if not isinstance(review, dict) or review.get("outcome") != "clean":
+        return None
+    value = review.get("clean_at_head_sha")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def max_iterations_for(state: dict[str, Any]) -> int:
+    value = state.get("max_iterations")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return DEFAULT_MAX_ITERATIONS
+    return value
+
+
+def blocked_candidate_ids(state: dict[str, Any]) -> list[int]:
+    review = state.get("review")
+    if not isinstance(review, dict):
+        return []
+    return [
+        candidate.get("id")
+        for candidate in review.get("candidates") or []
+        if candidate.get("status") == "skipped"
+    ]
+
+
+def stage_outcome(state: dict[str, Any]) -> str:
+    """Name this run's ending in the vocabulary an orchestrator records.
+
+    This says how the run ended. It never says whether the review is clean: that
+    stays with the recorded clean-at-head SHA, which is where a reader looks for
+    it. So `cleared` is read straight off that record and is never computed a
+    second way.
+
+    A batch that validation blocked leaves uncommitted work and stops the loop,
+    and a loop at its iteration cap cannot run again, so both need a person and
+    both are `escalated`. Every other ending is `no_progress`: the run reached no
+    clean review, and its commits, if it made any, are the head's problem now
+    rather than an ending of their own.
+    """
+
+    if recorded_clean_at_head_sha(state) is not None:
+        return "cleared"
+    if blocked_candidate_ids(state):
+        return "escalated"
+    if int(state.get("iterations", 0)) >= max_iterations_for(state):
+        return "escalated"
+    return "no_progress"
+
+
 def command_status(args: argparse.Namespace) -> None:
     if args.current:
         require_tools()
@@ -1537,6 +1597,7 @@ def command_status(args: argparse.Namespace) -> None:
         "pr": pr,
         "review": review,
         "history": history,
+        "stage_outcome": stage_outcome(state),
         "iterations": int(state.get("iterations", 0)),
     }
     status_path = status_path_for(path)
@@ -1575,6 +1636,7 @@ def command_status(args: argparse.Namespace) -> None:
                 "history": len(history),
                 "pr_commits": len(((review or {}).get("pr_commits")) or []),
             },
+            "stage_outcome": stage_outcome(state),
             "iterations": int(state.get("iterations", 0)),
         }
     )

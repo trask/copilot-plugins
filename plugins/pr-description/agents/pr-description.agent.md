@@ -84,7 +84,8 @@ The helper provides:
 - `propose --state <path> --expected-run-id <run_id> --title <literal-title> --body-file <path>`: store a proposal bound to this run's exact pinned head, title, and body; change the body file's CRLF or CR line endings to LF; increment its durable proposal counter; and return `proposal_token`, the `body_newline` convention it will send, and whether it normalized the body file
 - `apply --state <path> --expected-head <head_sha> --expected-run-id <run_id> --expected-proposal-token <proposal_token>`: require the run and proposal capabilities, compare the exact live snapshot twice immediately before the REST update, include `live_head`, `live_title`, and `live_body` in a head-mismatch error, apply the stored proposal, read it back, and record validation only after the live head, title, and body match exactly
 - `validate --state <path> --expected-head <head_sha> --expected-run-id <run_id> --no-change`: verify the unchanged live title and body at the pinned head and record validation without changing anything
-- `status [--state <path> | --current --repo-root <workspace>]` and `cleanup --state <path>`
+- `status [--state <path> | --current --repo-root <workspace>]`: report the state, including `validated_head_sha` and a `stage_outcome` field that says how the run ended for anything that reads the outcome mechanically. `stage_outcome` is `cleared` when the state records a validated head and `no_progress` when it does not, and a state that holds no run reports none at all.
+- `cleanup --state <path>`
 
 Stop on the exact helper error. Never work around a head mismatch or a stale title or body check.
 

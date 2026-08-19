@@ -2390,5 +2390,187 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(self.emitted[-1]["result"], "cleaned_up")
 
 
+class StageOutcomeTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temporary.name).resolve()
+        self.addCleanup(self.temporary.cleanup)
+        self.emitted = []
+        patcher = mock.patch.object(MODULE, "emit", self.emitted.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def review(self, **overrides):
+        review = {
+            "id": "pr-7-iteration-1",
+            "status": "active",
+            "iteration": 1,
+            "head_sha": "head1",
+            "diff_path": str(self.directory / "state.json.diff"),
+            "anchors": {"app.py": {"LEFT": [2], "RIGHT": [2, 3]}},
+            "candidates": [],
+            "batches": [],
+        }
+        review.update(overrides)
+        return review
+
+    def status(self, **overrides):
+        path = write_state(self.directory, **overrides)
+        MODULE.command_status(
+            SimpleNamespace(state=str(path), current=False, repo_root=None)
+        )
+        envelope = self.emitted[-1]
+        result = json.loads(
+            MODULE.status_path_for(path).read_text(encoding="utf-8")
+        )
+        return envelope, result
+
+    def clean_review(self):
+        return self.review(outcome="clean", clean_at_head_sha="head1")
+
+    def marker_of(self, state):
+        """Read the clean-at-head marker the way an orchestrator reads it.
+
+        This deliberately repeats the rule rather than calling the helper, so a
+        change that lets `stage_outcome` claim `cleared` on its own still fails.
+        """
+
+        review = state.get("review")
+        if not isinstance(review, dict) or review.get("outcome") != "clean":
+            return None
+        value = review.get("clean_at_head_sha")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+
+    def test_a_resolved_clean_review_cleared(self):
+        envelope, result = self.status(review=self.clean_review())
+
+        self.assertEqual(envelope["result"], "ready")
+        self.assertEqual(envelope["stage_outcome"], "cleared")
+        self.assertEqual(result["result"], "ready")
+        self.assertEqual(result["stage_outcome"], "cleared")
+
+    def test_a_batch_validation_blocked_escalates(self):
+        review = self.review(
+            candidates=[{"id": 1, "status": "skipped", "path": "app.py"}],
+            batches=[{"id": "batch-1", "status": "skipped"}],
+        )
+
+        envelope, _ = self.status(review=review)
+
+        self.assertEqual(envelope["stage_outcome"], "escalated")
+
+    def test_the_iteration_cap_escalates(self):
+        envelope, _ = self.status(iterations=MODULE.DEFAULT_MAX_ITERATIONS)
+
+        self.assertEqual(envelope["stage_outcome"], "escalated")
+
+    def test_the_recorded_cap_beats_the_default(self):
+        below, _ = self.status(iterations=5, max_iterations=8)
+        at, _ = self.status(iterations=8, max_iterations=8)
+
+        self.assertEqual(below["stage_outcome"], "no_progress")
+        self.assertEqual(at["stage_outcome"], "escalated")
+
+    def test_preflight_records_the_cap_it_enforced(self):
+        state_path = write_state(self.directory)
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.directory),
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                side_effect=[
+                    {**MODULE.load_state(state_path)["pr"], "commits": []},
+                    {**MODULE.load_state(state_path)["pr"], "commits": []},
+                ],
+            ),
+            mock.patch.object(MODULE, "git", return_value=""),
+            mock.patch.object(MODULE, "checkout_pr", return_value=False),
+            mock.patch.object(MODULE, "require_checkout_head"),
+            mock.patch.object(MODULE, "fetch_authoritative_diff", return_value=DIFF),
+            mock.patch.object(MODULE, "commit_provenance", return_value=[]),
+            mock.patch.object(MODULE, "run"),
+        ):
+            MODULE.command_preflight(
+                SimpleNamespace(
+                    target="owner/repo#7",
+                    repo_root=str(self.directory),
+                    state=str(state_path),
+                    max_iterations=3,
+                )
+            )
+
+        self.assertEqual(MODULE.load_state(state_path)["max_iterations"], 3)
+
+    def test_an_unfinished_review_reports_no_progress(self):
+        pending, _ = self.status(
+            review=self.review(
+                candidates=[{"id": 1, "status": "pending", "path": "app.py"}]
+            )
+        )
+        published, _ = self.status(
+            review=self.review(status="published", published_head_sha="head2"),
+            iterations=1,
+        )
+
+        self.assertEqual(pending["stage_outcome"], "no_progress")
+        self.assertEqual(published["stage_outcome"], "no_progress")
+
+    def test_a_state_that_holds_no_run_reports_no_outcome(self):
+        target = MODULE.parse_target("owner/repo#7")
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.directory),
+            mock.patch.object(MODULE, "current_pr_target", return_value=target),
+            mock.patch.object(
+                MODULE,
+                "default_state_path",
+                return_value=self.directory / "missing.json",
+            ),
+        ):
+            MODULE.command_status(
+                SimpleNamespace(state=None, current=True, repo_root=None)
+            )
+
+        result = self.emitted[-1]
+        self.assertEqual(result["result"], "no_state")
+        self.assertNotIn("stage_outcome", result)
+
+    def test_cleared_never_outruns_the_recorded_clean_head(self):
+        states = [
+            {"review": self.review()},
+            {"review": self.review(outcome="clean")},
+            {"review": self.review(outcome="clean", clean_at_head_sha=None)},
+            {"review": self.review(outcome="clean", clean_at_head_sha="   ")},
+            {"review": self.review(clean_at_head_sha="head1")},
+            {"review": self.review(status="published", clean_at_head_sha="head1")},
+            {"review": self.review(outcome="dirty", clean_at_head_sha="head1")},
+            {"review": None},
+            {
+                "review": self.review(
+                    candidates=[{"id": 1, "status": "skipped", "path": "app.py"}]
+                )
+            },
+            {"iterations": MODULE.DEFAULT_MAX_ITERATIONS},
+            {"review": self.clean_review()},
+            {"review": self.clean_review(), "iterations": 4},
+        ]
+
+        for overrides in states:
+            with self.subTest(overrides=overrides):
+                envelope, result = self.status(**overrides)
+                state = MODULE.load_state(self.directory / "state.json")
+                cleared = self.marker_of(state) is not None
+                self.assertEqual(envelope["stage_outcome"] == "cleared", cleared)
+                self.assertEqual(result["stage_outcome"] == "cleared", cleared)
+                self.assertIn(
+                    envelope["stage_outcome"],
+                    {"cleared", "skipped", "no_progress", "escalated"},
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
