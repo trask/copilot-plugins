@@ -799,6 +799,174 @@ class StageMarkerTest(unittest.TestCase):
         self.assertEqual("pr-pipeline", path.parent.name)
 
 
+class StageOutcomeTest(unittest.TestCase):
+    def payload(self, **values) -> dict:
+        return {"result": "ready", **values}
+
+    def test_a_reported_outcome_is_read(self):
+        for outcome in MODULE.STAGE_OUTCOMES:
+            with self.subTest(outcome=outcome):
+                self.assertEqual(
+                    outcome,
+                    MODULE.extract_stage_outcome(self.payload(stage_outcome=outcome)),
+                )
+
+    def test_a_status_that_is_not_ready_reports_nothing(self):
+        self.assertIsNone(
+            MODULE.extract_stage_outcome(
+                {"result": "no_state", "stage_outcome": "no_progress"}
+            )
+        )
+
+    def test_a_word_outside_the_vocabulary_reports_nothing(self):
+        self.assertIsNone(
+            MODULE.extract_stage_outcome(self.payload(stage_outcome="green"))
+        )
+
+    def test_a_stage_that_does_not_report_one_reports_nothing(self):
+        self.assertIsNone(MODULE.extract_stage_outcome(self.payload()))
+        self.assertIsNone(MODULE.extract_stage_outcome(None))
+        self.assertIsNone(MODULE.extract_stage_outcome("ready"))
+
+    def test_a_github_backed_stage_still_gets_its_outcome_read(self):
+        status = {
+            "installed": True,
+            "script": "s.py",
+            "state": "x.json",
+            "ok": True,
+            "payload": {"result": "ready", "stage_outcome": "skipped"},
+        }
+        with mock.patch.object(MODULE, "run_stage_status", return_value=status):
+            reading = MODULE.read_stage_outcome(
+                MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
+                MODULE.build_target("owner", "repo", 7),
+            )
+        self.assertTrue(reading["available"])
+        self.assertEqual("skipped", reading["outcome"])
+        self.assertEqual("stage_status", reading["source"])
+
+    def test_a_stage_that_reports_nothing_is_not_available(self):
+        status = {
+            "installed": True,
+            "script": "s.py",
+            "state": "x.json",
+            "ok": True,
+            "payload": {"result": "ready"},
+        }
+        with mock.patch.object(MODULE, "run_stage_status", return_value=status):
+            reading = MODULE.read_stage_outcome(
+                MODULE.STAGE_BY_NAME[MODULE.STAGE_DESCRIPTION],
+                MODULE.build_target("owner", "repo", 7),
+            )
+        self.assertFalse(reading["available"])
+        self.assertEqual("not_reported", reading["reason"])
+
+    def test_a_helper_that_cannot_run_is_not_available(self):
+        status = {
+            "installed": False,
+            "script": "s.py",
+            "state": "x.json",
+            "ok": False,
+            "reason": "helper_missing",
+        }
+        with mock.patch.object(MODULE, "run_stage_status", return_value=status):
+            reading = MODULE.read_stage_outcome(
+                MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT],
+                MODULE.build_target("owner", "repo", 7),
+            )
+        self.assertFalse(reading["available"])
+        self.assertEqual("helper_missing", reading["reason"])
+
+    def test_a_github_backed_stage_actually_runs_its_helper_status(self):
+        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CI]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = (
+                root
+                / "installed-plugins"
+                / "trask-plugins"
+                / entry["plugin"]
+                / "scripts"
+                / f"{entry['module']}.py"
+            )
+            script.parent.mkdir(parents=True)
+            script.write_text("", encoding="utf-8")
+            state = root / "state.json"
+            state.write_text("{}", encoding="utf-8")
+            payload = SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"result": "ready", "stage_outcome": "cleared"}),
+                stderr="",
+            )
+            with mock.patch.object(MODULE, "copilot_home", return_value=root):
+                with mock.patch.object(MODULE, "stage_state_path", return_value=state):
+                    with mock.patch.object(
+                        MODULE, "run", return_value=payload
+                    ) as runner:
+                        reading = MODULE.read_stage_outcome(
+                            entry, MODULE.build_target("owner", "repo", 7)
+                        )
+        self.assertTrue(reading["available"])
+        self.assertEqual("cleared", reading["outcome"])
+        command = runner.call_args.args[0]
+        self.assertIn("status", command)
+        self.assertIn(str(state), command)
+
+    def test_an_outcome_never_makes_a_github_backed_stage_green(self):
+        state = build_state()
+        observed = observation(mergeable="CONFLICTING")
+        observed["stage_markers"][MODULE.STAGE_CONFLICT]["stage_outcome"] = "cleared"
+        decision = MODULE.decide_next(state, observed)
+        self.assertEqual("run_stage", decision["result"])
+        self.assertEqual(MODULE.STAGE_CONFLICT, decision["stage"])
+        self.assertFalse(decision["stage_states"][MODULE.STAGE_CONFLICT]["green"])
+
+    def test_a_reported_outcome_does_not_reach_the_greenness_decision(self):
+        self.assertNotIn("stage_outcome", MODULE.stage_green.__doc__ or "")
+        source = SCRIPT.read_text(encoding="utf-8")
+        body = source.split("def stage_green(")[1].split("\ndef ")[0]
+        self.assertNotIn("stage_outcome", body)
+
+
+class ResolveFinishOutcomeTest(unittest.TestCase):
+    def resolve(self, requested: str, reading: dict) -> dict:
+        with mock.patch.object(MODULE, "read_stage_outcome", return_value=reading):
+            return MODULE.resolve_finish_outcome(
+                MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
+                MODULE.build_target("owner", "repo", 7),
+                requested,
+            )
+
+    def test_the_stage_answer_beats_the_reported_one(self):
+        resolution = self.resolve(
+            "cleared", {"available": True, "outcome": "no_progress"}
+        )
+        self.assertEqual("no_progress", resolution["outcome"])
+        self.assertEqual("cleared", resolution["requested_outcome"])
+        self.assertEqual("stage_status", resolution["outcome_source"])
+
+    def test_an_escalation_the_stage_reports_beats_a_clearance(self):
+        resolution = self.resolve(
+            "cleared", {"available": True, "outcome": "escalated"}
+        )
+        self.assertEqual("escalated", resolution["outcome"])
+
+    def test_a_stage_that_says_nothing_keeps_the_reported_outcome(self):
+        resolution = self.resolve(
+            "skipped", {"available": False, "reason": "not_reported"}
+        )
+        self.assertEqual("skipped", resolution["outcome"])
+        self.assertEqual("reported", resolution["outcome_source"])
+        self.assertEqual("not_reported", resolution["outcome_reason"])
+
+    def test_a_helper_that_cannot_run_keeps_the_reported_outcome(self):
+        resolution = self.resolve(
+            "escalated", {"available": False, "reason": "status_failed"}
+        )
+        self.assertEqual("escalated", resolution["outcome"])
+        self.assertEqual("reported", resolution["outcome_source"])
+
+
 class ModelGateTest(unittest.TestCase):
     def test_pinned_claude_models_satisfy_every_stage(self):
         models = {stage: "claude-sonnet-4.6" for stage in MODULE.STAGE_NAMES}
@@ -956,9 +1124,24 @@ class CommandTestCase(unittest.TestCase):
         patcher = mock.patch.object(MODULE, "emit", self.emitted.append)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # No test may shell out to a real stage helper. A test that cares about
+        # the stage's own answer patches this with stage_says.
+        self.stage_reading = {
+            "available": False,
+            "outcome": None,
+            "reason": "not_reported",
+        }
+        reader = mock.patch.object(
+            MODULE, "read_stage_outcome", side_effect=lambda *_: self.stage_reading
+        )
+        reader.start()
+        self.addCleanup(reader.stop)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
+
+    def stage_says(self, outcome: str) -> None:
+        self.stage_reading = {"available": True, "outcome": outcome}
 
     def args(self, **values) -> SimpleNamespace:
         return SimpleNamespace(**values)
@@ -1198,10 +1381,79 @@ class FinishCommandTest(CommandTestCase):
             self.finish(path, MODULE.STAGE_CI, "cleared")
         self.assertIn("not recorded as running", str(error.exception))
 
+    def test_a_stage_that_reports_its_own_outcome_overrides_the_prose(self):
+        path = self.running_state(MODULE.STAGE_CI)
+        self.stage_says("no_progress")
+        self.finish(path, MODULE.STAGE_CI, "cleared", NEXT_HEAD)
+        state = MODULE.load_state(path)
+        self.assertNotIn(MODULE.STAGE_CI, state["cleared"])
+        self.assertEqual(1, state["no_progress"][MODULE.STAGE_CI]["count"])
+        entry = state["history"][0]
+        self.assertEqual("no_progress", entry["outcome"])
+        self.assertEqual("cleared", entry["requested_outcome"])
+        self.assertEqual("stage_status", entry["outcome_source"])
+        self.assertEqual("no_progress", self.emitted[-1]["outcome"])
+
+    def test_a_stage_that_reports_an_escalation_stops_the_pipeline(self):
+        path = self.running_state(MODULE.STAGE_CI)
+        self.stage_says("escalated")
+        self.finish(path, MODULE.STAGE_CI, "cleared", NEXT_HEAD)
+        state = MODULE.load_state(path)
+        self.assertEqual("stage_escalated", state["escalation"]["reason"])
+        self.assertTrue(self.emitted[-1]["keep_session"])
+
+    def test_a_stage_that_reports_nothing_keeps_the_reported_outcome(self):
+        path = self.running_state(MODULE.STAGE_SELF_REVIEW)
+        self.finish(path, MODULE.STAGE_SELF_REVIEW, "cleared", NEXT_HEAD)
+        state = MODULE.load_state(path)
+        self.assertEqual(NEXT_HEAD, state["cleared"][MODULE.STAGE_SELF_REVIEW])
+        entry = state["history"][0]
+        self.assertEqual("cleared", entry["outcome"])
+        self.assertEqual("reported", entry["outcome_source"])
+
+    def test_the_stage_is_asked_about_its_own_run(self):
+        path = self.running_state(MODULE.STAGE_CI)
+        with mock.patch.object(
+            MODULE, "read_stage_outcome", return_value={"available": False}
+        ) as reader:
+            self.finish(path, MODULE.STAGE_CI, "cleared", NEXT_HEAD)
+        entry = reader.call_args.args[0]
+        self.assertEqual(MODULE.STAGE_CI, entry["stage"])
+
     def test_finishing_the_wrong_stage_is_refused(self):
         path = self.running_state(MODULE.STAGE_CI)
         with self.assertRaises(MODULE.WorkflowError):
             self.finish(path, MODULE.STAGE_SELF_REVIEW, "cleared")
+
+
+class OutcomeCommandTest(CommandTestCase):
+    def call_outcome(self, stage: str, reading: dict):
+        path = write_state(self.root)
+        with mock.patch.object(MODULE, "read_stage_outcome", return_value=reading):
+            MODULE.command_outcome(self.args(state=str(path), stage=stage))
+        return self.emitted[-1]
+
+    def test_a_reported_outcome_is_authoritative(self):
+        payload = self.call_outcome(
+            MODULE.STAGE_CI, {"available": True, "outcome": "escalated"}
+        )
+        self.assertEqual("ready", payload["result"])
+        self.assertEqual("escalated", payload["outcome"])
+        self.assertTrue(payload["authoritative"])
+
+    def test_a_stage_that_says_nothing_sends_the_caller_to_the_report(self):
+        payload = self.call_outcome(
+            MODULE.STAGE_SELF_REVIEW, {"available": False, "reason": "not_reported"}
+        )
+        self.assertEqual("not_reported", payload["result"])
+        self.assertFalse(payload["authoritative"])
+        self.assertIsNone(payload["outcome"])
+        self.assertIn("report", payload["next_action"].lower())
+
+    def test_an_unknown_stage_is_refused(self):
+        path = write_state(self.root)
+        with self.assertRaises(MODULE.WorkflowError):
+            MODULE.command_outcome(self.args(state=str(path), stage="nope"))
 
 
 class NextCommandTest(CommandTestCase):
@@ -1630,6 +1882,7 @@ class ParserTest(unittest.TestCase):
                 "cleared",
             ],
             ["escalate", "--state", "s.json", "--reason", "flake", "--detail", "d"],
+            ["outcome", "--state", "s.json", "--stage", MODULE.STAGE_CI],
             ["models"],
             ["plan", "--state", "s.json", "--stage", MODULE.STAGE_CI],
             ["status", "--state", "s.json"],
@@ -1727,8 +1980,27 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "Never let it choose the outcome when `next` and the live state say "
-            "otherwise",
+            "Never let it choose the outcome when `outcome`, `next`, and the live "
+            "state say otherwise",
+            self.instructions,
+        )
+
+    def test_it_asks_the_stage_before_it_reads_the_report(self):
+        self.assertIn(
+            "Run `outcome --stage <plan stage>` first", self.instructions
+        )
+        self.assertIn(
+            "When its `result` is `not_reported`, the stage does not answer for "
+            "itself yet, so fall back to reading",
+            self.instructions,
+        )
+        first = self.instructions.index("Run `outcome --stage <plan stage>` first")
+        fallback = self.instructions.index("Run `next` again.")
+        self.assertLess(first, fallback)
+
+    def test_it_keeps_an_outcome_out_of_the_greenness_decision(self):
+        self.assertIn(
+            "A stage saying how its own run ended is not evidence of greenness.",
             self.instructions,
         )
 

@@ -684,6 +684,48 @@ def summarize_checks(rollup: Any) -> dict[str, Any]:
     }
 
 
+def run_stage_status(
+    entry: dict[str, Any], target: dict[str, Any]
+) -> dict[str, Any]:
+    """Run one stage helper's ``status`` and return its envelope.
+
+    Every stage has a helper, whatever kind of evidence makes the stage green.
+    Locating and running that helper is therefore separate from reading
+    greenness: the conflict and check stages answer to GitHub for greenness and
+    still have a helper that can say how their own run ended.
+    """
+
+    script = stage_script_path(entry)
+    state_path = stage_state_path(entry["plugin"], target)
+    result: dict[str, Any] = {
+        "installed": script.is_file(),
+        "script": str(script),
+        "state": str(state_path),
+        "payload": None,
+    }
+    if not result["installed"]:
+        return {**result, "ok": False, "reason": "helper_missing"}
+    if not state_path.is_file():
+        return {**result, "ok": False, "reason": "no_state"}
+    process = run(
+        [sys.executable, str(script), "status", "--state", str(state_path)],
+        check=False,
+    )
+    if process.returncode != 0:
+        detail = process.stderr.strip() or process.stdout.strip() or "no output"
+        return {**result, "ok": False, "reason": "status_failed", "detail": detail}
+    try:
+        payload = json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        return {
+            **result,
+            "ok": False,
+            "reason": "invalid_status_json",
+            "detail": str(error),
+        }
+    return {**result, "ok": True, "payload": payload}
+
+
 def read_stage_marker(entry: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
     """Read one stage's clean-at-head record from its own helper.
 
@@ -709,57 +751,33 @@ def read_stage_marker(entry: dict[str, Any], target: dict[str, Any]) -> dict[str
             "clean_at_head_sha": None,
         }
 
-    state_path = stage_state_path(entry["plugin"], target)
-    if not installed:
-        return {
-            "source": "helper",
-            "available": False,
-            "installed": False,
-            "reason": "helper_missing",
-            "script": str(script),
-            "clean_at_head_sha": None,
-        }
-    if not state_path.is_file():
+    status = run_stage_status(entry, target)
+    if not status.get("ok") and status.get("reason") == "no_state":
         return {
             "source": "helper",
             "available": True,
             "installed": True,
             "reason": "no_state",
-            "state": str(state_path),
+            "state": status["state"],
             "clean_at_head_sha": None,
         }
-    process = run(
-        [sys.executable, str(script), "status", "--state", str(state_path)],
-        check=False,
-    )
-    if process.returncode != 0:
-        detail = process.stderr.strip() or process.stdout.strip() or "no output"
+    if not status.get("ok"):
         return {
             "source": "helper",
             "available": False,
-            "installed": True,
-            "reason": "status_failed",
-            "state": str(state_path),
-            "detail": detail,
+            "installed": status["installed"],
+            "reason": status["reason"],
+            "script": status["script"],
+            "state": status["state"],
+            "detail": status.get("detail"),
             "clean_at_head_sha": None,
         }
-    try:
-        payload = json.loads(process.stdout)
-    except json.JSONDecodeError as error:
-        return {
-            "source": "helper",
-            "available": False,
-            "installed": True,
-            "reason": "invalid_status_json",
-            "state": str(state_path),
-            "detail": str(error),
-            "clean_at_head_sha": None,
-        }
+    payload = status["payload"]
     return {
         "source": "helper",
         "available": True,
         "installed": True,
-        "state": str(state_path),
+        "state": status["state"],
         "clean_at_head_sha": extract_clean_at_head_sha(entry["stage"], payload),
         "status_result": payload.get("result") if isinstance(payload, dict) else None,
     }
@@ -796,6 +814,69 @@ def extract_clean_at_head_sha(stage: str, payload: Any) -> str | None:
     if stage == STAGE_DESCRIPTION:
         return sha_or_none(payload.get("validated_head_sha"))
     return None
+
+
+def extract_stage_outcome(payload: Any) -> str | None:
+    """Pull a stage's own name for how its run ended out of its status envelope.
+
+    A stage that reports ``stage_outcome`` speaks the pipeline's vocabulary
+    directly, which removes the last place a model's reading of prose decided
+    anything. The field counts only on a ready status: an envelope that says a
+    stage has no state cannot describe a run, and a stage that cleaned up after
+    clearing must not be read as having done nothing.
+
+    This says how a run ended. It never says whether a stage is green. Greenness
+    stays where it was: live GitHub for the conflict and check stages, the
+    clean-at-head marker for the other three.
+    """
+
+    if not isinstance(payload, dict) or payload.get("result") != "ready":
+        return None
+    outcome = payload.get("stage_outcome")
+    if isinstance(outcome, str) and outcome.strip() in STAGE_OUTCOMES:
+        return outcome.strip()
+    return None
+
+
+def read_stage_outcome(
+    entry: dict[str, Any], target: dict[str, Any]
+) -> dict[str, Any]:
+    """Ask one stage's helper how its run ended.
+
+    Only some stages report this. A stage that does not is not a failure: the
+    caller falls back to reading the stage's report, which is what the pipeline
+    did for every stage before any of them could answer mechanically.
+    """
+
+    status = run_stage_status(entry, target)
+    common = {
+        "stage": entry["stage"],
+        "installed": status["installed"],
+        "script": status["script"],
+        "state": status["state"],
+    }
+    if not status.get("ok"):
+        return {
+            **common,
+            "available": False,
+            "outcome": None,
+            "reason": status["reason"],
+            "detail": status.get("detail"),
+        }
+    outcome = extract_stage_outcome(status["payload"])
+    if outcome is None:
+        return {
+            **common,
+            "available": False,
+            "outcome": None,
+            "reason": "not_reported",
+            "status_result": (
+                status["payload"].get("result")
+                if isinstance(status["payload"], dict)
+                else None
+            ),
+        }
+    return {**common, "available": True, "outcome": outcome, "source": "stage_status"}
 
 
 def sha_or_none(value: Any) -> str | None:
@@ -1395,6 +1476,70 @@ def command_start(args: argparse.Namespace) -> None:
     )
 
 
+def resolve_finish_outcome(
+    entry: dict[str, Any], target: dict[str, Any], requested: str
+) -> dict[str, Any]:
+    """Settle how a stage ended, preferring the stage's own answer.
+
+    The stage that just ran is the only thing that watched itself run, so its own
+    name for the ending outranks the one the caller reported. The caller's answer
+    is kept in the history either way, which is what makes a disagreement
+    visible instead of silent.
+
+    A pipeline problem that is not the stage's fault, such as a launch that never
+    produced a run, belongs in ``escalate`` rather than here. ``finish`` says how
+    the stage ended.
+    """
+
+    reading = read_stage_outcome(entry, target)
+    if not reading.get("available"):
+        return {
+            "outcome": requested,
+            "requested_outcome": requested,
+            "outcome_source": "reported",
+            "outcome_reason": reading.get("reason"),
+        }
+    return {
+        "outcome": reading["outcome"],
+        "requested_outcome": requested,
+        "outcome_source": "stage_status",
+        "outcome_reason": None,
+    }
+
+
+def command_outcome(args: argparse.Namespace) -> None:
+    """Report how the stage that just ran ended, in the pipeline's vocabulary."""
+
+    state = load_state(cli_path(args.state))
+    if args.stage not in STAGE_BY_NAME:
+        raise WorkflowError(f"unknown stage: {args.stage}")
+    entry = STAGE_BY_NAME[args.stage]
+    target = build_target(
+        state["pr"]["owner"], state["pr"]["repo"], state["pr"]["number"]
+    )
+    reading = read_stage_outcome(entry, target)
+    payload = {
+        **reading,
+        "stage": args.stage,
+        "outcome": reading.get("outcome"),
+    }
+    if reading.get("available"):
+        emit({**payload, "result": "ready", "authoritative": True})
+        return
+    emit(
+        {
+            **payload,
+            "result": "not_reported",
+            "authoritative": False,
+            "reason": reading.get("reason", "not_reported"),
+            "next_action": (
+                "This stage does not report its own outcome, so work it out from "
+                "the stage's report and pass it to finish."
+            ),
+        }
+    )
+
+
 def command_finish(args: argparse.Namespace) -> None:
     """Record how a stage ended, and keep the durable history entry."""
 
@@ -1410,9 +1555,16 @@ def command_finish(args: argparse.Namespace) -> None:
         )
 
     head_sha = args.head or running.get("head_sha")
+    target = build_target(
+        state["pr"]["owner"], state["pr"]["repo"], state["pr"]["number"]
+    )
+    resolution = resolve_finish_outcome(STAGE_BY_NAME[stage], target, args.outcome)
+    outcome = resolution["outcome"]
     entry = {
         "stage": stage,
-        "outcome": args.outcome,
+        "outcome": outcome,
+        "requested_outcome": resolution["requested_outcome"],
+        "outcome_source": resolution["outcome_source"],
         "iteration": running.get("iteration"),
         "started_head_sha": running.get("head_sha"),
         "head_sha": head_sha,
@@ -1428,7 +1580,7 @@ def command_finish(args: argparse.Namespace) -> None:
     state["running"] = None
 
     streaks = state.setdefault("no_progress", {})
-    if args.outcome == "no_progress":
+    if outcome == "no_progress":
         previous = streaks.get(stage)
         count = int(previous.get("count") or 0) + 1 if isinstance(previous, dict) else 1
         streaks[stage] = {"count": count, "head_sha": head_sha, "at": utc_now()}
@@ -1436,9 +1588,9 @@ def command_finish(args: argparse.Namespace) -> None:
         streaks.pop(stage, None)
 
     escalation = None
-    if args.outcome in CLEARING_OUTCOMES and head_sha:
+    if outcome in CLEARING_OUTCOMES and head_sha:
         state.setdefault("cleared", {})[stage] = head_sha
-    elif args.outcome == "escalated":
+    elif outcome == "escalated":
         escalation = record_escalation(
             state,
             {
@@ -1450,7 +1602,7 @@ def command_finish(args: argparse.Namespace) -> None:
                 "head_sha": head_sha,
             },
         )
-    elif args.outcome == "no_progress":
+    elif outcome == "no_progress":
         count = int((streaks.get(stage) or {}).get("count") or 0)
         if count >= NO_PROGRESS_LIMIT:
             escalation = record_escalation(
@@ -1472,12 +1624,14 @@ def command_finish(args: argparse.Namespace) -> None:
             "result": "escalated" if escalation else "recorded",
             "state": str(path),
             "stage": stage,
-            "outcome": args.outcome,
+            "outcome": outcome,
+            "requested_outcome": resolution["requested_outcome"],
+            "outcome_source": resolution["outcome_source"],
             "entry": entry,
             "cleared": state.get("cleared") or {},
             "no_progress": state.get("no_progress") or {},
             "escalation": escalation,
-            "keep_session": args.outcome != "cleared",
+            "keep_session": outcome != "cleared",
         }
     )
 
@@ -1707,6 +1861,13 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--stage", required=True, choices=list(STAGE_NAMES))
     plan.add_argument("--effort", default=DEFAULT_EFFORT)
     plan.set_defaults(function=command_plan)
+
+    outcome = subparsers.add_parser(
+        "outcome", help="ask a stage's own helper how its run ended"
+    )
+    outcome.add_argument("--state", required=True)
+    outcome.add_argument("--stage", required=True, choices=list(STAGE_NAMES))
+    outcome.set_defaults(function=command_outcome)
 
     status = subparsers.add_parser("status", help="print the pipeline state")
     status_source = status.add_mutually_exclusive_group(required=True)
