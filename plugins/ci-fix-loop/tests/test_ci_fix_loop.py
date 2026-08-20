@@ -166,6 +166,40 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
+    def test_states_the_suppression_refusal_and_what_to_do_about_it(self):
+        self.assertIn(
+            "`record` and `publish` both read the commit and stop the run when it "
+            "deletes a test file, or adds a skip, disable, or ignore annotation to "
+            "one.",
+            self.instructions,
+        )
+        self.assertIn(
+            "That refusal has no override and no rationale gets past it",
+            self.instructions,
+        )
+
+    def test_passes_a_launchers_loop_position_through_without_reading_it(self):
+        """The budget only bounds anything if the agent cannot supply the reset."""
+        self.assertIn("### A Launcher's Loop Position", self.instructions)
+        self.assertIn(
+            "`pipeline-run: <token> pipeline-iteration: <number> "
+            "pipeline-max-iterations: <number>`",
+            self.instructions,
+        )
+        self.assertIn(
+            "--pipeline-run <token> --pipeline-iteration <number> "
+            "--pipeline-max-iterations <number>",
+            self.instructions,
+        )
+        self.assertIn(
+            "Anything you supplied yourself would be this loop resetting its own cap",
+            self.instructions,
+        )
+        self.assertIn(
+            "Never invent a value to keep working after `max_iterations_reached`.",
+            self.instructions,
+        )
+
     def test_runs_the_whole_loop_from_a_bare_reference(self):
         self.assertIn("## Activation: Bare PR References Run The Full Loop", self.instructions)
         self.assertIn(
@@ -1538,6 +1572,41 @@ class RecordAndSkipCommandTest(unittest.TestCase):
         self.assertEqual("unfixable_failure", escalation["reason"])
         self.assertEqual(["check:a"], escalation["checks"])
 
+    def test_refuses_a_commit_that_deletes_a_test_file(self):
+        """The refusal has to sit on the command, not only in the helper."""
+        def fake_git(repo_root, *arguments):
+            if arguments[0] == "rev-parse":
+                return "abc123"
+            if "--name-status" in arguments:
+                return "D\ttests/test_widget.py"
+            return ""
+
+        with mock.patch.object(MODULE, "git", fake_git):
+            with self.assertRaises(MODULE.WorkflowError) as error:
+                call(
+                    "record", "--state", str(self.path), "--batch", "b1",
+                    "--summary", "made the build pass", "--commit", "HEAD",
+                )
+        self.assertIn("stopping a test from running", str(error.exception))
+        batch = MODULE.load_state(self.path)["run"]["batches"][0]
+        self.assertEqual("planned", batch["status"])
+
+    def test_refuses_a_commit_that_disables_a_running_test(self):
+        def fake_git(repo_root, *arguments):
+            if arguments[0] == "rev-parse":
+                return "abc123"
+            if "--name-status" in arguments:
+                return "M\ttests/test_widget.py"
+            return "+++ b/tests/test_widget.py\n+@pytest.mark.skip(reason='ci')"
+
+        with mock.patch.object(MODULE, "git", fake_git):
+            with self.assertRaises(MODULE.WorkflowError) as error:
+                call(
+                    "record", "--state", str(self.path), "--batch", "b1",
+                    "--summary", "made the build pass", "--commit", "HEAD",
+                )
+        self.assertIn("@pytest.mark.skip", str(error.exception))
+
 
 class EscalateCommandTest(unittest.TestCase):
     def setUp(self):
@@ -1788,7 +1857,7 @@ class PublishCommandTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def fake_git(self, status="", rev_list=""):
+    def fake_git(self, status="", rev_list="", show=""):
         def call_git(repo_root, *arguments):
             if arguments[0] == "status":
                 return status
@@ -1796,6 +1865,8 @@ class PublishCommandTest(unittest.TestCase):
                 return rev_list
             if arguments[0] == "rev-parse":
                 return "local1"
+            if arguments[0] == "show":
+                return show
             raise AssertionError(f"unexpected git call: {arguments}")
 
         return call_git
@@ -1924,6 +1995,32 @@ class PublishCommandTest(unittest.TestCase):
             with self.assertRaises(MODULE.WorkflowError) as error:
                 call("publish", "--state", str(path))
         self.assertIn("PR head mismatch", str(error.exception))
+
+    def test_refuses_to_push_a_commit_amended_to_suppress_a_test(self):
+        """`record` already passed. An amend after it would reach GitHub unseen.
+
+        This is the last gate before anything leaves the machine, so it reads the
+        commits it is about to push rather than trusting what was recorded.
+        """
+        path = write_state(
+            self.root,
+            run={
+                "batches": [
+                    {"id": "b1", "status": "recorded", "commit": "local1",
+                     "summary": "fixed the import", "rationale": None}
+                ]
+            },
+        )
+        git = self.fake_git(rev_list="local1", show="D\tsrc/test/java/FooTest.java")
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(MODULE, "git", git))
+            push = stack.enter_context(mock.patch.object(MODULE, "run"))
+            with self.assertRaises(MODULE.WorkflowError) as error:
+                call("publish", "--state", str(path))
+        self.assertIn("stopping a test from running", str(error.exception))
+        self.assertIn("FooTest.java", str(error.exception))
+        push.assert_not_called()
+        self.assertNotEqual("published", MODULE.load_state(path)["run"]["status"])
 
 
 class StatusCommandTest(unittest.TestCase):
@@ -2099,6 +2196,25 @@ class StageOutcomeTest(unittest.TestCase):
         state = {"outcome": "green", "escalation": {"reason": "head_changed"}}
         self.assertEqual("escalated", MODULE.stage_outcome(state))
 
+    def test_a_clearance_always_travels_with_the_head_it_was_measured_at(self):
+        """The orchestrator refuses a clearance whose marker names another head.
+
+        That guard reads one payload, so the marker has to be in the same payload
+        as the word. A `cleared` with no `clean_at_head_sha` beside it would be
+        rejected as a mismatch and read as a stage that answered nothing.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_state(
+                Path(directory),
+                outcome="green",
+                clean_at_head_sha="head1",
+                run={"head_sha": "head1", "status": "resolved"},
+            )
+            payload = call("status", "--state", str(path))
+        self.assertEqual("cleared", payload["stage_outcome"])
+        self.assertEqual("head1", payload["clean_at_head_sha"])
+        self.assertEqual("head1", payload["run"]["head_sha"])
+
 
 class ChargeIterationTest(unittest.TestCase):
     def test_spends_one_iteration_for_a_run_however_often_it_is_called(self):
@@ -2117,7 +2233,315 @@ class ChargeIterationTest(unittest.TestCase):
         self.assertEqual(3, state["iterations"])
 
 
-class CleanupCommandTest(unittest.TestCase):
+class TestSuppressionTest(unittest.TestCase):
+    def test_recognizes_a_test_path_by_directory_or_by_file_name(self):
+        for path in (
+            "src/test/java/com/example/FooTest.java",
+            "tests/test_widget.py",
+            "app/__tests__/widget.test.tsx",
+            "pkg/thing_test.go",
+            "spec/models/user_spec.rb",
+            "lib/WidgetTests.cs",
+            "TESTS/Upper_Test.py",
+            "src\\test\\java\\FooTest.java",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(MODULE.is_test_path(path))
+
+    def test_leaves_production_code_alone(self):
+        for path in (
+            "src/main/java/com/example/Widget.java",
+            "app/widget.ts",
+            "docs/testing.md",
+            "src/latest/thing.py",
+            "",
+            None,
+            42,
+        ):
+            with self.subTest(path=path):
+                self.assertFalse(MODULE.is_test_path(path))
+
+    def test_names_every_way_a_line_stops_a_test_running(self):
+        cases = {
+            "@pytest.mark.skip(reason='broken')": "@pytest.mark.skip",
+            "    @pytest.mark.xfail": "@pytest.mark.skip",
+            "@unittest.skipIf(sys.platform == 'win32', 'nope')": "@unittest.skip",
+            "        pytest.skip('flaky')": "pytest.skip()",
+            "        self.skipTest('flaky')": "self.skipTest()",
+            "  @Disabled(\"fails on CI\")": "@Disabled",
+            "  @Ignore": "@Ignore",
+            "  @Test(enabled = false)": "@Test(enabled = false)",
+            "  xit('adds two numbers', () => {": "xit()",
+            "  it.skip('adds two numbers', () => {": ".skip()",
+            "  test.todo('adds two numbers')": ".todo()",
+            "\tt.Skip(\"broken\")": "t.Skip()",
+            "#[ignore]": "#[ignore]",
+            "[Ignore(\"broken\")]": "[Ignore]",
+            "  Skip = \"broken on arm\"": 'Skip = "..."',
+        }
+        for line, marker in cases.items():
+            with self.subTest(line=line):
+                self.assertIn(marker, MODULE.suppression_markers(line))
+
+    def test_prose_about_a_skip_is_not_a_skip(self):
+        """A pattern that fired on prose would refuse an honest commit.
+
+        The refusal has no override, so a false positive stops the loop dead.
+        These lines all mention skipping without doing any.
+        """
+        for line in (
+            "# this test used to be skipped, and is not any more",
+            "    assert result.skip is False",
+            "// Ignore the ordering here; the assertion below is what matters.",
+            "        self.assertEqual(expected, disabled_reason)",
+            "  @Test(expected = IllegalStateException.class)",
+            "  boolean enabled = false;",
+            None,
+            17,
+        ):
+            with self.subTest(line=line):
+                self.assertEqual([], MODULE.suppression_markers(line))
+
+
+class CommitSuppressionTest(unittest.TestCase):
+    """Read real commits, because the scan parses real `git show` output."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        MODULE.git(self.root, "init", "--quiet", ".")
+        MODULE.git(self.root, "config", "user.email", "loop@example.invalid")
+        MODULE.git(self.root, "config", "user.name", "Loop")
+        MODULE.git(self.root, "config", "commit.gpgsign", "false")
+
+    def write(self, relative, text):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8", newline="")
+
+    def commit(self, message):
+        MODULE.git(self.root, "add", "--all")
+        MODULE.git(self.root, "commit", "--quiet", "--message", message)
+        return MODULE.git(self.root, "rev-parse", "HEAD")
+
+    def test_reports_a_deleted_test_file(self):
+        self.write("tests/test_widget.py", "def test_widget():\n    assert True\n")
+        self.write("app.py", "value = 1\n")
+        self.commit("first")
+        (self.root / "tests" / "test_widget.py").unlink()
+        head = self.commit("drop the test")
+        findings = MODULE.commit_suppressions(self.root, head)
+        self.assertEqual(
+            [{"kind": "deleted_test_file", "path": "tests/test_widget.py", "marker": None}],
+            findings,
+        )
+
+    def test_ignores_a_deleted_source_file(self):
+        self.write("app.py", "value = 1\n")
+        self.write("helper.py", "value = 2\n")
+        self.commit("first")
+        (self.root / "helper.py").unlink()
+        head = self.commit("drop the helper")
+        self.assertEqual([], MODULE.commit_suppressions(self.root, head))
+
+    def test_reports_a_skip_added_to_a_test_that_was_running(self):
+        self.write(
+            "tests/test_widget.py",
+            "def test_widget():\n    assert compute() == 2\n",
+        )
+        self.commit("first")
+        self.write(
+            "tests/test_widget.py",
+            "import pytest\n\n\n"
+            "@pytest.mark.skip(reason='fails on CI')\n"
+            "def test_widget():\n    assert compute() == 2\n",
+        )
+        head = self.commit("silence the test")
+        findings = MODULE.commit_suppressions(self.root, head)
+        self.assertEqual(1, len(findings))
+        self.assertEqual("added_suppression", findings[0]["kind"])
+        self.assertEqual("tests/test_widget.py", findings[0]["path"])
+        self.assertEqual("@pytest.mark.skip", findings[0]["marker"])
+
+    def test_ignores_a_skip_that_the_commit_removed(self):
+        """Re-enabling a test is the opposite of suppressing one."""
+        self.write(
+            "tests/test_widget.py",
+            "import pytest\n\n\n@pytest.mark.skip\ndef test_widget():\n    pass\n",
+        )
+        self.commit("first")
+        self.write(
+            "tests/test_widget.py",
+            "import pytest\n\n\ndef test_widget():\n    pass\n",
+        )
+        head = self.commit("re-enable the test")
+        self.assertEqual([], MODULE.commit_suppressions(self.root, head))
+
+    def test_ignores_an_annotation_outside_a_test_file(self):
+        self.write("app.py", "value = 1\n")
+        self.commit("first")
+        self.write("app.py", "value = 1\n# @Disabled\n")
+        head = self.commit("comment")
+        self.assertEqual([], MODULE.commit_suppressions(self.root, head))
+
+    def test_a_new_test_file_that_is_born_skipped_is_reported(self):
+        """Adding a test already disabled is coverage that never runs."""
+        self.write("app.py", "value = 1\n")
+        self.commit("first")
+        self.write(
+            "tests/test_new.py",
+            "import pytest\n\n\n@pytest.mark.skip\ndef test_new():\n    pass\n",
+        )
+        head = self.commit("add a disabled test")
+        markers = [item["marker"] for item in MODULE.commit_suppressions(self.root, head)]
+        self.assertEqual(["@pytest.mark.skip"], markers)
+
+    def test_refusal_names_the_commit_and_the_finding(self):
+        self.write("tests/test_widget.py", "def test_widget():\n    pass\n")
+        self.commit("first")
+        (self.root / "tests" / "test_widget.py").unlink()
+        head = self.commit("drop the test")
+        with self.assertRaises(MODULE.WorkflowError) as error:
+            MODULE.refuse_test_suppression(self.root, [head])
+        message = str(error.exception)
+        self.assertIn("stopping a test from running", message)
+        self.assertIn("tests/test_widget.py", message)
+        self.assertIn(head, message)
+        self.assertIn("unfixable_failure", message)
+
+    def test_an_honest_fix_passes(self):
+        self.write("app.py", "def compute():\n    return 1\n")
+        self.write("tests/test_widget.py", "def test_widget():\n    assert True\n")
+        self.commit("first")
+        self.write("app.py", "def compute():\n    return 2\n")
+        head = self.commit("fix the arithmetic")
+        MODULE.refuse_test_suppression(self.root, [head])
+
+
+class PipelineBudgetTest(unittest.TestCase):
+    def test_a_position_needs_both_halves(self):
+        self.assertEqual(("run1", 2), MODULE.pipeline_position("run1", 2))
+        for run, iteration in (
+            (None, 2),
+            ("", 2),
+            ("run1", None),
+            ("run1", 0),
+            ("run1", -1),
+            ("run1", "2"),
+            ("run1", True),
+            (7, 2),
+        ):
+            with self.subTest(run=run, iteration=iteration):
+                self.assertIsNone(MODULE.pipeline_position(run, iteration))
+
+    def test_a_standalone_run_never_resets_anything(self):
+        state = {"iterations": 4, "total_iterations": 9}
+        self.assertIsNone(MODULE.apply_pipeline_position(state, None, None))
+        self.assertEqual(4, state["iterations"])
+        self.assertEqual(9, state["total_iterations"])
+        self.assertNotIn("pipeline_run", state)
+
+    def test_a_new_pipeline_run_clears_both_budgets(self):
+        state = {"iterations": 5, "total_iterations": 10, "pipeline_run": "old"}
+        self.assertEqual("run", MODULE.apply_pipeline_position(state, "new", 1))
+        self.assertEqual(0, state["iterations"])
+        self.assertEqual(0, state["total_iterations"])
+        self.assertEqual("new", state["pipeline_run"])
+        self.assertEqual(1, state["pipeline_iteration"])
+
+    def test_the_pipeline_advancing_clears_only_the_per_iteration_budget(self):
+        state = {
+            "iterations": 5,
+            "total_iterations": 5,
+            "pipeline_run": "run1",
+            "pipeline_iteration": 1,
+        }
+        self.assertEqual("iteration", MODULE.apply_pipeline_position(state, "run1", 2))
+        self.assertEqual(0, state["iterations"])
+        self.assertEqual(5, state["total_iterations"])
+        self.assertEqual(2, state["pipeline_iteration"])
+
+    def test_a_relaunch_inside_one_iteration_buys_nothing(self):
+        state = {
+            "iterations": 3,
+            "total_iterations": 3,
+            "pipeline_run": "run1",
+            "pipeline_iteration": 2,
+        }
+        self.assertIsNone(MODULE.apply_pipeline_position(state, "run1", 2))
+        self.assertEqual(3, state["iterations"])
+
+    def test_replaying_an_earlier_iteration_buys_nothing(self):
+        state = {
+            "iterations": 3,
+            "total_iterations": 3,
+            "pipeline_run": "run1",
+            "pipeline_iteration": 4,
+        }
+        self.assertIsNone(MODULE.apply_pipeline_position(state, "run1", 2))
+        self.assertEqual(3, state["iterations"])
+        self.assertEqual(4, state["pipeline_iteration"])
+
+    def test_a_second_run_resets_even_though_it_counts_from_one_again(self):
+        """A pipeline numbers its iterations from one, so this must not be ordered.
+
+        Comparing iterations across runs would leave a pull request that reached
+        iteration three permanently unable to reset, and the ceiling would then
+        refuse every future run on it. A deadlock outlasts the false start it
+        would have prevented, so run identity is compared for equality instead.
+        """
+        state = {"iterations": 0, "total_iterations": 0}
+        MODULE.apply_pipeline_position(state, "run1", 1)
+        MODULE.apply_pipeline_position(state, "run1", 2)
+        MODULE.apply_pipeline_position(state, "run1", 3)
+        state["iterations"] = 5
+        state["total_iterations"] = 10
+        self.assertEqual("run", MODULE.apply_pipeline_position(state, "run2", 1))
+        self.assertEqual(0, state["iterations"])
+        self.assertEqual(0, state["total_iterations"])
+
+    def test_the_ceiling_is_derived_from_the_callers_own_cap(self):
+        self.assertEqual(15, MODULE.absolute_iteration_cap("run1", 1, 5, 3))
+        self.assertEqual(
+            5 * MODULE.DEFAULT_PIPELINE_MAX_ITERATIONS,
+            MODULE.absolute_iteration_cap("run1", 1, 5, None),
+        )
+        self.assertEqual(
+            5 * MODULE.DEFAULT_PIPELINE_MAX_ITERATIONS,
+            MODULE.absolute_iteration_cap("run1", 1, 5, 0),
+        )
+
+    def test_there_is_no_ceiling_without_a_pipeline(self):
+        self.assertIsNone(MODULE.absolute_iteration_cap(None, None, 5, 3))
+        self.assertIsNone(MODULE.absolute_iteration_cap("run1", None, 5, 3))
+
+    def test_names_which_budget_ran_out(self):
+        self.assertIsNone(MODULE.exhausted_budget({"iterations": 4}, 5, 10))
+        self.assertEqual(
+            "iteration", MODULE.exhausted_budget({"iterations": 5}, 5, 10)
+        )
+        self.assertEqual(
+            "absolute",
+            MODULE.exhausted_budget({"iterations": 0, "total_iterations": 10}, 5, 10),
+        )
+        self.assertEqual(
+            "iteration", MODULE.exhausted_budget({"iterations": 5}, 5, None)
+        )
+
+    def test_the_running_total_survives_a_pipeline_iteration(self):
+        """The ceiling only bounds anything if the per-iteration reset spares it."""
+        state = {"iterations": 0, "total_iterations": 0}
+        for iteration in (1, 2):
+            MODULE.apply_pipeline_position(state, "run1", iteration)
+            for _ in range(5):
+                MODULE.charge_iteration(state, {})
+        self.assertEqual(5, state["iterations"])
+        self.assertEqual(10, state["total_iterations"])
+        self.assertEqual("absolute", MODULE.exhausted_budget(state, 5, 10))
+
+
+
     def test_deletes_the_state_and_every_side_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

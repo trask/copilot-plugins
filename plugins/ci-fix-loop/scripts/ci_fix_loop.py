@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fnmatch
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ from typing import Any, Iterable
 
 STATE_VERSION = 1
 DEFAULT_MAX_ITERATIONS = 5
+DEFAULT_PIPELINE_MAX_ITERATIONS = 2
 DEFAULT_POLL_INTERVAL = 60
 DEFAULT_POLL_TIMEOUT = 5400
 DEFAULT_NOT_STARTED_GRACE = 900
@@ -88,6 +90,72 @@ PASSED_BASELINE_CONCLUSIONS = {"SUCCESS"}
 APPROVAL_RUN_STATES = {"ACTION_REQUIRED", "WAITING"}
 VERDICTS = ("pr_caused", "pre_existing", "flake")
 WORKING_ACTIONS = ("attribute", "rerun", "fix")
+
+# A path this matches holds tests. The loop refuses to make a check pass by
+# stopping one of them from running, so it needs to recognize one by name.
+TEST_PATH_MARKERS = (
+    "/test/",
+    "/tests/",
+    "/spec/",
+    "/specs/",
+    "/testing/",
+    "/__tests__/",
+    "/testdata/",
+)
+TEST_FILE_PATTERNS = (
+    "test_*.py",
+    "*_test.py",
+    "*_test.go",
+    "*_test.rb",
+    "*_spec.rb",
+    "*_test.cc",
+    "*_test.cpp",
+    "*_unittest.cc",
+    "*test.java",
+    "*tests.java",
+    "*testcase.java",
+    "*test.kt",
+    "*tests.kt",
+    "*test.cs",
+    "*tests.cs",
+    "*test.scala",
+    "*test.groovy",
+    "*spec.groovy",
+    "*.test.js",
+    "*.test.jsx",
+    "*.test.ts",
+    "*.test.tsx",
+    "*.spec.js",
+    "*.spec.jsx",
+    "*.spec.ts",
+    "*.spec.tsx",
+)
+
+# Adding one of these to a test that was running turns a failure green by not
+# running it. Each pattern matches only the annotation, never a mention of it in
+# prose, so a line that explains a skip does not read as one.
+SUPPRESSION_PATTERNS = (
+    (re.compile(r"@pytest\.mark\.(?:skip|skipif|xfail)\b"), "@pytest.mark.skip"),
+    (
+        re.compile(r"@unittest\.(?:skip|skipIf|skipUnless|expectedFailure)\b"),
+        "@unittest.skip",
+    ),
+    (re.compile(r"\bpytest\.skip\s*\("), "pytest.skip()"),
+    (re.compile(r"\bself\.skipTest\s*\("), "self.skipTest()"),
+    (re.compile(r"@Disabled\b"), "@Disabled"),
+    (re.compile(r"@Ignore\b"), "@Ignore"),
+    (
+        re.compile(r"@Test\s*\([^)]*enabled\s*=\s*false", re.IGNORECASE),
+        "@Test(enabled = false)",
+    ),
+    (re.compile(r"\bx(?:it|describe|test|context)\s*\("), "xit()"),
+    (re.compile(r"\b(?:it|describe|test|context|suite)\.skip\s*\("), ".skip()"),
+    (re.compile(r"\b(?:it|describe|test)\.todo\s*\("), ".todo()"),
+    (re.compile(r"\bt\.Skip(?:Now|f)?\s*\("), "t.Skip()"),
+    (re.compile(r"#\[ignore\b"), "#[ignore]"),
+    (re.compile(r"\[Ignore\b"), "[Ignore]"),
+    (re.compile(r"\bSkip\s*=\s*[\"']"), 'Skip = "..."'),
+)
 ESCALATION_REASONS = (
     "approval_required",
     "checks_never_started",
@@ -1330,17 +1398,204 @@ def next_action(state: dict[str, Any], decision: dict[str, Any]) -> dict[str, An
     }
 
 
+def is_test_path(path: Any) -> bool:
+    """Say whether a repository path holds tests, by name alone."""
+    if not isinstance(path, str) or not path:
+        return False
+    normalized = path.replace("\\", "/").lower().lstrip("/")
+    if any(marker in f"/{normalized}" for marker in TEST_PATH_MARKERS):
+        return True
+    name = normalized.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatch(name, pattern) for pattern in TEST_FILE_PATTERNS)
+
+
+def suppression_markers(line: Any) -> list[str]:
+    """Name every way one line stops a test from running."""
+    if not isinstance(line, str):
+        return []
+    return [label for pattern, label in SUPPRESSION_PATTERNS if pattern.search(line)]
+
+
+def commit_suppressions(repo_root: Path, commit: str) -> list[dict[str, Any]]:
+    """Find every way one commit makes a test stop running.
+
+    This reads the commit rather than the worktree, so it sees what would reach
+    the pull request. It reports only the unambiguous forms: a deleted test file,
+    and a skip or disable annotation added to a test file. Judging whether a
+    surviving test still asserts what it used to is deliberately not attempted.
+    """
+    findings: list[dict[str, Any]] = []
+    for line in git(
+        repo_root, "show", "--format=", "--name-status", "--no-renames", commit
+    ).splitlines():
+        fields = line.split("\t")
+        if len(fields) < 2:
+            continue
+        if fields[0].startswith("D") and is_test_path(fields[-1]):
+            findings.append(
+                {"kind": "deleted_test_file", "path": fields[-1], "marker": None}
+            )
+    current: str | None = None
+    for line in git(
+        repo_root, "show", "--format=", "--unified=0", "--no-renames", commit
+    ).splitlines():
+        if line.startswith("+++ "):
+            target = line[4:].strip()
+            current = target[2:] if target.startswith("b/") else target
+            continue
+        if line.startswith("---") or line.startswith("+++"):
+            continue
+        if not line.startswith("+") or current in (None, "/dev/null"):
+            continue
+        if not is_test_path(current):
+            continue
+        for marker in suppression_markers(line[1:]):
+            findings.append(
+                {
+                    "kind": "added_suppression",
+                    "path": current,
+                    "marker": marker,
+                    "line": line[1:].strip(),
+                }
+            )
+    return findings
+
+
+def refuse_test_suppression(repo_root: Path, commits: Iterable[str]) -> None:
+    """Refuse a commit that turns a check green by stopping a test from running.
+
+    Making the checks pass never legitimately includes removing a feature's
+    coverage, so this stage treats deleting a test file, or disabling a test that
+    was running, as something it cannot do rather than something it should weigh.
+    A refusal in code leaves no room for a rationale to talk its way past it.
+    """
+    findings: list[dict[str, Any]] = []
+    for commit in commits:
+        for finding in commit_suppressions(repo_root, commit):
+            findings.append({"commit": commit, **finding})
+    if not findings:
+        return
+    raise WorkflowError(
+        "this commit makes a check pass by stopping a test from running, which "
+        "this loop never does: "
+        f"{json.dumps(findings, sort_keys=True)}. Fix what the test caught, or "
+        "record the batch with --rationale and escalate it as unfixable_failure."
+    )
+
+
+def pipeline_position(pipeline_run: Any, pipeline_iteration: Any) -> tuple[str, int] | None:
+    """Read the caller's loop position, or nothing when it named none.
+
+    Both halves are required. A run identity with no iteration says nothing about
+    whether the loop advanced, and an iteration with no run identity cannot be
+    told apart from the same number in a different run, so either alone is treated
+    as absent rather than guessed at.
+    """
+    if not isinstance(pipeline_run, str) or not pipeline_run:
+        return None
+    if isinstance(pipeline_iteration, bool) or not isinstance(pipeline_iteration, int):
+        return None
+    if pipeline_iteration < 1:
+        return None
+    return pipeline_run, pipeline_iteration
+
+
+def apply_pipeline_position(
+    state: dict[str, Any], pipeline_run: Any, pipeline_iteration: Any
+) -> str | None:
+    """Refresh a budget when the pipeline itself moved forward, and only then.
+
+    The caller supplies both values, and this loop never constructs either one.
+    Nothing it can observe about itself, such as a new head, a relaunch, or a
+    commit it just pushed, reaches this function, so a reset cannot be
+    self-triggered. That is the whole point of the budget.
+
+    The run identity is opaque and compared only for equality, never parsed and
+    never ordered. The iteration is ordered, but only against an iteration of the
+    same run. A pipeline numbers its iterations from one, so a second run on the
+    same pull request legitimately presents a lower number than one already
+    recorded here; comparing across runs would refuse to reset again for the rest
+    of the pull request's life, and this loop's state outlives any one run.
+
+    Within a run the comparison stays strict, so a relaunch replaying an earlier
+    iteration, or repeating the current one, buys nothing.
+
+    A new run also clears the running total, because that total bounds one
+    pipeline run. A person starting the pipeline again is an authority outside any
+    budget this loop keeps, and a ceiling that no run can clear would eventually
+    refuse every future run on the pull request.
+    """
+    position = pipeline_position(pipeline_run, pipeline_iteration)
+    if position is None:
+        return None
+    run, iteration = position
+    if state.get("pipeline_run") != run:
+        state["pipeline_run"] = run
+        state["pipeline_iteration"] = iteration
+        state["iterations"] = 0
+        state["total_iterations"] = 0
+        return "run"
+    recorded = state.get("pipeline_iteration")
+    recorded = recorded if isinstance(recorded, int) and not isinstance(recorded, bool) else 0
+    if iteration <= recorded:
+        return None
+    state["pipeline_iteration"] = iteration
+    state["iterations"] = 0
+    return "iteration"
+
+
+def absolute_iteration_cap(
+    pipeline_run: Any,
+    pipeline_iteration: Any,
+    max_iterations: int,
+    pipeline_max_iterations: Any,
+) -> int | None:
+    """Bound the total work one pipeline run may spend on a pull request.
+
+    Derived from the caller's own cap rather than hardcoded, so raising the
+    pipeline's iteration limit raises this with it. It is enforced even though the
+    caller advancing its own loop at most that many times already implies it,
+    because a bound that depends on a peer behaving is not a bound.
+    """
+    if pipeline_position(pipeline_run, pipeline_iteration) is None:
+        return None
+    outer = (
+        pipeline_max_iterations
+        if isinstance(pipeline_max_iterations, int)
+        and not isinstance(pipeline_max_iterations, bool)
+        and pipeline_max_iterations > 0
+        else DEFAULT_PIPELINE_MAX_ITERATIONS
+    )
+    return max_iterations * outer
+
+
+def exhausted_budget(
+    state: dict[str, Any], max_iterations: int, absolute_cap: int | None
+) -> str | None:
+    """Name the budget this pull request has used up, if it has used one up."""
+    if absolute_cap is not None:
+        if int(state.get("total_iterations", 0)) >= absolute_cap:
+            return "absolute"
+    if int(state.get("iterations", 0)) >= max_iterations:
+        return "iteration"
+    return None
+
+
 def charge_iteration(state: dict[str, Any], run_state: dict[str, Any]) -> bool:
     """Spend an iteration on the current run, once, when it has real work to do.
 
     A launch that reads the checks and finds nothing to fix costs nothing. Only a
     run that reaches attribution, a re-run, or a fix spends one, so relaunching the
     loop at a head whose checks already passed can never exhaust the cap.
+
+    The running total is charged alongside, and a pipeline iteration does not
+    refresh it, so it still bounds the work across every iteration of one run.
     """
     if run_state.get("charged"):
         return False
     run_state["charged"] = True
     state["iterations"] = int(state.get("iterations", 0)) + 1
+    state["total_iterations"] = int(state.get("total_iterations", 0)) + 1
     return True
 
 
@@ -1502,22 +1757,32 @@ def command_preflight(args: argparse.Namespace) -> None:
             "version": STATE_VERSION,
             "created_at": utc_now(),
             "iterations": 0,
+            "total_iterations": 0,
             "history": [],
             "reruns": {},
             "escalation": None,
         }
     archive_run(state)
     state["iterations"] = int(state.get("iterations", 0))
+    state["total_iterations"] = int(state.get("total_iterations", 0))
     previous_run = state.get("run") or {}
     previous_head = previous_run.get("head_sha")
     if previous_head and previous_head != metadata["head_sha"]:
         # A new head invalidates every re-run this loop spent on the old one.
         state["reruns"] = {}
     max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
-    iteration = state["iterations"] + 1
-    result = (
-        "max_iterations_reached" if state["iterations"] >= max_iterations else "ready"
+    pipeline_run = getattr(args, "pipeline_run", None)
+    pipeline_iteration = getattr(args, "pipeline_iteration", None)
+    apply_pipeline_position(state, pipeline_run, pipeline_iteration)
+    absolute_cap = absolute_iteration_cap(
+        pipeline_run,
+        pipeline_iteration,
+        max_iterations,
+        getattr(args, "pipeline_max_iterations", None),
     )
+    exhausted = exhausted_budget(state, max_iterations, absolute_cap)
+    iteration = state["iterations"] + 1
+    result = "max_iterations_reached" if exhausted else "ready"
     diff_path = diff_path_for(state_path)
     diff_path.parent.mkdir(parents=True, exist_ok=True)
     diff_path.write_text(diff_text, encoding="utf-8", newline="")
@@ -1549,12 +1814,18 @@ def command_preflight(args: argparse.Namespace) -> None:
     state["outcome"] = None
     state["clean_at_head_sha"] = None
     if result == "max_iterations_reached":
-        state["escalation"] = {
-            "reason": "max_iterations_reached",
-            "detail": (
+        detail = (
+            f"this pull request already spent {state['total_iterations']} iteration(s) "
+            f"in this pipeline run, which is its ceiling of {absolute_cap}"
+            if exhausted == "absolute"
+            else (
                 f"this loop already ran {state['iterations']} iteration(s), which is "
                 f"its cap of {max_iterations}"
-            ),
+            )
+        )
+        state["escalation"] = {
+            "reason": "max_iterations_reached",
+            "detail": detail,
             "checks": [],
             "next_action": ESCALATION_ACTIONS["max_iterations_reached"],
             "head_sha": metadata["head_sha"],
@@ -1579,6 +1850,10 @@ def command_preflight(args: argparse.Namespace) -> None:
         "escalation": state.get("escalation"),
         "iteration": iteration,
         "max_iterations": max_iterations,
+        "total_iterations": state["total_iterations"],
+        "absolute_cap": absolute_cap,
+        "pipeline_run": state.get("pipeline_run"),
+        "pipeline_iteration": state.get("pipeline_iteration"),
     }
     write_result_file(preflight_path, payload, "preflight")
     emit(
@@ -1945,7 +2220,9 @@ def command_record(args: argparse.Namespace) -> None:
     batch = find_batch(run_state, args.batch)
     commit = args.commit
     if commit:
-        commit = git(Path(state["repo_root"]), "rev-parse", commit)
+        repo_root = Path(state["repo_root"])
+        commit = git(repo_root, "rev-parse", commit)
+        refuse_test_suppression(repo_root, [commit])
     batch.update(
         {
             "status": "recorded",
@@ -2182,6 +2459,10 @@ def command_publish(args: argparse.Namespace) -> None:
         )
         return
 
+    # The last gate before anything reaches the pull request. Every commit here
+    # passed `record`, but an amend after that would not have, so check them all.
+    refuse_test_suppression(repo_root, new_commits)
+
     pr = state["pr"]
     require_fork_head(pr)
     remote = find_push_remote(repo_root, pr["head_owner"], pr["head_repo"])
@@ -2272,6 +2553,9 @@ def status_payload(state: dict[str, Any], path: Path) -> dict[str, Any]:
         "clean_at_head_sha": state.get("clean_at_head_sha"),
         "skip_note": state.get("skip_note"),
         "iterations": int(state.get("iterations", 0)),
+        "total_iterations": int(state.get("total_iterations", 0)),
+        "pipeline_run": state.get("pipeline_run"),
+        "pipeline_iteration": state.get("pipeline_iteration"),
     }
 
 
@@ -2378,6 +2662,26 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--repo-root")
     preflight.add_argument("--state")
     preflight.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS)
+    preflight.add_argument(
+        "--pipeline-run",
+        help=(
+            "opaque identifier for one pipeline run, compared only for equality; "
+            "a different one starts both budgets over"
+        ),
+    )
+    preflight.add_argument(
+        "--pipeline-iteration",
+        type=int,
+        help=(
+            "the orchestrator's own loop counter; a higher one within the same run "
+            "refreshes the per-iteration budget"
+        ),
+    )
+    preflight.add_argument(
+        "--pipeline-max-iterations",
+        type=int,
+        help="the orchestrator's own iteration cap, which derives the ceiling",
+    )
     preflight.set_defaults(function=command_preflight)
 
     checks = subparsers.add_parser(

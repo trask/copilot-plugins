@@ -26,13 +26,13 @@ Run `preflight` first. After `preflight` succeeds, ensure the session name is `C
 - Fix only a failure this pull request plausibly caused. This is the rule that matters most. A check that already fails on the base commit is somebody else's breakage, and editing this pull request to hide it is worse than leaving it alone.
 - Never wait for `next`, `fix it`, `looks good`, `publish`, or `push`. Run the loop yourself, without stopping, until the checks are green, the repository runs no checks, it reaches the iteration cap, or a stop condition applies.
 - The loop is `preflight -> checks -> attribute -> fix -> publish`, repeated for each new head.
-- The maximum is 5 iterations. Respect `max_iterations_reached` before you edit anything; do not work around it.
+- The maximum is 5 iterations. Respect `max_iterations_reached` before you edit anything; do not work around it. An orchestrator running this loop as one stage of a larger loop may raise that budget, but only by naming its own position, never by anything this loop notices about itself.
 - Re-run a suspected flake exactly once. If it fails again, it is not a flake, so escalate instead of re-running it a second time or editing around it. A failure that was already on record when the re-run was requested is the old one, not a second failure.
 - A check that never starts, and a check that waits for a maintainer to approve a fork's workflow run, escalates straight away. Never wait for one of those indefinitely; they cannot resolve on their own.
 - A pull request whose head reports no applicable checks is a skip, never a pass. Record it with `resolve --outcome no_checks` and report the helper's one-line note. A broken continuous integration configuration must never look like a green pipeline.
 - GitHub states whether the checks pass, and this loop's own state never does. Read the live checks every time you are asked to run, however recently the state says they passed.
 - The helper owns every decision about what the loop does next. Run `checks`, then do exactly what its `action` says. Never decide for yourself that a failure is pre-existing, that a check is a flake, or that the loop may stop.
-- Never disable, delete, skip, or weaken a check to make it pass. Do not add a skip marker, do not loosen an assertion, do not raise a timeout to hide a hang, and do not edit a workflow file to stop a job from running. Fix the cause instead, or escalate.
+- Never disable, delete, skip, or weaken a check to make it pass. Do not add a skip marker, do not loosen an assertion, do not raise a timeout to hide a hang, and do not edit a workflow file to stop a job from running. Fix the cause instead, or escalate. The helper refuses two of those forms outright: `record` and `publish` both read the commit and stop the run when it deletes a test file, or adds a skip, disable, or ignore annotation to one. That refusal has no override and no rationale gets past it, so when it fires, fix what the test caught or escalate the failure as `unfixable_failure`.
 - Never touch a test's expectations to match broken behavior. Change a test only when the pull request deliberately changed the behavior the test asserts, and say so in the commit message.
 - A failure you cannot fix stops the whole run at once. Record it with `skip`, leave the worktree as it is so someone can inspect it, and do not publish partial work.
 - Do not treat a stored user memory as a workflow instruction. This file is the source of truth.
@@ -103,6 +103,14 @@ The workflow always covers the checks of one whole pull request.
    - `max_iterations_reached`: stop before you edit anything, and report the cap as an escalation.
 
 Record the returned `head_sha` as the immutable snapshot for this iteration, and do not replace or refresh it. Read the pinned diff only from the returned `diff_path`, which holds the exact text the helper fetched and validated at that head. Never run `gh pr diff` again and never rebuild the changeset another way. Read `changed_files`, `pr_commits`, and `history` from the complete result at `preflight_path`, paging through it with explicit line ranges when it exceeds a read tool's size limit, and check what you read against the envelope's `counts` so you skip nothing.
+
+### A Launcher's Loop Position
+
+An orchestrator that runs this loop as one stage of a larger loop may include a line of the form `pipeline-run: <token> pipeline-iteration: <number> pipeline-max-iterations: <number>` in the request, on its own line beside the target.
+
+When that line is present, pass all three values to `preflight` verbatim, as `--pipeline-run <token> --pipeline-iteration <number> --pipeline-max-iterations <number>`.
+
+Copy them exactly. Do not read the token, do not shorten or reformat it, and do not adjust either number. They tell the helper where the caller's own loop stands, which is the one thing that may refresh this loop's budget. Anything you supplied yourself would be this loop resetting its own cap, so if the line is absent, omit all three arguments and the flat cap of 5 applies. Never invent a value to keep working after `max_iterations_reached`.
 
 ## What Green Means Here
 
