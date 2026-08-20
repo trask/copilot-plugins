@@ -3472,6 +3472,8 @@ class PreflightTargetTest(unittest.TestCase):
         max_iterations=5,
         local_branch="branch",
         checked_out_branch=True,
+        pipeline=None,
+        state_path=None,
     ):
         metadata = {"head_branch": "branch", "head_sha": "head"}
 
@@ -3484,8 +3486,8 @@ class PreflightTargetTest(unittest.TestCase):
             }[arguments]
 
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "state.json"
-            if iterations:
+            path = Path(state_path) if state_path else Path(directory) / "state.json"
+            if iterations and not path.exists():
                 MODULE.save_state(
                     path,
                     {
@@ -3500,6 +3502,7 @@ class PreflightTargetTest(unittest.TestCase):
                 state=str(path),
                 max_iterations=max_iterations,
                 completed_run_iterations=completed_run_iterations,
+                **(pipeline or {}),
             )
 
             with (
@@ -3813,7 +3816,7 @@ class PreflightTargetTest(unittest.TestCase):
         self.assertEqual(payload["iteration"], 1)
         self.assertEqual(payload["completed_run_iterations"], 0)
         self.assertEqual(payload["max_iterations"], 5)
-        self.assertEqual(payload["total_iterations"], 5)
+        self.assertEqual(payload["published_iterations"], 5)
 
     def test_preflight_caps_empty_review_required_iteration_for_current_run(self):
         payload = self.run_preflight(
@@ -3824,7 +3827,7 @@ class PreflightTargetTest(unittest.TestCase):
         self.assertEqual(payload["iteration"], 6)
         self.assertEqual(payload["completed_run_iterations"], 5)
         self.assertEqual(payload["max_iterations"], 5)
-        self.assertEqual(payload["total_iterations"], 12)
+        self.assertEqual(payload["published_iterations"], 12)
 
     def test_preflight_stops_at_the_iteration_cap(self):
         metadata = {"head_branch": "branch", "head_sha": "head"}
@@ -3892,6 +3895,101 @@ class PreflightTargetTest(unittest.TestCase):
         self.assertEqual(payload["iteration"], 6)
         self.assertEqual(payload["completed_run_iterations"], 5)
         self.assertEqual(payload["max_iterations"], 5)
+
+
+class PipelineBudgetTest(unittest.TestCase):
+    """A stage budget belongs to an outer loop's iteration, not to a launch."""
+
+    def scope(self, state, **pipeline):
+        return MODULE.pipeline_scope(state, SimpleNamespace(**pipeline))
+
+    def test_a_standalone_invocation_is_left_exactly_as_it_was(self):
+        """Absent arguments must never read as a new run."""
+        self.assertIsNone(self.scope({"iterations": 3}))
+        self.assertIsNone(self.scope({"iterations": 3}, pipeline_run=None))
+        self.assertIsNone(self.scope({"iterations": 3}, pipeline_run=""))
+        self.assertIsNone(
+            self.scope({"iterations": 3}, pipeline_iteration=2, pipeline_max_iterations=4)
+        )
+
+    def test_a_run_this_stage_has_not_seen_starts_a_fresh_budget(self):
+        scope = self.scope({"iterations": 7}, pipeline_run="run-a", pipeline_iteration=1)
+
+        self.assertEqual(scope["baseline"], 7)
+
+    def test_a_relaunch_within_one_iteration_does_not_buy_a_fresh_budget(self):
+        """The launch is the one event the reset must ignore."""
+        state = {
+            "iterations": 9,
+            "pipeline_budget": {"run": "run-a", "iteration": 2, "baseline": 7},
+        }
+
+        scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=2)
+
+        self.assertEqual(scope["baseline"], 7)
+
+    def test_a_stale_or_replayed_iteration_is_inert(self):
+        """Strictly greater, so a repeat and a replay both change nothing."""
+        state = {
+            "iterations": 9,
+            "pipeline_budget": {"run": "run-a", "iteration": 4, "baseline": 7},
+        }
+
+        for iteration in (1, 3, 4):
+            with self.subTest(iteration=iteration):
+                scope = self.scope(
+                    state, pipeline_run="run-a", pipeline_iteration=iteration
+                )
+                self.assertEqual(scope["baseline"], 7)
+                self.assertEqual(scope["iteration"], 4)
+
+    def test_a_genuine_advance_within_one_run_resets_the_budget(self):
+        state = {
+            "iterations": 9,
+            "pipeline_budget": {"run": "run-a", "iteration": 2, "baseline": 7},
+        }
+
+        scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
+
+        self.assertEqual(scope["baseline"], 9)
+        self.assertEqual(scope["iteration"], 3)
+
+    def test_a_new_run_resets_even_when_its_iteration_went_backwards(self):
+        """An outer iteration restarts at 1 while this state is durable per PR.
+
+        Comparing order alone would see the count go backwards on every later
+        run and never reset again, holding the pull request permanently.
+        """
+        state = {
+            "iterations": 9,
+            "pipeline_budget": {"run": "run-a", "iteration": 6, "baseline": 7},
+        }
+
+        scope = self.scope(state, pipeline_run="run-b", pipeline_iteration=1)
+
+        self.assertEqual(scope["baseline"], 9)
+        self.assertEqual(scope["iteration"], 1)
+
+    def test_the_run_is_opaque_and_only_ever_compared_for_equality(self):
+        state = {
+            "iterations": 4,
+            "pipeline_budget": {"run": "2026-05-01/7", "iteration": 1, "baseline": 2},
+        }
+
+        same = self.scope(state, pipeline_run="2026-05-01/7", pipeline_iteration=1)
+        other = self.scope(state, pipeline_run="2026-05-01/8", pipeline_iteration=1)
+
+        self.assertEqual(same["baseline"], 2)
+        self.assertEqual(other["baseline"], 4)
+
+    def test_a_run_without_an_iteration_still_resets_on_the_run(self):
+        state = {
+            "iterations": 9,
+            "pipeline_budget": {"run": "run-a", "iteration": 2, "baseline": 7},
+        }
+
+        self.assertEqual(self.scope(state, pipeline_run="run-a")["baseline"], 7)
+        self.assertEqual(self.scope(state, pipeline_run="run-b")["baseline"], 9)
 
 
 if __name__ == "__main__":

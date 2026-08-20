@@ -768,6 +768,50 @@ def stage_outcome(state: dict[str, Any]) -> str | None:
     return STAGE_OUTCOME_BY_RESULT.get(last_result, "escalated")
 
 
+def pipeline_scope(
+    state: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any] | None:
+    """Scope the iteration budget to an outer pipeline's loop rather than a launch.
+
+    An invocation is not a sound unit of budget. An outer loop relaunches a
+    stage within one iteration as a matter of course, so a budget that resets on
+    launch is reset by the one event it must ignore, and nothing bounds the
+    total.
+
+    The budget resets on a run this stage has not seen, or on an iteration
+    strictly greater than the one it recorded. A repeat, a stale relaunch, and a
+    replayed iteration are all inert. Run inequality is load-bearing on its own:
+    this state is durable and per-pull-request while an outer iteration restarts
+    at 1, so comparing order alone would see the count go backwards on a later
+    run and never reset again.
+
+    Returns ``None`` when no outer loop is driving this stage, which leaves a
+    standalone invocation as it was. Absent arguments never read as a new run.
+    """
+
+    run = getattr(args, "pipeline_run", None)
+    if not run:
+        return None
+    iteration = getattr(args, "pipeline_iteration", None)
+    recorded = state.get("pipeline_budget") or {}
+    same_run = recorded.get("run") == run
+    seen = recorded.get("iteration")
+    advanced = (
+        same_run and iteration is not None and seen is not None and iteration > seen
+    )
+    published = int(state.get("iterations", 0))
+    if not same_run or advanced:
+        return {"run": run, "iteration": iteration, "baseline": published}
+    highest = max(
+        (value for value in (seen, iteration) if value is not None), default=None
+    )
+    return {
+        "run": run,
+        "iteration": highest,
+        "baseline": int(recorded.get("baseline", published)),
+    }
+
+
 def watcher_result(
     state: dict[str, Any], result: dict[str, Any], status: str = "completed"
 ) -> dict[str, Any]:
@@ -919,7 +963,15 @@ def command_preflight(args: argparse.Namespace) -> None:
     if bot_id:
         state["copilot_bot_id"] = bot_id
     max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
-    completed_run_iterations = getattr(args, "completed_run_iterations", 0)
+    scope = pipeline_scope(state, args)
+    if scope is None:
+        completed_run_iterations = getattr(args, "completed_run_iterations", 0)
+    else:
+        state["pipeline_budget"] = scope
+        completed_run_iterations = max(0, state["iterations"] - scope["baseline"])
+        cap = getattr(args, "pipeline_max_iterations", None)
+        if cap is not None:
+            max_iterations = cap
     iteration = completed_run_iterations + 1
     review_required = not comments and not head_review_clean
     if (comments or review_required) and completed_run_iterations >= max_iterations:
@@ -953,7 +1005,7 @@ def command_preflight(args: argparse.Namespace) -> None:
             "iteration": iteration,
             "completed_run_iterations": completed_run_iterations,
             "max_iterations": max_iterations,
-            "total_iterations": state["iterations"],
+            "published_iterations": state["iterations"],
             "pr": metadata,
         }
     )
@@ -1938,6 +1990,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS
     )
     preflight.add_argument("--completed-run-iterations", type=int, default=0)
+    preflight.add_argument("--pipeline-run")
+    preflight.add_argument("--pipeline-iteration", type=int)
+    preflight.add_argument("--pipeline-max-iterations", type=int)
     preflight.set_defaults(function=command_preflight)
 
     plan = subparsers.add_parser("plan", help="record one planned review batch")
