@@ -1104,7 +1104,6 @@ def command_preflight(args: argparse.Namespace) -> None:
     state.update(
         {
             "repo_root": str(repo_root),
-            "max_iterations": max_iterations,
             "pr": metadata,
             "review": {
                 "id": f"pr-{metadata['number']}-iteration-{iteration}",
@@ -1526,46 +1525,40 @@ def recorded_clean_at_head_sha(state: dict[str, Any]) -> str | None:
     return None
 
 
-def max_iterations_for(state: dict[str, Any]) -> int:
-    value = state.get("max_iterations")
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        return DEFAULT_MAX_ITERATIONS
-    return value
-
-
-def blocked_candidate_ids(state: dict[str, Any]) -> list[int]:
-    review = state.get("review")
-    if not isinstance(review, dict):
-        return []
-    return [
-        candidate.get("id")
-        for candidate in review.get("candidates") or []
-        if candidate.get("status") == "skipped"
-    ]
-
-
-def stage_outcome(state: dict[str, Any]) -> str:
+def stage_outcome(state: dict[str, Any]) -> str | None:
     """Name this run's ending in the vocabulary an orchestrator records.
 
-    This says how the run ended. It never says whether the review is clean: that
-    stays with the recorded clean-at-head SHA, which is where a reader looks for
-    it. So `cleared` is read straight off that record and is never computed a
-    second way.
+    `resolve` is the only command that records an ending, so `cleared` is the
+    only word this state can support, and it is read straight off the same
+    clean-at-head record a reader consults for the review's cleanness. This says
+    how the run ended. It never says whether the review is clean.
 
-    A batch that validation blocked leaves uncommitted work and stops the loop,
-    and a loop at its iteration cap cannot run again, so both need a person and
-    both are `escalated`. Every other ending is `no_progress`: the run reached no
-    clean review, and its commits, if it made any, are the head's problem now
-    rather than an ending of their own.
+    Returning `None` means this state supports no claim about an ending, and the
+    field is then left out so a reader sees an absent answer rather than a
+    manufactured one. State exists from the moment `preflight` writes it, so a
+    run killed at any point leaves exactly the same state as a run still in
+    flight. Nothing in that state distinguishes them, so neither is `no_progress`
+    and neither is `escalated`.
+
+    A blocked batch and a state at its iteration cap are conditions that persist
+    across runs, not endings that happened. Both outlive the run that caused
+    them, so a run that never started would inherit them and answer for a run it
+    never made. The agent that watched the run reports those endings itself,
+    through the orchestrator's own `finish`.
+
+    A reader is entitled to take any value it finds at face value, so a value
+    this function cannot support must not appear at all.
     """
 
     if recorded_clean_at_head_sha(state) is not None:
         return "cleared"
-    if blocked_candidate_ids(state):
-        return "escalated"
-    if int(state.get("iterations", 0)) >= max_iterations_for(state):
-        return "escalated"
-    return "no_progress"
+    return None
+
+
+def stage_outcome_fields(state: dict[str, Any]) -> dict[str, str]:
+    """Carry the stage outcome only when the state supports naming one."""
+    outcome = stage_outcome(state)
+    return {"stage_outcome": outcome} if outcome else {}
 
 
 def command_status(args: argparse.Namespace) -> None:
@@ -1597,7 +1590,7 @@ def command_status(args: argparse.Namespace) -> None:
         "pr": pr,
         "review": review,
         "history": history,
-        "stage_outcome": stage_outcome(state),
+        **stage_outcome_fields(state),
         "iterations": int(state.get("iterations", 0)),
     }
     status_path = status_path_for(path)
@@ -1636,7 +1629,7 @@ def command_status(args: argparse.Namespace) -> None:
                 "history": len(history),
                 "pr_commits": len(((review or {}).get("pr_commits")) or []),
             },
-            "stage_outcome": stage_outcome(state),
+            **stage_outcome_fields(state),
             "iterations": int(state.get("iterations", 0)),
         }
     )

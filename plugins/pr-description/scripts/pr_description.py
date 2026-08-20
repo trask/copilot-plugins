@@ -1368,23 +1368,38 @@ def recorded_validated_head_sha(state: dict[str, Any]) -> str | None:
     return None
 
 
-def stage_outcome(state: dict[str, Any]) -> str:
+def stage_outcome(state: dict[str, Any]) -> str | None:
     """Name this run's ending in the vocabulary an orchestrator records.
 
-    This says how the run ended. It never says whether the description is
-    settled: that stays with the recorded validated-at-head SHA, which is where a
-    reader looks for it. So `cleared` is read straight off that record and is
-    never computed a second way. Both endings that set it count, because a
-    description this run replaced and one it confirmed unchanged are equally
-    settled.
+    `apply` and `validate` are the only commands that record an ending, so
+    `cleared` is the only word this state can support, and it is read straight
+    off the same validated-at-head record a reader consults for whether the
+    description is settled. Both endings count, because a description this run
+    replaced and one it confirmed unchanged are equally settled. This says how
+    the run ended. It never says whether the description is settled.
 
-    A run that ended without that record settled nothing, whether it stopped
-    before proposing or after, so it is `no_progress`.
+    Returning `None` means this state supports no claim about an ending, and the
+    field is then left out so a reader sees an absent answer rather than a
+    manufactured one. State exists from the moment `preflight` writes it, so a
+    run killed at any point leaves exactly the same state as a run still in
+    flight. Nothing in that state distinguishes them, so neither is
+    `no_progress`, which asserts that a run ran to completion and settled
+    nothing. Only the agent that watched the run can support that claim, and it
+    reports it through the orchestrator's own `finish`.
+
+    A reader is entitled to take any value it finds at face value, so a value
+    this function cannot support must not appear at all.
     """
 
     if recorded_validated_head_sha(state) is not None:
         return "cleared"
-    return "no_progress"
+    return None
+
+
+def stage_outcome_fields(state: dict[str, Any]) -> dict[str, str]:
+    """Carry the stage outcome only when the state supports naming one."""
+    outcome = stage_outcome(state)
+    return {"stage_outcome": outcome} if outcome else {}
 
 
 def command_status(args: argparse.Namespace) -> None:
@@ -1420,7 +1435,7 @@ def command_status(args: argparse.Namespace) -> None:
                 "runs": state.get("runs") or [],
                 "validated_head_sha": state.get("validated_head_sha"),
                 "validation": state.get("validation"),
-                "stage_outcome": stage_outcome(state),
+                **stage_outcome_fields(state),
             }
         )
         return
@@ -1437,7 +1452,7 @@ def command_status(args: argparse.Namespace) -> None:
             "proposal_count": proposal_count(state),
             "validated_head_sha": state.get("validated_head_sha"),
             "validation": state.get("validation"),
-            "stage_outcome": stage_outcome(state),
+            **stage_outcome_fields(state),
         }
     )
 

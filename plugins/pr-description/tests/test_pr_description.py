@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -526,7 +527,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.23")
+        self.assertEqual(plugin["version"], "1.0.24")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -1982,15 +1983,23 @@ class StageOutcomeTest(unittest.TestCase):
 
         self.assertEqual(envelope["stage_outcome"], "cleared")
 
-    def test_a_run_that_settled_nothing_reports_no_progress(self):
+    def test_a_run_that_settled_nothing_reports_no_outcome(self):
         pinned, _ = self.run_status()
         proposed, _ = self.run_status(
             proposal_count=1,
             proposal={"number": 1, "run_id": "run-1", "title": "New title"},
         )
 
-        self.assertEqual(pinned["stage_outcome"], "no_progress")
-        self.assertEqual(proposed["stage_outcome"], "no_progress")
+        self.assertNotIn("stage_outcome", pinned)
+        self.assertNotIn("stage_outcome", proposed)
+
+    def test_the_outcome_can_say_that_it_has_no_answer(self):
+        """A return type with no absence value has to invent an ending."""
+
+        annotation = inspect.signature(MODULE.stage_outcome).return_annotation
+
+        self.assertEqual(str(annotation).replace("'", ""), "str | None")
+        self.assertIsNone(MODULE.stage_outcome({}))
 
     def test_the_index_reports_the_same_ending(self):
         cleared, _ = self.index_status(validated_head_sha="head1")
@@ -1998,7 +2007,7 @@ class StageOutcomeTest(unittest.TestCase):
 
         self.assertEqual(cleared["result"], "ready")
         self.assertEqual(cleared["stage_outcome"], "cleared")
-        self.assertEqual(pending["stage_outcome"], "no_progress")
+        self.assertNotIn("stage_outcome", pending)
 
     def test_a_state_that_holds_no_run_reports_no_outcome(self):
         target = MODULE.parse_target("owner/repo#7")
@@ -2043,16 +2052,19 @@ class StageOutcomeTest(unittest.TestCase):
         for overrides in runs:
             with self.subTest(kind="run", overrides=overrides):
                 envelope, state = self.run_status(**overrides)
-                cleared = self.marker_of(state) is not None
-                self.assertEqual(envelope["stage_outcome"] == "cleared", cleared)
-                self.assertIn(
-                    envelope["stage_outcome"],
-                    {"cleared", "skipped", "no_progress", "escalated"},
-                )
+                self.assert_outcome_tracks_the_marker(envelope, state)
             with self.subTest(kind="index", overrides=overrides):
                 envelope, state = self.index_status(**overrides)
-                cleared = self.marker_of(state) is not None
-                self.assertEqual(envelope["stage_outcome"] == "cleared", cleared)
+                self.assert_outcome_tracks_the_marker(envelope, state)
+
+    def assert_outcome_tracks_the_marker(self, envelope, state):
+        marker = self.marker_of(state)
+        cleared = marker is not None
+        self.assertEqual(envelope.get("stage_outcome") == "cleared", cleared)
+        if cleared:
+            self.assertEqual(envelope["validated_head_sha"], marker)
+        else:
+            self.assertNotIn("stage_outcome", envelope)
 
 
 class ParserShapeTest(unittest.TestCase):

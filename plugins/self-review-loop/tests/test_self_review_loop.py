@@ -1,5 +1,6 @@
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 from pathlib import Path
@@ -223,13 +224,20 @@ class AgentInstructionsTest(unittest.TestCase):
 
     def test_allows_focused_runtime_evidence_without_duplicating_ci(self):
         self.assertIn(
-            "Skip a local test suite, and any other check whose only purpose is to "
-            "repeat CI during review",
+            "Skip a blanket run of the test suite, and any other check whose only "
+            "purpose is to repeat CI during review",
             self.instructions,
         )
         self.assertIn(
-            "CI owns the routine build, lint, and test validation before this loop "
-            "edits anything",
+            "CI runs the suite before this loop edits anything, so running it again "
+            "here settles nothing",
+            self.instructions,
+        )
+        self.assertIn(
+            "Everything else about tests belongs to this review: read the test code "
+            "the pull request changes, investigate a test when it bears on a "
+            "candidate, and run a targeted test when that is how you answer a "
+            "question about the change",
             self.instructions,
         )
         self.assertIn(
@@ -250,6 +258,27 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn(
             "do not widen the probe into general validation", self.instructions
+        )
+
+    def test_reviews_for_suppressed_test_coverage(self):
+        self.assertIn(
+            "Treat suppressed coverage as a defect only a reviewer catches",
+            self.instructions,
+        )
+        self.assertIn(
+            "A deleted assertion, an added skip or disable annotation, a loosened "
+            "matcher or widened tolerance, and an exception swallowed inside a test "
+            "each turn a check green by asking less of the code",
+            self.instructions,
+        )
+        self.assertIn(
+            "register a candidate that says exactly what is no longer checked",
+            self.instructions,
+        )
+        self.assertIn(
+            "Judge the edit on that, not on its size or on the rationale attached "
+            "to it",
+            self.instructions,
         )
 
     def test_commit_body_uses_the_review_finding_label(self):
@@ -2451,60 +2480,24 @@ class StageOutcomeTest(unittest.TestCase):
         self.assertEqual(result["result"], "ready")
         self.assertEqual(result["stage_outcome"], "cleared")
 
-    def test_a_batch_validation_blocked_escalates(self):
+    def test_a_batch_validation_blocked_reports_no_outcome(self):
         review = self.review(
             candidates=[{"id": 1, "status": "skipped", "path": "app.py"}],
             batches=[{"id": "batch-1", "status": "skipped"}],
         )
 
-        envelope, _ = self.status(review=review)
+        envelope, result = self.status(review=review)
 
-        self.assertEqual(envelope["stage_outcome"], "escalated")
+        self.assertNotIn("stage_outcome", envelope)
+        self.assertNotIn("stage_outcome", result)
 
-    def test_the_iteration_cap_escalates(self):
-        envelope, _ = self.status(iterations=MODULE.DEFAULT_MAX_ITERATIONS)
+    def test_the_iteration_cap_reports_no_outcome(self):
+        envelope, result = self.status(iterations=MODULE.DEFAULT_MAX_ITERATIONS)
 
-        self.assertEqual(envelope["stage_outcome"], "escalated")
+        self.assertNotIn("stage_outcome", envelope)
+        self.assertNotIn("stage_outcome", result)
 
-    def test_the_recorded_cap_beats_the_default(self):
-        below, _ = self.status(iterations=5, max_iterations=8)
-        at, _ = self.status(iterations=8, max_iterations=8)
-
-        self.assertEqual(below["stage_outcome"], "no_progress")
-        self.assertEqual(at["stage_outcome"], "escalated")
-
-    def test_preflight_records_the_cap_it_enforced(self):
-        state_path = write_state(self.directory)
-        with (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.directory),
-            mock.patch.object(
-                MODULE,
-                "metadata_for",
-                side_effect=[
-                    {**MODULE.load_state(state_path)["pr"], "commits": []},
-                    {**MODULE.load_state(state_path)["pr"], "commits": []},
-                ],
-            ),
-            mock.patch.object(MODULE, "git", return_value=""),
-            mock.patch.object(MODULE, "checkout_pr", return_value=False),
-            mock.patch.object(MODULE, "require_checkout_head"),
-            mock.patch.object(MODULE, "fetch_authoritative_diff", return_value=DIFF),
-            mock.patch.object(MODULE, "commit_provenance", return_value=[]),
-            mock.patch.object(MODULE, "run"),
-        ):
-            MODULE.command_preflight(
-                SimpleNamespace(
-                    target="owner/repo#7",
-                    repo_root=str(self.directory),
-                    state=str(state_path),
-                    max_iterations=3,
-                )
-            )
-
-        self.assertEqual(MODULE.load_state(state_path)["max_iterations"], 3)
-
-    def test_an_unfinished_review_reports_no_progress(self):
+    def test_an_unfinished_review_reports_no_outcome(self):
         pending, _ = self.status(
             review=self.review(
                 candidates=[{"id": 1, "status": "pending", "path": "app.py"}]
@@ -2515,8 +2508,16 @@ class StageOutcomeTest(unittest.TestCase):
             iterations=1,
         )
 
-        self.assertEqual(pending["stage_outcome"], "no_progress")
-        self.assertEqual(published["stage_outcome"], "no_progress")
+        self.assertNotIn("stage_outcome", pending)
+        self.assertNotIn("stage_outcome", published)
+
+    def test_the_outcome_can_say_that_it_has_no_answer(self):
+        """A return type with no absence value has to invent an ending."""
+
+        annotation = inspect.signature(MODULE.stage_outcome).return_annotation
+
+        self.assertEqual(str(annotation).replace("'", ""), "str | None")
+        self.assertIsNone(MODULE.stage_outcome({}))
 
     def test_a_state_that_holds_no_run_reports_no_outcome(self):
         target = MODULE.parse_target("owner/repo#7")
@@ -2563,13 +2564,16 @@ class StageOutcomeTest(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 envelope, result = self.status(**overrides)
                 state = MODULE.load_state(self.directory / "state.json")
-                cleared = self.marker_of(state) is not None
-                self.assertEqual(envelope["stage_outcome"] == "cleared", cleared)
-                self.assertEqual(result["stage_outcome"] == "cleared", cleared)
-                self.assertIn(
-                    envelope["stage_outcome"],
-                    {"cleared", "skipped", "no_progress", "escalated"},
-                )
+                marker = self.marker_of(state)
+                cleared = marker is not None
+                self.assertEqual(envelope.get("stage_outcome") == "cleared", cleared)
+                self.assertEqual(result.get("stage_outcome") == "cleared", cleared)
+                if cleared:
+                    self.assertEqual(envelope["review"]["clean_at_head_sha"], marker)
+                    self.assertEqual(result["review"]["clean_at_head_sha"], marker)
+                else:
+                    self.assertNotIn("stage_outcome", envelope)
+                    self.assertNotIn("stage_outcome", result)
 
 
 if __name__ == "__main__":
