@@ -144,7 +144,7 @@ Repeat until `next` returns `complete` or `escalate`:
 2. On `escalate`, go to **Escalation**.
 3. On `complete`, go to **Finishing**.
 4. On `run_stage`, launch the stage named in `plan`:
-   - **Child session:** call `create_session` with the project holding this repository, `kickoff.agent` set to the plan's `agent`, `kickoff.prompt` set to the plan's `target`, `kickoff.model` set to the plan's `model`, `kickoff.mode` set to `autopilot`, `kickoff.reasoning_effort` set to the plan's `effort`, `notify_on_idle` set to `once`, and `name` set to the plan's `session_name`.
+   - **Child session:** call `create_session` with the project holding this repository, `kickoff.agent` set to the plan's `agent`, `kickoff.prompt` set to the plan's `prompt`, `kickoff.model` set to the plan's `model`, `kickoff.mode` set to `autopilot`, `kickoff.reasoning_effort` set to the plan's `effort`, `notify_on_idle` set to `once`, and `name` set to the plan's `session_name`. Use `prompt` and never `target`: `target` names the pull request alone, while `prompt` also carries the pipeline's position, and a stage launched without it silently keeps its own budget.
    - **Subprocess:** run the plan's `command` verbatim with `execute`. Give it no timeout you would not give a long review, because a check wait can run for an hour.
 5. Immediately record the launch with `start --stage <plan stage> --head <the head the plan reported> --launch <path>`, passing `--session` or `--process` when you have one.
 6. Wait for the stage to finish. For a child session, wait for the idle notification and confirm with `get_session`. For a subprocess, wait for the command to exit.

@@ -1700,19 +1700,36 @@ def pipeline_position_arguments(
     ]
 
 
+def position_line(arguments: list[str]) -> str:
+    """Render the pipeline's position as the keyed line a stage looks for.
+
+    A stage triggers on a line of keyed values rather than on the flags, so the
+    flags alone would leave its instruction waiting for something that never
+    arrives and its budget quietly unscoped.
+    """
+
+    pairs = zip(arguments[::2], arguments[1::2])
+    return " ".join(f"{flag.lstrip('-')}: {value}" for flag, value in pairs)
+
+
 def launch_prompt(target: str, arguments: list[str]) -> str:
     """Build the prompt that launches one stage.
 
     The pipeline's position reaches a stage through the prompt because that is
     the only channel both launch paths share: a child session gets no
-    environment of its own. The arguments are spelled out exactly as they must
-    be typed, so the stage copies them rather than translating anything.
+    environment of its own.
+
+    It goes in both spellings a stage may key on: the keyed line one watches
+    for, and the flags exactly as they must be typed. Sending only the spelling
+    a particular stage does not read would drop the position silently, leaving
+    that stage on its own budget while every report still says the stage ran.
     """
 
     if not arguments:
         return target
     return (
         f"{target}\n\n"
+        f"{position_line(arguments)}\n\n"
         "Add these arguments to your preflight command, exactly as written, "
         f"and change nothing else about how you run: {' '.join(arguments)}"
     )

@@ -1990,8 +1990,42 @@ class LaunchPlanTest(unittest.TestCase):
             "--pipeline-max-iterations 4",
             plan["prompt"],
         )
+        self.assertIn(
+            "pipeline-run: abc123 pipeline-iteration: 2 "
+            "pipeline-max-iterations: 4",
+            plan["prompt"],
+        )
         self.assertTrue(plan["prompt"].startswith("owner/repo#7"))
         self.assertEqual(plan["prompt"], plan["command"][2])
+
+    def test_the_position_goes_out_in_both_spellings_a_stage_may_read(self):
+        # Stages key on different spellings of the same position: one watches
+        # for the keyed line, another for the flags. A stage that never sees
+        # the spelling it reads keeps its own budget, and says nothing about
+        # having done so, so both go out every time.
+        self.accepts.return_value = True
+        state = build_state(iteration=2, max_iterations=4)
+        state["run_id"] = "abc123"
+        prompt = MODULE.launch_plan(state, MODULE.STAGE_CI)["prompt"]
+        for spelling in (
+            "pipeline-run: abc123",
+            "pipeline-iteration: 2",
+            "pipeline-max-iterations: 4",
+            "--pipeline-run abc123",
+            "--pipeline-iteration 2",
+            "--pipeline-max-iterations 4",
+        ):
+            with self.subTest(spelling=spelling):
+                self.assertIn(spelling, prompt)
+
+    def test_the_keyed_line_never_reads_as_a_flag(self):
+        # The keyed line and the flag list carry the same values, so the keyed
+        # one has to stay distinguishable from the flags a stage copies.
+        line = MODULE.position_line(
+            ["--pipeline-run", "abc123", "--pipeline-iteration", "2"]
+        )
+        self.assertEqual("pipeline-run: abc123 pipeline-iteration: 2", line)
+        self.assertNotIn("--", line)
 
     def test_a_stage_that_does_not_take_the_position_is_never_sent_it(self):
         # An older helper would stop on an unrecognized argument, so a stage
@@ -3607,6 +3641,17 @@ class HelperNeverPromotesTest(unittest.TestCase):
 class AgentInstructionsTest(unittest.TestCase):
     def setUp(self):
         self.instructions = AGENT.read_text(encoding="utf-8")
+
+    def test_both_launch_paths_carry_the_pipelines_position(self):
+        # The plan offers target and prompt, and only prompt carries the
+        # position. A child session launched from target would run the stage
+        # correctly on its own budget and report nothing amiss, so the
+        # difference between the two fields is stated where it is used.
+        self.assertIn("`kickoff.prompt` set to the plan's `prompt`", self.instructions)
+        self.assertNotIn(
+            "`kickoff.prompt` set to the plan's `target`", self.instructions
+        )
+        self.assertIn("Use `prompt` and never `target`", self.instructions)
 
     def test_frontmatter_matches_the_sibling_shape(self):
         self.assertIn("name: PR Pipeline", self.instructions)
