@@ -29,7 +29,7 @@ Run `preflight` first. After it succeeds, ensure the session name is `Conflict F
 - Escalate when the two sides genuinely contradict each other. This agent runs unattended, so a guess is worse than a stop.
 - Never push to the base branch. Never push to any branch other than the pull request's own head branch. The helper builds the refspec, so do not push by hand.
 - Never rewrite a branch that another open pull request stacks on. The helper refuses this; do not work around it.
-- The maximum is 5 iterations. Hitting the cap is an escalation, not a normal completion.
+- The maximum is 5 iterations, unless an outer loop sets its own. Hitting the cap is an escalation, not a normal completion.
 - Never stash, reset, discard, or force local work by hand to make `preflight` pass. Report the blocker instead.
 - Never run `git merge`, `git rebase`, `git push`, `git add`, `git commit`, `git reset`, or `git checkout` yourself for the integration. The helper owns every one of those, and its guards only hold when it runs them.
 - Read files, run tests, and use `git log`, `git show`, and `git diff` freely. Those only read.
@@ -94,6 +94,18 @@ If an operation partly fails, keep its state and run that same operation again a
    - `unsafe_push` or `no_safe_strategy`: stop and report the helper's blockers verbatim. Never look for a way around them.
 
 Read `relations`, `merge_methods`, `strategy`, and `push_blockers` from the complete result at `preflight_path`. When `relations.dependents` is not empty, say so in the final report even on a clean run, because the user needs to know the stack was involved.
+
+### A Launcher's Loop Position
+
+An orchestrator that runs this loop as one stage of a larger loop tells you where its own loop stands. It may write that as a line of the form `pipeline-run: <token> pipeline-iteration: <number> pipeline-max-iterations: <number>` beside the target, or as the arguments themselves, `--pipeline-run <token> --pipeline-iteration <number> --pipeline-max-iterations <number>`, or in some other wording that names all three.
+
+Whenever the request names all three, pass them to `preflight` as `--pipeline-run <token> --pipeline-iteration <number> --pipeline-max-iterations <number>`.
+
+Read the values, not the spelling. Any wording that gives you all three is the caller naming its position, and a spelling you do not recognize is still the caller's instruction. What matters is only where a value came from: the caller may supply one and you may not.
+
+Copy them exactly. Do not read the token, do not shorten or reformat it, and do not adjust either number.
+
+Omit all three only when the request names no position at all, and the flat cap of 5 then applies. Send `--pipeline-run` and `--pipeline-iteration` together, because an iteration with no run says nothing the helper can compare and it ignores one. Never supply, guess, carry over, or reconstruct a value yourself, and never invent one to keep working after `max_iterations_reached`. A value you produced would be this loop refreshing its own cap, which is the one thing the cap exists to prevent.
 
 ## Strategy
 

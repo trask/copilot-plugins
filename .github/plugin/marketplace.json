@@ -23,7 +23,7 @@
     {
       "name": "self-review-loop",
       "description": "Review a GitHub pull request, verify each finding independently, and commit the fixes without posting review comments.",
-      "version": "1.1.9",
+      "version": "1.1.10",
       "source": "./plugins/self-review-loop"
     },
     {
@@ -41,7 +41,7 @@
     {
       "name": "conflict-fix-loop",
       "description": "Resolve merge conflicts on a pull request by keeping both sides' intent, then push and repeat until GitHub reports it mergeable.",
-      "version": "1.0.6",
+      "version": "1.0.7",
       "source": "./plugins/conflict-fix-loop"
     },
     {

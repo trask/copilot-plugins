@@ -310,7 +310,7 @@ class AgentInstructionsTest(unittest.TestCase):
             "The loop is `preflight -> review -> evaluate -> batch -> commit -> publish`",
             self.instructions,
         )
-        self.assertIn("The maximum is 5 iterations.", self.instructions)
+        self.assertIn("The maximum is 5 iterations,", self.instructions)
         self.assertIn("`max_iterations_reached`", self.instructions)
         self.assertIn("`nothing_to_publish`", self.instructions)
         self.assertIn(
@@ -2574,6 +2574,395 @@ class StageOutcomeTest(unittest.TestCase):
                 else:
                     self.assertNotIn("stage_outcome", envelope)
                     self.assertNotIn("stage_outcome", result)
+
+
+
+class PipelineBudgetTest(unittest.TestCase):
+    """A stage budget belongs to an outer loop's iteration, not to a launch."""
+
+    RECORDED = {"run": "run-a", "iteration": 2, "baseline": 3, "run_baseline": 1}
+
+    def scope(self, state, **pipeline):
+        return MODULE.pipeline_scope(state, SimpleNamespace(**pipeline))
+
+    def test_a_standalone_invocation_is_left_exactly_as_it_was(self):
+        """Absent, empty, and unusable run tokens must never read as a new run."""
+        for pipeline in (
+            {},
+            {"pipeline_run": None, "pipeline_iteration": None},
+            {"pipeline_run": "", "pipeline_iteration": 2},
+            {"pipeline_run": 7, "pipeline_iteration": 2},
+            {"pipeline_iteration": 2},
+            {"pipeline_iteration": 2, "pipeline_max_iterations": 3},
+        ):
+            with self.subTest(pipeline=pipeline):
+                self.assertIsNone(self.scope({"iterations": 3}, **pipeline))
+
+    def test_the_run_token_alone_decides_whether_the_budget_is_scoped(self):
+        """Enumerate every subset of the three arguments rather than assert it in prose.
+
+        The two halves are not symmetric for a reader. An iteration with no run
+        asks which run it belongs to and nothing can answer it. A run with no
+        iteration still answers what the token is for, whether this loop has seen
+        the run before, so it scopes on equality alone. Only the outer cap is
+        optional in the other sense: leaving it out falls back rather than lifting
+        the ceiling.
+        """
+        parts = {
+            "run": {"pipeline_run": "run-a"},
+            "iteration": {"pipeline_iteration": 2},
+            "cap": {"pipeline_max_iterations": 3},
+        }
+        scoped_by_names = {
+            (): False,
+            ("run",): True,
+            ("iteration",): False,
+            ("cap",): False,
+            ("run", "cap"): True,
+            ("iteration", "cap"): False,
+            ("run", "iteration"): True,
+            ("run", "iteration", "cap"): True,
+        }
+        for names, scoped in scoped_by_names.items():
+            with self.subTest(names=names):
+                pipeline = {}
+                for name in names:
+                    pipeline.update(parts[name])
+                scope = self.scope({"iterations": 9}, **pipeline)
+                self.assertEqual(scoped, scope is not None)
+                self.assertEqual(
+                    scoped,
+                    MODULE.absolute_iteration_cap(
+                        scope, 5, pipeline.get("pipeline_max_iterations")
+                    )
+                    is not None,
+                )
+
+    def test_a_lone_run_token_resets_once_and_is_inert_on_every_relaunch(self):
+        """This is what makes the degraded case coarser rather than launch-scoped.
+
+        The caller mints one token per run and repeats it on every relaunch inside
+        that run, so equality alone still tells a first sighting from a repeat. The
+        budget therefore refreshes once when the run arrives and never again while
+        it lasts, which is the stricter direction, not the unbounded one.
+        """
+        state = {"iterations": 5}
+
+        first = self.scope(state, pipeline_run="run-a")
+        self.assertEqual(5, first["baseline"])
+        self.assertEqual(5, first["run_baseline"])
+
+        state["pipeline_budget"] = first
+        for spent in (5, 7, 40):
+            with self.subTest(spent=spent):
+                state["iterations"] = spent
+                relaunch = self.scope(state, pipeline_run="run-a")
+                self.assertEqual(5, relaunch["baseline"])
+                self.assertEqual(5, relaunch["run_baseline"])
+
+        state["iterations"] = 40
+        next_run = self.scope(state, pipeline_run="run-b")
+        self.assertEqual(40, next_run["baseline"])
+        self.assertEqual(40, next_run["run_baseline"])
+
+    def test_an_unusable_iteration_degrades_rather_than_refusing_the_pull_request(self):
+        """Ignoring the run outright is the permanent refusal this contract removes.
+
+        The durable count only ever climbs, so a position this loop discarded would
+        leave a pull request that already reached the cap refusing every later run
+        for the rest of its life. The usable half is used instead.
+        """
+        for iteration in (None, 0, -1, True, "2", 1.5):
+            with self.subTest(iteration=iteration):
+                scope = self.scope(
+                    {"iterations": 5}, pipeline_run="run-a", pipeline_iteration=iteration
+                )
+                self.assertIsNotNone(scope)
+                self.assertIsNone(
+                    MODULE.exhausted_budget({"iterations": 5}, scope, 5, 10)
+                )
+
+    def test_an_iteration_with_no_run_cannot_be_completed_by_this_loops_own_state(self):
+        """A run token must come from the caller, never from what this loop recorded.
+
+        Reading it back out of an earlier budget, a head it pushed, or an
+        escalation it wrote would be this loop naming its own position.
+        """
+        states = (
+            {},
+            {"iterations": 4},
+            {"iterations": 4, "pipeline_budget": dict(self.RECORDED)},
+            {"iterations": 4, "pr": {"head_sha": "aaaa"}, "history": [{"id": "one"}]},
+            {"iterations": 4, "escalation": {"kind": "max_iterations"}},
+            {"iterations": 4, "clean_at_head_sha": "aaaa"},
+        )
+        for state in states:
+            with self.subTest(state=state):
+                self.assertIsNone(
+                    self.scope(dict(state), pipeline_iteration=2, pipeline_max_iterations=3)
+                )
+
+    def test_only_the_position_the_caller_passes_can_reset_the_budget(self):
+        """Enumerate the inputs to a reset instead of claiming the property in prose.
+
+        A repeat of one position stays inert no matter what this loop did in
+        between: a new head, a commit it pushed, an escalation it recorded, a
+        clearance, or more iterations it spent. Every one of those varies here
+        while the caller's values stay the same, and neither baseline moves.
+        """
+        observable = (
+            {},
+            {"pr": {"head_sha": "new-head"}},
+            {"pr": {"head_sha": "another-head"}, "attempt": {"status": "published"}},
+            {"escalation": {"kind": "max_iterations"}},
+            {"history": [{"id": "one"}, {"id": "two"}]},
+            {"clean_at_head_sha": "new-head"},
+            {"last_result": "published"},
+        )
+        for spent in (0, 3, 5, 40):
+            for extra in observable:
+                with self.subTest(spent=spent, extra=extra):
+                    state = {
+                        "iterations": spent,
+                        "pipeline_budget": dict(self.RECORDED),
+                        **extra,
+                    }
+                    scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=2)
+                    self.assertEqual(self.RECORDED, scope)
+
+    def test_a_stale_or_replayed_iteration_is_inert(self):
+        """Strictly greater, so a repeat and a replay both buy nothing."""
+        for iteration in (1, 2):
+            with self.subTest(iteration=iteration):
+                state = {"iterations": 9, "pipeline_budget": dict(self.RECORDED)}
+                scope = self.scope(
+                    state, pipeline_run="run-a", pipeline_iteration=iteration
+                )
+                self.assertEqual(self.RECORDED, scope)
+
+    def test_a_genuine_advance_refreshes_only_the_per_iteration_budget(self):
+        """The whole-run ceiling must survive an advance, or it bounds nothing."""
+        state = {"iterations": 9, "pipeline_budget": dict(self.RECORDED)}
+
+        scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
+
+        self.assertEqual(
+            {"run": "run-a", "iteration": 3, "baseline": 9, "run_baseline": 1}, scope
+        )
+
+    def test_a_first_iteration_inside_a_run_scoped_budget_is_not_an_advance(self):
+        """Nothing was recorded to advance past, so the run's own reset still stands."""
+        state = {
+            "iterations": 9,
+            "pipeline_budget": {
+                "run": "run-a",
+                "iteration": None,
+                "baseline": 5,
+                "run_baseline": 5,
+            },
+        }
+
+        scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
+
+        self.assertEqual(
+            {"run": "run-a", "iteration": 3, "baseline": 5, "run_baseline": 5}, scope
+        )
+
+    def test_a_new_run_resets_both_budgets_even_when_its_iteration_went_backwards(self):
+        """An outer run restarts at 1 while this state is durable per pull request.
+
+        Comparing order alone would see the count go backwards on every later run
+        and never reset again, refusing the pull request for the rest of its life.
+        """
+        state = {
+            "iterations": 9,
+            "pipeline_budget": {
+                "run": "run-a",
+                "iteration": 6,
+                "baseline": 7,
+                "run_baseline": 2,
+            },
+        }
+
+        scope = self.scope(state, pipeline_run="run-b", pipeline_iteration=1)
+
+        self.assertEqual(
+            {"run": "run-b", "iteration": 1, "baseline": 9, "run_baseline": 9}, scope
+        )
+
+    def test_the_run_is_opaque_and_only_ever_compared_for_equality(self):
+        """Tokens that would sort or parse are still just tokens."""
+        state = {
+            "iterations": 4,
+            "pipeline_budget": {
+                "run": "2026-05-01/7",
+                "iteration": 3,
+                "baseline": 2,
+                "run_baseline": 0,
+            },
+        }
+
+        same = self.scope(state, pipeline_run="2026-05-01/7", pipeline_iteration=3)
+        self.assertEqual(2, same["baseline"])
+        for other in ("2026-05-01/8", "2026-04-01/7", "7", "run", " 2026-05-01/7"):
+            with self.subTest(other=other):
+                scope = self.scope(state, pipeline_run=other, pipeline_iteration=3)
+                self.assertEqual(4, scope["baseline"])
+                self.assertEqual(4, scope["run_baseline"])
+
+    def test_a_reset_never_rewrites_the_durable_count_itself(self):
+        """Both budgets are baselines, so the per-PR iteration numbering stays monotone.
+
+        Zeroing the count instead would restart the numbering, and an attempt id
+        built from it would collide with one already folded into history, where a
+        duplicate is dropped rather than recorded.
+        """
+        state = {"iterations": 9, "pipeline_budget": dict(self.RECORDED)}
+
+        self.scope(state, pipeline_run="run-b", pipeline_iteration=1)
+
+        self.assertEqual(9, state["iterations"])
+
+    def test_the_ceiling_is_derived_from_the_callers_own_cap(self):
+        scope = {"run": "run-a", "iteration": 1, "baseline": 0, "run_baseline": 0}
+        self.assertEqual(15, MODULE.absolute_iteration_cap(scope, 5, 3))
+        self.assertEqual(20, MODULE.absolute_iteration_cap(scope, 10, 2))
+
+    def test_an_omitted_outer_cap_falls_back_rather_than_disabling_the_ceiling(self):
+        """Only the outer cap is optional, and omitting it must not remove the bound."""
+        scope = {"run": "run-a", "iteration": 1, "baseline": 0, "run_baseline": 0}
+        for value in (None, 0, -1, True, "3"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    5 * MODULE.DEFAULT_PIPELINE_MAX_ITERATIONS,
+                    MODULE.absolute_iteration_cap(scope, 5, value),
+                )
+
+    def test_a_standalone_run_keeps_the_flat_per_pull_request_cap(self):
+        """No arguments means the behavior this loop has always had."""
+        for spent, expected in ((0, None), (4, None), (5, "iteration"), (9, "iteration")):
+            with self.subTest(spent=spent):
+                self.assertEqual(
+                    expected,
+                    MODULE.exhausted_budget({"iterations": spent}, None, 5, None),
+                )
+
+    def test_a_scoped_run_spends_against_its_baseline_and_not_the_lifetime_count(self):
+        """A spent brake must not read as a permanent refusal.
+
+        Ninety iterations over the pull request's life say nothing about the run
+        that just started, which has spent none of its own budget.
+        """
+        scope = {"run": "run-a", "iteration": 1, "baseline": 90, "run_baseline": 90}
+        self.assertIsNone(MODULE.exhausted_budget({"iterations": 90}, scope, 5, 10))
+        self.assertIsNone(MODULE.exhausted_budget({"iterations": 94}, scope, 5, 10))
+        self.assertEqual(
+            "iteration", MODULE.exhausted_budget({"iterations": 95}, scope, 5, 10)
+        )
+
+    def test_the_whole_run_ceiling_holds_even_when_every_iteration_looks_fresh(self):
+        """A caller that keeps advancing must still not spend without end."""
+        scope = {"run": "run-a", "iteration": 4, "baseline": 10, "run_baseline": 0}
+        self.assertEqual(
+            "absolute", MODULE.exhausted_budget({"iterations": 10}, scope, 5, 10)
+        )
+        self.assertIsNone(MODULE.exhausted_budget({"iterations": 9}, scope, 5, 10))
+
+    def test_preflight_takes_the_position_and_defaults_it_to_absent(self):
+        parser = MODULE.build_parser()
+
+        bare = parser.parse_args(["preflight"])
+        self.assertIsNone(bare.pipeline_run)
+        self.assertIsNone(bare.pipeline_iteration)
+        self.assertIsNone(bare.pipeline_max_iterations)
+
+        given = parser.parse_args(
+            [
+                "preflight",
+                "--pipeline-run",
+                "run-a",
+                "--pipeline-iteration",
+                "2",
+                "--pipeline-max-iterations",
+                "3",
+            ]
+        )
+        self.assertEqual("run-a", given.pipeline_run)
+        self.assertEqual(2, given.pipeline_iteration)
+        self.assertEqual(3, given.pipeline_max_iterations)
+
+    def test_the_helper_advertises_the_flag_an_orchestrator_probes_for(self):
+        """An orchestrator reads the installed script to decide whether to send it.
+
+        It omits the position entirely when the flag is missing, so renaming it
+        would silently leave this stage unscoped rather than fail.
+        """
+        self.assertIn("--pipeline-run", SCRIPT.read_text(encoding="utf-8"))
+
+
+class LauncherPositionInstructionsTest(unittest.TestCase):
+    """The agent file has to take a position however the caller words it."""
+
+    def setUp(self):
+        self.instructions = AGENT.read_text(encoding="utf-8")
+
+    def test_the_position_reaches_preflight_as_the_three_arguments(self):
+        self.assertIn("### A Launcher's Loop Position", self.instructions)
+        self.assertIn(
+            "--pipeline-run <token> --pipeline-iteration <number> "
+            "--pipeline-max-iterations <number>",
+            self.instructions,
+        )
+        self.assertIn("Copy them exactly. Do not read the token", self.instructions)
+
+    def test_keys_the_position_on_the_values_rather_than_one_spelling(self):
+        """A launcher that words it differently still gets its budget scoped.
+
+        Making one phrasing the trigger drops a position supplied any other way,
+        and it drops it silently: the run reports cleanly and the budget was
+        simply never scoped. What makes the widening safe is where a value came
+        from, not how it was written.
+        """
+        self.assertIn("Read the values, not the spelling.", self.instructions)
+        self.assertIn(
+            "a spelling you do not recognize is still the caller's instruction",
+            self.instructions,
+        )
+        self.assertIn("the caller may supply one and you may not", self.instructions)
+
+    def test_the_two_halves_go_out_together_as_a_rule_on_the_sender(self):
+        """The pairing binds what a launcher emits, never what this loop accepts.
+
+        Reading it as a receiver rule would have this loop discard a position that
+        arrived with a half missing, and its durable count would then refuse the
+        pull request for good.
+        """
+        self.assertIn(
+            "Omit all three only when the request names no position at all",
+            self.instructions,
+        )
+        self.assertIn(
+            "Send `--pipeline-run` and `--pipeline-iteration` together",
+            self.instructions,
+        )
+        self.assertNotIn("the helper ignores a lone one", self.instructions)
+
+    def test_the_loop_may_never_supply_a_value_itself(self):
+        self.assertIn(
+            "Never supply, guess, carry over, or reconstruct a value yourself",
+            self.instructions,
+        )
+        self.assertIn(
+            "never invent one to keep working after `max_iterations_reached`",
+            self.instructions,
+        )
+        self.assertIn(
+            "A value you produced would be this loop refreshing its own cap",
+            self.instructions,
+        )
+
+    def test_the_flat_cap_is_stated_as_a_default_an_outer_loop_may_replace(self):
+        self.assertIn("unless an outer loop sets its own", self.instructions)
 
 
 if __name__ == "__main__":

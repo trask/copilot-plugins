@@ -1044,21 +1044,17 @@ def compare_history_commits(
     ]
 
 
-def pipeline_position(pipeline_run: Any, pipeline_iteration: Any) -> tuple[str, int] | None:
-    """Read the caller's loop position, or nothing when it named none.
+def pipeline_iteration_value(pipeline_iteration: Any) -> int | None:
+    """Read the caller's loop counter, or nothing when it named no usable one.
 
-    Both halves are required. A run identity with no iteration says nothing about
-    whether the loop advanced, and an iteration with no run identity cannot be
-    told apart from the same number in a different run, so either alone is treated
-    as absent rather than guessed at.
+    An iteration this loop cannot compare is treated as absent rather than
+    guessed at, which leaves the run token to scope the budget on its own.
     """
-    if not isinstance(pipeline_run, str) or not pipeline_run:
-        return None
     if isinstance(pipeline_iteration, bool) or not isinstance(pipeline_iteration, int):
         return None
     if pipeline_iteration < 1:
         return None
-    return pipeline_run, pipeline_iteration
+    return pipeline_iteration
 
 
 def whole_number(value: Any, fallback: int) -> int:
@@ -1092,6 +1088,15 @@ def pipeline_scope(
     Within a run the comparison stays strict, so a relaunch replaying an earlier
     iteration, or repeating the current one, buys nothing.
 
+    The two halves are not symmetric for a reader. An iteration with no run asks
+    which run it belongs to and nothing can answer, so it is ignored. A run with
+    no iteration still answers the question the run token exists for, whether this
+    loop has seen the run before, so it scopes the budget on equality alone. The
+    caller mints one token per run and repeats it on every relaunch, so that
+    degrades to a coarser run-scoped budget rather than to a launch-scoped one.
+    Ignoring it instead would leave the durable count untouched and refuse a pull
+    request that already reached the cap for the rest of its life.
+
     Both budgets are expressed as baselines against the durable per-pull-request
     count, so a reset never rewrites that count. ``baseline`` moves on every
     advance and bounds one outer iteration. ``run_baseline`` moves only on a new
@@ -1101,12 +1106,10 @@ def pipeline_scope(
     standalone invocation exactly as it was. Absent arguments never read as a new
     run.
     """
-    position = pipeline_position(
-        getattr(args, "pipeline_run", None), getattr(args, "pipeline_iteration", None)
-    )
-    if position is None:
+    run = getattr(args, "pipeline_run", None)
+    if not isinstance(run, str) or not run:
         return None
-    run, iteration = position
+    iteration = pipeline_iteration_value(getattr(args, "pipeline_iteration", None))
     spent = int(state.get("iterations", 0))
     recorded = state.get("pipeline_budget") or {}
     if recorded.get("run") != run:
@@ -1117,7 +1120,8 @@ def pipeline_scope(
             "run_baseline": spent,
         }
     run_baseline = whole_number(recorded.get("run_baseline"), spent)
-    if iteration > whole_number(recorded.get("iteration"), 0):
+    seen = pipeline_iteration_value(recorded.get("iteration"))
+    if iteration is not None and seen is not None and iteration > seen:
         return {
             "run": run,
             "iteration": iteration,
@@ -1126,7 +1130,9 @@ def pipeline_scope(
         }
     return {
         "run": run,
-        "iteration": whole_number(recorded.get("iteration"), iteration),
+        "iteration": max(
+            (value for value in (seen, iteration) if value is not None), default=None
+        ),
         "baseline": whole_number(recorded.get("baseline"), spent),
         "run_baseline": run_baseline,
     }
