@@ -250,6 +250,110 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
 
+    def test_defines_the_bar_each_evaluator_judges_against(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn("## Evaluation Standard", instructions)
+        self.assertIn(
+            "Give it the **Evaluation Standard** as well, and require two "
+            "independent decisions, each judged against that standard and "
+            "supported by evidence",
+            instructions,
+        )
+        self.assertIn(
+            "Would a reasonable author apply this fix or knowingly decline it, "
+            "as part of what this PR already does?",
+            instructions,
+        )
+        self.assertIn(
+            "each evaluator judges against a fixed bar instead of its own taste",
+            instructions,
+        )
+        self.assertIn(
+            "Decision 1 asks whether this PR demonstrates the candidate as fact. "
+            "Nothing here relaxes it.",
+            instructions,
+        )
+        self.assertIn(
+            "needs no user-visible impact, needs no runtime defect behind it, "
+            "and needs no large fix",
+            instructions,
+        )
+        self.assertIn("- dead code this PR creates.", instructions)
+        self.assertIn(
+            "a departure from the reviewed repository's own instructions, when "
+            "the evaluator can name the instruction",
+            instructions,
+        )
+        self.assertIn(
+            "documentation, naming, or a test that this PR makes wrong or "
+            "misleading",
+            instructions,
+        )
+        self.assertIn(
+            "A preference with no repository instruction behind it does not "
+            "clear it",
+            instructions,
+        )
+
+    def test_rejects_unprovable_doubt_and_worth_uncertainty_as_drop_reasons(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn("Both decisions need demonstrated doubt", instructions)
+        self.assertIn(
+            "never drops one because a caller, a use, or a reason might exist "
+            "somewhere unseen",
+            instructions,
+        )
+        self.assertIn(
+            '"It cannot be ruled out" states that evidence is missing, so it '
+            "decides nothing",
+            instructions,
+        )
+        self.assertIn(
+            "Each verdict names the decision it failed and the evidence behind "
+            "that decision",
+            instructions,
+        )
+        self.assertIn(
+            "Drop the candidate when decision 1 fails or stays uncertain, or "
+            "when decision 2 fails on evidence the evaluator named",
+            instructions,
+        )
+        self.assertIn(
+            "Uncertainty about decision 2 on its own never drops a candidate",
+            instructions,
+        )
+        self.assertIn(
+            "Record every dropped candidate, the decision it failed, and its "
+            "concrete reason",
+            instructions,
+        )
+
+    def test_keeps_prefer_silence_from_blocking_the_evaluator(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            '"Prefer silence" sets the bar for a final finding, not for '
+            "reaching the evaluator",
+            instructions,
+        )
+        self.assertIn(
+            "Build a candidate when this PR demonstrates it concretely and the "
+            "**Evaluation Standard** admits it",
+            instructions,
+        )
+        self.assertIn(
+            "even when you cannot settle by yourself whether it is worth fixing",
+            instructions,
+        )
+        self.assertIn(
+            "a preference with no repository instruction behind it, or an issue "
+            "that already existed",
+            instructions,
+        )
+        self.assertNotIn("a triviality, a style preference", instructions)
+
     def test_requires_a_claude_model_gate_before_any_review_work(self):
         instructions = AGENT.read_text(encoding="utf-8")
 

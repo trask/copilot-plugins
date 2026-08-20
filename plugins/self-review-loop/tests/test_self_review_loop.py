@@ -193,6 +193,96 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
+    def test_defines_the_bar_each_evaluator_judges_against(self):
+        self.assertIn("## Evaluation Standard", self.instructions)
+        self.assertIn(
+            "Give that evaluator the PR's stated scope, the relevant diff and "
+            "context, the **Evaluation Standard**, and exactly one candidate",
+            self.instructions,
+        )
+        self.assertIn(
+            "Require two independent decisions, each judged against that "
+            "standard and supported by evidence",
+            self.instructions,
+        )
+        self.assertIn(
+            "Would a reasonable author apply this fix or knowingly decline it, "
+            "as part of what this PR already does?",
+            self.instructions,
+        )
+        self.assertIn(
+            "each evaluator judges against a fixed bar instead of its own taste",
+            self.instructions,
+        )
+        self.assertIn(
+            "Decision 1 asks whether this PR demonstrates the candidate as fact. "
+            "Nothing here relaxes it.",
+            self.instructions,
+        )
+        self.assertIn(
+            "needs no user-visible impact, needs no runtime defect behind it, "
+            "and needs no large fix",
+            self.instructions,
+        )
+        self.assertIn("- dead code this PR creates.", self.instructions)
+        self.assertIn(
+            "a departure from the reviewed repository's own instructions, when "
+            "the evaluator can name the instruction",
+            self.instructions,
+        )
+        self.assertIn(
+            "documentation, naming, or a test that this PR makes wrong or "
+            "misleading",
+            self.instructions,
+        )
+        self.assertIn(
+            "A preference with no repository instruction behind it does not "
+            "clear it",
+            self.instructions,
+        )
+
+    def test_rejects_unprovable_doubt_and_worth_uncertainty_as_drop_reasons(self):
+        self.assertIn("Both decisions need demonstrated doubt", self.instructions)
+        self.assertIn(
+            "never drops one because a caller, a use, or a reason might exist "
+            "somewhere unseen",
+            self.instructions,
+        )
+        self.assertIn(
+            '"It cannot be ruled out" states that evidence is missing, so it '
+            "decides nothing",
+            self.instructions,
+        )
+        self.assertIn(
+            "Each verdict names the decision it failed and the evidence behind "
+            "that decision",
+            self.instructions,
+        )
+        self.assertIn(
+            "Run `drop` for any candidate where decision 1 fails or stays "
+            "uncertain, or where decision 2 fails on evidence the evaluator "
+            "named",
+            self.instructions,
+        )
+        self.assertIn(
+            "record the decision it failed together with the evaluator's "
+            "concrete reason",
+            self.instructions,
+        )
+        self.assertIn(
+            "Uncertainty about decision 2 on its own never drops a candidate",
+            self.instructions,
+        )
+        self.assertIn("--rationale-file", self.instructions)
+
+    def test_narrows_the_silence_rule_to_preferences_without_an_instruction(self):
+        self.assertIn(
+            "a preference with no repository instruction behind it, or an issue "
+            "that already existed",
+            self.instructions,
+        )
+        self.assertNotIn("a triviality, a style preference", self.instructions)
+
     def test_runs_candidate_evaluations_in_parallel(self):
         self.assertIn("## Parallel Evaluation", self.instructions)
         self.assertIn(
@@ -392,7 +482,8 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "register a candidate when it presents a concrete, plausible defect",
+            "register a candidate when the PR demonstrates it concretely and "
+            "the **Evaluation Standard** admits it",
             self.instructions,
         )
         self.assertIn(
