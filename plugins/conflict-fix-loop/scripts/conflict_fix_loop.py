@@ -20,6 +20,7 @@ from typing import Any, Iterable
 
 STATE_VERSION = 1
 DEFAULT_MAX_ITERATIONS = 5
+DEFAULT_PIPELINE_MAX_ITERATIONS = 2
 NO_PROGRESS_LIMIT = 2
 MERGEABILITY_RETRY_DELAYS = (2, 4, 8, 16)
 PR_HEAD_LAG_RETRY_DELAY = 1
@@ -1291,6 +1292,151 @@ def checkout_pr_branch(
         )
 
 
+def pipeline_position(pipeline_run: Any, pipeline_iteration: Any) -> tuple[str, int] | None:
+    """Read the caller's loop position, or nothing when it named none.
+
+    Both halves are required. A run identity with no iteration says nothing about
+    whether the loop advanced, and an iteration with no run identity cannot be
+    told apart from the same number in a different run, so either alone is treated
+    as absent rather than guessed at.
+    """
+    if not isinstance(pipeline_run, str) or not pipeline_run:
+        return None
+    if isinstance(pipeline_iteration, bool) or not isinstance(pipeline_iteration, int):
+        return None
+    if pipeline_iteration < 1:
+        return None
+    return pipeline_run, pipeline_iteration
+
+
+def whole_number(value: Any, fallback: int) -> int:
+    """Read a counter out of stored state, falling back when it holds anything else."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return fallback
+    return value
+
+
+def pipeline_scope(
+    state: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any] | None:
+    """Scope the iteration budget to an outer loop's position rather than a launch.
+
+    An invocation is not a sound unit of budget. An outer loop relaunches a stage
+    within one of its iterations as a matter of course, so a budget that resets on
+    launch is reset by the one event it must ignore, and nothing bounds the total.
+
+    The caller supplies the whole position and this loop never constructs any part
+    of it. Nothing this loop can observe about itself, such as a new head, a
+    relaunch, a re-run, or a commit it just pushed, reaches this function, so a
+    reset cannot be self-triggered. That is the whole point of the budget.
+
+    The run identity is opaque and compared only for equality, never parsed and
+    never ordered. The iteration is ordered, but only against an iteration of the
+    same run. An outer loop numbers its iterations from one, so a second run on the
+    same pull request legitimately presents a lower number than one already
+    recorded here; comparing across runs would refuse to reset again for the rest
+    of the pull request's life, and this state outlives any one run.
+
+    Within a run the comparison stays strict, so a relaunch replaying an earlier
+    iteration, or repeating the current one, buys nothing.
+
+    Both budgets are expressed as baselines against the durable per-pull-request
+    count, so a reset never rewrites that count. ``baseline`` moves on every
+    advance and bounds one outer iteration. ``run_baseline`` moves only on a new
+    run and bounds the whole run, so an advance cannot refresh the ceiling.
+
+    Returns ``None`` when no outer loop is driving this stage, which leaves a
+    standalone invocation exactly as it was. Absent arguments never read as a new
+    run.
+    """
+    position = pipeline_position(
+        getattr(args, "pipeline_run", None), getattr(args, "pipeline_iteration", None)
+    )
+    if position is None:
+        return None
+    run, iteration = position
+    spent = int(state.get("iterations", 0))
+    recorded = state.get("pipeline_budget") or {}
+    if recorded.get("run") != run:
+        return {
+            "run": run,
+            "iteration": iteration,
+            "baseline": spent,
+            "run_baseline": spent,
+        }
+    run_baseline = whole_number(recorded.get("run_baseline"), spent)
+    if iteration > whole_number(recorded.get("iteration"), 0):
+        return {
+            "run": run,
+            "iteration": iteration,
+            "baseline": spent,
+            "run_baseline": run_baseline,
+        }
+    return {
+        "run": run,
+        "iteration": whole_number(recorded.get("iteration"), iteration),
+        "baseline": whole_number(recorded.get("baseline"), spent),
+        "run_baseline": run_baseline,
+    }
+
+
+def absolute_iteration_cap(
+    scope: dict[str, Any] | None, max_iterations: int, pipeline_max_iterations: Any
+) -> int | None:
+    """Bound the total work one outer run may spend on a pull request.
+
+    Derived from the caller's own cap rather than hardcoded, so raising the outer
+    iteration limit raises this with it. It is enforced even though the caller
+    advancing its own loop at most that many times already implies it, because a
+    bound that depends on a peer behaving is not a bound.
+
+    Only the outer cap is optional. Omitting it falls back rather than removing the
+    ceiling, so a caller cannot lift the bound by leaving the value out.
+    """
+    if scope is None:
+        return None
+    outer = (
+        pipeline_max_iterations
+        if isinstance(pipeline_max_iterations, int)
+        and not isinstance(pipeline_max_iterations, bool)
+        and pipeline_max_iterations > 0
+        else DEFAULT_PIPELINE_MAX_ITERATIONS
+    )
+    return max_iterations * outer
+
+
+def budget_spent(
+    state: dict[str, Any], scope: dict[str, Any] | None
+) -> tuple[int, int]:
+    """How much of the per-iteration budget and of the whole run this PR has used.
+
+    Without an outer loop both are the durable count itself, which is the flat
+    per-pull-request cap this loop has always applied.
+    """
+    spent = int(state.get("iterations", 0))
+    if scope is None:
+        return spent, spent
+    return (
+        max(0, spent - whole_number(scope.get("baseline"), spent)),
+        max(0, spent - whole_number(scope.get("run_baseline"), spent)),
+    )
+
+
+def exhausted_budget(
+    state: dict[str, Any],
+    scope: dict[str, Any] | None,
+    max_iterations: int,
+    absolute_cap: int | None,
+) -> str | None:
+    """Name the budget this pull request has used up, if it has used one up."""
+    iteration_spent, run_spent = budget_spent(state, scope)
+    if absolute_cap is not None and run_spent >= absolute_cap:
+        return "absolute"
+    if iteration_spent >= max_iterations:
+        return "iteration"
+    return None
+
+
 def command_preflight(args: argparse.Namespace) -> None:
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
@@ -1325,6 +1471,14 @@ def command_preflight(args: argparse.Namespace) -> None:
     state["merge_methods"] = merge_methods
 
     max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
+    scope = pipeline_scope(state, args)
+    if scope is not None:
+        state["pipeline_budget"] = scope
+    absolute_cap = absolute_iteration_cap(
+        scope, max_iterations, getattr(args, "pipeline_max_iterations", None)
+    )
+    exhausted = exhausted_budget(state, scope, max_iterations, absolute_cap)
+    completed_iterations = budget_spent(state, scope)[0]
     iteration = state["iterations"] + 1
     mergeability = classify_mergeability(metadata)
 
@@ -1339,7 +1493,7 @@ def command_preflight(args: argparse.Namespace) -> None:
 
     if push_blockers:
         result = "unsafe_push"
-    elif state["iterations"] >= max_iterations:
+    elif exhausted:
         result = "max_iterations_reached"
     elif mergeability == "mergeable":
         result = "mergeable"
@@ -1416,6 +1570,11 @@ def command_preflight(args: argparse.Namespace) -> None:
         "history": state["history"],
         "iteration": iteration,
         "max_iterations": max_iterations,
+        "completed_iterations": completed_iterations,
+        "absolute_cap": absolute_cap,
+        "budget_exhausted": exhausted,
+        "pipeline_run": None if scope is None else scope["run"],
+        "pipeline_iteration": None if scope is None else scope["iteration"],
     }
     write_result_file(preflight_path, payload, "preflight")
     emit(
@@ -1451,6 +1610,11 @@ def command_preflight(args: argparse.Namespace) -> None:
             "escalation": state.get("escalation"),
             "iteration": iteration,
             "max_iterations": max_iterations,
+            "completed_iterations": completed_iterations,
+            "absolute_cap": absolute_cap,
+            "budget_exhausted": exhausted,
+            "pipeline_run": None if scope is None else scope["run"],
+            "pipeline_iteration": None if scope is None else scope["iteration"],
         }
     )
 
@@ -2254,6 +2418,26 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--state")
     preflight.add_argument("--strategy", choices=list(STRATEGIES), default="auto")
     preflight.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS)
+    preflight.add_argument(
+        "--pipeline-run",
+        help=(
+            "opaque identifier for one outer run, compared only for equality; "
+            "a different one starts both budgets over"
+        ),
+    )
+    preflight.add_argument(
+        "--pipeline-iteration",
+        type=int,
+        help=(
+            "the orchestrator's own loop counter; a higher one within the same run "
+            "refreshes the per-iteration budget"
+        ),
+    )
+    preflight.add_argument(
+        "--pipeline-max-iterations",
+        type=int,
+        help="the orchestrator's own iteration cap, which derives the ceiling",
+    )
     preflight.set_defaults(function=command_preflight)
 
     attempt = subparsers.add_parser(
