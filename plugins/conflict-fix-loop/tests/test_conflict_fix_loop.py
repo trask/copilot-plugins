@@ -148,6 +148,22 @@ class AgentInstructionsTest(unittest.TestCase):
     def setUp(self):
         self.instructions = AGENT.read_text(encoding="utf-8")
 
+    def test_documents_the_helper_activity_stamp_without_overselling_it(self):
+        """A reader who thinks the stamp proves liveness stops checking further.
+
+        The helper writes only when a subcommand runs, so an hour of silence is
+        as consistent with hard thinking as with a hang.
+        """
+        self.assertIn("`last_helper_activity`", self.instructions)
+        self.assertIn(
+            "the moment this helper last wrote its state", self.instructions
+        )
+        self.assertIn("not proof the stage is alive", self.instructions)
+        self.assertIn(
+            "the agent driving it can think for a long time between two of them",
+            self.instructions,
+        )
+
     def test_declares_the_frontmatter_keys_the_sibling_loops_use(self):
         self.assertIn("name: Conflict Fix Loop", self.instructions)
         self.assertIn(
@@ -3012,6 +3028,19 @@ class StatusCommandTest(unittest.TestCase):
         self.assertEqual(
             {"conflicts": 1, "dependents": 1, "history": 1}, payload["counts"]
         )
+
+    def test_status_reports_when_the_helper_last_wrote_its_state(self):
+        """The only signal a reader has for telling working from wedged.
+
+        Every write stamps it, so a stamp minutes old and a stamp an hour old
+        are different answers to the question a person actually asks.
+        """
+        payload = self.status(updated_at="2026-02-03T04:05:06Z")
+        self.assertEqual("2026-02-03T04:05:06Z", payload["last_helper_activity"])
+        snapshot = json.loads(
+            MODULE.status_path_for(self.state_path).read_text(encoding="utf-8")
+        )
+        self.assertEqual("2026-02-03T04:05:06Z", snapshot["last_helper_activity"])
 
     def test_an_escalation_is_reported_verbatim(self):
         escalation = {

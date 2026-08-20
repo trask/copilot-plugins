@@ -69,13 +69,13 @@ The deterministic, JSON-only helper provides:
 
 - `preflight [target] [--repo-root <workspace>] [--state <path>] [--max-iterations 2] [--stage-model <stage>=<model>] [--no-pin]`: resolve the pull request, refuse anything that is not open, create or resume the pipeline state, apply any per-stage model pin, and report the pull request identity, the current head, the iteration, the cleared map, the model gate, and any stage plugin that is not installed. Resuming a state file starts a **new run**: it mints a fresh `run_id`, resets the iteration to 1, and clears the stored escalation, the no-progress streaks, and any stage left recorded as running. The clearances and the history survive. Run it once, at the start. The loop below never returns to it, and re-running it to escape an escalation would hand the pipeline a fresh iteration budget it did not earn.
 - `next --state <path> [--effort high]`: the whole control flow. It reads the live head, the live `mergeable` field, the live check rollup, and each review stage's own `status` subcommand, then returns `run_stage`, `complete`, or `escalate`. On `run_stage` it also returns a `plan` holding the plugin-qualified `agent`, the pinned `model`, the `target`, a suggested `session_name`, and the exact `command` for a subprocess launch.
-- `start --state <path> --stage <name> --head <sha> --launch session|subprocess [--session <id>] [--process <id>]`: record that a stage began, and charge it to an iteration. This is where a loop-back increments the iteration, and where the cap is enforced.
+- `start --state <path> --stage <name> --head <sha> --launch session|subprocess [--session <id>] [--process <id>]`: record that a stage began, and charge it to an iteration. This is where the start of a new pass increments the iteration, and where the cap is enforced.
 - `finish --state <path> --stage <name> --outcome cleared|skipped|no_progress|escalated [--head <sha>] [--detail <text>] [--session <id>]`: record how the stage ended, append the durable history entry, keep the no-progress streak, and escalate when the stage escalated or stalled twice. It asks the stage's own helper how the run ended and prefers that answer over the one you passed, keeping yours in the history as `requested_outcome`. A `cleared` from one of the three judgment stages is accepted only when that stage's own head-pinned marker names the head being recorded; otherwise it lands as `no_progress` with `outcome_reason` set to `clean_marker_head_mismatch`. `--detail` is **required** for `no_progress` and `escalated`, and optional for `cleared` and `skipped`. A clearing outcome is checked against GitHub, and one the pipeline cannot confirm at that head counts against the stage's no-progress streak instead of resetting it.
 - `outcome --state <path> --stage <name>`: ask the stage that just ran how its run ended, in the pipeline's own vocabulary. `result` is `ready` with an `outcome` when the stage reports one, and `not_reported` when it does not.
 - `escalate --state <path> --reason <code> --detail <text> [--stage <name>] [--next-action <text>] [--head <sha>]`: stop the pipeline for a reason no stage reported.
 - `models [--state <path>] [--pipeline-model <id>] [--no-pin]`: report the pinned per-stage model for every stage and whether each stage's family requirement is met.
 - `plan --state <path> --stage <name> [--effort high]`: print one stage's launch instructions on their own. It returns `not_installed` instead of a launch command when that stage's plugin is missing.
-- `status [--state <path> | --current --repo-root <workspace>]`: print the pipeline state and write the complete snapshot to `status_path`.
+- `status [--state <path> | --current --repo-root <workspace>]`: print the pipeline state and write the complete snapshot to `status_path`. While a stage is recorded as running it adds an `activity` block saying how long that stage has been running and how long ago its helper last wrote anything. That is not proof the stage is alive: the pipeline emits a launch plan and you run the stage, so there is no process here to probe. It only separates a stage that was active minutes ago from one silent for an hour. A helper that cannot answer reports `null` beside a `reason` rather than a zero.
 - `cleanup --state <path> [--force]`: delete the pipeline state.
 
 State lives at `~/.copilot/run/pr-pipeline/{owner}--{repo}--{number}.json`.
@@ -97,6 +97,8 @@ Every stage needs its plugin installed before it can run, whatever kind of evide
 ## How A Stage Goes Green
 
 A stage is green only at the current head commit. New commits on the head branch invalidate the stages that already cleared, and `next` loops back on its own. Description-only edits push no commits, so they never cause a loop-back.
+
+The loop back waits for the end of the pass. One iteration runs the stage order forward once, so a commit pushed by a later stage never sends the pipeline backwards in the middle of that pass: it carries on to the next stage that still needs running. Only when every stage from that point to the end is green does the pipeline go back for a clearance the push staled, and that is what starts the next iteration. Each stage's own budget is what bounds the churn inside one pass.
 
 Two kinds of evidence exist, and the helper picks the right one:
 
@@ -186,7 +188,7 @@ Escalate rather than continue when:
 
 - A stage hits its internal iteration cap.
 - A stage makes no progress twice in a row.
-- The pipeline would start an iteration past its cap of 2.
+- The pipeline would start an iteration past its cap of 2. Two iterations means two passes down the stage order, not two backward jumps.
 - The plugin a stage needs is not installed.
 - Checks never start, or a fork pull request has checks blocked awaiting maintainer approval.
 - A suspected flake fails a second time after one automatic re-run.

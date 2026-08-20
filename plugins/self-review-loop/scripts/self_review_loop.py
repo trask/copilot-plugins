@@ -193,6 +193,19 @@ def load_state(path: Path) -> dict[str, Any]:
     return state
 
 
+def last_helper_activity(state: dict[str, Any]) -> str | None:
+    """When this helper last wrote its state.
+
+    Every write stamps it, so a reader can tell a stage that was active minutes
+    ago from one that has been silent for an hour. That is the whole of what it
+    says. It is not proof the stage is alive: the helper writes only when a
+    subcommand runs, and the agent driving it can think, wait, or hang for a long
+    time between two of them.
+    """
+    value = state.get("updated_at")
+    return value if isinstance(value, str) and value else None
+
+
 def save_state(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = utc_now()
@@ -1766,6 +1779,7 @@ def command_status(args: argparse.Namespace) -> None:
         "history": history,
         **stage_outcome_fields(state),
         "iterations": int(state.get("iterations", 0)),
+        "last_helper_activity": last_helper_activity(state),
     }
     status_path = status_path_for(path)
     write_result_file(status_path, payload, "status")
@@ -1805,6 +1819,7 @@ def command_status(args: argparse.Namespace) -> None:
             },
             **stage_outcome_fields(state),
             "iterations": int(state.get("iterations", 0)),
+            "last_helper_activity": last_helper_activity(state),
         }
     )
 

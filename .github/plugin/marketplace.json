@@ -17,37 +17,37 @@
     {
       "name": "copilot-review-loop",
       "description": "Address Copilot pull request review comments, publish fixes, and repeat until the review is clean.",
-      "version": "1.0.38",
+      "version": "1.0.39",
       "source": "./plugins/copilot-review-loop"
     },
     {
       "name": "self-review-loop",
       "description": "Review a GitHub pull request, verify each finding independently, and commit the fixes without posting review comments.",
-      "version": "1.1.10",
+      "version": "1.1.11",
       "source": "./plugins/self-review-loop"
     },
     {
       "name": "pr-description",
       "description": "Review and automatically update a pull request title and description with head verification.",
-      "version": "1.0.24",
+      "version": "1.0.25",
       "source": "./plugins/pr-description"
     },
     {
       "name": "pr-pipeline",
       "description": "Drive an open draft pull request through conflict resolution, self review, Copilot review, check fixing, and description validation until every stage is green at the same head commit.",
-      "version": "1.0.8",
+      "version": "1.0.9",
       "source": "./plugins/pr-pipeline"
     },
     {
       "name": "conflict-fix-loop",
       "description": "Resolve merge conflicts on a pull request by keeping both sides' intent, then push and repeat until GitHub reports it mergeable.",
-      "version": "1.0.7",
+      "version": "1.0.8",
       "source": "./plugins/conflict-fix-loop"
     },
     {
       "name": "ci-fix-loop",
       "description": "Fix the failing continuous integration checks a pull request caused, re-run a suspected flake once, and push the fixes until the checks are green.",
-      "version": "1.0.6",
+      "version": "1.0.7",
       "source": "./plugins/ci-fix-loop"
     }
   ]

@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -133,6 +134,22 @@ class AgentInstructionsTest(unittest.TestCase):
     def setUp(self):
         self.instructions = AGENT.read_text(encoding="utf-8")
 
+    def test_documents_the_helper_activity_stamp_without_overselling_it(self):
+        """A reader who thinks the stamp proves liveness stops checking further.
+
+        The helper writes only when a subcommand runs, so an hour of silence is
+        as consistent with hard thinking as with a hang.
+        """
+        self.assertIn("`last_helper_activity`", self.instructions)
+        self.assertIn(
+            "the moment this helper last wrote its state", self.instructions
+        )
+        self.assertIn("not proof the stage is alive", self.instructions)
+        self.assertIn(
+            "the agent driving it can think for a long time between two of them",
+            self.instructions,
+        )
+
     def test_declares_the_frontmatter_the_siblings_use(self):
         self.assertIn("name: CI Fix Loop", self.instructions)
         self.assertIn(
@@ -217,7 +234,7 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "`--pipeline-run` and `--pipeline-iteration` go together",
+            "Send `--pipeline-run` and `--pipeline-iteration` together",
             self.instructions,
         )
         self.assertNotIn("if the line is absent, omit all three", self.instructions)
@@ -296,8 +313,24 @@ class AgentInstructionsTest(unittest.TestCase):
         )
 
     def test_caps_the_loop_at_five_iterations(self):
-        self.assertIn("The maximum is 5 iterations.", self.instructions)
+        self.assertIn("The maximum is 5 iterations", self.instructions)
         self.assertIn("max_iterations_reached", self.instructions)
+
+    def test_says_an_iteration_is_charged_per_head_rather_than_per_launch(self):
+        """The prose is what the next reader believes, so it has to say which it is.
+
+        An agent that thinks a relaunch costs an iteration rations its own reads
+        of the checks, and one that starts over at an unchanged head after a
+        re-run would otherwise burn a fifth of the budget on the same analysis.
+        """
+        self.assertIn(
+            "an iteration is charged per head rather than per launch",
+            self.instructions,
+        )
+        self.assertIn(
+            "only moving the head to a new commit spends the next one",
+            self.instructions,
+        )
 
     def test_never_weakens_a_check_to_make_it_pass(self):
         self.assertIn(
@@ -2074,6 +2107,20 @@ class StatusCommandTest(unittest.TestCase):
         self.assertEqual(1, payload["counts"]["passed"])
         self.assertTrue(Path(payload["status_path"]).is_file())
 
+    def test_status_reports_when_the_helper_last_wrote_its_state(self):
+        """The only signal a reader has for telling working from wedged.
+
+        Every write stamps it, so a stamp minutes old and a stamp an hour old
+        are different answers to the question a person actually asks.
+        """
+        path = write_state(self.root, updated_at="2026-02-03T04:05:06Z")
+        payload = call("status", "--state", str(path))
+        self.assertEqual("2026-02-03T04:05:06Z", payload["last_helper_activity"])
+        snapshot = json.loads(
+            Path(payload["status_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual("2026-02-03T04:05:06Z", snapshot["last_helper_activity"])
+
     def test_reports_an_escalation(self):
         path = write_state(
             self.root,
@@ -2241,7 +2288,7 @@ class StageOutcomeTest(unittest.TestCase):
 class ChargeIterationTest(unittest.TestCase):
     def test_spends_one_iteration_for_a_run_however_often_it_is_called(self):
         state = {"iterations": 2}
-        run_state = {}
+        run_state = {"head_sha": "head1"}
         self.assertTrue(MODULE.charge_iteration(state, run_state))
         self.assertFalse(MODULE.charge_iteration(state, run_state))
         self.assertFalse(MODULE.charge_iteration(state, run_state))
@@ -2250,9 +2297,43 @@ class ChargeIterationTest(unittest.TestCase):
 
     def test_each_run_spends_its_own_iteration(self):
         state = {"iterations": 0}
-        for _ in range(3):
-            MODULE.charge_iteration(state, {})
+        for head in ("head1", "head2", "head3"):
+            MODULE.charge_iteration(state, {"head_sha": head})
         self.assertEqual(3, state["iterations"])
+
+    def test_a_fresh_run_at_an_unchanged_head_costs_nothing(self):
+        """The budget bounds fix attempts, and an attempt is what moves the head.
+
+        A relaunch that re-derives the same analysis at the head already charged
+        is one logical attempt read twice, so charging it again would spend a
+        fifth of the budget on nothing.
+        """
+        state = {"iterations": 0}
+
+        self.assertTrue(MODULE.charge_iteration(state, {"head_sha": "head1"}))
+        for _ in range(4):
+            self.assertFalse(MODULE.charge_iteration(state, {"head_sha": "head1"}))
+
+        self.assertEqual(1, state["iterations"])
+        self.assertEqual("head1", state["charged_head_sha"])
+
+    def test_a_moved_head_is_a_new_attempt_and_charges_again(self):
+        state = {"iterations": 0}
+
+        MODULE.charge_iteration(state, {"head_sha": "head1"})
+        MODULE.charge_iteration(state, {"head_sha": "head2"})
+
+        self.assertEqual(2, state["iterations"])
+        self.assertEqual("head2", state["charged_head_sha"])
+
+    def test_a_run_with_no_head_is_charged_rather_than_deduped_on_a_guess(self):
+        state = {"iterations": 0}
+
+        for _ in range(3):
+            self.assertTrue(MODULE.charge_iteration(state, {}))
+
+        self.assertEqual(3, state["iterations"])
+        self.assertNotIn("charged_head_sha", state)
 
 
 class TestSuppressionTest(unittest.TestCase):
@@ -2442,68 +2523,105 @@ class CommitSuppressionTest(unittest.TestCase):
 
 
 class PipelineBudgetTest(unittest.TestCase):
-    def test_a_position_needs_both_halves(self):
-        self.assertEqual(("run1", 2), MODULE.pipeline_position("run1", 2))
-        for run, iteration in (
-            (None, 2),
-            ("", 2),
-            ("run1", None),
-            ("run1", 0),
-            ("run1", -1),
-            ("run1", "2"),
-            ("run1", True),
-            (7, 2),
-        ):
-            with self.subTest(run=run, iteration=iteration):
-                self.assertIsNone(MODULE.pipeline_position(run, iteration))
+    """A stage budget belongs to an outer loop's iteration, not to a launch."""
+
+    RECORDED = {"run": "run-a", "iteration": 2, "baseline": 3, "run_baseline": 1}
+
+    def scope(self, state, **pipeline):
+        return MODULE.pipeline_scope(state, SimpleNamespace(**pipeline))
+
+    def test_the_run_token_alone_decides_whether_the_budget_is_scoped(self):
+        """Enumerate every subset of the three arguments rather than assert it in prose.
+
+        The two halves are not symmetric for a reader. An iteration with no run
+        asks which run it belongs to and nothing can answer it. A run with no
+        iteration still answers what the token is for, whether this loop has seen
+        the run before, so it scopes on equality alone. Only the outer cap is
+        optional in the other sense: leaving it out falls back rather than lifting
+        the ceiling.
+        """
+        parts = {
+            "run": {"pipeline_run": "run-a"},
+            "iteration": {"pipeline_iteration": 2},
+            "cap": {"pipeline_max_iterations": 3},
+        }
+        scoped_by_names = {
+            (): False,
+            ("run",): True,
+            ("iteration",): False,
+            ("cap",): False,
+            ("run", "cap"): True,
+            ("iteration", "cap"): False,
+            ("run", "iteration"): True,
+            ("run", "iteration", "cap"): True,
+        }
+        for names, scoped in scoped_by_names.items():
+            with self.subTest(names=names):
+                pipeline = {}
+                for name in names:
+                    pipeline.update(parts[name])
+                scope = self.scope({"iterations": 9}, **pipeline)
+                self.assertEqual(scoped, scope is not None)
+                self.assertEqual(
+                    scoped,
+                    MODULE.absolute_iteration_cap(
+                        scope, 5, pipeline.get("pipeline_max_iterations")
+                    )
+                    is not None,
+                )
 
     def test_a_standalone_run_never_resets_anything(self):
-        state = {"iterations": 4, "total_iterations": 9}
-        self.assertIsNone(MODULE.apply_pipeline_position(state, None, None))
-        self.assertEqual(4, state["iterations"])
-        self.assertEqual(9, state["total_iterations"])
-        self.assertNotIn("pipeline_run", state)
+        """Absent, empty, and unusable run tokens must never read as a new run."""
+        for pipeline in (
+            {},
+            {"pipeline_run": None, "pipeline_iteration": None},
+            {"pipeline_run": "", "pipeline_iteration": 2},
+            {"pipeline_run": 7, "pipeline_iteration": 2},
+            {"pipeline_iteration": 2},
+            {"pipeline_iteration": 2, "pipeline_max_iterations": 3},
+        ):
+            with self.subTest(pipeline=pipeline):
+                state = {"iterations": 4}
+                self.assertIsNone(self.scope(state, **pipeline))
+                self.assertEqual(4, state["iterations"])
+                self.assertNotIn("pipeline_budget", state)
 
     def test_a_new_pipeline_run_clears_both_budgets(self):
-        state = {"iterations": 5, "total_iterations": 10, "pipeline_run": "old"}
-        self.assertEqual("run", MODULE.apply_pipeline_position(state, "new", 1))
-        self.assertEqual(0, state["iterations"])
-        self.assertEqual(0, state["total_iterations"])
-        self.assertEqual("new", state["pipeline_run"])
-        self.assertEqual(1, state["pipeline_iteration"])
+        state = {"iterations": 5, "pipeline_budget": dict(self.RECORDED)}
+
+        scope = self.scope(state, pipeline_run="run-b", pipeline_iteration=1)
+
+        self.assertEqual(
+            {"run": "run-b", "iteration": 1, "baseline": 5, "run_baseline": 5}, scope
+        )
+        self.assertEqual((0, 0), MODULE.budget_spent(state, scope))
 
     def test_the_pipeline_advancing_clears_only_the_per_iteration_budget(self):
-        state = {
-            "iterations": 5,
-            "total_iterations": 5,
-            "pipeline_run": "run1",
-            "pipeline_iteration": 1,
-        }
-        self.assertEqual("iteration", MODULE.apply_pipeline_position(state, "run1", 2))
-        self.assertEqual(0, state["iterations"])
-        self.assertEqual(5, state["total_iterations"])
-        self.assertEqual(2, state["pipeline_iteration"])
+        """The whole-run ceiling must survive an advance, or it bounds nothing."""
+        state = {"iterations": 9, "pipeline_budget": dict(self.RECORDED)}
+
+        scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
+
+        self.assertEqual(
+            {"run": "run-a", "iteration": 3, "baseline": 9, "run_baseline": 1}, scope
+        )
+        self.assertEqual((0, 8), MODULE.budget_spent(state, scope))
 
     def test_a_relaunch_inside_one_iteration_buys_nothing(self):
-        state = {
-            "iterations": 3,
-            "total_iterations": 3,
-            "pipeline_run": "run1",
-            "pipeline_iteration": 2,
-        }
-        self.assertIsNone(MODULE.apply_pipeline_position(state, "run1", 2))
-        self.assertEqual(3, state["iterations"])
+        state = {"iterations": 9, "pipeline_budget": dict(self.RECORDED)}
+
+        scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=2)
+
+        self.assertEqual(self.RECORDED, scope)
+        self.assertEqual((6, 8), MODULE.budget_spent(state, scope))
 
     def test_replaying_an_earlier_iteration_buys_nothing(self):
-        state = {
-            "iterations": 3,
-            "total_iterations": 3,
-            "pipeline_run": "run1",
-            "pipeline_iteration": 4,
-        }
-        self.assertIsNone(MODULE.apply_pipeline_position(state, "run1", 2))
-        self.assertEqual(3, state["iterations"])
-        self.assertEqual(4, state["pipeline_iteration"])
+        """Strictly greater, so a repeat and a replay both buy nothing."""
+        state = {"iterations": 9, "pipeline_budget": dict(self.RECORDED)}
+
+        scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=1)
+
+        self.assertEqual(self.RECORDED, scope)
 
     def test_a_second_run_resets_even_though_it_counts_from_one_again(self):
         """A pipeline numbers its iterations from one, so this must not be ordered.
@@ -2513,81 +2631,269 @@ class PipelineBudgetTest(unittest.TestCase):
         refuse every future run on it. A deadlock outlasts the false start it
         would have prevented, so run identity is compared for equality instead.
         """
-        state = {"iterations": 0, "total_iterations": 0}
-        MODULE.apply_pipeline_position(state, "run1", 1)
-        MODULE.apply_pipeline_position(state, "run1", 2)
-        MODULE.apply_pipeline_position(state, "run1", 3)
-        state["iterations"] = 5
-        state["total_iterations"] = 10
-        self.assertEqual("run", MODULE.apply_pipeline_position(state, "run2", 1))
-        self.assertEqual(0, state["iterations"])
-        self.assertEqual(0, state["total_iterations"])
+        state = {
+            "iterations": 9,
+            "pipeline_budget": {
+                "run": "run-a",
+                "iteration": 6,
+                "baseline": 7,
+                "run_baseline": 2,
+            },
+        }
 
-    def test_a_lone_half_of_the_position_is_ignored_rather_than_half_applied(self):
-        """The agent file promises this, so the helper has to honour it.
+        scope = self.scope(state, pipeline_run="run-b", pipeline_iteration=1)
 
-        A caller naming only one half has not said where its loop stands. Acting
-        on it would reset on a number with no run to scope it, which is the
-        cross-run deadlock in the other direction.
+        self.assertEqual(
+            {"run": "run-b", "iteration": 1, "baseline": 9, "run_baseline": 9}, scope
+        )
+
+    def test_a_reset_never_rewrites_the_durable_count_itself(self):
+        """Both budgets are baselines, so the per-PR iteration numbering stays monotone.
+
+        Zeroing the count instead would restart the numbering, and a run id built
+        from it would collide with one already folded into history, where a
+        duplicate is dropped rather than recorded.
         """
-        for run, iteration in ((None, 2), ("run1", None)):
-            with self.subTest(run=run, iteration=iteration):
-                state = {"iterations": 4, "total_iterations": 9}
-                self.assertIsNone(MODULE.apply_pipeline_position(state, run, iteration))
-                self.assertIsNone(MODULE.absolute_iteration_cap(run, iteration, 5, 3))
-                self.assertEqual(4, state["iterations"])
-                self.assertEqual(9, state["total_iterations"])
+        state = {"iterations": 9, "pipeline_budget": dict(self.RECORDED)}
+
+        self.scope(state, pipeline_run="run-b", pipeline_iteration=1)
+
+        self.assertEqual(9, state["iterations"])
+
+    def test_an_iteration_with_no_run_is_ignored_rather_than_half_applied(self):
+        """A run token must come from the caller, never from what this loop recorded.
+
+        Reading it back out of an earlier budget, a head it pushed, or an
+        escalation it wrote would be this loop naming its own position.
+        """
+        states = (
+            {},
+            {"iterations": 4},
+            {"iterations": 4, "pipeline_budget": dict(self.RECORDED)},
+            {"iterations": 4, "pr": {"head_sha": "aaaa"}, "history": [{"id": "one"}]},
+            {"iterations": 4, "escalation": {"reason": "max_iterations_reached"}},
+            {"iterations": 4, "clean_at_head_sha": "aaaa"},
+        )
+        for state in states:
+            with self.subTest(state=state):
+                self.assertIsNone(
+                    self.scope(dict(state), pipeline_iteration=2, pipeline_max_iterations=3)
+                )
+
+    def test_a_lone_run_token_resets_once_and_is_inert_on_every_relaunch(self):
+        """This is what makes the degraded case coarser rather than launch-scoped.
+
+        The caller mints one token per run and repeats it on every relaunch inside
+        that run, so equality alone still tells a first sighting from a repeat. The
+        budget therefore refreshes once when the run arrives and never again while
+        it lasts, which is the stricter direction, not the unbounded one.
+        """
+        state = {"iterations": 5}
+
+        first = self.scope(state, pipeline_run="run-a")
+        self.assertEqual(5, first["baseline"])
+        self.assertEqual(5, first["run_baseline"])
+
+        state["pipeline_budget"] = first
+        for spent in (5, 7, 40):
+            with self.subTest(spent=spent):
+                state["iterations"] = spent
+                relaunch = self.scope(state, pipeline_run="run-a")
+                self.assertEqual(5, relaunch["baseline"])
+                self.assertEqual(5, relaunch["run_baseline"])
+
+    def test_an_unusable_iteration_degrades_rather_than_refusing_the_pull_request(self):
+        """Ignoring the run outright is the permanent refusal this contract removes.
+
+        The durable count only ever climbs, so a position this loop discarded would
+        leave a pull request that already reached the cap refusing every later run
+        for the rest of its life. The usable half is used instead.
+        """
+        for iteration in (None, 0, -1, True, "2", 1.5):
+            with self.subTest(iteration=iteration):
+                scope = self.scope(
+                    {"iterations": 5}, pipeline_run="run-a", pipeline_iteration=iteration
+                )
+                self.assertIsNotNone(scope)
+                self.assertIsNone(
+                    MODULE.exhausted_budget({"iterations": 5}, scope, 5, 10)
+                )
+
+    def test_only_the_position_the_caller_passes_can_reset_the_budget(self):
+        """Enumerate the inputs to a reset instead of claiming the property in prose.
+
+        A repeat of one position stays inert no matter what this loop did in
+        between: a new head, a commit it pushed, an escalation it recorded, a
+        clearance, or more iterations it spent. Every one of those varies here
+        while the caller's values stay the same, and neither baseline moves.
+        """
+        observable = (
+            {},
+            {"pr": {"head_sha": "new-head"}},
+            {"pr": {"head_sha": "another-head"}, "run": {"status": "published"}},
+            {"escalation": {"reason": "max_iterations_reached"}},
+            {"history": [{"id": "one"}, {"id": "two"}]},
+            {"clean_at_head_sha": "new-head"},
+            {"reruns": {"1": 2}},
+        )
+        for spent in (0, 3, 5, 40):
+            for extra in observable:
+                with self.subTest(spent=spent, extra=extra):
+                    state = {
+                        "iterations": spent,
+                        "pipeline_budget": dict(self.RECORDED),
+                        **extra,
+                    }
+                    scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=2)
+                    self.assertEqual(self.RECORDED, scope)
+
+    def test_the_run_is_opaque_and_only_ever_compared_for_equality(self):
+        """Tokens that would sort or parse are still just tokens."""
+        state = {
+            "iterations": 4,
+            "pipeline_budget": {
+                "run": "2026-05-01/7",
+                "iteration": 3,
+                "baseline": 2,
+                "run_baseline": 0,
+            },
+        }
+
+        same = self.scope(state, pipeline_run="2026-05-01/7", pipeline_iteration=3)
+        self.assertEqual(2, same["baseline"])
+        for other in ("2026-05-01/8", "2026-04-01/7", "7", "run", " 2026-05-01/7"):
+            with self.subTest(other=other):
+                scope = self.scope(state, pipeline_run=other, pipeline_iteration=3)
+                self.assertEqual(4, scope["baseline"])
+                self.assertEqual(4, scope["run_baseline"])
 
     def test_an_omitted_outer_cap_falls_back_rather_than_disabling_the_ceiling(self):
         """Only the outer cap is optional, and omitting it must not remove the bound."""
-        state = {"iterations": 4, "total_iterations": 9}
-        self.assertEqual("run", MODULE.apply_pipeline_position(state, "run1", 1))
-        self.assertEqual(
-            5 * MODULE.DEFAULT_PIPELINE_MAX_ITERATIONS,
-            MODULE.absolute_iteration_cap("run1", 1, 5, None),
-        )
+        scope = {"run": "run-a", "iteration": 1, "baseline": 0, "run_baseline": 0}
+        for value in (None, 0, -1, True, "3"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    5 * MODULE.DEFAULT_PIPELINE_MAX_ITERATIONS,
+                    MODULE.absolute_iteration_cap(scope, 5, value),
+                )
 
     def test_the_ceiling_is_derived_from_the_callers_own_cap(self):
-        self.assertEqual(15, MODULE.absolute_iteration_cap("run1", 1, 5, 3))
-        self.assertEqual(
-            5 * MODULE.DEFAULT_PIPELINE_MAX_ITERATIONS,
-            MODULE.absolute_iteration_cap("run1", 1, 5, None),
-        )
-        self.assertEqual(
-            5 * MODULE.DEFAULT_PIPELINE_MAX_ITERATIONS,
-            MODULE.absolute_iteration_cap("run1", 1, 5, 0),
-        )
+        scope = {"run": "run-a", "iteration": 1, "baseline": 0, "run_baseline": 0}
+        self.assertEqual(15, MODULE.absolute_iteration_cap(scope, 5, 3))
+        self.assertEqual(20, MODULE.absolute_iteration_cap(scope, 10, 2))
 
     def test_there_is_no_ceiling_without_a_pipeline(self):
-        self.assertIsNone(MODULE.absolute_iteration_cap(None, None, 5, 3))
-        self.assertIsNone(MODULE.absolute_iteration_cap("run1", None, 5, 3))
+        self.assertIsNone(MODULE.absolute_iteration_cap(None, 5, 3))
 
     def test_names_which_budget_ran_out(self):
-        self.assertIsNone(MODULE.exhausted_budget({"iterations": 4}, 5, 10))
+        scope = {"run": "run-a", "iteration": 4, "baseline": 10, "run_baseline": 0}
+        self.assertIsNone(MODULE.exhausted_budget({"iterations": 14}, scope, 5, 20))
         self.assertEqual(
-            "iteration", MODULE.exhausted_budget({"iterations": 5}, 5, 10)
+            "iteration", MODULE.exhausted_budget({"iterations": 15}, scope, 5, 20)
         )
         self.assertEqual(
-            "absolute",
-            MODULE.exhausted_budget({"iterations": 0, "total_iterations": 10}, 5, 10),
+            "absolute", MODULE.exhausted_budget({"iterations": 10}, scope, 5, 10)
         )
         self.assertEqual(
-            "iteration", MODULE.exhausted_budget({"iterations": 5}, 5, None)
+            "iteration", MODULE.exhausted_budget({"iterations": 5}, None, 5, None)
+        )
+
+    def test_a_standalone_run_keeps_the_flat_per_pull_request_cap(self):
+        """No arguments means the behavior this loop has always had."""
+        for spent, expected in ((0, None), (4, None), (5, "iteration"), (9, "iteration")):
+            with self.subTest(spent=spent):
+                self.assertEqual(
+                    expected,
+                    MODULE.exhausted_budget({"iterations": spent}, None, 5, None),
+                )
+
+    def test_a_scoped_run_spends_against_its_baseline_and_not_the_lifetime_count(self):
+        """A spent brake must not read as a permanent refusal.
+
+        Ninety iterations over the pull request's life say nothing about the run
+        that just started, which has spent none of its own budget.
+        """
+        scope = {"run": "run-a", "iteration": 1, "baseline": 90, "run_baseline": 90}
+        self.assertIsNone(MODULE.exhausted_budget({"iterations": 90}, scope, 5, 10))
+        self.assertIsNone(MODULE.exhausted_budget({"iterations": 94}, scope, 5, 10))
+        self.assertEqual(
+            "iteration", MODULE.exhausted_budget({"iterations": 95}, scope, 5, 10)
         )
 
     def test_the_running_total_survives_a_pipeline_iteration(self):
         """The ceiling only bounds anything if the per-iteration reset spares it."""
-        state = {"iterations": 0, "total_iterations": 0}
+        state = {"iterations": 0}
+        head = 0
         for iteration in (1, 2):
-            MODULE.apply_pipeline_position(state, "run1", iteration)
+            scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=iteration)
+            state["pipeline_budget"] = scope
+            state.pop("charged_head_sha", None)
             for _ in range(5):
-                MODULE.charge_iteration(state, {})
-        self.assertEqual(5, state["iterations"])
-        self.assertEqual(10, state["total_iterations"])
-        self.assertEqual("absolute", MODULE.exhausted_budget(state, 5, 10))
+                head += 1
+                MODULE.charge_iteration(state, {"head_sha": f"head{head}"})
+        self.assertEqual(10, state["iterations"])
+        self.assertEqual((5, 10), MODULE.budget_spent(state, scope))
+        self.assertEqual("absolute", MODULE.exhausted_budget(state, scope, 5, 10))
+
+    def test_preflight_takes_the_position_and_defaults_it_to_absent(self):
+        parser = MODULE.build_parser()
+
+        bare = parser.parse_args(["preflight"])
+        self.assertIsNone(bare.pipeline_run)
+        self.assertIsNone(bare.pipeline_iteration)
+        self.assertIsNone(bare.pipeline_max_iterations)
+
+        given = parser.parse_args(
+            [
+                "preflight",
+                "--pipeline-run",
+                "run-a",
+                "--pipeline-iteration",
+                "2",
+                "--pipeline-max-iterations",
+                "3",
+            ]
+        )
+        self.assertEqual("run-a", given.pipeline_run)
+        self.assertEqual(2, given.pipeline_iteration)
+        self.assertEqual(3, given.pipeline_max_iterations)
 
 
+class BudgetAdvancedTest(unittest.TestCase):
+    """The per-head charge lives exactly as long as the budget it protects."""
 
+    RECORDED = {"run": "run-a", "iteration": 2, "baseline": 3, "run_baseline": 1}
+
+    def test_a_new_run_or_a_later_iteration_both_count_as_an_advance(self):
+        for scope in (
+            {"run": "run-b", "iteration": 1},
+            {"run": "run-a", "iteration": 3},
+            {"run": "run-a", "iteration": 99},
+        ):
+            with self.subTest(scope=scope):
+                self.assertTrue(MODULE.budget_advanced(self.RECORDED, scope))
+
+    def test_a_repeat_a_replay_and_a_standalone_run_are_not_an_advance(self):
+        for recorded, scope in (
+            (self.RECORDED, {"run": "run-a", "iteration": 2}),
+            (self.RECORDED, {"run": "run-a", "iteration": 1}),
+            (self.RECORDED, {"run": "run-a", "iteration": None}),
+            (self.RECORDED, None),
+            (None, None),
+        ):
+            with self.subTest(recorded=recorded, scope=scope):
+                self.assertFalse(MODULE.budget_advanced(recorded, scope))
+
+    def test_a_run_scoped_budget_advances_the_first_time_it_learns_an_iteration(self):
+        recorded = {"run": "run-a", "iteration": None, "baseline": 5, "run_baseline": 5}
+        self.assertTrue(MODULE.budget_advanced(recorded, {"run": "run-a", "iteration": 1}))
+
+    def test_nothing_recorded_yet_reads_as_an_advance(self):
+        self.assertTrue(MODULE.budget_advanced(None, {"run": "run-a", "iteration": 1}))
+        self.assertTrue(MODULE.budget_advanced("junk", {"run": "run-a", "iteration": 1}))
+
+
+class CleanupCommandTest(unittest.TestCase):
     def test_deletes_the_state_and_every_side_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2630,7 +2936,7 @@ class PreflightCommandTest(unittest.TestCase):
             "commits": [{"sha": "c1", "message": "Add a thing"}],
         }
 
-    def preflight(self, stack, *, status="", head="head1", state_path=None):
+    def preflight(self, stack, *, status="", head="head1", state_path=None, pipeline=()):
         def call_git(repo_root, *arguments):
             if arguments[0] == "status":
                 return status
@@ -2665,6 +2971,7 @@ class PreflightCommandTest(unittest.TestCase):
             str(self.root),
             "--state",
             str(state_path or self.root / "state.json"),
+            *pipeline,
         )
 
     def test_pins_the_head_and_the_diff(self):
@@ -2713,18 +3020,133 @@ class PreflightCommandTest(unittest.TestCase):
 
     def test_stops_at_the_iteration_cap(self):
         path = self.root / "state.json"
-        for _ in range(MODULE.DEFAULT_MAX_ITERATIONS):
+        for index in range(MODULE.DEFAULT_MAX_ITERATIONS):
+            # A charge is per head, so each attempt has to land on its own head
+            # the way a real fix does.
+            head = f"head{index + 1}"
+            self.metadata["head_sha"] = head
             with contextlib.ExitStack() as stack:
-                self.preflight(stack, state_path=path)
+                self.preflight(stack, head=head, state_path=path)
             state = MODULE.load_state(path)
             MODULE.charge_iteration(state, state["run"])
             MODULE.save_state(path, state)
+        self.metadata["head_sha"] = "head-last"
         with contextlib.ExitStack() as stack:
-            payload = self.preflight(stack, state_path=path)
+            payload = self.preflight(stack, head="head-last", state_path=path)
         self.assertEqual("max_iterations_reached", payload["result"])
         escalation = MODULE.load_state(path)["escalation"]
         self.assertEqual("max_iterations_reached", escalation["reason"])
         self.assertTrue(escalation["next_action"])
+
+    def test_a_second_preflight_at_a_charged_head_costs_nothing_and_keeps_its_number(self):
+        """One logical attempt, read twice, must be billed once and numbered once.
+
+        Advancing the number without charging would let the label outrun the
+        budget, and a third read would then mint ids that collide with the second
+        read's archived entries, which `archive_run` drops rather than records.
+        """
+        path = self.root / "state.json"
+        with contextlib.ExitStack() as stack:
+            first = self.preflight(stack, state_path=path)
+        state = MODULE.load_state(path)
+        MODULE.charge_iteration(state, state["run"])
+        MODULE.save_state(path, state)
+        self.assertEqual(1, first["iteration"])
+        self.assertEqual(1, state["iterations"])
+
+        for _ in range(3):
+            with contextlib.ExitStack() as stack:
+                again = self.preflight(stack, state_path=path)
+            self.assertEqual("ready", again["result"])
+            self.assertEqual(1, again["iteration"])
+            self.assertEqual(1, MODULE.load_state(path)["iterations"])
+
+    def test_a_preflight_after_the_head_moved_is_a_new_attempt(self):
+        path = self.root / "state.json"
+        with contextlib.ExitStack() as stack:
+            self.preflight(stack, state_path=path)
+        state = MODULE.load_state(path)
+        MODULE.charge_iteration(state, state["run"])
+        MODULE.save_state(path, state)
+
+        self.metadata["head_sha"] = "head2"
+        with contextlib.ExitStack() as stack:
+            moved = self.preflight(stack, head="head2", state_path=path)
+
+        self.assertEqual(2, moved["iteration"])
+
+    def test_a_pipeline_iteration_frees_the_head_it_already_charged(self):
+        """The per-head charge protects one budget and must not outlive it."""
+        path = self.root / "state.json"
+        with contextlib.ExitStack() as stack:
+            self.preflight(
+                stack,
+                state_path=path,
+                pipeline=["--pipeline-run", "run-a", "--pipeline-iteration", "1"],
+            )
+        state = MODULE.load_state(path)
+        MODULE.charge_iteration(state, state["run"])
+        MODULE.save_state(path, state)
+        self.assertEqual("head1", MODULE.load_state(path)["charged_head_sha"])
+
+        with contextlib.ExitStack() as stack:
+            advanced = self.preflight(
+                stack,
+                state_path=path,
+                pipeline=["--pipeline-run", "run-a", "--pipeline-iteration", "2"],
+            )
+
+        self.assertNotIn("charged_head_sha", MODULE.load_state(path))
+        self.assertEqual(2, advanced["iteration"])
+        complete = json.loads(
+            Path(advanced["preflight_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(0, complete["completed_iterations"])
+
+    def test_a_pipeline_iteration_never_rewrites_the_durable_count(self):
+        """Zeroing it would restart the numbering and collide with archived ids.
+
+        `archive_run` keys history on the iteration number, and it drops a
+        duplicate rather than recording it, so a budget that rewrote the count
+        would silently lose the second attempt's verdicts.
+        """
+        path = self.root / "state.json"
+        for index, head in enumerate(("head1", "head2")):
+            self.metadata["head_sha"] = head
+            with contextlib.ExitStack() as stack:
+                self.preflight(
+                    stack,
+                    head=head,
+                    state_path=path,
+                    pipeline=[
+                        "--pipeline-run",
+                        "run-a",
+                        "--pipeline-iteration",
+                        str(index + 1),
+                    ],
+                )
+            state = MODULE.load_state(path)
+            MODULE.charge_iteration(state, state["run"])
+            state["run"]["attributions"] = {
+                "check:a": {"verdict": "pr_caused", "name": "a"}
+            }
+            MODULE.save_state(path, state)
+
+        self.metadata["head_sha"] = "head3"
+        with contextlib.ExitStack() as stack:
+            self.preflight(
+                stack,
+                head="head3",
+                state_path=path,
+                pipeline=["--pipeline-run", "run-a", "--pipeline-iteration", "2"],
+            )
+
+        state = MODULE.load_state(path)
+        self.assertEqual(2, state["iterations"])
+        self.assertEqual(
+            ["1:verdict:check:a", "2:verdict:check:a"],
+            sorted(entry["id"] for entry in state["history"]),
+        )
 
     def test_a_new_head_forgets_the_reruns_of_the_old_one(self):
         path = write_state(self.root, reruns={"check:a": {"count": 1}})

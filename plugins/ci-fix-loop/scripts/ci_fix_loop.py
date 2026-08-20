@@ -377,6 +377,19 @@ def load_state(path: Path) -> dict[str, Any]:
     return state
 
 
+def last_helper_activity(state: dict[str, Any]) -> str | None:
+    """When this helper last wrote its state.
+
+    Every write stamps it, so a reader can tell a stage that was active minutes
+    ago from one that has been silent for an hour. That is the whole of what it
+    says. It is not proof the stage is alive: the helper writes only when a
+    subcommand runs, and the agent driving it can think, wait, or hang for a long
+    time between two of them.
+    """
+    value = state.get("updated_at")
+    return value if isinstance(value, str) and value else None
+
+
 def save_state(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = utc_now()
@@ -1483,81 +1496,114 @@ def refuse_test_suppression(repo_root: Path, commits: Iterable[str]) -> None:
     )
 
 
-def pipeline_position(pipeline_run: Any, pipeline_iteration: Any) -> tuple[str, int] | None:
-    """Read the caller's loop position, or nothing when it named none.
+def pipeline_iteration_value(pipeline_iteration: Any) -> int | None:
+    """Read the caller's loop counter, or nothing when it named no usable one.
 
-    Both halves are required. A run identity with no iteration says nothing about
-    whether the loop advanced, and an iteration with no run identity cannot be
-    told apart from the same number in a different run, so either alone is treated
-    as absent rather than guessed at.
+    An iteration this loop cannot compare is treated as absent rather than
+    guessed at, which leaves the run token to scope the budget on its own.
     """
-    if not isinstance(pipeline_run, str) or not pipeline_run:
-        return None
     if isinstance(pipeline_iteration, bool) or not isinstance(pipeline_iteration, int):
         return None
     if pipeline_iteration < 1:
         return None
-    return pipeline_run, pipeline_iteration
+    return pipeline_iteration
 
 
-def apply_pipeline_position(
-    state: dict[str, Any], pipeline_run: Any, pipeline_iteration: Any
-) -> str | None:
-    """Refresh a budget when the pipeline itself moved forward, and only then.
+def whole_number(value: Any, fallback: int) -> int:
+    """Read a counter out of stored state, falling back when it holds anything else."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return fallback
+    return value
 
-    The caller supplies both values, and this loop never constructs either one.
-    Nothing it can observe about itself, such as a new head, a relaunch, or a
-    commit it just pushed, reaches this function, so a reset cannot be
-    self-triggered. That is the whole point of the budget.
+
+def pipeline_scope(
+    state: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any] | None:
+    """Scope the iteration budget to an outer loop's position rather than a launch.
+
+    An invocation is not a sound unit of budget. An outer loop relaunches a stage
+    within one of its iterations as a matter of course, so a budget that resets on
+    launch is reset by the one event it must ignore, and nothing bounds the total.
+
+    The caller supplies the whole position and this loop never constructs any part
+    of it. Nothing this loop can observe about itself, such as a new head, a
+    relaunch, a re-run, or a commit it just pushed, reaches this function, so a
+    reset cannot be self-triggered. That is the whole point of the budget.
 
     The run identity is opaque and compared only for equality, never parsed and
     never ordered. The iteration is ordered, but only against an iteration of the
-    same run. A pipeline numbers its iterations from one, so a second run on the
+    same run. An outer loop numbers its iterations from one, so a second run on the
     same pull request legitimately presents a lower number than one already
     recorded here; comparing across runs would refuse to reset again for the rest
-    of the pull request's life, and this loop's state outlives any one run.
+    of the pull request's life, and this state outlives any one run.
 
     Within a run the comparison stays strict, so a relaunch replaying an earlier
     iteration, or repeating the current one, buys nothing.
 
-    A new run also clears the running total, because that total bounds one
-    pipeline run. A person starting the pipeline again is an authority outside any
-    budget this loop keeps, and a ceiling that no run can clear would eventually
-    refuse every future run on the pull request.
+    The two halves are not symmetric for a reader. An iteration with no run asks
+    which run it belongs to and nothing can answer, so it is ignored. A run with
+    no iteration still answers the question the run token exists for, whether this
+    loop has seen the run before, so it scopes the budget on equality alone. The
+    caller mints one token per run and repeats it on every relaunch, so that
+    degrades to a coarser run-scoped budget rather than to a launch-scoped one.
+    Ignoring it instead would leave the durable count untouched and refuse a pull
+    request that already reached the cap for the rest of its life.
+
+    Both budgets are expressed as baselines against the durable per-pull-request
+    count, so a reset never rewrites that count. ``baseline`` moves on every
+    advance and bounds one outer iteration. ``run_baseline`` moves only on a new
+    run and bounds the whole run, so an advance cannot refresh the ceiling.
+
+    Returns ``None`` when no outer loop is driving this stage, which leaves a
+    standalone invocation exactly as it was. Absent arguments never read as a new
+    run.
     """
-    position = pipeline_position(pipeline_run, pipeline_iteration)
-    if position is None:
+    run = getattr(args, "pipeline_run", None)
+    if not isinstance(run, str) or not run:
         return None
-    run, iteration = position
-    if state.get("pipeline_run") != run:
-        state["pipeline_run"] = run
-        state["pipeline_iteration"] = iteration
-        state["iterations"] = 0
-        state["total_iterations"] = 0
-        return "run"
-    recorded = state.get("pipeline_iteration")
-    recorded = recorded if isinstance(recorded, int) and not isinstance(recorded, bool) else 0
-    if iteration <= recorded:
-        return None
-    state["pipeline_iteration"] = iteration
-    state["iterations"] = 0
-    return "iteration"
+    iteration = pipeline_iteration_value(getattr(args, "pipeline_iteration", None))
+    spent = int(state.get("iterations", 0))
+    recorded = state.get("pipeline_budget") or {}
+    if recorded.get("run") != run:
+        return {
+            "run": run,
+            "iteration": iteration,
+            "baseline": spent,
+            "run_baseline": spent,
+        }
+    run_baseline = whole_number(recorded.get("run_baseline"), spent)
+    seen = pipeline_iteration_value(recorded.get("iteration"))
+    if iteration is not None and seen is not None and iteration > seen:
+        return {
+            "run": run,
+            "iteration": iteration,
+            "baseline": spent,
+            "run_baseline": run_baseline,
+        }
+    return {
+        "run": run,
+        "iteration": max(
+            (value for value in (seen, iteration) if value is not None), default=None
+        ),
+        "baseline": whole_number(recorded.get("baseline"), spent),
+        "run_baseline": run_baseline,
+    }
 
 
 def absolute_iteration_cap(
-    pipeline_run: Any,
-    pipeline_iteration: Any,
-    max_iterations: int,
-    pipeline_max_iterations: Any,
+    scope: dict[str, Any] | None, max_iterations: int, pipeline_max_iterations: Any
 ) -> int | None:
-    """Bound the total work one pipeline run may spend on a pull request.
+    """Bound the total work one outer run may spend on a pull request.
 
-    Derived from the caller's own cap rather than hardcoded, so raising the
-    pipeline's iteration limit raises this with it. It is enforced even though the
-    caller advancing its own loop at most that many times already implies it,
-    because a bound that depends on a peer behaving is not a bound.
+    Derived from the caller's own cap rather than hardcoded, so raising the outer
+    iteration limit raises this with it. It is enforced even though the caller
+    advancing its own loop at most that many times already implies it, because a
+    bound that depends on a peer behaving is not a bound.
+
+    Only the outer cap is optional. Omitting it falls back rather than removing the
+    ceiling, so a caller cannot lift the bound by leaving the value out.
     """
-    if pipeline_position(pipeline_run, pipeline_iteration) is None:
+    if scope is None:
         return None
     outer = (
         pipeline_max_iterations
@@ -1569,16 +1615,53 @@ def absolute_iteration_cap(
     return max_iterations * outer
 
 
+def budget_spent(
+    state: dict[str, Any], scope: dict[str, Any] | None
+) -> tuple[int, int]:
+    """How much of the per-iteration budget and of the whole run this PR has used.
+
+    Without an outer loop both are the durable count itself, which is the flat
+    per-pull-request cap this loop has always applied.
+    """
+    spent = int(state.get("iterations", 0))
+    if scope is None:
+        return spent, spent
+    return (
+        max(0, spent - whole_number(scope.get("baseline"), spent)),
+        max(0, spent - whole_number(scope.get("run_baseline"), spent)),
+    )
+
+
 def exhausted_budget(
-    state: dict[str, Any], max_iterations: int, absolute_cap: int | None
+    state: dict[str, Any],
+    scope: dict[str, Any] | None,
+    max_iterations: int,
+    absolute_cap: int | None,
 ) -> str | None:
     """Name the budget this pull request has used up, if it has used one up."""
-    if absolute_cap is not None:
-        if int(state.get("total_iterations", 0)) >= absolute_cap:
-            return "absolute"
-    if int(state.get("iterations", 0)) >= max_iterations:
+    iteration_spent, run_spent = budget_spent(state, scope)
+    if absolute_cap is not None and run_spent >= absolute_cap:
+        return "absolute"
+    if iteration_spent >= max_iterations:
         return "iteration"
     return None
+
+
+def budget_advanced(recorded: Any, scope: dict[str, Any] | None) -> bool:
+    """Whether this scope is a different outer position from the recorded one.
+
+    A new run, or a later iteration of the same run, both move the budget on.
+    Anything that leaves the budget where it was, including no outer loop at all,
+    reads as no advance.
+    """
+    if scope is None:
+        return False
+    previous = recorded if isinstance(recorded, dict) else {}
+    if previous.get("run") != scope.get("run"):
+        return True
+    seen = pipeline_iteration_value(previous.get("iteration"))
+    current = pipeline_iteration_value(scope.get("iteration"))
+    return current is not None and (seen is None or current > seen)
 
 
 def charge_iteration(state: dict[str, Any], run_state: dict[str, Any]) -> bool:
@@ -1588,14 +1671,26 @@ def charge_iteration(state: dict[str, Any], run_state: dict[str, Any]) -> bool:
     run that reaches attribution, a re-run, or a fix spends one, so relaunching the
     loop at a head whose checks already passed can never exhaust the cap.
 
-    The running total is charged alongside, and a pipeline iteration does not
-    refresh it, so it still bounds the work across every iteration of one run.
+    The budget bounds fix attempts, and a fix attempt is exactly what moves the
+    head, so an unchanged head is charged once however many times the loop is
+    relaunched on it. Re-deriving the same analysis, or re-running a flaky job and
+    reading the checks again, therefore costs nothing beyond the attempt that
+    reached that head. A run carrying no head is charged, because a dedupe with no
+    head to key on would be a guess.
+
+    The count is durable and only ever rises. Both budgets read it through a
+    baseline recorded in ``pipeline_budget``, so an outer iteration widens what
+    this loop may spend without rewriting what it already spent.
     """
     if run_state.get("charged"):
         return False
+    head_sha = run_state.get("head_sha")
+    if head_sha and state.get("charged_head_sha") == head_sha:
+        return False
     run_state["charged"] = True
     state["iterations"] = int(state.get("iterations", 0)) + 1
-    state["total_iterations"] = int(state.get("total_iterations", 0)) + 1
+    if head_sha:
+        state["charged_head_sha"] = head_sha
     return True
 
 
@@ -1757,31 +1852,46 @@ def command_preflight(args: argparse.Namespace) -> None:
             "version": STATE_VERSION,
             "created_at": utc_now(),
             "iterations": 0,
-            "total_iterations": 0,
             "history": [],
             "reruns": {},
             "escalation": None,
         }
     archive_run(state)
     state["iterations"] = int(state.get("iterations", 0))
-    state["total_iterations"] = int(state.get("total_iterations", 0))
     previous_run = state.get("run") or {}
     previous_head = previous_run.get("head_sha")
     if previous_head and previous_head != metadata["head_sha"]:
         # A new head invalidates every re-run this loop spent on the old one.
         state["reruns"] = {}
     max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
-    pipeline_run = getattr(args, "pipeline_run", None)
-    pipeline_iteration = getattr(args, "pipeline_iteration", None)
-    apply_pipeline_position(state, pipeline_run, pipeline_iteration)
+    scope = pipeline_scope(state, args)
+    if budget_advanced(state.get("pipeline_budget"), scope):
+        # The per-head charge protects one budget, so it lives exactly as long as
+        # that budget does. An outer iteration that widens what this loop may
+        # spend is entitled to a fresh attempt at the head it is looking at.
+        state.pop("charged_head_sha", None)
+    if scope is not None:
+        state["pipeline_budget"] = scope
     absolute_cap = absolute_iteration_cap(
-        pipeline_run,
-        pipeline_iteration,
-        max_iterations,
-        getattr(args, "pipeline_max_iterations", None),
+        scope, max_iterations, getattr(args, "pipeline_max_iterations", None)
     )
-    exhausted = exhausted_budget(state, max_iterations, absolute_cap)
-    iteration = state["iterations"] + 1
+    exhausted = exhausted_budget(state, scope, max_iterations, absolute_cap)
+    completed_iterations, run_spent = budget_spent(state, scope)
+    # Numbered from the durable count rather than from the budget, because this id
+    # is what `archive_run` dedupes history on and a duplicate is dropped rather
+    # than recorded. Any budget that rewrote that count instead of taking a
+    # baseline against it would restart the numbering and lose an entry.
+    #
+    # An unchanged head that was already charged keeps its number too, for the
+    # same reason. It is the same attempt read a second time, so it re-derives the
+    # verdicts already archived under that id and they are correctly dropped;
+    # advancing the number would let the label outrun the budget and make a third
+    # read collide with the second's entries instead.
+    already_charged = bool(
+        state.get("charged_head_sha")
+        and state.get("charged_head_sha") == metadata["head_sha"]
+    )
+    iteration = state["iterations"] + (0 if already_charged else 1)
     result = "max_iterations_reached" if exhausted else "ready"
     diff_path = diff_path_for(state_path)
     diff_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1815,11 +1925,11 @@ def command_preflight(args: argparse.Namespace) -> None:
     state["clean_at_head_sha"] = None
     if result == "max_iterations_reached":
         detail = (
-            f"this pull request already spent {state['total_iterations']} iteration(s) "
+            f"this pull request already spent {run_spent} iteration(s) "
             f"in this pipeline run, which is its ceiling of {absolute_cap}"
             if exhausted == "absolute"
             else (
-                f"this loop already ran {state['iterations']} iteration(s), which is "
+                f"this loop already ran {completed_iterations} iteration(s), which is "
                 f"its cap of {max_iterations}"
             )
         )
@@ -1850,10 +1960,11 @@ def command_preflight(args: argparse.Namespace) -> None:
         "escalation": state.get("escalation"),
         "iteration": iteration,
         "max_iterations": max_iterations,
-        "total_iterations": state["total_iterations"],
+        "completed_iterations": completed_iterations,
         "absolute_cap": absolute_cap,
-        "pipeline_run": state.get("pipeline_run"),
-        "pipeline_iteration": state.get("pipeline_iteration"),
+        "budget_exhausted": exhausted,
+        "pipeline_run": None if scope is None else scope["run"],
+        "pipeline_iteration": None if scope is None else scope["iteration"],
     }
     write_result_file(preflight_path, payload, "preflight")
     emit(
@@ -2553,9 +2664,8 @@ def status_payload(state: dict[str, Any], path: Path) -> dict[str, Any]:
         "clean_at_head_sha": state.get("clean_at_head_sha"),
         "skip_note": state.get("skip_note"),
         "iterations": int(state.get("iterations", 0)),
-        "total_iterations": int(state.get("total_iterations", 0)),
-        "pipeline_run": state.get("pipeline_run"),
-        "pipeline_iteration": state.get("pipeline_iteration"),
+        "pipeline_budget": state.get("pipeline_budget"),
+        "last_helper_activity": last_helper_activity(state),
     }
 
 
@@ -2631,6 +2741,7 @@ def command_status(args: argparse.Namespace) -> None:
                 **class_counts(checks),
             },
             "iterations": int(state.get("iterations", 0)),
+            "last_helper_activity": last_helper_activity(state),
         }
     )
 

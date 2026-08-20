@@ -51,6 +51,10 @@ DEFAULT_EFFORT = "high"
 # commits and checks are slow, so fixing checks earlier would fix a head that no
 # longer exists.
 #
+# One pass runs this order once, forward. A stage that pushes a commit stales the
+# clearances behind it, but the pass finishes the order first and only then goes
+# back for them, which starts the next pass.
+#
 # ``model`` names the model this stage runs best on. A stage that leaves it None
 # runs on DEFAULT_STAGE_MODEL. It is a starting point rather than a rule: a
 # ``--stage-model`` override at preflight beats it, and the ``requires_family``
@@ -1391,10 +1395,11 @@ def stage_green(
 def projected_iteration(state: dict[str, Any], stage: str) -> dict[str, Any]:
     """Work out which pipeline iteration running ``stage`` next would belong to.
 
-    An iteration is one pass down the stage order. Choosing a stage that sits
-    earlier than the furthest stage this iteration already started means the head
-    moved under a stage that had already run, so the pipeline is going round
-    again.
+    An iteration is one pass down the stage order. A stage at or after the
+    furthest stage this pass already started belongs to the same pass, whatever
+    pushed in between. A stage before it is only ever chosen once the rest of the
+    pass is green, so it means the pass finished and the pipeline is going round
+    again for a clearance that went stale.
     """
 
     iteration = int(state.get("iteration") or 1)
@@ -1459,18 +1464,42 @@ def decide_next(state: dict[str, Any], observation: dict[str, Any]) -> dict[str,
     cleared = state.get("cleared") or {}
     markers = observation.get("stage_markers") or {}
     stage_states: dict[str, Any] = {}
-    next_entry: dict[str, Any] | None = None
     for entry in STAGES:
-        verdict = stage_green(
+        stage_states[entry["stage"]] = stage_green(
             entry,
             head_sha=head_sha,
             cleared=cleared,
             marker=markers.get(entry["stage"]) or {},
             observation=observation,
         )
-        stage_states[entry["stage"]] = verdict
-        if next_entry is None and not verdict["green"]:
-            next_entry = entry
+
+    # A pass flows forward and only loops at its end. The floor is the furthest
+    # stage this pass has started, so a commit pushed by a later stage never drags
+    # the pipeline backwards mid-pass; it goes on to the next stage that still
+    # needs running. Only once every stage from the floor onward is green does the
+    # pass look behind it, and a stage whose clearance went stale there begins a
+    # new pass, which is the one move that costs an outer iteration.
+    #
+    # Charging the backward hop instead made `max_iterations` mean "one backward
+    # jump, ever": a push by any stage stole a whole pass, so the per-stage
+    # budgets could never be spent.
+    high_water = state.get("stage_high_water")
+    floor = high_water if isinstance(high_water, int) else 0
+    next_entry = next(
+        (
+            entry
+            for entry in STAGES[floor:]
+            if not stage_states[entry["stage"]]["green"]
+        ),
+        None,
+    ) or next(
+        (
+            entry
+            for entry in STAGES[:floor]
+            if not stage_states[entry["stage"]]["green"]
+        ),
+        None,
+    )
 
     if next_entry is None:
         return {
@@ -2581,6 +2610,62 @@ def summarize_history(history: Iterable[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
+NOT_A_LIVENESS_PROBE = (
+    "This is not proof the stage is alive. The pipeline emits a launch plan and "
+    "the agent runs the stage, so there is no process here to probe. These are "
+    "recorded timestamps and nothing more: they separate a stage whose helper "
+    "wrote something minutes ago from one that has been silent for an hour, "
+    "which is the question a person asks before intervening."
+)
+
+
+def stage_activity(state: dict[str, Any]) -> dict[str, Any] | None:
+    """How long the running stage has run, and how long its helper has been quiet.
+
+    Only a stage recorded as running has an activity block, because only then is
+    there a wait to judge. The stage's helper stamps its state on every write, so
+    reading that stamp back says when the stage last did anything the pipeline
+    can see.
+
+    A stamp the helper cannot supply reads as ``None`` beside a ``reason``. Zero
+    would claim the helper had just written, which is the opposite of what an
+    unanswerable question means.
+    """
+
+    running = state.get("running")
+    if not isinstance(running, dict) or not running:
+        return None
+    now = utc_now()
+    stage = running.get("stage")
+    activity: dict[str, Any] = {
+        "stage": stage,
+        "started_at": running.get("started_at"),
+        "running_for_seconds": elapsed_seconds(running.get("started_at"), now),
+        "last_helper_activity": None,
+        "helper_silent_for_seconds": None,
+        "note": NOT_A_LIVENESS_PROBE,
+    }
+    entry = STAGE_BY_NAME.get(stage) if isinstance(stage, str) else None
+    if entry is None:
+        activity["reason"] = "unknown_stage"
+        return activity
+    target = build_target(
+        state["pr"]["owner"], state["pr"]["repo"], state["pr"]["number"]
+    )
+    reading = run_stage_status(entry, target)
+    if not reading.get("ok"):
+        activity["reason"] = reading.get("reason") or "status_unavailable"
+        return activity
+    payload = reading.get("payload")
+    stamp = payload.get("last_helper_activity") if isinstance(payload, dict) else None
+    if not isinstance(stamp, str) or not stamp:
+        activity["reason"] = "not_reported"
+        return activity
+    activity["last_helper_activity"] = stamp
+    activity["helper_silent_for_seconds"] = elapsed_seconds(stamp, now)
+    return activity
+
+
 def command_status(args: argparse.Namespace) -> None:
     if args.current:
         require_tools()
@@ -2600,6 +2685,7 @@ def command_status(args: argparse.Namespace) -> None:
         path = cli_path(args.state)
     state = load_state(path)
     history = state.get("history") or []
+    activity = stage_activity(state)
     payload = {
         "result": "ready",
         "state": str(path),
@@ -2610,6 +2696,7 @@ def command_status(args: argparse.Namespace) -> None:
         "cleared": state.get("cleared") or {},
         "no_progress": state.get("no_progress") or {},
         "running": state.get("running"),
+        "activity": activity,
         "escalation": state.get("escalation"),
         "completed": state.get("completed"),
         "stage_models": stage_models(state),
@@ -2634,6 +2721,7 @@ def command_status(args: argparse.Namespace) -> None:
             "max_iterations": state.get("max_iterations"),
             "cleared": state.get("cleared") or {},
             "running": state.get("running"),
+            "activity": activity,
             "escalation": state.get("escalation"),
             "completed": state.get("completed"),
             "counts": {

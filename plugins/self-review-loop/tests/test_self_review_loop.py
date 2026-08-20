@@ -73,6 +73,22 @@ class AgentInstructionsTest(unittest.TestCase):
     def setUp(self):
         self.instructions = AGENT.read_text(encoding="utf-8")
 
+    def test_documents_the_helper_activity_stamp_without_overselling_it(self):
+        """A reader who thinks the stamp proves liveness stops checking further.
+
+        The helper writes only when a subcommand runs, so an hour of silence is
+        as consistent with hard thinking as with a hang.
+        """
+        self.assertIn("`last_helper_activity`", self.instructions)
+        self.assertIn(
+            "the moment this helper last wrote its state", self.instructions
+        )
+        self.assertIn("not proof the stage is alive", self.instructions)
+        self.assertIn(
+            "the agent driving it can think for a long time between two of them",
+            self.instructions,
+        )
+
     def test_names_the_session_from_preflight_metadata_idempotently(self):
         self.assertIn(
             "tools: [read, edit, search, execute, agent, todo, rename_session]",
@@ -2303,6 +2319,25 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(envelope["result"], "ready")
         self.assertEqual(envelope["pr"]["number"], 7)
         self.assertEqual(envelope["iterations"], 2)
+
+    def test_status_reports_when_the_helper_last_wrote_its_state(self):
+        """The only signal a reader has for telling working from wedged.
+
+        Every write stamps it, so a stamp minutes old and a stamp an hour old
+        are different answers to the question a person actually asks.
+        """
+        path = write_state(self.directory, updated_at="2026-02-03T04:05:06Z")
+
+        MODULE.command_status(
+            SimpleNamespace(state=str(path), current=False, repo_root=None)
+        )
+
+        envelope = self.emitted[-1]
+        self.assertEqual("2026-02-03T04:05:06Z", envelope["last_helper_activity"])
+        snapshot = json.loads(
+            Path(envelope["status_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual("2026-02-03T04:05:06Z", snapshot["last_helper_activity"])
 
     def test_writes_the_complete_state_snapshot_and_emits_a_compact_envelope(self):
         review = {

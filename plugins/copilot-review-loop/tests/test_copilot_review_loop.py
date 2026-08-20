@@ -67,6 +67,22 @@ def recorded_results() -> set[str]:
 
 
 class AgentInstructionsTest(unittest.TestCase):
+    def test_documents_the_helper_activity_stamp_without_overselling_it(self):
+        """A reader who thinks the stamp proves liveness stops checking further.
+
+        The helper writes only when a subcommand runs, so an hour of silence is
+        as consistent with hard thinking as with a hang.
+        """
+        self.assertIn("`last_helper_activity`", AGENT.read_text(encoding="utf-8"))
+        self.assertIn(
+            "the moment this helper last wrote its state", AGENT.read_text(encoding="utf-8")
+        )
+        self.assertIn("not proof the stage is alive", AGENT.read_text(encoding="utf-8"))
+        self.assertIn(
+            "the agent driving it can think for a long time between two of them",
+            AGENT.read_text(encoding="utf-8"),
+        )
+
     def test_names_the_session_from_preflight_metadata_idempotently(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
@@ -2761,6 +2777,32 @@ class CleanAtHeadShaTest(unittest.TestCase):
         payload = emit.call_args.args[0]
         self.assertEqual(payload["result"], "ready")
         self.assertEqual(payload["clean_at_head_sha"], "head")
+
+    def test_status_reports_when_the_helper_last_wrote_its_state(self):
+        """The only signal a reader has for telling working from wedged.
+
+        Every write stamps it, so a stamp minutes old and a stamp an hour old
+        are different answers to the question a person actually asks.
+        """
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "pr": {"number": 42, "url": "https://github.com/owner/repo/pull/42"},
+            "queue": {"id": "pr-42"},
+            "monitoring": {"status": "completed"},
+            "clean_at_head_sha": "head",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(path, state)
+            stamp = MODULE.load_state(path)["updated_at"]
+            args = SimpleNamespace(current=False, state=str(path), repo_root=None)
+
+            with mock.patch.object(MODULE, "emit") as emit:
+                MODULE.command_status(args)
+
+        payload = emit.call_args.args[0]
+        self.assertEqual(stamp, payload["last_helper_activity"])
 
     def test_status_reports_no_marker_before_the_stage_has_run(self):
         target = MODULE.parse_target("https://github.com/owner/repo/pull/42")

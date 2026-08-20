@@ -64,6 +64,22 @@ class AgentInstructionsTest(unittest.TestCase):
     def setUp(self):
         self.instructions = AGENT.read_text(encoding="utf-8")
 
+    def test_documents_the_helper_activity_stamp_without_overselling_it(self):
+        """A reader who thinks the stamp proves liveness stops checking further.
+
+        The helper writes only when a subcommand runs, so an hour of silence is
+        as consistent with hard thinking as with a hang.
+        """
+        self.assertIn("`last_helper_activity`", self.instructions)
+        self.assertIn(
+            "the moment this helper last wrote its state", self.instructions
+        )
+        self.assertIn("not proof the stage is alive", self.instructions)
+        self.assertIn(
+            "the agent driving it can think for a long time between two of them",
+            self.instructions,
+        )
+
     def test_is_manually_selected_and_user_invocable(self):
         self.assertIn("user-invocable: true", self.instructions)
         self.assertIn("disable-model-invocation: true", self.instructions)
@@ -527,7 +543,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.24")
+        self.assertEqual(plugin["version"], "1.0.25")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -1846,6 +1862,21 @@ class StatusAndCleanupTest(unittest.TestCase):
         self.assertEqual(result["pr"]["number"], 7)
         self.assertEqual(result["proposal_count"], 2)
         self.assertIsNone(result["validated_head_sha"])
+
+    def test_status_reports_when_the_helper_last_wrote_its_state(self):
+        """The only signal a reader has for telling working from wedged.
+
+        Every write stamps it, so a stamp minutes old and a stamp an hour old
+        are different answers to the question a person actually asks.
+        """
+        path = write_state(self.directory)
+        stamp = MODULE.load_state(path)["updated_at"]
+
+        MODULE.command_status(
+            SimpleNamespace(state=str(path), current=False, repo_root=None)
+        )
+
+        self.assertEqual(stamp, self.emitted[-1]["last_helper_activity"])
 
     def test_status_reports_no_state_for_the_current_branch_pr(self):
         target = MODULE.parse_target("owner/repo#7")

@@ -1,5 +1,6 @@
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 from pathlib import Path
@@ -453,12 +454,22 @@ class LoopBackTest(unittest.TestCase):
         self.assertFalse(decision["loop_back"])
 
     def test_new_commits_send_an_earlier_stage_round_again(self):
+        # The pass runs out first: every stage from the high-water mark on is
+        # green at the new head, so the only thing left is the clearance the push
+        # staled behind it, and going back for it starts the next pass.
         state = build_state(
             iteration=1,
             stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_COPILOT_REVIEW],
             cleared={MODULE.STAGE_SELF_REVIEW: HEAD},
         )
-        decision = MODULE.decide_next(state, observation(head_sha=NEXT_HEAD))
+        decision = MODULE.decide_next(
+            state,
+            observation(
+                head_sha=NEXT_HEAD,
+                copilot_review=NEXT_HEAD,
+                description=NEXT_HEAD,
+            ),
+        )
         self.assertEqual(MODULE.STAGE_SELF_REVIEW, decision["stage"])
         self.assertEqual(2, decision["iteration"])
         self.assertTrue(decision["loop_back"])
@@ -469,7 +480,9 @@ class LoopBackTest(unittest.TestCase):
             max_iterations=2,
             stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_CI],
         )
-        decision = MODULE.decide_next(state, observation(head_sha=NEXT_HEAD))
+        decision = MODULE.decide_next(
+            state, observation(head_sha=NEXT_HEAD, description=NEXT_HEAD)
+        )
         self.assertEqual("escalate", decision["result"])
         self.assertEqual("max_iterations_reached", decision["reason"])
         self.assertIn("iteration 3 of a maximum of 2", decision["detail"])
@@ -489,6 +502,7 @@ class LoopBackTest(unittest.TestCase):
         # pinned to a head and it can be re-picked after saying it cleared.
         # A push still costs it an iteration, because the review stages ahead
         # of it cleared at the old head and stop being green at the new one.
+        # It is charged at the end of the pass rather than the moment it pushes.
         state = build_state(
             iteration=1,
             stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_CI],
@@ -498,7 +512,7 @@ class LoopBackTest(unittest.TestCase):
             },
         )
         decision = MODULE.decide_next(
-            state, observation(head_sha=NEXT_HEAD, checks="failure")
+            state, observation(head_sha=NEXT_HEAD, description=NEXT_HEAD)
         )
         self.assertEqual(MODULE.STAGE_SELF_REVIEW, decision["stage"])
         self.assertEqual(2, decision["iteration"])
@@ -596,6 +610,126 @@ class LoopBackTest(unittest.TestCase):
         decision = MODULE.decide_next(state, all_green())
         self.assertEqual("complete", decision["result"])
         self.assertEqual(1, state["iteration"])
+
+
+class FlowForwardTest(unittest.TestCase):
+    """A pass runs the order forward once and only loops at its end.
+
+    Reaching behind the high-water mark the moment a later stage pushed made an
+    outer iteration cost a backward hop rather than a pass, so `max_iterations`
+    of 2 meant one backward jump ever, and the per-stage budgets could never be
+    spent.
+    """
+
+    def test_a_push_by_a_later_stage_does_not_drag_the_pass_backwards(self):
+        state = build_state(
+            iteration=1,
+            stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_COPILOT_REVIEW],
+            cleared={MODULE.STAGE_SELF_REVIEW: HEAD},
+        )
+
+        decision = MODULE.decide_next(state, observation(head_sha=NEXT_HEAD))
+
+        self.assertEqual(MODULE.STAGE_COPILOT_REVIEW, decision["stage"])
+        self.assertEqual(1, decision["iteration"])
+        self.assertFalse(decision["loop_back"])
+
+    def test_the_stage_that_pushed_keeps_running_while_it_is_still_not_green(self):
+        state = build_state(
+            iteration=1,
+            stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_CI],
+            cleared={
+                MODULE.STAGE_SELF_REVIEW: HEAD,
+                MODULE.STAGE_COPILOT_REVIEW: HEAD,
+            },
+        )
+
+        decision = MODULE.decide_next(
+            state, observation(head_sha=NEXT_HEAD, checks="failure")
+        )
+
+        self.assertEqual(MODULE.STAGE_CI, decision["stage"])
+        self.assertEqual(1, decision["iteration"])
+        self.assertFalse(decision["loop_back"])
+
+    def test_a_pass_ends_only_when_every_stage_from_the_floor_on_is_green(self):
+        """One stale stage behind the floor is not enough on its own."""
+        floor = MODULE.STAGE_INDEX[MODULE.STAGE_CI]
+        forward = {"checks": "success", "description": NEXT_HEAD}
+        for held_back, expected in (
+            ({"checks": "failure"}, MODULE.STAGE_CI),
+            ({"description": None}, MODULE.STAGE_DESCRIPTION),
+            ({}, MODULE.STAGE_SELF_REVIEW),
+        ):
+            with self.subTest(held_back=held_back):
+                state = build_state(
+                    iteration=1,
+                    stage_high_water=floor,
+                    cleared={
+                        MODULE.STAGE_SELF_REVIEW: HEAD,
+                        MODULE.STAGE_COPILOT_REVIEW: HEAD,
+                    },
+                )
+                decision = MODULE.decide_next(
+                    state,
+                    observation(head_sha=NEXT_HEAD, **{**forward, **held_back}),
+                )
+                self.assertEqual(expected, decision["stage"])
+
+    def test_a_within_pass_move_never_raises_the_iteration_at_the_cap(self):
+        """The cap bounds passes, so it must not bind on a forward move."""
+        for stage in (MODULE.STAGE_COPILOT_REVIEW, MODULE.STAGE_CI):
+            with self.subTest(stage=stage):
+                state = build_state(
+                    iteration=2,
+                    max_iterations=2,
+                    stage_high_water=MODULE.STAGE_INDEX[stage],
+                    cleared={
+                        MODULE.STAGE_SELF_REVIEW: HEAD,
+                        MODULE.STAGE_COPILOT_REVIEW: HEAD,
+                    },
+                )
+                decision = MODULE.decide_next(
+                    state, observation(head_sha=NEXT_HEAD, checks="failure")
+                )
+                self.assertEqual("run_stage", decision["result"])
+                self.assertEqual(2, decision["iteration"])
+                self.assertFalse(decision["loop_back"])
+
+    def test_the_review_stage_pushing_still_leaves_the_check_stage_in_this_pass(self):
+        """The shape that used to guarantee an escalation before CI could finish.
+
+        The Copilot review stage pushed, which staled the self-review clearance.
+        The pipeline used to spend a whole pass going back for it, so the check
+        stage only ever came up on a pass the cap had already refused.
+        """
+        state = build_state(
+            iteration=1,
+            max_iterations=2,
+            stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_COPILOT_REVIEW],
+            cleared={MODULE.STAGE_SELF_REVIEW: HEAD},
+        )
+
+        decision = MODULE.decide_next(
+            state,
+            observation(
+                head_sha=NEXT_HEAD, copilot_review=NEXT_HEAD, checks="failure"
+            ),
+        )
+
+        self.assertEqual(MODULE.STAGE_CI, decision["stage"])
+        self.assertEqual(1, decision["iteration"])
+        self.assertFalse(decision["loop_back"])
+
+    def test_an_unset_high_water_mark_puts_the_floor_at_the_first_stage(self):
+        """A fresh or resumed run starts a pass rather than resuming one."""
+        state = build_state(iteration=1, stage_high_water=None)
+
+        decision = MODULE.decide_next(state, observation(mergeable="CONFLICTING"))
+
+        self.assertEqual(MODULE.STAGE_CONFLICT, decision["stage"])
+        self.assertEqual(1, decision["iteration"])
+        self.assertFalse(decision["loop_back"])
 
 
 class ProjectedIterationTest(unittest.TestCase):
@@ -3182,7 +3316,9 @@ class NextCommandTest(CommandTestCase):
                 MODULE.STAGE_CI: HEAD,
             },
         )
-        self.call_next(path, observation(head_sha=NEXT_HEAD))
+        self.call_next(
+            path, observation(head_sha=NEXT_HEAD, description=NEXT_HEAD)
+        )
         payload = self.emitted[-1]
         self.assertEqual(MODULE.STAGE_SELF_REVIEW, payload["stage"])
         self.assertEqual(2, payload["iteration"])
@@ -3193,8 +3329,10 @@ class NextCommandTest(CommandTestCase):
             self.root,
             stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_DESCRIPTION],
         )
-        self.call_next(path, observation(head_sha=NEXT_HEAD))
-        self.call_next(path, observation(head_sha=NEXT_HEAD))
+        for _ in range(2):
+            self.call_next(
+                path, observation(head_sha=NEXT_HEAD, description=NEXT_HEAD)
+            )
         self.assertEqual(1, MODULE.load_state(path)["iteration"])
         self.assertEqual(2, self.emitted[-1]["iteration"])
 
@@ -3283,6 +3421,123 @@ class StatusCommandTest(CommandTestCase):
                     state=str(self.root / "missing.json"), current=False, repo_root=None
                 )
             )
+
+
+class StageActivityTest(CommandTestCase):
+    """Observability only. Nothing here bounds, throttles, or escalates anything."""
+
+    def running_state(self, **overrides) -> dict:
+        running = {
+            "stage": MODULE.STAGE_CI,
+            "head_sha": HEAD,
+            "iteration": 1,
+            "started_at": "2026-01-01T00:00:00Z",
+        }
+        running.update(overrides)
+        return build_state(running=running)
+
+    def test_a_stage_that_is_not_running_has_nothing_to_wait_on(self):
+        self.assertIsNone(MODULE.stage_activity(build_state()))
+
+    def test_a_running_stage_reports_both_waits_from_recorded_timestamps(self):
+        state = self.running_state()
+        with mock.patch.object(MODULE, "utc_now", return_value="2026-01-01T01:00:00Z"):
+            with mock.patch.object(
+                MODULE,
+                "run_stage_status",
+                return_value={
+                    "ok": True,
+                    "payload": {"last_helper_activity": "2026-01-01T00:45:00Z"},
+                },
+            ):
+                activity = MODULE.stage_activity(state)
+        self.assertEqual(MODULE.STAGE_CI, activity["stage"])
+        self.assertEqual(3600.0, activity["running_for_seconds"])
+        self.assertEqual("2026-01-01T00:45:00Z", activity["last_helper_activity"])
+        self.assertEqual(900.0, activity["helper_silent_for_seconds"])
+        self.assertNotIn("reason", activity)
+
+    def test_it_says_plainly_that_it_is_not_proof_the_stage_is_alive(self):
+        """The pipeline does not own the stage process, so it cannot probe one.
+
+        Claiming more than the timestamps support would put a reader's trust
+        behind a signal that was never measured.
+        """
+        with mock.patch.object(
+            MODULE, "run_stage_status", return_value={"ok": False, "reason": "no_state"}
+        ):
+            activity = MODULE.stage_activity(self.running_state())
+        self.assertIn("not proof the stage is alive", activity["note"])
+        self.assertIn("no process here to probe", activity["note"])
+
+    def test_a_helper_that_does_not_report_the_stamp_reads_as_unknown(self):
+        """An unanswerable question is not the answer "just now"."""
+
+        with mock.patch.object(
+            MODULE, "run_stage_status", return_value={"ok": True, "payload": {}}
+        ):
+            activity = MODULE.stage_activity(self.running_state())
+        self.assertIsNone(activity["last_helper_activity"])
+        self.assertIsNone(activity["helper_silent_for_seconds"])
+        self.assertEqual("not_reported", activity["reason"])
+
+    def test_a_helper_that_cannot_be_asked_carries_the_reason_it_gave(self):
+        with mock.patch.object(
+            MODULE,
+            "run_stage_status",
+            return_value={"ok": False, "reason": "helper_missing"},
+        ):
+            activity = MODULE.stage_activity(self.running_state())
+        self.assertIsNone(activity["last_helper_activity"])
+        self.assertEqual("helper_missing", activity["reason"])
+
+    def test_status_carries_the_block_in_the_envelope_and_the_snapshot(self):
+        path = write_state(
+            self.root,
+            running={
+                "stage": MODULE.STAGE_CI,
+                "head_sha": HEAD,
+                "iteration": 1,
+                "started_at": "2026-01-01T00:00:00Z",
+            },
+        )
+        with mock.patch.object(
+            MODULE,
+            "run_stage_status",
+            return_value={
+                "ok": True,
+                "payload": {"last_helper_activity": "2026-01-01T00:45:00Z"},
+            },
+        ):
+            MODULE.command_status(
+                self.args(state=str(path), current=False, repo_root=None)
+            )
+        payload = self.emitted[-1]
+        self.assertEqual(MODULE.STAGE_CI, payload["activity"]["stage"])
+        snapshot = json.loads(Path(payload["status_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            "2026-01-01T00:45:00Z", snapshot["activity"]["last_helper_activity"]
+        )
+
+    def test_status_without_a_running_stage_reports_no_activity(self):
+        path = write_state(self.root)
+        MODULE.command_status(self.args(state=str(path), current=False, repo_root=None))
+        payload = self.emitted[-1]
+        self.assertIsNone(payload["activity"])
+        snapshot = json.loads(Path(payload["status_path"]).read_text(encoding="utf-8"))
+        self.assertIsNone(snapshot["activity"])
+
+    def test_nothing_the_block_reports_reaches_the_stage_decision(self):
+        """Observability that steers the pipeline stops being observability."""
+
+        source = inspect.getsource(MODULE.decide_next)
+        for name in (
+            "stage_activity",
+            "last_helper_activity",
+            "helper_silent_for_seconds",
+            "running_for_seconds",
+        ):
+            self.assertNotIn(name, source)
 
 
 class CleanupCommandTest(CommandTestCase):
@@ -3686,6 +3941,53 @@ class AgentInstructionsTest(unittest.TestCase):
             "`kickoff.prompt` set to the plan's `target`", self.instructions
         )
         self.assertIn("Use `prompt` and never `target`", self.instructions)
+
+    def test_the_pass_flows_forward_and_only_loops_at_its_end(self):
+        """The prose is what the next reader reinstates, so it has to say which it is.
+
+        A reader who believes a push sends the pipeline straight back also
+        believes an outer iteration is spent on that hop, which is the accounting
+        this order removed.
+        """
+        self.assertIn("The loop back waits for the end of the pass.", self.instructions)
+        self.assertIn(
+            "a commit pushed by a later stage never sends the pipeline backwards "
+            "in the middle of that pass",
+            self.instructions,
+        )
+        self.assertIn(
+            "Only when every stage from that point to the end is green does the "
+            "pipeline go back for a clearance the push staled",
+            self.instructions,
+        )
+        self.assertIn(
+            "Two iterations means two passes down the stage order, not two "
+            "backward jumps.",
+            self.instructions,
+        )
+        self.assertIn(
+            "This is where the start of a new pass increments the iteration",
+            self.instructions,
+        )
+
+    def test_the_activity_block_is_documented_as_not_proof_of_liveness(self):
+        """Prose that oversells the block is worse than no block at all."""
+
+        self.assertIn("adds an `activity` block", self.instructions)
+        self.assertIn(
+            "That is not proof the stage is alive", self.instructions
+        )
+        self.assertIn("there is no process here to probe", self.instructions)
+        self.assertIn(
+            "separates a stage that was active minutes ago from one silent for "
+            "an hour",
+            self.instructions,
+        )
+        self.assertIn(
+            "A helper that cannot answer reports `null` beside a `reason` rather "
+            "than a zero.",
+            self.instructions,
+        )
 
     def test_frontmatter_matches_the_sibling_shape(self):
         self.assertIn("name: PR Pipeline", self.instructions)
