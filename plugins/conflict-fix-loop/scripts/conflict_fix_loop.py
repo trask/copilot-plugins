@@ -1485,6 +1485,10 @@ def command_preflight(args: argparse.Namespace) -> None:
     )
     exhausted = exhausted_budget(state, scope, max_iterations, absolute_cap)
     completed_iterations = budget_spent(state, scope)[0]
+    # Numbered from the durable count rather than from the budget, because this id
+    # is what `archive_attempt` dedupes history on and a duplicate is dropped
+    # rather than recorded. Any budget that rewrote that count instead of taking a
+    # baseline against it would restart the numbering and lose an entry.
     iteration = state["iterations"] + 1
     mergeability = classify_mergeability(metadata)
 

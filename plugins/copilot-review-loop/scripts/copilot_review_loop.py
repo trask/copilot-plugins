@@ -29,6 +29,10 @@ GH_REVIEWER_ALIAS_VERSION = (2, 88, 0)
 COPILOT_REQUEST_RETRY_DELAYS = (2, 4, 8, 16)
 STATE_VERSION = 3
 DEFAULT_MAX_ITERATIONS = 5
+# How many of its own iterations an outer loop is assumed to allow when it names no
+# cap of its own. Only the ceiling derived from it is affected, never the per-iteration
+# budget, so a caller cannot lift the bound by leaving the value out.
+DEFAULT_PIPELINE_MAX_ITERATIONS = 2
 PR_HEAD_LAG_RETRY_DELAYS = (1, 2, 4)
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
 # Preflight results that mean Copilot reviewed the current head and asked for nothing.
@@ -768,6 +772,18 @@ def stage_outcome(state: dict[str, Any]) -> str | None:
     return STAGE_OUTCOME_BY_RESULT.get(last_result, "escalated")
 
 
+def whole_number(value: Any, fallback: int) -> int:
+    """Read a counter out of stored state, falling back when it holds anything else.
+
+    A state file is durable and survives every run, so a value written by an older
+    version, edited by hand, or truncated mid-write reaches this loop long after
+    the run that produced it. Coercing it directly would raise on ``null``.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return fallback
+    return value
+
+
 def pipeline_scope(
     state: dict[str, Any], args: argparse.Namespace
 ) -> dict[str, Any] | None:
@@ -785,6 +801,11 @@ def pipeline_scope(
     at 1, so comparing order alone would see the count go backwards on a later
     run and never reset again.
 
+    Two baselines are kept because they bound different things. ``baseline``
+    moves on every advance and bounds one outer iteration. ``run_baseline`` moves
+    only on a new run and bounds the whole run, so an advance cannot refresh the
+    ceiling that stops a caller from spending without end.
+
     Returns ``None`` when no outer loop is driving this stage, which leaves a
     standalone invocation as it was. Absent arguments never read as a new run.
     """
@@ -800,16 +821,92 @@ def pipeline_scope(
         same_run and iteration is not None and seen is not None and iteration > seen
     )
     published = int(state.get("iterations", 0))
-    if not same_run or advanced:
-        return {"run": run, "iteration": iteration, "baseline": published}
+    if not same_run:
+        return {
+            "run": run,
+            "iteration": iteration,
+            "baseline": published,
+            "run_baseline": published,
+        }
+    run_baseline = whole_number(recorded.get("run_baseline"), published)
+    if advanced:
+        return {
+            "run": run,
+            "iteration": iteration,
+            "baseline": published,
+            "run_baseline": run_baseline,
+        }
     highest = max(
         (value for value in (seen, iteration) if value is not None), default=None
     )
     return {
         "run": run,
         "iteration": highest,
-        "baseline": int(recorded.get("baseline", published)),
+        "baseline": whole_number(recorded.get("baseline"), published),
+        "run_baseline": run_baseline,
     }
+
+
+def absolute_iteration_cap(
+    scope: dict[str, Any] | None, max_iterations: int, pipeline_max_iterations: Any
+) -> int | None:
+    """Bound the total work one outer run may spend on a pull request.
+
+    The outer cap counts the caller's own loop-backs and the stage cap counts
+    stage iterations, so the two are different quantities. Replacing one with the
+    other would hand a stage as many iterations as its caller has loop-backs,
+    which is far fewer than one round of review comments usually needs.
+
+    Derived from the caller's own cap rather than hardcoded, so raising the outer
+    iteration limit raises this with it. It is enforced even though the caller
+    advancing its own loop at most that many times already implies it, because a
+    bound that depends on a peer behaving is not a bound.
+
+    Only the outer cap is optional. Omitting it falls back rather than removing
+    the ceiling, so a caller cannot lift the bound by leaving the value out.
+    """
+    if scope is None:
+        return None
+    outer = (
+        pipeline_max_iterations
+        if isinstance(pipeline_max_iterations, int)
+        and not isinstance(pipeline_max_iterations, bool)
+        and pipeline_max_iterations > 0
+        else DEFAULT_PIPELINE_MAX_ITERATIONS
+    )
+    return max_iterations * outer
+
+
+def budget_spent(
+    state: dict[str, Any], scope: dict[str, Any] | None, completed_run_iterations: int
+) -> tuple[int, int]:
+    """How much of the per-iteration budget and of the whole run this PR has used.
+
+    Without an outer loop both are the count the agent keeps for this invocation,
+    which is the budget this loop has always applied standalone.
+    """
+    if scope is None:
+        return completed_run_iterations, completed_run_iterations
+    published = int(state.get("iterations", 0))
+    return (
+        max(0, published - whole_number(scope.get("baseline"), published)),
+        max(0, published - whole_number(scope.get("run_baseline"), published)),
+    )
+
+
+def exhausted_budget(
+    iteration_spent: int,
+    run_spent: int,
+    max_iterations: int,
+    absolute_cap: int | None,
+) -> str | None:
+    """Name the budget this pull request has used up, if it has used one up."""
+    if absolute_cap is not None and run_spent >= absolute_cap:
+        return "absolute"
+    if iteration_spent >= max_iterations:
+        return "iteration"
+    return None
+
 
 
 def watcher_result(
@@ -964,17 +1061,20 @@ def command_preflight(args: argparse.Namespace) -> None:
         state["copilot_bot_id"] = bot_id
     max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
     scope = pipeline_scope(state, args)
-    if scope is None:
-        completed_run_iterations = getattr(args, "completed_run_iterations", 0)
-    else:
+    if scope is not None:
         state["pipeline_budget"] = scope
-        completed_run_iterations = max(0, state["iterations"] - scope["baseline"])
-        cap = getattr(args, "pipeline_max_iterations", None)
-        if cap is not None:
-            max_iterations = cap
+    absolute_cap = absolute_iteration_cap(
+        scope, max_iterations, getattr(args, "pipeline_max_iterations", None)
+    )
+    completed_run_iterations, run_iterations = budget_spent(
+        state, scope, getattr(args, "completed_run_iterations", 0)
+    )
+    exhausted = exhausted_budget(
+        completed_run_iterations, run_iterations, max_iterations, absolute_cap
+    )
     iteration = completed_run_iterations + 1
     review_required = not comments and not head_review_clean
-    if (comments or review_required) and completed_run_iterations >= max_iterations:
+    if (comments or review_required) and exhausted:
         result = "max_iterations_reached"
     elif comments:
         result = "ready"
@@ -1004,7 +1104,10 @@ def command_preflight(args: argparse.Namespace) -> None:
             "clean_at_head_sha": clean_at_head_sha,
             "iteration": iteration,
             "completed_run_iterations": completed_run_iterations,
+            "run_iterations": run_iterations,
             "max_iterations": max_iterations,
+            "absolute_cap": absolute_cap,
+            "budget_exhausted": exhausted,
             "published_iterations": state["iterations"],
             "pr": metadata,
         }
@@ -1990,9 +2093,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS
     )
     preflight.add_argument("--completed-run-iterations", type=int, default=0)
-    preflight.add_argument("--pipeline-run")
-    preflight.add_argument("--pipeline-iteration", type=int)
-    preflight.add_argument("--pipeline-max-iterations", type=int)
+    preflight.add_argument(
+        "--pipeline-run",
+        help=(
+            "opaque identifier for one outer run, compared only for equality; "
+            "a different one starts both budgets over"
+        ),
+    )
+    preflight.add_argument(
+        "--pipeline-iteration",
+        type=int,
+        help=(
+            "which iteration of that run this is; a higher one within the same "
+            "run refreshes the per-iteration budget"
+        ),
+    )
+    preflight.add_argument(
+        "--pipeline-max-iterations",
+        type=int,
+        help=(
+            "how many iterations that run may take, used to derive the ceiling "
+            "on the whole run rather than to replace the per-iteration budget"
+        ),
+    )
     preflight.set_defaults(function=command_preflight)
 
     plan = subparsers.add_parser("plan", help="record one planned review batch")

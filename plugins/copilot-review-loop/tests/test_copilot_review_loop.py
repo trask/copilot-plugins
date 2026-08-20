@@ -3992,5 +3992,217 @@ class PipelineBudgetTest(unittest.TestCase):
         self.assertEqual(self.scope(state, pipeline_run="run-b")["baseline"], 9)
 
 
+class DerivedCeilingTest(unittest.TestCase):
+    """The outer cap bounds the run; it does not replace the stage's own budget."""
+
+    SCOPE = {"run": "run-a", "iteration": 2, "baseline": 9, "run_baseline": 2}
+
+    def scope(self, state, **pipeline):
+        return MODULE.pipeline_scope(state, SimpleNamespace(**pipeline))
+
+    def run_preflight(self, stored, threads=None, **pipeline):
+        metadata = {"head_branch": "branch", "head_sha": "head"}
+
+        def fake_git(repo_root, *arguments):
+            del repo_root
+            return {
+                ("status", "--porcelain=v1"): "",
+                ("branch", "--show-current"): "branch",
+                ("rev-parse", "HEAD"): "head",
+            }[arguments]
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(
+                path,
+                {
+                    "version": MODULE.STATE_VERSION,
+                    "queue": {"comments": [], "batches": []},
+                    **stored,
+                },
+            )
+            args = SimpleNamespace(
+                target="owner/repo#7",
+                repo_root=directory,
+                state=str(path),
+                max_iterations=5,
+                completed_run_iterations=0,
+                **pipeline,
+            )
+
+            with (
+                mock.patch.object(MODULE, "require_tools"),
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=Path(directory)
+                ),
+                mock.patch.object(MODULE, "git", side_effect=fake_git),
+                mock.patch.object(MODULE, "metadata_for", return_value=metadata),
+                mock.patch.object(MODULE, "checkout_pr", return_value=True),
+                mock.patch.object(MODULE, "run"),
+                mock.patch.object(MODULE, "fetch_threads", return_value=threads or []),
+                mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_preflight(args)
+
+        return emit.call_args.args[0]
+
+    def test_the_ceiling_is_derived_from_the_callers_own_cap(self):
+        self.assertEqual(15, MODULE.absolute_iteration_cap(self.SCOPE, 5, 3))
+        self.assertEqual(20, MODULE.absolute_iteration_cap(self.SCOPE, 10, 2))
+        self.assertIsNone(MODULE.absolute_iteration_cap(None, 5, 3))
+
+    def test_an_omitted_outer_cap_falls_back_rather_than_disabling_the_ceiling(self):
+        """Only the outer cap is optional, and omitting it must not remove the bound."""
+        for value in (None, 0, -1, True, "3"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    5 * MODULE.DEFAULT_PIPELINE_MAX_ITERATIONS,
+                    MODULE.absolute_iteration_cap(self.SCOPE, 5, value),
+                )
+
+    def test_the_outer_cap_never_becomes_the_stage_budget(self):
+        """Two different quantities: the caller's loop-backs and this stage's iterations.
+
+        Reading one as the other hands the stage as few iterations as its caller
+        has loop-backs, and review comments arrive in waves that two passes
+        routinely fail to clear.
+        """
+        payload = self.run_preflight(
+            {
+                "iterations": 12,
+                "pipeline_budget": {
+                    "run": "run-a",
+                    "iteration": 2,
+                    "baseline": 9,
+                    "run_baseline": 9,
+                },
+            },
+            pipeline_run="run-a",
+            pipeline_iteration=2,
+            pipeline_max_iterations=2,
+        )
+
+        self.assertEqual(5, payload["max_iterations"])
+        self.assertEqual(3, payload["completed_run_iterations"])
+        self.assertEqual("review_required", payload["result"])
+        self.assertIsNone(payload["budget_exhausted"])
+
+    def test_the_whole_run_ceiling_still_stops_a_caller_that_keeps_advancing(self):
+        """The stage budget being untouched must not leave the run unbounded."""
+        payload = self.run_preflight(
+            {
+                "iterations": 12,
+                "pipeline_budget": {
+                    "run": "run-a",
+                    "iteration": 2,
+                    "baseline": 12,
+                    "run_baseline": 2,
+                },
+            },
+            pipeline_run="run-a",
+            pipeline_iteration=2,
+            pipeline_max_iterations=2,
+        )
+
+        self.assertEqual(0, payload["completed_run_iterations"])
+        self.assertEqual(10, payload["absolute_cap"])
+        self.assertEqual("absolute", payload["budget_exhausted"])
+        self.assertEqual("max_iterations_reached", payload["result"])
+
+    def test_a_genuine_advance_refreshes_only_the_per_iteration_budget(self):
+        """The whole-run ceiling must survive an advance, or it bounds nothing."""
+        state = {"iterations": 9, "pipeline_budget": dict(self.SCOPE)}
+
+        scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
+
+        self.assertEqual(9, scope["baseline"])
+        self.assertEqual(2, scope["run_baseline"])
+
+    def test_a_new_run_resets_both_budgets(self):
+        """Starting the outer loop again is an authority outside any budget kept here."""
+        state = {"iterations": 9, "pipeline_budget": dict(self.SCOPE)}
+
+        scope = self.scope(state, pipeline_run="run-b", pipeline_iteration=1)
+
+        self.assertEqual(9, scope["baseline"])
+        self.assertEqual(9, scope["run_baseline"])
+
+    def test_a_relaunch_leaves_both_baselines_where_they_were(self):
+        state = {"iterations": 40, "pipeline_budget": dict(self.SCOPE)}
+
+        scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=2)
+
+        self.assertEqual(self.SCOPE, scope)
+
+    def test_a_stored_budget_that_lost_a_number_does_not_crash_the_run(self):
+        """State files are durable, so a value from any earlier version reaches this.
+
+        Coercing a stored baseline directly raises on ``null`` and on anything
+        else that is not a number, and it raises on the ordinary relaunch path
+        rather than on some rare branch.
+        """
+        for stored in (
+            {"baseline": None, "run_baseline": None},
+            {"baseline": "7", "run_baseline": "2"},
+            {"baseline": -1, "run_baseline": -1},
+            {"baseline": True, "run_baseline": False},
+            {},
+        ):
+            with self.subTest(stored=stored):
+                state = {
+                    "iterations": 9,
+                    "pipeline_budget": {"run": "run-a", "iteration": 2, **stored},
+                }
+
+                scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=2)
+
+                self.assertEqual(9, scope["baseline"])
+                self.assertEqual(9, scope["run_baseline"])
+                self.assertIsNone(
+                    MODULE.exhausted_budget(*MODULE.budget_spent(state, scope, 0), 5, 10)
+                )
+
+    def test_a_standalone_invocation_still_counts_what_the_agent_counts(self):
+        """The standalone budget stays the agent's per-invocation count, not the durable one.
+
+        This loop is alone among the pipeline stages in taking that count from
+        its caller, and nothing here changes it.
+        """
+        self.assertEqual((3, 3), MODULE.budget_spent({"iterations": 40}, None, 3))
+        self.assertEqual(
+            "iteration", MODULE.exhausted_budget(5, 5, 5, None)
+        )
+        self.assertIsNone(MODULE.exhausted_budget(4, 4, 5, None))
+
+    def test_a_spent_stage_budget_is_never_a_permanent_refusal(self):
+        """Forty iterations over the pull request's life say nothing about this run."""
+        scope = {"run": "run-a", "iteration": 1, "baseline": 40, "run_baseline": 40}
+        state = {"iterations": 40}
+
+        self.assertIsNone(
+            MODULE.exhausted_budget(*MODULE.budget_spent(state, scope, 0), 5, 10)
+        )
+
+    def test_the_agent_file_states_the_outer_cap_as_a_bound_on_the_run(self):
+        """Left as a replacement in prose, the next reader reinstates it in code."""
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "An outer loop does not raise or lower that; it bounds what the whole "
+            "run may spend instead.",
+            instructions,
+        )
+
+    def test_preflight_documents_the_ceiling_rather_than_a_replacement(self):
+        """The flag reads as a replacement unless its help says otherwise."""
+        parser = MODULE.build_parser()
+        bare = parser.parse_args(["preflight"])
+        self.assertIsNone(bare.pipeline_max_iterations)
+
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("used to derive the ceiling ", source)
+        self.assertIn("rather than to replace the per-iteration budget", source)
+
 if __name__ == "__main__":
     unittest.main()
