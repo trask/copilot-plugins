@@ -106,11 +106,15 @@ Record the returned `head_sha` as the immutable snapshot for this iteration, and
 
 ### A Launcher's Loop Position
 
-An orchestrator that runs this loop as one stage of a larger loop may include a line of the form `pipeline-run: <token> pipeline-iteration: <number> pipeline-max-iterations: <number>` in the request, on its own line beside the target.
+An orchestrator that runs this loop as one stage of a larger loop tells you where its own loop stands. It may write that as a line of the form `pipeline-run: <token> pipeline-iteration: <number> pipeline-max-iterations: <number>` beside the target, or as the arguments themselves, `--pipeline-run <token> --pipeline-iteration <number> --pipeline-max-iterations <number>`, or in some other wording that names all three.
 
-When that line is present, pass all three values to `preflight` verbatim, as `--pipeline-run <token> --pipeline-iteration <number> --pipeline-max-iterations <number>`.
+Whenever the request names all three, pass them to `preflight` as `--pipeline-run <token> --pipeline-iteration <number> --pipeline-max-iterations <number>`.
 
-Copy them exactly. Do not read the token, do not shorten or reformat it, and do not adjust either number. They tell the helper where the caller's own loop stands, which is the one thing that may refresh this loop's budget. Anything you supplied yourself would be this loop resetting its own cap, so if the line is absent, omit all three arguments and the flat cap of 5 applies. Never invent a value to keep working after `max_iterations_reached`.
+Read the values, not the spelling. Any wording that gives you all three is the caller naming its position, and a spelling you do not recognize is still the caller's instruction. What matters is only where a value came from: the caller may supply one and you may not.
+
+Copy them exactly. Do not read the token, do not shorten or reformat it, and do not adjust either number.
+
+Omit all three only when the request names no position at all, and the flat cap of 5 then applies. `--pipeline-run` and `--pipeline-iteration` go together, because neither alone says where the caller's loop stands and the helper ignores a lone one. Never supply, guess, carry over, or reconstruct a value yourself, and never invent one to keep working after `max_iterations_reached`. A value you produced would be this loop refreshing its own cap, which is the one thing the cap exists to prevent.
 
 ## What Green Means Here
 

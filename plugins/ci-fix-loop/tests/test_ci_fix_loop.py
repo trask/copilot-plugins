@@ -192,13 +192,35 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "Anything you supplied yourself would be this loop resetting its own cap",
+            "A value you produced would be this loop refreshing its own cap",
             self.instructions,
         )
         self.assertIn(
-            "Never invent a value to keep working after `max_iterations_reached`.",
+            "never invent one to keep working after `max_iterations_reached`",
             self.instructions,
         )
+
+    def test_keys_the_position_on_the_values_rather_than_one_spelling(self):
+        """A launcher that words it differently still gets its budget scoped.
+
+        Making one phrasing the trigger drops a position supplied any other way,
+        and it drops it silently: the run reports cleanly and the budget was
+        simply never scoped. The rule is about where a value came from.
+        """
+        self.assertIn("Read the values, not the spelling.", self.instructions)
+        self.assertIn(
+            "a spelling you do not recognize is still the caller's instruction",
+            self.instructions,
+        )
+        self.assertIn(
+            "Omit all three only when the request names no position at all",
+            self.instructions,
+        )
+        self.assertIn(
+            "`--pipeline-run` and `--pipeline-iteration` go together",
+            self.instructions,
+        )
+        self.assertNotIn("if the line is absent, omit all three", self.instructions)
 
     def test_runs_the_whole_loop_from_a_bare_reference(self):
         self.assertIn("## Activation: Bare PR References Run The Full Loop", self.instructions)
@@ -2500,6 +2522,30 @@ class PipelineBudgetTest(unittest.TestCase):
         self.assertEqual("run", MODULE.apply_pipeline_position(state, "run2", 1))
         self.assertEqual(0, state["iterations"])
         self.assertEqual(0, state["total_iterations"])
+
+    def test_a_lone_half_of_the_position_is_ignored_rather_than_half_applied(self):
+        """The agent file promises this, so the helper has to honour it.
+
+        A caller naming only one half has not said where its loop stands. Acting
+        on it would reset on a number with no run to scope it, which is the
+        cross-run deadlock in the other direction.
+        """
+        for run, iteration in ((None, 2), ("run1", None)):
+            with self.subTest(run=run, iteration=iteration):
+                state = {"iterations": 4, "total_iterations": 9}
+                self.assertIsNone(MODULE.apply_pipeline_position(state, run, iteration))
+                self.assertIsNone(MODULE.absolute_iteration_cap(run, iteration, 5, 3))
+                self.assertEqual(4, state["iterations"])
+                self.assertEqual(9, state["total_iterations"])
+
+    def test_an_omitted_outer_cap_falls_back_rather_than_disabling_the_ceiling(self):
+        """Only the outer cap is optional, and omitting it must not remove the bound."""
+        state = {"iterations": 4, "total_iterations": 9}
+        self.assertEqual("run", MODULE.apply_pipeline_position(state, "run1", 1))
+        self.assertEqual(
+            5 * MODULE.DEFAULT_PIPELINE_MAX_ITERATIONS,
+            MODULE.absolute_iteration_cap("run1", 1, 5, None),
+        )
 
     def test_the_ceiling_is_derived_from_the_callers_own_cap(self):
         self.assertEqual(15, MODULE.absolute_iteration_cap("run1", 1, 5, 3))
