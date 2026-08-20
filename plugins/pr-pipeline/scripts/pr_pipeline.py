@@ -1827,6 +1827,12 @@ def begin_run(state: dict[str, Any]) -> dict[str, Any]:
     the same shape: all of them bound one unattended pass through the stages,
     and none of them is a budget for the pull request's whole life.
 
+    The streaks have to go for a sharper reason than that. A streak is what
+    produces a no-progress escalation, so the two are one fact written down
+    twice. Clear the escalation but keep the streak that caused it and the next
+    run starts one strike from the limit, re-derives the same escalation from
+    the residue, and lands back where it started.
+
     The clearances survive, because each one names the commit it was recorded
     at and stops counting by itself when the head moves. The history survives,
     because it is the report.
@@ -2310,7 +2316,16 @@ def command_finish(args: argparse.Namespace) -> None:
     state["running"] = None
 
     streaks = state.setdefault("no_progress", {})
-    stalled = outcome == "no_progress" or repeat
+    confirmation = confirm_clearance(
+        STAGE_BY_NAME[stage], target, outcome, head_sha
+    )
+    entry["clearance_confirmed"] = confirmation.get("green")
+    entry["clearance_reason"] = confirmation.get("reason")
+    unconfirmed = outcome in CLEARING_OUTCOMES and confirmation.get("green") is not True
+    stalled = (
+        streak_effect(outcome, repeat=repeat, confirmed=confirmation.get("green"))
+        == "charge"
+    )
     if stalled:
         previous = streaks.get(stage)
         count = int(previous.get("count") or 0) + 1 if isinstance(previous, dict) else 1
@@ -2342,6 +2357,14 @@ def command_finish(args: argparse.Namespace) -> None:
                     f"{stage} repeated its {outcome} answer at {head_sha} without "
                     "the pipeline being able to act on it"
                 )
+            elif unconfirmed:
+                because = confirmation.get("reason") or "GitHub did not agree"
+                detail = (
+                    f"{stage} reported {outcome} {count} times in a row at a head "
+                    f"the pipeline could not confirm it at ({because}). The stage "
+                    "may well have done the work; the pipeline cannot see it, so "
+                    "it will not keep relaunching on the stage's word alone"
+                )
             escalation = record_escalation(
                 state,
                 {
@@ -2366,9 +2389,79 @@ def command_finish(args: argparse.Namespace) -> None:
             "entry": entry,
             "cleared": state.get("cleared") or {},
             "no_progress": state.get("no_progress") or {},
+            "clearance_confirmed": confirmation.get("green"),
             "escalation": escalation,
         }
     )
+
+
+def confirm_clearance(
+    entry: dict[str, Any],
+    target: dict[str, Any],
+    outcome: str,
+    head_sha: str | None,
+) -> dict[str, Any]:
+    """Ask GitHub whether a stage's clearing outcome is one the pipeline can see.
+
+    A stage that clears on GitHub evidence establishes a fact GitHub states, and
+    GitHub computes some of those facts asynchronously. So a stage can push a
+    real merge, report that it cleared, and have GitHub still answer ``UNKNOWN``
+    when the pipeline looks. The stage is not lying and the pipeline is not
+    wrong; they are describing the same commit at different moments.
+
+    The clearance is checked against live evidence alone, never against the
+    pipeline's own ``cleared`` map. A record the pipeline wrote cannot be what
+    confirms the record the pipeline is about to write.
+    """
+
+    if outcome not in CLEARING_OUTCOMES or not head_sha:
+        return {"checked": False, "green": None, "reason": None}
+    try:
+        observation = collect_observation(target)
+    except Exception as error:  # noqa: BLE001 - any failure is an unread answer
+        return {"checked": False, "green": None, "reason": f"unread: {error}"}
+    if observation.get("head_sha") != head_sha:
+        return {"checked": True, "green": False, "reason": "head_moved"}
+    verdict = stage_green(
+        entry,
+        head_sha=head_sha,
+        cleared={},
+        marker=(observation.get("stage_markers") or {}).get(entry["stage"]) or {},
+        observation=observation,
+    )
+    return {
+        "checked": True,
+        "green": bool(verdict.get("green")),
+        "reason": verdict.get("reason"),
+        "evidence": verdict.get("evidence"),
+    }
+
+
+def streak_effect(outcome: str, *, repeat: bool, confirmed: bool | None) -> str:
+    """Say what one finished run does to a stage's no-progress streak.
+
+    The streak is the brake on relaunching a stage for ever, so what may reset it
+    decides whether anything is bounded. Only a run that told the pipeline
+    something it can act on resets it.
+
+    A clearing outcome the pipeline cannot see is not something it can act on. It
+    leaves the stage exactly where it was: still not green, still the next stage
+    to pick, and now with a new commit that makes the run look different from the
+    last one. Reset the streak there and the stage can be relaunched for ever, a
+    push at a time, with nothing counting. So an unconfirmed clearance feeds the
+    same streak a stalled run feeds, and two in a row stop the pipeline.
+
+    Only a clearance GitHub confirmed resets the streak. ``confirmed`` is ``None``
+    when the pipeline could not get an answer, which is not the same as a
+    disagreement but is treated the same way, because an answer that was never
+    read is not one the pipeline can act on either.
+    """
+
+    if outcome == "no_progress" or repeat:
+        return "charge"
+    if outcome in CLEARING_OUTCOMES and confirmed is not True:
+        return "charge"
+    return "reset"
 
 
 def recorded_detail(

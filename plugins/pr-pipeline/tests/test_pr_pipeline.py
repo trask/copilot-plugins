@@ -542,17 +542,21 @@ class LoopBackTest(unittest.TestCase):
                 self.assertNotEqual(stage, decision.get("stage"))
 
     def test_no_stage_but_the_first_relies_on_nothing_to_hold_it(self):
-        # A stage whose clearance comes from GitHub rather than a head-pinned
-        # marker can report `cleared`, have GitHub disagree, and be picked
-        # again. What stops that repeating is a helper stage ahead of it: the
-        # push invalidates that stage's marker, so the next pick is earlier,
-        # which is a loop-back and charges an iteration.
+        # The brake on relaunching one stage for ever is the no-progress streak:
+        # a clearing outcome the pipeline cannot confirm never resets it, so two
+        # in a row stop the pipeline whatever the stage and wherever it sits.
         #
-        # The stage at index 0 has nothing ahead of it, so it has no such brake.
-        # Every other GitHub-evidence stage is safe only because at least one
-        # helper stage sits in front of it. That is a property of the order, not
-        # of the stage, so reordering must fail here rather than quietly
-        # reopening the hole at a new position.
+        # The ordering is a second, independent defense. A stage that clears on
+        # GitHub evidence and pushes a commit invalidates the head-pinned marker
+        # of any helper stage ahead of it, so the next pick is earlier, which is
+        # a loop-back and charges an iteration. Every GitHub-evidence stage below
+        # index 0 has at least one helper ahead of it, and that is what makes the
+        # iteration cap bind on it at all.
+        #
+        # That defense is a property of the order rather than of any stage, so
+        # nothing about a stage reveals when a reorder removes it. This asserts
+        # the property directly, so the design keeps the two brakes it assumes
+        # instead of quietly falling back to one.
         for index, entry in enumerate(MODULE.STAGES):
             if index == 0 or entry["stage"] in MODULE.HELPER_EVIDENCE_STAGES:
                 continue
@@ -2109,9 +2113,22 @@ class CommandTestCase(unittest.TestCase):
         )
         self.coverage_calls = coverage.start()
         self.addCleanup(coverage.stop)
+        # No command test may reach GitHub to confirm a clearance. The default is
+        # a pull request that is green at the head under test, so a clearing
+        # outcome confirms; a test about an unconfirmable clearance sets
+        # self.confirmation itself.
+        self.confirmation = {"checked": True, "green": True, "reason": None}
+        confirm = mock.patch.object(
+            MODULE, "confirm_clearance", side_effect=lambda *_: self.confirmation
+        )
+        self.confirm_calls = confirm.start()
+        self.addCleanup(confirm.stop)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
+
+    def github_disagrees(self, reason: str = "mergeable_unknown") -> None:
+        self.confirmation = {"checked": True, "green": False, "reason": reason}
 
     def stage_says(self, outcome: str, clean_at_head_sha: str | None = None) -> None:
         self.stage_reading = {
@@ -2641,6 +2658,25 @@ class BeginRunTest(unittest.TestCase):
         )
         self.assertEqual({}, state["no_progress"])
 
+    def test_a_streak_at_the_limit_cannot_outlive_the_escalation_it_produced(self):
+        # A streak is what produces a no-progress escalation, so keeping one
+        # while clearing the other leaves the next run a single strike from the
+        # limit and it re-derives the same escalation from the residue.
+        state, _ = self.restart(
+            escalation={"stage": MODULE.STAGE_CONFLICT, "reason": "no_progress"},
+            no_progress={
+                MODULE.STAGE_CONFLICT: {
+                    "count": MODULE.NO_PROGRESS_LIMIT,
+                    "head_sha": HEAD,
+                }
+            },
+        )
+        self.assertIsNone(state["escalation"])
+        self.assertEqual({}, state["no_progress"])
+        self.assertEqual(
+            0, MODULE.no_progress_streak(state, MODULE.STAGE_CONFLICT)
+        )
+
     def test_the_report_survives_because_it_is_the_report(self):
         history = [{"stage": MODULE.STAGE_CI, "outcome": "escalated"}]
         state, _ = self.restart(history=list(history))
@@ -2698,6 +2734,242 @@ class BeginRunTest(unittest.TestCase):
         self.assertEqual(1, len(state["runs"]))
         self.assertEqual(state["run_id"], state["runs"][0]["run_id"])
         self.assertIsNone(state["runs"][0]["previous_run_id"])
+
+
+class StreakEffectTest(unittest.TestCase):
+    """What may reset the brake decides whether anything is bounded."""
+
+    def test_a_stalled_run_charges(self):
+        self.assertEqual(
+            "charge",
+            MODULE.streak_effect("no_progress", repeat=False, confirmed=None),
+        )
+
+    def test_a_repeated_answer_charges_whatever_it_says(self):
+        for outcome in MODULE.STAGE_OUTCOMES:
+            with self.subTest(outcome=outcome):
+                self.assertEqual(
+                    "charge",
+                    MODULE.streak_effect(outcome, repeat=True, confirmed=True),
+                )
+
+    def test_a_confirmed_clearance_is_the_only_thing_that_resets(self):
+        for outcome in MODULE.CLEARING_OUTCOMES:
+            with self.subTest(outcome=outcome):
+                self.assertEqual(
+                    "reset",
+                    MODULE.streak_effect(outcome, repeat=False, confirmed=True),
+                )
+
+    def test_a_clearance_github_contradicts_charges(self):
+        for outcome in MODULE.CLEARING_OUTCOMES:
+            with self.subTest(outcome=outcome):
+                self.assertEqual(
+                    "charge",
+                    MODULE.streak_effect(outcome, repeat=False, confirmed=False),
+                )
+
+    def test_a_clearance_nothing_answered_about_charges_too(self):
+        # An answer that was never read is not one the pipeline can act on.
+        for outcome in MODULE.CLEARING_OUTCOMES:
+            with self.subTest(outcome=outcome):
+                self.assertEqual(
+                    "charge",
+                    MODULE.streak_effect(outcome, repeat=False, confirmed=None),
+                )
+
+    def test_nothing_a_stage_can_do_to_itself_resets_the_brake(self):
+        # The reset has one input the stage cannot produce: GitHub agreeing at
+        # this commit. Pushing, relaunching, and reporting a clearance are all
+        # things the stage does, and none of them reaches the reset.
+        resets = {
+            (outcome, repeat, confirmed)
+            for outcome in MODULE.STAGE_OUTCOMES
+            for repeat in (True, False)
+            for confirmed in (True, False, None)
+            if MODULE.streak_effect(outcome, repeat=repeat, confirmed=confirmed)
+            == "reset"
+        }
+        self.assertTrue(resets)
+        for outcome, repeat, confirmed in resets:
+            with self.subTest(outcome=outcome, repeat=repeat, confirmed=confirmed):
+                if outcome in MODULE.CLEARING_OUTCOMES:
+                    self.assertIs(True, confirmed)
+                self.assertFalse(repeat)
+
+
+class UnconfirmableClearanceTest(CommandTestCase):
+    """The first stage has no stage ahead of it, so the streak is its only brake."""
+
+    def running_state(self, stage: str, head: str, **overrides):
+        running = {
+            "stage": stage,
+            "iteration": 1,
+            "head_sha": head,
+            "launch": "session",
+            "session_id": None,
+            "process_id": None,
+            "model": MODULE.DEFAULT_STAGE_MODEL,
+            "started_at": "2026-01-01T00:00:00Z",
+        }
+        return write_state(self.root, running=running, **overrides)
+
+    def finish_at(self, path, stage, head, outcome="cleared"):
+        MODULE.command_finish(
+            self.args(
+                state=str(path),
+                stage=stage,
+                outcome=outcome,
+                head=head,
+                session=None,
+                process=None,
+                detail=None,
+            )
+        )
+        return MODULE.load_state(path)
+
+    def test_a_push_at_a_new_head_no_longer_buys_another_relaunch(self):
+        # conflict-fix-loop pushes a merge, reports cleared, and GitHub answers
+        # UNKNOWN because it computes mergeability asynchronously. The head is
+        # new every time, so the repeat brake never engages, and nothing sits
+        # ahead of index 0 to charge an iteration. Without this the stage can be
+        # relaunched for ever, a push at a time.
+        self.github_disagrees("mergeable_unknown")
+        path = self.running_state(MODULE.STAGE_CONFLICT, HEAD)
+        state = self.finish_at(path, MODULE.STAGE_CONFLICT, HEAD)
+        self.assertEqual(1, state["no_progress"][MODULE.STAGE_CONFLICT]["count"])
+        self.assertIsNone(state["escalation"])
+
+        state["running"] = {
+            "stage": MODULE.STAGE_CONFLICT,
+            "iteration": 1,
+            "head_sha": NEXT_HEAD,
+            "launch": "session",
+            "model": MODULE.DEFAULT_STAGE_MODEL,
+            "started_at": "2026-01-01T00:00:00Z",
+        }
+        MODULE.save_state(path, state)
+        state = self.finish_at(path, MODULE.STAGE_CONFLICT, NEXT_HEAD)
+        self.assertEqual("no_progress", state["escalation"]["reason"])
+        self.assertIn("could not confirm", state["escalation"]["detail"])
+        self.assertIn("mergeable_unknown", state["escalation"]["detail"])
+
+    def test_the_escalation_does_not_accuse_the_stage_of_doing_nothing(self):
+        # The stage may well have merged it. The pipeline just cannot see that.
+        self.github_disagrees()
+        path = self.running_state(
+            MODULE.STAGE_CONFLICT,
+            HEAD,
+            no_progress={
+                MODULE.STAGE_CONFLICT: {"count": 1, "head_sha": "older"}
+            },
+        )
+        state = self.finish_at(path, MODULE.STAGE_CONFLICT, HEAD)
+        detail = state["escalation"]["detail"]
+        self.assertIn("may well have done the work", detail)
+        self.assertNotIn("without changing anything", detail)
+
+    def test_a_confirmed_clearance_still_clears_the_brake(self):
+        path = self.running_state(
+            MODULE.STAGE_CONFLICT,
+            HEAD,
+            no_progress={MODULE.STAGE_CONFLICT: {"count": 1, "head_sha": "older"}},
+        )
+        state = self.finish_at(path, MODULE.STAGE_CONFLICT, HEAD)
+        self.assertNotIn(MODULE.STAGE_CONFLICT, state["no_progress"])
+        self.assertIsNone(state["escalation"])
+
+    def test_the_history_records_whether_the_pipeline_could_confirm_it(self):
+        self.github_disagrees("mergeable_unknown")
+        path = self.running_state(MODULE.STAGE_CONFLICT, HEAD)
+        state = self.finish_at(path, MODULE.STAGE_CONFLICT, HEAD)
+        entry = state["history"][0]
+        self.assertIs(False, entry["clearance_confirmed"])
+        self.assertEqual("mergeable_unknown", entry["clearance_reason"])
+        self.assertIs(False, self.emitted[-1]["clearance_confirmed"])
+
+    def test_an_unconfirmed_clearance_is_still_recorded_as_a_clearance(self):
+        # The stage's word is kept; it just stops resetting the brake. Demoting
+        # the outcome as well would put two different corrections on one reading.
+        self.github_disagrees()
+        path = self.running_state(MODULE.STAGE_CONFLICT, HEAD)
+        state = self.finish_at(path, MODULE.STAGE_CONFLICT, HEAD)
+        self.assertEqual("cleared", state["history"][0]["outcome"])
+
+
+class ConfirmClearanceTest(unittest.TestCase):
+    def setUp(self):
+        self.target = MODULE.build_target("owner", "repo", 7)
+
+    def confirm(self, outcome, head, observed):
+        with mock.patch.object(MODULE, "collect_observation", return_value=observed):
+            return MODULE.confirm_clearance(
+                MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT], self.target, outcome, head
+            )
+
+    def test_only_a_clearing_outcome_is_worth_confirming(self):
+        for outcome in MODULE.DETAIL_REQUIRED_OUTCOMES:
+            with self.subTest(outcome=outcome):
+                with mock.patch.object(MODULE, "collect_observation") as reader:
+                    result = MODULE.confirm_clearance(
+                        MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT],
+                        self.target,
+                        outcome,
+                        HEAD,
+                    )
+                reader.assert_not_called()
+                self.assertFalse(result["checked"])
+                self.assertIsNone(result["green"])
+
+    def test_github_agreeing_confirms_it(self):
+        result = self.confirm("cleared", HEAD, observation())
+        self.assertTrue(result["checked"])
+        self.assertIs(True, result["green"])
+
+    def test_github_not_having_computed_it_yet_does_not(self):
+        result = self.confirm("cleared", HEAD, observation(mergeable="UNKNOWN"))
+        self.assertIs(False, result["green"])
+        self.assertEqual("mergeable_unknown", result["reason"])
+
+    def test_a_head_that_moved_under_the_look_confirms_nothing(self):
+        result = self.confirm("cleared", HEAD, observation(head_sha=NEXT_HEAD))
+        self.assertIs(False, result["green"])
+        self.assertEqual("head_moved", result["reason"])
+
+    def test_an_answer_that_could_not_be_read_is_not_a_confirmation(self):
+        with mock.patch.object(
+            MODULE, "collect_observation", side_effect=OSError("no network")
+        ):
+            result = MODULE.confirm_clearance(
+                MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT],
+                self.target,
+                "cleared",
+                HEAD,
+            )
+        self.assertFalse(result["checked"])
+        self.assertIsNone(result["green"])
+        self.assertIn("no network", result["reason"])
+
+    def test_the_pipelines_own_record_never_confirms_its_own_record(self):
+        # Passing the cleared map would let a clearance the pipeline wrote at
+        # this head vouch for the clearance it is about to write.
+        captured = {}
+
+        def spy(entry, **values):
+            captured.update(values)
+            return {"green": True}
+
+        with mock.patch.object(
+            MODULE, "collect_observation", return_value=observation()
+        ):
+            with mock.patch.object(MODULE, "stage_green", side_effect=spy):
+                MODULE.confirm_clearance(
+                    MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT],
+                    self.target,
+                    "cleared",
+                    HEAD,
+                )
+        self.assertEqual({}, captured["cleared"])
 
 
 class OutcomeCommandTest(CommandTestCase):
@@ -3510,6 +3782,13 @@ class AgentInstructionsTest(unittest.TestCase):
             "`--detail` is **required** for `no_progress` and `escalated`",
             self.instructions,
         )
+
+    def test_it_says_an_unconfirmable_clearance_is_not_progress(self):
+        self.assertIn(
+            "A clearance the pipeline cannot see is not progress", self.instructions
+        )
+        self.assertIn("relaunched for ever, a push at a time", self.instructions)
+        self.assertIn("clearance_confirmed", self.instructions)
 
     def test_it_says_base_movement_triggers_nothing(self):
         self.assertIn("Base-branch movement triggers nothing", self.instructions)
