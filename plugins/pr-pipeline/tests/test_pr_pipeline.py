@@ -484,6 +484,63 @@ class LoopBackTest(unittest.TestCase):
         self.assertEqual(1, decision["iteration"])
         self.assertFalse(decision["loop_back"])
 
+    def test_a_push_by_the_check_stage_sends_an_earlier_stage_round_again(self):
+        # The check stage clears on GitHub evidence, so its clearance is not
+        # pinned to a head and it can be re-picked after saying it cleared.
+        # A push still costs it an iteration, because the review stages ahead
+        # of it cleared at the old head and stop being green at the new one.
+        state = build_state(
+            iteration=1,
+            stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_CI],
+            cleared={
+                MODULE.STAGE_SELF_REVIEW: HEAD,
+                MODULE.STAGE_COPILOT_REVIEW: HEAD,
+            },
+        )
+        decision = MODULE.decide_next(
+            state, observation(head_sha=NEXT_HEAD, checks="failure")
+        )
+        self.assertEqual(MODULE.STAGE_SELF_REVIEW, decision["stage"])
+        self.assertEqual(2, decision["iteration"])
+        self.assertTrue(decision["loop_back"])
+
+    def test_the_first_stage_has_no_earlier_stage_to_charge_an_iteration(self):
+        # Nothing sits ahead of the conflict stage, so a push by it invalidates
+        # no clearance and the pipeline picks it again at the same iteration.
+        # Every later stage is charged for a push; this one is not.
+        state = build_state(
+            iteration=1,
+            stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_CONFLICT],
+        )
+        decision = MODULE.decide_next(
+            state, observation(head_sha=NEXT_HEAD, mergeable="UNKNOWN")
+        )
+        self.assertEqual(MODULE.STAGE_CONFLICT, decision["stage"])
+        self.assertEqual(1, decision["iteration"])
+        self.assertFalse(decision["loop_back"])
+
+    def test_a_helper_stage_is_never_both_cleared_and_picked_again(self):
+        # A helper stage's clearance is only recorded when its marker names the
+        # head, and that same head makes it green. So it cannot reset the
+        # no-progress streak with a clearing outcome and still be re-picked,
+        # which is what keeps a push by one of them bounded.
+        for stage in MODULE.HELPER_EVIDENCE_STAGES:
+            with self.subTest(stage=stage):
+                state = build_state(
+                    iteration=1,
+                    stage_high_water=MODULE.STAGE_INDEX[stage],
+                    cleared={stage: NEXT_HEAD},
+                )
+                marker = {
+                    MODULE.STAGE_SELF_REVIEW: "self_review",
+                    MODULE.STAGE_COPILOT_REVIEW: "copilot_review",
+                    MODULE.STAGE_DESCRIPTION: "description",
+                }[stage]
+                decision = MODULE.decide_next(
+                    state, observation(head_sha=NEXT_HEAD, **{marker: NEXT_HEAD})
+                )
+                self.assertNotEqual(stage, decision.get("stage"))
+
     def test_base_branch_movement_alone_changes_nothing(self):
         state = build_state(
             iteration=1,
@@ -1779,7 +1836,91 @@ class ModelGateTest(unittest.TestCase):
         self.assertNotIn("nonsense", models)
 
 
+class PipelinePositionSupportTest(unittest.TestCase):
+    def probe(self, body: str | None) -> bool:
+        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CI]
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "ci_fix_loop.py"
+            if body is not None:
+                script.write_text(body, encoding="utf-8")
+            with mock.patch.object(
+                MODULE, "stage_script_path", return_value=script
+            ):
+                return MODULE.stage_accepts_pipeline_position(entry)
+
+    def test_a_helper_that_takes_the_argument_is_told_so(self):
+        self.assertTrue(self.probe('parser.add_argument("--pipeline-run")'))
+
+    def test_a_helper_that_does_not_take_it_is_left_alone(self):
+        self.assertFalse(self.probe('parser.add_argument("--max-iterations")'))
+
+    def test_a_missing_helper_is_not_an_error(self):
+        self.assertFalse(self.probe(None))
+
+    def test_the_probe_looks_for_the_argument_the_pipeline_actually_sends(self):
+        # If the probe and the launcher ever named different flags, a stage
+        # would be told it supports an argument that it stops on.
+        arguments = MODULE.pipeline_position_arguments(
+            MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
+            run_id="abc123",
+            iteration=1,
+            max_iterations=2,
+        )
+        probed = arguments or [MODULE.PIPELINE_RUN_FLAG]
+        self.assertTrue(self.probe(f'parser.add_argument("{probed[0]}")'))
+
+
+class PipelineRunIdTest(unittest.TestCase):
+    def test_a_run_carries_its_own_token(self):
+        state = build_state()
+        state["run_id"] = "abc123"
+        self.assertEqual("abc123", MODULE.pipeline_run_id(state))
+
+    def test_two_runs_on_one_pull_request_get_different_tokens(self):
+        target = MODULE.build_target("owner", "repo", 7)
+        observation = {"pr": {"owner": "owner"}, "head_sha": "a" * 40}
+        first = MODULE.new_state(target, observation, Path("."), 3)
+        second = MODULE.new_state(target, observation, Path("."), 3)
+        self.assertNotEqual(
+            MODULE.pipeline_run_id(first), MODULE.pipeline_run_id(second)
+        )
+
+    def test_a_state_written_before_the_token_falls_back_to_its_creation_time(self):
+        state = build_state()
+        state.pop("run_id", None)
+        state["created_at"] = "2026-08-19T00:00:00Z"
+        self.assertEqual("2026-08-19T00:00:00Z", MODULE.pipeline_run_id(state))
+
+    def test_a_state_with_nothing_stable_reports_no_token(self):
+        self.assertIsNone(MODULE.pipeline_run_id({}))
+
+    def test_the_token_never_changes_between_launches_in_one_run(self):
+        # A token that changed per launch would reset a stage's budget every
+        # time the pipeline relaunched it, which is the failure it exists to
+        # prevent rather than one it may cause.
+        target = MODULE.build_target("owner", "repo", 7)
+        observation = {"pr": {"owner": "owner"}, "head_sha": "a" * 40}
+        state = MODULE.new_state(target, observation, Path("."), 3)
+        first = MODULE.pipeline_run_id(state)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(path, state)
+            reloaded = MODULE.load_state(path)
+        self.assertEqual(first, MODULE.pipeline_run_id(state))
+        self.assertEqual(first, MODULE.pipeline_run_id(reloaded))
+
+
 class LaunchPlanTest(unittest.TestCase):
+    def setUp(self):
+        # Whether a stage takes the pipeline's position is read from the helper
+        # installed on this machine, so every plan test says which answer it
+        # wants rather than inheriting whatever happens to be installed.
+        patcher = mock.patch.object(
+            MODULE, "stage_accepts_pipeline_position", return_value=False
+        )
+        self.accepts = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_the_plan_names_the_agent_plugin_qualified(self):
         plan = MODULE.launch_plan(build_state(), MODULE.STAGE_SELF_REVIEW)
         self.assertEqual("self-review-loop:self-review-loop", plan["agent"])
@@ -1788,6 +1929,81 @@ class LaunchPlanTest(unittest.TestCase):
             "self-review-loop:self-review-loop",
             plan["command"][plan["command"].index("--agent") + 1],
         )
+
+    def test_the_plan_carries_the_pipelines_position(self):
+        state = build_state(iteration=2, max_iterations=4)
+        state["run_id"] = "abc123"
+        plan = MODULE.launch_plan(state, MODULE.STAGE_CI)
+        self.assertEqual("abc123", plan["pipeline_run"])
+        self.assertEqual(2, plan["pipeline_iteration"])
+        self.assertEqual(4, plan["pipeline_max_iterations"])
+
+    def test_a_stage_that_takes_the_position_is_told_it_verbatim(self):
+        self.accepts.return_value = True
+        state = build_state(iteration=2, max_iterations=4)
+        state["run_id"] = "abc123"
+        plan = MODULE.launch_plan(state, MODULE.STAGE_CI)
+        self.assertEqual(
+            [
+                "--pipeline-run",
+                "abc123",
+                "--pipeline-iteration",
+                "2",
+                "--pipeline-max-iterations",
+                "4",
+            ],
+            plan["pipeline_arguments"],
+        )
+        self.assertIn(
+            "--pipeline-run abc123 --pipeline-iteration 2 "
+            "--pipeline-max-iterations 4",
+            plan["prompt"],
+        )
+        self.assertTrue(plan["prompt"].startswith("owner/repo#7"))
+        self.assertEqual(plan["prompt"], plan["command"][2])
+
+    def test_a_stage_that_does_not_take_the_position_is_never_sent_it(self):
+        # An older helper would stop on an unrecognized argument, so a stage
+        # that cannot take the position is launched exactly as before.
+        self.accepts.return_value = False
+        state = build_state()
+        state["run_id"] = "abc123"
+        plan = MODULE.launch_plan(state, MODULE.STAGE_SELF_REVIEW)
+        self.assertEqual([], plan["pipeline_arguments"])
+        self.assertEqual("owner/repo#7", plan["prompt"])
+        self.assertNotIn("--pipeline-run", plan["prompt"])
+
+    def test_a_run_with_no_token_sends_no_position(self):
+        # Half a position is worse than none: an iteration with no run cannot
+        # be told from the same number in a different run.
+        self.accepts.return_value = True
+        state = build_state()
+        state.pop("run_id", None)
+        state.pop("created_at", None)
+        plan = MODULE.launch_plan(state, MODULE.STAGE_CI)
+        self.assertEqual([], plan["pipeline_arguments"])
+        self.assertEqual("owner/repo#7", plan["prompt"])
+
+    def test_relaunching_one_stage_keeps_the_same_iteration(self):
+        # A stage resets its budget when this number moves, so a relaunch
+        # inside one pass must hand it the number it already had.
+        state = build_state(
+            iteration=2, stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_CI]
+        )
+        first = MODULE.launch_plan(state, MODULE.STAGE_CI)
+        second = MODULE.launch_plan(state, MODULE.STAGE_CI)
+        self.assertEqual(2, first["pipeline_iteration"])
+        self.assertEqual(
+            first["pipeline_iteration"], second["pipeline_iteration"]
+        )
+
+    def test_a_loop_back_hands_the_stage_the_advanced_iteration(self):
+        # The plan is built before start records the advance, so reading the
+        # stored number here would hand the stage the previous pass's.
+        state = build_state(iteration=1, stage_high_water=3)
+        plan = MODULE.launch_plan(state, MODULE.STAGE_SELF_REVIEW)
+        self.assertEqual(1, state["iteration"])
+        self.assertEqual(2, plan["pipeline_iteration"])
 
     def test_the_plan_targets_the_pull_request_unambiguously(self):
         plan = MODULE.launch_plan(build_state(), MODULE.STAGE_CI)
@@ -2009,7 +2225,14 @@ class FinishCommandTest(CommandTestCase):
         }
         return write_state(self.root, running=running, **overrides)
 
-    def finish(self, path: Path, stage: str, outcome: str, head: str | None = None):
+    def finish(
+        self,
+        path: Path,
+        stage: str,
+        outcome: str,
+        head: str | None = None,
+        detail: str | None = "what the stage did, in one sentence",
+    ):
         MODULE.command_finish(
             self.args(
                 state=str(path),
@@ -2018,7 +2241,7 @@ class FinishCommandTest(CommandTestCase):
                 head=head,
                 session=None,
                 process=None,
-                detail=None,
+                detail=detail,
             )
         )
 
@@ -2029,14 +2252,14 @@ class FinishCommandTest(CommandTestCase):
         self.assertEqual(NEXT_HEAD, state["cleared"][MODULE.STAGE_SELF_REVIEW])
         self.assertIsNone(state["running"])
         self.assertEqual(1, len(state["history"]))
-        self.assertFalse(self.emitted[-1]["keep_session"])
+        self.assertNotIn("keep_session", self.emitted[-1])
 
     def test_a_skipped_stage_also_clears(self):
         path = self.running_state(MODULE.STAGE_CI)
         self.finish(path, MODULE.STAGE_CI, "skipped")
         state = MODULE.load_state(path)
         self.assertEqual(HEAD, state["cleared"][MODULE.STAGE_CI])
-        self.assertTrue(self.emitted[-1]["keep_session"])
+        self.assertNotIn("keep_session", self.emitted[-1])
 
     def test_the_history_entry_holds_what_a_dashboard_needs(self):
         path = self.running_state(MODULE.STAGE_CI)
@@ -2081,7 +2304,7 @@ class FinishCommandTest(CommandTestCase):
         self.assertEqual("stage_escalated", state["escalation"]["reason"])
         self.assertEqual("hit its own cap of 5", state["escalation"]["detail"])
         self.assertNotIn(MODULE.STAGE_COPILOT_REVIEW, state["cleared"])
-        self.assertTrue(self.emitted[-1]["keep_session"])
+        self.assertNotIn("keep_session", self.emitted[-1])
 
     def test_one_stalled_run_does_not_escalate(self):
         path = self.running_state(MODULE.STAGE_SELF_REVIEW)
@@ -2255,7 +2478,7 @@ class FinishCommandTest(CommandTestCase):
         self.finish(path, MODULE.STAGE_CI, "cleared", NEXT_HEAD)
         state = MODULE.load_state(path)
         self.assertEqual("stage_escalated", state["escalation"]["reason"])
-        self.assertTrue(self.emitted[-1]["keep_session"])
+        self.assertNotIn("keep_session", self.emitted[-1])
 
     def test_a_stage_that_reports_nothing_keeps_the_reported_outcome(self):
         path = self.running_state(MODULE.STAGE_SELF_REVIEW)
@@ -2279,6 +2502,175 @@ class FinishCommandTest(CommandTestCase):
         path = self.running_state(MODULE.STAGE_CI)
         with self.assertRaises(MODULE.WorkflowError):
             self.finish(path, MODULE.STAGE_SELF_REVIEW, "cleared")
+
+
+class RequiredDetailTest(CommandTestCase):
+    """The stage session is archived, so the sentence is the only account left."""
+
+    def running_state(self, stage: str, **overrides):
+        running = {
+            "stage": stage,
+            "iteration": 1,
+            "head_sha": HEAD,
+            "launch": "session",
+            "session_id": None,
+            "process_id": None,
+            "model": MODULE.DEFAULT_STAGE_MODEL,
+            "started_at": "2026-01-01T00:00:00Z",
+        }
+        return write_state(self.root, running=running, **overrides)
+
+    def call(self, stage: str, outcome: str, detail):
+        path = self.running_state(stage)
+        MODULE.command_finish(
+            self.args(
+                state=str(path),
+                stage=stage,
+                outcome=outcome,
+                head=HEAD,
+                session=None,
+                process=None,
+                detail=detail,
+            )
+        )
+        return MODULE.load_state(path)
+
+    def test_an_outcome_that_explains_nothing_by_itself_needs_a_sentence(self):
+        for outcome in MODULE.DETAIL_REQUIRED_OUTCOMES:
+            for detail in (None, "", "   "):
+                with self.subTest(outcome=outcome, detail=detail):
+                    with self.assertRaises(MODULE.WorkflowError) as caught:
+                        self.call(MODULE.STAGE_SELF_REVIEW, outcome, detail)
+                    self.assertIn("--detail", str(caught.exception))
+
+    def test_an_outcome_a_head_sha_already_accounts_for_does_not(self):
+        for outcome in MODULE.CLEARING_OUTCOMES:
+            with self.subTest(outcome=outcome):
+                state = self.call(MODULE.STAGE_SELF_REVIEW, outcome, None)
+                self.assertEqual(1, len(state["history"]))
+
+    def test_the_two_lists_do_not_overlap(self):
+        self.assertEqual(
+            set(),
+            set(MODULE.DETAIL_REQUIRED_OUTCOMES) & set(MODULE.CLEARING_OUTCOMES),
+        )
+        self.assertEqual(
+            set(MODULE.STAGE_OUTCOMES),
+            set(MODULE.DETAIL_REQUIRED_OUTCOMES) | set(MODULE.CLEARING_OUTCOMES),
+        )
+
+    def test_a_reclassified_outcome_says_so_rather_than_leaving_a_blank(self):
+        # The caller asked for a clearance, which needs no sentence, and the
+        # stage's own record disagreed. Refusing here would demand a reason for
+        # something the caller never saw, so the disagreement is the record.
+        self.stage_says("escalated")
+        state = self.call(MODULE.STAGE_CI, "cleared", None)
+        entry = state["history"][0]
+        self.assertEqual("escalated", entry["outcome"])
+        self.assertIn("escalated", entry["detail"])
+        self.assertIn("cleared", entry["detail"])
+        self.assertEqual(entry["detail"], state["escalation"]["detail"])
+
+    def test_a_supplied_sentence_is_never_replaced(self):
+        self.stage_says("escalated")
+        state = self.call(MODULE.STAGE_CI, "cleared", "the build never came back")
+        self.assertEqual(
+            "the build never came back", state["history"][0]["detail"]
+        )
+
+    def test_a_clearance_keeps_its_missing_sentence_missing(self):
+        state = self.call(MODULE.STAGE_SELF_REVIEW, "cleared", None)
+        self.assertIsNone(state["history"][0]["detail"])
+
+    def test_nothing_reports_whether_to_keep_a_session(self):
+        # Every stage session is archived, so a field answering "keep this one?"
+        # decides nothing. Left in place it reads as a switch that has been
+        # working, and the next reader rebuilds the branch from it.
+        self.assertNotIn("keep_session", SCRIPT.read_text(encoding="utf-8"))
+
+
+class BeginRunTest(unittest.TestCase):
+    """A fresh invocation is a new run, because the loop can never cause one."""
+
+    def restart(self, **overrides):
+        state = build_state(**overrides)
+        started = MODULE.begin_run(state)
+        return state, started
+
+    def test_a_stored_escalation_never_outlives_the_run_that_recorded_it(self):
+        state, _ = self.restart(
+            escalation={"stage": MODULE.STAGE_CONFLICT, "reason": "stage_escalated"}
+        )
+        self.assertIsNone(state["escalation"])
+
+    def test_the_iteration_budget_bounds_one_run_rather_than_one_pull_request(self):
+        state, _ = self.restart(iteration=2, stage_high_water=4)
+        self.assertEqual(1, state["iteration"])
+        self.assertIsNone(state["stage_high_water"])
+
+    def test_a_streak_from_an_earlier_run_does_not_escalate_this_one(self):
+        state, _ = self.restart(
+            no_progress={MODULE.STAGE_CI: {"count": 1, "head_sha": HEAD}}
+        )
+        self.assertEqual({}, state["no_progress"])
+
+    def test_the_report_survives_because_it_is_the_report(self):
+        history = [{"stage": MODULE.STAGE_CI, "outcome": "escalated"}]
+        state, _ = self.restart(history=list(history))
+        self.assertEqual(history, state["history"])
+
+    def test_a_clearance_survives_because_it_names_its_own_commit(self):
+        state, _ = self.restart(cleared={MODULE.STAGE_CONFLICT: HEAD})
+        self.assertEqual({MODULE.STAGE_CONFLICT: HEAD}, state["cleared"])
+
+    def test_the_run_identity_changes_so_the_stages_reset_their_budgets_too(self):
+        state = build_state()
+        before = MODULE.pipeline_run_id(state)
+        MODULE.begin_run(state)
+        self.assertNotEqual(before, MODULE.pipeline_run_id(state))
+
+    def test_a_stage_left_running_is_recorded_rather_than_dropped(self):
+        state, started = self.restart(
+            running={
+                "stage": MODULE.STAGE_CI,
+                "iteration": 2,
+                "head_sha": HEAD,
+                "session_id": "abc",
+                "started_at": "2026-01-01T00:00:00Z",
+            }
+        )
+        self.assertIsNone(state["running"])
+        entry = state["history"][-1]
+        self.assertEqual(MODULE.STAGE_CI, entry["stage"])
+        self.assertEqual("abandoned", entry["outcome"])
+        self.assertEqual("run_restarted", entry["outcome_reason"])
+        self.assertEqual("abc", entry["session_id"])
+        self.assertTrue(entry["detail"])
+        self.assertEqual(MODULE.STAGE_CI, started["abandoned_stage"])
+
+    def test_a_run_that_ended_tidily_adds_no_abandoned_entry(self):
+        state, started = self.restart(running=None, history=[])
+        self.assertEqual([], state["history"])
+        self.assertIsNone(started["abandoned_stage"])
+
+    def test_every_run_is_recorded_so_a_relaunched_pipeline_is_visible(self):
+        state = build_state()
+        first = MODULE.pipeline_run_id(state)
+        MODULE.begin_run(state)
+        MODULE.begin_run(state)
+        runs = state["runs"]
+        self.assertEqual(2, len(runs))
+        self.assertEqual(first, runs[0]["previous_run_id"])
+        self.assertEqual(runs[0]["run_id"], runs[1]["previous_run_id"])
+        self.assertEqual(runs[-1]["run_id"], state["run_id"])
+
+    def test_a_fresh_state_records_its_own_first_run(self):
+        state = MODULE.new_state(
+            MODULE.build_target("o", "r", 1), observation(), Path("."), 2
+        )
+        self.assertEqual(1, len(state["runs"]))
+        self.assertEqual(state["run_id"], state["runs"][0]["run_id"])
+        self.assertIsNone(state["runs"][0]["previous_run_id"])
 
 
 class OutcomeCommandTest(CommandTestCase):
@@ -2583,6 +2975,48 @@ class PreflightCommandTest(CommandTestCase):
         self.call_preflight(observation())
         self.call_preflight(observation())
         self.assertTrue(self.emitted[-1]["resumed"])
+
+    def test_an_escalated_pull_request_can_be_run_again(self):
+        # A stored escalation is read before anything live, so keeping it would
+        # make one escalation permanent and put the only escape behind deleting
+        # the history of why it happened.
+        self.call_preflight(observation())
+        path = self.root / "pipeline.json"
+        state = MODULE.load_state(path)
+        state["escalation"] = {
+            "stage": MODULE.STAGE_CONFLICT,
+            "reason": "stage_escalated",
+            "detail": "a person had to merge it by hand",
+        }
+        state["iteration"] = 2
+        state["stage_high_water"] = 4
+        state["history"] = [{"stage": MODULE.STAGE_CONFLICT, "outcome": "escalated"}]
+        MODULE.save_state(path, state)
+
+        self.call_preflight(observation())
+        resumed = MODULE.load_state(path)
+        self.assertIsNone(resumed["escalation"])
+        self.assertEqual(1, resumed["iteration"])
+        self.assertEqual(1, len(resumed["history"]))
+        self.assertEqual(2, self.emitted[-1]["run_count"])
+        self.assertEqual(resumed["run_id"], self.emitted[-1]["run_id"])
+        self.assertIsNotNone(self.emitted[-1]["restarted"])
+
+    def test_a_restarted_run_then_decides_from_what_is_live(self):
+        self.call_preflight(observation())
+        path = self.root / "pipeline.json"
+        state = MODULE.load_state(path)
+        state["escalation"] = {"stage": MODULE.STAGE_CI, "reason": "stage_escalated"}
+        MODULE.save_state(path, state)
+        self.call_preflight(observation())
+
+        decision = MODULE.decide_next(MODULE.load_state(path), observation())
+        self.assertNotEqual("escalate", decision["result"])
+
+    def test_a_fresh_run_reports_no_restart(self):
+        self.call_preflight(observation())
+        self.assertIsNone(self.emitted[-1]["restarted"])
+        self.assertEqual(1, self.emitted[-1]["run_count"])
 
     def test_a_fresh_run_remembers_the_head_it_saw(self):
         self.call_preflight(observation(head_sha=NEXT_HEAD))
@@ -3025,11 +3459,29 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("models --pipeline-model", self.instructions)
         self.assertIn("fixed GPT-5.6 Sol evaluator", self.instructions)
 
-    def test_it_documents_session_hygiene_in_both_directions(self):
+    def test_it_archives_every_stage_session_it_created(self):
         self.assertIn("## Session Hygiene", self.instructions)
-        self.assertIn("`keep_session` false", self.instructions)
         self.assertIn(
-            "Keep the session otherwise", self.instructions
+            "Archive every stage session you created, whatever the stage's "
+            "outcome",
+            self.instructions,
+        )
+        self.assertIn(
+            "Never archive a session you did not create, and never archive your "
+            "own",
+            self.instructions,
+        )
+        # The escape hatch that makes archiving cost nothing.
+        self.assertIn("can be unarchived by hand later", self.instructions)
+        # Nothing may reintroduce the branch the field used to drive.
+        self.assertNotIn("keep_session", self.instructions)
+
+    def test_it_says_a_resumed_state_file_starts_a_new_run(self):
+        self.assertIn("Resuming a state file starts a **new run**", self.instructions)
+        self.assertIn("The loop below never returns to it", self.instructions)
+        self.assertIn(
+            "`--detail` is **required** for `no_progress` and `escalated`",
+            self.instructions,
         )
 
     def test_it_says_base_movement_triggers_nothing(self):

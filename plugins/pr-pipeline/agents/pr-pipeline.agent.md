@@ -67,10 +67,10 @@ Never pass a `~`-prefixed helper path to native Windows Python from Git Bash.
 
 The deterministic, JSON-only helper provides:
 
-- `preflight [target] [--repo-root <workspace>] [--state <path>] [--max-iterations 2] [--stage-model <stage>=<model>] [--no-pin]`: resolve the pull request, refuse anything that is not open, create or resume the pipeline state, apply any per-stage model pin, and report the pull request identity, the current head, the iteration, the cleared map, the model gate, and any stage plugin that is not installed.
+- `preflight [target] [--repo-root <workspace>] [--state <path>] [--max-iterations 2] [--stage-model <stage>=<model>] [--no-pin]`: resolve the pull request, refuse anything that is not open, create or resume the pipeline state, apply any per-stage model pin, and report the pull request identity, the current head, the iteration, the cleared map, the model gate, and any stage plugin that is not installed. Resuming a state file starts a **new run**: it mints a fresh `run_id`, resets the iteration to 1, and clears the stored escalation, the no-progress streaks, and any stage left recorded as running. The clearances and the history survive. Run it once, at the start. The loop below never returns to it, and re-running it to escape an escalation would hand the pipeline a fresh iteration budget it did not earn.
 - `next --state <path> [--effort high]`: the whole control flow. It reads the live head, the live `mergeable` field, the live check rollup, and each review stage's own `status` subcommand, then returns `run_stage`, `complete`, or `escalate`. On `run_stage` it also returns a `plan` holding the plugin-qualified `agent`, the pinned `model`, the `target`, a suggested `session_name`, and the exact `command` for a subprocess launch.
 - `start --state <path> --stage <name> --head <sha> --launch session|subprocess [--session <id>] [--process <id>]`: record that a stage began, and charge it to an iteration. This is where a loop-back increments the iteration, and where the cap is enforced.
-- `finish --state <path> --stage <name> --outcome cleared|skipped|no_progress|escalated [--head <sha>] [--detail <text>] [--session <id>]`: record how the stage ended, append the durable history entry, keep the no-progress streak, and escalate when the stage escalated or stalled twice. It asks the stage's own helper how the run ended and prefers that answer over the one you passed, keeping yours in the history as `requested_outcome`. A `cleared` from one of the three judgment stages is accepted only when that stage's own head-pinned marker names the head being recorded; otherwise it lands as `no_progress` with `outcome_reason` set to `clean_marker_head_mismatch`. Its `keep_session` field tells you whether to keep the child session.
+- `finish --state <path> --stage <name> --outcome cleared|skipped|no_progress|escalated [--head <sha>] [--detail <text>] [--session <id>]`: record how the stage ended, append the durable history entry, keep the no-progress streak, and escalate when the stage escalated or stalled twice. It asks the stage's own helper how the run ended and prefers that answer over the one you passed, keeping yours in the history as `requested_outcome`. A `cleared` from one of the three judgment stages is accepted only when that stage's own head-pinned marker names the head being recorded; otherwise it lands as `no_progress` with `outcome_reason` set to `clean_marker_head_mismatch`. `--detail` is **required** for `no_progress` and `escalated`, and optional for `cleared` and `skipped`.
 - `outcome --state <path> --stage <name>`: ask the stage that just ran how its run ended, in the pipeline's own vocabulary. `result` is `ready` with an `outcome` when the stage reports one, and `not_reported` when it does not.
 - `escalate --state <path> --reason <code> --detail <text> [--stage <name>] [--next-action <text>] [--head <sha>]`: stop the pipeline for a reason no stage reported.
 - `models [--state <path>] [--pipeline-model <id>] [--no-pin]`: report the pinned per-stage model for every stage and whether each stage's family requirement is met.
@@ -155,7 +155,7 @@ Repeat until `next` returns `complete` or `escalate`:
      - When the stage reported that the repository has no applicable checks, or that it had nothing to do and said so explicitly, the outcome is `skipped`.
      - When the stage hit its own iteration cap, stopped on a validation failure it could not fix, or asked for a person, the outcome is `escalated`.
      - When the stage ended without clearing, without escalating, and without moving the head, the outcome is `no_progress`.
-8. Record it with `finish --stage <name> --outcome <outcome> --head <the head after the stage ran> [--detail <one plain sentence>]`. `finish` asks the stage once more and prefers the stage's own answer, so a reading that went wrong is corrected rather than acted on.
+8. Record it with `finish --stage <name> --outcome <outcome> --head <the head after the stage ran> [--detail <one plain sentence>]`. `finish` asks the stage once more and prefers the stage's own answer, so a reading that went wrong is corrected rather than acted on. Pass `--detail` always, and note that `finish` refuses `no_progress` and `escalated` without it.
 9. Apply **Session Hygiene**.
 10. Go back to step 1.
 
@@ -169,9 +169,10 @@ A clearance has to carry the commit it is about. The three stages whose result i
 
 ## Session Hygiene
 
-- Archive a stage's child session when `finish` returns `keep_session` false, which means the stage cleared. Use `archive_session` with the id `create_session` returned.
-- Keep the session otherwise. That transcript is exactly what the user will want when a stage escalated or stalled.
+- Archive every stage session you created, whatever the stage's outcome. Use `archive_session` with the id `create_session` returned, right after `finish` records the stage.
+- Nothing is lost by archiving. `finish` writes the session id into the history entry, so a session is always findable and can be unarchived by hand later. The history is the record; the transcript is not.
 - Never archive a session you did not create, and never archive your own.
+- This is why `--detail` is required for `no_progress` and `escalated`. Once the transcript is archived, the sentence you write there is the only answer the report can give to "what happened at this stage."
 
 ## Escalation
 

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from typing import Any, Iterable
 
 
@@ -115,6 +116,16 @@ HELPER_EVIDENCE_STAGES = tuple(
 
 STAGE_OUTCOMES = ("cleared", "skipped", "no_progress", "escalated")
 CLEARING_OUTCOMES = ("cleared", "skipped")
+# An outcome and a head SHA account for a clearance on their own. Nothing
+# accounts for a stall or a surrender except a sentence someone wrote.
+DETAIL_REQUIRED_OUTCOMES = ("no_progress", "escalated")
+
+# A stage scopes a budget to one pass of the pipeline by resetting when this
+# pair changes. The run is opaque and compared only for equality; the iteration
+# is compared for order, and only against an iteration of the same run.
+PIPELINE_RUN_FLAG = "--pipeline-run"
+PIPELINE_ITERATION_FLAG = "--pipeline-iteration"
+PIPELINE_MAX_ITERATIONS_FLAG = "--pipeline-max-iterations"
 
 ESCALATION_ACTIONS = {
     "checks_never_registered": (
@@ -327,6 +338,23 @@ def stage_installed(entry: dict[str, Any]) -> bool:
     """
 
     return stage_script_path(entry).is_file()
+
+
+def stage_accepts_pipeline_position(entry: dict[str, Any]) -> bool:
+    """Report whether a stage's installed helper takes the pipeline's position.
+
+    Only a stage that scopes a budget to one pass of the pipeline accepts these
+    arguments, and a stage that does not would fail on an unrecognized one. The
+    answer is read from the helper actually installed rather than assumed from a
+    version, so a pipeline running against an older stage simply omits them and
+    that stage keeps its own budget.
+    """
+
+    path = stage_script_path(entry)
+    try:
+        return PIPELINE_RUN_FLAG in path.read_text(encoding="utf-8")
+    except OSError:
+        return False
 
 
 def status_path_for(state_path: Path) -> Path:
@@ -1621,6 +1649,75 @@ def gate_stage_models(models: dict[str, str], *, can_pin: bool) -> dict[str, Any
     }
 
 
+def pipeline_run_id(state: dict[str, Any]) -> str | None:
+    """Return the token that identifies this pipeline run to a stage.
+
+    A stage that resets a budget when the pipeline advances needs to tell one
+    run from the next, because the iteration number alone cannot: a fresh run on
+    the same pull request starts counting at one again, so a stage comparing
+    iteration numbers across runs would see the count go backwards and would
+    never reset again. Pairing the number with a per-run token makes a new run
+    distinguishable from a replayed iteration.
+
+    A state file written before this token existed falls back to its creation
+    time, which is written once and never changes, so it identifies the run just
+    as well. The token is opaque: nothing may parse it.
+    """
+
+    run_id = state.get("run_id")
+    if isinstance(run_id, str) and run_id:
+        return run_id
+    created_at = state.get("created_at")
+    if isinstance(created_at, str) and created_at:
+        return created_at
+    return None
+
+
+def pipeline_position_arguments(
+    entry: dict[str, Any],
+    *,
+    run_id: str | None,
+    iteration: int,
+    max_iterations: int,
+) -> list[str]:
+    """Build the arguments that tell a stage where the pipeline has got to.
+
+    Both halves of the position go together or neither does. A run with no
+    iteration says nothing about whether the pipeline advanced, and an iteration
+    with no run cannot be told apart from the same number in a different run, so
+    a stage receiving one alone would have to guess.
+    """
+
+    if not run_id or not stage_accepts_pipeline_position(entry):
+        return []
+    return [
+        PIPELINE_RUN_FLAG,
+        run_id,
+        PIPELINE_ITERATION_FLAG,
+        str(iteration),
+        PIPELINE_MAX_ITERATIONS_FLAG,
+        str(max_iterations),
+    ]
+
+
+def launch_prompt(target: str, arguments: list[str]) -> str:
+    """Build the prompt that launches one stage.
+
+    The pipeline's position reaches a stage through the prompt because that is
+    the only channel both launch paths share: a child session gets no
+    environment of its own. The arguments are spelled out exactly as they must
+    be typed, so the stage copies them rather than translating anything.
+    """
+
+    if not arguments:
+        return target
+    return (
+        f"{target}\n\n"
+        "Add these arguments to your preflight command, exactly as written, "
+        f"and change nothing else about how you run: {' '.join(arguments)}"
+    )
+
+
 def launch_plan(
     state: dict[str, Any], stage: str, *, effort: str = DEFAULT_EFFORT
 ) -> dict[str, Any]:
@@ -1629,12 +1726,28 @@ def launch_plan(
     The plugin-qualified agent reference is built here rather than typed by the
     model. A bare basename silently resolves to the default agent and reports no
     error, so the reference is never left to a judgment call.
+
+    The plan also carries the pipeline's own position, which a stage needs to
+    scope a budget to one pass of the pipeline rather than to the pull request.
+    The iteration is projected rather than read from the state, because a plan
+    is built before ``start`` advances the count, so the stored number is still
+    the previous pass's.
     """
 
     entry = STAGE_BY_NAME[stage]
     model = stage_models(state)[stage]
     pr = state["pr"]
     target = f"{pr['repo_name']}#{pr['number']}"
+    projection = projected_iteration(state, stage)
+    max_iterations = int(state.get("max_iterations") or DEFAULT_MAX_ITERATIONS)
+    run_id = pipeline_run_id(state)
+    arguments = pipeline_position_arguments(
+        entry,
+        run_id=run_id,
+        iteration=projection["iteration"],
+        max_iterations=max_iterations,
+    )
+    prompt = launch_prompt(target, arguments)
     return {
         "stage": stage,
         "plugin": entry["plugin"],
@@ -1642,11 +1755,16 @@ def launch_plan(
         "model": model,
         "effort": effort,
         "target": target,
+        "prompt": prompt,
+        "pipeline_run": run_id,
+        "pipeline_iteration": projection["iteration"],
+        "pipeline_max_iterations": max_iterations,
+        "pipeline_arguments": arguments,
         "session_name": f"PR Pipeline {stage}: {pr['number']} - {pr['title']}",
         "command": [
             "copilot",
             "-p",
-            target,
+            prompt,
             "--agent",
             entry["agent"],
             "--model",
@@ -1663,9 +1781,20 @@ def new_state(
     repo_root: Path,
     max_iterations: int,
 ) -> dict[str, Any]:
+    run_id = uuid.uuid4().hex[:12]
+    created_at = utc_now()
     return {
         "version": STATE_VERSION,
-        "created_at": utc_now(),
+        "created_at": created_at,
+        "run_id": run_id,
+        "runs": [
+            {
+                "run_id": run_id,
+                "previous_run_id": None,
+                "at": created_at,
+                "abandoned_stage": None,
+            }
+        ],
         "repo_root": str(repo_root),
         "pr": observation["pr"],
         "max_iterations": max_iterations,
@@ -1680,6 +1809,79 @@ def new_state(
         "completed": None,
         "observed_head_sha": observation.get("head_sha"),
     }
+
+
+def begin_run(state: dict[str, Any]) -> dict[str, Any]:
+    """Start a new pipeline run over a state file that already exists.
+
+    ``preflight`` is the only way into the pipeline, and the loop never returns
+    to it, so reaching here means someone outside the loop asked for a run. That
+    is what makes this reset safe: the loop cannot cause it.
+
+    Everything that bounds or stops a single run is cleared, because carrying it
+    forward would mean the previous run's ending decides this one's. A stored
+    escalation is read before anything live, so a pull request that escalated
+    once would replay that escalation for ever, and the only escape would be
+    deleting the state file along with the history of why it escalated. The
+    iteration count, the stage high-water mark, and the no-progress streaks are
+    the same shape: all of them bound one unattended pass through the stages,
+    and none of them is a budget for the pull request's whole life.
+
+    The clearances survive, because each one names the commit it was recorded
+    at and stops counting by itself when the head moves. The history survives,
+    because it is the report.
+
+    Clearing at the start rather than at the end is deliberate. A run that dies
+    never gets to tidy up after itself, and that is exactly the run that leaves
+    state behind, so the tidying has to happen where a dead run cannot skip it.
+    """
+
+    abandoned = state.get("running")
+    if not isinstance(abandoned, dict) or not abandoned:
+        abandoned = None
+    previous_run = pipeline_run_id(state)
+    if abandoned is not None:
+        # A stage recorded as running when a new run begins never reported an
+        # ending. Saying so in the history keeps the report honest about a run
+        # that stopped rather than finished.
+        state.setdefault("history", []).append(
+            {
+                "stage": abandoned.get("stage"),
+                "outcome": "abandoned",
+                "outcome_source": "pipeline",
+                "outcome_reason": "run_restarted",
+                "iteration": abandoned.get("iteration"),
+                "started_head_sha": abandoned.get("head_sha"),
+                "head_sha": abandoned.get("head_sha"),
+                "started_at": abandoned.get("started_at"),
+                "ended_at": utc_now(),
+                "session_id": abandoned.get("session_id"),
+                "process_id": abandoned.get("process_id"),
+                "launch": abandoned.get("launch"),
+                "model": abandoned.get("model"),
+                "detail": (
+                    f"{abandoned.get('stage')} was still recorded as running "
+                    "when a new pipeline run began, so it never reported how "
+                    "it ended"
+                ),
+                "repeat": False,
+            }
+        )
+    state["run_id"] = uuid.uuid4().hex[:12]
+    state["iteration"] = 1
+    state["stage_high_water"] = None
+    state["escalation"] = None
+    state["completed"] = None
+    state["no_progress"] = {}
+    state["running"] = None
+    started = {
+        "run_id": state["run_id"],
+        "previous_run_id": previous_run,
+        "at": utc_now(),
+        "abandoned_stage": abandoned.get("stage") if abandoned else None,
+    }
+    state.setdefault("runs", []).append(started)
+    return started
 
 
 def collect_observation(
@@ -1755,9 +1957,11 @@ def command_preflight(args: argparse.Namespace) -> None:
         state["pr"] = observation["pr"]
         state["repo_root"] = str(repo_root)
         state["max_iterations"] = max_iterations
+        restarted = begin_run(state)
         resumed = True
     else:
         state = new_state(target, observation, repo_root, max_iterations)
+        restarted = None
         resumed = False
     state["observed_head_sha"] = observation["head_sha"]
     apply_check_coverage(
@@ -1793,6 +1997,9 @@ def command_preflight(args: argparse.Namespace) -> None:
             "is_draft": state["pr"]["is_draft"],
             "iteration": state["iteration"],
             "max_iterations": state["max_iterations"],
+            "run_id": state.get("run_id"),
+            "restarted": restarted,
+            "run_count": len(state.get("runs") or []),
             "cleared": state.get("cleared") or {},
             "model_gate": gate,
             "stages": list(STAGE_NAMES),
@@ -2046,6 +2253,18 @@ def command_finish(args: argparse.Namespace) -> None:
         )
 
     head_sha = args.head or running.get("head_sha")
+    # Every stage session is archived, so this text is the only human-readable
+    # account of a run that did not clear. An outcome and a commit say what
+    # happened for a clearance; they say nothing about why a stage stalled or
+    # gave up. Checked against the outcome the caller passed rather than the one
+    # that gets recorded, because the caller cannot supply detail for a
+    # reclassification that happens after the stage has already run.
+    if args.outcome in DETAIL_REQUIRED_OUTCOMES and not (args.detail or "").strip():
+        raise WorkflowError(
+            f"--detail is required for {args.outcome}: say in one plain sentence "
+            "what happened, because the stage session is archived and the "
+            "history is all that survives"
+        )
     target = build_target(
         state["pr"]["owner"], state["pr"]["repo"], state["pr"]["number"]
     )
@@ -2053,6 +2272,8 @@ def command_finish(args: argparse.Namespace) -> None:
         STAGE_BY_NAME[stage], target, args.outcome, head_sha=head_sha
     )
     outcome = resolution["outcome"]
+    detail = recorded_detail(args.detail, resolution)
+    entry_detail = detail
     entry = {
         "stage": stage,
         "outcome": outcome,
@@ -2070,7 +2291,7 @@ def command_finish(args: argparse.Namespace) -> None:
         "process_id": args.process or running.get("process_id"),
         "launch": running.get("launch"),
         "model": running.get("model"),
-        "detail": args.detail,
+        "detail": entry_detail,
     }
     # A stage repeating an answer it already gave at this head has told the
     # pipeline nothing new. Relaunching a stage that has run out of its own road
@@ -2106,7 +2327,7 @@ def command_finish(args: argparse.Namespace) -> None:
             {
                 "stage": stage,
                 "reason": "stage_escalated",
-                "detail": args.detail
+                "detail": entry_detail
                 or f"{stage} stopped without clearing and asked for a person",
                 "next_action": ESCALATION_ACTIONS["stage_escalated"],
                 "head_sha": head_sha,
@@ -2146,8 +2367,38 @@ def command_finish(args: argparse.Namespace) -> None:
             "cleared": state.get("cleared") or {},
             "no_progress": state.get("no_progress") or {},
             "escalation": escalation,
-            "keep_session": outcome != "cleared",
         }
+    )
+
+
+def recorded_detail(
+    supplied: str | None, resolution: dict[str, Any]
+) -> str | None:
+    """Return the sentence the history keeps about how a stage ended.
+
+    ``finish`` refuses ``no_progress`` and ``escalated`` without a sentence, so
+    the caller has already supplied one whenever it asked for either. The gap is
+    the other direction: a caller asks for ``cleared``, which needs no sentence,
+    and the stage's own record disagrees, so what gets written down is an
+    outcome that does need one and has none.
+
+    Refusing there would be worse than useless. The stage has already run, and
+    the caller cannot go back and observe a reason it did not have. What it can
+    do is state the disagreement, which is the whole of what happened, so that
+    is what gets written when nothing else was offered.
+    """
+
+    text = (supplied or "").strip()
+    if text:
+        return text
+    outcome = resolution.get("outcome")
+    if outcome not in DETAIL_REQUIRED_OUTCOMES:
+        return supplied
+    requested = resolution.get("requested_outcome")
+    reason = resolution.get("outcome_reason") or "the stage disagreed"
+    return (
+        f"recorded as {outcome} rather than the {requested} the pipeline "
+        f"reported, because {reason}"
     )
 
 
