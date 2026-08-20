@@ -2049,6 +2049,40 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual([], plan["pipeline_arguments"])
         self.assertEqual("owner/repo#7", plan["prompt"])
 
+    def test_a_position_is_never_sent_in_halves(self):
+        # Stages disagree about what a half position means: one ignores it and
+        # keeps a per-pull-request budget that then never resets, another reads
+        # the half it can and scopes on that. Neither reading is exercised while
+        # the launcher only ever sends all three or none, so that property is
+        # what keeps the disagreement off the wire, and it is checked here
+        # rather than left to the shape of one literal.
+        self.accepts.return_value = True
+        for iteration, max_iterations in ((1, 2), (2, 4), (7, 7)):
+            for run_id in ("abc123", "", None):
+                with self.subTest(iteration=iteration, run=run_id):
+                    state = build_state(
+                        iteration=iteration, max_iterations=max_iterations
+                    )
+                    if run_id is None:
+                        state.pop("run_id", None)
+                        state.pop("created_at", None)
+                    else:
+                        state["run_id"] = run_id
+                    arguments = MODULE.launch_plan(state, MODULE.STAGE_CI)[
+                        "pipeline_arguments"
+                    ]
+                    self.assertIn(len(arguments), (0, 6))
+                    if arguments:
+                        self.assertEqual(
+                            [
+                                MODULE.PIPELINE_RUN_FLAG,
+                                MODULE.PIPELINE_ITERATION_FLAG,
+                                MODULE.PIPELINE_MAX_ITERATIONS_FLAG,
+                            ],
+                            arguments[::2],
+                        )
+                        self.assertTrue(all(arguments[1::2]))
+
     def test_relaunching_one_stage_keeps_the_same_iteration(self):
         # A stage resets its budget when this number moves, so a relaunch
         # inside one pass must hand it the number it already had.
