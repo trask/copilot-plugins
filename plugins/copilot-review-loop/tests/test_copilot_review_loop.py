@@ -2571,7 +2571,10 @@ class CleanAtHeadShaTest(unittest.TestCase):
         self.assertIsNone(payload["clean_at_head_sha"])
         self.assertIsNone(saved["clean_at_head_sha"])
         self.assertEqual(saved["last_result"], "review_required")
-        self.assertEqual(MODULE.stage_outcome(saved), "escalated")
+        # `preflight` writes this before any work, so it is not an ending. The
+        # run is owed one from the agent, and reading it as `escalated` is the
+        # #19517 false ending that discarded an unpushed fix.
+        self.assertIsNone(MODULE.stage_outcome(saved))
 
     def test_preflight_clears_a_stale_marker_from_an_earlier_clean_head(self):
         thread = {
@@ -2600,7 +2603,12 @@ class CleanAtHeadShaTest(unittest.TestCase):
         self.assertEqual(payload["result"], "ready")
         self.assertIsNone(payload["clean_at_head_sha"])
         self.assertIsNone(saved["clean_at_head_sha"])
-
+        # The #19517 scenario built through real preflight: Copilot left comments,
+        # so the run is owed an ending from the agent. `stage_outcome` must defer
+        # rather than manufacture `escalated`, which is the false ending that
+        # overrode the live agent and discarded its unpushed fix commit.
+        self.assertEqual(saved["last_result"], "ready")
+        self.assertIsNone(MODULE.stage_outcome(saved))
     def run_preflight(self, *, threads=None, reviews=None, prior_clean_at_head_sha=None):
         metadata = {"head_branch": "branch", "head_sha": "head"}
 
@@ -2849,7 +2857,7 @@ class StageOutcomeTest(unittest.TestCase):
             with self.subTest(result=result):
                 outcome = MODULE.stage_outcome({"last_result": result})
                 self.assertNotEqual(outcome, "cleared")
-                self.assertIn(outcome, self.PIPELINE_VOCABULARY)
+                self.assertIn(outcome, (None, *self.PIPELINE_VOCABULARY))
 
     def test_an_absent_review_asks_for_a_person(self):
         for result in ("request_cancelled", "review_dismissed", "max_iterations_reached"):
@@ -2902,23 +2910,36 @@ class StageOutcomeTest(unittest.TestCase):
         )
 
     def test_every_result_the_writer_can_record_is_classified(self):
-        """Growing the writer must fail here rather than escalate in the field.
+        """Growing the writer must fail here rather than misreport in the field.
 
-        An unmapped result escalates by design, which is right for an ending
-        nobody recognizes and wrong for one somebody simply forgot to map. The
-        difference is invisible at runtime, so it is pinned here instead.
+        Every ``last_result`` the code can write falls into exactly one class:
+        a preflight-pending value the run is still owed an ending for, the clean
+        pair that clears through the marker, or a recorded ending the map names.
+        A new recorded ending nobody adds to the map would escalate every run
+        silently, and a new preflight value nobody lists here would be read as an
+        unrecognized ending and escalate a run that never ended. The difference
+        is invisible at runtime, so both are pinned here.
         """
 
+        pending = set(MODULE.PREFLIGHT_PENDING_RESULTS)
         clears = MODULE.CLEAN_PREFLIGHT_RESULTS | {"review_no_comments"}
-        # Recorded before the agent hands back, so the run is still owed an ending.
-        owed = {"ready", "review_required", "review_comments"}
-        classified = clears | owed | set(MODULE.STAGE_OUTCOME_BY_RESULT)
+        mapped = set(MODULE.STAGE_OUTCOME_BY_RESULT)
+        classified = pending | clears | mapped
 
         self.assertEqual(sorted(recorded_results() - classified), [])
-        for result in sorted(owed):
-            with self.subTest(result=result):
+        # A run still owed an ending defers to the agent rather than being read
+        # as one; `ready`/`review_required` are the values the #19517 loss turned
+        # into a false `escalated`.
+        for result in sorted(pending - clears):
+            with self.subTest(pending=result):
+                self.assertIsNone(MODULE.stage_outcome({"last_result": result}))
+        # A recorded ending the map does not resolve to a clearing word is a real
+        # ending, so it escalates rather than deferring.
+        for result in sorted(mapped):
+            with self.subTest(mapped=result):
                 self.assertEqual(
-                    MODULE.stage_outcome({"last_result": result}), "escalated"
+                    MODULE.stage_outcome({"last_result": result}),
+                    MODULE.STAGE_OUTCOME_BY_RESULT[result],
                 )
 
     def test_a_cleared_run_always_carries_the_marker_it_rests_on(self):

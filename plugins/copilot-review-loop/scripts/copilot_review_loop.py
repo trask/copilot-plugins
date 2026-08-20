@@ -37,14 +37,28 @@ PR_HEAD_LAG_RETRY_DELAYS = (1, 2, 4)
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
 # Preflight results that mean Copilot reviewed the current head and asked for nothing.
 CLEAN_PREFLIGHT_RESULTS = frozenset({"no_copilot_comments", "no_unresolved_comments"})
+# The results `preflight` writes to `last_result` before a run does any work and
+# that are not themselves an ending. `preflight` writes the state up front, so a
+# run killed at any point leaves state holding one of these byte-identical to a
+# run still in flight. They are not evidence of how a run ended, so `stage_outcome`
+# refuses to speak for them and defers to the agent's own report. The clean pair
+# additionally set `clean_at_head_sha`, which `stage_outcome` reads first, so in
+# practice they answer `cleared`; they are listed here so a run that recorded one
+# without a marker still defers rather than being read as an ending.
+# `max_iterations_reached` is the one result `preflight` writes that IS a terminal
+# ending, so it is deliberately absent here and classified by the map below.
+PREFLIGHT_PENDING_RESULTS = frozenset(
+    {"ready", "review_required"} | CLEAN_PREFLIGHT_RESULTS
+)
 # How a run ended, in the vocabulary an external orchestrator reads. This says how a
 # run ended and never whether the stage is green: `clean_at_head_sha` alone says that.
-# A result missing from this table ends up "escalated", because a run nobody can
-# describe is worth a person's attention, and a wrong clearance is not.
+# A recorded ending this table does not name escalates, because a run ended some way
+# nobody can describe and that is worth a person's attention.
 STAGE_OUTCOME_BY_RESULT = {
     "max_iterations_reached": "escalated",
     "request_cancelled": "escalated",
     "review_dismissed": "escalated",
+    "review_comments": "escalated",
     "head_changed": "no_progress",
     "cancelled_locally": "no_progress",
     "stopped": "no_progress",
@@ -771,16 +785,24 @@ def stage_outcome(state: dict[str, Any]) -> str | None:
     ``cleared`` is read straight off ``clean_at_head_sha`` rather than decided
     again here, so this can never become a second, softer route to a clearance.
 
-    Every word this returns is a claim about a run that happened. A state that
-    recorded no ending supports no such claim, so it answers nothing at all and
-    a reader falls back to the report. An ending nobody recognizes is different:
-    a run did end, and one nobody can describe is worth a person's attention.
+    Every word this returns is a claim about a run that ended. ``preflight``
+    writes ``last_result`` before a run does any work, so a value it leaves is
+    byte-identical whether the run was killed mid-flight or is still going; those
+    values are not endings, so this answers nothing at all for them and a reader
+    falls back to the report. That distinction is load-bearing: the caller
+    prefers this word over its own, on the grounds that the stage watched itself
+    run, and that only holds for a recorded ending. Deferring a preflight value
+    keeps a guess from overriding the live agent that actually watched the run.
+
+    Everything else is a recorded ending. One the map names gets that word. One
+    it does not is still a real ending nobody can describe, which escalates,
+    because that is evidence of absence rather than absence of evidence.
     """
 
     if state.get("clean_at_head_sha"):
         return "cleared"
     last_result = state.get("last_result")
-    if not last_result:
+    if not last_result or last_result in PREFLIGHT_PENDING_RESULTS:
         return None
     return STAGE_OUTCOME_BY_RESULT.get(last_result, "escalated")
 

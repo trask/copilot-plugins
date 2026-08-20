@@ -2776,6 +2776,48 @@ def command_finish(args: argparse.Namespace) -> None:
     target = build_target(
         state["pr"]["owner"], state["pr"]["repo"], state["pr"]["number"]
     )
+    # A stage that committed without pushing leaves its work only in the shared
+    # worktree, which the next stage's `reset` discards. Recording an ending here
+    # would seal that loss: the pipeline moves on, the worktree is reset, and the
+    # commit becomes a dangling object. This fires wherever the commit lands, not
+    # only on the specific ending the loss was first seen under, because the
+    # hazard is the unpushed commit and not the word the stage chose for it.
+    #
+    # It reports rather than pushes. `finish` records how a stage ended; it is not
+    # a publish path, and pushing here would guess a destination and a force
+    # policy the pipeline never chose and could clobber a head another actor moved
+    # underneath it. The reversible move is to stop and name the shas so a person,
+    # or a deliberate re-run, pushes. `reset` already escalates on the same
+    # condition rather than pushing.
+    repo_root = (
+        cli_path(args.repo_root)
+        if getattr(args, "repo_root", None)
+        else Path(state["repo_root"])
+    )
+    unpushed = local_head_ahead_of_remote(repo_root, target)
+    if unpushed is not None:
+        decision = {
+            "stage": stage,
+            "reason": "local_head_ahead_of_remote",
+            "detail": (
+                f"refusing to record an ending for {stage}: {unpushed}. Recording "
+                "it would let the next stage reset the worktree and discard the "
+                "commit."
+            ),
+            "next_action": ESCALATION_ACTIONS["local_head_ahead_of_remote"],
+            "head_sha": head_sha,
+        }
+        escalation = record_escalation(state, decision)
+        save_state(path, state)
+        emit(
+            {
+                "result": "escalated",
+                "state": str(path),
+                "stage": stage,
+                "escalation": escalation,
+            }
+        )
+        return
     resolution = resolve_finish_outcome(
         STAGE_BY_NAME[stage], target, args.outcome, head_sha=head_sha
     )
@@ -3252,6 +3294,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     finish = subparsers.add_parser("finish", help="record how a stage ended")
     finish.add_argument("--state", required=True)
+    finish.add_argument("--repo-root", dest="repo_root")
     finish.add_argument("--stage", required=True, choices=list(STAGE_NAMES))
     finish.add_argument("--outcome", required=True, choices=list(STAGE_OUTCOMES))
     finish.add_argument("--head")

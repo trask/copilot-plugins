@@ -17,7 +17,7 @@
     {
       "name": "copilot-review-loop",
       "description": "Address Copilot pull request review comments, publish fixes, and repeat until the review is clean.",
-      "version": "1.0.39",
+      "version": "1.0.40",
       "source": "./plugins/copilot-review-loop"
     },
     {
@@ -35,7 +35,7 @@
     {
       "name": "pr-pipeline",
       "description": "Drive an open draft pull request through conflict resolution, self review, Copilot review, check fixing, and description validation until every stage is green at the same head commit.",
-      "version": "1.0.11",
+      "version": "1.0.12",
       "source": "./plugins/pr-pipeline"
     },
     {

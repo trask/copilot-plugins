@@ -3,7 +3,9 @@ import importlib.util
 import inspect
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -16,6 +18,8 @@ SPEC = importlib.util.spec_from_file_location("pr_pipeline", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+
+REAL_LOCAL_HEAD_AHEAD_OF_REMOTE = MODULE.local_head_ahead_of_remote
 
 
 HEAD = "head1"
@@ -2325,6 +2329,16 @@ class CommandTestCase(unittest.TestCase):
         )
         self.confirm_calls = confirm.start()
         self.addCleanup(confirm.stop)
+        # No command test may reach git or GitHub to check whether a stage left an
+        # unpushed commit. The default is a branch level with its remote head, so
+        # `finish` records the ending; a test about a stage that committed without
+        # pushing sets self.unpushed itself.
+        self.unpushed = None
+        ahead = mock.patch.object(
+            MODULE, "local_head_ahead_of_remote", side_effect=lambda *_: self.unpushed
+        )
+        ahead.start()
+        self.addCleanup(ahead.stop)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
@@ -2499,6 +2513,67 @@ class FinishCommandTest(CommandTestCase):
         self.assertIsNone(state["running"])
         self.assertEqual(1, len(state["history"]))
         self.assertNotIn("keep_session", self.emitted[-1])
+
+    def test_an_unpushed_commit_refuses_the_ending_through_real_git(self):
+        """A stage that committed without pushing must not have its ending sealed.
+
+        This is the #19517 loss, driven through the real git detector rather than
+        a stubbed one: a run made a real commit whose parent is the pull request
+        head, then died before pushing. Recording the ending would let the next
+        stage reset the worktree and turn that commit into a dangling object. The
+        artifacts are asserted, not a result string: the escalation is recorded,
+        the stage's `running` is cleared, and no history ending is written.
+        """
+
+        repo = Path(self.directory.name) / "repo"
+        repo.mkdir()
+
+        def git(*arguments: str) -> str:
+            result = subprocess.run(
+                ["git", "-C", str(repo), *arguments],
+                capture_output=True,
+                text=True,
+                check=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "t",
+                    "GIT_AUTHOR_EMAIL": "t@e",
+                    "GIT_COMMITTER_NAME": "t",
+                    "GIT_COMMITTER_EMAIL": "t@e",
+                },
+            )
+            return result.stdout.strip()
+
+        git("init", "-q")
+        git("commit", "-q", "--allow-empty", "-m", "pr head")
+        pr_head = git("rev-parse", "HEAD")
+        git("commit", "-q", "--allow-empty", "-m", "the fix the stage never pushed")
+        fix_sha = git("rev-parse", "HEAD")
+
+        path = self.running_state(MODULE.STAGE_COPILOT_REVIEW, repo_root=str(repo))
+        # The real detector runs; only the network read of the PR head is stubbed
+        # to the commit that is actually published.
+        with (
+            mock.patch.object(
+                MODULE,
+                "local_head_ahead_of_remote",
+                REAL_LOCAL_HEAD_AHEAD_OF_REMOTE,
+            ),
+            mock.patch.object(MODULE, "target_remote_head", return_value=pr_head),
+        ):
+            self.finish(
+                path, MODULE.STAGE_COPILOT_REVIEW, "cleared", fix_sha
+            )
+
+        state = MODULE.load_state(path)
+        self.assertEqual("escalated", self.emitted[-1]["result"])
+        self.assertEqual(
+            "local_head_ahead_of_remote", state["escalation"]["reason"]
+        )
+        self.assertIn(pr_head, state["escalation"]["detail"])
+        self.assertIsNone(state["running"])
+        self.assertEqual([], state["history"])
+        self.assertEqual({}, state["cleared"])
 
     def test_a_skipped_stage_also_clears(self):
         path = self.running_state(MODULE.STAGE_CI)
