@@ -768,8 +768,18 @@ def stage_outcome(state: dict[str, Any]) -> str | None:
     return STAGE_OUTCOME_BY_RESULT.get(last_result, "escalated")
 
 
-def watcher_result(state: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
-    state["monitoring"].update({"status": "completed", "result": result})
+def watcher_result(
+    state: dict[str, Any], result: dict[str, Any], status: str = "completed"
+) -> dict[str, Any]:
+    """Record how the watcher ended, in the one place that writes ``last_result``.
+
+    Every terminal watcher path goes through here, so an ending is recorded
+    exactly where it happens. A path that updates ``monitoring`` on its own
+    leaves ``last_result`` holding an earlier command's result, and the run then
+    reports an ending that is not the one it had.
+    """
+
+    state["monitoring"].update({"status": status, "result": result})
     state["last_result"] = result["result"]
     return result
 
@@ -1856,9 +1866,7 @@ def command_watch(args: argparse.Namespace) -> None:
             time.sleep(args.interval)
     except KeyboardInterrupt:
         state = load_state(path)
-        state["monitoring"].update(
-            {"status": "stopped", "result": {"result": "stopped"}}
-        )
+        watcher_result(state, {"result": "stopped"}, status="stopped")
         save_state(path, state)
         emit({"result": "stopped"})
 

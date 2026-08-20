@@ -1,4 +1,5 @@
 import importlib.util
+import ast
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,52 @@ SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+
+
+def _literal_strings(node: ast.AST) -> set[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return {node.value}
+    if isinstance(node, ast.IfExp):
+        return _literal_strings(node.body) | _literal_strings(node.orelse)
+    return set()
+
+
+def recorded_results() -> set[str]:
+    """Every value the helper can record in `last_result`, read from its source.
+
+    Derived rather than restated, so growing the writer fails the tests that
+    classify these values instead of waiting for somebody to remember them.
+    """
+
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "watcher_result":
+            for argument in node.args:
+                if not isinstance(argument, ast.Dict):
+                    continue
+                for key, value in zip(argument.keys, argument.values):
+                    if isinstance(key, ast.Constant) and key.value == "result":
+                        found |= _literal_strings(value)
+    for function in ast.walk(tree):
+        if not isinstance(function, ast.FunctionDef):
+            continue
+        assigned_names = {
+            node.value.id
+            for node in ast.walk(function)
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name)
+            for target in node.targets
+            if isinstance(target, ast.Subscript)
+            and isinstance(target.slice, ast.Constant)
+            and target.slice.value == "last_result"
+        }
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in assigned_names:
+                    found |= _literal_strings(node.value)
+    return found
 
 
 class AgentInstructionsTest(unittest.TestCase):
@@ -2755,21 +2802,7 @@ class StageOutcomeTest(unittest.TestCase):
         Every result a run can record is checked, including the ones that mean
         Copilot asked for nothing. Without the marker, none of them clear.
         """
-        results = [
-            "no_copilot_comments",
-            "no_unresolved_comments",
-            "review_no_comments",
-            "review_comments",
-            "ready",
-            "review_required",
-            "max_iterations_reached",
-            "head_changed",
-            "request_cancelled",
-            "review_dismissed",
-            "cancelled_locally",
-            "stopped",
-            "published",
-        ]
+        results = sorted(recorded_results() | {"published"})
         for result in results:
             with self.subTest(result=result):
                 outcome = MODULE.stage_outcome({"last_result": result})
@@ -2814,6 +2847,52 @@ class StageOutcomeTest(unittest.TestCase):
             with self.subTest(result=result):
                 self.assertIn(outcome, self.PIPELINE_VOCABULARY)
 
+    def test_no_mapped_result_is_unreachable(self):
+        """A map entry for a result nothing records describes a run nobody has.
+
+        It reads as a promise the helper keeps, so it hides the case it claims to
+        cover: the run ends some other way and is described by whatever an
+        earlier command happened to leave behind.
+        """
+
+        self.assertEqual(
+            sorted(set(MODULE.STAGE_OUTCOME_BY_RESULT) - recorded_results()), []
+        )
+
+    def test_every_result_the_writer_can_record_is_classified(self):
+        """Growing the writer must fail here rather than escalate in the field.
+
+        An unmapped result escalates by design, which is right for an ending
+        nobody recognizes and wrong for one somebody simply forgot to map. The
+        difference is invisible at runtime, so it is pinned here instead.
+        """
+
+        clears = MODULE.CLEAN_PREFLIGHT_RESULTS | {"review_no_comments"}
+        # Recorded before the agent hands back, so the run is still owed an ending.
+        owed = {"ready", "review_required", "review_comments"}
+        classified = clears | owed | set(MODULE.STAGE_OUTCOME_BY_RESULT)
+
+        self.assertEqual(sorted(recorded_results() - classified), [])
+        for result in sorted(owed):
+            with self.subTest(result=result):
+                self.assertEqual(
+                    MODULE.stage_outcome({"last_result": result}), "escalated"
+                )
+
+    def test_a_cleared_run_always_carries_the_marker_it_rests_on(self):
+        """`pr-pipeline` refuses a clearance whose marker names another head.
+
+        That guard only works when the marker travels with the word, so no path
+        may report `cleared` and leave the reader nothing to check it against.
+        """
+
+        for result in sorted(recorded_results() | {"", "surprise"}):
+            for marker in (None, "", "abc123"):
+                state = {"last_result": result, "clean_at_head_sha": marker}
+                with self.subTest(result=result, marker=marker):
+                    if MODULE.stage_outcome(state) == "cleared":
+                        self.assertTrue(state["clean_at_head_sha"])
+
     def test_the_watcher_records_the_result_the_outcome_is_read_from(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
@@ -2827,6 +2906,53 @@ class StageOutcomeTest(unittest.TestCase):
 
         self.assertEqual(recorded["last_result"], "request_cancelled")
         self.assertEqual(MODULE.stage_outcome(recorded), "escalated")
+
+    def test_a_stopped_watch_records_the_ending_it_actually_had(self):
+        """Interrupting the watcher must not report the result preflight left.
+
+        The user stopped this run themselves, so it did not clear and nobody
+        needs fetching. Recording the stop anywhere but `last_result` leaves the
+        run described by an earlier command, and preflight's own results
+        escalate.
+        """
+
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "pr": {
+                "number": 7,
+                "upstream_owner": "trask",
+                "upstream_repo": "copilot-plugins",
+            },
+            "queue": {},
+            "last_result": "review_required",
+            "monitoring": {
+                "status": "running",
+                "head_sha": "abc123",
+                "baseline_review_id": 0,
+                "copilot_bot_id": "BOT_1",
+                "request_start": "2026-05-01T12:00:00Z",
+                "cancel_requested": False,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(path, state)
+            args = SimpleNamespace(state=str(path), interval=0, cancellation_grace=0)
+
+            with (
+                mock.patch.object(MODULE, "gh_json", side_effect=KeyboardInterrupt),
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_watch(args)
+
+            recorded = MODULE.load_state(path)
+
+        self.assertEqual(emit.call_args.args[0], {"result": "stopped"})
+        self.assertEqual(recorded["monitoring"]["status"], "stopped")
+        self.assertEqual(recorded["last_result"], "stopped")
+        self.assertEqual(MODULE.stage_outcome(recorded), "no_progress")
+        self.assertIsNone(recorded.get("clean_at_head_sha"))
 
     def test_status_reports_the_outcome_for_an_external_orchestrator(self):
         state = {
