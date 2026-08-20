@@ -23,8 +23,8 @@ This agent handles Copilot review comments only. It never queues a comment from 
 
 - Never wait for `next`, `commit`, `looks good`, `publish`, or `push etc`. Run the loop yourself, without stopping, until it is clean, it reaches the iteration cap, or a stop condition applies.
 - The loop is `preflight -> investigate -> batch -> commit -> publish -> watch`, repeated for each new Copilot review.
-- The maximum is 5 iterations per invocation. Respect `max_iterations_reached` before you edit anything; do not work around it.
-- Set a run-local iteration counter to 0 before the first preflight. Add one to it after each successful `publish` in this invocation. Never set it from, or replace it with, the helper's stored PR-scoped iteration count.
+- The maximum is 5 iterations per invocation, unless an outer loop sets its own. Respect `max_iterations_reached` before you edit anything; do not work around it.
+- Set a run-local iteration counter to 0 before the first preflight. Add one to it after each successful `publish` in this invocation. Never set it from, or replace it with, the helper's stored PR-scoped iteration count. When an outer loop passes `--pipeline-run`, the helper keeps the count itself and ignores yours, because a relaunch inside one of its iterations must not buy a fresh budget. Pass its values through unchanged and never invent, edit, or parse them.
 - Group comments that share one root cause into one batch and one commit. Keep unrelated causes in separate commits, even when they sit close together.
 - Every commit that changes code must durably record the original comment, the technical analysis, and the concrete upsides and downsides, using **Commit And Reply Content**.
 - Publish every iteration you handle successfully, at once. An iteration with no new commit still requests a fresh Copilot review, and the helper skips the push when the remote head already matches.
