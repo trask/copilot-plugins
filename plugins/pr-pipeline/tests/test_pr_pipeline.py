@@ -4401,8 +4401,168 @@ class ResetCommandTest(CommandTestCase):
             state=str(path), stage=MODULE.STAGE_SELF_REVIEW, repo_root=str(self.root)
         )
 
+    def make_dirty_repo(self) -> Path:
+        """A real git repo dirtied the way a user or a stage would leave it.
+
+        The gate keys on real `git status`, so a fake porcelain string cannot
+        prove it protects the files on disk. This builds an actual repo with a
+        committed tracked file, then modifies it, adds an untracked file, and
+        drops a gitignored build artifact.
+        """
+
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run_git(*argv):
+            import subprocess
+
+            subprocess.run(
+                ["git", *argv], cwd=repo, check=True, capture_output=True, text=True
+            )
+
+        run_git("init", "-q")
+        run_git("config", "user.email", "t@e.st")
+        run_git("config", "user.name", "test")
+        (repo / "tracked.txt").write_text("committed content\n", encoding="utf-8")
+        (repo / ".gitignore").write_text("build/\n", encoding="utf-8")
+        run_git("add", "-A")
+        run_git("commit", "-qm", "init")
+        (repo / "tracked.txt").write_text("USER EDIT\n", encoding="utf-8")
+        (repo / "user_notes.txt").write_text("scratch\n", encoding="utf-8")
+        (repo / "build").mkdir()
+        (repo / "build" / "out.class").write_text("artifact\n", encoding="utf-8")
+        return repo
+
+    def begun_state(self, **overrides) -> dict:
+        """State as `begin_run` actually leaves it, not a hand-made literal.
+
+        A fresh run has empty history and `iteration == 1`. A test that omits
+        `iteration` or sets it to 0 hides the very bug the gate exists to catch,
+        so the fixture is produced by the real code path instead.
+        """
+
+        state = build_state(**overrides)
+        MODULE.begin_run(state)
+        return state
+
+    def test_dirt_before_any_stage_has_run_is_the_users_and_is_not_reset(self):
+        # The load-bearing case: a fresh run with the user's own uncommitted
+        # edits present. Misattributing this to a stage is unrecoverable data
+        # loss, so the gate must refuse and leave every file untouched.
+        state = self.begun_state()
+        self.assertEqual(1, state["iteration"])  # what begin_run produces
+        self.assertEqual([], state["history"])
+        self.assertIsNone(state["running"])
+
+        repo = self.make_dirty_repo()
+        outcome = MODULE.ensure_clean_worktree_for_launch(state, repo)
+
+        self.assertEqual("escalate", outcome["result"])
+        self.assertEqual("dirty_worktree_before_run", outcome["reason"])
+        # Assert on the artifact, not the verdict: the files must be intact.
+        self.assertEqual(
+            "USER EDIT\n", (repo / "tracked.txt").read_text(encoding="utf-8")
+        )
+        self.assertTrue((repo / "user_notes.txt").exists())
+
+    def test_a_resumed_run_after_escalation_does_not_reset_the_users_fix(self):
+        # The route my first fix missed: the pipeline escalated asking for a
+        # human decision, the user edited the source to address it and has not
+        # committed, then relaunched. Resuming mints a fresh run_id while the
+        # prior run's history survives, so a history-based gate would call the
+        # user's fix a stage's dirt and destroy the very change the escalation
+        # asked for. Scoped to the current run, it must refuse.
+        state = self.begun_state(
+            history=[
+                {"stage": MODULE.STAGE_CI, "outcome": "escalated", "run_id": "OLDRUN"}
+            ]
+        )
+        # begin_run left a fresh run_id, cleared running, and kept the history.
+        self.assertNotEqual("OLDRUN", state["run_id"])
+        self.assertTrue(state["history"])
+        self.assertIsNone(state["running"])
+
+        repo = self.make_dirty_repo()
+        outcome = MODULE.ensure_clean_worktree_for_launch(state, repo)
+
+        self.assertEqual("escalate", outcome["result"])
+        self.assertEqual("dirty_worktree_before_run", outcome["reason"])
+        self.assertEqual(
+            "USER EDIT\n", (repo / "tracked.txt").read_text(encoding="utf-8")
+        )
+        self.assertTrue((repo / "user_notes.txt").exists())
+
+    def test_dirt_after_a_stage_finished_in_this_run_is_reset_on_a_real_repo(self):
+        # A stage finished earlier in this same run, so its leftover dirt is the
+        # pipeline's to clear. The gitignored build/ survives.
+        state = self.begun_state()
+        state["history"] = [
+            {
+                "stage": MODULE.STAGE_CONFLICT,
+                "outcome": "cleared",
+                "run_id": state["run_id"],
+            }
+        ]
+
+        repo = self.make_dirty_repo()
+        outcome = MODULE.ensure_clean_worktree_for_launch(state, repo)
+
+        self.assertEqual("reset", outcome["result"])
+        self.assertEqual(
+            "committed content\n",
+            (repo / "tracked.txt").read_text(encoding="utf-8"),
+        )
+        self.assertFalse((repo / "user_notes.txt").exists())
+        self.assertTrue((repo / "build" / "out.class").exists())
+
+    def test_finish_stamps_the_run_id_on_the_history_entry(self):
+        # The gate scopes by run, so the history entry must carry the run it
+        # belongs to. Without this stamp an old run's dirt is misattributed.
+        running = {
+            "stage": MODULE.STAGE_CONFLICT,
+            "head_sha": HEAD,
+            "iteration": 1,
+            "launch": "subprocess",
+            "process_id": "1",
+            "model": MODULE.DEFAULT_STAGE_MODEL,
+            "started_at": "2026-01-01T00:00:00Z",
+        }
+        path = write_state(
+            self.root, run_id="RUN123", running=running, escalation=None
+        )
+        self.stage_says("skipped")
+        MODULE.command_finish(
+            self.args(
+                state=str(path),
+                stage=MODULE.STAGE_CONFLICT,
+                outcome="skipped",
+                head=HEAD,
+                detail=None,
+                session=None,
+                process=None,
+            )
+        )
+        state = MODULE.load_state(path)
+        self.assertEqual("RUN123", state["history"][-1]["run_id"])
+
+    def test_dirt_after_a_stage_has_run_is_reset_on_a_real_repo(self):
+        # A stage is still recorded as running, so leftover dirt is the stage's
+        # and is cleared. The gitignored build/ survives.
+        state = self.begun_state()
+        state["running"] = {"stage": MODULE.STAGE_CONFLICT, "head_sha": HEAD}
+
+        repo = self.make_dirty_repo()
+        outcome = MODULE.ensure_clean_worktree_for_launch(state, repo)
+
+        self.assertIn(outcome["result"], ("reset",))
+        self.assertEqual(
+            "committed content\n",
+            (repo / "tracked.txt").read_text(encoding="utf-8"),
+        )
+        self.assertFalse((repo / "user_notes.txt").exists())
+        self.assertTrue((repo / "build" / "out.class").exists())
+
     def test_dirt_before_any_stage_has_run_is_the_users_and_escalates(self):
-        path = write_state(self.root, history=[], iteration=0)
+        path = write_state(self.root, history=[], iteration=1, running=None)
         with mock.patch.object(MODULE, "local_head_ahead_of_remote", return_value=None):
             with mock.patch.object(MODULE, "worktree_dirt", return_value=" M file.py"):
                 MODULE.command_reset(self.reset_args(path))
@@ -4414,7 +4574,8 @@ class ResetCommandTest(CommandTestCase):
         path = write_state(
             self.root,
             iteration=1,
-            history=[{"stage": MODULE.STAGE_CONFLICT}],
+            run_id="RUNX",
+            history=[{"stage": MODULE.STAGE_CONFLICT, "run_id": "RUNX"}],
         )
         dirt = iter([" M file.py", ""])
         with mock.patch.object(MODULE, "local_head_ahead_of_remote", return_value=None):

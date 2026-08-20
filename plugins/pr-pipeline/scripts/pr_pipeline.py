@@ -2059,6 +2059,7 @@ def begin_run(state: dict[str, Any]) -> dict[str, Any]:
             {
                 "stage": abandoned.get("stage"),
                 "outcome": "abandoned",
+                "run_id": state.get("run_id"),
                 "outcome_source": "pipeline",
                 "outcome_reason": "run_restarted",
                 "iteration": abandoned.get("iteration"),
@@ -2363,10 +2364,16 @@ def ensure_clean_worktree_for_launch(
     precondition of launching rather than a courtesy the previous stage performs,
     because a stage that crashed never gets to clean up after itself.
 
-    Provenance decides what may be reset. Dirt present before this run has
-    launched any stage is the user's own uncommitted work, so the pipeline
-    refuses rather than destroys it. Dirt present after a stage has run belongs to
-    a stage, so the pipeline resets it. The reset drops uncommitted tracked
+    Provenance decides what may be reset, scoped to the current run. Dirt
+    present before this run has launched any stage is the user's own uncommitted
+    work, so the pipeline refuses rather than destroys it. This holds on a
+    resumed run too: resuming mints a fresh ``run_id`` while the prior run's
+    history survives, so the question is not "has a stage ever run for this pull
+    request" but "has a stage run in this run". A stage that finished earlier in
+    this run, or one still recorded as running, means the dirt belongs to a
+    stage, so the pipeline resets it. An old history entry from before run
+    stamping never matches the current run, so it reads as "not this run" and the
+    user is asked rather than overruled. The reset drops uncommitted tracked
     changes with ``reset --hard HEAD`` and removes untracked files with
     ``clean -fd``; it never resets to a recorded sha, which would discard the
     stage's own commits, and it never uses ``-x``, so a gitignored ``build/``
@@ -2374,7 +2381,14 @@ def ensure_clean_worktree_for_launch(
     """
 
     dirt = worktree_dirt(repo_root)
-    a_stage_has_run = bool(state.get("history")) or state.get("iteration", 0) > 0
+    current_run = state.get("run_id")
+    a_stage_has_run = bool(state.get("running")) or (
+        current_run is not None
+        and any(
+            isinstance(past, dict) and past.get("run_id") == current_run
+            for past in state.get("history") or []
+        )
+    )
 
     if dirt and not a_stage_has_run:
         return {
@@ -2771,6 +2785,7 @@ def command_finish(args: argparse.Namespace) -> None:
     entry = {
         "stage": stage,
         "outcome": outcome,
+        "run_id": state.get("run_id"),
         "requested_outcome": resolution["requested_outcome"],
         "outcome_source": resolution["outcome_source"],
         "outcome_reason": resolution.get("outcome_reason"),
