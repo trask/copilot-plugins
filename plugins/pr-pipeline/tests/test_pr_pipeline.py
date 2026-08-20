@@ -541,6 +541,33 @@ class LoopBackTest(unittest.TestCase):
                 )
                 self.assertNotEqual(stage, decision.get("stage"))
 
+    def test_no_stage_but_the_first_relies_on_nothing_to_hold_it(self):
+        # A stage whose clearance comes from GitHub rather than a head-pinned
+        # marker can report `cleared`, have GitHub disagree, and be picked
+        # again. What stops that repeating is a helper stage ahead of it: the
+        # push invalidates that stage's marker, so the next pick is earlier,
+        # which is a loop-back and charges an iteration.
+        #
+        # The stage at index 0 has nothing ahead of it, so it has no such brake.
+        # Every other GitHub-evidence stage is safe only because at least one
+        # helper stage sits in front of it. That is a property of the order, not
+        # of the stage, so reordering must fail here rather than quietly
+        # reopening the hole at a new position.
+        for index, entry in enumerate(MODULE.STAGES):
+            if index == 0 or entry["stage"] in MODULE.HELPER_EVIDENCE_STAGES:
+                continue
+            with self.subTest(stage=entry["stage"]):
+                ahead = {
+                    earlier["stage"] for earlier in MODULE.STAGES[:index]
+                } & set(MODULE.HELPER_EVIDENCE_STAGES)
+                self.assertTrue(
+                    ahead,
+                    f"{entry['stage']} clears on GitHub evidence and has no "
+                    "helper stage ahead of it, so a push it makes invalidates "
+                    "nothing and it can be re-picked without charging an "
+                    "iteration",
+                )
+
     def test_base_branch_movement_alone_changes_nothing(self):
         state = build_state(
             iteration=1,
