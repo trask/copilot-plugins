@@ -37,6 +37,18 @@ PR_HEAD_LAG_RETRY_DELAYS = (1, 2, 4)
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
 # Preflight results that mean Copilot reviewed the current head and asked for nothing.
 CLEAN_PREFLIGHT_RESULTS = frozenset({"no_copilot_comments", "no_unresolved_comments"})
+# The two results the watcher records after reading Copilot's review. Named here so
+# both the writer and `stage_outcome` agree on the spelling and the classification
+# lives in one place rather than being restated in a test.
+WATCHER_REVIEW_CLEAN = "review_no_comments"
+WATCHER_REVIEW_COMMENTS = "review_comments"
+# Watcher endings that are themselves a clearance: Copilot reviewed and asked for
+# nothing. The watcher writes `clean_at_head_sha` in the same `save_state` as this
+# result, so `stage_outcome` reads the marker first and never reaches this set in
+# practice. It is classified here anyway so a clean review does not depend on that
+# one writer to avoid the catch-all: a clean result is a clearance, and the false
+# `escalated` it would otherwise produce is on the most common good outcome.
+WATCHER_CLEAN_RESULTS = frozenset({WATCHER_REVIEW_CLEAN})
 # The results `preflight` writes to `last_result` before a run does any work and
 # that are not themselves an ending. `preflight` writes the state up front, so a
 # run killed at any point leaves state holding one of these byte-identical to a
@@ -58,7 +70,13 @@ STAGE_OUTCOME_BY_RESULT = {
     "max_iterations_reached": "escalated",
     "request_cancelled": "escalated",
     "review_dismissed": "escalated",
-    "review_comments": "escalated",
+    # A terminal `review_comments` means the watcher saw Copilot leave comments and
+    # the run then died. This is safe to escalate precisely because the window is
+    # always pre-work: the only writers of `last_result` are `preflight` and the
+    # watcher, and the agent re-runs `preflight` immediately after a watch, so a
+    # `review_comments` that survives to be read here is a run that stopped before
+    # any fix work. Escalating it can never override a completed run's own report.
+    WATCHER_REVIEW_COMMENTS: "escalated",
     "head_changed": "no_progress",
     "cancelled_locally": "no_progress",
     "stopped": "no_progress",
@@ -794,15 +812,23 @@ def stage_outcome(state: dict[str, Any]) -> str | None:
     run, and that only holds for a recorded ending. Deferring a preflight value
     keeps a guess from overriding the live agent that actually watched the run.
 
-    Everything else is a recorded ending. One the map names gets that word. One
-    it does not is still a real ending nobody can describe, which escalates,
-    because that is evidence of absence rather than absence of evidence.
+    Everything else is a recorded ending. A clean review clears only through its
+    marker, exactly like the clean preflight pair: with the marker the check above
+    returns ``cleared``, and without one it defers rather than reporting a
+    markerless clearance or a false ``escalated`` on the clean path. Any other
+    recorded ending the map names gets that word; one it does not is still a real
+    ending nobody can describe, which escalates, because that is evidence of
+    absence rather than absence of evidence.
     """
 
     if state.get("clean_at_head_sha"):
         return "cleared"
     last_result = state.get("last_result")
-    if not last_result or last_result in PREFLIGHT_PENDING_RESULTS:
+    if (
+        not last_result
+        or last_result in PREFLIGHT_PENDING_RESULTS
+        or last_result in WATCHER_CLEAN_RESULTS
+    ):
         return None
     return STAGE_OUTCOME_BY_RESULT.get(last_result, "escalated")
 
@@ -2015,7 +2041,9 @@ def command_watch(args: argparse.Namespace) -> None:
                         state,
                         {
                             "result": (
-                                "review_no_comments" if clean else "review_comments"
+                                WATCHER_REVIEW_CLEAN
+                                if clean
+                                else WATCHER_REVIEW_COMMENTS
                             ),
                             "review_id": review["id"],
                             "review_url": review["html_url"],

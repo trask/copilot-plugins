@@ -25,6 +25,13 @@ def _literal_strings(node: ast.AST) -> set[str]:
         return {node.value}
     if isinstance(node, ast.IfExp):
         return _literal_strings(node.body) | _literal_strings(node.orelse)
+    # The writer may name a module-level string constant rather than inline the
+    # literal, so the classification can live in one place. Resolve the name to
+    # the value the module actually binds, so `recorded_results` still sees it.
+    if isinstance(node, ast.Name):
+        value = getattr(MODULE, node.id, None)
+        if isinstance(value, str):
+            return {value}
     return set()
 
 
@@ -2912,29 +2919,57 @@ class StageOutcomeTest(unittest.TestCase):
     def test_every_result_the_writer_can_record_is_classified(self):
         """Growing the writer must fail here rather than misreport in the field.
 
-        Every ``last_result`` the code can write falls into exactly one class:
-        a preflight-pending value the run is still owed an ending for, the clean
-        pair that clears through the marker, or a recorded ending the map names.
-        A new recorded ending nobody adds to the map would escalate every run
-        silently, and a new preflight value nobody lists here would be read as an
-        unrecognized ending and escalate a run that never ended. The difference
-        is invisible at runtime, so both are pinned here.
+        Every ``last_result`` the code can write falls into exactly one class the
+        source declares: a preflight-pending value the run is still owed an ending
+        for, a clean review that clears through its marker, or a recorded ending
+        the map names. Each class's declaration lives in the source, and this test
+        asserts what ``stage_outcome`` actually returns for it rather than trusting
+        a set the test builds. A new recorded ending nobody maps would escalate
+        every run silently; a new preflight or clean value nobody declares would be
+        read as an unrecognized ending and escalate a run that never ended; and a
+        clean value read without its marker must never be a markerless clearance.
+        All are invisible at runtime, so all are pinned here from the source sets.
         """
 
         pending = set(MODULE.PREFLIGHT_PENDING_RESULTS)
-        clears = MODULE.CLEAN_PREFLIGHT_RESULTS | {"review_no_comments"}
+        # Clears only through the marker, so without one it must defer, not clear.
+        marker_clears = set(MODULE.CLEAN_PREFLIGHT_RESULTS) | set(
+            MODULE.WATCHER_CLEAN_RESULTS
+        )
         mapped = set(MODULE.STAGE_OUTCOME_BY_RESULT)
-        classified = pending | clears | mapped
+        classified = pending | marker_clears | mapped
 
+        # Every value the writer can record is classified somewhere. `pending` and
+        # `marker_clears` overlap by design -- the clean preflight pair is both
+        # written up front and a clearance through its marker -- so they are not
+        # required to be disjoint. What must never overlap is a value the map gives
+        # a word and a value that defers or clears through the marker: a mapped
+        # ending returns its word unconditionally, which would override the other
+        # two behaviors. That disjointness is the one that guards the contract.
         self.assertEqual(sorted(recorded_results() - classified), [])
-        # A run still owed an ending defers to the agent rather than being read
-        # as one; `ready`/`review_required` are the values the #19517 loss turned
-        # into a false `escalated`.
-        for result in sorted(pending - clears):
+        self.assertEqual(set(), mapped & (pending | marker_clears))
+
+        # A run still owed an ending defers rather than being read as one;
+        # `ready`/`review_required` are the values the #19517 loss made a false
+        # `escalated`. A preflight-pending value never carries a marker of its own.
+        for result in sorted(pending):
             with self.subTest(pending=result):
                 self.assertIsNone(MODULE.stage_outcome({"last_result": result}))
-        # A recorded ending the map does not resolve to a clearing word is a real
-        # ending, so it escalates rather than deferring.
+
+        # A clean review is a clearance, but only with its marker. With one it
+        # clears; without one it defers rather than reporting a markerless
+        # clearance or a false `escalated` on the clean path.
+        for result in sorted(marker_clears):
+            with self.subTest(clean=result):
+                self.assertEqual(
+                    "cleared",
+                    MODULE.stage_outcome(
+                        {"last_result": result, "clean_at_head_sha": "head"}
+                    ),
+                )
+                self.assertIsNone(MODULE.stage_outcome({"last_result": result}))
+
+        # A recorded ending the map names returns exactly its word.
         for result in sorted(mapped):
             with self.subTest(mapped=result):
                 self.assertEqual(
