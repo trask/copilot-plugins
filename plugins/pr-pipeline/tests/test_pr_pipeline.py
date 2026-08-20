@@ -3458,17 +3458,18 @@ class StageActivityTest(CommandTestCase):
         self.assertNotIn("reason", activity)
 
     def test_it_says_plainly_that_it_is_not_proof_the_stage_is_alive(self):
-        """The pipeline does not own the stage process, so it cannot probe one.
+        """`status` reports timestamps, not a probe.
 
-        Claiming more than the timestamps support would put a reader's trust
-        behind a signal that was never measured.
+        The pipeline's `wait` owns the stage process and decides liveness from
+        its pid; `status` does not, so it must not claim more than the recorded
+        timestamps support.
         """
         with mock.patch.object(
             MODULE, "run_stage_status", return_value={"ok": False, "reason": "no_state"}
         ):
             activity = MODULE.stage_activity(self.running_state())
-        self.assertIn("not proof the stage is alive", activity["note"])
-        self.assertIn("no process here to probe", activity["note"])
+        self.assertIn("a timestamp view, not a probe", activity["note"])
+        self.assertIn("`status` does not", activity["note"])
 
     def test_a_helper_that_does_not_report_the_stamp_reads_as_unknown(self):
         """An unanswerable question is not the answer "just now"."""
@@ -3931,16 +3932,18 @@ class AgentInstructionsTest(unittest.TestCase):
     def setUp(self):
         self.instructions = AGENT.read_text(encoding="utf-8")
 
-    def test_both_launch_paths_carry_the_pipelines_position(self):
-        # The plan offers target and prompt, and only prompt carries the
-        # position. A child session launched from target would run the stage
-        # correctly on its own budget and report nothing amiss, so the
-        # difference between the two fields is stated where it is used.
-        self.assertIn("`kickoff.prompt` set to the plan's `prompt`", self.instructions)
-        self.assertNotIn(
-            "`kickoff.prompt` set to the plan's `target`", self.instructions
+    def test_the_launch_command_carries_the_pipelines_position(self):
+        # The plan's command embeds the prompt, which carries the pipeline's
+        # position; the agent runs that command verbatim through `launch` rather
+        # than choosing between target and prompt itself.
+        self.assertIn(
+            "`launch --log <plan log_path> -- <plan command>`", self.instructions
         )
-        self.assertIn("Use `prompt` and never `target`", self.instructions)
+        state = build_state(run_id="abc123")
+        plan = MODULE.launch_plan(state, MODULE.STAGE_CI)
+        self.assertIn("-p", plan["command"])
+        prompt = plan["command"][plan["command"].index("-p") + 1]
+        self.assertIn(MODULE.PIPELINE_RUN_FLAG.lstrip("-"), prompt)
 
     def test_the_pass_flows_forward_and_only_loops_at_its_end(self):
         """The prose is what the next reader reinstates, so it has to say which it is.
@@ -3975,9 +3978,12 @@ class AgentInstructionsTest(unittest.TestCase):
 
         self.assertIn("adds an `activity` block", self.instructions)
         self.assertIn(
-            "That is not proof the stage is alive", self.instructions
+            "That block is a timestamp view, not a probe", self.instructions
         )
-        self.assertIn("there is no process here to probe", self.instructions)
+        self.assertIn(
+            "`wait` owns the stage process and judges liveness from its pid",
+            self.instructions,
+        )
         self.assertIn(
             "separates a stage that was active minutes ago from one silent for "
             "an hour",
@@ -3994,10 +4000,16 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("argument-hint:", self.instructions)
         self.assertIn("user-invocable: true", self.instructions)
         self.assertIn(
-            "tools: [read, search, execute, todo, rename_session, create_session, "
-            "get_session, archive_session]",
+            "tools: [read, search, execute, todo, rename_session]",
             self.instructions,
         )
+        tools_line = next(
+            line for line in self.instructions.splitlines()
+            if line.startswith("tools:")
+        )
+        self.assertNotIn("create_session", tools_line)
+        self.assertNotIn("get_session", tools_line)
+        self.assertNotIn("archive_session", tools_line)
 
     def test_a_model_may_start_it_and_the_file_says_why(self):
         self.assertIn("disable-model-invocation: false", self.instructions)
@@ -4028,14 +4040,14 @@ class AgentInstructionsTest(unittest.TestCase):
 
     def test_it_asks_the_stage_before_it_reads_the_report(self):
         self.assertIn(
-            "Run `outcome --stage <plan stage>` first", self.instructions
+            "Confirm it with `outcome --stage <plan stage>`", self.instructions
         )
         self.assertIn(
-            "When its `result` is `not_reported`, the stage does not answer for "
-            "itself yet, so fall back to reading",
+            "When `outcome`'s `result` is `not_reported`, the stage does not "
+            "answer for itself yet, so fall back to reading",
             self.instructions,
         )
-        first = self.instructions.index("Run `outcome --stage <plan stage>` first")
+        first = self.instructions.index("`wait` already gives the outcome")
         fallback = self.instructions.index("Run `next` again.")
         self.assertLess(first, fallback)
 
@@ -4145,39 +4157,36 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
-    def test_it_documents_both_launch_paths(self):
-        self.assertIn("## Choosing The Launch Path", self.instructions)
+    def test_it_documents_the_single_subprocess_launch_path(self):
+        self.assertIn("## The Launch Path", self.instructions)
         self.assertIn(
-            "an agent that names `create_session` in its `tools:` allowlist does "
-            "receive it",
+            "Every stage runs as a subprocess in this session's own worktree",
             self.instructions,
         )
-        self.assertIn(
-            "The plain Copilot CLI does not provide `create_session`",
-            self.instructions,
-        )
-        self.assertIn("plan.command", self.instructions)
+        self.assertIn("There is no child-session path", self.instructions)
+        self.assertIn("The pipeline owns the stage process, not you", self.instructions)
+        self.assertNotIn("Child sessions.", self.instructions)
 
     def test_it_documents_the_model_gate(self):
         self.assertIn("## Model Gate", self.instructions)
         self.assertIn("models --pipeline-model", self.instructions)
         self.assertIn("fixed GPT-5.6 Sol evaluator", self.instructions)
 
-    def test_it_archives_every_stage_session_it_created(self):
-        self.assertIn("## Session Hygiene", self.instructions)
+    def test_it_documents_the_stage_logs_and_detail(self):
+        self.assertIn("## Stage Logs", self.instructions)
         self.assertIn(
-            "Archive every stage session you created, whatever the stage's "
-            "outcome",
+            "combined output goes to the log file at the `log_path`",
             self.instructions,
         )
         self.assertIn(
-            "Never archive a session you did not create, and never archive your "
-            "own",
+            "read at most the last 100 lines of the log", self.instructions
+        )
+        self.assertIn(
+            "the sentence you write there is the only answer the report gives",
             self.instructions,
         )
-        # The escape hatch that makes archiving cost nothing.
-        self.assertIn("can be unarchived by hand later", self.instructions)
-        # Nothing may reintroduce the branch the field used to drive.
+        # Nothing may reintroduce per-stage sessions.
+        self.assertNotIn("archive_session", self.instructions)
         self.assertNotIn("keep_session", self.instructions)
 
     def test_it_says_a_resumed_state_file_starts_a_new_run(self):
@@ -4225,6 +4234,227 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_it_runs_unattended_without_approval_gates(self):
         self.assertIn("Run fully unattended", self.instructions)
         self.assertIn("There is no approval gate between stages", self.instructions)
+
+
+class StageLogPathTest(unittest.TestCase):
+    def test_the_path_carries_the_pull_request_stage_and_iteration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                MODULE, "copilot_home", return_value=Path(directory)
+            ):
+                path = MODULE.stage_log_path(
+                    {"owner": "octo", "repo": "hello", "number": 42},
+                    MODULE.STAGE_CI,
+                    3,
+                )
+        self.assertEqual(
+            f"octo--hello--42--{MODULE.STAGE_CI}--3.log", path.name
+        )
+        self.assertEqual(("run", "pr-pipeline", "logs"), path.parts[-4:-1])
+
+    def test_a_rerun_at_a_higher_iteration_keeps_its_own_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                MODULE, "copilot_home", return_value=Path(directory)
+            ):
+                first = MODULE.stage_log_path(
+                    {"owner": "o", "repo": "r", "number": 1}, MODULE.STAGE_CI, 1
+                )
+                second = MODULE.stage_log_path(
+                    {"owner": "o", "repo": "r", "number": 1}, MODULE.STAGE_CI, 2
+                )
+        self.assertNotEqual(first, second)
+
+
+class LaunchPlanLogTest(unittest.TestCase):
+    def test_the_plan_names_a_log_and_carries_the_permission_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                MODULE, "copilot_home", return_value=Path(directory)
+            ):
+                plan = MODULE.launch_plan(build_state(), MODULE.STAGE_CONFLICT)
+        self.assertIn("log_path", plan)
+        self.assertTrue(plan["log_path"].endswith(".log"))
+        for flag in MODULE.STAGE_PERMISSION_FLAGS:
+            self.assertIn(flag, plan["command"])
+
+    def test_the_flag_set_stays_narrow(self):
+        # The narrowest set proven to run a stage unattended is tools plus
+        # paths; urls stay off because stages reach GitHub through the gh CLI.
+        self.assertEqual(
+            ("--allow-all-tools", "--allow-all-paths"),
+            MODULE.STAGE_PERMISSION_FLAGS,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                MODULE, "copilot_home", return_value=Path(directory)
+            ):
+                plan = MODULE.launch_plan(build_state(), MODULE.STAGE_CONFLICT)
+        self.assertNotIn("--allow-all-urls", plan["command"])
+        self.assertNotIn("--allow-all", plan["command"])
+
+
+class StartLogRoundTripTest(CommandTestCase):
+    def test_start_records_the_log_path_on_running(self):
+        path = write_state(self.root)
+        MODULE.command_start(
+            self.args(
+                state=str(path),
+                stage=MODULE.STAGE_CONFLICT,
+                head=HEAD,
+                launch="subprocess",
+                session=None,
+                process="4242",
+                log="/tmp/some--stage.log",
+            )
+        )
+        state = MODULE.load_state(path)
+        self.assertEqual("/tmp/some--stage.log", state["running"]["log_path"])
+
+    def test_an_old_state_file_with_a_session_launch_still_loads(self):
+        # Old state files recorded launch=session; reading them must not break.
+        path = write_state(
+            self.root,
+            running={
+                "stage": MODULE.STAGE_CONFLICT,
+                "head_sha": HEAD,
+                "iteration": 1,
+                "launch": "session",
+                "session_id": "abc",
+            },
+        )
+        state = MODULE.load_state(path)
+        self.assertEqual("session", state["running"]["launch"])
+
+
+class WaitCommandTest(CommandTestCase):
+    def wait_args(self, path, **overrides):
+        base = dict(
+            state=str(path),
+            stage=MODULE.STAGE_CI,
+            pid="4242",
+            process_create_time="100.0",
+            timeout=None,
+            poll=None,
+        )
+        base.update(overrides)
+        return self.args(**base)
+
+    def test_it_returns_the_outcome_only_after_the_process_exits(self):
+        path = write_state(self.root)
+        self.stage_reading = {"available": True, "outcome": "cleared"}
+        with mock.patch.object(MODULE, "process_alive", return_value=False):
+            with mock.patch.object(MODULE, "time") as clock:
+                clock.monotonic.side_effect = [0.0, 0.0]
+                MODULE.command_wait(self.wait_args(path))
+        result = self.emitted[-1]
+        self.assertEqual("finished", result["result"])
+        self.assertEqual("cleared", result["outcome"])
+
+    def test_a_process_gone_without_an_outcome_escalates(self):
+        path = write_state(self.root)
+        self.stage_reading = {"available": False, "reason": "not_reported"}
+        with mock.patch.object(MODULE, "process_alive", return_value=False):
+            with mock.patch.object(MODULE, "time") as clock:
+                clock.monotonic.side_effect = [0.0, 0.0]
+                MODULE.command_wait(self.wait_args(path))
+        result = self.emitted[-1]
+        self.assertEqual("escalate", result["result"])
+        self.assertEqual("process_exited_without_outcome", result["reason"])
+
+    def test_a_process_still_alive_at_the_ceiling_escalates(self):
+        path = write_state(self.root)
+        with mock.patch.object(MODULE, "process_alive", return_value=True):
+            with mock.patch.object(MODULE, "time") as clock:
+                # first sample under ceiling schedules a sleep, second is over it
+                clock.monotonic.side_effect = [0.0, 0.0, 999999.0, 999999.0]
+                clock.sleep.return_value = None
+                MODULE.command_wait(self.wait_args(path, timeout="10"))
+        result = self.emitted[-1]
+        self.assertEqual("escalate", result["result"])
+        self.assertEqual("wait_timeout_exceeded", result["reason"])
+
+    def test_seeing_an_outcome_while_alive_is_not_a_reason_to_return(self):
+        # The load-bearing ordering: exit is observed before the outcome is
+        # read. A stage that has written its outcome but is still pushing must
+        # not be returned, because the next stage would launch into the shared
+        # worktree while this one is still mutating it. This reads like a
+        # redundant liveness check; it is not, and must not be simplified away.
+        path = write_state(self.root)
+        self.stage_reading = {"available": True, "outcome": "cleared"}
+        alive_states = [True, False]
+        with mock.patch.object(
+            MODULE, "process_alive", side_effect=lambda *_: alive_states.pop(0)
+        ):
+            with mock.patch.object(MODULE, "time") as clock:
+                clock.monotonic.side_effect = [0.0, 0.0, 0.0, 0.0]
+                clock.sleep.return_value = None
+                MODULE.command_wait(self.wait_args(path))
+        # It looped once while alive, then returned finished only after exit.
+        self.assertEqual([], alive_states)
+        self.assertEqual("finished", self.emitted[-1]["result"])
+
+
+class ResetCommandTest(CommandTestCase):
+    def reset_args(self, path):
+        return self.args(
+            state=str(path), stage=MODULE.STAGE_SELF_REVIEW, repo_root=str(self.root)
+        )
+
+    def test_dirt_before_any_stage_has_run_is_the_users_and_escalates(self):
+        path = write_state(self.root, history=[], iteration=0)
+        with mock.patch.object(MODULE, "local_head_ahead_of_remote", return_value=None):
+            with mock.patch.object(MODULE, "worktree_dirt", return_value=" M file.py"):
+                MODULE.command_reset(self.reset_args(path))
+        state = MODULE.load_state(path)
+        self.assertEqual("escalated", self.emitted[-1]["result"])
+        self.assertEqual("dirty_worktree_before_run", state["escalation"]["reason"])
+
+    def test_dirt_after_a_stage_has_run_is_reset(self):
+        path = write_state(
+            self.root,
+            iteration=1,
+            history=[{"stage": MODULE.STAGE_CONFLICT}],
+        )
+        dirt = iter([" M file.py", ""])
+        with mock.patch.object(MODULE, "local_head_ahead_of_remote", return_value=None):
+            with mock.patch.object(
+                MODULE, "worktree_dirt", side_effect=lambda *_: next(dirt)
+            ):
+                with mock.patch.object(MODULE, "git", return_value="") as git:
+                    MODULE.command_reset(self.reset_args(path))
+        self.assertEqual("ready", self.emitted[-1]["result"])
+        self.assertTrue(self.emitted[-1]["reset"])
+        calls = [tuple(call.args[1:]) for call in git.call_args_list]
+        self.assertIn(("reset", "--hard", "HEAD"), calls)
+        self.assertIn(("clean", "-fd"), calls)
+        # Never -x: a gitignored build/ must survive for the warm-compile win.
+        for call in git.call_args_list:
+            self.assertNotIn("-x", call.args)
+
+    def test_a_local_head_ahead_of_remote_escalates_instead_of_resetting(self):
+        path = write_state(
+            self.root, iteration=1, history=[{"stage": MODULE.STAGE_CONFLICT}]
+        )
+        with mock.patch.object(
+            MODULE,
+            "local_head_ahead_of_remote",
+            return_value="the local branch is 1 commit(s) ahead",
+        ):
+            MODULE.command_reset(self.reset_args(path))
+        state = MODULE.load_state(path)
+        self.assertEqual("escalated", self.emitted[-1]["result"])
+        self.assertEqual("local_head_ahead_of_remote", state["escalation"]["reason"])
+
+    def test_a_clean_tree_is_ready_without_a_reset(self):
+        path = write_state(
+            self.root, iteration=1, history=[{"stage": MODULE.STAGE_CONFLICT}]
+        )
+        with mock.patch.object(MODULE, "local_head_ahead_of_remote", return_value=None):
+            with mock.patch.object(MODULE, "worktree_dirt", return_value=""):
+                MODULE.command_reset(self.reset_args(path))
+        self.assertEqual("ready", self.emitted[-1]["result"])
+        self.assertFalse(self.emitted[-1]["reset"])
 
 
 if __name__ == "__main__":

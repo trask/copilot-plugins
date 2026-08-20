@@ -2,7 +2,7 @@
 name: PR Pipeline
 description: "Use to drive an open draft pull request through conflict resolution, self review, Copilot review, check fixing, and description validation until every stage is green at the same head commit."
 argument-hint: "PR URL, PR number, or owner/repo#number; omit to use the current branch's PR"
-tools: [read, search, execute, todo, rename_session, create_session, get_session, archive_session]
+tools: [read, search, execute, todo, rename_session]
 user-invocable: true
 disable-model-invocation: false
 ---
@@ -69,13 +69,16 @@ The deterministic, JSON-only helper provides:
 
 - `preflight [target] [--repo-root <workspace>] [--state <path>] [--max-iterations 2] [--stage-model <stage>=<model>] [--no-pin]`: resolve the pull request, refuse anything that is not open, create or resume the pipeline state, apply any per-stage model pin, and report the pull request identity, the current head, the iteration, the cleared map, the model gate, and any stage plugin that is not installed. Resuming a state file starts a **new run**: it mints a fresh `run_id`, resets the iteration to 1, and clears the stored escalation, the no-progress streaks, and any stage left recorded as running. The clearances and the history survive. Run it once, at the start. The loop below never returns to it, and re-running it to escape an escalation would hand the pipeline a fresh iteration budget it did not earn.
 - `next --state <path> [--effort high]`: the whole control flow. It reads the live head, the live `mergeable` field, the live check rollup, and each review stage's own `status` subcommand, then returns `run_stage`, `complete`, or `escalate`. On `run_stage` it also returns a `plan` holding the plugin-qualified `agent`, the pinned `model`, the `target`, a suggested `session_name`, and the exact `command` for a subprocess launch.
-- `start --state <path> --stage <name> --head <sha> --launch session|subprocess [--session <id>] [--process <id>]`: record that a stage began, and charge it to an iteration. This is where the start of a new pass increments the iteration, and where the cap is enforced.
-- `finish --state <path> --stage <name> --outcome cleared|skipped|no_progress|escalated [--head <sha>] [--detail <text>] [--session <id>]`: record how the stage ended, append the durable history entry, keep the no-progress streak, and escalate when the stage escalated or stalled twice. It asks the stage's own helper how the run ended and prefers that answer over the one you passed, keeping yours in the history as `requested_outcome`. A `cleared` from one of the three judgment stages is accepted only when that stage's own head-pinned marker names the head being recorded; otherwise it lands as `no_progress` with `outcome_reason` set to `clean_marker_head_mismatch`. `--detail` is **required** for `no_progress` and `escalated`, and optional for `cleared` and `skipped`. A clearing outcome is checked against GitHub, and one the pipeline cannot confirm at that head counts against the stage's no-progress streak instead of resetting it.
+- `start --state <path> --stage <name> --head <sha> --launch subprocess [--process <id>] [--log <path>]`: record that a stage began, and charge it to an iteration. This is where the start of a new pass increments the iteration, and where the cap is enforced. `--launch` still accepts the old `session` value so an old state file reads, but every launch now passes `subprocess`. Pass `--process` with the pid and `--log` with the log path from `launch`, so the history keeps both.
+- `reset --state <path> [--stage <name>] [--repo-root <workspace>]`: make the shared worktree clean before a stage launches. Four of the five stage helpers refuse any dirty tree, and every stage now shares this session's one worktree, so this runs before each `launch`. Dirt present before any stage has run is your own work, so it escalates as `dirty_worktree_before_run` rather than destroying it. Dirt from a stage that already ran is reset with `reset --hard HEAD` and `clean -fd`, which keeps every commit and keeps a gitignored `build/`. A local branch ahead of the pull request head escalates as `local_head_ahead_of_remote`, because a stage that committed without pushing must not have that work reset away.
+- `launch --log <path> [--repo-root <workspace>] -- <command...>`: spawn one stage as a detached subprocess whose combined output goes to the log file, and return its `pid` and `process_create_time` at once. It never streams the stage's output back, because a stage can emit thousands of lines the pipeline decides nothing from.
+- `wait --state <path> --stage <name> --pid <id> [--process-create-time <t>] [--timeout <s>] [--poll <s>]`: block until the stage process exits, then report the outcome its helper recorded. It returns `finished` with an `outcome` only after the process has exited, so the next stage never launches into the shared worktree while this one is still pushing. A process that exits without an outcome escalates as `process_exited_without_outcome`, and one still running at the ceiling escalates as `wait_timeout_exceeded`. Pass the `process_create_time` from `launch` so a reused pid cannot read as alive.
+- `finish --state <path> --stage <name> --outcome cleared|skipped|no_progress|escalated [--head <sha>] [--detail <text>] [--session <id>]`: record how the stage ended, append the durable history entry, keep the no-progress streak, and escalate when the stage escalated or stalled twice. It asks the stage's own helper how the run ended and prefers that answer over the one you passed, keeping yours in the history as `requested_outcome`. A `cleared` from one of the three judgment stages is accepted only when that stage's own head-pinned marker names the head being recorded; otherwise it lands as `no_progress` with `outcome_reason` set to `clean_marker_head_mismatch`. `--detail` is **required** for `no_progress` and `escalated`, and optional for `cleared` and `skipped`. The history entry keeps the stage's `log_path`, so a later reader can find the run's output. A clearing outcome is checked against GitHub, and one the pipeline cannot confirm at that head counts against the stage's no-progress streak instead of resetting it.
 - `outcome --state <path> --stage <name>`: ask the stage that just ran how its run ended, in the pipeline's own vocabulary. `result` is `ready` with an `outcome` when the stage reports one, and `not_reported` when it does not.
 - `escalate --state <path> --reason <code> --detail <text> [--stage <name>] [--next-action <text>] [--head <sha>]`: stop the pipeline for a reason no stage reported.
 - `models [--state <path>] [--pipeline-model <id>] [--no-pin]`: report the pinned per-stage model for every stage and whether each stage's family requirement is met.
 - `plan --state <path> --stage <name> [--effort high]`: print one stage's launch instructions on their own. It returns `not_installed` instead of a launch command when that stage's plugin is missing.
-- `status [--state <path> | --current --repo-root <workspace>]`: print the pipeline state and write the complete snapshot to `status_path`. While a stage is recorded as running it adds an `activity` block saying how long that stage has been running and how long ago its helper last wrote anything. That is not proof the stage is alive: the pipeline emits a launch plan and you run the stage, so there is no process here to probe. It only separates a stage that was active minutes ago from one silent for an hour. A helper that cannot answer reports `null` beside a `reason` rather than a zero.
+- `status [--state <path> | --current --repo-root <workspace>]`: print the pipeline state and write the complete snapshot to `status_path`. While a stage is recorded as running it adds an `activity` block saying how long that stage has been running and how long ago its helper last wrote anything. That block is a timestamp view, not a probe: `wait` owns the stage process and judges liveness from its pid, while `status` only reads recorded stamps. It separates a stage that was active minutes ago from one silent for an hour. A helper that cannot answer reports `null` beside a `reason` rather than a zero.
 - `cleanup --state <path> [--force]`: delete the pipeline state.
 
 State lives at `~/.copilot/run/pr-pipeline/{owner}--{repo}--{number}.json`.
@@ -129,14 +132,19 @@ Each stage carries its own default model, and a stage that names none runs on th
 3. Stop when it is `blocked`. Report the blocked stages and the reason, and do not run a single stage.
 4. If you cannot work out which model you run as, pass no `--pipeline-model` and continue. The stage pins still hold, and the gate still checks them.
 
-## Choosing The Launch Path
+## The Launch Path
 
-Two launch paths exist, and which one you have depends on where you are running. Check once, at the start, and use the same path for the whole run.
+Every stage runs as a subprocess in this session's own worktree, which already
+has the pull request branch checked out. There is no child-session path: the
+agent does not have `create_session`, and per-stage sessions would each spawn a
+separate worktree and raise a separate completion popup.
 
-- **Child sessions.** When you actually have the `create_session` tool, use it. Under the Copilot App an agent that names `create_session` in its `tools:` allowlist does receive it. Do not assume the tool exists because this file lists it; look at what you were given.
-- **Subprocess.** When you do not have `create_session`, run the helper's `plan.command` with the `execute` tool. The plain Copilot CLI does not provide `create_session`, so this is the normal path there.
-
-Record which path you chose in `start --launch`.
+The pipeline owns the stage process, not you. `launch` spawns it detached with
+its output going to a log file, and `wait` blocks on it and reports how it ended.
+You never run `copilot` yourself, never background a process in the shell, and
+never read the stage's output into your own context. Record the launch with
+`start --launch subprocess`, passing the `--process` and `--log` values `launch`
+returned.
 
 ## The Loop
 
@@ -145,25 +153,24 @@ Repeat until `next` returns `complete` or `escalate`:
 1. Run `next --state <path>`.
 2. On `escalate`, go to **Escalation**.
 3. On `complete`, go to **Finishing**.
-4. On `run_stage`, launch the stage named in `plan`:
-   - **Child session:** call `create_session` with the project holding this repository, `kickoff.agent` set to the plan's `agent`, `kickoff.prompt` set to the plan's `prompt`, `kickoff.model` set to the plan's `model`, `kickoff.mode` set to `autopilot`, `kickoff.reasoning_effort` set to the plan's `effort`, `notify_on_idle` set to `once`, and `name` set to the plan's `session_name`. Use `prompt` and never `target`: `target` names the pull request alone, while `prompt` also carries the pipeline's position, and a stage launched without it silently keeps its own budget.
-   - **Subprocess:** run the plan's `command` verbatim with `execute`. Give it no timeout you would not give a long review, because a check wait can run for an hour.
-5. Immediately record the launch with `start --stage <plan stage> --head <the head the plan reported> --launch <path>`, passing `--session` or `--process` when you have one.
-6. Wait for the stage to finish. For a child session, wait for the idle notification and confirm with `get_session`. For a subprocess, wait for the command to exit.
+4. On `run_stage`, prepare and launch the stage named in `plan`:
+   - Run `reset --state <path> --stage <plan stage>` first. It makes the shared worktree clean, which four of the five stage helpers require before they will run. If it escalates, go to **Escalation**: `dirty_worktree_before_run` means the worktree held your own uncommitted work, and `local_head_ahead_of_remote` means a stage committed without pushing.
+   - Then launch the stage as a subprocess with `launch --log <plan log_path> -- <plan command>`. It returns a `pid` and a `process_create_time`.
+5. Immediately record the launch with `start --stage <plan stage> --head <the head the plan reported> --launch subprocess --process <the pid> --log <plan log_path>`.
+6. Wait for the stage with `wait --stage <plan stage> --pid <the pid> --process-create-time <the value launch returned>`. It blocks until the stage process exits, then reports how the stage ended. On `finished`, take its `outcome`. On `escalate`, go to **Escalation**: `process_exited_without_outcome` means the process died before the stage recorded anything, and `wait_timeout_exceeded` means it ran past the wait ceiling.
 7. Work out the stage's outcome **without reading its prose for a decision**:
-   - Run `outcome --stage <plan stage>` first. When its `result` is `ready`, use the `outcome` it gives you. That answer comes from the stage's own helper, and it is the one to pass to `finish`.
-   - When its `result` is `not_reported`, the stage does not answer for itself yet, so fall back to reading:
+   - `wait` already gives the outcome the stage's own helper recorded. Confirm it with `outcome --stage <plan stage>`, and use the `outcome` it gives you.
+   - When `outcome`'s `result` is `not_reported`, the stage does not answer for itself yet, so fall back to reading:
      - Run `next` again. When the stage it just ran is now green, the outcome is `cleared`.
      - When the stage reported that the repository has no applicable checks, or that it had nothing to do and said so explicitly, the outcome is `skipped`.
      - When the stage hit its own iteration cap, stopped on a validation failure it could not fix, or asked for a person, the outcome is `escalated`.
      - When the stage ended without clearing, without escalating, and without moving the head, the outcome is `no_progress`.
-8. Record it with `finish --stage <name> --outcome <outcome> --head <the head after the stage ran> [--detail <one plain sentence>]`. `finish` asks the stage once more and prefers the stage's own answer, so a reading that went wrong is corrected rather than acted on. Pass `--detail` always, and note that `finish` refuses `no_progress` and `escalated` without it.
-9. Apply **Session Hygiene**.
-10. Go back to step 1.
+8. Record it with `finish --stage <name> --outcome <outcome> --head <the head after the stage ran> [--detail <one plain sentence>]`. `finish` asks the stage once more and prefers the stage's own answer, so a reading that went wrong is corrected rather than acted on. Pass `--detail` always, and note that `finish` refuses `no_progress` and `escalated` without it. To write `--detail` for an escalation or a confusing outcome, read at most the last 100 lines of the stage's log at its `log_path`. Never read the whole log into your context.
+9. Go back to step 1.
 
 Reading a stage's report to fill in `--detail` is fine. That text is for the user. Never let it choose the outcome when `outcome`, `next`, and the live state say otherwise.
 
-A launch that produced no run at all is not a stage outcome. A child session that never started, or a subprocess that died before the stage did anything, is a pipeline problem: record it with `escalate`, not with `finish`.
+A launch that produced no run at all is not a stage outcome. A subprocess that died before the stage did anything, which `wait` reports as `process_exited_without_outcome`, is a pipeline problem: record it with `escalate`, not with `finish`.
 
 A stage that gives the same answer at the same head it already gave there has told the pipeline nothing new. A stage that has run out of its own iterations returns that answer the moment it starts, every time, so treating a repeat as fresh evidence is how a pipeline relaunches one stage until the user stops it. `finish` marks a repeat in the history and counts it against the same streak that a stalled run feeds, so the second one escalates.
 
@@ -173,12 +180,11 @@ The price is worth knowing. A stage that genuinely fixed the pull request but me
 
 A clearance has to carry the commit it is about. The three stages whose result is a judgment keep that judgment in a state file that outlives the run which wrote it, and a state file left behind by an earlier run answers `cleared` just as readily as one the current run wrote. So `finish` accepts a clearance from those stages only when the stage's own head-pinned marker names the head being recorded. A run that died before it replaced an old record answers about a commit it never looked at, and the pipeline records `no_progress` and keeps the disagreement in the history rather than stamping a clearance at a head nothing examined.
 
-## Session Hygiene
+## Stage Logs
 
-- Archive every stage session you created, whatever the stage's outcome. Use `archive_session` with the id `create_session` returned, right after `finish` records the stage.
-- Nothing is lost by archiving. `finish` writes the session id into the history entry, so a session is always findable and can be unarchived by hand later. The history is the record; the transcript is not.
-- Never archive a session you did not create, and never archive your own.
-- This is why `--detail` is required for `no_progress` and `escalated`. Once the transcript is archived, the sentence you write there is the only answer the report can give to "what happened at this stage."
+- Each stage runs as a subprocess whose combined output goes to the log file at the `log_path` the plan named, and `finish` writes that path into the stage's history entry. The log is the durable account of what the stage did.
+- The log is never read into your context wholesale. When an escalation or a confusing outcome needs `--detail`, read at most the last 100 lines of the log, and write one plain sentence.
+- This is why `--detail` is required for `no_progress` and `escalated`. The log is not rolled into the report, so the sentence you write there is the only answer the report gives to "what happened at this stage."
 
 ## Escalation
 
@@ -211,7 +217,7 @@ Send one compact report and nothing after it. Cover:
 - The pull request, as `owner/repo#number`, and the head commit everything cleared at.
 - One line per stage: its outcome, and the SHA it cleared at.
 - The iteration count and the cap.
-- Whether the run completed or escalated. On an escalation, name the stage, the reason in one plain sentence, and the recommended next action, and give the id or path of the session that holds the detail.
+- Whether the run completed or escalated. On an escalation, name the stage, the reason in one plain sentence, and the recommended next action, and give the `log_path` of the stage that holds the detail.
 - A single closing line stating that the pull request is still a draft and that promoting it out of draft is the user's call.
 
 Never pad the report with a recap of every command you ran.

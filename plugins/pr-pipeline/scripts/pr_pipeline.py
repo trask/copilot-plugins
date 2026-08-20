@@ -44,6 +44,21 @@ CLAUDE_FAMILY = "claude"
 DEFAULT_STAGE_MODEL = "claude-sonnet-4.6"
 DEFAULT_EFFORT = "high"
 
+# Every stage runs as a non-interactive subprocess with no person to answer a
+# permission prompt. ``--allow-all-tools`` is what makes non-interactive mode
+# possible at all. ``--allow-all-paths`` is required on top of it because a stage
+# helper reads its installed scripts and writes its run state under
+# ``~/.copilot``, outside the pipeline worktree, and path verification denies
+# that by default. ``--allow-all-urls`` is deliberately left off: stages reach
+# GitHub through the ``gh`` CLI, which is a shell tool rather than a URL fetch.
+STAGE_PERMISSION_FLAGS = ("--allow-all-tools", "--allow-all-paths")
+
+# How long the pipeline waits on one stage before it stops calling the stage
+# alive. A check wait inside ``ci-fix-loop`` can run for an hour, so the ceiling
+# is generous. It exists to bound a wedged stage, not to cut a working one short.
+STAGE_WAIT_CEILING_SECONDS = 7200
+STAGE_WAIT_POLL_SECONDS = 15
+
 # Execution order. This is the pipeline's own order and is deliberately not the
 # bottleneck chain any dashboard shows. The conflict stage leads because a
 # conflicted pull request cannot produce meaningful checks and may not present a
@@ -138,15 +153,16 @@ ESCALATION_ACTIONS = {
         "start the pipeline again once the checks can run."
     ),
     "max_iterations_reached": (
-        "Read the kept stage transcripts, decide what still needs a human, and "
-        "start the remaining stage yourself."
+        "Read the tail of the kept stage logs, decide what still needs a human, "
+        "and start the remaining stage yourself."
     ),
     "stage_escalated": (
-        "Read the kept stage session, which holds the reason the stage stopped."
+        "Read the tail of the kept stage log, which holds the reason the stage "
+        "stopped."
     ),
     "no_progress": (
-        "Read the kept stage session. The stage ran twice without changing "
-        "anything, so it needs a decision the pipeline cannot make."
+        "Read the tail of the kept stage log. The stage ran twice without "
+        "changing anything, so it needs a decision the pipeline cannot make."
     ),
     "pr_not_open": "Reopen the pull request or start the pipeline on an open one.",
     "helper_missing": (
@@ -155,6 +171,30 @@ ESCALATION_ACTIONS = {
     ),
     "model_gate": (
         "Start the pipeline again where it can pin a model for every stage."
+    ),
+    "process_exited_without_outcome": (
+        "Read the tail of the stage log named in the escalation. The stage "
+        "process ended before its helper recorded an outcome, so the log is the "
+        "only account of what it did."
+    ),
+    "wait_timeout_exceeded": (
+        "Read the tail of the stage log named in the escalation. The stage ran "
+        "past the wait ceiling without finishing, so decide whether to let it "
+        "keep going or to stop it yourself."
+    ),
+    "dirty_worktree_before_run": (
+        "The pipeline worktree had uncommitted changes before any stage ran, so "
+        "they are yours. Commit, stash, or discard them, then start the pipeline "
+        "again."
+    ),
+    "local_head_ahead_of_remote": (
+        "A stage committed without pushing, so the local branch is ahead of the "
+        "pull request head. Push or reconcile the branch yourself, then start "
+        "the pipeline again."
+    ),
+    "worktree_reset_failed": (
+        "The pipeline could not return its worktree to a clean state between "
+        "stages. Clean the worktree by hand, then start the pipeline again."
     ),
 }
 
@@ -198,6 +238,100 @@ def run(
 
 def git(repo_root: Path, *arguments: str) -> str:
     return run(["git", "-C", str(repo_root), *arguments]).stdout.strip()
+
+
+def process_create_time(pid: int) -> float | None:
+    """The creation time of a process, used to tell it from a reused pid.
+
+    Windows reuses process ids, so a bare pid can name a different program by the
+    time a later ``wait`` checks it. Pairing the pid with its creation time makes
+    a stale match detectable. ``None`` means the platform could not answer, and a
+    caller treats that as "cannot confirm identity" rather than as a match.
+    """
+
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return _process_create_time_native(pid)
+    try:
+        return float(psutil.Process(pid).create_time())
+    except Exception:
+        return None
+
+
+def _process_create_time_native(pid: int) -> float | None:
+    if IS_WINDOWS:
+        try:
+            completed = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "(Get-Process -Id "
+                    f"{pid}"
+                    " -ErrorAction Stop).StartTime.ToUniversalTime().Ticks",
+                ],
+                text=True,
+                capture_output=True,
+            )
+        except Exception:
+            return None
+        text = completed.stdout.strip()
+        if completed.returncode != 0 or not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
+            fields = handle.read().rsplit(")", 1)[1].split()
+        return float(fields[19])
+    except Exception:
+        return None
+
+
+def process_alive(pid: int, create_time: float | None) -> bool:
+    """Whether the launched stage process is still running.
+
+    A recorded creation time guards against a reused pid: a live process whose
+    creation time no longer matches is a different program, so the stage is
+    treated as gone rather than alive.
+    """
+
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        psutil = None  # type: ignore
+    if psutil is not None:
+        try:
+            proc = psutil.Process(pid)
+        except Exception:
+            return False
+        if create_time is not None:
+            try:
+                if abs(float(proc.create_time()) - create_time) > 1.0:
+                    return False
+            except Exception:
+                return False
+        return proc.is_running() and proc.status() != psutil.ZOMBIE
+    current = _process_create_time_native(pid)
+    if current is None:
+        return False
+    if create_time is not None and abs(current - create_time) > 1.0:
+        return False
+    return True
+
+
+def worktree_dirt(repo_root: Path) -> str:
+    """The porcelain status the stage preflights key on, tracked and untracked.
+
+    Untracked files ignored by ``.gitignore`` never appear here, so a warm
+    gitignored ``build/`` directory reads as clean. Everything a stage preflight
+    would refuse does appear.
+    """
+
+    return git(repo_root, "status", "--porcelain=v1")
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -317,6 +451,23 @@ def default_state_path(target: dict[str, Any]) -> Path:
 def stage_state_path(plugin: str, target: dict[str, Any]) -> Path:
     name = f"{target['owner']}--{target['repo']}--{target['number']}.json"
     return Path.home() / ".copilot" / "run" / plugin / name
+
+
+def stage_log_path(target: dict[str, Any], stage: str, iteration: int) -> Path:
+    """Where one stage subprocess writes its combined output.
+
+    The path sits beside the run state rather than in a temporary directory, so a
+    later reader can find it from the history entry that records it. Its name
+    carries the pull request, the stage, and the iteration, so one run's stages
+    never overwrite each other and a re-run at a higher iteration keeps its own
+    log.
+    """
+
+    name = (
+        f"{target['owner']}--{target['repo']}--{target['number']}"
+        f"--{stage}--{iteration}.log"
+    )
+    return copilot_home() / "run" / "pr-pipeline" / "logs" / name
 
 
 def stage_script_path(entry: dict[str, Any]) -> Path:
@@ -1794,6 +1945,11 @@ def launch_plan(
         max_iterations=max_iterations,
     )
     prompt = launch_prompt(target, arguments)
+    log_path = stage_log_path(
+        {"owner": pr["owner"], "repo": pr["repo"], "number": pr["number"]},
+        stage,
+        projection["iteration"],
+    )
     return {
         "stage": stage,
         "plugin": entry["plugin"],
@@ -1807,6 +1963,7 @@ def launch_plan(
         "pipeline_max_iterations": max_iterations,
         "pipeline_arguments": arguments,
         "session_name": f"PR Pipeline {stage}: {pr['number']} - {pr['title']}",
+        "log_path": str(log_path),
         "command": [
             "copilot",
             "-p",
@@ -1817,6 +1974,7 @@ def launch_plan(
             model,
             "--effort",
             effort,
+            *STAGE_PERMISSION_FLAGS,
         ],
     }
 
@@ -2168,7 +2326,7 @@ def command_start(args: argparse.Namespace) -> None:
 
     state["iteration"] = projection["iteration"]
     state["stage_high_water"] = projection["high_water"]
-    state["running"] = {
+    running_entry = {
         "stage": stage,
         "head_sha": args.head,
         "iteration": projection["iteration"],
@@ -2178,6 +2336,9 @@ def command_start(args: argparse.Namespace) -> None:
         "model": stage_models(state)[stage],
         "started_at": utc_now(),
     }
+    if getattr(args, "log", None):
+        running_entry["log_path"] = args.log
+    state["running"] = running_entry
     save_state(path, state)
     emit(
         {
@@ -2190,6 +2351,286 @@ def command_start(args: argparse.Namespace) -> None:
             "running": state["running"],
         }
     )
+
+
+def ensure_clean_worktree_for_launch(
+    state: dict[str, Any], repo_root: Path
+) -> dict[str, Any]:
+    """Guarantee a clean tree before a stage launches, by provenance.
+
+    Four of the five stage preflights refuse any non-empty ``git status``, so a
+    shared worktree has to be clean before each stage. Cleanliness is a
+    precondition of launching rather than a courtesy the previous stage performs,
+    because a stage that crashed never gets to clean up after itself.
+
+    Provenance decides what may be reset. Dirt present before this run has
+    launched any stage is the user's own uncommitted work, so the pipeline
+    refuses rather than destroys it. Dirt present after a stage has run belongs to
+    a stage, so the pipeline resets it. The reset drops uncommitted tracked
+    changes with ``reset --hard HEAD`` and removes untracked files with
+    ``clean -fd``; it never resets to a recorded sha, which would discard the
+    stage's own commits, and it never uses ``-x``, so a gitignored ``build/``
+    survives.
+    """
+
+    dirt = worktree_dirt(repo_root)
+    a_stage_has_run = bool(state.get("history")) or state.get("iteration", 0) > 0
+
+    if dirt and not a_stage_has_run:
+        return {
+            "result": "escalate",
+            "reason": "dirty_worktree_before_run",
+            "detail": (
+                "the pipeline worktree had uncommitted changes before any stage "
+                f"ran, so they are yours:\n{dirt}"
+            ),
+        }
+
+    if dirt:
+        git(repo_root, "reset", "--hard", "HEAD")
+        git(repo_root, "clean", "-fd")
+        leftover = worktree_dirt(repo_root)
+        if leftover:
+            return {
+                "result": "escalate",
+                "reason": "worktree_reset_failed",
+                "detail": (
+                    "the worktree was still not clean after reset --hard and "
+                    f"clean -fd:\n{leftover}"
+                ),
+                "reset": True,
+            }
+        return {"result": "reset", "was_dirty": True}
+
+    return {"result": "clean", "was_dirty": False}
+
+
+def command_launch(args: argparse.Namespace) -> None:
+    """Spawn one stage as a detached subprocess writing to its log.
+
+    Python owns the process so the agent never writes shell. It opens the log,
+    starts the stage detached, records the real pid and its creation time, and
+    returns at once. The combined output goes to the log and never to the
+    pipeline's context, because a stage can emit thousands of lines the pipeline
+    decides nothing from.
+    """
+
+    if not args.command:
+        raise WorkflowError("launch needs the stage command after --")
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise WorkflowError("launch needs the stage command after --")
+    log_path = cli_path(args.log)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = open(log_path, "w", encoding="utf-8")
+    try:
+        popen_kwargs: dict[str, Any] = {
+            "cwd": args.repo_root or None,
+            "stdout": log_handle,
+            "stderr": subprocess.STDOUT,
+            "stdin": subprocess.DEVNULL,
+        }
+        if IS_WINDOWS:
+            popen_kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            ) | getattr(subprocess, "DETACHED_PROCESS", 0)
+        else:
+            popen_kwargs["start_new_session"] = True
+        process = subprocess.Popen(list(command), **popen_kwargs)
+    finally:
+        log_handle.close()
+    emit(
+        {
+            "result": "launched",
+            "pid": process.pid,
+            "process_create_time": process_create_time(process.pid),
+            "log_path": str(log_path),
+        }
+    )
+
+
+def command_wait(args: argparse.Namespace) -> None:
+    """Block until the stage process exits, then report the outcome it recorded.
+
+    The healthy path returns only after the process has **exited**. The stage
+    helper writes its terminal outcome before the stage agent finishes
+    summarizing and pushing, so returning the moment an outcome appears would let
+    the next stage launch into the shared worktree while this one is still
+    mutating it. The outcome is therefore read only after exit is observed, in an
+    order that cannot misread a clean exit as a crash: observe exit, then read the
+    outcome, then decide.
+    """
+
+    state = load_state(cli_path(args.state))
+    if args.stage not in STAGE_BY_NAME:
+        raise WorkflowError(f"unknown stage: {args.stage}")
+    entry = STAGE_BY_NAME[args.stage]
+    target = build_target(
+        state["pr"]["owner"], state["pr"]["repo"], state["pr"]["number"]
+    )
+    pid = int(args.pid)
+    create_time = (
+        float(args.process_create_time)
+        if args.process_create_time is not None
+        else None
+    )
+    ceiling = float(args.timeout or STAGE_WAIT_CEILING_SECONDS)
+    poll = float(args.poll or STAGE_WAIT_POLL_SECONDS)
+    started = time.monotonic()
+
+    while True:
+        alive = process_alive(pid, create_time)
+        if not alive:
+            # Exit observed first. Only now read the outcome, so a stage that
+            # wrote its outcome and exited within a poll window is not mistaken
+            # for a process that died without one.
+            reading = read_stage_outcome(entry, target)
+            if reading.get("available"):
+                emit(
+                    {
+                        "result": "finished",
+                        "stage": args.stage,
+                        "outcome": reading.get("outcome"),
+                        "pid": pid,
+                        "waited_seconds": round(time.monotonic() - started, 3),
+                    }
+                )
+                return
+            emit(
+                {
+                    "result": "escalate",
+                    "reason": "process_exited_without_outcome",
+                    "stage": args.stage,
+                    "pid": pid,
+                    "detail": (
+                        f"the {args.stage} process exited before its helper "
+                        "recorded an outcome"
+                    ),
+                    "next_action": ESCALATION_ACTIONS[
+                        "process_exited_without_outcome"
+                    ],
+                    "waited_seconds": round(time.monotonic() - started, 3),
+                }
+            )
+            return
+        if time.monotonic() - started >= ceiling:
+            emit(
+                {
+                    "result": "escalate",
+                    "reason": "wait_timeout_exceeded",
+                    "stage": args.stage,
+                    "pid": pid,
+                    "detail": (
+                        f"the {args.stage} process was still running after "
+                        f"{int(ceiling)} seconds"
+                    ),
+                    "next_action": ESCALATION_ACTIONS["wait_timeout_exceeded"],
+                    "waited_seconds": round(time.monotonic() - started, 3),
+                }
+            )
+            return
+        time.sleep(poll)
+
+
+def command_reset(args: argparse.Namespace) -> None:
+    """Ensure the shared worktree is clean before a stage launches."""
+
+    path = cli_path(args.state)
+    state = load_state(path)
+    repo_root = cli_path(args.repo_root) if args.repo_root else Path(state["repo_root"])
+    target = build_target(
+        state["pr"]["owner"], state["pr"]["repo"], state["pr"]["number"]
+    )
+
+    ahead = local_head_ahead_of_remote(repo_root, target)
+    if ahead is not None:
+        decision = {
+            "stage": args.stage,
+            "reason": "local_head_ahead_of_remote",
+            "detail": ahead,
+            "next_action": ESCALATION_ACTIONS["local_head_ahead_of_remote"],
+        }
+        escalation = record_escalation(state, decision)
+        save_state(path, state)
+        emit({"result": "escalated", "state": str(path), "escalation": escalation})
+        return
+
+    outcome = ensure_clean_worktree_for_launch(state, repo_root)
+    if outcome["result"] == "escalate":
+        decision = {
+            "stage": args.stage,
+            "reason": outcome["reason"],
+            "detail": outcome["detail"],
+            "next_action": ESCALATION_ACTIONS[outcome["reason"]],
+        }
+        escalation = record_escalation(state, decision)
+        save_state(path, state)
+        emit({"result": "escalated", "state": str(path), "escalation": escalation})
+        return
+
+    emit(
+        {
+            "result": "ready",
+            "state": str(path),
+            "was_dirty": outcome.get("was_dirty", False),
+            "reset": outcome["result"] == "reset",
+        }
+    )
+
+
+def local_head_ahead_of_remote(
+    repo_root: Path, target: dict[str, Any]
+) -> str | None:
+    """Detect a stage that committed without pushing.
+
+    A local head ahead of the pull request's remote head is committed work the
+    reset must not discard. Resetting to the remote would silently drop it, and
+    carrying on trips a later preflight's head assertion. The pipeline escalates
+    instead. A local head that merely differs, or is behind, is not this case: a
+    stage that has not committed leaves the head where it was.
+    """
+
+    try:
+        local_head = git(repo_root, "rev-parse", "HEAD")
+    except WorkflowError:
+        return None
+    remote_head = target_remote_head(target)
+    if not remote_head or local_head == remote_head:
+        return None
+    try:
+        ahead = git(repo_root, "rev-list", "--count", f"{remote_head}..{local_head}")
+    except WorkflowError:
+        return None
+    if ahead.strip() in ("", "0"):
+        return None
+    return (
+        f"the local branch is {ahead.strip()} commit(s) ahead of the pull "
+        f"request head {remote_head}; a stage committed without pushing"
+    )
+
+
+def target_remote_head(target: dict[str, Any]) -> str | None:
+    try:
+        payload = gh_json(
+            [
+                "pr",
+                "view",
+                str(target["number"]),
+                "--repo",
+                target["repo_name"],
+                "--json",
+                "headRefOid",
+            ]
+        )
+    except WorkflowError:
+        return None
+    if isinstance(payload, dict):
+        head = payload.get("headRefOid")
+        if isinstance(head, str) and head.strip():
+            return head.strip()
+    return None
 
 
 def resolve_finish_outcome(
@@ -2306,17 +2747,17 @@ def command_finish(args: argparse.Namespace) -> None:
         )
 
     head_sha = args.head or running.get("head_sha")
-    # Every stage session is archived, so this text is the only human-readable
-    # account of a run that did not clear. An outcome and a commit say what
-    # happened for a clearance; they say nothing about why a stage stalled or
-    # gave up. Checked against the outcome the caller passed rather than the one
-    # that gets recorded, because the caller cannot supply detail for a
-    # reclassification that happens after the stage has already run.
+    # The stage log is never rolled into the pipeline's report, so this text is
+    # the only human-readable account of a run that did not clear. An outcome and
+    # a commit say what happened for a clearance; they say nothing about why a
+    # stage stalled or gave up. Checked against the outcome the caller passed
+    # rather than the one that gets recorded, because the caller cannot supply
+    # detail for a reclassification that happens after the stage has already run.
     if args.outcome in DETAIL_REQUIRED_OUTCOMES and not (args.detail or "").strip():
         raise WorkflowError(
             f"--detail is required for {args.outcome}: say in one plain sentence "
-            "what happened, because the stage session is archived and the "
-            "history is all that survives"
+            "what happened, because the stage log is not read into the report and "
+            "the history is all that survives"
         )
     target = build_target(
         state["pr"]["owner"], state["pr"]["repo"], state["pr"]["number"]
@@ -2342,6 +2783,7 @@ def command_finish(args: argparse.Namespace) -> None:
         "ended_at": utc_now(),
         "session_id": args.session or running.get("session_id"),
         "process_id": args.process or running.get("process_id"),
+        "log_path": running.get("log_path"),
         "launch": running.get("launch"),
         "model": running.get("model"),
         "detail": entry_detail,
@@ -2555,7 +2997,7 @@ def command_escalate(args: argparse.Namespace) -> None:
             "detail": args.detail,
             "next_action": args.next_action
             or ESCALATION_ACTIONS.get(args.reason)
-            or "Read the kept stage session and decide what to do next.",
+            or "Read the tail of the kept stage log and decide what to do next.",
             "head_sha": args.head,
         },
     )
@@ -2611,11 +3053,11 @@ def summarize_history(history: Iterable[dict[str, Any]]) -> dict[str, int]:
 
 
 NOT_A_LIVENESS_PROBE = (
-    "This is not proof the stage is alive. The pipeline emits a launch plan and "
-    "the agent runs the stage, so there is no process here to probe. These are "
-    "recorded timestamps and nothing more: they separate a stage whose helper "
-    "wrote something minutes ago from one that has been silent for an hour, "
-    "which is the question a person asks before intervening."
+    "This is a timestamp view, not a probe. The pipeline's `wait` owns the stage "
+    "process and decides liveness from its pid; `status` does not, and reports "
+    "only recorded timestamps. They separate a stage whose helper wrote something "
+    "minutes ago from one that has been silent for an hour, which is the question "
+    "a person asks before intervening."
 )
 
 
@@ -2790,6 +3232,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--launch", choices=["session", "subprocess"], required=True)
     start.add_argument("--session")
     start.add_argument("--process")
+    start.add_argument("--log")
     start.set_defaults(function=command_start)
 
     finish = subparsers.add_parser("finish", help="record how a stage ended")
@@ -2845,6 +3288,33 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--state", required=True)
     cleanup.add_argument("--force", action="store_true")
     cleanup.set_defaults(function=command_cleanup)
+
+    reset = subparsers.add_parser(
+        "reset", help="ensure the shared worktree is clean before a stage launches"
+    )
+    reset.add_argument("--state", required=True)
+    reset.add_argument("--stage", choices=list(STAGE_NAMES))
+    reset.add_argument("--repo-root")
+    reset.set_defaults(function=command_reset)
+
+    launch = subparsers.add_parser(
+        "launch", help="spawn a stage subprocess writing to its log"
+    )
+    launch.add_argument("--log", required=True)
+    launch.add_argument("--repo-root")
+    launch.add_argument("command", nargs=argparse.REMAINDER)
+    launch.set_defaults(function=command_launch)
+
+    wait = subparsers.add_parser(
+        "wait", help="block until a stage process exits, then report its outcome"
+    )
+    wait.add_argument("--state", required=True)
+    wait.add_argument("--stage", required=True, choices=list(STAGE_NAMES))
+    wait.add_argument("--pid", required=True, type=int)
+    wait.add_argument("--process-create-time", type=float)
+    wait.add_argument("--timeout", type=float)
+    wait.add_argument("--poll", type=float)
+    wait.set_defaults(function=command_wait)
 
     return parser
 
