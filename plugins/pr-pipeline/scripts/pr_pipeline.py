@@ -1828,10 +1828,11 @@ def begin_run(state: dict[str, Any]) -> dict[str, Any]:
     and none of them is a budget for the pull request's whole life.
 
     The streaks have to go for a sharper reason than that. A streak is what
-    produces a no-progress escalation, so the two are one fact written down
-    twice. Clear the escalation but keep the streak that caused it and the next
-    run starts one strike from the limit, re-derives the same escalation from
-    the residue, and lands back where it started.
+    produces a no-progress escalation, and ``decide_next`` escalates on a streak
+    at the limit before it launches anything. So a streak that outlived its run
+    would rebuild the stored escalation on the first look, with no run in
+    between: clearing the escalation without clearing the streak leaves the pull
+    request exactly as stuck, by a longer route.
 
     The clearances survive, because each one names the commit it was recorded
     at and stops counting by itself when the head moves. The history survives,

@@ -2677,6 +2677,30 @@ class BeginRunTest(unittest.TestCase):
             0, MODULE.no_progress_streak(state, MODULE.STAGE_CONFLICT)
         )
 
+    def test_a_surviving_streak_would_deadlock_the_pull_request_on_its_own(self):
+        # decide_next escalates on a streak at the limit before it launches
+        # anything, so a streak that outlived its run would rebuild the stored
+        # escalation from scratch on the first look. Clearing the escalation
+        # without clearing the streak would leave the pull request exactly as
+        # stuck, by a different route and with no run in between.
+        stuck = build_state(
+            escalation=None,
+            no_progress={
+                MODULE.STAGE_CONFLICT: {
+                    "count": MODULE.NO_PROGRESS_LIMIT,
+                    "head_sha": HEAD,
+                }
+            },
+        )
+        blocked = MODULE.decide_next(stuck, observation(mergeable="UNKNOWN"))
+        self.assertEqual("escalate", blocked["result"])
+        self.assertEqual("no_progress", blocked["reason"])
+
+        MODULE.begin_run(stuck)
+        freed = MODULE.decide_next(stuck, observation(mergeable="UNKNOWN"))
+        self.assertEqual("run_stage", freed["result"])
+        self.assertEqual(MODULE.STAGE_CONFLICT, freed["stage"])
+
     def test_the_report_survives_because_it_is_the_report(self):
         history = [{"stage": MODULE.STAGE_CI, "outcome": "escalated"}]
         state, _ = self.restart(history=list(history))
