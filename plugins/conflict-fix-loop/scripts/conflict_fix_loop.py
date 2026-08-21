@@ -113,6 +113,19 @@ def git_bytes(repo_root: Path, *arguments: str) -> bytes | None:
     return process.stdout if process.returncode == 0 else None
 
 
+def is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
+    """Report whether ``ancestor`` is already contained in ``descendant``.
+
+    ``git merge-base --is-ancestor`` answers this directly and treats an equal
+    pair as an ancestor, which is what a caller asking "is this base already in
+    this head" wants.
+    """
+    return (
+        git_try(repo_root, "merge-base", "--is-ancestor", ancestor, descendant).returncode
+        == 0
+    )
+
+
 def emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
 
@@ -138,6 +151,44 @@ def graphql(query: str, variables: dict[str, str | int | None]) -> Any:
     if errors:
         raise WorkflowError(f"GraphQL failed: {json.dumps(errors, sort_keys=True)}")
     return payload
+
+
+def base_ref_tip(repo_name: str, base_branch: str) -> str:
+    """Return the live tip commit of a pull request's base branch.
+
+    GitHub's ``baseRefOid`` freezes at the moment the pull request was created
+    or last synced and does not follow the base branch as it moves, so reading
+    it compares the head against a commit the base branch has since left behind.
+    The branch ref always names the current tip, so this reads that instead.
+
+    A base branch that has been deleted or is otherwise unreadable is a hard
+    error. Falling back to the frozen ``baseRefOid`` would silently restore the
+    staleness this exists to remove, and nothing downstream would see it happen.
+    """
+    result = run(
+        ["gh", "api", f"repos/{repo_name}/git/ref/heads/{base_branch}"],
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WorkflowError(
+            f"could not read the tip of base branch {base_branch!r} in {repo_name}; "
+            f"it may have been deleted: {detail}"
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise WorkflowError(
+            f"reading the tip of base branch {base_branch!r} in {repo_name} "
+            f"returned invalid JSON: {error}"
+        ) from error
+    obj = payload.get("object") if isinstance(payload, dict) else None
+    sha = obj.get("sha") if isinstance(obj, dict) else None
+    if not isinstance(sha, str) or not sha:
+        raise WorkflowError(
+            f"the tip of base branch {base_branch!r} in {repo_name} has no commit SHA"
+        )
+    return sha
 
 
 def utc_now() -> str:
@@ -467,7 +518,7 @@ def resolve_target(value: str | None, repo_root: Path) -> dict[str, Any]:
 def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     fields = (
         "number,title,url,state,isDraft,mergeable,mergeStateStatus,headRefName,"
-        "headRefOid,headRepositoryOwner,headRepository,baseRefName,baseRefOid,commits"
+        "headRefOid,headRepositoryOwner,headRepository,baseRefName,commits"
     )
     metadata = gh_json(
         ["pr", "view", target["pr_url"], "--repo", target["repo_name"], "--json", fields]
@@ -497,9 +548,10 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     head_sha = metadata.get("headRefOid")
     if not isinstance(head_sha, str) or not head_sha:
         raise WorkflowError("resolved PR metadata has no head commit")
-    base_sha = metadata.get("baseRefOid")
-    if not isinstance(base_sha, str) or not base_sha:
-        raise WorkflowError("resolved PR metadata has no base commit")
+    base_branch = metadata.get("baseRefName")
+    if not isinstance(base_branch, str) or not base_branch:
+        raise WorkflowError("resolved PR metadata has no base branch")
+    base_sha = base_ref_tip(resolved["repo_name"], base_branch)
     title = metadata.get("title")
     if not isinstance(title, str) or not title.strip():
         raise WorkflowError("resolved PR metadata has no title")
@@ -532,7 +584,7 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
         "head_repo": head_repository["name"],
         "head_branch": metadata["headRefName"],
         "head_sha": head_sha,
-        "base_branch": metadata["baseRefName"],
+        "base_branch": base_branch,
         "base_sha": base_sha,
         "commits": commits,
     }
@@ -1770,6 +1822,38 @@ def command_attempt(args: argparse.Namespace) -> None:
         repo_root, f"{merge_base}..{attempt['head_sha']}"
     )
 
+    if is_ancestor(repo_root, pr["base_sha"], attempt["head_sha"]):
+        # The base tip is already contained in the head, so there is genuinely
+        # nothing to integrate. Deciding this from the merge afterwards would
+        # infer it from the merge changing nothing; asking git directly lets the
+        # escalation state the fact and name the two commits it compared. GitHub
+        # can report CONFLICTING against a base tip that is already an ancestor,
+        # and that stale flag is exactly what leaves this loop with no work.
+        attempt["status"] = "escalated"
+        escalation = record_escalation(
+            state,
+            kind="contradiction",
+            reason=(
+                f"the base branch tip {pr['base_sha']} is already an ancestor of the "
+                f"head {attempt['head_sha']}, so there is nothing to integrate, yet "
+                f"GitHub reports {pr['head_branch']} as conflicting with "
+                f"{pr['base_branch']}"
+            ),
+            recommended_action="a person must work out why GitHub still reports a conflict",
+            iteration=attempt["iteration"],
+        )
+        archive_attempt(state)
+        save_state(state_path, state)
+        emit(
+            {
+                "result": "already_integrated",
+                "state": str(state_path),
+                "attempt": attempt_summary(attempt),
+                "escalation": escalation,
+            }
+        )
+        return
+
     process = start_integration(repo_root, attempt, pr["base_sha"])
     conflicts = collect_conflicts(
         repo_root,
@@ -1816,36 +1900,6 @@ def command_attempt(args: argparse.Namespace) -> None:
         raise WorkflowError(
             f"{attempt['strategy']} failed without leaving a conflicted file: {detail}"
         )
-
-    if attempt["strategy"] == "merge":
-        already_integrated = not merge_in_progress(repo_root)
-        detail = f"merging {pr['base_branch']} into {pr['head_branch']} changed nothing"
-    else:
-        already_integrated = git(repo_root, "rev-parse", "HEAD") == attempt["head_sha"]
-        detail = f"rebasing {pr['head_branch']} onto {pr['base_branch']} changed nothing"
-    if already_integrated:
-        attempt["status"] = "escalated"
-        escalation = record_escalation(
-            state,
-            kind="other",
-            reason=(
-                f"{detail}, so this conflict does not come from the base branch this "
-                "loop can integrate"
-            ),
-            recommended_action="a person must work out why GitHub still reports a conflict",
-            iteration=attempt["iteration"],
-        )
-        archive_attempt(state)
-        save_state(state_path, state)
-        emit(
-            {
-                "result": "already_integrated",
-                "state": str(state_path),
-                "attempt": attempt_summary(attempt),
-                "escalation": escalation,
-            }
-        )
-        return
 
     attempt["status"] = "integrated" if attempt["strategy"] == "merge" else "resolved"
     save_state(state_path, state)

@@ -770,9 +770,11 @@ def gh_metadata(**overrides):
 
 
 class PullRequestMetadataTest(unittest.TestCase):
-    def metadata(self, **overrides):
+    def metadata(self, *, base_tip="live-tip", **overrides):
         target = MODULE.parse_target("owner/repo#7")
-        with mock.patch.object(MODULE, "gh_json", return_value=gh_metadata(**overrides)):
+        with mock.patch.object(
+            MODULE, "gh_json", return_value=gh_metadata(**overrides)
+        ), mock.patch.object(MODULE, "base_ref_tip", return_value=base_tip):
             return MODULE.metadata_for(target)
 
     def test_normalizes_the_fields_the_loop_uses(self):
@@ -784,10 +786,21 @@ class PullRequestMetadataTest(unittest.TestCase):
         self.assertEqual("feature", metadata["head_branch"])
         self.assertEqual("head1", metadata["head_sha"])
         self.assertEqual("main", metadata["base_branch"])
-        self.assertEqual("base1", metadata["base_sha"])
+        self.assertEqual("live-tip", metadata["base_sha"])
         self.assertEqual("CONFLICTING", metadata["mergeable"])
         self.assertEqual("DIRTY", metadata["merge_state_status"])
         self.assertEqual([{"sha": "head1", "message": "Add a thing"}], metadata["commits"])
+
+    def test_base_sha_is_the_live_base_branch_tip_not_the_frozen_base_ref_oid(self):
+        target = MODULE.parse_target("owner/repo#7")
+        with mock.patch.object(
+            MODULE, "gh_json", return_value=gh_metadata(baseRefOid="frozen")
+        ), mock.patch.object(
+            MODULE, "base_ref_tip", return_value="live-tip"
+        ) as tip:
+            metadata = MODULE.metadata_for(target)
+        self.assertEqual("live-tip", metadata["base_sha"])
+        tip.assert_called_once_with("owner/repo", "main")
 
     def test_rejects_a_non_object_response(self):
         target = MODULE.parse_target("owner/repo#7")
@@ -806,7 +819,7 @@ class PullRequestMetadataTest(unittest.TestCase):
     def test_rejects_missing_commit_details(self):
         for overrides, message in (
             ({"headRefOid": ""}, "no head commit"),
-            ({"baseRefOid": None}, "no base commit"),
+            ({"baseRefName": None}, "no base branch"),
             ({"title": "  "}, "no title"),
             ({"commits": None}, "no commit list"),
             ({"commits": ["nope"]}, "is not an object"),
@@ -822,6 +835,25 @@ class PullRequestMetadataTest(unittest.TestCase):
         MODULE.require_open_pull_request(pr_metadata())
         with self.assertRaisesRegex(MODULE.WorkflowError, "is closed"):
             MODULE.require_open_pull_request(pr_metadata(state="CLOSED"))
+
+
+class BaseRefTipTest(unittest.TestCase):
+    def test_returns_the_live_tip_from_the_branch_ref(self):
+        response = completed(
+            0, json.dumps({"object": {"sha": "live-tip", "type": "commit"}})
+        )
+        with mock.patch.object(MODULE, "run", return_value=response) as run:
+            self.assertEqual("live-tip", MODULE.base_ref_tip("owner/repo", "main"))
+        self.assertEqual(
+            ["gh", "api", "repos/owner/repo/git/ref/heads/main"],
+            run.call_args.args[0],
+        )
+
+    def test_a_deleted_base_branch_raises_rather_than_falling_back(self):
+        response = completed(1, "", "gh: Not Found (HTTP 404)")
+        with mock.patch.object(MODULE, "run", return_value=response):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "may have been deleted"):
+                MODULE.base_ref_tip("owner/repo", "gone")
 
 
 class MergeabilityTest(unittest.TestCase):
@@ -2116,6 +2148,7 @@ class AttemptTest(unittest.TestCase):
         conflicts=None,
         process=None,
         merging=True,
+        ancestor=False,
         git_call=None,
         **state_overrides,
     ):
@@ -2133,6 +2166,8 @@ class AttemptTest(unittest.TestCase):
             MODULE, "fetch_reference"
         ) as fetch, mock.patch.object(
             MODULE, "commit_subjects", return_value=["Add a thing"]
+        ), mock.patch.object(
+            MODULE, "is_ancestor", return_value=ancestor
         ), mock.patch.object(
             MODULE, "start_integration", return_value=process or completed(1, "", "CONFLICT")
         ) as start, mock.patch.object(
@@ -2225,24 +2260,38 @@ class AttemptTest(unittest.TestCase):
         self.assertEqual("publish", payload["next"])
         self.assertEqual("resolved", self.saved()["attempt"]["status"])
 
-    def test_a_rebase_that_changed_nothing_escalates(self):
+    def test_a_base_already_in_the_head_escalates_as_a_contradiction(self):
+        # is_ancestor is decided before the merge runs, so a merge that would
+        # succeed (merging in progress, clean exit) must still escalate: the
+        # base tip is already in the head and GitHub's conflict flag is stale.
         payload = self.attempt(
-            process=completed(0), attempt=self.planned(strategy="rebase"), merging=False
+            process=completed(0),
+            merging=True,
+            ancestor=True,
+            attempt=self.planned(),
         )
         self.assertEqual("already_integrated", payload["result"])
-        self.assertEqual("other", payload["escalation"]["kind"])
-        self.assertIn("rebasing", payload["escalation"]["reason"])
-        self.assertIn("changed nothing", payload["escalation"]["reason"])
-        self.assertEqual("escalated", self.saved()["attempt"]["status"])
-
-    def test_a_merge_that_changed_nothing_escalates(self):
-        payload = self.attempt(process=completed(0), merging=False, attempt=self.planned())
-        self.assertEqual("already_integrated", payload["result"])
-        self.assertEqual("other", payload["escalation"]["kind"])
-        self.assertIn("changed nothing", payload["escalation"]["reason"])
+        self.assertEqual("contradiction", payload["escalation"]["kind"])
+        self.assertIn("already an ancestor", payload["escalation"]["reason"])
+        self.assertIn("base1", payload["escalation"]["reason"])
+        self.assertIn("head1", payload["escalation"]["reason"])
         state = self.saved()
         self.assertEqual("escalated", state["attempt"]["status"])
         self.assertEqual(1, len(state["history"]))
+        self.start.assert_not_called()
+
+    def test_a_base_already_in_a_rebased_head_also_escalates(self):
+        payload = self.attempt(
+            process=completed(0),
+            ancestor=True,
+            attempt=self.planned(strategy="rebase"),
+            merging=False,
+        )
+        self.assertEqual("already_integrated", payload["result"])
+        self.assertEqual("contradiction", payload["escalation"]["kind"])
+        self.assertIn("already an ancestor", payload["escalation"]["reason"])
+        self.assertEqual("escalated", self.saved()["attempt"]["status"])
+        self.start.assert_not_called()
 
     def test_a_failure_with_no_conflicted_file_is_reported(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "without leaving a conflicted file"):

@@ -734,6 +734,72 @@ class ParseTargetTest(unittest.TestCase):
             MODULE.parse_target("https://github.com/owner/repo/issues/7")
 
 
+def ci_gh_metadata(**overrides):
+    payload = {
+        "number": 7,
+        "title": "Add a thing",
+        "url": "https://github.com/owner/repo/pull/7",
+        "state": "OPEN",
+        "isDraft": False,
+        "headRefName": "feature",
+        "headRefOid": "head1",
+        "headRepositoryOwner": {"login": "fork"},
+        "headRepository": {"name": "repo"},
+        "baseRefName": "main",
+        "baseRefOid": "frozen",
+        "commits": [{"oid": "head1", "messageHeadline": "Add a thing"}],
+    }
+    payload.update(overrides)
+    return payload
+
+
+class PullRequestMetadataTest(unittest.TestCase):
+    def test_base_sha_is_the_live_base_branch_tip_not_the_frozen_base_ref_oid(self):
+        target = MODULE.parse_target("owner/repo#7")
+        with mock.patch.object(
+            MODULE, "gh_json", return_value=ci_gh_metadata()
+        ), mock.patch.object(
+            MODULE, "base_ref_tip", return_value="live-tip"
+        ) as tip:
+            metadata = MODULE.metadata_for(target)
+        # The base commit is what baseline_conclusions attributes against, so it
+        # must be the branch's live tip, never GitHub's frozen baseRefOid.
+        self.assertEqual("live-tip", metadata["base_sha"])
+        self.assertEqual("main", metadata["base_branch"])
+        tip.assert_called_once_with("owner/repo", "main")
+
+    def test_a_missing_base_branch_is_rejected(self):
+        target = MODULE.parse_target("owner/repo#7")
+        with mock.patch.object(
+            MODULE, "gh_json", return_value=ci_gh_metadata(baseRefName=None)
+        ), mock.patch.object(MODULE, "base_ref_tip", return_value="live-tip"):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "no base branch"):
+                MODULE.metadata_for(target)
+
+
+class BaseRefTipTest(unittest.TestCase):
+    def test_returns_the_live_tip_from_the_branch_ref(self):
+        response = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"object": {"sha": "live-tip", "type": "commit"}}),
+            stderr="",
+        )
+        with mock.patch.object(MODULE, "run", return_value=response) as run:
+            self.assertEqual("live-tip", MODULE.base_ref_tip("owner/repo", "main"))
+        self.assertEqual(
+            ["gh", "api", "repos/owner/repo/git/ref/heads/main"],
+            run.call_args.args[0],
+        )
+
+    def test_a_deleted_base_branch_raises_rather_than_falling_back(self):
+        response = SimpleNamespace(
+            returncode=1, stdout="", stderr="gh: Not Found (HTTP 404)"
+        )
+        with mock.patch.object(MODULE, "run", return_value=response):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "may have been deleted"):
+                MODULE.base_ref_tip("owner/repo", "gone")
+
+
 class PathHelperTest(unittest.TestCase):
     def test_state_path_uses_the_orchestrator_naming(self):
         target = MODULE.parse_target("owner/repo#7")

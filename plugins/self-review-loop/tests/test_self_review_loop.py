@@ -1268,14 +1268,18 @@ class PullRequestMetadataTest(unittest.TestCase):
             "headRepositoryOwner": {"login": "fork"},
             "headRepository": {"name": "repo"},
             "baseRefName": "main",
-            "baseRefOid": "base",
+            "baseRefOid": "frozen",
             "commits": [
                 {"oid": "one", "messageHeadline": "First change"},
                 {"oid": "two", "messageHeadline": "Second change"},
             ],
         }
 
-        with mock.patch.object(MODULE, "gh_json", return_value=payload) as gh_json:
+        with mock.patch.object(
+            MODULE, "gh_json", return_value=payload
+        ) as gh_json, mock.patch.object(
+            MODULE, "base_ref_tip", return_value="live-tip"
+        ):
             metadata = MODULE.metadata_for(target)
 
         self.assertEqual(
@@ -1286,6 +1290,52 @@ class PullRequestMetadataTest(unittest.TestCase):
             ],
         )
         self.assertIn("commits", gh_json.call_args.args[0][-1])
+
+    def test_base_sha_is_the_live_base_branch_tip_not_the_frozen_base_ref_oid(self):
+        target = MODULE.parse_target("https://github.com/owner/repo/pull/7")
+        payload = {
+            "number": 7,
+            "title": "Add a thing",
+            "url": "https://github.com/owner/repo/pull/7",
+            "headRefName": "feature",
+            "headRefOid": "head",
+            "headRepositoryOwner": {"login": "fork"},
+            "headRepository": {"name": "repo"},
+            "baseRefName": "main",
+            "baseRefOid": "frozen",
+            "commits": [{"oid": "one", "messageHeadline": "First change"}],
+        }
+        with mock.patch.object(
+            MODULE, "gh_json", return_value=payload
+        ), mock.patch.object(
+            MODULE, "base_ref_tip", return_value="live-tip"
+        ) as tip:
+            metadata = MODULE.metadata_for(target)
+        self.assertEqual("live-tip", metadata["base_sha"])
+        tip.assert_called_once_with("owner/repo", "main")
+
+
+class BaseRefTipTest(unittest.TestCase):
+    def test_returns_the_live_tip_from_the_branch_ref(self):
+        response = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"object": {"sha": "live-tip", "type": "commit"}}),
+            stderr="",
+        )
+        with mock.patch.object(MODULE, "run", return_value=response) as run:
+            self.assertEqual("live-tip", MODULE.base_ref_tip("owner/repo", "main"))
+        self.assertEqual(
+            ["gh", "api", "repos/owner/repo/git/ref/heads/main"],
+            run.call_args.args[0],
+        )
+
+    def test_a_deleted_base_branch_raises_rather_than_falling_back(self):
+        response = SimpleNamespace(
+            returncode=1, stdout="", stderr="gh: Not Found (HTTP 404)"
+        )
+        with mock.patch.object(MODULE, "run", return_value=response):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "may have been deleted"):
+                MODULE.base_ref_tip("owner/repo", "gone")
 
 
 class DiffAnchorTest(unittest.TestCase):

@@ -452,6 +452,45 @@ def graphql(query: str, variables: dict[str, str | int | None]) -> Any:
     return payload
 
 
+def base_ref_tip(repo_name: str, base_branch: str) -> str:
+    """Return the live tip commit of a pull request's base branch.
+
+    GitHub's ``baseRefOid`` freezes at the moment the pull request was created
+    or last synced and does not follow the base branch as it moves, so reading
+    it names a commit the base branch has since left behind. The branch ref
+    always names the current tip, so this reads that instead, and ``base_sha``
+    always means the current base tip.
+
+    A base branch that has been deleted or is otherwise unreadable is a hard
+    error. Falling back to the frozen ``baseRefOid`` would silently restore the
+    staleness this exists to remove, and nothing downstream would see it happen.
+    """
+    result = run(
+        ["gh", "api", f"repos/{repo_name}/git/ref/heads/{base_branch}"],
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WorkflowError(
+            f"could not read the tip of base branch {base_branch!r} in {repo_name}; "
+            f"it may have been deleted: {detail}"
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise WorkflowError(
+            f"reading the tip of base branch {base_branch!r} in {repo_name} "
+            f"returned invalid JSON: {error}"
+        ) from error
+    obj = payload.get("object") if isinstance(payload, dict) else None
+    sha = obj.get("sha") if isinstance(obj, dict) else None
+    if not isinstance(sha, str) or not sha:
+        raise WorkflowError(
+            f"the tip of base branch {base_branch!r} in {repo_name} has no commit SHA"
+        )
+    return sha
+
+
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -973,7 +1012,7 @@ def observe_pull_request(
 
     fields = (
         "number,title,url,state,isDraft,mergeable,mergeStateStatus,headRefName,"
-        "headRefOid,headRepositoryOwner,headRepository,baseRefName,baseRefOid,"
+        "headRefOid,headRepositoryOwner,headRepository,baseRefName,"
         "statusCheckRollup"
     )
     payload: dict[str, Any] = {}
@@ -1033,7 +1072,10 @@ def observe_pull_request(
         raise WorkflowError(
             "pull request head repository is unavailable; it may have been deleted"
         )
-    base_sha = payload.get("baseRefOid")
+    base_branch = payload.get("baseRefName")
+    if not isinstance(base_branch, str) or not base_branch:
+        raise WorkflowError("resolved PR metadata has no base branch")
+    base_sha = base_ref_tip(target["repo_name"], base_branch)
     return {
         "pr": {
             "number": target["number"],
@@ -1045,7 +1087,7 @@ def observe_pull_request(
             "head_owner": head_owner["login"],
             "head_repo": head_repository["name"],
             "head_branch": payload.get("headRefName"),
-            "base_branch": payload.get("baseRefName"),
+            "base_branch": base_branch,
             "is_draft": bool(payload.get("isDraft")),
         },
         "state": payload.get("state"),

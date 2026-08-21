@@ -275,6 +275,47 @@ def graphql(query: str, variables: dict[str, str | int | None]) -> Any:
     return payload
 
 
+def base_ref_tip(repo_name: str, base_branch: str) -> str:
+    """Return the live tip commit of a pull request's base branch.
+
+    GitHub's ``baseRefOid`` freezes at the moment the pull request was created
+    or last synced and does not follow the base branch as it moves, so reading
+    it names a commit the base branch has since left behind. The base commit is
+    the baseline the check attribution compares against, so a stale one blames
+    the pull request for a failure the newer base introduced and excuses one the
+    newer base fixed. The branch ref always names the current tip, so this reads
+    that instead.
+
+    A base branch that has been deleted or is otherwise unreadable is a hard
+    error. Falling back to the frozen ``baseRefOid`` would silently restore the
+    staleness this exists to remove, and nothing downstream would see it happen.
+    """
+    result = run(
+        ["gh", "api", f"repos/{repo_name}/git/ref/heads/{base_branch}"],
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WorkflowError(
+            f"could not read the tip of base branch {base_branch!r} in {repo_name}; "
+            f"it may have been deleted: {detail}"
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise WorkflowError(
+            f"reading the tip of base branch {base_branch!r} in {repo_name} "
+            f"returned invalid JSON: {error}"
+        ) from error
+    obj = payload.get("object") if isinstance(payload, dict) else None
+    sha = obj.get("sha") if isinstance(obj, dict) else None
+    if not isinstance(sha, str) or not sha:
+        raise WorkflowError(
+            f"the tip of base branch {base_branch!r} in {repo_name} has no commit SHA"
+        )
+    return sha
+
+
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -626,7 +667,7 @@ def resolve_target(value: str | None, repo_root: Path) -> dict[str, Any]:
 def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     fields = (
         "number,title,url,state,isDraft,headRefName,headRefOid,headRepositoryOwner,"
-        "headRepository,baseRefName,baseRefOid,commits"
+        "headRepository,baseRefName,commits"
     )
     metadata = gh_json(
         [
@@ -688,6 +729,10 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
         commits.append({"sha": sha, "message": headline.strip()})
     upstream_repo_name = f"{resolved['owner']}/{resolved['repo']}"
     head_repo_name = f"{head_owner['login']}/{head_repository['name']}"
+    base_branch = metadata.get("baseRefName")
+    if not isinstance(base_branch, str) or not base_branch:
+        raise WorkflowError("resolved PR metadata has no base branch")
+    base_sha = base_ref_tip(upstream_repo_name, base_branch)
     return {
         "number": target["number"],
         "title": title.strip(),
@@ -699,8 +744,8 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
         "head_repo": head_repository["name"],
         "head_branch": metadata["headRefName"],
         "head_sha": head_sha,
-        "base_branch": metadata["baseRefName"],
-        "base_sha": metadata["baseRefOid"],
+        "base_branch": base_branch,
+        "base_sha": base_sha,
         "is_fork": head_repo_name.lower() != upstream_repo_name.lower(),
         "is_draft": bool(metadata.get("isDraft")),
         "commits": commits,

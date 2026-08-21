@@ -927,14 +927,43 @@ class MetadataTest(unittest.TestCase):
             "headRefName": "branch",
             "headRefOid": "head",
             "baseRefName": "main",
-            "baseRefOid": "base",
+            "baseRefOid": "frozen",
         }
 
-        with mock.patch.object(MODULE, "gh_json", return_value=metadata) as gh_json:
+        with mock.patch.object(
+            MODULE, "gh_json", return_value=metadata
+        ) as gh_json, mock.patch.object(
+            MODULE, "base_ref_tip", return_value="live-tip"
+        ):
             result = MODULE.metadata_for(target)
 
         self.assertEqual(result["title"], "Fix the review loop")
         self.assertIn("title", gh_json.call_args.args[0][-1].split(","))
+
+    def test_base_sha_is_the_live_base_branch_tip_not_the_frozen_base_ref_oid(self):
+        target = MODULE.parse_target("owner/repo#42")
+        metadata = {
+            "id": "PR_1",
+            "number": 42,
+            "title": "Fix the review loop",
+            "url": target["pr_url"],
+            "headRepositoryOwner": {"login": "owner"},
+            "headRepository": {"name": "repo"},
+            "headRefName": "branch",
+            "headRefOid": "head",
+            "baseRefName": "main",
+            "baseRefOid": "frozen",
+        }
+
+        with mock.patch.object(
+            MODULE, "gh_json", return_value=metadata
+        ), mock.patch.object(
+            MODULE, "base_ref_tip", return_value="live-tip"
+        ) as tip:
+            result = MODULE.metadata_for(target)
+
+        self.assertEqual("live-tip", result["base_sha"])
+        tip.assert_called_once_with("owner/repo", "main")
 
     def test_reports_a_deleted_head_repository(self):
         target = MODULE.parse_target("owner/repo#42")
@@ -947,7 +976,7 @@ class MetadataTest(unittest.TestCase):
             "headRefName": "branch",
             "headRefOid": "head",
             "baseRefName": "main",
-            "baseRefOid": "base",
+            "baseRefOid": "frozen",
         }
 
         with (
@@ -955,6 +984,29 @@ class MetadataTest(unittest.TestCase):
             self.assertRaisesRegex(MODULE.WorkflowError, "head repository is unavailable"),
         ):
             MODULE.metadata_for(target)
+
+
+class BaseRefTipTest(unittest.TestCase):
+    def test_returns_the_live_tip_from_the_branch_ref(self):
+        response = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"object": {"sha": "live-tip", "type": "commit"}}),
+            stderr="",
+        )
+        with mock.patch.object(MODULE, "run", return_value=response) as run:
+            self.assertEqual("live-tip", MODULE.base_ref_tip("owner/repo", "main"))
+        self.assertEqual(
+            ["gh", "api", "repos/owner/repo/git/ref/heads/main"],
+            run.call_args.args[0],
+        )
+
+    def test_a_deleted_base_branch_raises_rather_than_falling_back(self):
+        response = SimpleNamespace(
+            returncode=1, stdout="", stderr="gh: Not Found (HTTP 404)"
+        )
+        with mock.patch.object(MODULE, "run", return_value=response):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "may have been deleted"):
+                MODULE.base_ref_tip("owner/repo", "gone")
 
 
 class ProcessLivenessTest(unittest.TestCase):

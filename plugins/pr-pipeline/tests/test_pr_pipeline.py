@@ -1271,17 +1271,32 @@ class ObservePullRequestTest(unittest.TestCase):
             ],
         }
 
-    def observe(self, *responses, known_head_sha: str | None = None):
+    def observe(self, *responses, known_head_sha: str | None = None, base_tip="live-tip"):
         self.sleeps: list[float] = []
         with mock.patch.object(MODULE, "gh_json", side_effect=list(responses)) as reader:
             with mock.patch.object(MODULE, "time") as clock:
-                clock.sleep = self.sleeps.append
-                result = MODULE.observe_pull_request(
-                    MODULE.build_target("owner", "repo", 7),
-                    known_head_sha=known_head_sha,
-                )
+                with mock.patch.object(MODULE, "base_ref_tip", return_value=base_tip):
+                    clock.sleep = self.sleeps.append
+                    result = MODULE.observe_pull_request(
+                        MODULE.build_target("owner", "repo", 7),
+                        known_head_sha=known_head_sha,
+                    )
         self.reads = reader.call_count
         return result
+
+    def test_base_sha_is_the_live_base_branch_tip_not_the_frozen_base_ref_oid(self):
+        with mock.patch.object(
+            MODULE, "gh_json", return_value=self.payload(mergeable="MERGEABLE", status="CLEAN")
+        ):
+            with mock.patch.object(MODULE, "time"):
+                with mock.patch.object(
+                    MODULE, "base_ref_tip", return_value="live-tip"
+                ) as tip:
+                    result = MODULE.observe_pull_request(
+                        MODULE.build_target("owner", "repo", 7)
+                    )
+        self.assertEqual("live-tip", result["base_sha"])
+        tip.assert_called_once_with("owner/repo", "main")
 
     def test_a_corroborated_answer_is_taken_on_the_first_read(self):
         result = self.observe(self.payload(mergeable="MERGEABLE", status="CLEAN"))
@@ -1338,6 +1353,29 @@ class ObservePullRequestTest(unittest.TestCase):
         self.assertEqual(["build"], result["checks"]["names"])
         self.assertEqual("unsatisfied", result["checks"]["coverage"]["state"])
         self.assertEqual("not_judged", result["checks"]["coverage"]["reason"])
+
+
+class BaseRefTipTest(unittest.TestCase):
+    def test_returns_the_live_tip_from_the_branch_ref(self):
+        response = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"object": {"sha": "live-tip", "type": "commit"}}),
+            stderr="",
+        )
+        with mock.patch.object(MODULE, "run", return_value=response) as run:
+            self.assertEqual("live-tip", MODULE.base_ref_tip("owner/repo", "main"))
+        self.assertEqual(
+            ["gh", "api", "repos/owner/repo/git/ref/heads/main"],
+            run.call_args.args[0],
+        )
+
+    def test_a_deleted_base_branch_raises_rather_than_falling_back(self):
+        response = SimpleNamespace(
+            returncode=1, stdout="", stderr="gh: Not Found (HTTP 404)"
+        )
+        with mock.patch.object(MODULE, "run", return_value=response):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "may have been deleted"):
+                MODULE.base_ref_tip("owner/repo", "gone")
 
 
 class GithubEvidenceTest(unittest.TestCase):
