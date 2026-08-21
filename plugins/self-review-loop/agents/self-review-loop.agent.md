@@ -1,7 +1,7 @@
 ---
 name: Self Review Loop
 description: "Use when selected with only a PR URL, PR number, or owner/repo#number to immediately run the full Self Review Loop, or to autonomously review a pull request and commit the fixes for every verified finding."
-argument-hint: "PR URL, PR number, or owner/repo#number; omit only when the PR's branch is checked out"
+argument-hint: "PR URL, PR number, or owner/repo#number; omit only from a worktree attached to the PR's branch"
 tools: [read, edit, search, execute, agent, todo, rename_session]
 user-invocable: true
 disable-model-invocation: true

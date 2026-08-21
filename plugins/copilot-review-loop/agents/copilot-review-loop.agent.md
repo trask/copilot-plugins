@@ -1,7 +1,7 @@
 ---
 name: Copilot Review Loop
 description: "Use when selected with only a PR URL, PR number, or owner/repo#number to immediately run the full Copilot Review Loop, or to autonomously address Copilot review comments until the review is clean."
-argument-hint: "PR URL, PR number, or owner/repo#number; omit only when the PR's branch is checked out"
+argument-hint: "PR URL, PR number, or owner/repo#number; omit only from a worktree attached to the PR's branch"
 tools: [read, edit, search, execute, todo, rename_session]
 agents: []
 user-invocable: true

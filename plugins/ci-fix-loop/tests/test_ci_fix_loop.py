@@ -172,7 +172,7 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("name: CI Fix Loop", self.instructions)
         self.assertIn(
             'argument-hint: "PR URL, PR number, or owner/repo#number; omit only '
-            "when the PR's branch is checked out\"",
+            "from a worktree attached to the PR's branch\"",
             self.instructions,
         )
         self.assertIn(
@@ -688,7 +688,7 @@ class AgentInstructionsTest(unittest.TestCase):
         clause is worded the way it is.
         """
         self.assertIn(
-            "omit only when the PR's branch is checked out", self.instructions
+            "omit only from a worktree attached to the PR's branch", self.instructions
         )
         self.assertNotIn("omit to use the current branch's PR", self.instructions)
 

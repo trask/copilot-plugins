@@ -2202,7 +2202,10 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument(
         "target",
         nargs="?",
-        help="PR URL or owner/repo#number; omit only when the PR's branch is checked out",
+        help=(
+            "PR URL or owner/repo#number; omit only from a worktree "
+            "attached to the PR's branch"
+        ),
     )
     preflight.add_argument("--repo-root")
     preflight.add_argument("--state")
