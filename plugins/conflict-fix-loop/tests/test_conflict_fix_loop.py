@@ -1783,19 +1783,41 @@ class FetchReferenceTest(unittest.TestCase):
 
 
 class CheckoutTest(unittest.TestCase):
-    def test_the_pull_request_branch_is_checked_out_and_verified(self):
+    def checkout(self, branches):
+        """Run the checkout with `git` answering the branch readings in turn."""
         with mock.patch.object(MODULE, "run") as runner, mock.patch.object(
-            MODULE, "git", side_effect=["feature", "head1"]
+            MODULE, "git", side_effect=[*branches, "head1"]
         ):
-            MODULE.checkout_pr_branch(Path("."), MODULE.parse_target("owner/repo#7"), pr_metadata())
+            attached = MODULE.checkout_pr_branch(
+                Path("."), MODULE.parse_target("owner/repo#7"), pr_metadata()
+            )
+        return attached, runner.call_args[0][0]
+
+    def test_a_worktree_elsewhere_detaches_onto_the_head(self):
+        attached, command = self.checkout(["other", ""])
+        self.assertFalse(attached)
         self.assertEqual(
-            ["gh", "pr", "checkout", "https://github.com/owner/repo/pull/7"],
-            runner.call_args[0][0],
+            [
+                "gh",
+                "pr",
+                "checkout",
+                "https://github.com/owner/repo/pull/7",
+                "--detach",
+            ],
+            command,
         )
 
-    def test_a_branch_mismatch_is_refused(self):
+    def test_a_worktree_already_holding_the_branch_keeps_it(self):
+        attached, command = self.checkout(["feature", "feature"])
+        self.assertTrue(attached)
+        self.assertEqual(
+            ["gh", "pr", "checkout", "https://github.com/owner/repo/pull/7"],
+            command,
+        )
+
+    def test_landing_on_some_other_branch_is_refused(self):
         with mock.patch.object(MODULE, "run"), mock.patch.object(
-            MODULE, "git", side_effect=["other", "head1"]
+            MODULE, "git", side_effect=["other", "unrelated", "head1"]
         ):
             with self.assertRaisesRegex(MODULE.WorkflowError, "branch mismatch"):
                 MODULE.checkout_pr_branch(
@@ -1804,12 +1826,16 @@ class CheckoutTest(unittest.TestCase):
 
     def test_local_work_ahead_of_the_pull_request_head_is_refused(self):
         with mock.patch.object(MODULE, "run"), mock.patch.object(
-            MODULE, "git", side_effect=["feature", "local9"]
+            MODULE, "git", side_effect=["feature", "feature", "local9"]
         ):
             with self.assertRaisesRegex(MODULE.WorkflowError, "HEAD mismatch"):
                 MODULE.checkout_pr_branch(
                     Path("."), MODULE.parse_target("owner/repo#7"), pr_metadata()
                 )
+
+    def test_a_detached_head_is_not_read_as_another_line_of_work(self):
+        with mock.patch.object(MODULE, "git", return_value=""):
+            self.assertIsNone(MODULE.attached_to_other_branch(Path("."), "feature"))
 
 
 class PreflightTest(unittest.TestCase):
@@ -2171,6 +2197,14 @@ class AttemptTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.WorkflowError, "branch mismatch"):
             self.attempt(attempt=self.planned(), git_call=fake_git(branch="other"))
 
+    def test_a_detached_worktree_integrates_like_an_attached_one(self):
+        payload = self.attempt(
+            conflicts=[conflict_record("a.py")],
+            attempt=self.planned(),
+            git_call=fake_git(branch=""),
+        )
+        self.assertEqual("conflicted", payload["result"])
+
     def test_a_head_that_moved_away_is_refused(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "HEAD mismatch"):
             self.attempt(attempt=self.planned(), git_call=fake_git(head="local9"))
@@ -2513,6 +2547,7 @@ class PublishTest(unittest.TestCase):
         self,
         *,
         local_head="head2",
+        branch="feature",
         relations_before=None,
         relations_after=None,
         refreshed=None,
@@ -2531,7 +2566,7 @@ class PublishTest(unittest.TestCase):
         ), mock.patch.object(
             MODULE, "require_no_integration_in_progress"
         ), mock.patch.object(
-            MODULE, "git", side_effect=fake_git(head=local_head)
+            MODULE, "git", side_effect=fake_git(head=local_head, branch=branch)
         ), mock.patch.object(
             MODULE, "stack_relations", side_effect=[relations_before, relations_after]
         ), mock.patch.object(
@@ -2680,6 +2715,21 @@ class PublishTest(unittest.TestCase):
         ), mock.patch.object(MODULE, "git", side_effect=fake_git(branch="main")):
             with self.assertRaisesRegex(MODULE.WorkflowError, "refusing to push from branch"):
                 MODULE.command_publish(args)
+
+    def test_a_detached_worktree_publishes_through_the_refspec(self):
+        payload = self.publish(branch="")
+        self.assertEqual("published", payload["result"])
+        command = self.runner.call_args[0][0]
+        self.assertEqual(["origin", "HEAD:refs/heads/feature"], command[-2:])
+
+    def test_a_detached_rebase_keeps_the_lease_on_the_head_it_read(self):
+        self.publish(branch="", attempt=attempt_record(status="resolved", strategy="rebase"))
+        observed = self.heads[("fork", "repo", "feature")]
+        branch = pr_metadata()["head_branch"]
+        self.assertIn(
+            f"--force-with-lease=refs/heads/{branch}:{observed}",
+            self.runner.call_args[0][0],
+        )
 
     def test_the_push_is_skipped_when_the_remote_already_holds_the_result(self):
         self.heads[("fork", "repo", "feature")] = "head2"
@@ -3968,3 +4018,96 @@ class LauncherPositionInstructionsTest(unittest.TestCase):
 
     def test_the_flat_cap_is_stated_as_a_default_an_outer_loop_may_replace(self):
         self.assertIn("unless an outer loop sets its own", self.instructions)
+
+
+@unittest.skipUnless(shutil.which("git"), "git is not installed")
+class HeadBranchHeldElsewhereTest(unittest.TestCase):
+    """The head branch is checked out in a sibling worktree, as in a live run."""
+
+    def setUp(self):
+        root = temporary_directory(self)
+        self.real_run = MODULE.run
+        self.repo = root / "pipeline"
+        self.repo.mkdir()
+        self.session = root / "session"
+        self.git("init", "--initial-branch", "main")
+        self.git("config", "user.name", "Conflict Fix Loop")
+        self.git("config", "user.email", "conflict-fix-loop@example.invalid")
+        self.git("config", "commit.gpgsign", "false")
+        self.write("app.py", "start\n")
+        self.commit("Start the app")
+        self.branch = pr_metadata()["head_branch"]
+        self.git("checkout", "-b", self.branch)
+        self.write("app.py", "change\n")
+        self.commit("Change the app")
+        self.head_sha = self.git("rev-parse", "HEAD")
+        self.git("checkout", "main")
+        self.git("worktree", "add", str(self.session), self.branch)
+        self.metadata = pr_metadata(head_sha=self.head_sha)
+        self.target = MODULE.parse_target("owner/repo#7")
+
+    def git(self, *arguments):
+        process = subprocess.run(
+            ["git", "-C", str(self.repo), *arguments],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if process.returncode != 0:
+            self.fail(f"git {' '.join(arguments)} failed: {process.stderr}")
+        return process.stdout.strip()
+
+    def write(self, name, text):
+        (self.repo / name).write_text(text, encoding="utf-8", newline="\n")
+
+    def commit(self, message):
+        self.git("add", "--all")
+        self.git("commit", "--no-gpg-sign", "--message", message)
+
+    def gh_checkout(self, command, cwd=None, **keywords):
+        """Stand in for `gh pr checkout`, which runs exactly these git checkouts.
+
+        Everything else the module runs is a real git command and is passed
+        through, so the checkout meets git's own rules about worktrees.
+        """
+        if command[0] != "gh":
+            return self.real_run(command, cwd=cwd, **keywords)
+        self.assertEqual(["gh", "pr", "checkout", self.target["pr_url"]], command[:4])
+        if "--detach" in command:
+            arguments = ["checkout", "--detach", self.head_sha]
+        else:
+            arguments = ["checkout", self.branch]
+        process = subprocess.run(
+            ["git", "-C", str(cwd or self.repo), *arguments],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if process.returncode != 0:
+            raise MODULE.WorkflowError(process.stderr.strip())
+        return process
+
+    def test_git_refuses_to_hand_the_branch_to_a_second_worktree(self):
+        with self.assertRaises(MODULE.WorkflowError) as refusal:
+            self.gh_checkout(["gh", "pr", "checkout", self.target["pr_url"]])
+        self.assertIn("already", str(refusal.exception))
+        self.assertIn(self.branch, str(refusal.exception))
+
+    def test_the_checkout_reaches_the_head_the_branch_is_held_elsewhere(self):
+        with mock.patch.object(MODULE, "run", side_effect=self.gh_checkout):
+            attached = MODULE.checkout_pr_branch(
+                self.repo, self.target, self.metadata
+            )
+        self.assertFalse(attached)
+        self.assertEqual("", self.git("branch", "--show-current"))
+        self.assertEqual(self.head_sha, self.git("rev-parse", "HEAD"))
+
+    def test_a_worktree_already_holding_the_branch_stays_on_it(self):
+        self.git("worktree", "remove", str(self.session))
+        self.git("checkout", self.branch)
+        with mock.patch.object(MODULE, "run", side_effect=self.gh_checkout):
+            attached = MODULE.checkout_pr_branch(
+                self.repo, self.target, self.metadata
+            )
+        self.assertTrue(attached)
+        self.assertEqual(self.branch, self.git("branch", "--show-current"))

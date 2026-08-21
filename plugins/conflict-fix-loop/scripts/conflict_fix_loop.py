@@ -1282,19 +1282,45 @@ def fetch_reference(repo_root: Path, remote: str, branch: str, sha: str) -> None
         )
 
 
+def attached_to_other_branch(repo_root: Path, head_branch: str) -> str | None:
+    """Name the branch this worktree holds when it is not the pull request's own.
+
+    A detached head returns nothing and is welcome. The resolution reaches the
+    head branch through the push refspec, so the branch a worktree happens to
+    hold decides nothing about where the work lands. Another branch is another
+    line of work, and committing a resolution onto it would be wrong.
+    """
+    branch = git(repo_root, "branch", "--show-current")
+    if branch and branch != head_branch:
+        return branch
+    return None
+
+
 def checkout_pr_branch(
     repo_root: Path, target: dict[str, Any], metadata: dict[str, Any]
-) -> None:
-    """Check out the pull request's own branch.
+) -> bool:
+    """Put this worktree on the pull request's head commit, detaching to get there.
 
-    Resolving a conflict has to commit onto the head branch, so a detached head is
-    never acceptable here even though it would be enough to read a diff.
+    Resolving a conflict commits onto the head branch through the push refspec,
+    not through the branch name this worktree carries, so a detached head serves
+    the whole loop. It also serves the one arrangement that claiming the branch
+    cannot: git refuses to check a branch out in two worktrees of one repository,
+    and the session worktree that opened the pull request is usually still
+    holding it, so attaching would fail exactly when a conflict needs resolving.
+    The branch is kept only when this worktree already holds it.
+
+    Returns whether the worktree stayed attached to the head branch.
     """
-    run(["gh", "pr", "checkout", target["pr_url"]], cwd=repo_root)
-    branch = git(repo_root, "branch", "--show-current")
-    if branch != metadata["head_branch"]:
+    current_branch = git(repo_root, "branch", "--show-current")
+    on_pr_branch = current_branch == metadata["head_branch"]
+    command = ["gh", "pr", "checkout", target["pr_url"]]
+    if not on_pr_branch:
+        command.append("--detach")
+    run(command, cwd=repo_root)
+    stray = attached_to_other_branch(repo_root, metadata["head_branch"])
+    if stray is not None:
         raise WorkflowError(
-            f"branch mismatch: local {branch!r}, PR head {metadata['head_branch']!r}"
+            f"branch mismatch: local {stray!r}, PR head {metadata['head_branch']!r}"
         )
     local_head = git(repo_root, "rev-parse", "HEAD")
     if local_head != metadata["head_sha"]:
@@ -1303,6 +1329,7 @@ def checkout_pr_branch(
             "this loop resolves the authoritative remote branch, so publish or "
             "reconcile local work before preflight"
         )
+    return on_pr_branch
 
 
 def pipeline_iteration_value(pipeline_iteration: Any) -> int | None:
@@ -1720,10 +1747,10 @@ def command_attempt(args: argparse.Namespace) -> None:
     require_clean_worktree(repo_root)
     require_no_integration_in_progress(repo_root)
 
-    branch = git(repo_root, "branch", "--show-current")
-    if branch != pr["head_branch"]:
+    stray = attached_to_other_branch(repo_root, pr["head_branch"])
+    if stray is not None:
         raise WorkflowError(
-            f"branch mismatch: local {branch!r}, PR head {pr['head_branch']!r}"
+            f"branch mismatch: local {stray!r}, PR head {pr['head_branch']!r}"
         )
     local_head = git(repo_root, "rev-parse", "HEAD")
     if local_head != attempt["head_sha"]:
@@ -2116,10 +2143,10 @@ def command_publish(args: argparse.Namespace) -> None:
     require_clean_worktree(repo_root)
     require_no_integration_in_progress(repo_root)
 
-    branch = git(repo_root, "branch", "--show-current")
-    if branch != pr["head_branch"]:
+    stray = attached_to_other_branch(repo_root, pr["head_branch"])
+    if stray is not None:
         raise WorkflowError(
-            f"refusing to push from branch {branch!r}, which is not the PR head "
+            f"refusing to push from branch {stray!r}, which is not the PR head "
             f"branch {pr['head_branch']!r}"
         )
 
