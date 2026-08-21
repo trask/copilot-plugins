@@ -29,13 +29,13 @@
     {
       "name": "pr-description",
       "description": "Review and automatically update a pull request title and description with head verification.",
-      "version": "1.0.26",
+      "version": "1.0.27",
       "source": "./plugins/pr-description"
     },
     {
       "name": "pr-pipeline",
       "description": "Drive an open draft pull request through conflict resolution, self review, Copilot review, check fixing, and description validation until every stage is green at the same head commit.",
-      "version": "1.0.16",
+      "version": "1.0.17",
       "source": "./plugins/pr-pipeline"
     },
     {

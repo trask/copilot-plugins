@@ -561,7 +561,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.26")
+        self.assertEqual(plugin["version"], "1.0.27")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -2212,6 +2212,31 @@ class ParserShapeTest(unittest.TestCase):
                     "run",
                 ]
             )
+
+    def test_preflight_accepts_and_ignores_the_pipeline_position(self):
+        # An orchestrator that runs this stage inside a larger loop sends its
+        # position to every stage. This stage has no loop and no budget of its
+        # own, so the position means nothing here -- but rejecting it makes the
+        # helper exit non-zero, and an agent that then improvises its own
+        # --state path writes a result the orchestrator never reads. The stage
+        # looks like it did nothing while having done the work correctly.
+        parsed = self.parser.parse_args(
+            [
+                "preflight",
+                "owner/repo#7",
+                "--state",
+                "state",
+                "--pipeline-run",
+                "run-token",
+                "--pipeline-iteration",
+                "2",
+                "--pipeline-max-iterations",
+                "5",
+            ]
+        )
+        self.assertEqual("command_preflight", parsed.function.__name__)
+        self.assertEqual("state", parsed.state)
+        self.assertEqual("owner/repo#7", parsed.target)
 
 
 if __name__ == "__main__":

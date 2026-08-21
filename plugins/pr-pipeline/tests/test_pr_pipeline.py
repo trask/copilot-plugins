@@ -5851,6 +5851,87 @@ class NextProbesTheStageProcessTest(CommandTestCase):
         )
         self.assertEqual("False", visible)
 
+    def shim_path(self, directory, name):
+        directory.mkdir(parents=True, exist_ok=True)
+        shim = directory / f"{name}.cmd"
+        shim.write_text("@echo off\r\n", encoding="utf-8")
+        return shim
+
+    def test_a_stage_program_that_is_only_a_shim_is_refused_by_name(self):
+        # A .cmd shim receives one command line, so a prompt is cut at its first
+        # newline and the stage loses the pipeline's position and its
+        # instruction. The shim still exits reporting success, so the stage reads
+        # exactly like one that had nothing to do. Refusing names the cause.
+        if not MODULE.IS_WINDOWS:
+            self.skipTest("shim resolution is a Windows behavior")
+        directory = self.root / "shim_only"
+        shim = self.shim_path(directory, "stagetool")
+        with mock.patch.dict(
+            os.environ, {"PATH": str(directory), "PATHEXT": ".EXE;.CMD;.BAT"}
+        ):
+            with self.assertRaises(MODULE.WorkflowError) as caught:
+                MODULE.resolve_launch_program("stagetool")
+        message = str(caught.exception)
+        self.assertIn(str(shim).lower(), message.lower())
+        self.assertIn("newline", message)
+
+    def test_a_real_image_wins_over_a_shim_earlier_on_the_path(self):
+        # PATH order decides which one Windows would run, so a shim placed by one
+        # installer can shadow a working executable from another. The launch
+        # wants whichever entry can carry the prompt, not whichever comes first.
+        if not MODULE.IS_WINDOWS:
+            self.skipTest("shim resolution is a Windows behavior")
+        first = self.root / "shim_first"
+        second = self.root / "image_second"
+        self.shim_path(first, "stagetool")
+        second.mkdir(parents=True, exist_ok=True)
+        image = second / "stagetool.exe"
+        image.write_bytes(b"MZ")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PATH": os.pathsep.join([str(first), str(second)]),
+                "PATHEXT": ".EXE;.CMD;.BAT",
+            },
+        ):
+            self.assertEqual(
+                str(image).lower(),
+                MODULE.resolve_launch_program("stagetool").lower(),
+            )
+
+    def test_a_stage_program_missing_from_the_path_is_named(self):
+        # Windows reports a bare name it cannot resolve as "the system cannot
+        # find the file specified", which names neither the program nor PATH.
+        with mock.patch.dict(
+            os.environ, {"PATH": str(self.root / "empty"), "PATHEXT": ".EXE"}
+        ):
+            with self.assertRaises(MODULE.WorkflowError) as caught:
+                MODULE.resolve_launch_program("stagetool")
+        self.assertIn("stagetool", str(caught.exception))
+
+    def test_launching_a_stage_resolves_the_program_before_spawning_it(self):
+        # The refusal has to happen at the launch, not only in the resolver, or
+        # the pipeline still spawns the shim and records a stage that ran.
+        if not MODULE.IS_WINDOWS:
+            self.skipTest("shim resolution is a Windows behavior")
+        directory = self.root / "launch_shim"
+        self.shim_path(directory, "stagetool")
+        log = self.root / "shim.log"
+        state = str(self.preflight_state(self.make_repo("session")))
+        with mock.patch.dict(
+            os.environ, {"PATH": str(directory), "PATHEXT": ".EXE;.CMD;.BAT"}
+        ):
+            with self.assertRaises(MODULE.WorkflowError) as caught:
+                MODULE.command_launch(
+                    self.args(
+                        state=state,
+                        log=str(log),
+                        command=["stagetool", "-p", "line one\n\nline two"],
+                    )
+                )
+        self.assertIn("newline", str(caught.exception))
+        self.assertFalse(log.exists(), "a refused stage still opened its log")
+
 
 if __name__ == "__main__":
     unittest.main()

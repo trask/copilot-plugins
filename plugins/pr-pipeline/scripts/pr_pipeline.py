@@ -526,6 +526,78 @@ def require_tools() -> None:
         raise WorkflowError(f"required tools not found: {', '.join(missing)}")
 
 
+SHIM_SUFFIXES = (".cmd", ".bat")
+
+
+def path_image(name: str) -> str | None:
+    """Find a directly executable image for a bare command name on PATH.
+
+    ``shutil.which`` answers what Windows would run, which is whichever entry
+    comes first including a shim. This looks past a shim for a real image
+    anywhere on PATH, because the two are usually different installs of the same
+    tool and only one of them can carry the stage's prompt.
+    """
+
+    suffixes = [
+        suffix
+        for suffix in os.environ.get("PATHEXT", ".EXE").split(os.pathsep)
+        if suffix and suffix.lower() not in SHIM_SUFFIXES
+    ]
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        for suffix in suffixes:
+            candidate = Path(directory) / f"{name}{suffix}"
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
+def resolve_launch_program(name: str) -> str:
+    """Resolve a stage's program to something that can carry its prompt.
+
+    A stage is launched with a prompt that spans several lines, and Windows
+    hands a ``.cmd`` or ``.bat`` shim one command line rather than an argument
+    list. Everything from the first newline on is dropped, and the shim still
+    exits reporting success, so the stage runs without the pipeline's position
+    and without its instruction and then reports nothing. That is
+    indistinguishable from a stage that had nothing to do, which is the one
+    thing the pipeline must never confuse. So a shim is refused by name.
+    """
+
+    if not IS_WINDOWS:
+        return name
+    if os.sep in name or (os.altsep and os.altsep in name):
+        if Path(name).suffix.lower() in SHIM_SUFFIXES:
+            raise WorkflowError(
+                f"the stage program {name} is a shim, and a shim cannot carry "
+                "an argument containing a newline; name the executable itself"
+            )
+        return name
+    if Path(name).suffix:
+        resolved = shutil.which(name)
+        if resolved is None:
+            raise WorkflowError(f"the stage program {name} is not on PATH")
+        if Path(resolved).suffix.lower() in SHIM_SUFFIXES:
+            raise WorkflowError(
+                f"the stage program {name} resolves to the shim {resolved}, and "
+                "a shim cannot carry an argument containing a newline"
+            )
+        return resolved
+    image = path_image(name)
+    if image is not None:
+        return image
+    resolved = shutil.which(name)
+    if resolved is None:
+        raise WorkflowError(f"the stage program {name} is not on PATH")
+    raise WorkflowError(
+        f"the stage program {name} resolves only to the shim {resolved}, and a "
+        "shim cannot carry an argument containing a newline: the prompt would "
+        "be cut at its first line and the stage would report success having "
+        "done nothing. Install the executable, or put it ahead on PATH."
+    )
+
+
 def normalize_cli_path(value: str, *, windows: bool) -> str:
     if windows:
         match = re.fullmatch(r"/([A-Za-z])(?:/(.*))?", value)
@@ -2775,6 +2847,7 @@ def command_launch(args: argparse.Namespace) -> None:
         command = command[1:]
     if not command:
         raise WorkflowError("launch needs the stage command after --")
+    command[0] = resolve_launch_program(command[0])
     state = load_state(cli_path(args.state))
     repo_root = recorded_repo_root(state)
     log_path = cli_path(args.log)

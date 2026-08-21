@@ -1533,6 +1533,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preflight.add_argument("--repo-root")
     preflight.add_argument("--state")
+    # An orchestrator that runs this stage inside a larger loop sends its own
+    # position to every stage it launches. This stage runs once and keeps no
+    # budget, so the position decides nothing here. It is accepted anyway
+    # because refusing it makes the helper exit non-zero on an argument the
+    # orchestrator told the stage to pass, and an agent that then improvises a
+    # state path of its own writes a result the orchestrator never reads: the
+    # stage reports nothing while having done the work correctly.
+    preflight.add_argument("--pipeline-run", help=argparse.SUPPRESS)
+    preflight.add_argument("--pipeline-iteration", help=argparse.SUPPRESS)
+    preflight.add_argument("--pipeline-max-iterations", help=argparse.SUPPRESS)
     preflight.set_defaults(function=command_preflight)
 
     propose = subparsers.add_parser("propose", help="store a title and body proposal")
