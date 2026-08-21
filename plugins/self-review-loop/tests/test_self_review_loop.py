@@ -3464,5 +3464,41 @@ class DetachedHeadTargetTest(unittest.TestCase):
         )
 
 
+class PreflightHelpTest(unittest.TestCase):
+    """`--help` is read by a caller building a call, not one recovering from it.
+
+    An agent constructing a `preflight` invocation reads this line first. A hint
+    that still promises the checked-out branch's pull request sends it to a
+    resolver a detached worktree cannot satisfy, and the refusal's correction
+    then arrives only after the launch it wasted.
+    """
+
+    def test_the_target_help_repeats_the_agent_file_hint(self):
+        """Deriving the clause keeps one sentence across both surfaces.
+
+        The agent file's own guard fixes what that clause says; this one stops
+        the two from drifting apart.
+        """
+        hint = re.search(
+            r'^argument-hint: "(.+)"$', AGENT.read_text(encoding="utf-8"), re.M
+        )
+        self.assertIsNotNone(hint)
+        clause = hint.group(1).split("; ", 1)[1]
+        subparsers = next(
+            action
+            for action in MODULE.build_parser()._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        target = next(
+            action
+            for action in subparsers.choices["preflight"]._actions
+            if action.dest == "target"
+        )
+        self.assertTrue(
+            target.help.endswith(f"; {clause}"),
+            f"preflight target help {target.help!r} does not end with {clause!r}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
