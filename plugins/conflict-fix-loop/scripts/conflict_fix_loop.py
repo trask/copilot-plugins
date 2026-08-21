@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -52,12 +53,31 @@ UNMERGED_CODES = {
 DELETION_CONFLICT_CODES = {"DD", "UD", "DU"}
 
 STRATEGIES = ("auto", "merge", "rebase")
+STACK_ENTRIES_PAGE = 100
+# Documented `gh stack` exit codes, keyed by name so a caller reads the cause
+# instead of a bare number. Public preview, so the numbers may move; they are
+# named here once and nowhere else.
+GH_STACK_EXIT = {
+    0: "success",
+    1: "generic error",
+    2: "not in a stack, or the stack was not found",
+    3: "rebase conflict",
+    4: "GitHub API failure",
+    5: "invalid arguments or flags",
+    6: "the branch belongs to more than one stack",
+    7: "a rebase is already in progress",
+    8: "the stack is locked by another process",
+    9: "stacked pull requests are not enabled for this repository",
+    10: "a modify session was interrupted and needs recovery",
+}
+GH_STACK_CONFLICT_EXIT = 3
 ESCALATION_KINDS = (
     "contradiction",
     "max_iterations",
     "no_progress",
     "unsafe_push",
     "unknown_mergeability",
+    "ad_hoc_base",
     "validation",
     "other",
 )
@@ -191,6 +211,216 @@ def base_ref_tip(repo_name: str, base_branch: str) -> str:
     return sha
 
 
+def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
+    """Turn a GraphQL ``PullRequestStack`` into an ordered member snapshot.
+
+    A stack entry can name a pull request the reader cannot see; that entry is
+    skipped rather than failing the whole detection, because a cascade acts on
+    the members it can read and the missing one is reported by its absence. Every
+    readable member must carry the four fields the cascade and its verification
+    depend on, so a member missing one of those is a hard error rather than a
+    silently thinned snapshot.
+    """
+    trunk = raw.get("baseRefName")
+    if not isinstance(trunk, str) or not trunk:
+        raise WorkflowError("the native stack has no trunk branch")
+    entries = raw.get("entries")
+    nodes = entries.get("nodes") if isinstance(entries, dict) else None
+    members: list[dict[str, Any]] = []
+    for node in nodes or []:
+        if not isinstance(node, dict):
+            continue
+        member = node.get("pullRequest")
+        if not isinstance(member, dict):
+            continue
+        number = member.get("number")
+        head_branch = member.get("headRefName")
+        base_branch = member.get("baseRefName")
+        head_sha = member.get("headRefOid")
+        if (
+            not isinstance(number, int)
+            or not isinstance(head_branch, str)
+            or not head_branch
+            or not isinstance(base_branch, str)
+            or not base_branch
+            or not isinstance(head_sha, str)
+            or not head_sha
+        ):
+            raise WorkflowError(
+                f"native stack member {number!r} is missing a required field"
+            )
+        members.append(
+            {
+                "position": node.get("position"),
+                "number": number,
+                "head_branch": head_branch,
+                "base_branch": base_branch,
+                "mergeable": member.get("mergeable"),
+                "head_sha": head_sha,
+            }
+        )
+    members.sort(
+        key=lambda item: (item["position"] is None, item["position"], item["number"])
+    )
+    return {
+        "id": raw.get("id"),
+        "number": raw.get("number"),
+        "size": raw.get("size"),
+        "trunk": trunk,
+        "members": members,
+    }
+
+
+def stack_membership(pr: dict[str, Any]) -> dict[str, Any]:
+    """Read the repository default branch and whether this PR is a native stack.
+
+    ``pullRequest.stack`` is the detection mechanism: non-null means a native
+    GitHub stack, and ad-hoc base targeting returns null. The default branch is
+    read here too so no downstream decision has to assume it is named ``main``.
+    ``entries`` is paginated and returns the whole ``stack`` field as null unless
+    a ``first:`` bound is supplied, so one is always passed.
+    """
+    query = (
+        "query($owner: String!, $name: String!, $number: Int!, $first: Int!) {"
+        "  repository(owner: $owner, name: $name) {"
+        "    defaultBranchRef { name }"
+        "    pullRequest(number: $number) {"
+        "      stack {"
+        "        id number size baseRefName"
+        "        entries(first: $first) {"
+        "          nodes {"
+        "            position"
+        "            pullRequest {"
+        "              number headRefName baseRefName mergeable headRefOid"
+        "            }"
+        "          }"
+        "        }"
+        "      }"
+        "    }"
+        "  }"
+        "}"
+    )
+    payload = graphql(
+        query,
+        {
+            "owner": pr["upstream_owner"],
+            "name": pr["upstream_repo"],
+            "number": pr["number"],
+            "first": STACK_ENTRIES_PAGE,
+        },
+    )
+    data = payload.get("data") if isinstance(payload, dict) else None
+    repository = data.get("repository") if isinstance(data, dict) else None
+    if not isinstance(repository, dict):
+        raise WorkflowError("the stack query returned no repository")
+    default_ref = repository.get("defaultBranchRef")
+    default_branch = (
+        default_ref.get("name") if isinstance(default_ref, dict) else None
+    )
+    if not isinstance(default_branch, str) or not default_branch:
+        raise WorkflowError(
+            f"repository {pr['upstream_owner']}/{pr['upstream_repo']} has no "
+            "default branch"
+        )
+    pull = repository.get("pullRequest")
+    if not isinstance(pull, dict):
+        raise WorkflowError("the stack query returned no pull request")
+    raw_stack = pull.get("stack")
+    stack = parse_stack(raw_stack) if isinstance(raw_stack, dict) else None
+    return {"default_branch": default_branch, "stack": stack}
+
+
+def merge_tree_conflicts(repo_root: Path, left: str, right: str) -> list[str]:
+    """Return the files a real three-way merge of two commits would conflict in.
+
+    ``git merge-tree --write-tree`` performs the merge in memory and exits 0 when
+    it is clean and 1 when it conflicts; any other exit is a genuine git error,
+    such as an unknown revision, and is surfaced rather than read as "clean".
+    With ``--name-only`` the first line is the resulting tree object and the
+    conflicted paths follow until the first blank line, after which git prints
+    informational messages that are not file names.
+    """
+    result = git_try(
+        repo_root, "merge-tree", "--write-tree", "--name-only", left, right
+    )
+    if result.returncode == 0:
+        return []
+    if result.returncode != 1:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WorkflowError(
+            f"could not test-merge {left} into {right}: {detail}"
+        )
+    conflicts: list[str] = []
+    for line in result.stdout.splitlines()[1:]:
+        if not line.strip():
+            break
+        conflicts.append(line)
+    return sorted(conflicts)
+
+
+def ad_hoc_escalation(
+    repo_root: Path,
+    remote: str,
+    pr: dict[str, Any],
+    default_branch: str,
+    default_sha: str,
+) -> dict[str, Any]:
+    """Explain a conflict on a pull request that targets a non-default base.
+
+    Comparing only against the declared base reproduces the bare contradiction
+    this exists to replace: an ad-hoc PR's declared base is usually already an
+    ancestor of the head, so that merge is clean and names no file. Both merges
+    are run and both reported, so the escalation names the branch and file that
+    actually conflict instead of guessing at a stacked PR or stale state.
+    """
+    fetch_reference(repo_root, remote, pr["base_branch"], pr["base_sha"])
+    fetch_reference(repo_root, remote, default_branch, default_sha)
+    base_conflicts = merge_tree_conflicts(repo_root, pr["base_sha"], pr["head_sha"])
+    default_conflicts = merge_tree_conflicts(
+        repo_root, default_sha, pr["head_sha"]
+    )
+    if base_conflicts:
+        reason = (
+            f"the head {pr['head_sha']} conflicts with its declared base branch "
+            f"{pr['base_branch']} in {', '.join(base_conflicts)}"
+        )
+        recommended_action = (
+            "a person must resolve the conflict with the declared base branch this "
+            "names"
+        )
+    elif default_conflicts:
+        reason = (
+            f"the head {pr['head_sha']} is clean against its declared base branch "
+            f"{pr['base_branch']} but conflicts with the repository default branch "
+            f"{default_branch} in {', '.join(default_conflicts)}; this pull request "
+            f"targets a non-default base and is not part of a native stack, so "
+            f"GitHub measures mergeability against {default_branch}"
+        )
+        recommended_action = (
+            f"a person must resolve the conflict with {default_branch} this names, "
+            "or retarget the pull request"
+        )
+    else:
+        reason = (
+            f"the head {pr['head_sha']} is clean against both its declared base "
+            f"branch {pr['base_branch']} and the repository default branch "
+            f"{default_branch}, yet GitHub reports it as conflicting; neither merge "
+            f"reproduces GitHub's answer"
+        )
+        recommended_action = (
+            "a person must work out why GitHub reports a conflict that neither merge "
+            "reproduces"
+        )
+    return {
+        "reason": reason,
+        "recommended_action": recommended_action,
+        "base_branch": pr["base_branch"],
+        "base_conflicts": base_conflicts,
+        "default_branch": default_branch,
+        "default_conflicts": default_conflicts,
+    }
+
+
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -199,6 +429,23 @@ def require_tools() -> None:
     missing = [name for name in ("git", "gh") if shutil.which(name) is None]
     if missing:
         raise WorkflowError(f"required tools not found: {', '.join(missing)}")
+
+
+def require_gh_stack() -> None:
+    """Fail clearly when the `gh stack` extension is not usable.
+
+    A cascade is driven entirely by `gh stack`. A missing or broken extension is
+    a setup problem, not a conflict-resolution failure, so it is named here as
+    the extension rather than surfacing later as an opaque `gh` error mid-rebase.
+    """
+    result = run(["gh", "stack", "--help"], check=False)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WorkflowError(
+            "the `gh stack` extension is required to resolve a native GitHub "
+            "stack; install it with `gh extension install github/gh-stack`: "
+            f"{detail}"
+        )
 
 
 def normalize_cli_path(value: str, *, windows: bool) -> str:
@@ -1071,6 +1318,48 @@ def collect_conflicts(
     return sorted(conflicts, key=lambda item: item["path"])
 
 
+def collect_stack_conflicts(repo_root: Path) -> list[dict[str, Any]]:
+    """Report the conflicted files a cascading rebase left, without commit lists.
+
+    ``collect_conflicts`` frames each file with two-sided commit lists computed
+    against the pull request's declared base. A cascade conflicts against a stack
+    layer that is not that base, so those lists would attribute the conflict to
+    the wrong commits. The plainer signal the rebase itself leaves — the
+    conflicted files and their markers — is reported instead, in the same record
+    shape so ``resolved`` and the conflicts result reader need no special case.
+    """
+    conflicts = []
+    for entry in unmerged_entries(repo_root):
+        path = entry["path"]
+        blobs = stage_blobs(repo_root, path)
+        text = read_worktree_text(repo_root / path)
+        markers = (
+            parse_conflict_markers(text)
+            if text is not None
+            else {"regions": [], "problems": []}
+        )
+        conflicts.append(
+            {
+                "path": path,
+                "code": entry["code"],
+                "kind": entry["kind"],
+                "binary": text is None,
+                "deletion": entry["code"] in DELETION_CONFLICT_CODES,
+                "marker_regions": markers["regions"],
+                "marker_problems": markers["problems"],
+                "present_stages": sorted(
+                    name for name, blob in blobs.items() if blob is not None
+                ),
+                "head_commits": [],
+                "base_commits": [],
+                "status": "conflicted",
+                "rationale": None,
+                "one_side": None,
+            }
+        )
+    return sorted(conflicts, key=lambda item: item["path"])
+
+
 def rebase_in_progress(repo_root: Path) -> bool:
     for name in ("rebase-merge", "rebase-apply"):
         location = git_try(repo_root, "rev-parse", "--git-path", name)
@@ -1236,6 +1525,25 @@ def active_attempt(state: dict[str, Any]) -> dict[str, Any]:
             "the next one"
         )
     return attempt
+
+
+def attempt_repo_root(state: dict[str, Any], attempt: dict[str, Any]) -> Path:
+    """The checkout an attempt operates in.
+
+    A single-branch attempt works in the session worktree recorded as
+    ``repo_root``. A stack cascade works in its own scratch clone, because it has
+    to claim and move every branch in the stack and git refuses to check a branch
+    out in two worktrees of one repository. Reading the root from the attempt
+    keeps ``resolved`` and the rest of the staging path identical for both.
+    """
+    if attempt.get("strategy") == "stack":
+        workspace = (attempt.get("stack") or {}).get("workspace")
+        if not workspace:
+            raise WorkflowError(
+                "this stack attempt has no cascade workspace; run stack-rebase first"
+            )
+        return Path(workspace)
+    return Path(state["repo_root"])
 
 
 def find_conflicts(
@@ -1538,6 +1846,57 @@ def exhausted_budget(
     return None
 
 
+def planned_stack_attempt(
+    metadata: dict[str, Any], stack: dict[str, Any], iteration: int
+) -> dict[str, Any]:
+    """Build the planned attempt for a native-stack cascade.
+
+    The member head SHAs are captured now as the pre-cascade baseline; publish
+    compares the rebased tips against these to prove exactly what moved and that
+    nothing landed anywhere unexpected.
+    """
+    members = [
+        {
+            "number": member["number"],
+            "head_branch": member["head_branch"],
+            "base_branch": member["base_branch"],
+            "mergeable": member.get("mergeable"),
+            "head_sha": member["head_sha"],
+        }
+        for member in stack["members"]
+    ]
+    return {
+        "id": f"pr-{metadata['number']}-iteration-{iteration}",
+        "status": "planned",
+        "iteration": iteration,
+        "strategy": "stack",
+        "strategy_reason": (
+            "the pull request is part of a native GitHub stack; the conflict is "
+            "resolved by cascading a rebase through the trunk"
+        ),
+        "strategy_warnings": [],
+        "head_sha": metadata["head_sha"],
+        "base_sha": metadata["base_sha"],
+        "merge_base": None,
+        "mergeable": metadata.get("mergeable"),
+        "merge_state_status": metadata.get("merge_state_status"),
+        "started_at": utc_now(),
+        "conflicts": [],
+        "conflict_signature": None,
+        "published_head_sha": None,
+        "mergeable_at_head_sha": None,
+        "stack": {
+            "number": stack["number"],
+            "size": stack["size"],
+            "trunk": stack["trunk"],
+            "invoked_number": metadata["number"],
+            "members": members,
+            "workspace": None,
+            "members_after": None,
+        },
+    }
+
+
 def command_preflight(args: argparse.Namespace) -> None:
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
@@ -1555,6 +1914,9 @@ def command_preflight(args: argparse.Namespace) -> None:
     relations = stack_relations(metadata)
     merge_methods = repository_merge_methods(metadata["repo_name"])
     push_blockers = push_safety_blockers(metadata, relations)
+    detection = stack_membership(metadata)
+    default_branch = detection["default_branch"]
+    stack = detection["stack"]
 
     if state is None:
         state = {
@@ -1570,6 +1932,8 @@ def command_preflight(args: argparse.Namespace) -> None:
     state["pr"] = metadata
     state["relations"] = relations
     state["merge_methods"] = merge_methods
+    state["default_branch"] = default_branch
+    state["stack"] = stack
 
     max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
     scope = pipeline_scope(state, args)
@@ -1596,14 +1960,25 @@ def command_preflight(args: argparse.Namespace) -> None:
     except WorkflowError as error:
         strategy_error = str(error)
 
-    if push_blockers:
+    if push_blockers and stack is None:
         result = "unsafe_push"
     elif exhausted:
         result = "max_iterations_reached"
     elif mergeability == "mergeable":
         result = "mergeable"
+    elif stack is not None:
+        # A native GitHub stack resolves by cascading a rebase through the trunk,
+        # a whole-stack operation the single-branch strategies cannot express, so
+        # it is routed to its own path rather than through choose_strategy.
+        result = "stack_rebase"
     elif mergeability == "unknown":
         result = "unknown_mergeability"
+    elif metadata["base_branch"] != default_branch:
+        # The declared base is neither the default branch nor a native stack
+        # trunk, so GitHub measures mergeability against a different branch than
+        # the one this loop would merge in. Naming the real conflict beats
+        # rebasing onto the declared base and reporting a false clearance.
+        result = "ad_hoc_base"
     elif strategy_error is not None:
         result = "no_safe_strategy"
     else:
@@ -1635,8 +2010,18 @@ def command_preflight(args: argparse.Namespace) -> None:
             else None,
         }
         state["attempt"] = attempt
+    elif result == "stack_rebase":
+        state["attempt"] = planned_stack_attempt(metadata, stack, iteration)
     else:
         state["attempt"] = None
+
+    ad_hoc: dict[str, Any] | None = None
+    if result == "ad_hoc_base":
+        remote = find_remote(repo_root, metadata["repo_name"], push=False)
+        default_sha = base_ref_tip(metadata["repo_name"], default_branch)
+        ad_hoc = ad_hoc_escalation(
+            repo_root, remote, metadata, default_branch, default_sha
+        )
 
     if result in {"unsafe_push", "max_iterations_reached", "no_safe_strategy", "unknown_mergeability"}:
         record_escalation(
@@ -1652,7 +2037,15 @@ def command_preflight(args: argparse.Namespace) -> None:
             recommended_action="a person must decide how to proceed on this pull request",
             iteration=iteration,
         )
-    elif result in {"mergeable", "ready"}:
+    elif result == "ad_hoc_base":
+        record_escalation(
+            state,
+            kind="ad_hoc_base",
+            reason=ad_hoc["reason"],
+            recommended_action=ad_hoc["recommended_action"],
+            iteration=iteration,
+        )
+    elif result in {"mergeable", "ready", "stack_rebase"}:
         state["escalation"] = None
 
     save_state(state_path, state)
@@ -1669,6 +2062,9 @@ def command_preflight(args: argparse.Namespace) -> None:
         "relations": relations,
         "merge_methods": merge_methods,
         "push_blockers": push_blockers,
+        "default_branch": default_branch,
+        "stack": stack,
+        "ad_hoc": ad_hoc,
         "strategy": strategy_choice,
         "strategy_error": strategy_error,
         "escalation": state.get("escalation"),
@@ -1712,6 +2108,16 @@ def command_preflight(args: argparse.Namespace) -> None:
                 "history": len(state["history"]),
             },
             "stacked_on": relations["stacked_on"],
+            "default_branch": default_branch,
+            "stack": None
+            if stack is None
+            else {
+                "number": stack["number"],
+                "trunk": stack["trunk"],
+                "size": stack["size"],
+                "members": [member["number"] for member in stack["members"]],
+            },
+            "ad_hoc": ad_hoc,
             "escalation": state.get("escalation"),
             "iteration": iteration,
             "max_iterations": max_iterations,
@@ -1922,7 +2328,7 @@ def command_resolved(args: argparse.Namespace) -> None:
             f"no conflicted files are recorded for this attempt (status "
             f"{attempt['status']})"
         )
-    repo_root = Path(state["repo_root"])
+    repo_root = attempt_repo_root(state, attempt)
     conflicts = find_conflicts(attempt, args.paths)
     rationale = (
         load_text_input(args.rationale_file, "rationale")
@@ -2349,6 +2755,372 @@ def command_publish(args: argparse.Namespace) -> None:
     )
 
 
+def force_rmtree(path: Path) -> None:
+    """Remove a directory tree, clearing the read-only bit git sets on objects."""
+
+    def clear_readonly(function, target, _info):
+        os.chmod(target, stat.S_IWRITE)
+        function(target)
+
+    shutil.rmtree(path, ignore_errors=False, onerror=clear_readonly)
+
+
+def create_stack_workspace(pr: dict[str, Any]) -> Path:
+    """Clone the upstream repository into a throwaway directory for a cascade.
+
+    A cascade must check out and move every branch in the stack, which the App's
+    worktrees forbid because git refuses to check one branch out in two worktrees
+    of a repository. A separate clone has independent refs, so it can claim every
+    branch, and it holds none the App's worktrees hold. The clone is safe to
+    discard at any point because ``gh stack rebase`` rebases locally and pushes
+    nothing, so nothing on the remote moves until an explicit publish.
+    """
+    workspace = Path(tempfile.mkdtemp(prefix="conflict-fix-loop-stack."))
+    upstream = f"{pr['upstream_owner']}/{pr['upstream_repo']}"
+    clone = run(
+        ["gh", "repo", "clone", upstream, str(workspace), "--", "--no-single-branch"],
+        check=False,
+    )
+    if clone.returncode != 0:
+        detail = clone.stderr.strip() or clone.stdout.strip() or "no output"
+        force_rmtree(workspace)
+        raise WorkflowError(
+            f"could not clone {upstream} for the stack cascade: {detail}"
+        )
+    return workspace
+
+
+def remove_stack_workspace(attempt: dict[str, Any]) -> None:
+    """Delete a cascade's scratch clone and forget its path."""
+    stack = attempt.get("stack") or {}
+    workspace = stack.get("workspace")
+    if workspace and Path(workspace).exists():
+        force_rmtree(Path(workspace))
+    if stack:
+        stack["workspace"] = None
+
+
+def run_gh_stack_rebase(
+    workspace: Path, extra: list[str]
+) -> subprocess.CompletedProcess[str]:
+    environment = {**os.environ, "GIT_EDITOR": "true", "GIT_SEQUENCE_EDITOR": "true"}
+    return run(
+        ["gh", "stack", "rebase", *extra],
+        cwd=workspace,
+        check=False,
+        env=environment,
+    )
+
+
+def capture_member_tips(
+    workspace: Path, stack: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Read the local tip of every stack member after a clean cascade.
+
+    These are the commits publish must land on the remote, and the only commits
+    it may land: a member that ends up on anything else is the cascade's own
+    equivalent of the single-branch "nothing else moved" assertion, inverted to
+    "each member moved to exactly this".
+    """
+    tips = []
+    for member in stack["members"]:
+        rev = git_try(workspace, "rev-parse", f"refs/heads/{member['head_branch']}")
+        if rev.returncode != 0:
+            raise WorkflowError(
+                f"rebased branch {member['head_branch']!r} is missing from the "
+                "cascade workspace"
+            )
+        tips.append(
+            {
+                "number": member["number"],
+                "head_branch": member["head_branch"],
+                "head_sha": rev.stdout.strip(),
+            }
+        )
+    return tips
+
+
+def finish_stack_rebase(
+    state_path: Path,
+    state: dict[str, Any],
+    attempt: dict[str, Any],
+    workspace: Path,
+    process: subprocess.CompletedProcess[str],
+    verb: str,
+) -> None:
+    """Interpret a `gh stack rebase` (or `--continue`) result and record it.
+
+    Exit 0 means the whole cascade is clean; exit 3 means it stopped on a
+    conflict a person or the resolution machinery must clear before continuing;
+    every other documented code is a setup or state failure named by its cause
+    rather than mistaken for a conflict.
+    """
+    code = process.returncode
+    output = (process.stdout + process.stderr).strip()
+    stack = attempt["stack"]
+
+    if code == 0:
+        attempt["stack"]["members_after"] = capture_member_tips(workspace, stack)
+        attempt["status"] = "resolved"
+        attempt["command_output"] = output
+        save_state(state_path, state)
+        emit(
+            {
+                "result": "resolved",
+                "state": str(state_path),
+                "attempt": attempt_summary(attempt),
+                "members_after": attempt["stack"]["members_after"],
+                "next": "stack-publish",
+            }
+        )
+        return
+
+    if code == GH_STACK_CONFLICT_EXIT:
+        conflicts = collect_stack_conflicts(workspace)
+        attempt["conflicts"] = conflicts
+        attempt["conflict_signature"] = conflict_signature(
+            conflict["path"] for conflict in conflicts
+        )
+        attempt["status"] = "conflicted"
+        attempt["command_output"] = output
+        repeats = detect_no_progress(state["history"], attempt["conflict_signature"])
+        result = "no_progress" if repeats >= NO_PROGRESS_LIMIT else "conflicted"
+        if result == "no_progress":
+            attempt["status"] = "escalated"
+            record_escalation(
+                state,
+                kind="no_progress",
+                reason=(
+                    f"the last {repeats} finished attempts ended on this same set of "
+                    f"conflicted files: "
+                    f"{', '.join(conflict['path'] for conflict in conflicts)}"
+                ),
+                recommended_action="a person must resolve this conflict by hand",
+                iteration=attempt["iteration"],
+            )
+        save_state(state_path, state)
+        conflicts_path = write_conflicts_result(state_path, state, attempt, result)
+        emit_conflicts(
+            state_path,
+            conflicts_path,
+            state,
+            attempt,
+            result,
+            {"escalation": state.get("escalation"), "next": "resolved"},
+        )
+        return
+
+    # Any other documented exit is a setup or state failure, not a conflict. The
+    # workspace is aborted and removed so a half-cascaded stack is never left
+    # behind, and the message names the cause instead of reading as a failed
+    # resolution.
+    cause = GH_STACK_EXIT.get(code, f"exit code {code}")
+    if rebase_in_progress(workspace):
+        run_gh_stack_rebase(workspace, ["--abort"])
+    remove_stack_workspace(attempt)
+    save_state(state_path, state)
+    raise WorkflowError(
+        f"`gh stack {verb}` failed ({cause}): {output or 'no output'}"
+    )
+
+
+def command_stack_rebase(args: argparse.Namespace) -> None:
+    require_tools()
+    require_gh_stack()
+    state_path = cli_path(args.state)
+    state = load_state(state_path)
+    attempt = active_attempt(state)
+    if attempt.get("strategy") != "stack":
+        raise WorkflowError(
+            "this attempt is not a native-stack cascade; only preflight on a native "
+            "stack starts one"
+        )
+    if attempt["status"] != "planned":
+        raise WorkflowError(
+            f"this stack attempt is already {attempt['status']}; run preflight to "
+            "start the next one"
+        )
+    stack = attempt["stack"]
+    workspace = create_stack_workspace(state["pr"])
+    stack["workspace"] = str(workspace)
+    # Persist the workspace path before the rebase runs so a later abort can find
+    # and remove it even if this process is interrupted mid-cascade.
+    save_state(state_path, state)
+
+    checkout = run(
+        ["gh", "stack", "checkout", str(stack["invoked_number"])],
+        cwd=workspace,
+        check=False,
+    )
+    if checkout.returncode != 0:
+        detail = checkout.stderr.strip() or checkout.stdout.strip() or "no output"
+        remove_stack_workspace(attempt)
+        save_state(state_path, state)
+        raise WorkflowError(
+            f"could not check out the stack in the cascade workspace: {detail}"
+        )
+
+    process = run_gh_stack_rebase(workspace, [])
+    finish_stack_rebase(state_path, state, attempt, workspace, process, "rebase")
+
+
+def command_stack_continue(args: argparse.Namespace) -> None:
+    require_tools()
+    require_gh_stack()
+    state_path = cli_path(args.state)
+    state = load_state(state_path)
+    attempt = active_attempt(state)
+    if attempt.get("strategy") != "stack":
+        raise WorkflowError("this attempt is not a native-stack cascade")
+    workspace = attempt_repo_root(state, attempt)
+    if attempt["status"] != "conflicted":
+        raise WorkflowError(
+            f"a stack cascade can only be continued from a conflict, not from "
+            f"{attempt['status']}"
+        )
+    unresolved = [
+        conflict["path"]
+        for conflict in attempt.get("conflicts") or []
+        if conflict.get("status") != "resolved"
+    ]
+    if unresolved:
+        raise WorkflowError(f"these conflicted files are not resolved yet: {unresolved}")
+    still_unmerged = [entry["path"] for entry in unmerged_entries(workspace)]
+    if still_unmerged:
+        raise WorkflowError(
+            f"git still reports these paths as unmerged: {still_unmerged}"
+        )
+    process = run_gh_stack_rebase(workspace, ["--continue"])
+    finish_stack_rebase(state_path, state, attempt, workspace, process, "rebase --continue")
+
+
+def command_stack_abort(args: argparse.Namespace) -> None:
+    state_path = cli_path(args.state)
+    state = load_state(state_path)
+    attempt = state.get("attempt")
+    undone = None
+    if attempt is not None and attempt.get("strategy") == "stack":
+        workspace = (attempt.get("stack") or {}).get("workspace")
+        if workspace and Path(workspace).exists():
+            if rebase_in_progress(Path(workspace)):
+                run(
+                    ["gh", "stack", "rebase", "--abort"],
+                    cwd=Path(workspace),
+                    check=False,
+                )
+                undone = "stack-rebase"
+            remove_stack_workspace(attempt)
+    if attempt is not None and attempt.get("status") not in {"published"}:
+        attempt["status"] = "aborted"
+        archive_attempt(state)
+        state["attempt"] = None
+    save_state(state_path, state)
+    emit(
+        {
+            "result": "aborted",
+            "state": str(state_path),
+            "undone": undone,
+        }
+    )
+
+
+def command_stack_publish(args: argparse.Namespace) -> None:
+    require_tools()
+    require_gh_stack()
+    state_path = cli_path(args.state)
+    state = load_state(state_path)
+    attempt = active_attempt(state)
+    pr = state["pr"]
+    if attempt.get("strategy") != "stack":
+        raise WorkflowError("this attempt is not a native-stack cascade")
+    if attempt["status"] != "resolved":
+        raise WorkflowError(
+            f"only a resolved stack cascade can be published; this one is "
+            f"{attempt['status']}"
+        )
+    stack = attempt["stack"]
+    workspace = attempt_repo_root(state, attempt)
+    intended = stack.get("members_after")
+    if not intended:
+        raise WorkflowError(
+            "no rebased member tips were recorded; run stack-rebase to completion "
+            "before publishing"
+        )
+
+    # The user approved rewriting every member of the stack, including ones that
+    # are currently mergeable and under review, so `gh stack push` force-pushes
+    # each branch. Native-stack branches live in the upstream repository, so each
+    # member is verified there.
+    push = run(["gh", "stack", "push"], cwd=workspace, check=False)
+    if push.returncode != 0:
+        detail = push.stderr.strip() or push.stdout.strip() or "no output"
+        raise WorkflowError(f"`gh stack push` failed: {detail}")
+
+    mismatches = []
+    for member in intended:
+        landed = wait_for_remote_head(
+            pr["upstream_owner"],
+            pr["upstream_repo"],
+            member["head_branch"],
+            member["head_sha"],
+        )
+        if landed != member["head_sha"]:
+            mismatches.append(
+                {
+                    "number": member["number"],
+                    "head_branch": member["head_branch"],
+                    "expected": member["head_sha"],
+                    "actual": landed,
+                }
+            )
+    if mismatches:
+        described = "; ".join(
+            f"#{item['number']} {item['head_branch']} is at {item['actual']} not "
+            f"{item['expected']}"
+            for item in mismatches
+        )
+        raise WorkflowError(
+            "the stack push landed a member on an unexpected commit: " + described
+        )
+
+    invoked = next(
+        (
+            member
+            for member in intended
+            if member["number"] == stack["invoked_number"]
+        ),
+        None,
+    )
+    attempt["status"] = "published"
+    attempt["published_head_sha"] = None if invoked is None else invoked["head_sha"]
+    attempt["stack"]["members_published"] = intended
+    remove_stack_workspace(attempt)
+    state["iterations"] = int(state.get("iterations", 0)) + 1
+
+    target = parse_target(pr["pr_url"])
+    final = live_mergeability(target)
+    mergeability = classify_mergeability(final)
+    attempt["mergeable"] = final.get("mergeable")
+    attempt["merge_state_status"] = final.get("merge_state_status")
+    attempt["mergeable_at_head_sha"] = (
+        attempt["published_head_sha"] if mergeability == "mergeable" else None
+    )
+    state["pr"] = final
+    archive_attempt(state)
+    save_state(state_path, state)
+    emit(
+        {
+            "result": "published",
+            "state": str(state_path),
+            "members_published": intended,
+            "invoked_head_sha": attempt["published_head_sha"],
+            "mergeability": mergeability,
+            "mergeable_at_head_sha": attempt["mergeable_at_head_sha"],
+            "iterations": state["iterations"],
+        }
+    )
+
+
 def cleared_head_sha(state: dict[str, Any] | None) -> str | None:
     """The commit a run cleared the pull request at, or None when no run cleared one.
 
@@ -2615,6 +3387,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     publish.add_argument("--state", required=True)
     publish.set_defaults(function=command_publish)
+
+    stack_rebase = subparsers.add_parser(
+        "stack-rebase",
+        help="cascade a rebase through the trunk for a native GitHub stack",
+    )
+    stack_rebase.add_argument("--state", required=True)
+    stack_rebase.set_defaults(function=command_stack_rebase)
+
+    stack_continue = subparsers.add_parser(
+        "stack-continue",
+        help="continue a cascading rebase after resolving its conflicted files",
+    )
+    stack_continue.add_argument("--state", required=True)
+    stack_continue.set_defaults(function=command_stack_continue)
+
+    stack_abort = subparsers.add_parser(
+        "stack-abort",
+        help="abort a cascading rebase and remove its scratch clone",
+    )
+    stack_abort.add_argument("--state", required=True)
+    stack_abort.set_defaults(function=command_stack_abort)
+
+    stack_publish = subparsers.add_parser(
+        "stack-publish",
+        help="push every stack member and verify each landed on its rebased tip",
+    )
+    stack_publish.add_argument("--state", required=True)
+    stack_publish.set_defaults(function=command_stack_publish)
 
     status = subparsers.add_parser("status", help="print compact workflow state")
     status_source = status.add_mutually_exclusive_group(required=True)

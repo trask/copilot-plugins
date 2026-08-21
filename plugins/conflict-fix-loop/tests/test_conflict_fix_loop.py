@@ -362,6 +362,16 @@ class AgentInstructionsTest(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIn(f"- `{command}", self.instructions)
 
+    def test_documents_the_native_stack_subcommands(self):
+        for command in (
+            "stack-rebase",
+            "stack-continue",
+            "stack-abort",
+            "stack-publish",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(f"- `{command}", self.instructions)
+
     def test_documents_every_preflight_result(self):
         for result in (
             "ready",
@@ -370,9 +380,43 @@ class AgentInstructionsTest(unittest.TestCase):
             "max_iterations_reached",
             "unsafe_push",
             "no_safe_strategy",
+            "stack_rebase",
+            "ad_hoc_base",
         ):
             with self.subTest(result=result):
                 self.assertIn(f"`{result}`", self.instructions)
+
+    def test_explains_the_native_stack_cascade(self):
+        self.assertIn("## Native GitHub Stacks", self.instructions)
+        self.assertIn(
+            "Detection is the API's `pullRequest.stack`, never the branch name",
+            self.instructions,
+        )
+        self.assertIn(
+            "the cascade runs in a throwaway clone", self.instructions
+        )
+        self.assertIn(
+            "force-pushes every member of the stack, including ones that are "
+            "currently mergeable and under review",
+            self.instructions,
+        )
+        self.assertIn(
+            "Never widen the single-branch push guards to let a cascade through",
+            self.instructions,
+        )
+
+    def test_names_the_conflict_on_an_ad_hoc_base_rather_than_guessing(self):
+        self.assertIn(
+            "targets a branch that is neither the repository default branch nor a "
+            "native stack trunk",
+            self.instructions,
+        )
+        self.assertIn(
+            "names the branch and file that actually conflict", self.instructions
+        )
+        self.assertIn(
+            "do not rebase onto the declared base", self.instructions
+        )
 
     def test_reads_mergeability_live_and_never_claims_it_otherwise(self):
         self.assertIn(
@@ -1810,6 +1854,7 @@ class StateHelpersTest(unittest.TestCase):
                 "no_progress",
                 "unsafe_push",
                 "unknown_mergeability",
+                "ad_hoc_base",
                 "validation",
                 "other",
             ),
@@ -1947,6 +1992,8 @@ class PreflightTest(unittest.TestCase):
         strategy="auto",
         max_iterations=MODULE.DEFAULT_MAX_ITERATIONS,
         state=None,
+        detection=None,
+        ad_hoc=None,
     ):
         args = SimpleNamespace(
             target="owner/repo#7",
@@ -1955,6 +2002,14 @@ class PreflightTest(unittest.TestCase):
             strategy=strategy,
             max_iterations=max_iterations,
         )
+        ad_hoc = ad_hoc or {
+            "reason": "the head conflicts with develop in docs/list.yaml",
+            "recommended_action": "a person must resolve the conflict with develop",
+            "base_branch": "feature-base",
+            "base_conflicts": [],
+            "default_branch": "develop",
+            "default_conflicts": ["docs/list.yaml"],
+        }
         with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
             MODULE, "resolve_repo_root", return_value=self.directory
         ), mock.patch.object(
@@ -1967,6 +2022,16 @@ class PreflightTest(unittest.TestCase):
             MODULE, "checkout_pr_branch"
         ) as checkout, mock.patch.object(
             MODULE, "stack_relations", return_value=dict(relations or NO_RELATIONS)
+        ), mock.patch.object(
+            MODULE,
+            "stack_membership",
+            return_value=detection or {"default_branch": "main", "stack": None},
+        ), mock.patch.object(
+            MODULE, "find_remote", return_value="origin"
+        ), mock.patch.object(
+            MODULE, "base_ref_tip", return_value="defaultsha"
+        ), mock.patch.object(
+            MODULE, "ad_hoc_escalation", return_value=ad_hoc
         ), mock.patch.object(
             MODULE,
             "repository_merge_methods",
@@ -2090,6 +2155,101 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual("rebase", payload["strategy"])
         self.assertEqual("rebase", self.saved()["attempt"]["strategy"])
 
+    def test_a_native_stack_is_routed_to_a_cascade(self):
+        detection = {
+            "default_branch": "main",
+            "stack": {
+                "id": "S_1",
+                "number": 19578,
+                "size": 2,
+                "trunk": "main",
+                "members": [
+                    {
+                        "position": 0,
+                        "number": 19483,
+                        "head_branch": "v143",
+                        "base_branch": "main",
+                        "mergeable": "MERGEABLE",
+                        "head_sha": "aaa",
+                    },
+                    {
+                        "position": 1,
+                        "number": 7,
+                        "head_branch": "feature",
+                        "base_branch": "v143",
+                        "mergeable": "CONFLICTING",
+                        "head_sha": "head1",
+                    },
+                ],
+            },
+        }
+        payload = self.preflight(detection=detection)
+        self.assertEqual("stack_rebase", payload["result"])
+        self.assertIsNone(payload["escalation"])
+        state = self.saved()
+        attempt = state["attempt"]
+        self.assertEqual("planned", attempt["status"])
+        self.assertEqual("stack", attempt["strategy"])
+        self.assertEqual("main", attempt["stack"]["trunk"])
+        self.assertEqual(7, attempt["stack"]["invoked_number"])
+        self.assertEqual(
+            [19483, 7], [member["number"] for member in attempt["stack"]["members"]]
+        )
+        # The baseline head SHAs are captured so publish can prove what moved.
+        self.assertEqual("aaa", attempt["stack"]["members"][0]["head_sha"])
+
+    def test_a_native_stack_reads_its_default_branch_from_the_api(self):
+        # The trunk here is not the repository default branch, and neither is
+        # named `main`; the routing must still send a native stack to the cascade
+        # rather than assuming any particular branch name.
+        detection = {
+            "default_branch": "develop",
+            "stack": {
+                "id": "S_2",
+                "number": 40,
+                "size": 1,
+                "trunk": "release",
+                "members": [
+                    {
+                        "position": 0,
+                        "number": 7,
+                        "head_branch": "feature",
+                        "base_branch": "release",
+                        "mergeable": "CONFLICTING",
+                        "head_sha": "head1",
+                    }
+                ],
+            },
+        }
+        payload = self.preflight(
+            metadata=pr_metadata(base_branch="release"), detection=detection
+        )
+        self.assertEqual("stack_rebase", payload["result"])
+        self.assertEqual("develop", payload["default_branch"])
+
+    def test_an_ad_hoc_base_escalates_and_names_the_conflict(self):
+        # base_branch differs from the default branch and there is no native
+        # stack, so GitHub measures mergeability against a branch this loop would
+        # not merge in. The escalation names the real conflict.
+        detection = {"default_branch": "develop", "stack": None}
+        payload = self.preflight(
+            metadata=pr_metadata(base_branch="feature-base"), detection=detection
+        )
+        self.assertEqual("ad_hoc_base", payload["result"])
+        self.assertEqual("ad_hoc_base", payload["escalation"]["kind"])
+        self.assertIn("docs/list.yaml", payload["escalation"]["reason"])
+        self.assertIsNone(self.saved()["attempt"])
+
+    def test_a_default_branch_base_still_merges_even_when_not_main(self):
+        # The declared base is the repository default branch, so the existing
+        # merge path is correct even though the default branch is not `main`.
+        detection = {"default_branch": "develop", "stack": None}
+        payload = self.preflight(
+            metadata=pr_metadata(base_branch="develop"), detection=detection
+        )
+        self.assertEqual("ready", payload["result"])
+        self.assertEqual("merge", payload["strategy"])
+
     def test_the_default_state_path_is_used_when_none_is_given(self):
         args = SimpleNamespace(
             target="owner/repo#7",
@@ -2108,6 +2268,10 @@ class PreflightTest(unittest.TestCase):
             MODULE, "checkout_pr_branch"
         ), mock.patch.object(
             MODULE, "stack_relations", return_value=dict(NO_RELATIONS)
+        ), mock.patch.object(
+            MODULE,
+            "stack_membership",
+            return_value={"default_branch": "main", "stack": None},
         ), mock.patch.object(
             MODULE, "repository_merge_methods", return_value=dict(ALL_MERGE_METHODS)
         ), mock.patch.object(
@@ -4223,3 +4387,457 @@ class HeadBranchHeldElsewhereTest(unittest.TestCase):
             )
         self.assertTrue(attached)
         self.assertEqual(self.branch, self.git("branch", "--show-current"))
+
+
+def stack_attempt_record(**overrides):
+    attempt = {
+        "id": "pr-7-iteration-1",
+        "status": "planned",
+        "iteration": 1,
+        "strategy": "stack",
+        "strategy_reason": "cascade",
+        "strategy_warnings": [],
+        "head_sha": "head1",
+        "base_sha": "base1",
+        "merge_base": None,
+        "mergeable": "CONFLICTING",
+        "merge_state_status": "DIRTY",
+        "started_at": "2026-01-01T00:00:00Z",
+        "conflicts": [],
+        "conflict_signature": None,
+        "published_head_sha": None,
+        "mergeable_at_head_sha": None,
+        "stack": {
+            "number": 19578,
+            "size": 2,
+            "trunk": "main",
+            "invoked_number": 7,
+            "members": [
+                {
+                    "number": 19483,
+                    "head_branch": "v143",
+                    "base_branch": "main",
+                    "mergeable": "MERGEABLE",
+                    "head_sha": "aaa",
+                },
+                {
+                    "number": 7,
+                    "head_branch": "feature",
+                    "base_branch": "v143",
+                    "mergeable": "CONFLICTING",
+                    "head_sha": "head1",
+                },
+            ],
+            "workspace": None,
+            "members_after": None,
+        },
+    }
+    stack_overrides = overrides.pop("stack", None)
+    attempt.update(overrides)
+    if stack_overrides:
+        attempt["stack"].update(stack_overrides)
+    return attempt
+
+
+def stack_entry(position, number, head, base, mergeable="MERGEABLE", oid=None):
+    return {
+        "position": position,
+        "pullRequest": {
+            "number": number,
+            "headRefName": head,
+            "baseRefName": base,
+            "mergeable": mergeable,
+            "headRefOid": oid or f"oid{number}",
+        },
+    }
+
+
+class ParseStackTest(unittest.TestCase):
+    def raw(self, nodes, base="main"):
+        return {
+            "id": "S_1",
+            "number": 100,
+            "size": len(nodes),
+            "baseRefName": base,
+            "entries": {"nodes": nodes},
+        }
+
+    def test_members_are_ordered_by_position(self):
+        stack = MODULE.parse_stack(
+            self.raw(
+                [
+                    stack_entry(1, 7, "feature", "v143", "CONFLICTING"),
+                    stack_entry(0, 5, "v143", "main"),
+                ]
+            )
+        )
+        self.assertEqual([5, 7], [member["number"] for member in stack["members"]])
+        self.assertEqual("main", stack["trunk"])
+        self.assertEqual("oid7", stack["members"][1]["head_sha"])
+
+    def test_an_unreadable_member_is_skipped_not_fatal(self):
+        nodes = [
+            stack_entry(0, 5, "v143", "main"),
+            {"position": 1, "pullRequest": None},
+        ]
+        stack = MODULE.parse_stack(self.raw(nodes))
+        self.assertEqual([5], [member["number"] for member in stack["members"]])
+
+    def test_a_member_missing_a_required_field_is_a_hard_error(self):
+        node = stack_entry(0, 5, "v143", "main")
+        del node["pullRequest"]["headRefOid"]
+        with self.assertRaisesRegex(MODULE.WorkflowError, "missing a required field"):
+            MODULE.parse_stack(self.raw([node]))
+
+    def test_a_stack_with_no_trunk_is_a_hard_error(self):
+        raw = self.raw([stack_entry(0, 5, "v143", "main")])
+        del raw["baseRefName"]
+        with self.assertRaisesRegex(MODULE.WorkflowError, "no trunk branch"):
+            MODULE.parse_stack(raw)
+
+
+class StackMembershipTest(unittest.TestCase):
+    def membership(self, *, stack, default="main"):
+        payload = {
+            "data": {
+                "repository": {
+                    "defaultBranchRef": None if default is None else {"name": default},
+                    "pullRequest": {"stack": stack},
+                }
+            }
+        }
+        with mock.patch.object(MODULE, "graphql", return_value=payload) as query:
+            result = MODULE.stack_membership(pr_metadata())
+        self.query = query
+        return result
+
+    def test_a_null_stack_means_no_native_stack(self):
+        result = self.membership(stack=None)
+        self.assertIsNone(result["stack"])
+
+    def test_the_default_branch_is_read_from_the_api_not_assumed(self):
+        result = self.membership(stack=None, default="develop")
+        self.assertEqual("develop", result["default_branch"])
+
+    def test_a_present_stack_is_parsed_into_members(self):
+        raw = {
+            "id": "S_1",
+            "number": 100,
+            "size": 1,
+            "baseRefName": "main",
+            "entries": {"nodes": [stack_entry(0, 5, "v143", "main")]},
+        }
+        result = self.membership(stack=raw)
+        self.assertEqual([5], [member["number"] for member in result["stack"]["members"]])
+
+    def test_a_missing_default_branch_is_a_hard_error(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "no.*default branch"):
+            self.membership(stack=None, default=None)
+
+    def test_the_entries_page_is_bounded_so_the_stack_field_is_not_nulled(self):
+        self.membership(stack=None)
+        variables = self.query.call_args[0][1]
+        self.assertEqual(MODULE.STACK_ENTRIES_PAGE, variables["first"])
+
+
+class MergeTreeConflictsTest(unittest.TestCase):
+    def test_a_clean_merge_names_no_files(self):
+        with mock.patch.object(
+            MODULE, "git_try", return_value=completed(0, stdout="treeoid\n")
+        ):
+            self.assertEqual([], MODULE.merge_tree_conflicts(Path("."), "a", "b"))
+
+    def test_conflicted_files_are_parsed_up_to_the_blank_line(self):
+        out = (
+            "treeoid\n"
+            "docs/list.yaml\n"
+            "src/app.py\n"
+            "\n"
+            "Auto-merging docs/list.yaml\n"
+            "CONFLICT (content): Merge conflict in docs/list.yaml\n"
+        )
+        with mock.patch.object(
+            MODULE, "git_try", return_value=completed(1, stdout=out)
+        ):
+            self.assertEqual(
+                ["docs/list.yaml", "src/app.py"],
+                MODULE.merge_tree_conflicts(Path("."), "a", "b"),
+            )
+
+    def test_a_git_error_is_not_read_as_clean(self):
+        with mock.patch.object(
+            MODULE, "git_try", return_value=completed(128, stderr="unknown revision")
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "could not test-merge"):
+                MODULE.merge_tree_conflicts(Path("."), "a", "b")
+
+
+class AdHocEscalationTest(unittest.TestCase):
+    def escalate(self, base_conflicts, default_conflicts):
+        with mock.patch.object(MODULE, "fetch_reference"), mock.patch.object(
+            MODULE,
+            "merge_tree_conflicts",
+            side_effect=[base_conflicts, default_conflicts],
+        ):
+            return MODULE.ad_hoc_escalation(
+                Path("."),
+                "origin",
+                pr_metadata(base_branch="feature-base"),
+                "main",
+                "defaultsha",
+            )
+
+    def test_a_conflict_with_the_default_branch_names_it(self):
+        result = self.escalate([], ["docs/instrumentation-list.yaml"])
+        self.assertIn("docs/instrumentation-list.yaml", result["reason"])
+        self.assertIn("main", result["reason"])
+        self.assertEqual(["docs/instrumentation-list.yaml"], result["default_conflicts"])
+
+    def test_a_conflict_with_the_declared_base_names_it(self):
+        result = self.escalate(["src/app.py"], [])
+        self.assertIn("src/app.py", result["reason"])
+        self.assertIn("feature-base", result["reason"])
+
+    def test_clean_against_both_is_reported_honestly(self):
+        result = self.escalate([], [])
+        self.assertIn("neither merge", result["reason"])
+
+
+class RequireGhStackTest(unittest.TestCase):
+    def test_a_missing_extension_names_itself_not_a_conflict_failure(self):
+        with mock.patch.object(
+            MODULE, "run", return_value=completed(1, stderr="unknown command stack")
+        ):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "`gh stack` extension is required"
+            ):
+                MODULE.require_gh_stack()
+
+    def test_a_usable_extension_passes(self):
+        with mock.patch.object(MODULE, "run", return_value=completed(0)):
+            self.assertIsNone(MODULE.require_gh_stack())
+
+
+class AttemptRepoRootTest(unittest.TestCase):
+    def test_a_stack_attempt_stages_in_its_workspace(self):
+        state = {"repo_root": "/session"}
+        attempt = {"strategy": "stack", "stack": {"workspace": "/scratch"}}
+        self.assertEqual(Path("/scratch"), MODULE.attempt_repo_root(state, attempt))
+
+    def test_a_single_branch_attempt_stages_in_the_session_worktree(self):
+        self.assertEqual(
+            Path("/session"),
+            MODULE.attempt_repo_root({"repo_root": "/session"}, {"strategy": "merge"}),
+        )
+
+    def test_a_stack_attempt_without_a_workspace_is_refused(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "no cascade workspace"):
+            MODULE.attempt_repo_root({}, {"strategy": "stack", "stack": {}})
+
+
+class StackRebaseCommandTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = temporary_directory(self)
+        self.workspace = temporary_directory(self)
+
+    def run_rebase(self, *, checkout=None, rebase=None, members_after=None,
+                   conflicts=None, rebase_in_progress=False, attempt=None):
+        attempt = attempt or stack_attempt_record()
+        state_path = write_state(self.directory, attempt=attempt)
+
+        def fake_run(cmd, **kwargs):
+            head = cmd[:3]
+            if head == ["gh", "stack", "checkout"]:
+                return checkout or completed(0)
+            if head == ["gh", "stack", "rebase"]:
+                if "--abort" in cmd:
+                    return completed(0)
+                return rebase or completed(0)
+            return completed(0)
+
+        args = SimpleNamespace(state=str(state_path))
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "require_gh_stack"
+        ), mock.patch.object(
+            MODULE, "create_stack_workspace", return_value=self.workspace
+        ), mock.patch.object(
+            MODULE, "run", side_effect=fake_run
+        ), mock.patch.object(
+            MODULE, "capture_member_tips", return_value=members_after or []
+        ), mock.patch.object(
+            MODULE, "collect_stack_conflicts", return_value=conflicts or []
+        ), mock.patch.object(
+            MODULE, "rebase_in_progress", return_value=rebase_in_progress
+        ), mock.patch.object(
+            MODULE, "remove_stack_workspace"
+        ) as remove, mock.patch.object(
+            MODULE, "emit"
+        ) as emit:
+            self.error = None
+            try:
+                MODULE.command_stack_rebase(args)
+            except MODULE.WorkflowError as error:
+                self.error = error
+        self.state_path = state_path
+        self.remove = remove
+        self.emit = emit
+        return emitted(emit) if emit.called else None
+
+    def saved(self):
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def test_a_clean_cascade_resolves_and_records_the_rebased_tips(self):
+        tips = [
+            {"number": 19483, "head_branch": "v143", "head_sha": "newa"},
+            {"number": 7, "head_branch": "feature", "head_sha": "newf"},
+        ]
+        payload = self.run_rebase(rebase=completed(0), members_after=tips)
+        self.assertEqual("resolved", payload["result"])
+        self.assertEqual("stack-publish", payload["next"])
+        state = self.saved()
+        self.assertEqual("resolved", state["attempt"]["status"])
+        self.assertEqual(tips, state["attempt"]["stack"]["members_after"])
+
+    def test_a_rebase_conflict_surfaces_the_conflicted_files(self):
+        payload = self.run_rebase(
+            rebase=completed(MODULE.GH_STACK_CONFLICT_EXIT, stderr="CONFLICT"),
+            conflicts=[conflict_record("docs/list.yaml")],
+        )
+        self.assertEqual("conflicted", payload["result"])
+        self.assertEqual(["docs/list.yaml"], payload["conflict_paths"])
+        self.assertEqual("resolved", payload["next"])
+        self.assertEqual("conflicted", self.saved()["attempt"]["status"])
+
+    def test_stacks_not_enabled_fails_by_cause_and_removes_the_workspace(self):
+        self.run_rebase(rebase=completed(9, stderr="not enabled"))
+        self.assertIsNotNone(self.error)
+        self.assertIn("stacked pull requests are not enabled", str(self.error))
+        self.remove.assert_called_once()
+
+
+class StackPublishCommandTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = temporary_directory(self)
+        self.workspace = temporary_directory(self)
+        self.intended = [
+            {"number": 19483, "head_branch": "v143", "head_sha": "newa"},
+            {"number": 7, "head_branch": "feature", "head_sha": "newf"},
+        ]
+
+    def publish(self, *, push=None, landed=None, members_after="default",
+                final=None):
+        if members_after == "default":
+            members_after = self.intended
+        attempt = stack_attempt_record(
+            status="resolved",
+            stack={
+                "workspace": str(self.workspace),
+                "members_after": members_after,
+            },
+        )
+        state_path = write_state(self.directory, attempt=attempt)
+        landed = landed or {member["head_branch"]: member["head_sha"]
+                            for member in (members_after or [])}
+
+        def fake_wait(owner, repo, branch, expected):
+            return landed.get(branch)
+
+        args = SimpleNamespace(state=str(state_path))
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "require_gh_stack"
+        ), mock.patch.object(
+            MODULE, "run", return_value=push or completed(0)
+        ), mock.patch.object(
+            MODULE, "wait_for_remote_head", side_effect=fake_wait
+        ), mock.patch.object(
+            MODULE, "remove_stack_workspace"
+        ) as remove, mock.patch.object(
+            MODULE, "live_mergeability",
+            return_value=final or pr_metadata(mergeable="MERGEABLE"),
+        ), mock.patch.object(
+            MODULE, "emit"
+        ) as emit:
+            self.error = None
+            try:
+                MODULE.command_stack_publish(args)
+            except MODULE.WorkflowError as error:
+                self.error = error
+        self.state_path = state_path
+        self.remove = remove
+        return emitted(emit) if emit.called else None
+
+    def saved(self):
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def test_every_member_landing_on_its_intended_sha_publishes(self):
+        payload = self.publish()
+        self.assertEqual("published", payload["result"])
+        self.assertEqual("newf", payload["invoked_head_sha"])
+        self.assertEqual("mergeable", payload["mergeability"])
+        self.remove.assert_called_once()
+        self.assertEqual("published", self.saved()["attempt"]["status"])
+
+    def test_a_member_on_an_unexpected_commit_is_a_hard_error(self):
+        self.publish(landed={"v143": "newa", "feature": "wrong"})
+        self.assertIsNotNone(self.error)
+        self.assertIn("unexpected commit", str(self.error))
+        self.assertIn("#7", str(self.error))
+
+    def test_a_failed_push_is_a_hard_error(self):
+        self.publish(push=completed(1, stderr="denied"))
+        self.assertIsNotNone(self.error)
+        self.assertIn("`gh stack push` failed", str(self.error))
+
+    def test_publishing_without_recorded_tips_is_refused(self):
+        self.publish(members_after=None)
+        self.assertIsNotNone(self.error)
+        self.assertIn("no rebased member tips", str(self.error))
+
+
+class StackAbortCommandTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = temporary_directory(self)
+        self.workspace = temporary_directory(self)
+
+    def abort(self, *, rebase_in_progress=True):
+        attempt = stack_attempt_record(
+            status="conflicted",
+            stack={"workspace": str(self.workspace)},
+        )
+        state_path = write_state(self.directory, attempt=attempt)
+        args = SimpleNamespace(state=str(state_path))
+        with mock.patch.object(
+            MODULE, "rebase_in_progress", return_value=rebase_in_progress
+        ), mock.patch.object(
+            MODULE, "run"
+        ) as run, mock.patch.object(
+            MODULE, "remove_stack_workspace"
+        ) as remove, mock.patch.object(
+            MODULE, "emit"
+        ) as emit:
+            MODULE.command_stack_abort(args)
+        self.run = run
+        self.remove = remove
+        self.state_path = state_path
+        return emitted(emit)
+
+    def saved(self):
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def test_an_in_progress_cascade_is_aborted_and_the_workspace_removed(self):
+        payload = self.abort(rebase_in_progress=True)
+        self.assertEqual("aborted", payload["result"])
+        self.assertEqual("stack-rebase", payload["undone"])
+        abort_calls = [
+            call for call in self.run.call_args_list
+            if call.args[0][:4] == ["gh", "stack", "rebase", "--abort"]
+        ]
+        self.assertEqual(1, len(abort_calls))
+        self.remove.assert_called_once()
+        self.assertIsNone(self.saved()["attempt"])
+
+    def test_a_settled_cascade_still_removes_the_workspace(self):
+        payload = self.abort(rebase_in_progress=False)
+        self.assertEqual("aborted", payload["result"])
+        self.assertIsNone(payload["undone"])
+        self.remove.assert_called_once()

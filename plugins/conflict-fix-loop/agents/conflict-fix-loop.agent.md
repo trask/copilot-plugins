@@ -27,8 +27,8 @@ Run `preflight` first. After it succeeds, ensure the session name is `Conflict F
 - Never post an issue comment, a pull request comment, a review, a review comment, a reply, or a discussion post. Never resolve a review thread. Never edit the pull request title, description, labels, reviewers, or draft state. Pushing commits to the head branch is the only write this agent performs.
 - Resolve by keeping what both sides meant to do. Never just pick one side because it is easier, because it is newer, or because it makes the file compile.
 - Escalate when the two sides genuinely contradict each other. This agent runs unattended, so a guess is worse than a stop.
-- Never push to the base branch. Never push to any branch other than the pull request's own head branch. The helper builds the refspec, so do not push by hand.
-- Never rewrite a branch that another open pull request stacks on. The helper refuses this; do not work around it.
+- Never push to the base branch. Never push to any branch other than the pull request's own head branch. The helper builds the refspec, so do not push by hand. The single exception is a native GitHub stack, whose `stack-publish` force-pushes every member of the stack; even then the helper owns the push and you never push by hand.
+- Never rewrite a branch that another open pull request stacks on. The helper refuses this; do not work around it. This is the single-branch path; a native GitHub stack is the one place the whole stack is rewritten, and only through the helper's `stack-*` commands with the user's approval.
 - The maximum is 5 iterations, unless an outer loop sets its own. Hitting the cap is an escalation, not a normal completion.
 - Never stash, reset, discard, or force local work by hand to make `preflight` pass. Report the blocker instead.
 - Never run `git merge`, `git rebase`, `git push`, `git add`, `git commit`, `git reset`, or `git checkout` yourself for the integration. The helper owns every one of those, and its guards only hold when it runs them.
@@ -76,6 +76,10 @@ The deterministic, JSON-only helper provides:
 - `abort --state <path>`: undo the in-progress merge or rebase and end the attempt.
 - `escalate --state <path> --kind <kind> (--reason <text> | --reason-file <file-or->) [--recommended-action <text>]`: record why this run stopped and needs a person.
 - `publish --state <path>`: require a resolved attempt, a clean worktree, and a worktree that is not attached to some other branch, re-check the stacking guards, verify the push range before pushing, push only the head branch through an explicit refspec, prove the base branch and every dependent pull request did not move, wait for the pull request head to match, and read mergeability live again.
+- `stack-rebase --state <path>`: for a native GitHub stack only. Require the `gh stack` extension, clone the repository into a throwaway workspace, check the stack out there, and cascade a rebase through the trunk. On a clean cascade it records every member's rebased tip and hands off to `stack-publish`; on a conflict it reports the conflicted files and hands off to `resolved`, exactly as `attempt` does; any other outcome names its documented cause and removes the workspace.
+- `stack-continue --state <path>`: the stack analogue of `continue`. Require every conflicted file resolved, then resume the cascade with `gh stack rebase --continue`. It may report a fresh conflict set as the cascade climbs to a later member.
+- `stack-abort --state <path>`: abort the in-progress cascade with `gh stack rebase --abort`, which restores every branch, and remove the throwaway workspace. Nothing on the remote moved, because the cascade pushes nothing until `stack-publish`.
+- `stack-publish --state <path>`: require a resolved cascade, force-push every member of the stack, and then prove every member's remote branch landed on exactly the commit the cascade intended. A member on any other commit is a hard error, the stack analogue of proving nothing else moved.
 - `status [--state <path> | --current --repo-root <workspace>]`: write the complete snapshot to `status_path` and print a compact envelope carrying `result`, `stage_outcome` when there is a run to describe, `attempt`, `escalation`, `mergeable_at_head_sha`, `counts`, and `iterations`. It also carries `last_helper_activity`, the moment this helper last wrote its state. That is not proof the stage is alive, because the helper writes only when a subcommand runs and the agent driving it can think for a long time between two of them.
 - `cleanup --state <path>`: delete the state file along with its preflight, conflicts, and status files.
 
@@ -91,6 +95,8 @@ If an operation partly fails, keep its state and run that same operation again a
    - `mergeable`: GitHub already reports the pull request as mergeable. Stop at once and report that. Do not merge, rebase, or push anything.
    - `unknown_mergeability`: GitHub never finished computing mergeability. Stop and report it. The helper already waited.
    - `max_iterations_reached`: stop before you change anything, and report the cap as an escalation.
+   - `stack_rebase`: the pull request is part of a native GitHub stack, so the conflict belongs to the trunk. Resolve it with `stack-rebase`, not `attempt`, and follow the stack path (below) through to `stack-publish`.
+   - `ad_hoc_base`: the pull request targets a branch that is neither the repository default branch nor a native stack trunk, so GitHub measures mergeability against a branch this loop would not merge in. The escalation names the branch and file that actually conflict. Stop and report it; do not rebase onto the declared base.
    - `unsafe_push` or `no_safe_strategy`: stop and report the helper's blockers verbatim. Never look for a way around them.
 
 Read `relations`, `merge_methods`, `strategy`, and `push_blockers` from the complete result at `preflight_path`. When `relations.dependents` is not empty, say so in the final report even on a clean run, because the user needs to know the stack was involved.
@@ -115,6 +121,20 @@ The helper picks the strategy and explains why in `strategy.reason`.
 - `rebase` replays the head branch's commits on the new base. It rewrites the branch, so the helper only chooses it when a merge commit would block the repository's merge button, and it refuses it outright when another open pull request stacks on this branch.
 
 Do not argue with the choice and do not pass `--strategy` to override it unless the user asked for a specific strategy in this session.
+
+## Native GitHub Stacks
+
+Detection is the API's `pullRequest.stack`, never the branch name. A pull request whose declared base is another pull request in the same GitHub stack has its conflict on the trunk, not on the branch below it, so the fix is a rebase cascaded through the whole stack rather than a merge into one branch. `preflight` reports this as `stack_rebase`.
+
+A cascade must check out and move every branch in the stack in turn, but git refuses to check one branch out in two worktrees of a repository, and the App routinely holds those branches in other worktrees. So the cascade runs in a throwaway clone with its own refs, created and removed by the helper. This is safe because `gh stack rebase` rebases locally and pushes nothing, so nothing on the remote moves until `stack-publish`, and a discarded clone or an abort leaves every remote branch untouched.
+
+The flow is the single-branch flow with stack verbs:
+
+1. `stack-rebase`. On a conflict, resolve each file with `resolved` exactly as usual — the conflicted files carry absolute paths into the clone — then `stack-continue`. Repeat until the cascade is clean.
+2. `stack-publish`. It force-pushes every member of the stack, including ones that are currently mergeable and under review, because the user approved rewriting the whole stack. It then proves every member landed on exactly the commit the cascade intended and treats any other commit as a hard error.
+3. On any failure, `stack-abort` restores every branch and removes the clone.
+
+Never widen the single-branch push guards to let a cascade through. The cascade has its own publish path with its own inverted assertion; the original guards stay exactly as strict.
 
 ## Reading The Conflict
 
@@ -205,6 +225,7 @@ Stop and send the final report when any of these holds:
 - The helper reports `no_progress`, meaning two finished attempts in a row ended on the same set of conflicted files.
 - You escalated a contradiction, a validation failure, or an unsafe push.
 - `preflight` reports `unsafe_push`, `no_safe_strategy`, or `unknown_mergeability`.
+- `preflight` reports `ad_hoc_base`, meaning the pull request targets a non-default base that is not a native stack trunk and the escalation names the conflicting branch and file.
 
 ## Final Report
 
