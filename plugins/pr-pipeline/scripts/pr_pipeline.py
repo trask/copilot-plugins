@@ -791,7 +791,10 @@ query($owner:String!,$repo:String!,$refName:String!,$after:String){
 def current_pr_target(repo_root: Path) -> dict[str, Any]:
     branch = git(repo_root, "branch", "--show-current")
     if not branch:
-        raise WorkflowError("cannot resolve the current pull request from detached HEAD")
+        raise WorkflowError(
+            "cannot resolve the current pull request from detached HEAD, which "
+            "names no branch to look up; pass the pull request explicitly"
+        )
     upstream = configured_upstream(repo_root, branch)
 
     if upstream is None or branch == upstream["branch"]:

@@ -164,6 +164,21 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
+    def test_the_no_target_path_is_not_offered_to_a_detached_worktree(self):
+        """The loop detaches, so a step telling a caller to omit the target traps them.
+
+        `preflight` and `status --current` both resolve the pull request from the
+        checked-out branch, and a detached worktree names none.
+        """
+        self.assertIn(
+            "A detached worktree names no branch to look up", self.instructions
+        )
+        self.assertIn(
+            "ask the user which pull request to resolve and pass it explicitly",
+            self.instructions,
+        )
+        self.assertIn("`--current` reads the branch this worktree has checked out", self.instructions)
+
     def test_declares_the_frontmatter_keys_the_sibling_loops_use(self):
         self.assertIn("name: Conflict Fix Loop", self.instructions)
         self.assertIn(
@@ -565,6 +580,12 @@ class CurrentPullRequestTest(unittest.TestCase):
         with mock.patch.object(MODULE, "git", return_value=""):
             with self.assertRaisesRegex(MODULE.WorkflowError, "detached HEAD"):
                 MODULE.current_pr_target(Path("."))
+
+    def test_the_refusal_names_the_way_out(self):
+        with mock.patch.object(MODULE, "git", return_value=""):
+            with self.assertRaises(MODULE.WorkflowError) as refusal:
+                MODULE.current_pr_target(Path("."))
+        self.assertIn("pass the pull request explicitly", str(refusal.exception))
 
     def test_no_upstream_and_no_pull_request_reports_the_branch(self):
         with mock.patch.object(MODULE, "git", return_value="feature"), mock.patch.object(

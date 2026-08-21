@@ -84,8 +84,8 @@ If an operation partly fails, keep its state and run that same operation again a
 ## Target And Preflight
 
 1. If the user supplied a PR URL or `owner/repo#number`, use it exactly. For a bare PR number, combine it with the current workspace's GitHub repository as `owner/repo#number`.
-2. For a `resume` or `continue` with no target, run `status --current --repo-root <workspace>` first and report what it finds. Do not fall back to another pull request.
-3. For any other request with no target, run `preflight --repo-root <workspace>` with no target, so the helper resolves the pull request attached to the branch that is checked out.
+2. For a `resume` or `continue` with no target, run `status --current --repo-root <workspace>` first and report what it finds. Do not fall back to another pull request. `--current` reads the branch this worktree has checked out, so it too needs an attached worktree; from a detached one, ask the user which pull request to resume and pass `--state` for it instead.
+3. For any other request with no target, run `preflight --repo-root <workspace>` with no target, so the helper resolves the pull request attached to the branch that is checked out. That works only from a worktree attached to a branch. A detached worktree names no branch to look up, and the loop leaves this worktree detached once it starts, so ask the user which pull request to resolve and pass it explicitly.
 4. Handle the results as follows:
    - `ready`: the pull request is conflicting. Continue with `attempt`.
    - `mergeable`: GitHub already reports the pull request as mergeable. Stop at once and report that. Do not merge, rebase, or push anything.

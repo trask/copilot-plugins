@@ -4023,6 +4023,13 @@ class TargetParsingTest(unittest.TestCase):
         with self.assertRaises(MODULE.WorkflowError):
             MODULE.parse_target("not a pull request")
 
+    def test_a_detached_worktree_is_told_to_name_the_pull_request(self):
+        with mock.patch.object(MODULE, "git", return_value=""):
+            with self.assertRaises(MODULE.WorkflowError) as refusal:
+                MODULE.current_pr_target(Path("."))
+        self.assertIn("detached HEAD", str(refusal.exception))
+        self.assertIn("pass the pull request explicitly", str(refusal.exception))
+
 
 class StateRoundTripTest(unittest.TestCase):
     def test_state_survives_a_save_and_load(self):
@@ -4170,6 +4177,15 @@ class AgentInstructionsTest(unittest.TestCase):
         # The agent file is the only place the invocations are written down. A
         # documented `--repo-root` is how a second tree gets named in one run.
         self.assertNotIn("--repo-root", self.instructions)
+
+    def test_preflight_is_told_to_name_the_pull_request(self):
+        # `reset` detaches the worktree from the first stage onward, so resolving
+        # the pull request from the checked-out branch stops working the moment
+        # the run starts.
+        self.assertIn("Pass the target.", self.instructions)
+        self.assertIn(
+            "works only while the worktree is attached to one", self.instructions
+        )
 
     def test_every_local_head_escalation_is_named_for_the_reader(self):
         # Read off the source map, so a new verdict has to be documented rather
