@@ -192,6 +192,15 @@ ESCALATION_ACTIONS = {
         "pull request head. Push or reconcile the branch yourself, then start "
         "the pipeline again."
     ),
+    "local_head_diverged_from_remote": (
+        "The worktree is on the pull request's branch but its commits are not "
+        "the pull request's. Reconcile the branch yourself, then start the "
+        "pipeline again."
+    ),
+    "checkout_pr_head_failed": (
+        "The pipeline could not put its worktree on the pull request head. "
+        "Check out the pull request head by hand, then start the pipeline again."
+    ),
     "worktree_reset_failed": (
         "The pipeline could not return its worktree to a clean state between "
         "stages. Clean the worktree by hand, then start the pipeline again."
@@ -205,6 +214,26 @@ CHECK_FAILURE_STATES = frozenset(
 CHECK_PENDING_STATES = frozenset(
     {"PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "EXPECTED", "STALE"}
 )
+
+# How the pipeline's own worktree stands against the pull request head. Four
+# answers, because the count of commits the local head holds beyond the pull
+# request head cannot tell an extra commit from an unrelated history, and those
+# two need opposite treatment: one is a stage's work that must not be lost, the
+# other is a fresh session that has not been put on the pull request yet.
+LOCAL_HEAD_AT_PR_HEAD = "at_pr_head"
+LOCAL_HEAD_AHEAD = "ahead"
+LOCAL_HEAD_DIVERGED = "diverged"
+LOCAL_HEAD_NEEDS_CHECKOUT = "checkout_required"
+# The facts could not be read, so the pipeline neither escalates nor moves the
+# worktree. An answer never read is not one to act on in either direction.
+LOCAL_HEAD_UNKNOWN = "unknown"
+
+# The verdicts that hold commits the pipeline must not check out over, and the
+# escalation reason each one is reported under.
+LOCAL_HEAD_ESCALATIONS = {
+    LOCAL_HEAD_AHEAD: "local_head_ahead_of_remote",
+    LOCAL_HEAD_DIVERGED: "local_head_diverged_from_remote",
+}
 
 
 class WorkflowError(RuntimeError):
@@ -563,10 +592,34 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
         raise
 
 
-def resolve_repo_root(value: str | None) -> Path:
-    cwd = cli_path(value) if value else Path.cwd()
+def resolve_repo_root() -> Path:
+    """The worktree the pipeline itself is running in.
+
+    The process working directory is the only source. No command takes a repo
+    path, because a path supplied per invocation lets two commands in one run
+    name two different trees, and then a guard reads one tree while the stages
+    write another.
+    """
+
+    cwd = Path.cwd()
     output = run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"]).stdout.strip()
     return Path(output).resolve()
+
+
+def recorded_repo_root(state: dict[str, Any]) -> Path:
+    """The one worktree this run established, read back from the state.
+
+    ``preflight`` resolves it once and records it. Every later command reads it
+    from here, so the tree a guard inspects is the tree the stages run in.
+    """
+
+    value = state.get("repo_root")
+    if not isinstance(value, str) or not value.strip():
+        raise WorkflowError(
+            "the pipeline state records no repo_root; run preflight in the "
+            "worktree the pipeline runs in"
+        )
+    return Path(value)
 
 
 def github_repo_from_remote(url: str) -> str | None:
@@ -2144,7 +2197,7 @@ def record_escalation(
 
 def command_preflight(args: argparse.Namespace) -> None:
     require_tools()
-    repo_root = resolve_repo_root(args.repo_root)
+    repo_root = resolve_repo_root()
     target = resolve_target(args.target, repo_root)
     path = cli_path(args.state) if args.state else default_state_path(target)
     max_iterations = max(1, int(args.max_iterations))
@@ -2427,6 +2480,12 @@ def command_launch(args: argparse.Namespace) -> None:
     returns at once. The combined output goes to the log and never to the
     pipeline's context, because a stage can emit thousands of lines the pipeline
     decides nothing from.
+
+    The stage runs in the worktree this run recorded, never in whatever
+    directory the pipeline agent happened to invoke the helper from. That is
+    what makes the guards on that worktree mean anything: the tree `reset` puts
+    on the pull request head, and the tree `finish` checks for an unpushed
+    commit, is provably the tree the stage wrote in.
     """
 
     if not args.command:
@@ -2436,12 +2495,14 @@ def command_launch(args: argparse.Namespace) -> None:
         command = command[1:]
     if not command:
         raise WorkflowError("launch needs the stage command after --")
+    state = load_state(cli_path(args.state))
+    repo_root = recorded_repo_root(state)
     log_path = cli_path(args.log)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_handle = open(log_path, "w", encoding="utf-8")
     try:
         popen_kwargs: dict[str, Any] = {
-            "cwd": args.repo_root or None,
+            "cwd": str(repo_root),
             "stdout": log_handle,
             "stderr": subprocess.STDOUT,
             "stdin": subprocess.DEVNULL,
@@ -2461,6 +2522,7 @@ def command_launch(args: argparse.Namespace) -> None:
             "pid": process.pid,
             "process_create_time": process_create_time(process.pid),
             "log_path": str(log_path),
+            "repo_root": str(repo_root),
         }
     )
 
@@ -2549,22 +2611,43 @@ def command_wait(args: argparse.Namespace) -> None:
 
 
 def command_reset(args: argparse.Namespace) -> None:
-    """Ensure the shared worktree is clean before a stage launches."""
+    """Put the shared worktree on the pull request head, clean, before a launch.
+
+    Three things can be true of the worktree the pipeline runs in, and they need
+    opposite treatment, so the diagnosis comes first and the repair second.
+
+    A local head that holds the pull request head plus commits of its own is a
+    stage that committed without pushing. That work must not be discarded, so the
+    pipeline escalates. A worktree on the pull request's own branch whose commits
+    are not the pull request's has diverged, which is a different fault and says
+    so rather than claiming the branch is merely ahead. Anything else -- another
+    branch, an unrelated history, or simply an older head -- is a session that
+    has not been put on the pull request yet, and putting it there is a
+    precondition rather than a failure.
+
+    The provenance gate runs between the diagnosis and the checkout, and the
+    order is load bearing. Uncommitted changes that predate every stage in this
+    run are the user's, so the pipeline refuses instead of checking out over
+    them.
+    """
 
     path = cli_path(args.state)
     state = load_state(path)
-    repo_root = cli_path(args.repo_root) if args.repo_root else Path(state["repo_root"])
+    repo_root = recorded_repo_root(state)
     target = build_target(
         state["pr"]["owner"], state["pr"]["repo"], state["pr"]["number"]
     )
 
-    ahead = local_head_ahead_of_remote(repo_root, target)
-    if ahead is not None:
+    diagnosis = diagnose_local_head(
+        repo_root, target, head_branch=state["pr"].get("head_branch")
+    )
+    reason = LOCAL_HEAD_ESCALATIONS.get(diagnosis["verdict"])
+    if reason is not None:
         decision = {
             "stage": args.stage,
-            "reason": "local_head_ahead_of_remote",
-            "detail": ahead,
-            "next_action": ESCALATION_ACTIONS["local_head_ahead_of_remote"],
+            "reason": reason,
+            "detail": diagnosis["detail"],
+            "next_action": ESCALATION_ACTIONS[reason],
         }
         escalation = record_escalation(state, decision)
         save_state(path, state)
@@ -2584,45 +2667,205 @@ def command_reset(args: argparse.Namespace) -> None:
         emit({"result": "escalated", "state": str(path), "escalation": escalation})
         return
 
+    checked_out = False
+    if diagnosis["verdict"] == LOCAL_HEAD_NEEDS_CHECKOUT:
+        checkout = checkout_pr_head(repo_root, target, diagnosis["pr_head"])
+        if checkout["result"] == "escalate":
+            decision = {
+                "stage": args.stage,
+                "reason": checkout["reason"],
+                "detail": checkout["detail"],
+                "next_action": ESCALATION_ACTIONS[checkout["reason"]],
+            }
+            escalation = record_escalation(state, decision)
+            save_state(path, state)
+            emit({"result": "escalated", "state": str(path), "escalation": escalation})
+            return
+        checked_out = True
+
     emit(
         {
             "result": "ready",
             "state": str(path),
+            "repo_root": str(repo_root),
+            "local_head": diagnosis["verdict"],
+            "checked_out": checked_out,
+            "head_sha": diagnosis["pr_head"],
             "was_dirty": outcome.get("was_dirty", False),
             "reset": outcome["result"] == "reset",
         }
     )
 
 
-def local_head_ahead_of_remote(
-    repo_root: Path, target: dict[str, Any]
-) -> str | None:
-    """Detect a stage that committed without pushing.
+def git_succeeds(repo_root: Path, *arguments: str) -> bool:
+    return (
+        run(["git", "-C", str(repo_root), *arguments], check=False).returncode == 0
+    )
 
-    A local head ahead of the pull request's remote head is committed work the
-    reset must not discard. Resetting to the remote would silently drop it, and
-    carrying on trips a later preflight's head assertion. The pipeline escalates
-    instead. A local head that merely differs, or is behind, is not this case: a
-    stage that has not committed leaves the head where it was.
+
+def git_or_none(repo_root: Path, *arguments: str) -> str | None:
+    try:
+        return git(repo_root, *arguments)
+    except WorkflowError:
+        return None
+
+
+def classify_local_head(
+    *,
+    local_head: str | None,
+    pr_head: str | None,
+    on_pr_branch: bool,
+    descends_from_pr_head: bool,
+    ahead_count: int,
+) -> str:
+    """Say how the local head stands against the pull request head.
+
+    A count of commits beyond the pull request head cannot tell a stage's extra
+    commit from an unrelated branch, because both count above zero. Ancestry
+    tells them apart: a head that contains the pull request head carries the
+    pull request's work and something more, and nothing else does.
+
+    ``descends_from_pr_head`` is read before the branch, so a worktree detached
+    one commit past the pull request head still reads as a stage's unpushed
+    work. The branch only decides between divergence and a checkout, because
+    commits on a branch that is not the pull request's are that branch's own
+    business.
     """
 
-    try:
-        local_head = git(repo_root, "rev-parse", "HEAD")
-    except WorkflowError:
-        return None
-    remote_head = target_remote_head(target)
-    if not remote_head or local_head == remote_head:
-        return None
-    try:
-        ahead = git(repo_root, "rev-list", "--count", f"{remote_head}..{local_head}")
-    except WorkflowError:
-        return None
-    if ahead.strip() in ("", "0"):
-        return None
-    return (
-        f"the local branch is {ahead.strip()} commit(s) ahead of the pull "
-        f"request head {remote_head}; a stage committed without pushing"
+    if not local_head or not pr_head:
+        return LOCAL_HEAD_UNKNOWN
+    if local_head == pr_head:
+        return LOCAL_HEAD_AT_PR_HEAD
+    if descends_from_pr_head and ahead_count > 0:
+        return LOCAL_HEAD_AHEAD
+    if on_pr_branch and ahead_count > 0:
+        return LOCAL_HEAD_DIVERGED
+    return LOCAL_HEAD_NEEDS_CHECKOUT
+
+
+def diagnose_local_head(
+    repo_root: Path, target: dict[str, Any], *, head_branch: str | None = None
+) -> dict[str, Any]:
+    """Read the facts one worktree presents about the pull request head."""
+
+    local_head = git_or_none(repo_root, "rev-parse", "HEAD")
+    branch = git_or_none(repo_root, "branch", "--show-current") or ""
+    pr_head = target_remote_head(target)
+    ahead_count = 0
+    behind_count = 0
+    descends = False
+    if local_head and pr_head:
+        descends = git_succeeds(
+            repo_root, "merge-base", "--is-ancestor", pr_head, local_head
+        )
+        ahead_count = commit_count(repo_root, pr_head, local_head)
+        behind_count = commit_count(repo_root, local_head, pr_head)
+    verdict = classify_local_head(
+        local_head=local_head,
+        pr_head=pr_head,
+        on_pr_branch=bool(branch) and branch == head_branch,
+        descends_from_pr_head=descends,
+        ahead_count=ahead_count,
     )
+    where = f"branch {branch}" if branch else f"detached at {local_head}"
+    details = {
+        LOCAL_HEAD_UNKNOWN: (
+            "the pipeline could not read both the local head and the pull "
+            "request head, so it left the worktree alone"
+        ),
+        LOCAL_HEAD_AT_PR_HEAD: f"the worktree is on the pull request head {pr_head}",
+        LOCAL_HEAD_AHEAD: (
+            f"the local branch is {ahead_count} commit(s) ahead of the pull "
+            f"request head {pr_head}; a stage committed without pushing"
+        ),
+        LOCAL_HEAD_DIVERGED: (
+            f"the worktree is on the pull request branch {branch}, but its head "
+            f"{local_head} has diverged from the pull request head {pr_head}: "
+            f"{ahead_count} commit(s) here are not on the pull request and "
+            f"{behind_count} commit(s) on the pull request are not here"
+        ),
+        LOCAL_HEAD_NEEDS_CHECKOUT: (
+            f"the worktree is on {where}, which is not the pull request head "
+            f"{pr_head}, so the pipeline checks the pull request head out"
+        ),
+    }
+    return {
+        "verdict": verdict,
+        "local_head": local_head,
+        "pr_head": pr_head,
+        "branch": branch,
+        "head_branch": head_branch,
+        "ahead_count": ahead_count,
+        "behind_count": behind_count,
+        "detail": details[verdict],
+    }
+
+
+def commit_count(repo_root: Path, start: str, end: str) -> int:
+    counted = git_or_none(repo_root, "rev-list", "--count", f"{start}..{end}")
+    try:
+        return int((counted or "0").strip())
+    except ValueError:
+        return 0
+
+
+def pr_remote_name(repo_root: Path, target: dict[str, Any]) -> str:
+    """The remote that serves the pull request's own repository."""
+
+    listing = git_or_none(repo_root, "remote", "-v") or ""
+    wanted = str(target.get("repo_name") or "").lower()
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        named = github_repo_from_remote(fields[1])
+        if named and named.lower() == wanted:
+            return fields[0]
+    return "origin"
+
+
+def checkout_pr_head(
+    repo_root: Path, target: dict[str, Any], pr_head: str | None
+) -> dict[str, Any]:
+    """Put the worktree on the pull request head, detached.
+
+    The head is fetched through ``refs/pull/<number>/head`` because that ref
+    exists on the pull request's own repository whatever fork the branch lives
+    on. The checkout detaches on purpose: the pull request's branch is often
+    already checked out in the session worktree that opened it, and git refuses
+    to check the same branch out twice in one repository.
+    """
+
+    if not pr_head:
+        return {
+            "result": "escalate",
+            "reason": "checkout_pr_head_failed",
+            "detail": "the pipeline could not read the pull request head from GitHub",
+        }
+    remote = pr_remote_name(repo_root, target)
+    reference = f"refs/pull/{target['number']}/head"
+    try:
+        git(repo_root, "fetch", "--quiet", remote, reference)
+        git(repo_root, "checkout", "--quiet", "--detach", "FETCH_HEAD")
+    except WorkflowError as error:
+        return {
+            "result": "escalate",
+            "reason": "checkout_pr_head_failed",
+            "detail": (
+                f"the pipeline could not check out {reference} from {remote}: {error}"
+            ),
+        }
+    landed = git_or_none(repo_root, "rev-parse", "HEAD")
+    if landed != pr_head:
+        return {
+            "result": "escalate",
+            "reason": "checkout_pr_head_failed",
+            "detail": (
+                f"the worktree is on {landed} after checking out {reference} from "
+                f"{remote}, which is not the pull request head {pr_head}"
+            ),
+        }
+    return {"result": "checked_out", "head_sha": landed}
 
 
 def target_remote_head(target: dict[str, Any]) -> str | None:
@@ -2789,22 +3032,21 @@ def command_finish(args: argparse.Namespace) -> None:
     # underneath it. The reversible move is to stop and name the shas so a person,
     # or a deliberate re-run, pushes. `reset` already escalates on the same
     # condition rather than pushing.
-    repo_root = (
-        cli_path(args.repo_root)
-        if getattr(args, "repo_root", None)
-        else Path(state["repo_root"])
+    repo_root = recorded_repo_root(state)
+    diagnosis = diagnose_local_head(
+        repo_root, target, head_branch=state["pr"].get("head_branch")
     )
-    unpushed = local_head_ahead_of_remote(repo_root, target)
-    if unpushed is not None:
+    reason = LOCAL_HEAD_ESCALATIONS.get(diagnosis["verdict"])
+    if reason is not None:
         decision = {
             "stage": stage,
-            "reason": "local_head_ahead_of_remote",
+            "reason": reason,
             "detail": (
-                f"refusing to record an ending for {stage}: {unpushed}. Recording "
-                "it would let the next stage reset the worktree and discard the "
-                "commit."
+                f"refusing to record an ending for {stage}: {diagnosis['detail']}. "
+                "Recording it would let the next stage reset the worktree and "
+                "discard the commit."
             ),
-            "next_action": ESCALATION_ACTIONS["local_head_ahead_of_remote"],
+            "next_action": ESCALATION_ACTIONS[reason],
             "head_sha": head_sha,
         }
         escalation = record_escalation(state, decision)
@@ -3168,7 +3410,7 @@ def stage_activity(state: dict[str, Any]) -> dict[str, Any] | None:
 def command_status(args: argparse.Namespace) -> None:
     if args.current:
         require_tools()
-        repo_root = resolve_repo_root(args.repo_root)
+        repo_root = resolve_repo_root()
         target = current_pr_target(repo_root)
         path = default_state_path(target)
         if not path.is_file():
@@ -3258,7 +3500,6 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         help="PR URL, owner/repo#number, or bare number; omit to use the current PR",
     )
-    preflight.add_argument("--repo-root")
     preflight.add_argument("--state")
     preflight.add_argument(
         "--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS
@@ -3294,7 +3535,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     finish = subparsers.add_parser("finish", help="record how a stage ended")
     finish.add_argument("--state", required=True)
-    finish.add_argument("--repo-root", dest="repo_root")
     finish.add_argument("--stage", required=True, choices=list(STAGE_NAMES))
     finish.add_argument("--outcome", required=True, choices=list(STAGE_OUTCOMES))
     finish.add_argument("--head")
@@ -3339,7 +3579,6 @@ def build_parser() -> argparse.ArgumentParser:
     status_source = status.add_mutually_exclusive_group(required=True)
     status_source.add_argument("--state")
     status_source.add_argument("--current", action="store_true")
-    status.add_argument("--repo-root")
     status.set_defaults(function=command_status)
 
     cleanup = subparsers.add_parser("cleanup", help="delete the pipeline state")
@@ -3352,14 +3591,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reset.add_argument("--state", required=True)
     reset.add_argument("--stage", choices=list(STAGE_NAMES))
-    reset.add_argument("--repo-root")
     reset.set_defaults(function=command_reset)
 
     launch = subparsers.add_parser(
         "launch", help="spawn a stage subprocess writing to its log"
     )
+    launch.add_argument("--state", required=True)
     launch.add_argument("--log", required=True)
-    launch.add_argument("--repo-root")
     launch.add_argument("command", nargs=argparse.REMAINDER)
     launch.set_defaults(function=command_launch)
 

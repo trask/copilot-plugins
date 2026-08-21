@@ -1,12 +1,15 @@
 import contextlib
 import importlib.util
+import argparse
 import inspect
 import io
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -19,11 +22,82 @@ assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
-REAL_LOCAL_HEAD_AHEAD_OF_REMOTE = MODULE.local_head_ahead_of_remote
+REAL_DIAGNOSE_LOCAL_HEAD = MODULE.diagnose_local_head
 
 
 HEAD = "head1"
 NEXT_HEAD = "head2"
+
+
+def git_in(repo: Path, *arguments: str) -> str:
+    """Run one git command in a real repository built for a test."""
+
+    result = subprocess.run(
+        ["git", "-C", str(repo), *arguments],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@e",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@e",
+        },
+    )
+    return result.stdout.strip()
+
+
+def make_pull_request_remote(root: Path) -> dict:
+    """A real repository that publishes `refs/pull/<n>/head`, as GitHub does.
+
+    The pipeline fetches the pull request head through that ref, so a test that
+    stubs the fetch would never find out whether the ref it asks for exists.
+    """
+
+    remote = root / "remote"
+    remote.mkdir()
+    git_in(remote, "init", "-q", "-b", "main")
+    git_in(remote, "commit", "-q", "--allow-empty", "-m", "base")
+    base = git_in(remote, "rev-parse", "HEAD")
+    git_in(remote, "checkout", "-q", "-b", base_pr()["head_branch"])
+    git_in(remote, "commit", "-q", "--allow-empty", "-m", "the pull request")
+    pr_head = git_in(remote, "rev-parse", "HEAD")
+    git_in(remote, "update-ref", f"refs/pull/{base_pr()['number']}/head", pr_head)
+    git_in(remote, "checkout", "-q", "main")
+    return {"remote": remote, "base": base, "pr_head": pr_head}
+
+
+def clone_for_pipeline(root: Path, remote: Path, name: str) -> Path:
+    """A worktree the pipeline could run in, holding only the base branch.
+
+    Cloning a single branch matches what a session worktree carries: the pull
+    request head is not present until something fetches it.
+    """
+
+    local = root / name
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "-q",
+            "--single-branch",
+            "--branch",
+            "main",
+            str(remote),
+            str(local),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git_in(local, "config", "user.email", "t@e.st")
+    git_in(local, "config", "user.name", "test")
+    return local
+
+
+def fetch_pr_head(local: Path) -> None:
+    git_in(local, "fetch", "-q", "origin", f"refs/pull/{base_pr()['number']}/head")
 
 
 def base_pr() -> dict:
@@ -2329,19 +2403,79 @@ class CommandTestCase(unittest.TestCase):
         )
         self.confirm_calls = confirm.start()
         self.addCleanup(confirm.stop)
-        # No command test may reach git or GitHub to check whether a stage left an
-        # unpushed commit. The default is a branch level with its remote head, so
-        # `finish` records the ending; a test about a stage that committed without
-        # pushing sets self.unpushed itself.
-        self.unpushed = None
-        ahead = mock.patch.object(
-            MODULE, "local_head_ahead_of_remote", side_effect=lambda *_: self.unpushed
+        # No command test may reach git or GitHub to work out how the local head
+        # stands against the pull request head. The default is a worktree already
+        # sitting on the pull request head, so `reset` moves nothing and `finish`
+        # records the ending. A test about a stage that committed without
+        # pushing, or about a session that has not been put on the pull request
+        # yet, sets self.local_head itself.
+        self.local_head = MODULE.LOCAL_HEAD_AT_PR_HEAD
+        diagnosis = mock.patch.object(
+            MODULE,
+            "diagnose_local_head",
+            side_effect=lambda *_, **__: {
+                "verdict": self.local_head,
+                "local_head": HEAD,
+                "pr_head": HEAD,
+                "branch": base_pr()["head_branch"],
+                "head_branch": base_pr()["head_branch"],
+                "ahead_count": 0,
+                "behind_count": 0,
+                "detail": f"the worktree reads as {self.local_head}",
+            },
         )
-        ahead.start()
-        self.addCleanup(ahead.stop)
+        diagnosis.start()
+        self.addCleanup(diagnosis.stop)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
+
+    def in_directory(self, directory: Path):
+        """Run a command from another working directory, as the agent would."""
+
+        @contextlib.contextmanager
+        def moved():
+            previous = os.getcwd()
+            os.chdir(directory)
+            try:
+                yield
+            finally:
+                os.chdir(previous)
+
+        return moved()
+
+    def preflight_state(self, repo: Path, **values) -> Path:
+        """State as the real `preflight` writes it, run from inside `repo`.
+
+        The repo root is not stubbed: `preflight` resolves it from the working
+        directory the same way it does in a session, so the recorded value is
+        the one a real run would carry.
+        """
+
+        path = Path(values.pop("state", self.root / "pipeline.json"))
+        home = self.root / "home"
+        home.mkdir(exist_ok=True)
+        install_stage_script(home, *MODULE.STAGE_NAMES)
+        arguments = {
+            "target": "owner/repo#7",
+            "state": str(path),
+            "max_iterations": 2,
+            "stage_model": None,
+            "no_pin": False,
+        }
+        arguments.update(values)
+        previous = os.getcwd()
+        os.chdir(repo)
+        try:
+            with mock.patch.object(MODULE, "require_tools"):
+                with mock.patch.object(
+                    MODULE, "collect_observation", return_value=observation()
+                ):
+                    with mock.patch.object(MODULE, "copilot_home", return_value=home):
+                        MODULE.command_preflight(self.args(**arguments))
+        finally:
+            os.chdir(previous)
+        return path
 
     def github_disagrees(self, reason: str = "mergeable_unknown") -> None:
         self.confirmation = {"checked": True, "green": False, "reason": reason}
@@ -2551,13 +2685,13 @@ class FinishCommandTest(CommandTestCase):
         fix_sha = git("rev-parse", "HEAD")
 
         path = self.running_state(MODULE.STAGE_COPILOT_REVIEW, repo_root=str(repo))
-        # The real detector runs; only the network read of the PR head is stubbed
+        # The real diagnosis runs; only the network read of the PR head is stubbed
         # to the commit that is actually published.
         with (
             mock.patch.object(
                 MODULE,
-                "local_head_ahead_of_remote",
-                REAL_LOCAL_HEAD_AHEAD_OF_REMOTE,
+                "diagnose_local_head",
+                REAL_DIAGNOSE_LOCAL_HEAD,
             ),
             mock.patch.object(MODULE, "target_remote_head", return_value=pr_head),
         ):
@@ -3473,7 +3607,7 @@ class StatusCommandTest(CommandTestCase):
                 {"stage": MODULE.STAGE_SELF_REVIEW, "outcome": "no_progress"},
             ],
         )
-        MODULE.command_status(self.args(state=str(path), current=False, repo_root=None))
+        MODULE.command_status(self.args(state=str(path), current=False))
         payload = self.emitted[-1]
         self.assertEqual("ready", payload["result"])
         self.assertEqual(2, payload["counts"]["history"])
@@ -3493,7 +3627,7 @@ class StatusCommandTest(CommandTestCase):
         with self.assertRaises(MODULE.WorkflowError):
             MODULE.command_status(
                 self.args(
-                    state=str(self.root / "missing.json"), current=False, repo_root=None
+                    state=str(self.root / "missing.json"), current=False
                 )
             )
 
@@ -3586,7 +3720,7 @@ class StageActivityTest(CommandTestCase):
             },
         ):
             MODULE.command_status(
-                self.args(state=str(path), current=False, repo_root=None)
+                self.args(state=str(path), current=False)
             )
         payload = self.emitted[-1]
         self.assertEqual(MODULE.STAGE_CI, payload["activity"]["stage"])
@@ -3597,7 +3731,7 @@ class StageActivityTest(CommandTestCase):
 
     def test_status_without_a_running_stage_reports_no_activity(self):
         path = write_state(self.root)
-        MODULE.command_status(self.args(state=str(path), current=False, repo_root=None))
+        MODULE.command_status(self.args(state=str(path), current=False))
         payload = self.emitted[-1]
         self.assertIsNone(payload["activity"])
         snapshot = json.loads(Path(payload["status_path"]).read_text(encoding="utf-8"))
@@ -3619,7 +3753,7 @@ class StageActivityTest(CommandTestCase):
 class CleanupCommandTest(CommandTestCase):
     def test_cleanup_removes_the_state_and_its_snapshot(self):
         path = write_state(self.root)
-        MODULE.command_status(self.args(state=str(path), current=False, repo_root=None))
+        MODULE.command_status(self.args(state=str(path), current=False))
         status_path = MODULE.status_path_for(path)
         self.assertTrue(status_path.is_file())
         MODULE.command_cleanup(self.args(state=str(path), force=False))
@@ -3641,7 +3775,6 @@ class PreflightCommandTest(CommandTestCase):
     def call_preflight(self, observed: dict, *, installed=(), **values):
         arguments = {
             "target": "owner/repo#7",
-            "repo_root": str(self.root),
             "state": str(self.root / "pipeline.json"),
             "max_iterations": 2,
             "stage_model": None,
@@ -3757,7 +3890,6 @@ class PreflightCommandTest(CommandTestCase):
                     MODULE.command_preflight(
                         self.args(
                             target="owner/repo#7",
-                            repo_root=str(self.root),
                             state=str(self.root / "pipeline.json"),
                             max_iterations=2,
                             stage_model=None,
@@ -4012,13 +4144,26 @@ class AgentInstructionsTest(unittest.TestCase):
         # position; the agent runs that command verbatim through `launch` rather
         # than choosing between target and prompt itself.
         self.assertIn(
-            "`launch --log <plan log_path> -- <plan command>`", self.instructions
+            "`launch --state <path> --log <plan log_path> -- <plan command>`",
+            self.instructions,
         )
         state = build_state(run_id="abc123")
         plan = MODULE.launch_plan(state, MODULE.STAGE_CI)
         self.assertIn("-p", plan["command"])
         prompt = plan["command"][plan["command"].index("-p") + 1]
         self.assertIn(MODULE.PIPELINE_RUN_FLAG.lstrip("-"), prompt)
+
+    def test_the_documented_invocations_never_pass_a_repository_path(self):
+        # The agent file is the only place the invocations are written down. A
+        # documented `--repo-root` is how a second tree gets named in one run.
+        self.assertNotIn("--repo-root", self.instructions)
+
+    def test_every_local_head_escalation_is_named_for_the_reader(self):
+        # Read off the source map, so a new verdict has to be documented rather
+        # than left for the agent to meet unannounced.
+        for verdict, reason in MODULE.LOCAL_HEAD_ESCALATIONS.items():
+            with self.subTest(verdict=verdict):
+                self.assertIn(reason, self.instructions)
 
     def test_the_pass_flows_forward_and_only_loops_at_its_end(self):
         """The prose is what the next reader reinstates, so it has to say which it is.
@@ -4472,9 +4617,7 @@ class WaitCommandTest(CommandTestCase):
 
 class ResetCommandTest(CommandTestCase):
     def reset_args(self, path):
-        return self.args(
-            state=str(path), stage=MODULE.STAGE_SELF_REVIEW, repo_root=str(self.root)
-        )
+        return self.args(state=str(path), stage=MODULE.STAGE_SELF_REVIEW)
 
     def make_dirty_repo(self) -> Path:
         """A real git repo dirtied the way a user or a stage would leave it.
@@ -4638,9 +4781,8 @@ class ResetCommandTest(CommandTestCase):
 
     def test_dirt_before_any_stage_has_run_is_the_users_and_escalates(self):
         path = write_state(self.root, history=[], iteration=1, running=None)
-        with mock.patch.object(MODULE, "local_head_ahead_of_remote", return_value=None):
-            with mock.patch.object(MODULE, "worktree_dirt", return_value=" M file.py"):
-                MODULE.command_reset(self.reset_args(path))
+        with mock.patch.object(MODULE, "worktree_dirt", return_value=" M file.py"):
+            MODULE.command_reset(self.reset_args(path))
         state = MODULE.load_state(path)
         self.assertEqual("escalated", self.emitted[-1]["result"])
         self.assertEqual("dirty_worktree_before_run", state["escalation"]["reason"])
@@ -4653,12 +4795,11 @@ class ResetCommandTest(CommandTestCase):
             history=[{"stage": MODULE.STAGE_CONFLICT, "run_id": "RUNX"}],
         )
         dirt = iter([" M file.py", ""])
-        with mock.patch.object(MODULE, "local_head_ahead_of_remote", return_value=None):
-            with mock.patch.object(
-                MODULE, "worktree_dirt", side_effect=lambda *_: next(dirt)
-            ):
-                with mock.patch.object(MODULE, "git", return_value="") as git:
-                    MODULE.command_reset(self.reset_args(path))
+        with mock.patch.object(
+            MODULE, "worktree_dirt", side_effect=lambda *_: next(dirt)
+        ):
+            with mock.patch.object(MODULE, "git", return_value="") as git:
+                MODULE.command_reset(self.reset_args(path))
         self.assertEqual("ready", self.emitted[-1]["result"])
         self.assertTrue(self.emitted[-1]["reset"])
         calls = [tuple(call.args[1:]) for call in git.call_args_list]
@@ -4672,25 +4813,406 @@ class ResetCommandTest(CommandTestCase):
         path = write_state(
             self.root, iteration=1, history=[{"stage": MODULE.STAGE_CONFLICT}]
         )
-        with mock.patch.object(
-            MODULE,
-            "local_head_ahead_of_remote",
-            return_value="the local branch is 1 commit(s) ahead",
-        ):
-            MODULE.command_reset(self.reset_args(path))
+        self.local_head = MODULE.LOCAL_HEAD_AHEAD
+        MODULE.command_reset(self.reset_args(path))
         state = MODULE.load_state(path)
         self.assertEqual("escalated", self.emitted[-1]["result"])
-        self.assertEqual("local_head_ahead_of_remote", state["escalation"]["reason"])
+        self.assertEqual(
+            MODULE.LOCAL_HEAD_ESCALATIONS[MODULE.LOCAL_HEAD_AHEAD],
+            state["escalation"]["reason"],
+        )
+
+    def test_a_diverged_local_head_escalates_instead_of_resetting(self):
+        path = write_state(
+            self.root, iteration=1, history=[{"stage": MODULE.STAGE_CONFLICT}]
+        )
+        self.local_head = MODULE.LOCAL_HEAD_DIVERGED
+        MODULE.command_reset(self.reset_args(path))
+        state = MODULE.load_state(path)
+        self.assertEqual("escalated", self.emitted[-1]["result"])
+        self.assertEqual(
+            MODULE.LOCAL_HEAD_ESCALATIONS[MODULE.LOCAL_HEAD_DIVERGED],
+            state["escalation"]["reason"],
+        )
 
     def test_a_clean_tree_is_ready_without_a_reset(self):
         path = write_state(
             self.root, iteration=1, history=[{"stage": MODULE.STAGE_CONFLICT}]
         )
-        with mock.patch.object(MODULE, "local_head_ahead_of_remote", return_value=None):
-            with mock.patch.object(MODULE, "worktree_dirt", return_value=""):
-                MODULE.command_reset(self.reset_args(path))
+        with mock.patch.object(MODULE, "worktree_dirt", return_value=""):
+            MODULE.command_reset(self.reset_args(path))
         self.assertEqual("ready", self.emitted[-1]["result"])
         self.assertFalse(self.emitted[-1]["reset"])
+
+
+class RecordedRepoRootTest(CommandTestCase):
+    """One worktree per run, established once and read back everywhere."""
+
+    def make_repo(self, name: str) -> Path:
+        repo = self.root / name
+        repo.mkdir()
+        git_in(repo, "init", "-q", "-b", "main")
+        git_in(repo, "config", "user.email", "t@e.st")
+        git_in(repo, "config", "user.name", "test")
+        git_in(repo, "commit", "-q", "--allow-empty", "-m", "base")
+        return repo
+
+    def test_no_subcommand_accepts_a_repo_root_flag(self):
+        # Walked off the parser rather than listed here, so a flag added back to
+        # any subcommand fails without the test having to name it.
+        parser = MODULE.build_parser()
+        subparsers = [
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        ]
+        self.assertTrue(subparsers)
+        offenders = []
+        for action in subparsers:
+            for name, sub in action.choices.items():
+                for option in sub._actions:
+                    if any(
+                        flag.startswith("--repo-root") for flag in option.option_strings
+                    ):
+                        offenders.append(name)
+        self.assertEqual([], offenders)
+
+    def test_the_worktree_commands_read_the_recorded_root(self):
+        # `reset`, `launch`, and `finish` are the three that act on a worktree.
+        # Reading `args.repo_root` in any of them is the defect returning.
+        for command in ("command_reset", "command_launch", "command_finish"):
+            with self.subTest(command=command):
+                source = inspect.getsource(getattr(MODULE, command))
+                self.assertIn("recorded_repo_root(state)", source)
+                self.assertNotIn("args.repo_root", source)
+
+    def test_preflight_records_the_worktree_it_was_run_from(self):
+        repo = self.make_repo("session")
+        other = self.make_repo("elsewhere")
+        path = self.preflight_state(repo)
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(repo.resolve(), Path(state["repo_root"]).resolve())
+        self.assertNotEqual(other.resolve(), Path(state["repo_root"]).resolve())
+
+    def test_a_state_without_a_recorded_root_refuses_to_guess(self):
+        state = build_state()
+        del state["repo_root"]
+        with self.assertRaises(MODULE.WorkflowError) as caught:
+            MODULE.recorded_repo_root(state)
+        self.assertIn("repo_root", str(caught.exception))
+
+    def test_a_stage_runs_in_the_recorded_worktree_not_the_callers(self):
+        # The production topology: `preflight` ran in one worktree and the agent
+        # invokes `launch` from another. The stage has to land in the recorded
+        # one, or every guard on that tree inspects a tree nothing writes to.
+        recorded = self.make_repo("recorded")
+        caller = self.make_repo("caller")
+        path = self.preflight_state(recorded)
+        witness = self.root / "cwd.txt"
+        program = (
+            "import os, pathlib; "
+            f"pathlib.Path({str(witness)!r}).write_text(os.getcwd(), encoding='utf-8')"
+        )
+        with self.in_directory(caller):
+            MODULE.command_launch(
+                self.args(
+                    state=str(path),
+                    log=str(self.root / "stage.log"),
+                    command=[sys.executable, "-c", program],
+                )
+            )
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not witness.is_file():
+            time.sleep(0.05)
+        self.assertTrue(witness.is_file(), "the stage process never reported a cwd")
+        self.assertEqual(
+            recorded.resolve(),
+            Path(witness.read_text(encoding="utf-8")).resolve(),
+        )
+        self.assertEqual(
+            recorded.resolve(), Path(self.emitted[-1]["repo_root"]).resolve()
+        )
+
+
+class FinishGuardFollowsTheRecordedRootTest(CommandTestCase):
+    """The unpushed-commit guard must read the tree the stage wrote in."""
+
+    def test_an_unpushed_commit_in_the_recorded_tree_refuses_the_ending(self):
+        # Two trees, as in the live run. The stage's commit is in the recorded
+        # one; the pipeline agent's own directory is a clean tree sitting on the
+        # published head. A guard that followed the caller would see nothing.
+        published = make_pull_request_remote(self.root)
+        stage_tree = clone_for_pipeline(self.root, published["remote"], "stage")
+        fetch_pr_head(stage_tree)
+        git_in(stage_tree, "checkout", "-q", "--detach", published["pr_head"])
+        caller = clone_for_pipeline(self.root, published["remote"], "caller")
+        fetch_pr_head(caller)
+        git_in(caller, "checkout", "-q", "--detach", published["pr_head"])
+
+        with mock.patch.object(
+            MODULE, "target_remote_head", return_value=published["pr_head"]
+        ):
+            path = self.preflight_state(stage_tree)
+            (stage_tree / "fix.txt").write_text("the stage's work\n", encoding="utf-8")
+            git_in(stage_tree, "add", "fix.txt")
+            git_in(stage_tree, "commit", "-q", "-m", "fix, never pushed")
+            unpushed = git_in(stage_tree, "rev-parse", "HEAD")
+            MODULE.command_start(
+                self.args(
+                    state=str(path),
+                    stage=MODULE.STAGE_SELF_REVIEW,
+                    head=published["pr_head"],
+                    launch="subprocess",
+                    session=None,
+                    process=None,
+                    log=None,
+                )
+            )
+            with (
+                mock.patch.object(
+                    MODULE, "diagnose_local_head", REAL_DIAGNOSE_LOCAL_HEAD
+                ),
+                self.in_directory(caller),
+            ):
+                MODULE.command_finish(
+                    self.args(
+                        state=str(path),
+                        stage=MODULE.STAGE_SELF_REVIEW,
+                        outcome=MODULE.CLEARING_OUTCOMES[0],
+                        head=published["pr_head"],
+                        detail=None,
+                        session=None,
+                        process=None,
+                        commit=None,
+                    )
+                )
+
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual("escalated", self.emitted[-1]["result"])
+        self.assertEqual(
+            MODULE.LOCAL_HEAD_ESCALATIONS[MODULE.LOCAL_HEAD_AHEAD],
+            state["escalation"]["reason"],
+        )
+        self.assertIn(published["pr_head"], state["escalation"]["detail"])
+        # The commit the guard was protecting is still there.
+        self.assertEqual(unpushed, git_in(stage_tree, "rev-parse", "HEAD"))
+
+
+class ClassifyLocalHeadTest(unittest.TestCase):
+    """The verdict table, read off the source constants."""
+
+    def test_the_fact_space_maps_to_the_source_verdicts(self):
+        cases = [
+            (
+                "neither head could be read",
+                {
+                    "local_head": None,
+                    "pr_head": "aaa",
+                    "on_pr_branch": False,
+                    "descends_from_pr_head": False,
+                    "ahead_count": 0,
+                },
+                MODULE.LOCAL_HEAD_UNKNOWN,
+            ),
+            (
+                "the pull request head is unreadable",
+                {
+                    "local_head": "aaa",
+                    "pr_head": None,
+                    "on_pr_branch": True,
+                    "descends_from_pr_head": True,
+                    "ahead_count": 3,
+                },
+                MODULE.LOCAL_HEAD_UNKNOWN,
+            ),
+            (
+                "already on the pull request head",
+                {
+                    "local_head": "aaa",
+                    "pr_head": "aaa",
+                    "on_pr_branch": True,
+                    "descends_from_pr_head": True,
+                    "ahead_count": 0,
+                },
+                MODULE.LOCAL_HEAD_AT_PR_HEAD,
+            ),
+            (
+                "a stage committed without pushing, on the branch",
+                {
+                    "local_head": "bbb",
+                    "pr_head": "aaa",
+                    "on_pr_branch": True,
+                    "descends_from_pr_head": True,
+                    "ahead_count": 1,
+                },
+                MODULE.LOCAL_HEAD_AHEAD,
+            ),
+            (
+                "a stage committed without pushing, detached",
+                {
+                    "local_head": "bbb",
+                    "pr_head": "aaa",
+                    "on_pr_branch": False,
+                    "descends_from_pr_head": True,
+                    "ahead_count": 1,
+                },
+                MODULE.LOCAL_HEAD_AHEAD,
+            ),
+            (
+                "on the pull request branch, but the histories parted",
+                {
+                    "local_head": "bbb",
+                    "pr_head": "aaa",
+                    "on_pr_branch": True,
+                    "descends_from_pr_head": False,
+                    "ahead_count": 7,
+                },
+                MODULE.LOCAL_HEAD_DIVERGED,
+            ),
+            (
+                "a fresh session on its own branch, 7 ahead and 1 behind",
+                {
+                    "local_head": "bbb",
+                    "pr_head": "aaa",
+                    "on_pr_branch": False,
+                    "descends_from_pr_head": False,
+                    "ahead_count": 7,
+                },
+                MODULE.LOCAL_HEAD_NEEDS_CHECKOUT,
+            ),
+            (
+                "simply behind the pull request head",
+                {
+                    "local_head": "bbb",
+                    "pr_head": "aaa",
+                    "on_pr_branch": True,
+                    "descends_from_pr_head": False,
+                    "ahead_count": 0,
+                },
+                MODULE.LOCAL_HEAD_NEEDS_CHECKOUT,
+            ),
+        ]
+        for label, facts, expected in cases:
+            with self.subTest(label):
+                self.assertEqual(expected, MODULE.classify_local_head(**facts))
+
+    def test_only_the_two_faults_escalate(self):
+        # Derived from the source map, so a verdict that gains or loses an
+        # escalation has to be stated in the source, not in the test.
+        self.assertEqual(
+            {MODULE.LOCAL_HEAD_AHEAD, MODULE.LOCAL_HEAD_DIVERGED},
+            set(MODULE.LOCAL_HEAD_ESCALATIONS),
+        )
+        for verdict, reason in MODULE.LOCAL_HEAD_ESCALATIONS.items():
+            with self.subTest(verdict=verdict):
+                self.assertIn(reason, MODULE.ESCALATION_ACTIONS)
+
+
+class ResetAgainstRealRepositoriesTest(CommandTestCase):
+    """`reset` decided against real branches, real ancestry, and real dirt."""
+
+    def setUp(self):
+        super().setUp()
+        self.published = make_pull_request_remote(self.root)
+        self.local = clone_for_pipeline(self.root, self.published["remote"], "session")
+        self.remote_head = mock.patch.object(
+            MODULE, "target_remote_head", return_value=self.published["pr_head"]
+        )
+        self.remote_head.start()
+        self.addCleanup(self.remote_head.stop)
+        self.diagnosis = mock.patch.object(
+            MODULE, "diagnose_local_head", REAL_DIAGNOSE_LOCAL_HEAD
+        )
+        self.diagnosis.start()
+        self.addCleanup(self.diagnosis.stop)
+
+    def reset_from_state(self, **overrides):
+        path = self.preflight_state(self.local)
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state.update(overrides)
+        path.write_text(json.dumps(state), encoding="utf-8")
+        MODULE.command_reset(
+            self.args(state=str(path), stage=MODULE.STAGE_SELF_REVIEW)
+        )
+        return path
+
+    def head_of_local(self) -> str:
+        return git_in(self.local, "rev-parse", "HEAD")
+
+    def test_a_session_on_its_own_branch_is_checked_out_and_started(self):
+        # The reproduction: a new session worktree on a branch of its own,
+        # unrelated to the pull request. Refusing here is what blocked normal
+        # use, so the pipeline establishes the precondition instead.
+        git_in(self.local, "checkout", "-q", "-b", "trask-refactored-invention")
+        for index in range(7):
+            git_in(self.local, "commit", "-q", "--allow-empty", "-m", f"own {index}")
+        self.reset_from_state(
+            iteration=1, history=[{"stage": MODULE.STAGE_CONFLICT}]
+        )
+        self.assertEqual("ready", self.emitted[-1]["result"])
+        self.assertEqual(
+            MODULE.LOCAL_HEAD_NEEDS_CHECKOUT, self.emitted[-1]["local_head"]
+        )
+        self.assertTrue(self.emitted[-1]["checked_out"])
+        self.assertEqual(self.published["pr_head"], self.head_of_local())
+
+    def test_a_worktree_already_detached_at_the_head_is_left_alone(self):
+        fetch_pr_head(self.local)
+        git_in(self.local, "checkout", "-q", "--detach", self.published["pr_head"])
+        self.reset_from_state(
+            iteration=1, history=[{"stage": MODULE.STAGE_CONFLICT}]
+        )
+        self.assertEqual("ready", self.emitted[-1]["result"])
+        self.assertEqual(MODULE.LOCAL_HEAD_AT_PR_HEAD, self.emitted[-1]["local_head"])
+        self.assertFalse(self.emitted[-1]["checked_out"])
+        self.assertEqual(self.published["pr_head"], self.head_of_local())
+
+    def test_a_commit_on_top_of_the_head_escalates_and_survives(self):
+        fetch_pr_head(self.local)
+        git_in(self.local, "checkout", "-q", "--detach", self.published["pr_head"])
+        git_in(self.local, "commit", "-q", "--allow-empty", "-m", "unpushed stage work")
+        unpushed = self.head_of_local()
+        path = self.reset_from_state(
+            iteration=1, history=[{"stage": MODULE.STAGE_CONFLICT}]
+        )
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual("escalated", self.emitted[-1]["result"])
+        self.assertEqual(
+            MODULE.LOCAL_HEAD_ESCALATIONS[MODULE.LOCAL_HEAD_AHEAD],
+            state["escalation"]["reason"],
+        )
+        self.assertEqual(unpushed, self.head_of_local())
+
+    def test_a_diverged_pull_request_branch_says_diverged_not_ahead(self):
+        git_in(self.local, "checkout", "-q", "-b", base_pr()["head_branch"])
+        git_in(self.local, "commit", "-q", "--allow-empty", "-m", "someone else's work")
+        diverged = self.head_of_local()
+        path = self.reset_from_state(
+            iteration=1, history=[{"stage": MODULE.STAGE_CONFLICT}]
+        )
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual("escalated", self.emitted[-1]["result"])
+        self.assertEqual(
+            MODULE.LOCAL_HEAD_ESCALATIONS[MODULE.LOCAL_HEAD_DIVERGED],
+            state["escalation"]["reason"],
+        )
+        self.assertIn("diverged", state["escalation"]["detail"])
+        self.assertEqual(diverged, self.head_of_local())
+
+    def test_dirt_before_any_stage_is_never_checked_out_over(self):
+        # The provenance gate runs before the checkout, so a user's uncommitted
+        # work in a session that is not on the pull request yet survives.
+        git_in(self.local, "checkout", "-q", "-b", "trask-refactored-invention")
+        (self.local / "user_notes.txt").write_text("mine\n", encoding="utf-8")
+        before = self.head_of_local()
+        path = self.reset_from_state(iteration=1, history=[], running=None)
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual("escalated", self.emitted[-1]["result"])
+        self.assertEqual("dirty_worktree_before_run", state["escalation"]["reason"])
+        self.assertEqual(before, self.head_of_local())
+        self.assertEqual(
+            "mine\n", (self.local / "user_notes.txt").read_text(encoding="utf-8")
+        )
 
 
 if __name__ == "__main__":
