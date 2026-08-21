@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -4222,6 +4223,28 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
+    def test_the_probe_and_its_abandoned_verdict_are_documented(self):
+        """A caller who does not know `next` probes will keep waiting on a corpse."""
+
+        self.assertIn(
+            "matching the recorded pid **and** its creation time", self.instructions
+        )
+        self.assertIn(
+            "a pid alone is recycled and would read as a healthy stage",
+            self.instructions,
+        )
+        self.assertIn("`stage_abandoned`", self.instructions)
+        for verdict in (
+            MODULE.RUNNING_STAGE_ALIVE,
+            MODULE.RUNNING_STAGE_FINISHED,
+            MODULE.RUNNING_STAGE_UNVERIFIABLE,
+        ):
+            with self.subTest(verdict=verdict):
+                self.assertIn(f"`{verdict}`", self.instructions)
+        self.assertIn(
+            "it neither guesses the outcome nor clears anything", self.instructions
+        )
+
     def test_the_activity_block_is_documented_as_not_proof_of_liveness(self):
         """Prose that oversells the block is worse than no block at all."""
 
@@ -4230,7 +4253,8 @@ class AgentInstructionsTest(unittest.TestCase):
             "That block is a timestamp view, not a probe", self.instructions
         )
         self.assertIn(
-            "`wait` owns the stage process and judges liveness from its pid",
+            "`wait` and `next` judge liveness from the recorded pid and its "
+            "creation time, while `status` only reads recorded stamps",
             self.instructions,
         )
         self.assertIn(
@@ -5446,6 +5470,253 @@ class ResetAgainstRealRepositoriesTest(CommandTestCase):
         self.assertEqual(
             "mine\n", (self.local / "user_notes.txt").read_text(encoding="utf-8")
         )
+
+
+class NextProbesTheStageProcessTest(CommandTestCase):
+    """`next` is the only liveness probe a run that lost its own agent reaches.
+
+    The failure reproduced here is the live one: a stage exited without ever
+    recording a terminal result, and the state went on saying `running` under a
+    pid that no longer existed. `wait` is the only other probe and it belongs to
+    the agent that had already stopped, so nothing looked again.
+    """
+
+    def make_repo(self, name: str) -> Path:
+        repo = self.root / name
+        repo.mkdir()
+        git_in(repo, "init", "-q", "-b", "main")
+        git_in(repo, "config", "user.email", "t@e.st")
+        git_in(repo, "config", "user.name", "test")
+        git_in(repo, "commit", "-q", "--allow-empty", "-m", "base")
+        return repo
+
+    def sleeping_process(self) -> subprocess.Popen:
+        """A real process, so the pid and its creation time are real facts."""
+
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(120)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        def reap() -> None:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+
+        self.addCleanup(reap)
+        return process
+
+    def stop_when_done(self, pid: int) -> None:
+        """Let go of the launched process before the temporary tree is removed."""
+
+        def stop() -> None:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                return
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if MODULE.process_create_time(pid) is None:
+                    return
+                time.sleep(0.1)
+
+        self.addCleanup(stop)
+
+    def record_running(
+        self,
+        path: Path,
+        *,
+        pid: object,
+        create_time: float | None,
+        log: Path,
+        stage: str | None = None,
+    ) -> None:
+        """Put a stage into `running` the way a real launch does."""
+
+        MODULE.command_start(
+            self.args(
+                state=str(path),
+                stage=stage or MODULE.STAGE_CI,
+                head=HEAD,
+                launch="subprocess",
+                session=None,
+                process=pid,
+                process_create_time=create_time,
+                log=str(log),
+            )
+        )
+
+    def ask_next(self, path: Path) -> dict:
+        with mock.patch.object(MODULE, "require_tools"):
+            MODULE.command_next(self.args(state=str(path), effort="high"))
+        return self.emitted[-1]
+
+    def test_a_stage_whose_process_is_gone_without_a_result_is_abandoned(self):
+        repo = self.make_repo("session")
+        path = self.preflight_state(repo)
+        log = self.root / "ci-fix-loop.log"
+        log.write_text("the stage's output\n", encoding="utf-8")
+        process = self.sleeping_process()
+        create_time = MODULE.process_create_time(process.pid)
+        self.assertIsNotNone(
+            create_time, "the platform must answer, or the probe proves nothing"
+        )
+        self.record_running(path, pid=process.pid, create_time=create_time, log=log)
+        cleared_before = dict(MODULE.load_state(path).get("cleared") or {})
+        process.kill()
+        process.wait()
+
+        emitted = self.ask_next(path)
+
+        self.assertEqual("escalate", emitted["result"])
+        self.assertEqual("stage_abandoned", emitted["reason"])
+        self.assertEqual(
+            MODULE.ESCALATION_ACTIONS["stage_abandoned"], emitted["next_action"]
+        )
+        state = MODULE.load_state(path)
+        self.assertEqual("stage_abandoned", state["escalation"]["reason"])
+        self.assertEqual(MODULE.STAGE_CI, state["escalation"]["stage"])
+        # Nothing is inferred and nothing advances: no clearance, no completion,
+        # and a history entry that says only what is known.
+        self.assertEqual(cleared_before, dict(state.get("cleared") or {}))
+        self.assertIsNone(state.get("completed"))
+        recorded = state["history"][-1]
+        self.assertEqual("abandoned", recorded["outcome"])
+        self.assertEqual("process_gone", recorded["outcome_reason"])
+        self.assertEqual("pipeline", recorded["outcome_source"])
+        self.assertEqual(str(log), recorded["log_path"])
+        self.assertIn(str(log), state["escalation"]["detail"])
+
+    def test_a_recycled_pid_is_not_the_stage(self):
+        # The same pid, still alive, but created at another time: the number was
+        # inherited by another program. A bare existence check reads this as a
+        # healthy stage for as long as that program lives.
+        repo = self.make_repo("session")
+        path = self.preflight_state(repo)
+        log = self.root / "stage.log"
+        process = self.sleeping_process()
+        create_time = MODULE.process_create_time(process.pid)
+        self.assertIsNotNone(create_time)
+        self.record_running(
+            path,
+            pid=process.pid,
+            create_time=create_time - MODULE.PROCESS_IDENTITY_TOLERANCE * 10,
+            log=log,
+        )
+
+        emitted = self.ask_next(path)
+
+        self.assertEqual("escalate", emitted["result"])
+        self.assertEqual("stage_abandoned", emitted["reason"])
+        self.assertIsNone(process.poll(), "the fixture's process must still be alive")
+
+        # The other half of the same fact, so this cannot pass because the
+        # process died: the very same live pid, recorded with the creation time
+        # it really has, reads as the stage still running.
+        honest = self.preflight_state(repo, state=self.root / "honest.json")
+        self.record_running(
+            honest, pid=process.pid, create_time=create_time, log=log
+        )
+
+        still_there = self.ask_next(honest)
+
+        self.assertEqual("stage_running", still_there["result"])
+        self.assertEqual(MODULE.RUNNING_STAGE_ALIVE, still_there["verdict"])
+
+    def test_a_stage_that_recorded_its_result_before_exiting_is_not_abandoned(self):
+        # Order matters. Probing before reading the recorded result would turn
+        # every completed stage into an escalation.
+        repo = self.make_repo("session")
+        path = self.preflight_state(repo)
+        log = self.root / "stage.log"
+        process = self.sleeping_process()
+        create_time = MODULE.process_create_time(process.pid)
+        self.record_running(path, pid=process.pid, create_time=create_time, log=log)
+        self.stage_says(MODULE.CLEARING_OUTCOMES[0])
+        process.kill()
+        process.wait()
+        before = path.read_bytes()
+
+        emitted = self.ask_next(path)
+
+        self.assertEqual("stage_running", emitted["result"])
+        self.assertEqual(MODULE.RUNNING_STAGE_FINISHED, emitted["verdict"])
+        self.assertEqual(
+            MODULE.RUNNING_STAGE_DETAILS[MODULE.RUNNING_STAGE_FINISHED],
+            emitted["detail"],
+        )
+        self.assertEqual(before, path.read_bytes(), "a read must not write")
+        state = MODULE.load_state(path)
+        self.assertIsNone(state.get("escalation"))
+        self.assertEqual(MODULE.STAGE_CI, state["running"]["stage"])
+
+    def test_a_process_with_no_recorded_creation_time_is_never_judged(self):
+        # A pid alone cannot be confirmed, so the probe declines rather than
+        # falling back to a check that a recycled pid would pass.
+        repo = self.make_repo("session")
+        path = self.preflight_state(repo)
+        log = self.root / "stage.log"
+        process = self.sleeping_process()
+        with mock.patch.object(MODULE, "process_create_time", return_value=None):
+            self.record_running(
+                path, pid=process.pid, create_time=None, log=log
+            )
+        self.assertIsNone(MODULE.load_state(path)["running"]["process_create_time"])
+        before = path.read_bytes()
+
+        emitted = self.ask_next(path)
+
+        self.assertEqual("stage_running", emitted["result"])
+        self.assertEqual(MODULE.RUNNING_STAGE_UNVERIFIABLE, emitted["verdict"])
+        self.assertEqual(
+            "no_process_create_time_recorded", emitted["running"]["reason"]
+        )
+        self.assertEqual(before, path.read_bytes())
+        self.assertIsNone(MODULE.load_state(path).get("escalation"))
+
+    def test_a_creation_time_is_seconds_so_two_of_them_can_be_compared(self):
+        # Read as raw Windows ticks the number is around 6.4e17, where the gap
+        # between representable floats is larger than the tolerance itself, so
+        # a recycled pid compares equal to the stage it replaced.
+        reading = MODULE.process_create_time(os.getpid())
+        self.assertIsNotNone(reading)
+        age = time.time() - reading
+        self.assertGreaterEqual(age, 0)
+        self.assertLess(age, 86400)
+        self.assertGreater(
+            abs(reading - (reading + MODULE.PROCESS_IDENTITY_TOLERANCE * 10)),
+            MODULE.PROCESS_IDENTITY_TOLERANCE,
+            "the scale must be coarse enough for the tolerance to mean something",
+        )
+
+    def test_the_launch_reports_a_creation_time_the_start_records(self):
+        # The whole probe rests on this pairing surviving the hand-off from
+        # `launch` to `start`.
+        repo = self.make_repo("session")
+        path = self.preflight_state(repo)
+        MODULE.command_launch(
+            self.args(
+                state=str(path),
+                log=str(self.root / "launched.log"),
+                command=[sys.executable, "-c", "import time; time.sleep(30)"],
+            )
+        )
+        launched = self.emitted[-1]
+        self.stop_when_done(launched["pid"])
+        self.assertIsNotNone(launched["process_create_time"])
+        self.record_running(
+            path,
+            pid=launched["pid"],
+            create_time=launched["process_create_time"],
+            log=Path(launched["log_path"]),
+        )
+        running = MODULE.load_state(path)["running"]
+        self.assertEqual(launched["pid"], running["process_id"])
+        self.assertEqual(
+            launched["process_create_time"], running["process_create_time"]
+        )
+        self.assertEqual(MODULE.RUNNING_STAGE_ALIVE, self.ask_next(path)["verdict"])
 
 
 if __name__ == "__main__":

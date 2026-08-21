@@ -182,6 +182,12 @@ ESCALATION_ACTIONS = {
         "past the wait ceiling without finishing, so decide whether to let it "
         "keep going or to stop it yourself."
     ),
+    "stage_abandoned": (
+        "Read the tail of the stage log named in the escalation. The stage "
+        "process is gone and never recorded an outcome, so nothing knows how "
+        "far it got or whether its work is sound. Judge that yourself, then "
+        "start the pipeline again."
+    ),
     "dirty_worktree_before_run": (
         "The pipeline worktree had uncommitted changes before any stage ran, so "
         "they are yours. Commit, stash, or discard them, then start the pipeline "
@@ -245,6 +251,34 @@ LOCAL_HEAD_ESCALATIONS = {
     LOCAL_HEAD_DIVERGED: "local_head_diverged_from_remote",
 }
 
+# What the process a run recorded as running turns out to be. Four answers,
+# because "not alive" and "not answerable" are different facts: one is evidence
+# the stage is gone, the other is the absence of evidence either way, and only
+# the first may stop the pipeline.
+RUNNING_STAGE_ALIVE = "alive"
+RUNNING_STAGE_FINISHED = "finished"
+RUNNING_STAGE_ABANDONED = "abandoned"
+RUNNING_STAGE_UNVERIFIABLE = "unverifiable"
+
+# What each verdict means for the caller. None of the three below stops the
+# pipeline, and none of them advances it either: a stage is still recorded as
+# running, so the next thing to do is finish that stage, not start another.
+RUNNING_STAGE_DETAILS = {
+    RUNNING_STAGE_ALIVE: (
+        "the stage process is still running, so wait for it rather than "
+        "deciding anything else"
+    ),
+    RUNNING_STAGE_FINISHED: (
+        "the stage recorded its result and is still recorded as running, so "
+        "finish it before asking what comes next"
+    ),
+    RUNNING_STAGE_UNVERIFIABLE: (
+        "the stage's process cannot be identified from what the run recorded, "
+        "so whether it is still running is unknown; read its log and finish or "
+        "escalate the stage yourself"
+    ),
+}
+
 
 class WorkflowError(RuntimeError):
     pass
@@ -279,6 +313,10 @@ def git(repo_root: Path, *arguments: str) -> str:
     return run(["git", "-C", str(repo_root), *arguments]).stdout.strip()
 
 
+WINDOWS_EPOCH_TICKS = 621355968000000000
+TICKS_PER_SECOND = 10000000
+
+
 def process_create_time(pid: int) -> float | None:
     """The creation time of a process, used to tell it from a reused pid.
 
@@ -286,6 +324,11 @@ def process_create_time(pid: int) -> float | None:
     time a later ``wait`` checks it. Pairing the pid with its creation time makes
     a stale match detectable. ``None`` means the platform could not answer, and a
     caller treats that as "cannot confirm identity" rather than as a match.
+
+    The value is in seconds, so that comparing two of them stays meaningful. The
+    Windows reading arrives as 100-nanosecond ticks since year 1, a number so
+    large that a difference of a second or less disappears into floating point
+    rounding, which would silently make a recycled pid look like a match.
     """
 
     try:
@@ -319,15 +362,18 @@ def _process_create_time_native(pid: int) -> float | None:
         if completed.returncode != 0 or not text:
             return None
         try:
-            return float(text)
+            return (float(text) - WINDOWS_EPOCH_TICKS) / TICKS_PER_SECOND
         except ValueError:
             return None
     try:
         with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
             fields = handle.read().rsplit(")", 1)[1].split()
-        return float(fields[19])
+        return float(fields[19]) / os.sysconf("SC_CLK_TCK")
     except Exception:
         return None
+
+
+PROCESS_IDENTITY_TOLERANCE = 1.0
 
 
 def process_alive(pid: int, create_time: float | None) -> bool:
@@ -349,7 +395,10 @@ def process_alive(pid: int, create_time: float | None) -> bool:
             return False
         if create_time is not None:
             try:
-                if abs(float(proc.create_time()) - create_time) > 1.0:
+                if (
+                    abs(float(proc.create_time()) - create_time)
+                    > PROCESS_IDENTITY_TOLERANCE
+                ):
                     return False
             except Exception:
                 return False
@@ -357,7 +406,10 @@ def process_alive(pid: int, create_time: float | None) -> bool:
     current = _process_create_time_native(pid)
     if current is None:
         return False
-    if create_time is not None and abs(current - create_time) > 1.0:
+    if (
+        create_time is not None
+        and abs(current - create_time) > PROCESS_IDENTITY_TOLERANCE
+    ):
         return False
     return True
 
@@ -2286,10 +2338,159 @@ def command_preflight(args: argparse.Namespace) -> None:
     )
 
 
+def probe_running_stage(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Say what became of the process this state records as running.
+
+    ``wait`` is the only other liveness probe, and it belongs to the agent that
+    launched the stage. When that agent stops -- because the stage died, because
+    it exhausted its own cap without reporting, or because the host running it
+    went away -- nothing else in the loop ever looks again, and the state goes on
+    saying ``running`` under a pid that no longer exists. So the probe has to sit
+    in the command every later caller passes through, rather than in the one that
+    already stopped.
+
+    The recorded result is read before the process, because a stage that wrote
+    its outcome and then exited is finished rather than abandoned. Probing first
+    would turn every completed stage into an escalation.
+
+    Identity is the pid **and** its creation time, never the pid alone. Pids are
+    recycled, so a bare existence check reads whichever program later inherited
+    the number as the stage, and a stall would be laundered into a green for as
+    long as that program lived. Without a recorded creation time the probe
+    therefore declines to answer and names the fact it is missing, because a
+    probe that can be fooled is worse than none.
+    """
+
+    running = state.get("running")
+    if not isinstance(running, dict) or not running:
+        return None
+    stage = running.get("stage")
+    probe: dict[str, Any] = {
+        "stage": stage,
+        "pid": running.get("process_id"),
+        "process_create_time": running.get("process_create_time"),
+        "log_path": running.get("log_path"),
+        "started_at": running.get("started_at"),
+        "iteration": running.get("iteration"),
+        "head_sha": running.get("head_sha"),
+    }
+
+    entry = STAGE_BY_NAME.get(stage) if isinstance(stage, str) else None
+    if entry is not None:
+        reading = read_stage_outcome(
+            entry,
+            build_target(
+                state["pr"]["owner"], state["pr"]["repo"], state["pr"]["number"]
+            ),
+        )
+        if reading.get("available"):
+            probe["verdict"] = RUNNING_STAGE_FINISHED
+            probe["outcome"] = reading.get("outcome")
+            return probe
+
+    try:
+        pid = int(str(probe["pid"]))
+    except (TypeError, ValueError):
+        probe["verdict"] = RUNNING_STAGE_UNVERIFIABLE
+        probe["reason"] = "no_process_id_recorded"
+        return probe
+    if probe["process_create_time"] is None:
+        probe["verdict"] = RUNNING_STAGE_UNVERIFIABLE
+        probe["reason"] = "no_process_create_time_recorded"
+        return probe
+
+    probe["verdict"] = (
+        RUNNING_STAGE_ALIVE
+        if process_alive(pid, float(probe["process_create_time"]))
+        else RUNNING_STAGE_ABANDONED
+    )
+    return probe
+
+
+def record_abandoned_stage(
+    state: dict[str, Any], probe: dict[str, Any]
+) -> dict[str, Any]:
+    """Write down that a stage stopped without saying how, and escalate.
+
+    Abandoned is not an outcome. Nothing here guesses what the stage would have
+    reported, nothing clears a stage, and the pipeline does not advance: the
+    history records that the process is gone, that the result is unknown, and
+    where the log is, which is all anyone can honestly say about it.
+    """
+
+    stage = probe.get("stage")
+    detail = (
+        f"{stage} was recorded as running under pid {probe.get('pid')}, which is "
+        "gone, and no terminal result was ever recorded, so how far it got and "
+        "whether its work is sound are both unknown"
+    )
+    log_path = probe.get("log_path")
+    if log_path:
+        detail = f"{detail}; its log is {log_path}"
+    state.setdefault("history", []).append(
+        {
+            "stage": stage,
+            "outcome": "abandoned",
+            "run_id": state.get("run_id"),
+            "outcome_source": "pipeline",
+            "outcome_reason": "process_gone",
+            "iteration": probe.get("iteration"),
+            "started_head_sha": probe.get("head_sha"),
+            "head_sha": probe.get("head_sha"),
+            "started_at": probe.get("started_at"),
+            "ended_at": utc_now(),
+            "process_id": probe.get("pid"),
+            "log_path": log_path,
+            "detail": detail,
+            "repeat": False,
+        }
+    )
+    return record_escalation(
+        state,
+        {
+            "stage": stage,
+            "reason": "stage_abandoned",
+            "detail": detail,
+            "next_action": ESCALATION_ACTIONS["stage_abandoned"],
+            "head_sha": probe.get("head_sha"),
+        },
+    )
+
+
 def command_next(args: argparse.Namespace) -> None:
     require_tools()
     path = cli_path(args.state)
     state = load_state(path)
+    probe = probe_running_stage(state)
+    if probe is not None:
+        if probe["verdict"] == RUNNING_STAGE_ABANDONED:
+            escalation = record_abandoned_stage(state, probe)
+            save_state(path, state)
+            emit(
+                {
+                    "result": "escalate",
+                    "recorded": True,
+                    "stage": probe.get("stage"),
+                    "reason": escalation["reason"],
+                    "detail": escalation["detail"],
+                    "next_action": escalation["next_action"],
+                    "head_sha": escalation["head_sha"],
+                    "running": probe,
+                    "state": str(path),
+                }
+            )
+            return
+        emit(
+            {
+                "result": "stage_running",
+                "verdict": probe["verdict"],
+                "stage": probe.get("stage"),
+                "running": probe,
+                "state": str(path),
+                "detail": RUNNING_STAGE_DETAILS[probe["verdict"]],
+            }
+        )
+        return
     target = build_target(
         state["pr"]["owner"], state["pr"]["repo"], state["pr"]["number"]
     )
@@ -2356,6 +2557,29 @@ def command_next(args: argparse.Namespace) -> None:
     )
 
 
+def launched_process_create_time(args: argparse.Namespace) -> float | None:
+    """The creation time that identifies the launched process, or ``None``.
+
+    ``launch`` reports the value, and the caller passes it straight back. When
+    it does not, the time is read from the live process here, which is accurate
+    because ``start`` runs immediately after the launch, while the process is
+    still there.
+
+    ``None`` means the platform would not answer. It is recorded as ``None``
+    rather than dropped, so a later probe refuses to judge liveness instead of
+    trusting a pid that another program may have inherited.
+    """
+
+    supplied = getattr(args, "process_create_time", None)
+    if supplied is not None:
+        return float(supplied)
+    try:
+        pid = int(str(getattr(args, "process", None)))
+    except (TypeError, ValueError):
+        return None
+    return process_create_time(pid)
+
+
 def command_start(args: argparse.Namespace) -> None:
     """Record that a stage is starting, and charge it to an iteration."""
 
@@ -2400,6 +2624,7 @@ def command_start(args: argparse.Namespace) -> None:
         "launch": args.launch,
         "session_id": args.session,
         "process_id": args.process,
+        "process_create_time": launched_process_create_time(args),
         "model": stage_models(state)[stage],
         "started_at": utc_now(),
     }
@@ -3478,8 +3703,8 @@ def summarize_history(history: Iterable[dict[str, Any]]) -> dict[str, int]:
 
 
 NOT_A_LIVENESS_PROBE = (
-    "This is a timestamp view, not a probe. The pipeline's `wait` owns the stage "
-    "process and decides liveness from its pid; `status` does not, and reports "
+    "This is a timestamp view, not a probe. `wait` and `next` decide liveness "
+    "from the recorded pid and its creation time; `status` does not, and reports "
     "only recorded timestamps. They separate a stage whose helper wrote something "
     "minutes ago from one that has been silent for an hour, which is the question "
     "a person asks before intervening."
@@ -3656,6 +3881,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--launch", choices=["session", "subprocess"], required=True)
     start.add_argument("--session")
     start.add_argument("--process")
+    start.add_argument("--process-create-time", type=float)
     start.add_argument("--log")
     start.set_defaults(function=command_start)
 
