@@ -17,13 +17,13 @@
     {
       "name": "copilot-review-loop",
       "description": "Address Copilot pull request review comments, publish fixes, and repeat until the review is clean.",
-      "version": "1.0.41",
+      "version": "1.0.42",
       "source": "./plugins/copilot-review-loop"
     },
     {
       "name": "self-review-loop",
       "description": "Review a GitHub pull request, verify each finding independently, and commit the fixes without posting review comments.",
-      "version": "1.1.12",
+      "version": "1.1.13",
       "source": "./plugins/self-review-loop"
     },
     {
@@ -47,7 +47,7 @@
     {
       "name": "ci-fix-loop",
       "description": "Fix the failing continuous integration checks a pull request caused, re-run a suspected flake once, and push the fixes until the checks are green.",
-      "version": "1.0.7",
+      "version": "1.0.8",
       "source": "./plugins/ci-fix-loop"
     }
   ]

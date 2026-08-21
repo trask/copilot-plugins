@@ -1810,6 +1810,44 @@ query($owner:String!,$repo:String!,$number:Int!){
     return result
 
 
+def local_validation_entry(args: argparse.Namespace, head_sha: str) -> dict[str, Any]:
+    """Describe the local validation behind one publication.
+
+    Three answers are distinct and a reader needs all three. `passed` names the
+    commands that ran and passed, `skipped` carries the reason none ran, and
+    `unreported` says the publication claimed nothing either way. `rewrote` names
+    the subset that changed files, because a fixing command's rewrites have to
+    reach the commits being pushed and a record that only says "ran clean"
+    cannot show whether they did.
+
+    Nothing here refuses a push. A repository that offers no covering command
+    must still publish, and a malformed claim is folded into a coherent record
+    rather than raised: naming a command as rewriting implies it ran, so it
+    counts as validated too. The record exists so someone can read what the loop
+    did instead of inferring it from the checks that fail afterwards.
+    """
+    entry: dict[str, Any] = {"head_sha": head_sha}
+    rewrote = [command.strip() for command in (args.rewrote or []) if command.strip()]
+    commands = [
+        command.strip() for command in (args.validated or []) if command.strip()
+    ]
+    for command in rewrote:
+        if command not in commands:
+            commands.append(command)
+    if commands:
+        entry["status"] = "passed"
+        entry["commands"] = commands
+        entry["rewrote"] = rewrote
+        return entry
+    reason = (args.not_validated or "").strip()
+    if reason:
+        entry["status"] = "skipped"
+        entry["reason"] = reason
+        return entry
+    entry["status"] = "unreported"
+    return entry
+
+
 def command_publish(args: argparse.Namespace) -> None:
     path = cli_path(args.state)
     state = load_state(path)
@@ -1883,6 +1921,15 @@ def command_publish(args: argparse.Namespace) -> None:
     monitoring = request_copilot(state, path, pushed_head)
     verification = verify_publish(state, comments)
     queue["status"] = "published"
+    # An iteration that only re-requests a review pushes no code, so it has
+    # nothing to validate and records nothing.
+    validation = (
+        local_validation_entry(args, local_head)
+        if local_head != expected_remote_head
+        else None
+    )
+    if validation:
+        state.setdefault("local_validation", []).append(validation)
     state["iterations"] = int(state.get("iterations", 0)) + 1
     state["clean_at_head_sha"] = None
     save_state(path, state)
@@ -1894,6 +1941,7 @@ def command_publish(args: argparse.Namespace) -> None:
             "reply_ids": reply_ids,
             "monitoring": monitoring,
             "verification": verification,
+            "local_validation": validation,
         }
     )
 
@@ -2107,6 +2155,7 @@ def command_status(args: argparse.Namespace) -> None:
                     "queue": None,
                     "monitoring": None,
                     "clean_at_head_sha": None,
+                    "local_validation": [],
                 }
             )
             return
@@ -2121,6 +2170,7 @@ def command_status(args: argparse.Namespace) -> None:
         "queue": state.get("queue"),
         "monitoring": state.get("monitoring"),
         "clean_at_head_sha": state.get("clean_at_head_sha"),
+        "local_validation": state.get("local_validation") or [],
         "last_helper_activity": last_helper_activity(state),
     }
     if outcome:
@@ -2224,6 +2274,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     publish.add_argument("--state", required=True)
     publish.add_argument("--no-comments", action="store_true")
+    publish_validation = publish.add_mutually_exclusive_group()
+    publish_validation.add_argument(
+        "--validated",
+        action="append",
+        metavar="COMMAND",
+        help="a covering check that ran locally and passed; repeat for each one",
+    )
+    publish_validation.add_argument(
+        "--not-validated",
+        metavar="REASON",
+        help="why no covering check ran locally before this push",
+    )
+    publish.add_argument(
+        "--rewrote",
+        action="append",
+        metavar="COMMAND",
+        help="a covering check that rewrote files; those rewrites must already be "
+        "in the commits this pushes",
+    )
     publish.set_defaults(function=command_publish)
 
     watch = subparsers.add_parser("watch", help="watch one requested Copilot review")

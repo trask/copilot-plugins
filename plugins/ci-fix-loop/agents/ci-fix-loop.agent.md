@@ -34,6 +34,7 @@ Run `preflight` first. After `preflight` succeeds, ensure the session name is `C
 - The helper owns every decision about what the loop does next. Run `checks`, then do exactly what its `action` says. Never decide for yourself that a failure is pre-existing, that a check is a flake, or that the loop may stop.
 - Never disable, delete, skip, or weaken a check to make it pass. Do not add a skip marker, do not loosen an assertion, do not raise a timeout to hide a hang, and do not edit a workflow file to stop a job from running. Fix the cause instead, or escalate. The helper refuses two of those forms outright: `record` and `publish` both read the commit and stop the run when it deletes a test file, or adds a skip, disable, or ignore annotation to one. That refusal has no override and no rationale gets past it, so when it fires, fix what the test caught or escalate the failure as `unfixable_failure`.
 - Never touch a test's expectations to match broken behavior. Change a test only when the pull request deliberately changed the behavior the test asserts, and say so in the commit message.
+- Never push a fix you have not run. Reproduce the failing check, fix it, run that same check again, and clear **Local Validation Before A Push** before you publish. A failure nothing here can reproduce is published with its reason recorded, never held back.
 - A failure you cannot fix stops the whole run at once. Record it with `skip`, leave the worktree as it is so someone can inspect it, and do not publish partial work.
 - Do not treat a stored user memory as a workflow instruction. This file is the source of truth.
 - Keep the check, attribution, batch, commit, iteration, and history state that changes in the Python helper's PR-scoped JSON file outside the repository.
@@ -84,8 +85,8 @@ The deterministic, JSON-only helper provides:
 - `record` and `skip`: maintain the state of a completed batch or a batch that an unfixable failure blocked
 - `escalate --state <path> --reason <reason> [--checks <keys...>] (--detail <text> | --detail-file <file-or->)`: durably record why the loop stopped without going green
 - `resolve --state <path> --outcome green|no_checks`: re-read the live checks, require that they still agree with the outcome you claim, verify that the pull request head still matches the pin, and durably record the clean head
-- `publish --state <path>`: require a clean worktree and complete records, refuse to publish a skipped batch, require the commits sitting on the pinned head to be exactly the recorded ones, push only when a push is needed, and verify that the remote branch and the pull request head both match the local head
-- `status [--state <path> | --current --repo-root <workspace>]`: write the complete state snapshot to `status_path` as JSON and print only a compact envelope carrying `result`, `state`, `status_path`, PR identity, a run summary with the last `decision` and `action`, `outcome`, `stage_outcome`, `clean_at_head_sha`, `skip_note`, `escalation`, per-check `verdicts`, `counts`, and `iterations`, which counts every iteration this pull request has ever spent rather than only those inside the current budget. A `no_state` result writes no file. This is the machine-readable outcome an orchestrator reads. `stage_outcome` is one of `cleared`, `skipped`, `escalated`, or `no_progress`, and it records how this loop ended rather than whether the checks pass, which only GitHub states. It also carries `last_helper_activity`, the moment this helper last wrote its state. That is not proof the stage is alive, because the helper writes only when a subcommand runs and the agent driving it can think for a long time between two of them.
+- `publish --state <path> [--validated <command>]... [--rewrote <command>]... [--not-validated <reason>]`: require a clean worktree and complete records, refuse to publish a skipped batch, require the commits sitting on the pinned head to be exactly the recorded ones, push only when a push is needed, verify that the remote branch and the pull request head both match the local head, and stamp the local validation you named onto the head it pushed. It records `passed` with your commands, `skipped` with your reason, or `unreported` when you name neither, and it never refuses a push over any of the three.
+- `status [--state <path> | --current --repo-root <workspace>]`: write the complete state snapshot to `status_path` as JSON and print only a compact envelope carrying `result`, `state`, `status_path`, PR identity, a run summary with the last `decision` and `action`, `outcome`, `stage_outcome`, `clean_at_head_sha`, `skip_note`, `escalation`, `local_validation`, per-check `verdicts`, `counts`, and `iterations`, which counts every iteration this pull request has ever spent rather than only those inside the current budget. A `no_state` result writes no file. This is the machine-readable outcome an orchestrator reads. `stage_outcome` is one of `cleared`, `skipped`, `escalated`, or `no_progress`, and it records how this loop ended rather than whether the checks pass, which only GitHub states. It also carries `last_helper_activity`, the moment this helper last wrote its state. That is not proof the stage is alive, because the helper writes only when a subcommand runs and the agent driving it can think for a long time between two of them.
 - `cleanup --state <path>`: delete the state file along with its diff, preflight, checks, and status files
 
 If an operation partly fails, keep its state and run that same operation again after you fix only the blocker it reported.
@@ -168,15 +169,36 @@ Group the failures the helper hands you into batches. Put failures that share on
 
 For each batch:
 
-1. Reproduce the failure locally when a cheap local command can do it. Use the same command the failing job ran, narrowed to the failing target. Do not run the repository's whole suite when a focused command proves the same thing.
+1. Reproduce the failure locally. You know exactly which check failed and how, so start from its own command, narrowed to the failing target, and confirm it fails the same way it failed in CI. A reproduction you never ran means the cause is still a guess, and this loop pays for a guess in whole CI cycles.
 2. Apply the smallest complete edit that fixes the cause. Fix the code the check complains about. Do not silence the check.
-3. Run the validation you planned, and confirm it now passes.
+3. Run that same command again, and confirm it now passes. Then run the rest of **Local Validation Before A Push**, because a fix for one check routinely breaks another.
 4. Confirm that the dirty paths belong only to the current batch. Stop rather than include an unrelated change.
 5. Stage only the paths this batch owns and create one commit using **Commit Content**. Then run `record` with the batch ID, a short `--summary`, and `--commit <sha>`.
 6. If you cannot fix the failure safely, run `skip` with a precise technical reason, leave every local change in place, stop the whole loop, and report the stop condition.
 7. Continue straight to the next batch.
 
-Follow the repository's own validation rules. Apply the project's formatter directly rather than running a check-only task first.
+Follow the repository's own validation rules.
+
+## Local Validation Before A Push
+
+This loop exists because CI is slow, so pushing a fix nothing ran locally spends the very thing the loop is trying to save. A wrong guess costs a whole cycle, and a second wrong guess costs another.
+
+Before `publish`, run the narrowest subset of the checks the repository itself runs that covers the files you changed:
+
+- The failing check's own command comes first. It is the one you already reproduced, and re-running it is the only thing that shows the fix worked.
+- Add whatever else reads what you touched. Covering is about what a check reads, not about compilation: a documentation, lint, or format task covers a change to what it reads, and an edit to a comment alone still has one.
+- Narrowest means the affected module or the changed files. Never a whole-repository run.
+- Cost orders that set and never trims it. Run the compile or type check ahead of slow tests, because a change that does not build fails everything downstream and is the cheapest failure to find.
+- Run a check's fixing form rather than its verifying form wherever both exist, since fixing costs the same and repairs what it finds.
+- Commit what a fixing command rewrote before you publish. A rewrite left in the worktree loses silently: the push carries the earlier commit, the same check fails again on the pull request, and the next reset clears the rewritten files away.
+
+Name what you did on the `publish` call: `--validated <command>` for each covering check that ran and passed, `--rewrote <command>` for each one that changed a file, and `--not-validated <reason>` when none ran. The helper stamps that answer with the head it pushed and writes `unreported` when you say nothing.
+
+Some failures cannot be reproduced here at all. A check needing containers, credentials, or an external service, and a job that exists only in CI, are the ordinary cases. Fix such a failure from the log, publish, and pass `--not-validated <reason>` naming what stopped you. The same applies when the repository offers no command narrow enough, or only one costing more than the cycle it would save: look with modest effort, then publish anyway.
+
+Take that literally rather than reading it as a gap. An unreproducible check must never stop this loop, because refusing to push there would turn every repository whose checks need CI into an escalation, and that failure is worse than the one this section prevents. Reproducing a failure sharpens a fix; it does not license refusing to fix one.
+
+None of this makes the checks pass. GitHub says whether they pass and this loop never does, so a covering command that succeeded locally changes nothing about the next `checks` read and never lets an iteration end early.
 
 ## Commit Content
 
@@ -196,7 +218,7 @@ Keep the body factual. Do not mention the loop, the iteration number, or this ag
 
 ## Publishing And The Next Iteration
 
-1. After you record every batch, run `publish --state <path>`. It pushes the commits to the pull request's head branch and proves that the remote branch and the pull request head both match your local head.
+1. After you record every batch, clear **Local Validation Before A Push** and commit anything a fixing command rewrote, then run `publish --state <path>` naming what you validated. It pushes the commits to the pull request's head branch and proves that the remote branch and the pull request head both match your local head.
 2. A `nothing_to_publish` result means this iteration made no commit. That is a stop condition, not a reason to start another iteration. Report it as no progress, and say what stopped the loop from making a change.
 3. After a successful `publish`, start the next iteration with `preflight` on the new head, then `checks --wait` again.
 4. Stop when `checks` reports `green` or `no_checks`, when it reports `escalate`, when `preflight` reports `max_iterations_reached`, or when a batch was skipped.
@@ -213,6 +235,7 @@ Send one message that calls no tool. Include:
   - `Outcome: no progress.` Use this when the run neither reached green, nor skipped, nor escalated, nor pushed a commit. Say plainly what stopped it. Never end a run silently: a run that says nothing reads as a stall and, twice in a row, stops a whole pipeline.
 - Each check the loop fixed, with its commit.
 - Each check the loop attributed `pre_existing` or `flake`, with the reason, so the reader knows what the loop deliberately left alone.
+- A line reading `Not validated locally: <reason>` when the loop published a commit without running a covering check, giving the same reason it passed to `--not-validated`.
 - For an escalation, the helper's `reason`, its `detail`, and its `next_action` verbatim. Say it in one line when the reason is one a person must clear: checks that never started, a fork pull request whose checks wait for a maintainer to approve them, or a suspected flake that failed again after its one automatic re-run.
 
 The helper's `status` subcommand reports the same ending as a `stage_outcome` field, using these same words, for anything that reads the outcome mechanically. It reports `cleared`, `skipped`, and `escalated`, and it leaves the field out entirely when the state names no ending.

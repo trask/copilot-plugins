@@ -73,8 +73,8 @@ The deterministic, JSON-only helper provides:
 - `preflight [target] [--max-iterations 5] [--completed-run-iterations <n>]`: resolve and check out the PR, require a clean worktree, check its head, drop every thread a non-Copilot author started, fetch thread and suppressed comments, enforce the per-invocation iteration cap, record whether the head is clean, and set up external state
 - `plan --state <path> --batch <id> --comments <ids...> --label <label> [--paths <paths...>] [--validation <command>]`: store one planned batch; `--batch` and `--comments` are required option names, not positional values
 - `refresh`, `record`, and `skip`: maintain the state of a comment and of a completed batch
-- `status --current --repo-root <workspace>`: return only the workflow state attached to the current branch's PR, including `clean_at_head_sha` and `stage_outcome`. It also carries `last_helper_activity`, the moment this helper last wrote its state. That is not proof the stage is alive, because the helper writes only when a subcommand runs and the agent driving it can think for a long time between two of them.
-- `publish`: compare the live remote PR head with the preflight pin directly before it pushes, return `head_changed` instead of pushing over a divergence, push only when a push is needed, post each thread reply as its own published comment and never twice, resolve thread comments, request Copilot even without a new commit, request the very first Copilot review when the PR has never had one, and verify the publication
+- `status --current --repo-root <workspace>`: return only the workflow state attached to the current branch's PR, including `clean_at_head_sha`, `local_validation`, and `stage_outcome`. It also carries `last_helper_activity`, the moment this helper last wrote its state. That is not proof the stage is alive, because the helper writes only when a subcommand runs and the agent driving it can think for a long time between two of them.
+- `publish [--validated <command>]... [--rewrote <command>]... [--not-validated <reason>]`: compare the live remote PR head with the preflight pin directly before it pushes, return `head_changed` instead of pushing over a divergence, push only when a push is needed, post each thread reply as its own published comment and never twice, resolve thread comments, request Copilot even without a new commit, request the very first Copilot review when the PR has never had one, verify the publication, and stamp the local validation you named onto the head it pushed. It records `passed` with your commands, `skipped` with your reason, or `unreported` when you name neither, it records nothing at all for a publication that pushes no commit, and it never refuses a push over any of that.
 - `watch`: monitor exactly the requested Copilot review, and wait for it
 - `cancel-watch`: stop monitoring that is stale or superseded
 - `await-watch --state <path>`: wait deterministically for an already running watcher to store and return its terminal result
@@ -144,7 +144,29 @@ For each batch:
 7. Write the model-authored GitHub reply content to a temporary UTF-8 file outside the repository. Run `record --state <path> --batch <id> --comments <ids...> --summary <summary> --reply-file <path>`, with either `--commit <sha>` or the no-code `--rationale <text>`. Always spell out the required `--batch` and `--comments` flags, and never pass the batch ID or a comment ID positionally. Delete the temporary file afterward.
 8. Continue straight to the next batch.
 
-Follow the repository's own validation rules. Apply the project's formatter directly rather than running a check-only task first.
+Follow the repository's own validation rules.
+
+### Local Validation Before A Push
+
+Step 3 asks whether the comment was right. This asks whether your edit is sound, and they are different questions: an edit can answer a reviewer perfectly and still break the build. Nothing has run this code yet, because the commits in this batch are newer than every check on the pull request.
+
+So before `publish`, run the narrowest subset of the checks the repository itself runs that covers the files you touched.
+
+- Covering follows what a check reads. A documentation, lint, or format task covers a change to what it reads, so an edit to a comment alone still has one, and a check that only compiles would sail straight past it.
+- Narrowest means the affected module or the changed files. A whole-repository run is not what this asks for.
+- Cost sets the order inside that set, never its membership. Put the compile or type check first when the covering tests are slow, because a change that does not build is the common failure and the cheapest to catch.
+- Prefer a check's fixing form over its verifying form wherever it has both. Fixing costs what verifying costs and repairs the problem as well, so verifying first is one job done twice.
+- Commit what a fixing command rewrote, then push. Leaving a rewrite in the worktree is how this step fails without saying so: the publication carries the earlier commit, the same check fails on the pull request anyway, and the next reset sweeps the rewritten files away.
+
+This loop is unusually expensive to get wrong. Every publication asks Copilot for a fresh review and starts a fresh cycle of checks, so a commit that does not build spends both at once and buys nothing. A covering check that fails is a validation failure like any other, so fix it, or `skip` it and stop the run the way rule 31 already says.
+
+Name what you did on the `publish` call: `--validated <command>` for each covering check that ran and passed, `--rewrote <command>` for each one that changed a file, and `--not-validated <reason>` when none ran. The helper stamps the answer with the head it pushed and writes `unreported` when you say nothing.
+
+Plenty of repositories offer no command narrow enough, and some offer only one costing more than the cycle it would save. Look with modest effort, then publish and pass `--not-validated <reason>` — the run continues exactly as it would have, and the reason reaches the final index.
+
+Read that as written rather than as a gap to close. A repository without a usable command must never stop this loop, since local validation is worth nothing there and refusing to proceed would only strand the run.
+
+Local success proves nothing about the pull request. Copilot's next review and the repository's own checks stay the only evidence, and a covering command that passed here never lets an iteration end early or a head count as clean.
 
 ## Commit And Reply Content
 
@@ -198,34 +220,36 @@ The short `--summary` is only the compact label for the final index. It never re
 
 After you record all the batches in the iteration:
 
-1. Run `publish --state <path>` at once. Never do its push, reply, resolve, review-request, or verification substeps by hand.
-2. Publishing leaves a suppressed entry out of the replies, the thread resolution, and the thread verification, while a queue of only suppressed entries can still publish.
-3. Each reply is published on its own rather than bundled into one review, and verification fails when any reply is left in a review nobody submitted.
-4. If the local and remote heads match, nothing is pushed. Publication still requests and verifies a fresh Copilot review, including on an iteration with no commit and on a no-code iteration.
-5. If `publish` returns `head_changed`, stop without retrying or pushing. Report that the pull request changed during publishing, so the run stopped to avoid overwriting the newer update. Tell the user to run the review loop again from the latest head.
-6. On a publish error, keep the state and run `publish` again only after you resolve the blocker it reported.
-7. After `published`, add exactly one to the run-local iteration counter, then start exactly one `watch --state <path>` process with terminal parameter `mode: sync`; leave out both `timeout` and `isBackground` entirely.
-8. Never use `mode: async`, `isBackground: true`, or `timeout: 0`; consume its final JSON result directly from that same call. Do not send a final response while the watcher is active.
-9. Handle the watcher result:
-   - `review_no_comments`: the loop is clean, so send the final compact index with the exact `review_id` and `review_url`.
-   - `review_comments`: run `preflight` on the same PR and begin the next iteration at once.
-   - `request_cancelled` or `review_dismissed`: the wait ended with no usable Copilot review, so stop and report a run that needs a person rather than another attempt. Say plainly that you waited for a Copilot review and none arrived, and never let it read like an ordinary uneventful run.
-   - `head_changed`, `cancelled_locally`, or `stopped`: stop, and include that exact outcome in the final compact index.
+1. Clear **Local Validation Before A Push**, and commit anything a fixing command rewrote, before you run `publish`.
+2. Run `publish --state <path>` at once, naming what you validated. Never do its push, reply, resolve, review-request, or verification substeps by hand.
+3. Publishing leaves a suppressed entry out of the replies, the thread resolution, and the thread verification, while a queue of only suppressed entries can still publish.
+4. Each reply is published on its own rather than bundled into one review, and verification fails when any reply is left in a review nobody submitted.
+5. If the local and remote heads match, nothing is pushed. Publication still requests and verifies a fresh Copilot review, including on an iteration with no commit and on a no-code iteration.
+6. If `publish` returns `head_changed`, stop without retrying or pushing. Report that the pull request changed during publishing, so the run stopped to avoid overwriting the newer update. Tell the user to run the review loop again from the latest head.
+7. On a publish error, keep the state and run `publish` again only after you resolve the blocker it reported.
+8. After `published`, add exactly one to the run-local iteration counter, then start exactly one `watch --state <path>` process with terminal parameter `mode: sync`; leave out both `timeout` and `isBackground` entirely.
+9. Never use `mode: async`, `isBackground: true`, or `timeout: 0`; consume its final JSON result directly from that same call. Do not send a final response while the watcher is active.
+10. Handle the watcher result:
+    - `review_no_comments`: the loop is clean, so send the final compact index with the exact `review_id` and `review_url`.
+    - `review_comments`: run `preflight` on the same PR and begin the next iteration at once.
+    - `request_cancelled` or `review_dismissed`: the wait ended with no usable Copilot review, so stop and report a run that needs a person rather than another attempt. Say plainly that you waited for a Copilot review and none arrived, and never let it read like an ordinary uneventful run.
+    - `head_changed`, `cancelled_locally`, or `stopped`: stop, and include that exact outcome in the final compact index.
 
 The helper increments the stored total iteration count only after a successful publication, to keep workflow history. It enforces the cap from `--completed-run-iterations`, so a stored iteration from an earlier invocation never uses up the current invocation's five-iteration budget.
 
 ## Final Response
 
-Keep chat as a compact index, because the reasoning lives in git. Emit exactly one terminal response and make it the last message of the run. Render ordinary Markdown, never a fenced code block. Emit one linked list item per commit, using the canonical pull request URL from the most recent preflight result's `pr.url`, then one loop-outcome line:
+Keep chat as a compact index, because the reasoning lives in git. Emit exactly one terminal response and make it the last message of the run. Render ordinary Markdown, never a fenced code block. Emit one linked list item per commit, using the canonical pull request URL from the most recent preflight result's `pr.url`, then an optional not-validated-locally line, then one loop-outcome line:
 
 - `[<short-sha> <short batch summary>](<pr.url>/changes/<full-sha>)`
+- `**Not validated locally:** <reason>`
 - `**Outcome:** clean after <n> iteration(s), [Copilot review <id>](<review-url>).`
 
 Finish every tool call the run needs, including the final publish, watcher, and cleanup steps, before you compose this response. Assemble every applicable section, including the retrospective, then send the whole thing in one message that calls no tool. Never attach any part of it to a message that also calls a tool, because the tool result then forces you to speak again. Once you send it the run is over: never restate, condense, expand, or re-render it, and never send another message because a tool result, a reminder, or a turn boundary invites one.
 
 Begin with the first applicable required line, and never open with a narrative recap of what the run did. The first commit link or `**Outcome:**` line begins the only report of the run, so render the `**Outcome:**` line at most once, and never begin a second report after it or after the retrospective.
 
-The backticks above mark templates only. Do not include them in the final response. For a clean exit at preflight, build the same link from `head_review_id` and `head_review_url`. Never print a bare review ID when its URL is available. For a capped or interrupted run, use `**Outcome:** <exact stop condition> after <n> iteration(s).` and add the same review link when the terminal helper result includes a review ID and URL. For `head_changed`, use `**Outcome:** \`head_changed\` after <n> iteration(s): the pull request changed during publishing from expected head \`<expected-head>\` to actual head \`<actual-head>\`. This run stopped without pushing to avoid overwriting the newer update. Run the review loop again from the latest head.` For `request_cancelled` or `review_dismissed`, use `**Outcome:** \`<exact stop condition>\` after <n> iteration(s): waited for a Copilot review and none arrived. This needs a person, not another attempt. Check why Copilot is not reviewing this pull request before running the review loop again.` Do not ask to be run again in that outcome. Mention uncommitted work only for a validation stop you could not fix. Do not repeat a Copilot comment, analysis, upsides, downsides, validation success, or publication mechanics in chat.
+The backticks above mark templates only. Do not include them in the final response. For a clean exit at preflight, build the same link from `head_review_id` and `head_review_url`. Never print a bare review ID when its URL is available. For a capped or interrupted run, use `**Outcome:** <exact stop condition> after <n> iteration(s).` and add the same review link when the terminal helper result includes a review ID and URL. For `head_changed`, use `**Outcome:** \`head_changed\` after <n> iteration(s): the pull request changed during publishing from expected head \`<expected-head>\` to actual head \`<actual-head>\`. This run stopped without pushing to avoid overwriting the newer update. Run the review loop again from the latest head.` For `request_cancelled` or `review_dismissed`, use `**Outcome:** \`<exact stop condition>\` after <n> iteration(s): waited for a Copilot review and none arrived. This needs a person, not another attempt. Check why Copilot is not reviewing this pull request before running the review loop again.` Do not ask to be run again in that outcome. Mention uncommitted work only for a validation stop you could not fix. Render the `**Not validated locally:**` line only when this run published a commit without running a covering check, directly before `**Outcome:**`, and give the same reason you passed to `--not-validated`. Do not repeat a Copilot comment, analysis, upsides, downsides, validation success, or publication mechanics in chat.
 
 In every outcome, `<n>` is the run-local iteration counter, not the helper's cumulative stored iteration count. A run that exits clean during its first preflight reports `0 iterations`; a run that begins with four stored iterations and publishes once reports `1 iteration`. The **Copilot Review Loop Agent Retrospective** is the only content allowed after the `**Outcome:**` line.
 

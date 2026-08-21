@@ -1592,6 +1592,44 @@ def require_fork_head(pr: dict[str, Any]) -> None:
         )
 
 
+def local_validation_entry(args: argparse.Namespace, head_sha: str) -> dict[str, Any]:
+    """Describe the local validation behind one publication.
+
+    Three answers are distinct and a reader needs all three. `passed` names the
+    commands that ran and passed, `skipped` carries the reason none ran, and
+    `unreported` says the publication claimed nothing either way. `rewrote` names
+    the subset that changed files, because a fixing command's rewrites have to
+    reach the commits being pushed and a record that only says "ran clean"
+    cannot show whether they did.
+
+    Nothing here refuses a push. A repository that offers no covering command
+    must still publish, and a malformed claim is folded into a coherent record
+    rather than raised: naming a command as rewriting implies it ran, so it
+    counts as validated too. The record exists so someone can read what the loop
+    did instead of inferring it from the checks that fail afterwards.
+    """
+    entry: dict[str, Any] = {"head_sha": head_sha}
+    rewrote = [command.strip() for command in (args.rewrote or []) if command.strip()]
+    commands = [
+        command.strip() for command in (args.validated or []) if command.strip()
+    ]
+    for command in rewrote:
+        if command not in commands:
+            commands.append(command)
+    if commands:
+        entry["status"] = "passed"
+        entry["commands"] = commands
+        entry["rewrote"] = rewrote
+        return entry
+    reason = (args.not_validated or "").strip()
+    if reason:
+        entry["status"] = "skipped"
+        entry["reason"] = reason
+        return entry
+    entry["status"] = "unreported"
+    return entry
+
+
 def command_publish(args: argparse.Namespace) -> None:
     path = cli_path(args.state)
     state = load_state(path)
@@ -1681,6 +1719,8 @@ def command_publish(args: argparse.Namespace) -> None:
 
     review["status"] = "published"
     review["published_head_sha"] = local_head
+    validation = local_validation_entry(args, local_head)
+    state.setdefault("local_validation", []).append(validation)
     state["iterations"] = int(state.get("iterations", 0)) + 1
     archive_review(state)
     save_state(path, state)
@@ -1691,6 +1731,7 @@ def command_publish(args: argparse.Namespace) -> None:
             "head_sha": local_head,
             "commits": commits,
             "iterations": state["iterations"],
+            "local_validation": validation,
         }
     )
 
@@ -1762,6 +1803,7 @@ def command_status(args: argparse.Namespace) -> None:
                     "pr": {"number": target["number"], "url": target["pr_url"]},
                     "review": None,
                     "history": [],
+                    "local_validation": [],
                 }
             )
             return
@@ -1777,6 +1819,7 @@ def command_status(args: argparse.Namespace) -> None:
         "pr": pr,
         "review": review,
         "history": history,
+        "local_validation": state.get("local_validation") or [],
         **stage_outcome_fields(state),
         "iterations": int(state.get("iterations", 0)),
         "last_helper_activity": last_helper_activity(state),
@@ -1817,6 +1860,7 @@ def command_status(args: argparse.Namespace) -> None:
                 "history": len(history),
                 "pr_commits": len(((review or {}).get("pr_commits")) or []),
             },
+            "local_validation": state.get("local_validation") or [],
             **stage_outcome_fields(state),
             "iterations": int(state.get("iterations", 0)),
             "last_helper_activity": last_helper_activity(state),
@@ -1932,6 +1976,25 @@ def build_parser() -> argparse.ArgumentParser:
         "publish", help="push this iteration's commits and verify the new head"
     )
     publish.add_argument("--state", required=True)
+    publish_validation = publish.add_mutually_exclusive_group()
+    publish_validation.add_argument(
+        "--validated",
+        action="append",
+        metavar="COMMAND",
+        help="a covering check that ran locally and passed; repeat for each one",
+    )
+    publish_validation.add_argument(
+        "--not-validated",
+        metavar="REASON",
+        help="why no covering check ran locally before this push",
+    )
+    publish.add_argument(
+        "--rewrote",
+        action="append",
+        metavar="COMMAND",
+        help="a covering check that rewrote files; those rewrites must already be "
+        "in the commits this pushes",
+    )
     publish.set_defaults(function=command_publish)
 
     status = subparsers.add_parser("status", help="print compact workflow state")

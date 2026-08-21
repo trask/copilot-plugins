@@ -1,9 +1,11 @@
+import argparse
 import contextlib
 import datetime as dt
 import importlib.util
 import io
 import json
 from pathlib import Path
+import re
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -128,6 +130,22 @@ def attribution(key, verdict, *, source="baseline", baseline=None, conclusion=No
         "baseline_verdict": baseline if baseline is not None else verdict,
         "rationale": None,
     }
+
+
+LOCAL_VALIDATION_HEADING = "## Local Validation Before A Push"
+def _agent_section(text, heading):
+    """Return the body of one Markdown section, stopping at the next peer heading."""
+    lines = text.split("\n")
+    start = lines.index(heading)
+    depth = len(heading) - len(heading.lstrip("#"))
+    body = []
+    for line in lines[start + 1 :]:
+        if line.startswith("#"):
+            level = len(line) - len(line.lstrip("#"))
+            if level <= depth:
+                break
+        body.append(line)
+    return "\n".join(body)
 
 
 class AgentInstructionsTest(unittest.TestCase):
@@ -467,6 +485,162 @@ class AgentInstructionsTest(unittest.TestCase):
             "The terminal response is the run's last message.", self.instructions
         )
         self.assertIn("Send one message that calls no tool.", self.instructions)
+
+    def test_names_no_build_tool_or_programming_language(self):
+        """Each stage runs under the configuration its own repository supplies.
+
+        This list exists to fail on the one wrong fix that is tempting here:
+        pasting a concrete build command into the file so the agent does not
+        have to work one out. Every name is matched on a word boundary,
+        because a bare substring on a short token eventually fires on an
+        innocent word and gets deleted by whoever trips over it, and the guard
+        is then gone.
+        """
+        forbidden = [
+            "bazel",
+            "cargo",
+            "dotnet",
+            "golang",
+            "gradle",
+            "gradlew",
+            "java",
+            "javac",
+            "jest",
+            "junit",
+            "kotlin",
+            "maven",
+            "mvn",
+            "npm",
+            "pnpm",
+            "pytest",
+            "rustc",
+            "tsc",
+            "typescript",
+            "yarn",
+        ]
+        found = sorted(
+            name
+            for name in forbidden
+            if re.search(rf"\b{name}\b", self.instructions, re.IGNORECASE)
+        )
+        self.assertEqual([], found)
+
+    def test_the_local_validation_fallback_publishes_instead_of_stopping(self):
+        """A repository with no usable narrow command must not become a stop.
+
+        Halting there would create a second class of false escalation on
+        exactly the repositories where local validation buys nothing, so every
+        paragraph that reaches for the skip flag has to push, and none of them
+        may reach for escalation vocabulary.
+        """
+        section = _agent_section(self.instructions, LOCAL_VALIDATION_HEADING)
+        paragraphs = [
+            paragraph
+            for paragraph in section.split("\n\n")
+            if "--not-validated" in paragraph
+        ]
+        self.assertTrue(paragraphs)
+        for paragraph in paragraphs:
+            with self.subTest(paragraph=paragraph):
+                self.assertIn("publish", paragraph)
+                self.assertNotIn("escalat", paragraph.lower())
+
+    def test_every_validation_flag_the_section_names_reaches_publish(self):
+        """Prose naming a flag the helper rejects would stop a push outright."""
+        section = _agent_section(self.instructions, LOCAL_VALIDATION_HEADING)
+        named = sorted(set(re.findall(r"--[a-z][a-z-]+", section)))
+        self.assertTrue(named)
+        parser = MODULE.build_parser()
+        for flag in named:
+            with self.subTest(flag=flag):
+                args = parser.parse_args(
+                    ["publish", "--state", "state.json", flag, "value"]
+                )
+                self.assertEqual("publish", args.command)
+
+    def test_publish_documents_every_validation_flag_it_accepts(self):
+        """A flag the helper grows and the file never mentions goes unused."""
+        parser = MODULE.build_parser()
+        subparsers = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        accepted = sorted(
+            option
+            for action in subparsers.choices["publish"]._actions
+            for option in action.option_strings
+            if "valid" in option or "rewrote" in option
+        )
+        self.assertTrue(accepted)
+        section = _agent_section(self.instructions, LOCAL_VALIDATION_HEADING)
+        for flag in accepted:
+            with self.subTest(flag=flag):
+                self.assertIn(flag, section)
+
+    def test_local_validation_is_wired_into_the_step_that_pushes(self):
+        """The requirement is only real where the run reaches the push."""
+        section = _agent_section(self.instructions, LOCAL_VALIDATION_HEADING)
+        elsewhere = self.instructions.replace(section, "")
+        self.assertIn(f"**{LOCAL_VALIDATION_HEADING.lstrip('# ')}**", elsewhere)
+
+    def test_covering_checks_are_not_narrowed_to_compilation(self):
+        """The failure this requirement was written for compiled cleanly.
+
+        It was a documentation comment that a separate documentation task
+        rejected, so wording that let covering mean "it builds" would sail
+        past the very cycle this is meant to save.
+        """
+        section = _agent_section(self.instructions, LOCAL_VALIDATION_HEADING)
+        for word in ["documentation", "lint", "format"]:
+            with self.subTest(word=word):
+                self.assertIn(word, section)
+
+    def test_requires_committing_what_a_fixing_command_rewrote(self):
+        """A rewrite left in the worktree fails silently.
+
+        The push carries the earlier commit, the same check fails on the pull
+        request anyway, and the next reset discards the rewritten files.
+        """
+        section = _agent_section(self.instructions, LOCAL_VALIDATION_HEADING)
+        self.assertIn("fixing form", section)
+        rewrite_paragraphs = [
+            paragraph
+            for paragraph in section.split("\n\n")
+            if re.search(r"rewr\w+", paragraph, re.IGNORECASE)
+            and "commit" in paragraph.lower()
+        ]
+        self.assertTrue(rewrite_paragraphs)
+
+    def test_local_success_does_not_stand_in_for_the_checks(self):
+        self.assertIn(
+            "GitHub says whether they pass and this loop never does",
+            self.instructions,
+        )
+
+    def test_requires_reproducing_the_failing_check_before_fixing_it(self):
+        """This stage knows which check failed, so it must not guess.
+
+        A guess costs a whole CI cycle, which is the most expensive mistake
+        available to a loop whose entire cost model is round trips.
+        """
+        self.assertIn("Reproduce the failure locally.", self.instructions)
+        self.assertIn(
+            "confirm it fails the same way it failed in CI", self.instructions
+        )
+        self.assertIn(
+            "Run that same command again, and confirm it now passes",
+            self.instructions,
+        )
+
+    def test_a_failure_that_cannot_be_reproduced_here_still_publishes(self):
+        """Checks needing containers or credentials only run in CI.
+
+        Refusing to push those would turn an ordinary repository into an
+        escalation, which is worse than the failure this section prevents.
+        """
+        section = _agent_section(self.instructions, LOCAL_VALIDATION_HEADING)
+        self.assertIn("must never stop this loop", section)
 
 
 class EscalationCatalogTest(unittest.TestCase):
@@ -2017,6 +2191,113 @@ class PublishCommandTest(unittest.TestCase):
         self.assertEqual("published", state["run"]["status"])
         self.assertEqual({}, state["reruns"])
 
+    def test_records_the_local_validation_behind_the_push(self):
+        """The state has to say what ran, or a live run proves nothing.
+
+        This loop pays for a wrong guess in whole CI cycles, so the record of
+        what it ran before spending one is the point of the requirement.
+        """
+        path = write_state(
+            self.root,
+            run={
+                "batches": [
+                    {"id": "b1", "status": "recorded", "commit": "local1",
+                     "summary": "fixed the import", "rationale": None}
+                ]
+            },
+        )
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(MODULE, "git", self.fake_git(rev_list="local1"))
+            )
+            stack.enter_context(
+                mock.patch.object(MODULE, "find_push_remote", return_value="origin")
+            )
+            stack.enter_context(
+                mock.patch.object(MODULE, "remote_head", side_effect=["head1", "local1"])
+            )
+            stack.enter_context(
+                mock.patch.object(MODULE, "wait_for_remote_head", return_value="local1")
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE, "metadata_for", return_value={"head_sha": "local1"}
+                )
+            )
+            stack.enter_context(mock.patch.object(MODULE, "run"))
+            payload = call(
+                "publish",
+                "--state",
+                str(path),
+                "--validated",
+                "the failing check",
+                "--rewrote",
+                "the fixing form",
+            )
+        state = MODULE.load_state(path)
+        self.assertEqual(
+            [
+                {
+                    "head_sha": "local1",
+                    "status": "passed",
+                    "commands": ["the failing check", "the fixing form"],
+                    "rewrote": ["the fixing form"],
+                }
+            ],
+            state["local_validation"],
+        )
+        self.assertEqual(state["local_validation"][-1], payload["local_validation"])
+
+    def test_publishes_a_fix_that_could_not_be_reproduced_locally(self):
+        """A check that only runs in CI must not hold a fix back.
+
+        Refusing to push there would turn an ordinary repository into an
+        escalation, which costs more than the failure this record watches for.
+        """
+        path = write_state(
+            self.root,
+            run={
+                "batches": [
+                    {"id": "b1", "status": "recorded", "commit": "local1",
+                     "summary": "fixed the import", "rationale": None}
+                ]
+            },
+        )
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(MODULE, "git", self.fake_git(rev_list="local1"))
+            )
+            stack.enter_context(
+                mock.patch.object(MODULE, "find_push_remote", return_value="origin")
+            )
+            stack.enter_context(
+                mock.patch.object(MODULE, "remote_head", side_effect=["head1", "local1"])
+            )
+            stack.enter_context(
+                mock.patch.object(MODULE, "wait_for_remote_head", return_value="local1")
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE, "metadata_for", return_value={"head_sha": "local1"}
+                )
+            )
+            push = stack.enter_context(mock.patch.object(MODULE, "run"))
+            payload = call(
+                "publish",
+                "--state",
+                str(path),
+                "--not-validated",
+                "the check needs a container this workspace has no access to",
+            )
+        push.assert_called_once()
+        self.assertEqual("published", payload["result"])
+        state = MODULE.load_state(path)
+        self.assertEqual("skipped", state["local_validation"][-1]["status"])
+        self.assertEqual(
+            "the check needs a container this workspace has no access to",
+            state["local_validation"][-1]["reason"],
+        )
+
     def test_refuses_when_the_pull_request_head_does_not_catch_up(self):
         path = write_state(
             self.root,
@@ -3186,6 +3467,66 @@ class MainTest(unittest.TestCase):
                     code = MODULE.main()
             self.assertEqual(0, code)
             self.assertEqual("cleaned_up", json.loads(stream.getvalue())["result"])
+
+
+class LocalValidationRecordTest(unittest.TestCase):
+    """The record is what makes the push requirement falsifiable.
+
+    Reading a stage's own state afterwards has to say whether it validated,
+    skipped, or claimed nothing at all, because inferring that from the checks
+    that fail later is exactly the guessing this replaced.
+    """
+
+    def entry(self, head="head1", **overrides):
+        args = SimpleNamespace(validated=None, rewrote=None, not_validated=None)
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return MODULE.local_validation_entry(args, head)
+
+    def test_records_the_commands_that_ran_and_the_head_they_covered(self):
+        entry = self.entry(validated=["check one", "check two"])
+        self.assertEqual("passed", entry["status"])
+        self.assertEqual(["check one", "check two"], entry["commands"])
+        self.assertEqual([], entry["rewrote"])
+        self.assertEqual("head1", entry["head_sha"])
+
+    def test_separates_the_commands_that_rewrote_files(self):
+        """A command that ran clean and one that changed files differ.
+
+        Only the second has anything that must reach the commits being pushed.
+        """
+        entry = self.entry(validated=["check one"], rewrote=["check one"])
+        self.assertEqual(["check one"], entry["rewrote"])
+        self.assertEqual(["check one"], entry["commands"])
+
+    def test_a_rewriting_command_counts_as_one_that_ran(self):
+        """Naming a command as rewriting implies it ran.
+
+        Folding that in keeps a malformed claim from reaching the state as a
+        contradiction, and keeps it from becoming a reason to refuse.
+        """
+        entry = self.entry(rewrote=["check one"])
+        self.assertEqual("passed", entry["status"])
+        self.assertEqual(["check one"], entry["commands"])
+        self.assertEqual(["check one"], entry["rewrote"])
+
+    def test_records_the_reason_when_nothing_covering_ran(self):
+        entry = self.entry(not_validated="no narrow command exists here")
+        self.assertEqual("skipped", entry["status"])
+        self.assertEqual("no narrow command exists here", entry["reason"])
+        self.assertNotIn("commands", entry)
+
+    def test_records_that_the_publication_claimed_nothing(self):
+        """This is the value that shows the requirement being ignored.
+
+        A run that says neither thing must be distinguishable from one that
+        deliberately skipped, or a live run proves nothing either way.
+        """
+        self.assertEqual("unreported", self.entry()["status"])
+
+    def test_blank_claims_are_treated_as_no_claim(self):
+        entry = self.entry(validated=["  "], not_validated="   ")
+        self.assertEqual("unreported", entry["status"])
 
 
 if __name__ == "__main__":

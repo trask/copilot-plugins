@@ -29,7 +29,7 @@ Clear the **Model Gate** first, then run `preflight`. After `preflight` succeeds
 - The loop is `preflight -> review -> evaluate -> batch -> commit -> publish`, repeated for each new head.
 - The maximum is 5 iterations, unless an outer loop sets its own. Respect `max_iterations_reached` before you edit anything; do not work around it.
 - The authoritative changeset is the diff the helper pins at `head_sha`. Never use a local branch diff, the working tree, or a comparison with the current base tip in its place.
-- Skip a blanket run of the test suite, and any other check whose only purpose is to repeat CI during review. CI runs the suite before this loop edits anything, so running it again here settles nothing. Everything else about tests belongs to this review: read the test code the pull request changes, investigate a test when it bears on a candidate, and run a targeted test when that is how you answer a question about the change. This does not forbid running something locally as evidence: when the sources or the documentation do not settle behavior you need to prove or disprove a candidate, run the smallest throwaway probe that establishes the relevant repository, shared-helper, dependency, or third-party runtime behavior. Reuse the dependencies and caches you already have, keep generated files outside the repository, delete them afterward, and do not widen the probe into general validation. Always run focused validation for an edit you make.
+- Skip a blanket run of the test suite, and any other check whose only purpose is to repeat CI during review. CI runs the suite before this loop edits anything, so running it again here settles nothing. Everything else about tests belongs to this review: read the test code the pull request changes, investigate a test when it bears on a candidate, and run a targeted test when that is how you answer a question about the change. This does not forbid running something locally as evidence: when the sources or the documentation do not settle behavior you need to prove or disprove a candidate, run the smallest throwaway probe that establishes the relevant repository, shared-helper, dependency, or third-party runtime behavior. Reuse the dependencies and caches you already have, keep a probe's own generated files outside the repository, delete them afterward, and do not widen the probe into general validation. Always run focused validation for an edit you make, and clear **Local Validation Before A Push** before any of it is published.
 - Treat suppressed coverage as a defect only a reviewer catches. A deleted assertion, an added skip or disable annotation, a loosened matcher or widened tolerance, and an exception swallowed inside a test each turn a check green by asking less of the code, and a green check is then evidence of nothing. Decide for each such edit whether the behavior it stops checking is behavior this pull request still ships, and register a candidate that says exactly what is no longer checked. Judge the edit on that, not on its size or on the rationale attached to it. A suppression that the pull request justifies is fine; one that only makes a failure disappear is not.
 - Raise an issue only when the reader can act on it, this PR demonstrates it as fact, and fixing it fits the PR's stated scope. Changed documentation or metadata can demonstrate an issue, and the same demonstrated issue elsewhere in the PR can be in scope.
 - Prefer silence. Zero candidates is a successful review. Never invent work to justify a commit, and never raise a guess, a triviality, praise, a preference with no repository instruction behind it, or an issue that already existed and that this PR does not make relevant.
@@ -96,8 +96,8 @@ The deterministic, JSON-only helper provides:
 - `plan --state <path> --batch <id> --candidates <ids...> --label <label> [--paths <paths...>] [--validation <command>]`: store one planned fix batch
 - `record` and `skip`: maintain the state of a completed batch or a batch that validation blocked
 - `resolve --state <path> --outcome clean`: require that there are no candidates, or only dropped ones, verify that the live PR head still matches the pin, and durably mark the active review clean
-- `publish --state <path>`: require a clean worktree and complete records, refuse to publish a skipped batch, require the commits sitting on the pinned head to be exactly the recorded ones, push only when a push is needed, and verify that the remote branch and the PR head both match the local head
-- `status [--state <path> | --current --repo-root <workspace>]`: write the complete state snapshot to `status_path` as JSON and print only a compact envelope carrying `result`, `state`, `status_path`, PR identity, an active-review summary with `candidate_statuses` and `batch_statuses`, `counts`, `stage_outcome`, and `iterations`. The complete result at `status_path` adds full `pr` metadata, the whole `review` with its anchors, candidates, and batches, and the carried-forward `history`. A `no_state` result writes no file. `stage_outcome` is the machine-readable ending an orchestrator reads. It appears only as `cleared`, when the state records a clean review, and it is absent otherwise. State exists from the moment `preflight` writes it, so a run killed partway through leaves the same state as a run still going, and no reading of that state can name an ending it never reached. An absent `stage_outcome` says exactly that, and an orchestrator then takes the ending from your own report instead. It records how the loop ended rather than whether the review is clean, which only the recorded clean head states. It also carries `last_helper_activity`, the moment this helper last wrote its state. That is not proof the stage is alive, because the helper writes only when a subcommand runs and the agent driving it can think for a long time between two of them.
+- `publish --state <path> [--validated <command>]... [--rewrote <command>]... [--not-validated <reason>]`: require a clean worktree and complete records, refuse to publish a skipped batch, require the commits sitting on the pinned head to be exactly the recorded ones, push only when a push is needed, verify that the remote branch and the PR head both match the local head, and stamp the local validation you named onto the head it pushed. It records `passed` with your commands, `skipped` with your reason, or `unreported` when you name neither, and it never refuses a push over any of the three.
+- `status [--state <path> | --current --repo-root <workspace>]`: write the complete state snapshot to `status_path` as JSON and print only a compact envelope carrying `result`, `state`, `status_path`, PR identity, an active-review summary with `candidate_statuses` and `batch_statuses`, `counts`, `local_validation`, `stage_outcome`, and `iterations`. The complete result at `status_path` adds full `pr` metadata, the whole `review` with its anchors, candidates, and batches, and the carried-forward `history`. A `no_state` result writes no file. `stage_outcome` is the machine-readable ending an orchestrator reads. It appears only as `cleared`, when the state records a clean review, and it is absent otherwise. State exists from the moment `preflight` writes it, so a run killed partway through leaves the same state as a run still going, and no reading of that state can name an ending it never reached. An absent `stage_outcome` says exactly that, and an orchestrator then takes the ending from your own report instead. It records how the loop ended rather than whether the review is clean, which only the recorded clean head states. It also carries `last_helper_activity`, the moment this helper last wrote its state. That is not proof the stage is alive, because the helper writes only when a subcommand runs and the agent driving it can think for a long time between two of them.
 - `cleanup --state <path>`: delete the state file along with its diff, preflight, and status files
 
 If an operation partly fails, keep its state and run that same operation again after you fix only the blocker it reported.
@@ -191,7 +191,29 @@ For each batch:
 6. For a no-code outcome, run `record` with `--rationale` instead of `--commit`.
 7. Continue straight to the next batch.
 
-Follow the repository's own validation rules. Apply the project's formatter directly rather than running a check-only task first.
+Follow the repository's own validation rules.
+
+### Local Validation Before A Push
+
+The commits this loop makes have never been through CI. Reading the diff settles what a change means, and it never settles whether the repository still accepts it, so an edit needs evidence of its own before **Publishing And The Next Iteration** sends it anywhere.
+
+Work out the narrowest subset of the checks the repository itself runs that covers the files you changed, and run it. Covering is about what a check reads, not about compilation: a documentation, lint, or format task covers a change to what it reads, and an edit confined to a comment still has one. Narrowest means the affected module or the changed files alone, never a whole-repository run, which is the blanket check the review rules already send you past.
+
+Order that set by what it costs. When the covering tests are slow, run the compile or type check first, because an edit that does not build is both the likeliest failure and the cheapest to find. Cost decides the order and never the membership: a check that reads what you touched stays in the set however you sequence it.
+
+Where a check has a fixing form as well as a verifying one, run the fixing form. It costs the same and repairs what it finds, so verifying first and fixing afterwards is one job done twice.
+
+Commit whatever a fixing command rewrites, before you publish. A rewrite left sitting in the worktree is the quiet way this whole step fails: the push carries the commit you already made, the pull request fails that same check anyway, and the next reset clears the rewritten files away as somebody's leftovers. The order is run the covering checks, commit what they changed, then `publish`.
+
+A covering check that fails is a validation failure like any other, so fix it or take the `skip` path the batch rules already describe. Build output a covering command leaves behind stays where it is; it is not a probe's generated file to delete, and the next run compiles faster for finding it.
+
+Tell `publish` what you did. Pass `--validated <command>` for each covering check that ran and passed, add `--rewrote <command>` for each one that changed a file, and pass `--not-validated <reason>` when none of them ran. The helper stamps that answer with the head it pushed, and records `unreported` when you say nothing. None of it refuses a push.
+
+Many repositories offer nothing narrow enough, and some offer only a command costing more than the CI cycle it would save. Look with modest effort, then stop looking: publish, pass `--not-validated <reason>`, and say the same thing in the final index.
+
+That is deliberate and it is not an oversight to correct. A missing command must never become a stop condition, because halting there would strand the loop on exactly the repositories where running anything locally buys nothing.
+
+Passing locally is not a pass. The pull request's checks remain the only thing that says a change is sound, and a covering command that succeeded here never lets this loop treat a head as reviewed, clean, or finished.
 
 ## Commit Content
 
@@ -219,9 +241,10 @@ The short `--summary` is only the compact label for the final index. It never re
 
 After you record all the batches in the iteration:
 
-1. Run `publish --state <path>` at once. Never do its push or verification substeps by hand.
-2. On a publish error, keep the state and run `publish` again only after you resolve the blocker it reported.
-3. Handle the result:
+1. Clear **Local Validation Before A Push**, and commit anything a fixing command rewrote, before you run `publish`.
+2. Run `publish --state <path>` at once, naming what you validated. Never do its push or verification substeps by hand.
+3. On a publish error, keep the state and run `publish` again only after you resolve the blocker it reported.
+4. Handle the result:
    - `published`: run `preflight` on the same PR and begin the next iteration at once against the new head.
    - `nothing_to_publish`: this iteration produced no commit, so nothing changed and another pass would repeat itself. Stop and send the final index.
 
@@ -233,11 +256,12 @@ The general pull request instruction to keep the title and description materiall
 
 ## Final Response
 
-Keep chat as a compact index, because the reasoning for accepted findings lives in git. Emit exactly one terminal response and make it the last message of the run. Render ordinary Markdown, never a fenced code block. Emit one linked list item per commit, then any no-code outcome, one loop-outcome line, an optional dropped-candidate block, and finally the canonical pull request link from the most recent preflight result's `pr.pr_url`:
+Keep chat as a compact index, because the reasoning for accepted findings lives in git. Emit exactly one terminal response and make it the last message of the run. Render ordinary Markdown, never a fenced code block. Emit one linked list item per commit, then any no-code outcome, one loop-outcome line, an optional not-validated-locally line, an optional dropped-candidate block, and finally the canonical pull request link from the most recent preflight result's `pr.pr_url`:
 
 - `[<short-sha> <short batch summary>](<pr.pr_url>/changes/<full-sha>)`
 - `No code change: <short summary> - <one-line rationale>`
 - `**Outcome:** clean after <n> iteration(s).`
+- `**Not validated locally:** <reason>`
 - `**Dropped candidates:**`
 - `- \`<path>:<line>\` - <concise candidate problem>: <concrete evaluator reason>`
 - `**PR:** [#<pr.number> <pr.title>](<pr.pr_url>)`
@@ -250,7 +274,7 @@ Include the dropped-candidate block only when this run dropped candidates. Put i
 
 For a clean pass with no commits and no no-code outcomes, leave out the first two line types. With no dropped candidates, render exactly the `**Outcome:**` line followed by the `**PR:**` line. With dropped candidates, render the outcome, the dropped-candidate block, and the PR line in that order. Do not invent a commit, a no-code line, or a narrative line just to fill the space above `**Outcome:**`.
 
-The backticks above mark templates only. Do not include them in the final response, except for the dropped candidate's inline-code location. For a capped or interrupted run, use `**Outcome:** <exact stop condition> after <n> iteration(s).` Always end with the linked `**PR:**` line so the pull request is one click away. Mention uncommitted work only for a validation stop you could not fix. Do not repeat accepted findings, analysis, upsides, downsides, validation success, or publication mechanics in chat. The **Self Review Loop Agent Retrospective** is the only content allowed after the `**PR:**` line.
+The backticks above mark templates only. Do not include them in the final response, except for the dropped candidate's inline-code location. For a capped or interrupted run, use `**Outcome:** <exact stop condition> after <n> iteration(s).` Always end with the linked `**PR:**` line so the pull request is one click away. Mention uncommitted work only for a validation stop you could not fix. Render the `**Not validated locally:**` line only when this run published without running a covering check, directly after `**Outcome:**`, and give the same reason you passed to `--not-validated`. Do not repeat accepted findings, analysis, upsides, downsides, validation success, or publication mechanics in chat. The **Self Review Loop Agent Retrospective** is the only content allowed after the `**PR:**` line.
 
 ## Self Review Loop Agent Retrospective
 
