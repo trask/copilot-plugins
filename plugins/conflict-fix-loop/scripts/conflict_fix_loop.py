@@ -3240,11 +3240,21 @@ def command_stack_publish(args: argparse.Namespace) -> None:
 
     landed = []
     pending = []
+    skipped = []
     for member in intended:
         flags = skip_flags.get(member["head_branch"]) or {}
         if flags.get("merged") or flags.get("queued"):
             # `gh stack push` skips a merged or queued branch by design, so it is
-            # not expected to move and is not a mismatch.
+            # not expected to move and is not a mismatch. It is still named in a
+            # partial-publish report so a reader counting members against the
+            # landed and not-landed groups can account for every one.
+            skipped.append(
+                {
+                    "number": member["number"],
+                    "head_branch": member["head_branch"],
+                    "reason": "merged" if flags.get("merged") else "queued",
+                }
+            )
             continue
         remote = wait_for_remote_head(
             pr["upstream_owner"],
@@ -3295,6 +3305,12 @@ def command_stack_publish(args: argparse.Namespace) -> None:
             f"The cascade workspace is preserved at {workspace} for recovery; "
             "re-run stack-publish to retry the members that did not land."
         )
+        if skipped:
+            skipped_desc = "; ".join(
+                f"#{item['number']} {item['head_branch']} ({item['reason']})"
+                for item in skipped
+            )
+            message += f" Skipped by `gh stack push`: {skipped_desc}."
         if push.returncode != 0:
             message += f" `gh stack push` reported: {push_detail}"
         if borrow is not None:
@@ -3310,7 +3326,15 @@ def command_stack_publish(args: argparse.Namespace) -> None:
         ),
         None,
     )
+    # Every member landed on its intended tip, so this publishes. But a non-zero
+    # `gh stack push` that nonetheless moved every ref means the tool reported
+    # something after the pushes succeeded, and a clean publish must not be
+    # byte-identical to one where the tool errored. Carry the detail through
+    # rather than blocking, since re-running would be a no-op and the remote is
+    # already on the intended tips.
+    push_detail_note = push_detail if push.returncode != 0 else None
     attempt["status"] = "published"
+    attempt["stack_push_detail"] = push_detail_note
     attempt["published_head_sha"] = None if invoked is None else invoked["head_sha"]
     attempt["stack"]["members_published"] = intended
     remove_stack_workspace(attempt)
@@ -3336,6 +3360,11 @@ def command_stack_publish(args: argparse.Namespace) -> None:
             "mergeability": mergeability,
             "mergeable_at_head_sha": attempt["mergeable_at_head_sha"],
             "iterations": state["iterations"],
+            **(
+                {"push_detail": push_detail_note}
+                if push_detail_note is not None
+                else {}
+            ),
         }
     )
 

@@ -5133,6 +5133,10 @@ class StackPublishCommandTest(unittest.TestCase):
         self.assertEqual("mergeable", payload["mergeability"])
         self.remove.assert_called_once()
         self.assertEqual("published", self.saved()["attempt"]["status"])
+        # A clean, zero-exit push carries no reported detail, so a publish that
+        # errored is distinguishable from one that did not.
+        self.assertNotIn("push_detail", payload)
+        self.assertIsNone(self.saved()["attempt"]["stack_push_detail"])
 
     def test_a_partial_push_that_still_landed_every_member_publishes(self):
         # `gh stack push` exits non-zero on a partial push, but the remote shows
@@ -5194,6 +5198,39 @@ class StackPublishCommandTest(unittest.TestCase):
         )
         self.assertIsNotNone(self.error)
         self.assertIn("remote rejected feature", str(self.error))
+
+    def test_a_non_zero_push_with_every_member_landed_surfaces_the_detail(self):
+        # `gh stack push` exited non-zero but every member is on its intended tip,
+        # so this publishes rather than failing. The tool still reported something
+        # after the pushes succeeded, so that detail is carried onto the attempt
+        # and into the emitted result; a clean publish and an errored one must not
+        # be byte-identical from outside.
+        payload = self.publish(push=completed(1, stderr="post-push hook failed"))
+        self.assertEqual("published", payload["result"])
+        self.assertIn("push_detail", payload)
+        self.assertIn("post-push hook failed", payload["push_detail"])
+        self.assertIn(
+            "post-push hook failed", self.saved()["attempt"]["stack_push_detail"]
+        )
+
+    def test_a_partial_publish_names_a_skipped_member(self):
+        # v143 is merged so `gh stack push` skips it, and feature stayed on its
+        # pre-cascade commit so it did not land. The skipped member is named as its
+        # own group so a reader counting members against landed and not-landed can
+        # account for every one.
+        view = {
+            "trunk": "main",
+            "branches": [
+                {"name": "v143", "isMerged": True, "isQueued": False},
+                {"name": "feature", "isMerged": False, "isQueued": False},
+            ],
+        }
+        self.publish(view=view, landed={"v143": "aaa", "feature": "head1"})
+        self.assertIsNotNone(self.error)
+        message = str(self.error)
+        self.assertIn("Skipped by `gh stack push`", message)
+        self.assertIn("#19483 v143 (merged)", message)
+        self.assertIn("#7 feature", message)
 
     def test_publishing_without_recorded_tips_is_refused(self):
         self.publish(members_after=None)
