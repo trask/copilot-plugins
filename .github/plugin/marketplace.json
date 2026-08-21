@@ -29,7 +29,7 @@
     {
       "name": "pr-description",
       "description": "Review and automatically update a pull request title and description with head verification.",
-      "version": "1.0.25",
+      "version": "1.0.26",
       "source": "./plugins/pr-description"
     },
     {

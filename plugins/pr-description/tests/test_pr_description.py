@@ -85,6 +85,24 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("disable-model-invocation: true", self.instructions)
         self.assertIn("The user selects this agent by hand", self.instructions)
 
+    def test_the_no_target_path_is_not_offered_to_a_detached_worktree(self):
+        """A pipeline runs this stage detached, so omitting the target traps it.
+
+        `preflight` resolves the pull request from the checked-out branch, and a
+        detached worktree names none.
+        """
+        self.assertIn(
+            "works only while it is attached to one", self.instructions
+        )
+        self.assertIn(
+            "pass the pull request explicitly whenever you have it",
+            self.instructions,
+        )
+        self.assertIn(
+            "omit only from a worktree attached to the PR's branch",
+            self.instructions,
+        )
+
     def test_renames_once_after_preflight(self):
         self.assertIn(
             "tools: [read, search, execute, skill, todo, rename_session]",
@@ -543,7 +561,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.25")
+        self.assertEqual(plugin["version"], "1.0.26")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -642,6 +660,18 @@ class TargetParsingTest(unittest.TestCase):
         self.assertEqual(metadata["body"], "")
         self.assertEqual(metadata["head_sha"], "head1")
         gh_json.assert_called_once_with(["api", "repos/owner/repo/pulls/7"])
+
+    def test_the_refusal_names_the_way_out(self):
+        """A message that names only the fault leaves the caller stuck.
+
+        Detached HEAD is the normal state for a pipeline stage, so the refusal
+        has to say what to do instead.
+        """
+        with mock.patch.object(MODULE, "git", return_value=""):
+            with self.assertRaises(MODULE.WorkflowError) as raised:
+                MODULE.current_pr_target(Path("repo"))
+
+        self.assertIn("pass the pull request explicitly", str(raised.exception))
 
     def test_current_branch_without_upstream_uses_direct_gh_resolution(self):
         expected = MODULE.parse_target("owner/repo#7")

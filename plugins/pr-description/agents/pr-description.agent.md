@@ -1,7 +1,7 @@
 ---
 name: PR Description
 description: "Use when manually selected to review a pull request title and description, then automatically validate them or apply a replacement."
-argument-hint: "PR URL, PR number, or owner/repo#number; omit to use the current branch's PR"
+argument-hint: "PR URL, PR number, or owner/repo#number; omit only from a worktree attached to the PR's branch"
 tools: [read, search, execute, skill, todo, rename_session]
 user-invocable: true
 disable-model-invocation: true
@@ -91,7 +91,7 @@ Stop on the exact helper error. Never work around a head mismatch or a stale tit
 
 ## Preflight And Session Naming
 
-1. Run `preflight` once for the requested target. Pass a supplied PR URL, bare PR number, or `owner/repo#number` exactly. Omit the target to use the current branch's PR.
+1. Run `preflight` once for the requested target. Pass a supplied PR URL, bare PR number, or `owner/repo#number` exactly. Omitting the target uses the branch this worktree has checked out, which works only while it is attached to one. A pipeline runs this stage from a worktree detached at the pull request head, and a detached worktree names no branch to look up, so pass the pull request explicitly whenever you have it.
 2. After preflight succeeds, call `rename_session` exactly once with `PR Description: <number> - <title>`, built from the returned `pr.number` and `pr.title`. Never use an interim name and never rename again during this run.
 3. Keep the returned `state`, `run_id`, `head_sha`, `pr.url`, `pr.repo_name`, `title`, and exact stored `body`. Look at the decoded `body` for its real newline characters before you judge its structure; never trust how serialized JSON looks. Never switch to the stable `index_state` for a proposal or an apply.
 4. Read the authoritative pull request diff with `gh pr diff <pr.url> --repo <pr.repo_name>`. If the command output is too large for one tool read and the tool saves it to a file, read the authoritative diff from that saved file. The preflight `head_sha` is the immutable head for this evaluation and for any proposal. A later `validate` or `apply` verifies that the live head still matches it.
