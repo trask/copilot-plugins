@@ -4504,6 +4504,50 @@ class AgentInstructionsTest(unittest.TestCase):
             with self.subTest(command=name):
                 self.assertIn(f"`{name} ", self.instructions)
 
+    def test_the_target_help_carries_the_argument_hint_condition(self):
+        """Derived, not copied: drift in either surface fails here.
+
+        A literal only catches the change you thought of. Reading the clause out
+        of the agent file catches the agent file drifting too.
+        """
+
+        hint = next(
+            line for line in self.instructions.splitlines()
+            if line.startswith("argument-hint:")
+        )
+        clause = hint.strip().rstrip('"').rsplit("; ", 1)[1]
+        self.assertEqual("omit only from a worktree attached to the PR's branch", clause)
+        parser = MODULE.build_parser()
+        subparsers = [
+            action
+            for action in parser._actions
+            if isinstance(action, MODULE.argparse._SubParsersAction)
+        ][0]
+        targets = [
+            action
+            for name, sub in subparsers.choices.items()
+            for action in sub._actions
+            if action.dest == "target" and not action.option_strings
+        ]
+        self.assertTrue(targets, "the helper must take a target somewhere")
+        for action in targets:
+            with self.subTest(help=action.help):
+                self.assertTrue(
+                    action.help.endswith(clause),
+                    f"{action.help!r} does not end with {clause!r}",
+                )
+
+    def test_a_bare_number_reaches_the_parser_only_with_repository_context(self):
+        # The agent file may offer a bare number because the agent has the
+        # repository to combine it with. The command line accepts one only when
+        # the worktree's origin supplies that repository, and never a form the
+        # parser refuses.
+        with self.assertRaises(MODULE.WorkflowError):
+            MODULE.parse_target("19517")
+        self.assertEqual(
+            "octo/hello", MODULE.parse_target("19517", "octo/hello")["repo_name"]
+        )
+
     def test_it_runs_unattended_without_approval_gates(self):
         self.assertIn("Run fully unattended", self.instructions)
         self.assertIn("There is no approval gate between stages", self.instructions)

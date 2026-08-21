@@ -1,7 +1,7 @@
 ---
 name: Conflict Fix Loop
 description: "Use when selected with only a PR URL, PR number, or owner/repo#number to immediately run the full Conflict Fix Loop, or to autonomously resolve merge conflicts on a pull request and push the resolution."
-argument-hint: "PR URL, PR number, or owner/repo#number; omit to use the current branch's PR"
+argument-hint: "PR URL, PR number, or owner/repo#number; omit only from a worktree attached to the PR's branch"
 tools: [read, edit, search, execute, todo, rename_session]
 user-invocable: true
 disable-model-invocation: true

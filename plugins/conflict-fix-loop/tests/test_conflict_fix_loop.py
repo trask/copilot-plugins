@@ -187,8 +187,8 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "argument-hint: \"PR URL, PR number, or owner/repo#number; omit to use "
-            "the current branch's PR\"",
+            "argument-hint: \"PR URL, PR number, or owner/repo#number; omit only "
+            "from a worktree attached to the PR's branch\"",
             self.instructions,
         )
         self.assertIn(
@@ -197,6 +197,48 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn("user-invocable: true", self.instructions)
         self.assertIn("disable-model-invocation: true", self.instructions)
+
+    def test_the_target_help_carries_the_argument_hint_condition(self):
+        """Derived, not copied: drift in either surface fails here.
+
+        A literal only catches the change you thought of. Reading the clause out
+        of the agent file catches the agent file drifting too.
+        """
+
+        hint = next(
+            line for line in self.instructions.splitlines()
+            if line.startswith("argument-hint:")
+        )
+        clause = hint.strip().rstrip('"').rsplit("; ", 1)[1]
+        self.assertEqual(
+            "omit only from a worktree attached to the PR's branch", clause
+        )
+        parser = MODULE.build_parser()
+        subparsers = [
+            action
+            for action in parser._actions
+            if isinstance(action, MODULE.argparse._SubParsersAction)
+        ][0]
+        targets = [
+            action
+            for sub in subparsers.choices.values()
+            for action in sub._actions
+            if action.dest == "target" and not action.option_strings
+        ]
+        self.assertTrue(targets, "the helper must take a target somewhere")
+        for action in targets:
+            with self.subTest(help=action.help):
+                self.assertTrue(
+                    action.help.endswith(clause),
+                    f"{action.help!r} does not end with {clause!r}",
+                )
+
+    def test_a_bare_number_is_refused_by_this_parser(self):
+        # The agent file may offer a bare number because the agent combines it
+        # with the workspace's repository first. This parser takes no repository,
+        # so its own help must not offer a form it refuses.
+        with self.assertRaises(MODULE.WorkflowError):
+            MODULE.parse_target("19517")
 
     def test_does_not_invent_a_model_frontmatter_key(self):
         frontmatter = self.instructions.split("---")[1]

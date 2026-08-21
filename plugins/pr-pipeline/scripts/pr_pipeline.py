@@ -3849,7 +3849,10 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument(
         "target",
         nargs="?",
-        help="PR URL, owner/repo#number, or bare number; omit to use the current PR",
+        help=(
+            "PR URL, owner/repo#number, or a bare number when origin names the "
+            "repository; omit only from a worktree attached to the PR's branch"
+        ),
     )
     preflight.add_argument("--state")
     preflight.add_argument(

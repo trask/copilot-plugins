@@ -1,7 +1,7 @@
 ---
 name: PR Pipeline
 description: "Use to drive an open draft pull request through conflict resolution, self review, Copilot review, check fixing, and description validation until every stage is green at the same head commit."
-argument-hint: "PR URL, PR number, or owner/repo#number; omit to use the current branch's PR"
+argument-hint: "PR URL, PR number, or owner/repo#number; omit only from a worktree attached to the PR's branch"
 tools: [read, search, execute, todo, rename_session]
 user-invocable: true
 disable-model-invocation: false
