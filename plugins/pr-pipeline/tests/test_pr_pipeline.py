@@ -48,6 +48,19 @@ def git_in(repo: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def git_succeeds_in(repo: Path, *arguments: str) -> bool:
+    """Whether one git command succeeds, used to prove an object still exists."""
+
+    return (
+        subprocess.run(
+            ["git", "-C", str(repo), *arguments],
+            capture_output=True,
+            text=True,
+        ).returncode
+        == 0
+    )
+
+
 def make_pull_request_remote(root: Path) -> dict:
     """A real repository that publishes `refs/pull/<n>/head`, as GitHub does.
 
@@ -4997,6 +5010,59 @@ class FinishGuardFollowsTheRecordedRootTest(CommandTestCase):
         # The commit the guard was protecting is still there.
         self.assertEqual(unpushed, git_in(stage_tree, "rev-parse", "HEAD"))
 
+    def test_a_stale_api_head_does_not_halt_a_stage_that_did_push(self):
+        # The normal cycle: the stage pushed and finished at once, so the API
+        # still serves the old head. `ls-remote` reads the ref itself and says
+        # the commits are published, so the ending is recorded.
+        published = make_pull_request_remote(self.root)
+        stage_tree = clone_for_pipeline(self.root, published["remote"], "stage")
+        fetch_pr_head(stage_tree)
+        git_in(stage_tree, "checkout", "-q", "--detach", published["pr_head"])
+
+        with mock.patch.object(
+            MODULE, "target_remote_head", return_value=published["pr_head"]
+        ):
+            path = self.preflight_state(stage_tree)
+            git_in(stage_tree, "commit", "-q", "--allow-empty", "-m", "pushed fix")
+            pushed = git_in(stage_tree, "rev-parse", "HEAD")
+            git_in(
+                stage_tree,
+                "push",
+                "-q",
+                "origin",
+                f"HEAD:refs/pull/{base_pr()['number']}/head",
+            )
+            MODULE.command_start(
+                self.args(
+                    state=str(path),
+                    stage=MODULE.STAGE_SELF_REVIEW,
+                    head=pushed,
+                    launch="subprocess",
+                    session=None,
+                    process=None,
+                    log=None,
+                )
+            )
+            with mock.patch.object(
+                MODULE, "diagnose_local_head", REAL_DIAGNOSE_LOCAL_HEAD
+            ):
+                MODULE.command_finish(
+                    self.args(
+                        state=str(path),
+                        stage=MODULE.STAGE_SELF_REVIEW,
+                        outcome=MODULE.CLEARING_OUTCOMES[0],
+                        head=pushed,
+                        detail=None,
+                        session=None,
+                        process=None,
+                        commit=None,
+                    )
+                )
+
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual("recorded", self.emitted[-1]["result"])
+        self.assertIsNone(state.get("escalation"))
+
 
 class ClassifyLocalHeadTest(unittest.TestCase):
     """The verdict table, read off the source constants."""
@@ -5011,6 +5077,7 @@ class ClassifyLocalHeadTest(unittest.TestCase):
                     "on_pr_branch": False,
                     "descends_from_pr_head": False,
                     "ahead_count": 0,
+                    "unreachable_count": 0,
                 },
                 MODULE.LOCAL_HEAD_UNKNOWN,
             ),
@@ -5022,6 +5089,7 @@ class ClassifyLocalHeadTest(unittest.TestCase):
                     "on_pr_branch": True,
                     "descends_from_pr_head": True,
                     "ahead_count": 3,
+                    "unreachable_count": 3,
                 },
                 MODULE.LOCAL_HEAD_UNKNOWN,
             ),
@@ -5033,6 +5101,7 @@ class ClassifyLocalHeadTest(unittest.TestCase):
                     "on_pr_branch": True,
                     "descends_from_pr_head": True,
                     "ahead_count": 0,
+                    "unreachable_count": 0,
                 },
                 MODULE.LOCAL_HEAD_AT_PR_HEAD,
             ),
@@ -5044,6 +5113,7 @@ class ClassifyLocalHeadTest(unittest.TestCase):
                     "on_pr_branch": True,
                     "descends_from_pr_head": True,
                     "ahead_count": 1,
+                    "unreachable_count": 0,
                 },
                 MODULE.LOCAL_HEAD_AHEAD,
             ),
@@ -5055,8 +5125,39 @@ class ClassifyLocalHeadTest(unittest.TestCase):
                     "on_pr_branch": False,
                     "descends_from_pr_head": True,
                     "ahead_count": 1,
+                    "unreachable_count": 1,
                 },
                 MODULE.LOCAL_HEAD_AHEAD,
+            ),
+            (
+                "detached work the pull request head moved out from under",
+                # Ancestry is broken, the branch says nothing, and the commits
+                # exist only under HEAD. Without the reachability arm this falls
+                # through to a checkout and the commits become garbage.
+                {
+                    "local_head": "bbb",
+                    "pr_head": "aaa",
+                    "on_pr_branch": False,
+                    "descends_from_pr_head": False,
+                    "ahead_count": 2,
+                    "unreachable_count": 2,
+                },
+                MODULE.LOCAL_HEAD_UNREACHABLE,
+            ),
+            (
+                "detached at a commit another ref still holds",
+                # The false positive to avoid: a worktree parked on `main` has
+                # commits absent from the pull request head, but every one of
+                # them is reachable, so starting here is safe.
+                {
+                    "local_head": "bbb",
+                    "pr_head": "aaa",
+                    "on_pr_branch": False,
+                    "descends_from_pr_head": False,
+                    "ahead_count": 40,
+                    "unreachable_count": 0,
+                },
+                MODULE.LOCAL_HEAD_NEEDS_CHECKOUT,
             ),
             (
                 "on the pull request branch, but the histories parted",
@@ -5066,6 +5167,7 @@ class ClassifyLocalHeadTest(unittest.TestCase):
                     "on_pr_branch": True,
                     "descends_from_pr_head": False,
                     "ahead_count": 7,
+                    "unreachable_count": 0,
                 },
                 MODULE.LOCAL_HEAD_DIVERGED,
             ),
@@ -5077,6 +5179,7 @@ class ClassifyLocalHeadTest(unittest.TestCase):
                     "on_pr_branch": False,
                     "descends_from_pr_head": False,
                     "ahead_count": 7,
+                    "unreachable_count": 0,
                 },
                 MODULE.LOCAL_HEAD_NEEDS_CHECKOUT,
             ),
@@ -5088,6 +5191,7 @@ class ClassifyLocalHeadTest(unittest.TestCase):
                     "on_pr_branch": True,
                     "descends_from_pr_head": False,
                     "ahead_count": 0,
+                    "unreachable_count": 0,
                 },
                 MODULE.LOCAL_HEAD_NEEDS_CHECKOUT,
             ),
@@ -5096,11 +5200,15 @@ class ClassifyLocalHeadTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(expected, MODULE.classify_local_head(**facts))
 
-    def test_only_the_two_faults_escalate(self):
+    def test_only_the_unsafe_verdicts_escalate(self):
         # Derived from the source map, so a verdict that gains or loses an
         # escalation has to be stated in the source, not in the test.
         self.assertEqual(
-            {MODULE.LOCAL_HEAD_AHEAD, MODULE.LOCAL_HEAD_DIVERGED},
+            {
+                MODULE.LOCAL_HEAD_AHEAD,
+                MODULE.LOCAL_HEAD_UNREACHABLE,
+                MODULE.LOCAL_HEAD_DIVERGED,
+            },
             set(MODULE.LOCAL_HEAD_ESCALATIONS),
         )
         for verdict, reason in MODULE.LOCAL_HEAD_ESCALATIONS.items():
@@ -5114,12 +5222,15 @@ class ResetAgainstRealRepositoriesTest(CommandTestCase):
     def setUp(self):
         super().setUp()
         self.published = make_pull_request_remote(self.root)
-        self.local = clone_for_pipeline(self.root, self.published["remote"], "session")
+        self.remote_repo = self.published["remote"]
+        # The API's answer, which a test moves when it wants the head to lag.
+        self.api_head = self.published["pr_head"]
         self.remote_head = mock.patch.object(
-            MODULE, "target_remote_head", return_value=self.published["pr_head"]
+            MODULE, "target_remote_head", side_effect=lambda *_: self.api_head
         )
         self.remote_head.start()
         self.addCleanup(self.remote_head.stop)
+        self.local = clone_for_pipeline(self.root, self.published["remote"], "session")
         self.diagnosis = mock.patch.object(
             MODULE, "diagnose_local_head", REAL_DIAGNOSE_LOCAL_HEAD
         )
@@ -5138,6 +5249,112 @@ class ResetAgainstRealRepositoriesTest(CommandTestCase):
 
     def head_of_local(self) -> str:
         return git_in(self.local, "rev-parse", "HEAD")
+
+    def publish_a_new_head(self) -> str:
+        """Move the pull request head on the remote, as a push from elsewhere does."""
+
+        git_in(self.remote_repo, "checkout", "-q", base_pr()["head_branch"])
+        git_in(self.remote_repo, "commit", "-q", "--allow-empty", "-m", "moved on")
+        moved = git_in(self.remote_repo, "rev-parse", "HEAD")
+        git_in(
+            self.remote_repo, "update-ref", f"refs/pull/{base_pr()['number']}/head", moved
+        )
+        git_in(self.remote_repo, "checkout", "-q", "main")
+        return moved
+
+    def test_detached_work_the_head_moved_out_from_under_is_never_orphaned(self):
+        # Ancestry cannot save this one: the pull request head moved, so it is no
+        # longer an ancestor, and a detached worktree is on no branch. Only
+        # reachability says the commits would be lost.
+        fetch_pr_head(self.local)
+        git_in(self.local, "checkout", "-q", "--detach", self.published["pr_head"])
+        git_in(self.local, "commit", "-q", "--allow-empty", "-m", "stage work")
+        stranded = self.head_of_local()
+        moved = self.publish_a_new_head()
+        self.api_head = moved
+        path = self.reset_from_state(
+            iteration=1, history=[{"stage": MODULE.STAGE_CONFLICT}]
+        )
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual("escalated", self.emitted[-1]["result"])
+        self.assertEqual(
+            MODULE.LOCAL_HEAD_ESCALATIONS[MODULE.LOCAL_HEAD_UNREACHABLE],
+            state["escalation"]["reason"],
+        )
+        self.assertEqual(stranded, self.head_of_local())
+        # The object is still there, which is the whole point of refusing.
+        self.assertTrue(
+            git_succeeds_in(self.local, "cat-file", "-e", stranded),
+            "the commit the pipeline refused to orphan is gone",
+        )
+
+    def test_detached_at_a_commit_another_ref_holds_starts_normally(self):
+        # The false positive to avoid. A worktree parked on `main` holds commits
+        # the pull request head does not, but `origin/main` keeps every one of
+        # them, so there is nothing to lose and nothing to escalate.
+        for index in range(3):
+            git_in(self.remote_repo, "commit", "-q", "--allow-empty", "-m", f"main {index}")
+        git_in(self.local, "fetch", "-q", "origin", "main")
+        git_in(self.local, "checkout", "-q", "--detach", "origin/main")
+        # The arm under test only means something if these commits really are
+        # absent from the pull request head, which is what makes a count-based
+        # rule escalate here.
+        self.assertGreater(
+            MODULE.commit_count(self.local, self.published["pr_head"], "HEAD"), 0
+        )
+        self.assertEqual(0, MODULE.unreachable_commit_count(self.local))
+        self.reset_from_state(iteration=1, history=[{"stage": MODULE.STAGE_CONFLICT}])
+        self.assertEqual("ready", self.emitted[-1]["result"])
+        self.assertEqual(
+            MODULE.LOCAL_HEAD_NEEDS_CHECKOUT, self.emitted[-1]["local_head"]
+        )
+        self.assertTrue(self.emitted[-1]["checked_out"])
+        self.assertEqual(self.published["pr_head"], self.head_of_local())
+
+    def test_a_stale_api_head_is_corrected_from_the_ref_instead_of_halting(self):
+        # A stage pushes and finishes at once, so `gh pr view` still serves the
+        # old head. The commits are published; halting here would stop a healthy
+        # run on its normal cycle.
+        fetch_pr_head(self.local)
+        git_in(self.local, "checkout", "-q", "--detach", self.published["pr_head"])
+        git_in(self.local, "commit", "-q", "--allow-empty", "-m", "pushed by the stage")
+        pushed = self.head_of_local()
+        git_in(
+            self.local,
+            "push",
+            "-q",
+            "origin",
+            f"HEAD:refs/pull/{base_pr()['number']}/head",
+        )
+        self.reset_from_state(iteration=1, history=[{"stage": MODULE.STAGE_CONFLICT}])
+        self.assertEqual("ready", self.emitted[-1]["result"])
+        self.assertEqual(MODULE.LOCAL_HEAD_AT_PR_HEAD, self.emitted[-1]["local_head"])
+        self.assertEqual(pushed, self.emitted[-1]["head_sha"])
+        self.assertEqual(pushed, self.head_of_local())
+
+    def test_a_ref_that_agrees_the_commit_is_absent_still_escalates(self):
+        # The other direction: `ls-remote` confirms the commit is not published,
+        # so the escalation stands and the work is kept.
+        fetch_pr_head(self.local)
+        git_in(self.local, "checkout", "-q", "--detach", self.published["pr_head"])
+        git_in(self.local, "commit", "-q", "--allow-empty", "-m", "never pushed")
+        unpushed = self.head_of_local()
+        self.assertEqual(
+            self.published["pr_head"],
+            MODULE.remote_pull_request_head(
+                self.local, MODULE.build_target("owner", "repo", 7)
+            ),
+        )
+        path = self.reset_from_state(
+            iteration=1, history=[{"stage": MODULE.STAGE_CONFLICT}]
+        )
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual("escalated", self.emitted[-1]["result"])
+        self.assertEqual(
+            MODULE.LOCAL_HEAD_ESCALATIONS[MODULE.LOCAL_HEAD_AHEAD],
+            state["escalation"]["reason"],
+        )
+        self.assertEqual(unpushed, self.head_of_local())
 
     def test_a_session_on_its_own_branch_is_checked_out_and_started(self):
         # The reproduction: a new session worktree on a branch of its own,

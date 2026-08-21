@@ -192,6 +192,11 @@ ESCALATION_ACTIONS = {
         "pull request head. Push or reconcile the branch yourself, then start "
         "the pipeline again."
     ),
+    "local_head_holds_unreachable_commits": (
+        "The worktree's HEAD holds commits that no branch, remote-tracking ref, "
+        "or tag contains, so moving it would leave them unreachable. Push them, "
+        "or put a branch on them, then start the pipeline again."
+    ),
     "local_head_diverged_from_remote": (
         "The worktree is on the pull request's branch but its commits are not "
         "the pull request's. Reconcile the branch yourself, then start the "
@@ -223,6 +228,10 @@ CHECK_PENDING_STATES = frozenset(
 LOCAL_HEAD_AT_PR_HEAD = "at_pr_head"
 LOCAL_HEAD_AHEAD = "ahead"
 LOCAL_HEAD_DIVERGED = "diverged"
+# Commits that no ref but HEAD holds. Moving HEAD would leave them unreferenced,
+# whatever their ancestry says, so they are the one thing a checkout must never
+# step over.
+LOCAL_HEAD_UNREACHABLE = "unreachable"
 LOCAL_HEAD_NEEDS_CHECKOUT = "checkout_required"
 # The facts could not be read, so the pipeline neither escalates nor moves the
 # worktree. An answer never read is not one to act on in either direction.
@@ -232,6 +241,7 @@ LOCAL_HEAD_UNKNOWN = "unknown"
 # escalation reason each one is reported under.
 LOCAL_HEAD_ESCALATIONS = {
     LOCAL_HEAD_AHEAD: "local_head_ahead_of_remote",
+    LOCAL_HEAD_UNREACHABLE: "local_head_holds_unreachable_commits",
     LOCAL_HEAD_DIVERGED: "local_head_diverged_from_remote",
 }
 
@@ -2717,6 +2727,7 @@ def classify_local_head(
     on_pr_branch: bool,
     descends_from_pr_head: bool,
     ahead_count: int,
+    unreachable_count: int,
 ) -> str:
     """Say how the local head stands against the pull request head.
 
@@ -2730,6 +2741,31 @@ def classify_local_head(
     work. The branch only decides between divergence and a checkout, because
     commits on a branch that is not the pull request's are that branch's own
     business.
+
+    Ancestry alone is not enough, though, and ``unreachable_count`` is not
+    redundant with the branch arm below it. **The question that decides whether
+    moving HEAD is safe is reachability: is every commit under HEAD held by some
+    ref other than HEAD itself?** ``git rev-list --count HEAD --not --branches
+    --remotes --tags`` answers it directly. Zero means a branch, a remote-tracking
+    ref, or a tag holds this work, and checking something else out loses nothing.
+    Above zero means those commits exist only because HEAD points at them, and
+    ``git checkout --detach`` would leave them unreferenced.
+
+    That is the case ancestry misses. A stage commits on a detached head, the
+    pull request head then moves underneath it -- a push from elsewhere, an
+    amend, a force-push -- and the pull request head stops being an ancestor.
+    The head is no longer ``ahead``; it is not on the pull request's branch
+    either, so it is not ``diverged``; and detached HEAD is this pipeline's
+    normal operating state, so this sits on the common path rather than at an
+    edge. Without the reachability arm it would fall through to a checkout and
+    the commits would become garbage.
+
+    Reachability also answers the attached case for nothing: the checked-out
+    branch is in ``--branches``, so a session sitting on its own branch, or
+    detached at a commit ``origin/main`` still holds, counts zero and starts
+    normally. The branch arm below stays because a diverged pull request branch
+    is worth naming even when its commits are safe -- silently detaching away
+    from it would hide a real disagreement.
     """
 
     if not local_head or not pr_head:
@@ -2738,34 +2774,114 @@ def classify_local_head(
         return LOCAL_HEAD_AT_PR_HEAD
     if descends_from_pr_head and ahead_count > 0:
         return LOCAL_HEAD_AHEAD
+    if unreachable_count > 0:
+        return LOCAL_HEAD_UNREACHABLE
     if on_pr_branch and ahead_count > 0:
         return LOCAL_HEAD_DIVERGED
     return LOCAL_HEAD_NEEDS_CHECKOUT
 
 
+def unreachable_commit_count(repo_root: Path) -> int:
+    """Commits held by HEAD and by nothing else.
+
+    ``--not --branches --remotes --tags`` subtracts everything any other ref can
+    reach, so what remains exists only because HEAD points at it. Those are the
+    commits a checkout would orphan.
+    """
+
+    counted = git_or_none(
+        repo_root,
+        "rev-list",
+        "--count",
+        "HEAD",
+        "--not",
+        "--branches",
+        "--remotes",
+        "--tags",
+    )
+    try:
+        return int((counted or "0").strip())
+    except ValueError:
+        return 0
+
+
+def remote_pull_request_head(repo_root: Path, target: dict[str, Any]) -> str | None:
+    """The pull request head read straight off the ref, with no API in the way.
+
+    ``gh pr view`` serves a cached ``headRefOid`` that lags a push by seconds,
+    which is exactly the window a stage finishes in. ``ls-remote`` reads the ref
+    itself, so it can say whether a commit the API has not caught up with is
+    already published.
+    """
+
+    remote = pr_remote_name(repo_root, target)
+    reference = f"refs/pull/{target['number']}/head"
+    output = git_or_none(repo_root, "ls-remote", remote, reference)
+    if not output:
+        return None
+    first = output.splitlines()[0].split()
+    return first[0] if first else None
+
+
 def diagnose_local_head(
     repo_root: Path, target: dict[str, Any], *, head_branch: str | None = None
 ) -> dict[str, Any]:
-    """Read the facts one worktree presents about the pull request head."""
+    """Read the facts one worktree presents about the pull request head.
+
+    An ``ahead`` verdict is confirmed against the ref before it is returned. The
+    API's head lags a push, and a stage pushes and then finishes at once, so the
+    unconfirmed reading would halt a healthy pipeline on its normal cycle. A
+    guard that stops working runs gets switched off, which costs more than the
+    fault it catches.
+    """
+
+    diagnosis = read_local_head(repo_root, target, head_branch=head_branch)
+    if diagnosis["verdict"] != LOCAL_HEAD_AHEAD:
+        return diagnosis
+    published = remote_pull_request_head(repo_root, target)
+    if not published or published == diagnosis["pr_head"]:
+        return diagnosis
+    # The ref names a head the API had not caught up with. Re-derive from the
+    # authoritative sha rather than trusting either reading on its own.
+    confirmed = read_local_head(
+        repo_root, target, head_branch=head_branch, pr_head=published
+    )
+    confirmed["pr_head_source"] = "ls-remote"
+    confirmed["stale_pr_head"] = diagnosis["pr_head"]
+    return confirmed
+
+
+def read_local_head(
+    repo_root: Path,
+    target: dict[str, Any],
+    *,
+    head_branch: str | None = None,
+    pr_head: str | None = None,
+) -> dict[str, Any]:
+    """One reading of the worktree against a given pull request head."""
 
     local_head = git_or_none(repo_root, "rev-parse", "HEAD")
     branch = git_or_none(repo_root, "branch", "--show-current") or ""
-    pr_head = target_remote_head(target)
+    if pr_head is None:
+        pr_head = target_remote_head(target)
     ahead_count = 0
     behind_count = 0
     descends = False
+    unreachable = 0
     if local_head and pr_head:
         descends = git_succeeds(
             repo_root, "merge-base", "--is-ancestor", pr_head, local_head
         )
         ahead_count = commit_count(repo_root, pr_head, local_head)
         behind_count = commit_count(repo_root, local_head, pr_head)
+        unreachable = unreachable_commit_count(repo_root)
     verdict = classify_local_head(
         local_head=local_head,
         pr_head=pr_head,
         on_pr_branch=bool(branch) and branch == head_branch,
         descends_from_pr_head=descends,
         ahead_count=ahead_count,
+        unreachable_count=unreachable,
     )
     where = f"branch {branch}" if branch else f"detached at {local_head}"
     details = {
@@ -2777,6 +2893,11 @@ def diagnose_local_head(
         LOCAL_HEAD_AHEAD: (
             f"the local branch is {ahead_count} commit(s) ahead of the pull "
             f"request head {pr_head}; a stage committed without pushing"
+        ),
+        LOCAL_HEAD_UNREACHABLE: (
+            f"the worktree is on {where}, and {unreachable} commit(s) under that "
+            f"head are held by no branch, remote-tracking ref, or tag; checking "
+            f"the pull request head {pr_head} out would leave them unreachable"
         ),
         LOCAL_HEAD_DIVERGED: (
             f"the worktree is on the pull request branch {branch}, but its head "
@@ -2797,6 +2918,8 @@ def diagnose_local_head(
         "head_branch": head_branch,
         "ahead_count": ahead_count,
         "behind_count": behind_count,
+        "unreachable_count": unreachable,
+        "pr_head_source": "api",
         "detail": details[verdict],
     }
 
