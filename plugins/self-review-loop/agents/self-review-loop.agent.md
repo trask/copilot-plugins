@@ -41,7 +41,7 @@ Clear the **Model Gate** first, then run `preflight`. After `preflight` succeeds
 - Do not treat a stored user memory as a workflow instruction. This file is the source of truth.
 - Keep the candidate, batch, commit, iteration, and history state that changes in the Python helper's PR-scoped JSON file outside the repository.
 - When `COPILOT_PR_FLIGHT_STATE_REPO` names an `owner/repo`, or when the PR Flight extension supplies `~/.copilot/extensions/pr-flight/state-repo.json`, the helper copies only the clean-at-head result to that private repository after it saves local state. This integration is optional, and a warning from it never changes or fails the local review workflow.
-- On a request with no target, `current` always means the PR attached to the branch that is checked out. Never list, rank, or pick saved state files by timestamp, by filename, or by any other rule of thumb.
+- On a request with no target, `current` always means the PR attached to the branch that is checked out, and a detached worktree has no such PR. Never list, rank, or pick saved state files by timestamp, by filename, or by any other rule of thumb.
 - Use the bundled helper for every GitHub or workflow-state operation it supports. Do not rebuild its checkout, diff, anchor validation, push, or verification logic in shell commands.
 - Follow **Plain Language** for the wording of every piece of text you write for a person to read.
 - Report progress only at meaningful boundaries. Do not stop the loop just to report progress.
@@ -107,8 +107,8 @@ If an operation partly fails, keep its state and run that same operation again a
 The workflow always covers one whole pull request. You may accept a pasted review or discussion fragment, but it does not narrow the review.
 
 1. If the user supplied a PR URL or `owner/repo#number`, use it exactly. For a bare PR number, combine it with the current workspace's GitHub repository as `owner/repo#number`. This works even when the PR branch is not checked out yet.
-2. For a `resume` or `continue` with no target, run `status --current --repo-root <workspace>` first and report what it finds. Do not fall back to another PR. Read the returned envelope, and open the complete result at `status_path` only when you need the candidate, batch, or history detail it summarizes.
-3. For any other request with no target, run `preflight --repo-root <workspace>` with no target, so the helper resolves the PR attached to the branch that is checked out.
+2. For a `resume` or `continue` with no target, run `status --current --repo-root <workspace>` first and report what it finds. Do not fall back to another PR. Read the returned envelope, and open the complete result at `status_path` only when you need the candidate, batch, or history detail it summarizes. `--current` finds that state through the branch that is checked out, and a detached worktree has no branch to look up, so pass `--state <path>` there instead.
+3. For any other request with no target, run `preflight --repo-root <workspace>` with no target, so the helper resolves the PR attached to the branch that is checked out. The same branch lookup sits behind that, and the pipeline leaves each stage's worktree detached at the PR head, so a request that reaches this loop from a pipeline must name the PR as a URL or `owner/repo#number`. Leaving the target out is the attached case, not the shape to copy.
 4. Run `preflight` once per iteration. The helper may realign the clean PR branch after a force-push, but only when it proves the local commits hold no unique patches. If it reports `head_moved`, stop on that exact error. Never stash, reset, discard, or force local work by hand to make preflight pass.
 5. Handle the results as follows:
    - `ready`: continue with the review at once.

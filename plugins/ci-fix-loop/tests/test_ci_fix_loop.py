@@ -642,6 +642,43 @@ class AgentInstructionsTest(unittest.TestCase):
         section = _agent_section(self.instructions, LOCAL_VALIDATION_HEADING)
         self.assertIn("must never stop this loop", section)
 
+    def test_routes_a_no_target_request_around_a_detached_worktree(self):
+        """A stage the pipeline launches has no branch checked out.
+
+        A reader who copies the bare no-target form there reaches a resolver
+        that refuses on purpose, so both steps have to name what to pass
+        instead of leaving the refusal as the answer.
+        """
+        self.assertIn(
+            "`--current` resolves through the branch that is checked out, which "
+            "a detached worktree does not have, so pass `--state <path>` when "
+            "the worktree is detached.",
+            self.instructions,
+        )
+        self.assertIn(
+            "a stage the pipeline launches works in a worktree detached at the "
+            "pull request head, so name the pull request as a URL or "
+            "`owner/repo#number` instead",
+            self.instructions,
+        )
+        self.assertIn(
+            "The bare form is for a checkout still sitting on a branch, and "
+            "this loop's ordinary case under a pipeline is not one.",
+            self.instructions,
+        )
+
+    def test_the_current_rule_admits_a_detached_worktree_has_no_pull_request(self):
+        """The rule still rightly forbids picking a state file by hand.
+
+        It was only wrong to imply a checked-out branch is always there to ask.
+        """
+        self.assertIn(
+            "`current` always means the pull request attached to the branch "
+            "that is checked out, and a detached worktree has no such pull "
+            "request",
+            self.instructions,
+        )
+
 
 class EscalationCatalogTest(unittest.TestCase):
     def test_every_reason_carries_a_concrete_next_action(self):
@@ -3527,6 +3564,26 @@ class LocalValidationRecordTest(unittest.TestCase):
     def test_blank_claims_are_treated_as_no_claim(self):
         entry = self.entry(validated=["  "], not_validated="   ")
         self.assertEqual("unreported", entry["status"])
+
+
+class DetachedHeadTargetTest(unittest.TestCase):
+    """A refusal that names no correction is a dead end for its caller.
+
+    The resolver is right to refuse, because a commit can belong to more than
+    one pull request and no tie-break belongs here. What it owes the caller is
+    the one thing that gets them past it.
+    """
+
+    def test_the_refusal_names_the_correction_and_not_only_the_fault(self):
+        with mock.patch.object(MODULE, "git", return_value=""):
+            with self.assertRaises(MODULE.WorkflowError) as error:
+                MODULE.current_pr_target(Path("repo"))
+        message = str(error.exception)
+        self.assertIn("detached HEAD", message)
+        self.assertIn(
+            "pass the pull request explicitly as a URL or owner/repo#number",
+            message,
+        )
 
 
 if __name__ == "__main__":

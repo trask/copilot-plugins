@@ -31,7 +31,7 @@ This agent handles Copilot review comments only. It never queues a comment from 
 - A validation failure you cannot fix stops the whole run at once. Record it with `skip`, leave the worktree as it is so someone can inspect it, and do not publish partial work.
 - Do not treat a stored user memory as a workflow instruction. This file is the source of truth.
 - Keep the queue, batch, validation, commit, reply, thread, iteration, and monitoring state that changes in the Python helper's PR-scoped JSON file outside the repository.
-- On a request with no target, `current` always means the PR attached to the branch that is checked out. Never list, rank, or pick saved state files by watcher status, by timestamp, by filename, or by any other rule of thumb.
+- On a request with no target, `current` always means the PR attached to the branch that is checked out, and a detached worktree has no such PR. Never list, rank, or pick saved state files by watcher status, by timestamp, by filename, or by any other rule of thumb.
 - Use the bundled Python helper for every GitHub or workflow-state operation it supports. Do not rebuild its `gh api`, reply, resolution, verification, or watcher logic in shell commands.
 - Follow **Plain Language** for the wording of every piece of text you write for a person to read.
 - Report progress only at meaningful boundaries. Do not stop the loop just to report progress.
@@ -90,8 +90,8 @@ Run `preflight` first, so the canonical PR metadata is available. After `preflig
 The workflow always covers the whole Copilot queue for one pull request. You may accept a pasted review or discussion fragment, but it does not narrow the queue.
 
 1. If the user supplied a PR URL or `owner/repo#number`, use it exactly. For a bare PR number, combine it with the current workspace's GitHub repository as `owner/repo#number`. This works even when the PR branch is not checked out yet.
-2. For a `watch`, `resume`, or `continue` with no target, run `status --current --repo-root <workspace>`. If monitoring is `requested` or `running`, resume `watch` with that state. If monitoring finished with comments, run `preflight` for that same PR. If there is no state to resume, report that; do not fall back to another PR.
-3. For any other request with no target, run `preflight --repo-root <workspace>` with no target, so the helper resolves the PR attached to the branch that is checked out.
+2. For a `watch`, `resume`, or `continue` with no target, run `status --current --repo-root <workspace>`. If monitoring is `requested` or `running`, resume `watch` with that state. If monitoring finished with comments, run `preflight` for that same PR. If there is no state to resume, report that; do not fall back to another PR. `--current` reaches that state through the checked-out branch, and a detached worktree names no branch, so pass `--state <path>` there and skip the lookup.
+3. For any other request with no target, run `preflight --repo-root <workspace>` with no target, so the helper resolves the PR attached to the branch that is checked out. That resolution needs a branch too, and the pipeline detaches each stage's worktree at the PR head, because the PR branch is usually checked out in another worktree already. A request arriving from a pipeline therefore has to name the PR as a URL or `owner/repo#number`; the bare form belongs to an attached checkout alone.
 4. If a watcher belongs to a different requested PR, use `cancel-watch --state <path>`, then `await-watch --state <path>` before you start over.
 5. Run `preflight --completed-run-iterations <n>` once, where `<n>` is the run-local iteration counter. Pass the current counter on every later preflight in the same invocation. Stop on its exact error, and never stash, reset, discard, or force local work to make it pass.
 6. Handle the results as follows:

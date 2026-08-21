@@ -38,7 +38,7 @@ Run `preflight` first. After `preflight` succeeds, ensure the session name is `C
 - A failure you cannot fix stops the whole run at once. Record it with `skip`, leave the worktree as it is so someone can inspect it, and do not publish partial work.
 - Do not treat a stored user memory as a workflow instruction. This file is the source of truth.
 - Keep the check, attribution, batch, commit, iteration, and history state that changes in the Python helper's PR-scoped JSON file outside the repository.
-- On a request with no target, `current` always means the pull request attached to the branch that is checked out. Never list, rank, or pick saved state files by timestamp, by filename, or by any other rule of thumb.
+- On a request with no target, `current` always means the pull request attached to the branch that is checked out, and a detached worktree has no such pull request. Never list, rank, or pick saved state files by timestamp, by filename, or by any other rule of thumb.
 - Use the bundled helper for every GitHub or workflow-state operation it supports. Do not rebuild its checkout, check reading, attribution, re-run, push, or verification logic in shell commands.
 - Follow **Plain Language** for the wording of every piece of text you write for a person to read.
 - Report progress only at meaningful boundaries. Do not stop the loop just to report progress.
@@ -96,8 +96,8 @@ If an operation partly fails, keep its state and run that same operation again a
 The workflow always covers the checks of one whole pull request.
 
 1. If the user supplied a PR URL or `owner/repo#number`, use it exactly. For a bare PR number, combine it with the current workspace's GitHub repository as `owner/repo#number`. This works even when the pull request branch is not checked out yet.
-2. For a `resume` or `continue` with no target, run `status --current --repo-root <workspace>` first and report what it finds. Do not fall back to another pull request.
-3. For any other request with no target, run `preflight --repo-root <workspace>` with no target, so the helper resolves the pull request attached to the branch that is checked out.
+2. For a `resume` or `continue` with no target, run `status --current --repo-root <workspace>` first and report what it finds. Do not fall back to another pull request. `--current` resolves through the branch that is checked out, which a detached worktree does not have, so pass `--state <path>` when the worktree is detached.
+3. For any other request with no target, run `preflight --repo-root <workspace>` with no target, so the helper resolves the pull request attached to the branch that is checked out. That lookup wants a branch as well, and a stage the pipeline launches works in a worktree detached at the pull request head, so name the pull request as a URL or `owner/repo#number` instead. The bare form is for a checkout still sitting on a branch, and this loop's ordinary case under a pipeline is not one.
 4. Run `preflight` once per iteration. If it reports `head_moved`, stop on that exact error. Never stash, reset, discard, or force local work by hand to make preflight pass.
 5. Handle the results as follows:
    - `ready`: continue with the checks at once.
