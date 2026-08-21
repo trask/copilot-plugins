@@ -79,7 +79,7 @@ The deterministic, JSON-only helper provides:
 - `stack-rebase --state <path>`: for a native GitHub stack only. Require the `gh stack` extension, clone the repository into a throwaway workspace, check the stack out there, and cascade a rebase through the trunk. On a clean cascade it records every member's rebased tip and hands off to `stack-publish`; on a conflict it reports the conflicted files and hands off to `resolved`, exactly as `attempt` does; any other outcome names its documented cause and removes the workspace.
 - `stack-continue --state <path>`: the stack analogue of `continue`. Require every conflicted file resolved, then resume the cascade with `gh stack rebase --continue`. It may report a fresh conflict set as the cascade climbs to a later member.
 - `stack-abort --state <path>`: abort the in-progress cascade with `gh stack rebase --abort`, which restores every branch, and remove the throwaway workspace. Nothing on the remote moved, because the cascade pushes nothing until `stack-publish`.
-- `stack-publish --state <path>`: require a resolved cascade, force-push every member of the stack, and then prove every member's remote branch landed on exactly the commit the cascade intended. A member on any other commit is a hard error, the stack analogue of proving nothing else moved.
+- `stack-publish --state <path>`: require a resolved cascade, force-push every member of the stack, and then prove every member's remote branch landed on exactly the commit the cascade intended. It verifies every member from the remote whatever `gh stack push` returns, because that push is not atomic and a partial one exits non-zero; a member still on its pre-cascade commit and a member another actor moved are named as distinct causes. When a member did not land it keeps the throwaway workspace instead of removing it, names the landed and not-landed members and where the workspace is, and re-running `stack-publish` retries the members that did not land.
 - `status [--state <path> | --current --repo-root <workspace>]`: write the complete snapshot to `status_path` and print a compact envelope carrying `result`, `stage_outcome` when there is a run to describe, `attempt`, `escalation`, `mergeable_at_head_sha`, `counts`, and `iterations`. It also carries `last_helper_activity`, the moment this helper last wrote its state. That is not proof the stage is alive, because the helper writes only when a subcommand runs and the agent driving it can think for a long time between two of them.
 - `cleanup --state <path>`: delete the state file along with its preflight, conflicts, and status files.
 
@@ -96,6 +96,7 @@ If an operation partly fails, keep its state and run that same operation again a
    - `unknown_mergeability`: GitHub never finished computing mergeability. Stop and report it. The helper already waited.
    - `max_iterations_reached`: stop before you change anything, and report the cap as an escalation.
    - `stack_rebase`: the pull request is part of a native GitHub stack, so the conflict belongs to the trunk. Resolve it with `stack-rebase`, not `attempt`, and follow the stack path (below) through to `stack-publish`.
+   - `stack_external_dependents`: the pull request is a native stack, but an open pull request outside the stack is based on a branch the cascade would force-push, and rewriting it was never approved. The escalation names each such pull request and the branch it targets. Stop and report it; do not cascade.
    - `ad_hoc_base`: the pull request targets a branch that is neither the repository default branch nor a native stack trunk, so GitHub measures mergeability against a branch this loop would not merge in. The escalation names the branch and file that actually conflict. Stop and report it; do not rebase onto the declared base.
    - `unsafe_push` or `no_safe_strategy`: stop and report the helper's blockers verbatim. Never look for a way around them.
 
@@ -131,10 +132,12 @@ A cascade must check out and move every branch in the stack in turn, but git ref
 The flow is the single-branch flow with stack verbs:
 
 1. `stack-rebase`. On a conflict, resolve each file with `resolved` exactly as usual — the conflicted files carry absolute paths into the clone — then `stack-continue`. Repeat until the cascade is clean.
-2. `stack-publish`. It force-pushes every member of the stack, including ones that are currently mergeable and under review, because the user approved rewriting the whole stack. It then proves every member landed on exactly the commit the cascade intended and treats any other commit as a hard error.
+2. `stack-publish`. It force-pushes every member of the stack, including ones that are currently mergeable and under review, because the user approved rewriting the whole stack. It then proves every member landed on exactly the commit the cascade intended, reading the remote whatever the push returned, and on a partial publish it keeps the clone and names what to re-run rather than leaving a half-published stack unexplained.
 3. On any failure, `stack-abort` restores every branch and removes the clone.
 
-Never widen the single-branch push guards to let a cascade through. The cascade has its own publish path with its own inverted assertion; the original guards stay exactly as strict.
+The user approved rewriting the stack's own members, and that grant does not reach an open pull request outside the stack that happens to be based on one of those branches. `preflight` refuses such a cascade as `stack_external_dependents` and names the dependents, rather than orphaning their history silently. The trunk is not rewritten, so pull requests targeting the trunk are not dependents.
+
+Never widen the single-branch push guards to let a cascade through. The cascade has its own publish path with its own inverted assertion; the original guards stay exactly as strict, and they still fire on a native stack whose own metadata makes a push unsafe.
 
 ## Reading The Conflict
 

@@ -33,6 +33,43 @@ REBASE_ONLY_MERGE_METHODS = {
 NO_RELATIONS = {"dependents": [], "stacked_on": None}
 
 
+def native_stack_detection(default_branch="main", trunk="main", members=None):
+    """A `stack_membership` result describing a healthy two-member native stack.
+
+    The invoked pull request is #7 on `feature`, stacked on #19483 on `v143`,
+    which is stacked on the trunk. Overriding `members` builds a different shape.
+    """
+    if members is None:
+        members = [
+            {
+                "position": 0,
+                "number": 19483,
+                "head_branch": "v143",
+                "base_branch": "main",
+                "mergeable": "MERGEABLE",
+                "head_sha": "aaa",
+            },
+            {
+                "position": 1,
+                "number": 7,
+                "head_branch": "feature",
+                "base_branch": "v143",
+                "mergeable": "CONFLICTING",
+                "head_sha": "head1",
+            },
+        ]
+    return {
+        "default_branch": default_branch,
+        "stack": {
+            "id": "S_1",
+            "number": 19578,
+            "size": len(members),
+            "trunk": trunk,
+            "members": members,
+        },
+    }
+
+
 def temporary_directory(test: unittest.TestCase) -> Path:
     """Make a temporary directory that survives read-only files on cleanup."""
 
@@ -381,10 +418,46 @@ class AgentInstructionsTest(unittest.TestCase):
             "unsafe_push",
             "no_safe_strategy",
             "stack_rebase",
+            "stack_external_dependents",
             "ad_hoc_base",
         ):
             with self.subTest(result=result):
                 self.assertIn(f"`{result}`", self.instructions)
+
+    def test_refuses_a_cascade_that_would_orphan_an_external_dependent(self):
+        self.assertIn(
+            "an open pull request outside the stack is based on a branch the "
+            "cascade would force-push",
+            self.instructions,
+        )
+        self.assertIn(
+            "names each such pull request and the branch it targets",
+            self.instructions,
+        )
+        self.assertIn(
+            "The trunk is not rewritten, so pull requests targeting the trunk "
+            "are not dependents",
+            self.instructions,
+        )
+
+    def test_documents_the_partial_publish_recovery(self):
+        self.assertIn(
+            "verifies every member from the remote whatever `gh stack push` "
+            "returns",
+            self.instructions,
+        )
+        self.assertIn(
+            "a member still on its pre-cascade commit and a member another actor "
+            "moved are named as distinct causes",
+            self.instructions,
+        )
+        self.assertIn(
+            "keeps the throwaway workspace instead of removing it", self.instructions
+        )
+        self.assertIn(
+            "re-running `stack-publish` retries the members that did not land",
+            self.instructions,
+        )
 
     def test_explains_the_native_stack_cascade(self):
         self.assertIn("## Native GitHub Stacks", self.instructions)
@@ -1095,6 +1168,65 @@ class StackRelationsTest(unittest.TestCase):
             ],
             listing.call_args_list,
         )
+
+
+class ExternalStackDependentsTest(unittest.TestCase):
+    def stack(self):
+        return {
+            "number": 100,
+            "trunk": "main",
+            "members": [
+                {
+                    "number": 19483,
+                    "head_branch": "v143",
+                    "base_branch": "main",
+                    "head_sha": "aaa",
+                },
+                {
+                    "number": 7,
+                    "head_branch": "feature",
+                    "base_branch": "v143",
+                    "head_sha": "head1",
+                },
+            ],
+        }
+
+    def by_branch(self, mapping):
+        def fake_list(_repo, parameters):
+            return mapping.get(parameters["base"], [])
+
+        return fake_list
+
+    def test_names_open_pull_requests_based_on_a_member_branch(self):
+        mapping = {"v143": [pull_payload(42, "outside", "v143")], "feature": []}
+        with mock.patch.object(
+            MODULE, "list_open_pulls", side_effect=self.by_branch(mapping)
+        ):
+            found = MODULE.external_stack_dependents(pr_metadata(), self.stack())
+        self.assertEqual([42], [item["number"] for item in found])
+        self.assertEqual("v143", found[0]["base_branch"])
+        self.assertEqual("outside", found[0]["head_branch"])
+
+    def test_excludes_the_stack_members_themselves(self):
+        # #7's base is v143, which is another member's head, so #7 shows up when
+        # v143 is queried. A member is never its own external dependent.
+        mapping = {"v143": [pull_payload(7, "feature", "v143")], "feature": []}
+        with mock.patch.object(
+            MODULE, "list_open_pulls", side_effect=self.by_branch(mapping)
+        ):
+            found = MODULE.external_stack_dependents(pr_metadata(), self.stack())
+        self.assertEqual([], found)
+
+    def test_does_not_query_the_trunk(self):
+        # The trunk is a member's base but never a member's head, so the cascade
+        # does not rewrite it and pull requests targeting it are not dependents.
+        with mock.patch.object(
+            MODULE, "list_open_pulls", return_value=[]
+        ) as listing:
+            MODULE.external_stack_dependents(pr_metadata(), self.stack())
+        queried = sorted(call.args[1]["base"] for call in listing.call_args_list)
+        self.assertEqual(["feature", "v143"], queried)
+        self.assertNotIn("main", queried)
 
 
 def dependent(number=9, head_branch="child"):
@@ -1855,6 +1987,7 @@ class StateHelpersTest(unittest.TestCase):
                 "unsafe_push",
                 "unknown_mergeability",
                 "ad_hoc_base",
+                "stack_external_dependents",
                 "validation",
                 "other",
             ),
@@ -1994,6 +2127,7 @@ class PreflightTest(unittest.TestCase):
         state=None,
         detection=None,
         ad_hoc=None,
+        external=None,
     ):
         args = SimpleNamespace(
             target="owner/repo#7",
@@ -2032,6 +2166,8 @@ class PreflightTest(unittest.TestCase):
             MODULE, "base_ref_tip", return_value="defaultsha"
         ), mock.patch.object(
             MODULE, "ad_hoc_escalation", return_value=ad_hoc
+        ), mock.patch.object(
+            MODULE, "external_stack_dependents", return_value=external or []
         ), mock.patch.object(
             MODULE,
             "repository_merge_methods",
@@ -2226,6 +2362,72 @@ class PreflightTest(unittest.TestCase):
         )
         self.assertEqual("stack_rebase", payload["result"])
         self.assertEqual("develop", payload["default_branch"])
+
+    def test_a_native_stack_with_no_head_branch_still_escalates(self):
+        # A push-safety blocker is degenerate pull request metadata, not an
+        # artifact of the single-branch refspec, so it must fire on a native
+        # stack too rather than being skipped into the cascade.
+        payload = self.preflight(
+            metadata=pr_metadata(head_branch=None),
+            detection=native_stack_detection(),
+        )
+        self.assertEqual("unsafe_push", payload["result"])
+        self.assertEqual("unsafe_push", payload["escalation"]["kind"])
+        self.assertIn("no head branch", payload["push_blockers"][0])
+        self.assertIsNone(self.saved()["attempt"])
+
+    def test_a_native_stack_whose_head_is_its_base_still_escalates(self):
+        # The head branch and base branch are the same ref in the upstream
+        # repository, so a push would write to the base branch. That is broken
+        # however it is pushed, cascade or not.
+        payload = self.preflight(
+            metadata=pr_metadata(head_owner="owner", base_branch="feature"),
+            detection=native_stack_detection(),
+        )
+        self.assertEqual("unsafe_push", payload["result"])
+        self.assertEqual("unsafe_push", payload["escalation"]["kind"])
+        self.assertIn("write to the base branch", payload["push_blockers"][0])
+        self.assertIsNone(self.saved()["attempt"])
+
+    def test_a_native_stack_stacked_on_its_own_head_still_escalates(self):
+        # The declared base resolves to this same head branch through an open
+        # pull request, so a push cannot be safe regardless of the stack.
+        relations = {
+            "dependents": [],
+            "stacked_on": {"number": 3, "head_branch": "feature"},
+        }
+        payload = self.preflight(
+            relations=relations, detection=native_stack_detection()
+        )
+        self.assertEqual("unsafe_push", payload["result"])
+        self.assertEqual("unsafe_push", payload["escalation"]["kind"])
+        self.assertIn("#3", payload["push_blockers"][0])
+        self.assertIsNone(self.saved()["attempt"])
+
+    def test_a_native_stack_with_an_external_dependent_escalates(self):
+        # An open pull request based on a branch the cascade will force-push,
+        # but which is not a stack member, would be orphaned. The user approved
+        # rewriting the stack's own members, not this one, so the cascade is
+        # refused and the dependent is named rather than silently orphaned.
+        external = [
+            {
+                "number": 42,
+                "url": "https://github.com/owner/repo/pull/42",
+                "head_branch": "outside",
+                "base_branch": "v143",
+            }
+        ]
+        payload = self.preflight(
+            detection=native_stack_detection(), external=external
+        )
+        self.assertEqual("stack_external_dependents", payload["result"])
+        self.assertEqual(
+            "stack_external_dependents", payload["escalation"]["kind"]
+        )
+        self.assertIn("#42", payload["escalation"]["reason"])
+        self.assertIn("v143", payload["escalation"]["reason"])
+        self.assertEqual(external, payload["external_dependents"])
+        self.assertIsNone(self.saved()["attempt"])
 
     def test_an_ad_hoc_base_escalates_and_names_the_conflict(self):
         # base_branch differs from the default branch and there is no native
@@ -4635,6 +4837,142 @@ class AttemptRepoRootTest(unittest.TestCase):
             MODULE.attempt_repo_root({}, {"strategy": "stack", "stack": {}})
 
 
+class CreateStackWorkspaceTest(unittest.TestCase):
+    def clone_command(self, reference=None):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return completed(0)
+
+        with mock.patch.object(MODULE, "run", side_effect=fake_run):
+            workspace = MODULE.create_stack_workspace(
+                pr_metadata(), reference=reference
+            )
+        self.addCleanup(MODULE.force_rmtree, workspace)
+        return calls[0], workspace
+
+    def test_borrows_local_objects_when_a_reference_is_given(self):
+        reference = Path("/main/repo/.git")
+        cmd, workspace = self.clone_command(reference=reference)
+        self.assertEqual(
+            ["gh", "repo", "clone", "owner/repo", str(workspace), "--"], cmd[:6]
+        )
+        self.assertIn("--reference-if-able", cmd)
+        index = cmd.index("--reference-if-able")
+        self.assertEqual(str(reference), cmd[index + 1])
+        self.assertIn("--no-single-branch", cmd)
+
+    def test_full_clone_when_no_reference_is_available(self):
+        cmd, _ = self.clone_command(reference=None)
+        self.assertNotIn("--reference-if-able", cmd)
+        self.assertIn("--no-single-branch", cmd)
+
+
+class LocalObjectSourceTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = temporary_directory(self)
+
+    def test_resolves_the_common_object_store(self):
+        common = self.directory / "common.git"
+        (common / "objects").mkdir(parents=True)
+        with mock.patch.object(
+            MODULE, "git_try", return_value=completed(0, stdout=f"{common}\n")
+        ):
+            self.assertEqual(common, MODULE.local_object_source(self.directory))
+
+    def test_resolves_a_relative_common_dir_against_the_repo_root(self):
+        (self.directory / ".git" / "objects").mkdir(parents=True)
+        with mock.patch.object(
+            MODULE, "git_try", return_value=completed(0, stdout=".git")
+        ):
+            self.assertEqual(
+                (self.directory / ".git").resolve(),
+                MODULE.local_object_source(self.directory),
+            )
+
+    def test_none_when_the_objects_directory_is_absent(self):
+        common = self.directory / "empty.git"
+        common.mkdir()
+        with mock.patch.object(
+            MODULE, "git_try", return_value=completed(0, stdout=str(common))
+        ):
+            self.assertIsNone(MODULE.local_object_source(self.directory))
+
+    def test_none_when_rev_parse_fails(self):
+        with mock.patch.object(MODULE, "git_try", return_value=completed(1)):
+            self.assertIsNone(MODULE.local_object_source(self.directory))
+
+
+class DissociateWorkspaceTest(unittest.TestCase):
+    def setUp(self):
+        self.workspace = temporary_directory(self)
+        self.alternates = (
+            self.workspace / ".git" / "objects" / "info" / "alternates"
+        )
+
+    def write_alternates(self, text="/main/repo/.git/objects"):
+        self.alternates.parent.mkdir(parents=True, exist_ok=True)
+        self.alternates.write_text(text, encoding="utf-8")
+
+    def test_no_alternates_is_a_no_op(self):
+        self.assertIsNone(MODULE.dissociate_workspace(self.workspace))
+
+    def test_repacks_and_drops_the_alternates(self):
+        self.write_alternates()
+
+        def fake_git_try(_root, *args):
+            if args[:1] == ("rev-parse",):
+                return completed(0, stdout="HEADSHA")
+            return completed(0)
+
+        with mock.patch.object(MODULE, "git_try", side_effect=fake_git_try):
+            result = MODULE.dissociate_workspace(self.workspace)
+        self.assertIsNone(result)
+        self.assertFalse(self.alternates.exists())
+
+    def test_names_the_borrowed_source_when_repack_fails(self):
+        self.write_alternates("/gone/.git/objects")
+        with mock.patch.object(
+            MODULE, "git_try", return_value=completed(1, stderr="boom")
+        ):
+            result = MODULE.dissociate_workspace(self.workspace)
+        self.assertIn("/gone/.git/objects", result)
+        self.assertIn("repack", result)
+        self.assertTrue(self.alternates.exists())
+
+
+class StackBranchFlagsTest(unittest.TestCase):
+    def flags(self, payload, returncode=0):
+        with mock.patch.object(
+            MODULE, "run", return_value=completed(returncode, stdout=json.dumps(payload))
+        ):
+            return MODULE.stack_branch_flags(Path("/workspace"))
+
+    def test_reads_merged_and_queued_keyed_by_branch(self):
+        payload = {
+            "branches": [
+                {"name": "v143", "isMerged": True, "isQueued": False},
+                {"name": "feature", "isMerged": False, "isQueued": True},
+            ]
+        }
+        flags = self.flags(payload)
+        self.assertTrue(flags["v143"]["merged"])
+        self.assertFalse(flags["v143"]["queued"])
+        self.assertTrue(flags["feature"]["queued"])
+
+    def test_skips_a_branch_with_no_name(self):
+        flags = self.flags({"branches": [{"isMerged": True}]})
+        self.assertEqual({}, flags)
+
+    def test_a_failed_view_is_a_hard_error(self):
+        with mock.patch.object(
+            MODULE, "run", return_value=completed(2, stderr="not a stack")
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "gh stack view"):
+                MODULE.stack_branch_flags(Path("/workspace"))
+
+
 class StackRebaseCommandTest(unittest.TestCase):
     def setUp(self):
         self.directory = temporary_directory(self)
@@ -4724,8 +5062,8 @@ class StackPublishCommandTest(unittest.TestCase):
             {"number": 7, "head_branch": "feature", "head_sha": "newf"},
         ]
 
-    def publish(self, *, push=None, landed=None, members_after="default",
-                final=None):
+    def publish(self, *, push=None, view=None, landed=None, members_after="default",
+                final=None, dissociate=None):
         if members_after == "default":
             members_after = self.intended
         attempt = stack_attempt_record(
@@ -4736,8 +5074,24 @@ class StackPublishCommandTest(unittest.TestCase):
             },
         )
         state_path = write_state(self.directory, attempt=attempt)
-        landed = landed or {member["head_branch"]: member["head_sha"]
-                            for member in (members_after or [])}
+        if landed is None:
+            landed = {member["head_branch"]: member["head_sha"]
+                      for member in (members_after or [])}
+        view_payload = view if view is not None else {
+            "trunk": "main",
+            "branches": [
+                {"name": "v143", "isMerged": False, "isQueued": False},
+                {"name": "feature", "isMerged": False, "isQueued": False},
+            ],
+        }
+
+        def fake_run(cmd, **kwargs):
+            head = cmd[:3]
+            if head == ["gh", "stack", "view"]:
+                return completed(0, stdout=json.dumps(view_payload))
+            if head == ["gh", "stack", "push"]:
+                return push or completed(0)
+            return completed(0)
 
         def fake_wait(owner, repo, branch, expected):
             return landed.get(branch)
@@ -4746,10 +5100,12 @@ class StackPublishCommandTest(unittest.TestCase):
         with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
             MODULE, "require_gh_stack"
         ), mock.patch.object(
-            MODULE, "run", return_value=push or completed(0)
+            MODULE, "run", side_effect=fake_run
         ), mock.patch.object(
             MODULE, "wait_for_remote_head", side_effect=fake_wait
         ), mock.patch.object(
+            MODULE, "dissociate_workspace", return_value=dissociate
+        ) as dissociate_mock, mock.patch.object(
             MODULE, "remove_stack_workspace"
         ) as remove, mock.patch.object(
             MODULE, "live_mergeability",
@@ -4764,6 +5120,7 @@ class StackPublishCommandTest(unittest.TestCase):
                 self.error = error
         self.state_path = state_path
         self.remove = remove
+        self.dissociate = dissociate_mock
         return emitted(emit) if emit.called else None
 
     def saved(self):
@@ -4777,21 +5134,72 @@ class StackPublishCommandTest(unittest.TestCase):
         self.remove.assert_called_once()
         self.assertEqual("published", self.saved()["attempt"]["status"])
 
-    def test_a_member_on_an_unexpected_commit_is_a_hard_error(self):
-        self.publish(landed={"v143": "newa", "feature": "wrong"})
-        self.assertIsNotNone(self.error)
-        self.assertIn("unexpected commit", str(self.error))
-        self.assertIn("#7", str(self.error))
+    def test_a_partial_push_that_still_landed_every_member_publishes(self):
+        # `gh stack push` exits non-zero on a partial push, but the remote shows
+        # every member on its intended commit, so the remote is believed over the
+        # exit code and the per-member verification is what decides.
+        payload = self.publish(push=completed(1, stderr="one branch rejected"))
+        self.assertIsNone(self.error)
+        self.assertEqual("published", payload["result"])
+        self.remove.assert_called_once()
+        self.assertEqual("published", self.saved()["attempt"]["status"])
 
-    def test_a_failed_push_is_a_hard_error(self):
-        self.publish(push=completed(1, stderr="denied"))
+    def test_a_member_left_on_its_pre_cascade_commit_preserves_the_workspace(self):
+        # `feature` is still at its pre-cascade commit head1, so the push never
+        # moved it. The workspace is preserved for a re-run rather than removed.
+        self.publish(landed={"v143": "newa", "feature": "head1"})
         self.assertIsNotNone(self.error)
-        self.assertIn("`gh stack push` failed", str(self.error))
+        message = str(self.error)
+        self.assertIn("#7 feature", message)
+        self.assertIn("did not move it", message)
+        self.assertIn("landed only some members", message)
+        self.assertIn(str(self.workspace), message)
+        self.assertIn("re-run stack-publish", message)
+        self.remove.assert_not_called()
+        self.dissociate.assert_called_once()
+        self.assertEqual("resolved", self.saved()["attempt"]["status"])
+
+    def test_a_member_moved_by_another_actor_is_named_as_such(self):
+        # `feature` is on neither its intended tip nor its pre-cascade commit, so
+        # something moved it while the cascade ran and the lease was rejected.
+        self.publish(landed={"v143": "newa", "feature": "someoneelse"})
+        self.assertIsNotNone(self.error)
+        message = str(self.error)
+        self.assertIn("#7 feature", message)
+        self.assertIn("force-with-lease was rejected", message)
+        self.remove.assert_not_called()
+
+    def test_a_skipped_merged_member_is_not_a_mismatch(self):
+        # v143 is already merged, so `gh stack push` skips it and the remote will
+        # not carry a rebased tip. That is expected, not a member that failed to
+        # land, so the publish still succeeds.
+        view = {
+            "trunk": "main",
+            "branches": [
+                {"name": "v143", "isMerged": True, "isQueued": False},
+                {"name": "feature", "isMerged": False, "isQueued": False},
+            ],
+        }
+        payload = self.publish(
+            view=view, landed={"v143": "aaa", "feature": "newf"}
+        )
+        self.assertIsNone(self.error)
+        self.assertEqual("published", payload["result"])
+        self.remove.assert_called_once()
+
+    def test_a_partial_push_names_the_push_output_when_a_member_is_pending(self):
+        self.publish(
+            push=completed(1, stderr="remote rejected feature"),
+            landed={"v143": "newa", "feature": "head1"},
+        )
+        self.assertIsNotNone(self.error)
+        self.assertIn("remote rejected feature", str(self.error))
 
     def test_publishing_without_recorded_tips_is_refused(self):
         self.publish(members_after=None)
         self.assertIsNotNone(self.error)
         self.assertIn("no rebased member tips", str(self.error))
+
 
 
 class StackAbortCommandTest(unittest.TestCase):

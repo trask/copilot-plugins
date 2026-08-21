@@ -78,6 +78,7 @@ ESCALATION_KINDS = (
     "unsafe_push",
     "unknown_mergeability",
     "ad_hoc_base",
+    "stack_external_dependents",
     "validation",
     "other",
 )
@@ -974,6 +975,39 @@ def stack_relations(pr: dict[str, Any]) -> dict[str, Any]:
         "dependents": [dependents[key] for key in sorted(dependents)],
         "stacked_on": stacked_on,
     }
+
+
+def external_stack_dependents(
+    pr: dict[str, Any], stack: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Open pull requests based on a branch the cascade moves but outside the stack.
+
+    A cascade rewrites every member's head branch. An open pull request based on
+    one of those branches, but not itself a member, has its history orphaned when
+    that branch is force-pushed. The user approved rewriting the stack's own
+    members, and that grant does not reach an arbitrary dependent, so one refuses
+    the cascade instead of silently orphaning it.
+
+    Only the members' head branches are checked. The trunk is a member's base but
+    never a member's head, so the cascade does not rewrite it, and open pull
+    requests targeting the trunk are not dependents in this sense.
+    """
+    upstream = f"{pr['upstream_owner']}/{pr['upstream_repo']}"
+    member_numbers = {member["number"] for member in stack["members"]}
+    member_branches = {member["head_branch"] for member in stack["members"]}
+    found: dict[int, dict[str, Any]] = {}
+    for branch in sorted(member_branches):
+        for item in list_open_pulls(upstream, {"base": branch}):
+            summary = summarize_pull(item)
+            if summary["number"] in member_numbers:
+                continue
+            found[summary["number"]] = {
+                "number": summary["number"],
+                "url": summary["url"],
+                "head_branch": summary["head_branch"],
+                "base_branch": branch,
+            }
+    return [found[key] for key in sorted(found)]
 
 
 def choose_strategy(
@@ -1917,6 +1951,11 @@ def command_preflight(args: argparse.Namespace) -> None:
     detection = stack_membership(metadata)
     default_branch = detection["default_branch"]
     stack = detection["stack"]
+    # Established from metadata before anything touches disk: a cascade the user
+    # did not approve is refused here, not after a workspace is cloned.
+    external_dependents = (
+        external_stack_dependents(metadata, stack) if stack is not None else []
+    )
 
     if state is None:
         state = {
@@ -1960,12 +1999,17 @@ def command_preflight(args: argparse.Namespace) -> None:
     except WorkflowError as error:
         strategy_error = str(error)
 
-    if push_blockers and stack is None:
+    if push_blockers:
         result = "unsafe_push"
     elif exhausted:
         result = "max_iterations_reached"
     elif mergeability == "mergeable":
         result = "mergeable"
+    elif stack is not None and external_dependents:
+        # The cascade would force-push branches that open pull requests outside
+        # the stack are based on. The user approved rewriting the stack's own
+        # members, not these, so name them and refuse rather than orphan them.
+        result = "stack_external_dependents"
     elif stack is not None:
         # A native GitHub stack resolves by cascading a rebase through the trunk,
         # a whole-stack operation the single-branch strategies cannot express, so
@@ -2045,6 +2089,24 @@ def command_preflight(args: argparse.Namespace) -> None:
             recommended_action=ad_hoc["recommended_action"],
             iteration=iteration,
         )
+    elif result == "stack_external_dependents":
+        listed = "; ".join(
+            f"#{item['number']} (targets {item['base_branch']})"
+            for item in external_dependents
+        )
+        record_escalation(
+            state,
+            kind="stack_external_dependents",
+            reason=(
+                "the cascade would rewrite branches that open pull requests "
+                f"outside the stack are based on: {listed}"
+            ),
+            recommended_action=(
+                "a person must retarget or close these dependent pull requests "
+                "before the stack can be cascaded"
+            ),
+            iteration=iteration,
+        )
     elif result in {"mergeable", "ready", "stack_rebase"}:
         state["escalation"] = None
 
@@ -2064,6 +2126,7 @@ def command_preflight(args: argparse.Namespace) -> None:
         "push_blockers": push_blockers,
         "default_branch": default_branch,
         "stack": stack,
+        "external_dependents": external_dependents,
         "ad_hoc": ad_hoc,
         "strategy": strategy_choice,
         "strategy_error": strategy_error,
@@ -2118,6 +2181,7 @@ def command_preflight(args: argparse.Namespace) -> None:
                 "members": [member["number"] for member in stack["members"]],
             },
             "ad_hoc": ad_hoc,
+            "external_dependents": external_dependents,
             "escalation": state.get("escalation"),
             "iteration": iteration,
             "max_iterations": max_iterations,
@@ -2765,7 +2829,7 @@ def force_rmtree(path: Path) -> None:
     shutil.rmtree(path, ignore_errors=False, onerror=clear_readonly)
 
 
-def create_stack_workspace(pr: dict[str, Any]) -> Path:
+def create_stack_workspace(pr: dict[str, Any], reference: Path | None = None) -> Path:
     """Clone the upstream repository into a throwaway directory for a cascade.
 
     A cascade must check out and move every branch in the stack, which the App's
@@ -2774,11 +2838,24 @@ def create_stack_workspace(pr: dict[str, Any]) -> Path:
     branch, and it holds none the App's worktrees hold. The clone is safe to
     discard at any point because ``gh stack rebase`` rebases locally and pushes
     nothing, so nothing on the remote moves until an explicit publish.
+
+    ``gh repo clone`` forwards everything after ``--`` to ``git clone`` while
+    keeping ``gh``'s own credential setup, which ``gh stack push`` later depends
+    on. When ``reference`` names an on-disk object store, it is forwarded as
+    ``--reference-if-able`` so the clone borrows those objects instead of
+    downloading the whole repository, which for a large upstream is minutes and
+    gigabytes per cascade. ``--reference-if-able`` degrades to a full clone on its
+    own if the reference turns out to be unusable. A clone that borrows objects
+    must be dissociated before it is preserved past the cascade; see
+    ``dissociate_workspace``.
     """
     workspace = Path(tempfile.mkdtemp(prefix="conflict-fix-loop-stack."))
     upstream = f"{pr['upstream_owner']}/{pr['upstream_repo']}"
+    git_flags = ["--no-single-branch"]
+    if reference is not None:
+        git_flags.extend(["--reference-if-able", str(reference)])
     clone = run(
-        ["gh", "repo", "clone", upstream, str(workspace), "--", "--no-single-branch"],
+        ["gh", "repo", "clone", upstream, str(workspace), "--", *git_flags],
         check=False,
     )
     if clone.returncode != 0:
@@ -2788,6 +2865,71 @@ def create_stack_workspace(pr: dict[str, Any]) -> Path:
             f"could not clone {upstream} for the stack cascade: {detail}"
         )
     return workspace
+
+
+def local_object_source(repo_root: Path) -> Path | None:
+    """The common object store a cascade clone can borrow, or None when there is none.
+
+    Almost every checkout this pipeline runs in is a linked worktree whose own
+    ``.git`` is a file and whose objects live in the main repository.
+    ``--git-common-dir`` resolves to that shared store; a worktree path passed to
+    ``--reference`` would not give the object reuse we want. The objects directory
+    must exist to borrow from, and when the path does not resolve the caller falls
+    back to a full clone.
+    """
+    result = git_try(repo_root, "rev-parse", "--git-common-dir")
+    if result.returncode != 0:
+        return None
+    common = Path(result.stdout.strip())
+    if not common.is_absolute():
+        common = (Path(repo_root) / common).resolve()
+    if not (common / "objects").is_dir():
+        return None
+    return common
+
+
+def dissociate_workspace(workspace: Path) -> str | None:
+    """Make a preserved cascade clone own the objects it borrows through a reference.
+
+    A ``--reference`` clone borrows objects through
+    ``.git/objects/info/alternates`` rather than owning them. That is fine for a
+    scratch clone deleted at the end of a cascade, but a workspace preserved after
+    a partial publish can outlive the source it borrows from -- worktrees vanish
+    from disk in this environment, and even a surviving source can prune the
+    borrowed objects, which its garbage collection does without knowing about an
+    outside borrower. Either way the preserved workspace becomes a corrupt
+    repository at exactly the moment someone needs it to recover a half-published
+    stack. Repack to copy the objects in, drop the alternates file, and prove HEAD
+    still resolves.
+
+    Returns None once the workspace stands on its own, or a message naming the
+    still-borrowed source when the workspace could not be dissociated.
+    """
+    alternates = Path(workspace) / ".git" / "objects" / "info" / "alternates"
+    if not alternates.exists():
+        return None
+    borrowed = alternates.read_text(encoding="utf-8").strip() or "its object source"
+    repack = git_try(workspace, "repack", "-a", "-d")
+    if repack.returncode != 0:
+        detail = repack.stderr.strip() or repack.stdout.strip() or "no output"
+        return (
+            "could not repack the preserved cascade workspace, which still borrows "
+            f"objects from {borrowed}: {detail}"
+        )
+    try:
+        alternates.unlink()
+    except OSError as error:
+        return (
+            "could not drop the alternates file from the preserved cascade "
+            f"workspace, which still borrows objects from {borrowed}: {error}"
+        )
+    resolved = git_try(workspace, "rev-parse", "HEAD")
+    if resolved.returncode != 0 or alternates.exists():
+        return (
+            f"the preserved cascade workspace may still depend on {borrowed}: HEAD "
+            "did not resolve after dissociating"
+        )
+    return None
 
 
 def remove_stack_workspace(attempt: dict[str, Any]) -> None:
@@ -2941,7 +3083,8 @@ def command_stack_rebase(args: argparse.Namespace) -> None:
             "start the next one"
         )
     stack = attempt["stack"]
-    workspace = create_stack_workspace(state["pr"])
+    reference = local_object_source(Path(state["repo_root"]))
+    workspace = create_stack_workspace(state["pr"], reference=reference)
     stack["workspace"] = str(workspace)
     # Persist the workspace path before the rebase runs so a later abort can find
     # and remove it even if this process is interrupted mid-cascade.
@@ -3024,6 +3167,38 @@ def command_stack_abort(args: argparse.Namespace) -> None:
     )
 
 
+def stack_branch_flags(workspace: Path) -> dict[str, dict[str, bool]]:
+    """Read each branch's merged and queued flags from `gh stack view --json`.
+
+    `gh stack push` skips a branch that is already merged or queued, so a member
+    that publish must not expect to move is read here rather than mistaken for one
+    that failed to land. The view carries no pull request numbers and no head
+    SHAs, so it is keyed by branch name, which is what publish reconciles by.
+    """
+    result = run(["gh", "stack", "view", "--json"], cwd=workspace, check=False)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WorkflowError(
+            f"could not read `gh stack view` before publishing: {detail}"
+        )
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as error:
+        raise WorkflowError(
+            f"could not parse `gh stack view --json` output: {error}"
+        )
+    flags: dict[str, dict[str, bool]] = {}
+    for branch in payload.get("branches") or []:
+        name = branch.get("name")
+        if name is None:
+            continue
+        flags[name] = {
+            "merged": bool(branch.get("isMerged")),
+            "queued": bool(branch.get("isQueued")),
+        }
+    return flags
+
+
 def command_stack_publish(args: argparse.Namespace) -> None:
     require_tools()
     require_gh_stack()
@@ -3047,41 +3222,85 @@ def command_stack_publish(args: argparse.Namespace) -> None:
             "before publishing"
         )
 
+    # Pre-cascade head SHAs. A member found still on its old commit is one that
+    # `gh stack push` never moved, which reads differently from one another actor
+    # moved out from under the cascade.
+    baseline = {member["number"]: member["head_sha"] for member in stack["members"]}
+    skip_flags = stack_branch_flags(workspace)
+
     # The user approved rewriting every member of the stack, including ones that
     # are currently mergeable and under review, so `gh stack push` force-pushes
-    # each branch. Native-stack branches live in the upstream repository, so each
-    # member is verified there.
+    # each branch. The push is not atomic: a branch may update even when another
+    # is rejected, and that partial state exits non-zero. So the remote is the
+    # authority on what landed, and every member is verified regardless of the
+    # exit code rather than the verification being skipped on the partial failure
+    # it exists to describe.
     push = run(["gh", "stack", "push"], cwd=workspace, check=False)
-    if push.returncode != 0:
-        detail = push.stderr.strip() or push.stdout.strip() or "no output"
-        raise WorkflowError(f"`gh stack push` failed: {detail}")
+    push_detail = push.stderr.strip() or push.stdout.strip() or "no output"
 
-    mismatches = []
+    landed = []
+    pending = []
     for member in intended:
-        landed = wait_for_remote_head(
+        flags = skip_flags.get(member["head_branch"]) or {}
+        if flags.get("merged") or flags.get("queued"):
+            # `gh stack push` skips a merged or queued branch by design, so it is
+            # not expected to move and is not a mismatch.
+            continue
+        remote = wait_for_remote_head(
             pr["upstream_owner"],
             pr["upstream_repo"],
             member["head_branch"],
             member["head_sha"],
         )
-        if landed != member["head_sha"]:
-            mismatches.append(
-                {
-                    "number": member["number"],
-                    "head_branch": member["head_branch"],
-                    "expected": member["head_sha"],
-                    "actual": landed,
-                }
+        if remote == member["head_sha"]:
+            landed.append(member)
+            continue
+        if remote == baseline.get(member["number"]):
+            cause = "`gh stack push` did not move it"
+        else:
+            cause = (
+                "another actor moved this branch while the cascade ran, so its "
+                "force-with-lease was rejected"
             )
-    if mismatches:
-        described = "; ".join(
-            f"#{item['number']} {item['head_branch']} is at {item['actual']} not "
-            f"{item['expected']}"
-            for item in mismatches
+        pending.append(
+            {
+                "number": member["number"],
+                "head_branch": member["head_branch"],
+                "expected": member["head_sha"],
+                "actual": remote,
+                "cause": cause,
+            }
         )
-        raise WorkflowError(
-            "the stack push landed a member on an unexpected commit: " + described
+
+    if pending:
+        # A partial publish is the case this verification exists for, so the
+        # workspace is preserved on purpose rather than removed, and re-running
+        # publish is the documented recovery. A `--reference` clone is made
+        # self-contained first; otherwise the preserved workspace rots when its
+        # borrowed object source is pruned or deleted.
+        borrow = dissociate_workspace(Path(workspace))
+        landed_desc = (
+            ", ".join(f"#{item['number']} {item['head_branch']}" for item in landed)
+            or "none"
         )
+        pending_desc = "; ".join(
+            f"#{item['number']} {item['head_branch']} is at "
+            f"{item['actual'] or 'a missing branch'} not {item['expected']} "
+            f"because {item['cause']}"
+            for item in pending
+        )
+        message = (
+            "the stack publish landed only some members. "
+            f"Landed: {landed_desc}. Not landed: {pending_desc}. "
+            f"The cascade workspace is preserved at {workspace} for recovery; "
+            "re-run stack-publish to retry the members that did not land."
+        )
+        if push.returncode != 0:
+            message += f" `gh stack push` reported: {push_detail}"
+        if borrow is not None:
+            message += f" ({borrow})"
+        save_state(state_path, state)
+        raise WorkflowError(message)
 
     invoked = next(
         (
