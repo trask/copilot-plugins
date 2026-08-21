@@ -989,6 +989,19 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
+    def test_the_argument_hint_stops_selling_the_bare_form_as_the_default(self):
+        """The hint is the shape a caller copies before reaching any step list.
+
+        It used to promise the current branch's PR, which a detached worktree
+        cannot supply, so the omission read as the ordinary way to call this.
+        """
+        self.assertIn(
+            'argument-hint: "PR URL, PR number, or owner/repo#number; omit only '
+            "when the PR's branch is checked out\"",
+            self.instructions,
+        )
+        self.assertNotIn("omit to use the current branch's PR", self.instructions)
+
 
 class TargetParsingTest(unittest.TestCase):
     def test_accepts_urls_and_short_targets(self):

@@ -1,7 +1,7 @@
 ---
 name: CI Fix Loop
 description: "Use when selected with only a PR URL, PR number, or owner/repo#number to immediately run the full CI Fix Loop, or to autonomously fix the failing checks on a pull request and push the fixes until CI is green."
-argument-hint: "PR URL, PR number, or owner/repo#number; omit to use the current branch's PR"
+argument-hint: "PR URL, PR number, or owner/repo#number; omit only when the PR's branch is checked out"
 tools: [read, edit, search, execute, agent, todo, rename_session]
 user-invocable: true
 disable-model-invocation: true
