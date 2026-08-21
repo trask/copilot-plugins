@@ -2788,9 +2788,16 @@ def command_launch(args: argparse.Namespace) -> None:
             "stdin": subprocess.DEVNULL,
         }
         if IS_WINDOWS:
+            # CREATE_NO_WINDOW rather than DETACHED_PROCESS. Both keep the stage
+            # off this console, but DETACHED_PROCESS leaves it with no console at
+            # all, and Windows then gives every console program the stage runs a
+            # new visible one. CREATE_NO_WINDOW gives the stage an invisible
+            # console its children inherit instead. The two are mutually
+            # exclusive: CREATE_NO_WINDOW is ignored when DETACHED_PROCESS is
+            # also set.
             popen_kwargs["creationflags"] = getattr(
                 subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-            ) | getattr(subprocess, "DETACHED_PROCESS", 0)
+            ) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         else:
             popen_kwargs["start_new_session"] = True
         process = subprocess.Popen(list(command), **popen_kwargs)

@@ -5801,5 +5801,56 @@ class NextProbesTheStageProcessTest(CommandTestCase):
         self.assertEqual(MODULE.RUNNING_STAGE_ALIVE, self.ask_next(path)["verdict"])
 
 
+    def test_a_program_a_stage_runs_gets_no_visible_console_window(self):
+        # A stage spawned with DETACHED_PROCESS has no console at all, so Windows
+        # hands every console program the stage then runs -- git, gh, the check
+        # helpers -- a brand new console, and that one is visible. Several
+        # pipelines at once fill the screen with flashing windows. The stage
+        # itself is not the level that matters here; what it runs is.
+        if not MODULE.IS_WINDOWS:
+            self.skipTest("console allocation is a Windows behavior")
+        inner = self.root / "console_inner.py"
+        inner.write_text(
+            "import ctypes\n"
+            "handle = ctypes.windll.kernel32.GetConsoleWindow()\n"
+            "visible = bool(ctypes.windll.user32.IsWindowVisible(handle))\n"
+            "print(handle, visible if handle else False)\n",
+            encoding="utf-8",
+        )
+        outer = self.root / "console_outer.py"
+        outer.write_text(
+            "import subprocess, sys\n"
+            f"result = subprocess.run([sys.executable, r{str(inner)!r}],"
+            " capture_output=True, text=True)\n"
+            "print(result.stdout.strip())\n",
+            encoding="utf-8",
+        )
+        log = self.root / "console.log"
+        MODULE.command_launch(
+            self.args(
+                state=str(self.preflight_state(self.make_repo("session"))),
+                log=str(log),
+                command=[sys.executable, str(outer)],
+            )
+        )
+        launched = self.emitted[-1]
+        self.stop_when_done(launched["pid"])
+        deadline = time.time() + 60
+        reported = ""
+        while time.time() < deadline:
+            reported = log.read_text(encoding="utf-8").strip()
+            if reported:
+                break
+            time.sleep(0.2)
+        self.assertTrue(reported, "the probe never reported a console")
+        handle, visible = reported.split()
+        self.assertEqual(
+            "0",
+            handle,
+            f"a program the stage ran was given its own console: {reported}",
+        )
+        self.assertEqual("False", visible)
+
+
 if __name__ == "__main__":
     unittest.main()
