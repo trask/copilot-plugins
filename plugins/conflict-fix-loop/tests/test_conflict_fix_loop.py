@@ -3328,7 +3328,8 @@ class StageOutcomeTest(unittest.TestCase):
 
     def test_every_outcome_is_in_the_agreed_vocabulary(self):
         self.assertEqual(
-            ("cleared", "skipped", "no_progress", "escalated"), MODULE.STAGE_OUTCOMES
+            ("cleared", "skipped", "no_progress", "escalated", "carried"),
+            MODULE.STAGE_OUTCOMES,
         )
 
     def test_a_pull_request_already_mergeable_cleared_the_stage(self):
@@ -3391,9 +3392,15 @@ class StageOutcomeTest(unittest.TestCase):
         )
         self.assertEqual("no_progress", outcome)
 
+    def test_a_spent_iteration_cap_reports_carried(self):
+        outcome = MODULE.stage_outcome(
+            self.state(escalation={"kind": "max_iterations", "reason": "r"})
+        )
+        self.assertEqual("carried", outcome)
+
     def test_every_other_escalation_kind_reports_escalated(self):
         for kind in MODULE.ESCALATION_KINDS:
-            if kind == "no_progress":
+            if kind in ("no_progress", "max_iterations"):
                 continue
             with self.subTest(kind=kind):
                 outcome = MODULE.stage_outcome(

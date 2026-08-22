@@ -232,9 +232,9 @@ Stop and send the final report when any of these holds:
 
 ## Final Report
 
-Before you write the report, run `status` and read its `stage_outcome`. That field is how a caller reads this run mechanically, and it is one of `cleared`, `skipped`, `no_progress`, and `escalated`. It says how the run ended; it never says the stage is green. Whether this stage is green is decided from GitHub's live mergeability, so if your prose and that field ever disagree, the field is right about the run and neither of you is right about greenness. Do not describe a run as finished when `stage_outcome` is `escalated`.
+Before you write the report, run `status` and read its `stage_outcome`. That field is how a caller reads this run mechanically, and it is one of `cleared`, `skipped`, `no_progress`, `escalated`, and `carried`. It says how the run ended; it never says the stage is green. Whether this stage is green is decided from GitHub's live mergeability, so if your prose and that field ever disagree, the field is right about the run and neither of you is right about greenness. Do not describe a run as finished when `stage_outcome` is `escalated` or `carried`. A run that spent its iteration cap reads as `carried`: an orchestrator gives the stage another pass, while a run a person started still reports the cap as an escalation, as above.
 
-When `status` reports `no_state` the field is absent, because there is no run to describe. That is not a failure and it is not `no_progress`. Say what `status` actually found instead of reaching for one of the four words.
+When `status` reports `no_state` the field is absent, because there is no run to describe. That is not a failure and it is not `no_progress`. Say what `status` actually found instead of reaching for one of the five words.
 
 The field is also absent while a run is still going, because a state written mid-flight looks the same whether the run is still working or was killed, and the helper will not guess between them. If you see no field on a run you just finished, finish it properly — `publish`, `abort`, or `escalate` — and read `status` again. Absence there means no command recorded an ending, which usually means you skipped one.
 

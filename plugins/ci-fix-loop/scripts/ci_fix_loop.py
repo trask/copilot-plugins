@@ -2706,8 +2706,11 @@ def stage_outcome(state: dict[str, Any]) -> str | None:
 
     A pipeline reads greenness from GitHub rather than from here, so this states
     only how the loop itself ended: `cleared` when it recorded green, `skipped`
-    when the head ran no applicable checks, `escalated` when it handed the pull
-    request back to a person.
+    when the head ran no applicable checks, `carried` when it spent its own
+    iteration cap, and `escalated` when it handed the pull request back to a
+    person for any other reason. A cap bounds one pass of the orchestrator, which
+    gives the stage the rest of its budget on the next pass rather than ending
+    the run.
 
     Returning `None` means this state supports no claim about an ending, and the
     field is then left out so a reader sees an absent answer rather than a
@@ -2721,7 +2724,10 @@ def stage_outcome(state: dict[str, Any]) -> str | None:
     A reader is entitled to take any value it finds at face value, so a value
     this function cannot support must not appear at all.
     """
-    if state.get("escalation"):
+    escalation = state.get("escalation")
+    if escalation:
+        if escalation.get("reason") == "max_iterations_reached":
+            return "carried"
         return "escalated"
     outcome = state.get("outcome")
     if outcome == "no_checks":

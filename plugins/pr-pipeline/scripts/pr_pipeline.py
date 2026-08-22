@@ -135,11 +135,17 @@ HELPER_EVIDENCE_STAGES = tuple(
     entry["stage"] for entry in STAGES if entry["evidence"] == "helper"
 )
 
-STAGE_OUTCOMES = ("cleared", "skipped", "no_progress", "escalated")
+STAGE_OUTCOMES = ("cleared", "skipped", "no_progress", "escalated", "carried")
 CLEARING_OUTCOMES = ("cleared", "skipped")
 # An outcome and a head SHA account for a clearance on their own. Nothing
 # accounts for a stall or a surrender except a sentence someone wrote.
 DETAIL_REQUIRED_OUTCOMES = ("no_progress", "escalated")
+
+# A carried stage could not clear on this pass but has budget left. It is set
+# aside for the rest of the pass and picked up again on the next one. A machine
+# reading always means the stage hit its own per-pass iteration cap; a process
+# that died before recording an outcome is carried under its own reason.
+CARRIED_REASONS = ("max_iterations_reached", "process_exited_without_outcome")
 
 # A stage scopes a budget to one pass of the pipeline by resetting when this
 # pair changes. The run is opaque and compared only for equality; the iteration
@@ -1812,9 +1818,10 @@ def no_progress_streak(state: dict[str, Any], stage: str) -> int:
 def decide_next(state: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any]:
     """Choose what the pipeline does next. This is the whole control flow.
 
-    The result is one of ``escalate``, ``complete``, or ``run_stage``. Nothing
-    here reads a stage's prose, and nothing here looks at the base branch: base
-    movement deliberately triggers no re-review and no fresh check wait.
+    The result is one of ``escalate``, ``complete``, ``incomplete``, or
+    ``run_stage``. Nothing here reads a stage's prose, and nothing here looks at
+    the base branch: base movement deliberately triggers no re-review and no
+    fresh check wait.
     """
 
     head_sha = observation["head_sha"]
@@ -1968,17 +1975,48 @@ def decide_next(state: dict[str, Any], observation: dict[str, Any]) -> dict[str,
 
     projection = projected_iteration(state, stage)
     if projection["iteration"] > max_iterations:
+        carried = state.get("carried") or {}
+        uncleared: list[dict[str, Any]] = []
+        for entry in STAGES:
+            name = entry["stage"]
+            if stage_states[name]["green"]:
+                continue
+            record = carried.get(name)
+            if record:
+                uncleared.append(
+                    {
+                        "stage": name,
+                        "reason": record.get("reason"),
+                        "head_sha": record.get("head_sha"),
+                        "carried": True,
+                    }
+                )
+            else:
+                uncleared.append(
+                    {
+                        "stage": name,
+                        "reason": "never_cleared",
+                        "head_sha": head_sha,
+                        "carried": False,
+                    }
+                )
+        named = ", ".join(
+            f"{item['stage']} ({item['reason']}, last at "
+            f"{item['head_sha'] or 'an unknown head'})"
+            for item in uncleared
+        )
         return {
-            "result": "escalate",
-            "stage": stage,
-            "reason": "max_iterations_reached",
+            "result": "incomplete",
+            "reason": "stages_never_cleared",
             "detail": (
-                f"running {stage} again would start iteration "
-                f"{projection['iteration']} of a maximum of {max_iterations}"
+                f"the pipeline spent its {max_iterations} iterations and these "
+                f"stages never cleared: {named}"
             ),
-            "next_action": ESCALATION_ACTIONS["max_iterations_reached"],
             "head_sha": head_sha,
-            "recorded": False,
+            "iteration": int(state.get("iteration") or 1),
+            "max_iterations": max_iterations,
+            "uncleared": uncleared,
+            "stage_states": stage_states,
         }
 
     return {
@@ -2240,6 +2278,7 @@ def new_state(
         "stage_high_water": None,
         "stage_models": default_stage_models(),
         "cleared": {},
+        "carried": {},
         "no_progress": {},
         "running": None,
         "history": [],
@@ -2261,9 +2300,10 @@ def begin_run(state: dict[str, Any]) -> dict[str, Any]:
     escalation is read before anything live, so a pull request that escalated
     once would replay that escalation for ever, and the only escape would be
     deleting the state file along with the history of why it escalated. The
-    iteration count, the stage high-water mark, and the no-progress streaks are
-    the same shape: all of them bound one unattended pass through the stages,
-    and none of them is a budget for the pull request's whole life.
+    iteration count, the stage high-water mark, the carried set, and the
+    no-progress streaks are the same shape: all of them bound one unattended
+    pass through the stages, and none of them is a budget for the pull request's
+    whole life.
 
     The streaks have to go for a sharper reason than that. A streak is what
     produces a no-progress escalation, and ``decide_next`` escalates on a streak
@@ -2318,6 +2358,7 @@ def begin_run(state: dict[str, Any]) -> dict[str, Any]:
     state["stage_high_water"] = None
     state["escalation"] = None
     state["completed"] = None
+    state["carried"] = {}
     state["no_progress"] = {}
     state["running"] = None
     started = {
@@ -2660,6 +2701,31 @@ def command_next(args: argparse.Namespace) -> None:
         )
         return
 
+    if decision["result"] == "incomplete":
+        sync_cleared(state, decision)
+        state["running"] = None
+        save_state(path, state)
+        emit(
+            {
+                **{
+                    key: value
+                    for key, value in decision.items()
+                    if key != "stage_states"
+                },
+                "state": str(path),
+                "stage_states": decision["stage_states"],
+                "checks": observation["checks"],
+                "mergeable": observation["mergeable"],
+                "mergeability": observation.get("mergeability"),
+                "cleared": state.get("cleared") or {},
+                "reminder": (
+                    "The pipeline reached its iteration limit with stages still "
+                    "not green. It never marks a pull request ready for review."
+                ),
+            }
+        )
+        return
+
     if not decision.get("recorded"):
         record_escalation(state, decision)
     save_state(path, state)
@@ -2938,7 +3004,7 @@ def command_wait(args: argparse.Namespace) -> None:
                 return
             emit(
                 {
-                    "result": "escalate",
+                    "result": "carry",
                     "reason": "process_exited_without_outcome",
                     "stage": args.stage,
                     "pid": pid,
@@ -2946,9 +3012,11 @@ def command_wait(args: argparse.Namespace) -> None:
                         f"the {args.stage} process exited before its helper "
                         "recorded an outcome"
                     ),
-                    "next_action": ESCALATION_ACTIONS[
-                        "process_exited_without_outcome"
-                    ],
+                    "next_action": (
+                        "Carry the stage: record it with finish --outcome carried "
+                        "--carried-reason process_exited_without_outcome. The next "
+                        "pass gives it the rest of its budget."
+                    ),
                     "waited_seconds": round(time.monotonic() - started, 3),
                 }
             )
@@ -3539,11 +3607,28 @@ def command_finish(args: argparse.Namespace) -> None:
         STAGE_BY_NAME[stage], target, args.outcome, head_sha=head_sha
     )
     outcome = resolution["outcome"]
+    carried_reason = None
+    if outcome == "carried":
+        # A machine reading of a carried stage always means the stage spent its
+        # own per-pass iteration cap. A reported carry names its own reason,
+        # because a process that died before recording an outcome is carried the
+        # same way without the stage ever getting to speak.
+        if resolution["outcome_source"] == "stage_status":
+            carried_reason = "max_iterations_reached"
+        else:
+            carried_reason = getattr(args, "carried_reason", None)
+            if carried_reason not in CARRIED_REASONS:
+                raise WorkflowError(
+                    "--carried-reason is required for a reported carried outcome, "
+                    f"one of {', '.join(CARRIED_REASONS)}: name why the stage was "
+                    "set aside for the next pass"
+                )
     detail = recorded_detail(args.detail, resolution)
     entry_detail = detail
     entry = {
         "stage": stage,
         "outcome": outcome,
+        "carried_reason": carried_reason,
         "run_id": state.get("run_id"),
         "requested_outcome": resolution["requested_outcome"],
         "outcome_source": resolution["outcome_source"],
@@ -3585,20 +3670,35 @@ def command_finish(args: argparse.Namespace) -> None:
     entry["clearance_confirmed"] = confirmation.get("green")
     entry["clearance_reason"] = confirmation.get("reason")
     unconfirmed = outcome in CLEARING_OUTCOMES and confirmation.get("green") is not True
-    stalled = (
-        streak_effect(outcome, repeat=repeat, confirmed=confirmation.get("green"))
-        == "charge"
-    )
-    if stalled:
+    effect = streak_effect(outcome, repeat=repeat, confirmed=confirmation.get("green"))
+    stalled = effect == "charge"
+    if effect == "charge":
         previous = streaks.get(stage)
         count = int(previous.get("count") or 0) + 1 if isinstance(previous, dict) else 1
         streaks[stage] = {"count": count, "head_sha": head_sha, "at": utc_now()}
-    else:
+    elif effect == "reset":
         streaks.pop(stage, None)
 
     escalation = None
+    carried_map = state.setdefault("carried", {})
     if outcome in CLEARING_OUTCOMES and head_sha:
         state.setdefault("cleared", {})[stage] = head_sha
+    if outcome == "carried":
+        # Setting the floor past the carried stage takes it out of the running
+        # for the rest of this pass. The end-of-pass look-behind finds it again
+        # and starts a new pass, which is the move that spends an outer iteration
+        # and hands the stage the rest of its absolute budget.
+        carried_map[stage] = {
+            "reason": carried_reason,
+            "head_sha": head_sha,
+            "iteration": running.get("iteration"),
+            "at": utc_now(),
+        }
+        floor = state.get("stage_high_water")
+        floor = floor if isinstance(floor, int) else 0
+        state["stage_high_water"] = max(floor, STAGE_INDEX[stage] + 1)
+    elif outcome in CLEARING_OUTCOMES:
+        carried_map.pop(stage, None)
     if outcome == "escalated":
         escalation = record_escalation(
             state,
@@ -3718,8 +3818,15 @@ def streak_effect(outcome: str, *, repeat: bool, confirmed: bool | None) -> str:
     when the pipeline could not get an answer, which is not the same as a
     disagreement but is treated the same way, because an answer that was never
     read is not one the pipeline can act on either.
+
+    A carried run holds the streak where it is. Being set aside for the next pass
+    is neither progress the pipeline saw nor a stall, so it neither resets the
+    streak nor charges it. The effect is one of ``charge``, ``reset``, or
+    ``hold``.
     """
 
+    if outcome == "carried":
+        return "hold"
     if outcome == "no_progress" or repeat:
         return "charge"
     if outcome in CLEARING_OUTCOMES and confirmed is not True:
@@ -4016,6 +4123,7 @@ def build_parser() -> argparse.ArgumentParser:
     finish.add_argument("--state", required=True)
     finish.add_argument("--stage", required=True, choices=list(STAGE_NAMES))
     finish.add_argument("--outcome", required=True, choices=list(STAGE_OUTCOMES))
+    finish.add_argument("--carried-reason", choices=list(CARRIED_REASONS))
     finish.add_argument("--head")
     finish.add_argument("--session")
     finish.add_argument("--process")

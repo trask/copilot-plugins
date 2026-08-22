@@ -82,7 +82,7 @@ ESCALATION_KINDS = (
     "validation",
     "other",
 )
-STAGE_OUTCOMES = ("cleared", "skipped", "no_progress", "escalated")
+STAGE_OUTCOMES = ("cleared", "skipped", "no_progress", "escalated", "carried")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 
@@ -3414,6 +3414,10 @@ def stage_outcome(state: dict[str, Any] | None) -> str | None:
     escalated. That is evidence of an ending nobody can describe, which is worth a
     person's attention, and not the same as having no evidence at all.
 
+    A run that spent its own iteration cap reports carried. The cap bounds one pass
+    of the orchestrator, and the orchestrator gives the stage the rest of its
+    budget on the next pass rather than ending the run there.
+
     With no state at all there is likewise no run to describe. A stage that was never
     launched and one that finished and cleaned up after itself both look like this,
     and neither of them made no progress.
@@ -3422,7 +3426,12 @@ def stage_outcome(state: dict[str, Any] | None) -> str | None:
         return None
     escalation = state.get("escalation")
     if escalation:
-        return "no_progress" if escalation.get("kind") == "no_progress" else "escalated"
+        kind = escalation.get("kind")
+        if kind == "no_progress":
+            return "no_progress"
+        if kind == "max_iterations":
+            return "carried"
+        return "escalated"
     status = (state.get("attempt") or {}).get("status")
     if status not in RECORDED_ENDINGS:
         return None

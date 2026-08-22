@@ -566,7 +566,7 @@ class LoopBackTest(unittest.TestCase):
         self.assertEqual(2, decision["iteration"])
         self.assertTrue(decision["loop_back"])
 
-    def test_a_loop_back_past_the_cap_escalates(self):
+    def test_a_loop_back_past_the_cap_reports_incomplete(self):
         state = build_state(
             iteration=2,
             max_iterations=2,
@@ -575,9 +575,9 @@ class LoopBackTest(unittest.TestCase):
         decision = MODULE.decide_next(
             state, observation(head_sha=NEXT_HEAD, description=NEXT_HEAD)
         )
-        self.assertEqual("escalate", decision["result"])
-        self.assertEqual("max_iterations_reached", decision["reason"])
-        self.assertIn("iteration 3 of a maximum of 2", decision["detail"])
+        self.assertEqual("incomplete", decision["result"])
+        self.assertEqual(2, decision["max_iterations"])
+        self.assertTrue(decision["uncleared"])
 
     def test_the_same_stage_again_is_not_a_loop_back(self):
         state = build_state(
@@ -3075,9 +3075,15 @@ class RequiredDetailTest(CommandTestCase):
             set(),
             set(MODULE.DETAIL_REQUIRED_OUTCOMES) & set(MODULE.CLEARING_OUTCOMES),
         )
+        # A carry is accounted for by its head and a named reason rather than by
+        # a head alone or a sentence, so it sits in neither list.
+        self.assertNotIn("carried", MODULE.DETAIL_REQUIRED_OUTCOMES)
+        self.assertNotIn("carried", MODULE.CLEARING_OUTCOMES)
         self.assertEqual(
             set(MODULE.STAGE_OUTCOMES),
-            set(MODULE.DETAIL_REQUIRED_OUTCOMES) | set(MODULE.CLEARING_OUTCOMES),
+            set(MODULE.DETAIL_REQUIRED_OUTCOMES)
+            | set(MODULE.CLEARING_OUTCOMES)
+            | {"carried"},
         )
 
     def test_a_reclassified_outcome_says_so_rather_than_leaving_a_blank(self):
@@ -3248,6 +3254,11 @@ class StreakEffectTest(unittest.TestCase):
 
     def test_a_repeated_answer_charges_whatever_it_says(self):
         for outcome in MODULE.STAGE_OUTCOMES:
+            if outcome == "carried":
+                # A carry never feeds the streak, repeated or not. The pipeline
+                # set the stage aside itself, so counting that as no progress
+                # would punish the stage for the pipeline's own move.
+                continue
             with self.subTest(outcome=outcome):
                 self.assertEqual(
                     "charge",
@@ -4532,10 +4543,10 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_it_says_base_movement_triggers_nothing(self):
         self.assertIn("Base-branch movement triggers nothing", self.instructions)
 
-    def test_it_treats_an_internal_cap_as_an_escalation(self):
+    def test_it_carries_an_internal_cap_instead_of_escalating(self):
         self.assertIn(
-            "A stage that hits its own internal iteration cap is an escalation, not "
-            "a completion.",
+            "A stage that hits its own internal iteration cap is carried, not "
+            "completed and not escalated.",
             self.instructions,
         )
 
@@ -4720,7 +4731,7 @@ class WaitCommandTest(CommandTestCase):
         self.assertEqual("finished", result["result"])
         self.assertEqual("cleared", result["outcome"])
 
-    def test_a_process_gone_without_an_outcome_escalates(self):
+    def test_a_process_gone_without_an_outcome_is_carried(self):
         path = write_state(self.root)
         self.stage_reading = {"available": False, "reason": "not_reported"}
         with mock.patch.object(MODULE, "process_alive", return_value=False):
@@ -4728,7 +4739,7 @@ class WaitCommandTest(CommandTestCase):
                 clock.monotonic.side_effect = [0.0, 0.0]
                 MODULE.command_wait(self.wait_args(path))
         result = self.emitted[-1]
-        self.assertEqual("escalate", result["result"])
+        self.assertEqual("carry", result["result"])
         self.assertEqual("process_exited_without_outcome", result["reason"])
 
     def test_a_process_still_alive_at_the_ceiling_escalates(self):
@@ -5945,6 +5956,311 @@ class NextProbesTheStageProcessTest(CommandTestCase):
                 )
         self.assertIn("newline", str(caught.exception))
         self.assertFalse(log.exists(), "a refused stage still opened its log")
+
+
+class CarryDecideNextTest(unittest.TestCase):
+    """A carried stage falls below the pass floor and the pipeline reads it there."""
+
+    def test_carried_is_in_the_pipeline_vocabulary(self):
+        self.assertIn("carried", MODULE.STAGE_OUTCOMES)
+        self.assertNotIn("carried", MODULE.CLEARING_OUTCOMES)
+
+    def test_a_carried_stage_is_skipped_for_the_rest_of_the_pass(self):
+        # The floor advanced past self-review when it was carried, so the pass
+        # runs the next stage that still needs running rather than picking the
+        # carried stage again.
+        state = build_state(
+            iteration=1,
+            stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_COPILOT_REVIEW],
+            carried={MODULE.STAGE_SELF_REVIEW: {"reason": "max_iterations_reached"}},
+        )
+        decision = MODULE.decide_next(state, observation())
+        self.assertEqual("run_stage", decision["result"])
+        self.assertEqual(MODULE.STAGE_COPILOT_REVIEW, decision["stage"])
+
+    def test_a_carried_stage_is_looked_at_again_once_the_pass_ends(self):
+        state = build_state(
+            iteration=1,
+            stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_COPILOT_REVIEW],
+            carried={MODULE.STAGE_SELF_REVIEW: {"reason": "max_iterations_reached"}},
+        )
+        decision = MODULE.decide_next(
+            state, observation(copilot_review=HEAD, description=HEAD)
+        )
+        self.assertEqual("run_stage", decision["result"])
+        self.assertEqual(MODULE.STAGE_SELF_REVIEW, decision["stage"])
+        self.assertEqual(2, decision["iteration"])
+        self.assertTrue(decision["loop_back"])
+
+    def test_a_loop_back_past_the_cap_reports_incomplete(self):
+        state = build_state(
+            iteration=2,
+            max_iterations=2,
+            stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_CI],
+        )
+        decision = MODULE.decide_next(
+            state, observation(head_sha=NEXT_HEAD, description=NEXT_HEAD)
+        )
+        self.assertEqual("incomplete", decision["result"])
+        self.assertNotEqual("complete", decision["result"])
+        self.assertEqual(2, decision["max_iterations"])
+
+    def test_incomplete_names_each_uncleared_stage_with_its_reason_and_head(self):
+        state = build_state(
+            iteration=2,
+            max_iterations=2,
+            stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_DESCRIPTION],
+            carried={
+                MODULE.STAGE_SELF_REVIEW: {
+                    "reason": "max_iterations_reached",
+                    "head_sha": HEAD,
+                }
+            },
+        )
+        decision = MODULE.decide_next(
+            state,
+            observation(copilot_review=HEAD, description=HEAD),
+        )
+        self.assertEqual("incomplete", decision["result"])
+        uncleared = {item["stage"]: item for item in decision["uncleared"]}
+        self.assertIn(MODULE.STAGE_SELF_REVIEW, uncleared)
+        entry = uncleared[MODULE.STAGE_SELF_REVIEW]
+        self.assertEqual("max_iterations_reached", entry["reason"])
+        self.assertEqual(HEAD, entry["head_sha"])
+        self.assertTrue(entry["carried"])
+
+    def test_a_never_carried_uncleared_stage_is_named_too(self):
+        state = build_state(
+            iteration=2,
+            max_iterations=2,
+            stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_DESCRIPTION],
+        )
+        decision = MODULE.decide_next(
+            state,
+            observation(head_sha=NEXT_HEAD, copilot_review=HEAD, description=NEXT_HEAD),
+        )
+        self.assertEqual("incomplete", decision["result"])
+        uncleared = {item["stage"]: item for item in decision["uncleared"]}
+        self.assertIn(MODULE.STAGE_SELF_REVIEW, uncleared)
+        self.assertFalse(uncleared[MODULE.STAGE_SELF_REVIEW]["carried"])
+
+    def test_a_non_green_stage_can_never_complete(self):
+        # The whole point of the pipeline: an uncleared stage is never a green
+        # ending, whichever stage it is and wherever the floor sits.
+        for stage in MODULE.STAGE_NAMES:
+            with self.subTest(stage=stage):
+                markers = {
+                    MODULE.STAGE_SELF_REVIEW: HEAD,
+                    MODULE.STAGE_COPILOT_REVIEW: HEAD,
+                    MODULE.STAGE_DESCRIPTION: HEAD,
+                }
+                observed = observation(
+                    self_review=markers[MODULE.STAGE_SELF_REVIEW],
+                    copilot_review=markers[MODULE.STAGE_COPILOT_REVIEW],
+                    description=markers[MODULE.STAGE_DESCRIPTION],
+                )
+                if stage in (MODULE.STAGE_CONFLICT, MODULE.STAGE_CI):
+                    observed = observation(
+                        self_review=HEAD,
+                        copilot_review=HEAD,
+                        description=HEAD,
+                        mergeable="CONFLICTING"
+                        if stage == MODULE.STAGE_CONFLICT
+                        else "MERGEABLE",
+                        checks="failure" if stage == MODULE.STAGE_CI else "success",
+                    )
+                else:
+                    observed["stage_markers"][stage]["clean_at_head_sha"] = None
+                decision = MODULE.decide_next(build_state(), observed)
+                self.assertNotEqual("complete", decision["result"])
+
+    def test_a_carried_last_stage_never_reads_as_complete(self):
+        # The floor advanced to the end when the last stage was carried, so the
+        # look-behind still finds it rather than the pass reading as finished.
+        state = build_state(
+            iteration=1,
+            max_iterations=2,
+            stage_high_water=len(MODULE.STAGES),
+            carried={MODULE.STAGE_DESCRIPTION: {"reason": "max_iterations_reached"}},
+        )
+        decision = MODULE.decide_next(
+            state, observation(self_review=HEAD, copilot_review=HEAD)
+        )
+        self.assertNotEqual("complete", decision["result"])
+        self.assertEqual("run_stage", decision["result"])
+        self.assertEqual(MODULE.STAGE_DESCRIPTION, decision["stage"])
+        self.assertTrue(decision["loop_back"])
+
+
+class CarryFinishTest(CommandTestCase):
+    def running_state(self, stage: str, **overrides) -> Path:
+        running = {
+            "stage": stage,
+            "head_sha": HEAD,
+            "iteration": 1,
+            "launch": "session",
+            "session_id": "abc",
+            "process_id": None,
+            "model": MODULE.DEFAULT_STAGE_MODEL,
+            "started_at": "2026-01-01T00:00:00Z",
+        }
+        return write_state(self.root, running=running, **overrides)
+
+    def carry(self, path, stage, reason="max_iterations_reached", head=None):
+        MODULE.command_finish(
+            self.args(
+                state=str(path),
+                stage=stage,
+                outcome="carried",
+                carried_reason=reason,
+                head=head,
+                session=None,
+                process=None,
+                detail=None,
+            )
+        )
+
+    def test_carrying_advances_the_floor_and_records_the_reason(self):
+        path = self.running_state(MODULE.STAGE_SELF_REVIEW)
+        self.carry(path, MODULE.STAGE_SELF_REVIEW)
+        state = MODULE.load_state(path)
+        self.assertEqual(
+            MODULE.STAGE_INDEX[MODULE.STAGE_SELF_REVIEW] + 1,
+            state["stage_high_water"],
+        )
+        carried = state["carried"][MODULE.STAGE_SELF_REVIEW]
+        self.assertEqual("max_iterations_reached", carried["reason"])
+        self.assertEqual(HEAD, carried["head_sha"])
+        self.assertIsNone(state["escalation"])
+        self.assertIsNone(state["running"])
+        entry = state["history"][-1]
+        self.assertEqual("carried", entry["outcome"])
+        self.assertEqual("max_iterations_reached", entry["carried_reason"])
+        self.assertEqual("recorded", self.emitted[-1]["result"])
+
+    def test_carrying_never_charges_the_no_progress_streak(self):
+        path = self.running_state(
+            MODULE.STAGE_SELF_REVIEW,
+            no_progress={MODULE.STAGE_SELF_REVIEW: {"count": 1, "head_sha": HEAD}},
+        )
+        self.carry(path, MODULE.STAGE_SELF_REVIEW)
+        state = MODULE.load_state(path)
+        self.assertEqual(1, state["no_progress"][MODULE.STAGE_SELF_REVIEW]["count"])
+        self.assertIsNone(state["escalation"])
+
+    def test_carrying_is_not_a_clearance(self):
+        path = self.running_state(MODULE.STAGE_SELF_REVIEW)
+        self.carry(path, MODULE.STAGE_SELF_REVIEW)
+        state = MODULE.load_state(path)
+        self.assertNotIn(MODULE.STAGE_SELF_REVIEW, state["cleared"])
+
+    def test_clearing_a_carried_stage_forgets_the_carry(self):
+        path = self.running_state(
+            MODULE.STAGE_SELF_REVIEW,
+            stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_COPILOT_REVIEW],
+            carried={MODULE.STAGE_SELF_REVIEW: {"reason": "max_iterations_reached"}},
+        )
+        self.stage_says("cleared", clean_at_head_sha=NEXT_HEAD)
+        MODULE.command_finish(
+            self.args(
+                state=str(path),
+                stage=MODULE.STAGE_SELF_REVIEW,
+                outcome="cleared",
+                carried_reason=None,
+                head=NEXT_HEAD,
+                session=None,
+                process=None,
+                detail=None,
+            )
+        )
+        state = MODULE.load_state(path)
+        self.assertNotIn(MODULE.STAGE_SELF_REVIEW, state.get("carried") or {})
+
+    def test_a_carry_the_stage_did_not_report_needs_a_reason(self):
+        path = self.running_state(MODULE.STAGE_SELF_REVIEW)
+        with self.assertRaises(MODULE.WorkflowError) as error:
+            self.carry(path, MODULE.STAGE_SELF_REVIEW, reason=None)
+        self.assertIn("carried-reason", str(error.exception))
+
+    def test_a_machine_reported_carry_names_the_cap_itself(self):
+        path = self.running_state(MODULE.STAGE_CONFLICT)
+        self.stage_reading = {"available": True, "outcome": "carried"}
+        MODULE.command_finish(
+            self.args(
+                state=str(path),
+                stage=MODULE.STAGE_CONFLICT,
+                outcome="carried",
+                carried_reason=None,
+                head=HEAD,
+                session=None,
+                process=None,
+                detail=None,
+            )
+        )
+        state = MODULE.load_state(path)
+        entry = state["history"][-1]
+        self.assertEqual("carried", entry["outcome"])
+        self.assertEqual("max_iterations_reached", entry["carried_reason"])
+
+    def test_a_process_death_is_carried_with_its_own_reason(self):
+        path = self.running_state(MODULE.STAGE_CI)
+        self.carry(
+            path, MODULE.STAGE_CI, reason="process_exited_without_outcome"
+        )
+        state = MODULE.load_state(path)
+        self.assertEqual(
+            "process_exited_without_outcome",
+            state["carried"][MODULE.STAGE_CI]["reason"],
+        )
+        self.assertIsNone(state["escalation"])
+
+
+class CarryStreakEffectTest(unittest.TestCase):
+    def test_a_carry_holds_the_streak(self):
+        self.assertEqual(
+            "hold", MODULE.streak_effect("carried", repeat=False, confirmed=None)
+        )
+
+    def test_a_repeated_carry_still_holds_rather_than_charging(self):
+        self.assertEqual(
+            "hold", MODULE.streak_effect("carried", repeat=True, confirmed=None)
+        )
+
+
+class CarryNextCommandTest(CommandTestCase):
+    def call_next(self, path: Path, observed: dict):
+        with mock.patch.object(MODULE, "require_tools"):
+            with mock.patch.object(
+                MODULE, "collect_observation", return_value=observed
+            ):
+                MODULE.command_next(self.args(state=str(path), effort="high"))
+
+    def test_next_reports_incomplete_without_marking_the_run_complete(self):
+        path = write_state(
+            self.root,
+            iteration=2,
+            max_iterations=2,
+            stage_high_water=MODULE.STAGE_INDEX[MODULE.STAGE_DESCRIPTION],
+            carried={
+                MODULE.STAGE_SELF_REVIEW: {
+                    "reason": "max_iterations_reached",
+                    "head_sha": HEAD,
+                }
+            },
+        )
+        self.call_next(
+            path,
+            observation(
+                head_sha=NEXT_HEAD, copilot_review=NEXT_HEAD, description=NEXT_HEAD
+            ),
+        )
+        payload = self.emitted[-1]
+        state = MODULE.load_state(path)
+        self.assertEqual("incomplete", payload["result"])
+        self.assertIsNone(state["completed"])
+        self.assertIsNone(state["escalation"])
+        stages = {item["stage"] for item in payload["uncleared"]}
+        self.assertIn(MODULE.STAGE_SELF_REVIEW, stages)
 
 
 if __name__ == "__main__":

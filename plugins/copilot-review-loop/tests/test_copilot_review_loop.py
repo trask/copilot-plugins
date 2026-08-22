@@ -275,7 +275,8 @@ class AgentInstructionsTest(unittest.TestCase):
             "`status` also reports `stage_outcome`", instructions
         )
         self.assertIn(
-            "`cleared`, `skipped`, `no_progress`, or `escalated`", instructions
+            "`cleared`, `skipped`, `no_progress`, `escalated`, or `carried`",
+            instructions,
         )
         self.assertIn(
             "It never says whether this stage is green, because `clean_at_head_sha` "
@@ -3255,7 +3256,7 @@ class CleanAtHeadShaTest(unittest.TestCase):
 class StageOutcomeTest(unittest.TestCase):
     """The vocabulary an external orchestrator reads instead of the prose report."""
 
-    PIPELINE_VOCABULARY = ("cleared", "skipped", "no_progress", "escalated")
+    PIPELINE_VOCABULARY = ("cleared", "skipped", "no_progress", "escalated", "carried")
 
     def test_a_clearance_is_read_off_the_marker_and_never_decided_again(self):
         self.assertEqual(MODULE.stage_outcome({"clean_at_head_sha": "abc123"}), "cleared")
@@ -3273,8 +3274,13 @@ class StageOutcomeTest(unittest.TestCase):
                 self.assertNotEqual(outcome, "cleared")
                 self.assertIn(outcome, (None, *self.PIPELINE_VOCABULARY))
 
+    def test_a_spent_iteration_cap_is_carried(self):
+        self.assertEqual(
+            MODULE.stage_outcome({"last_result": "max_iterations_reached"}), "carried"
+        )
+
     def test_an_absent_review_asks_for_a_person(self):
-        for result in ("request_cancelled", "review_dismissed", "max_iterations_reached"):
+        for result in ("request_cancelled", "review_dismissed"):
             with self.subTest(result=result):
                 self.assertEqual(
                     MODULE.stage_outcome({"last_result": result}), "escalated"

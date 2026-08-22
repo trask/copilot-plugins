@@ -17,7 +17,7 @@
     {
       "name": "copilot-review-loop",
       "description": "Address Copilot pull request review comments, publish fixes, and repeat until the review is clean.",
-      "version": "1.0.43",
+      "version": "1.0.44",
       "source": "./plugins/copilot-review-loop"
     },
     {
@@ -41,13 +41,13 @@
     {
       "name": "conflict-fix-loop",
       "description": "Resolve merge conflicts on a pull request by keeping both sides' intent, then push and repeat until GitHub reports it mergeable.",
-      "version": "1.0.11",
+      "version": "1.0.12",
       "source": "./plugins/conflict-fix-loop"
     },
     {
       "name": "ci-fix-loop",
       "description": "Fix the failing continuous integration checks a pull request caused, re-run a suspected flake once, and push the fixes until the checks are green.",
-      "version": "1.0.9",
+      "version": "1.0.10",
       "source": "./plugins/ci-fix-loop"
     }
   ]

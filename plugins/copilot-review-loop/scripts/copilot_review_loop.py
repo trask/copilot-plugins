@@ -66,8 +66,11 @@ PREFLIGHT_PENDING_RESULTS = frozenset(
 # run ended and never whether the stage is green: `clean_at_head_sha` alone says that.
 # A recorded ending this table does not name escalates, because a run ended some way
 # nobody can describe and that is worth a person's attention.
+#
+# `max_iterations_reached` is carried rather than escalated: the cap bounds one pass of
+# the orchestrator, which gives the stage the rest of its budget on the next pass.
 STAGE_OUTCOME_BY_RESULT = {
-    "max_iterations_reached": "escalated",
+    "max_iterations_reached": "carried",
     "request_cancelled": "escalated",
     "review_dismissed": "escalated",
     # A terminal `review_comments` means the watcher saw Copilot leave comments and

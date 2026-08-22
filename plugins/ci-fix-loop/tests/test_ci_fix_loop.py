@@ -188,8 +188,8 @@ class AgentInstructionsTest(unittest.TestCase):
 
     def test_tells_the_agent_that_no_progress_is_its_claim_to_make(self):
         self.assertIn(
-            "It reports `cleared`, `skipped`, and `escalated`, and it leaves the "
-            "field out entirely when the state names no ending.",
+            "It reports `cleared`, `skipped`, `escalated`, and `carried`, and it "
+            "leaves the field out entirely when the state names no ending.",
             self.instructions,
         )
         self.assertIn(
@@ -2595,6 +2595,7 @@ class StatusCommandTest(unittest.TestCase):
             ({"outcome": "no_checks", "skip_note": "no applicable checks"}, "skipped"),
             ({"escalation": {"reason": "timeout"}}, "escalated"),
             ({"outcome": "green", "escalation": {"reason": "timeout"}}, "escalated"),
+            ({"escalation": {"reason": "max_iterations_reached"}}, "carried"),
         ):
             with self.subTest(expected=expected):
                 path = write_state(self.root, **overrides)
@@ -2661,6 +2662,14 @@ class StageOutcomeTest(unittest.TestCase):
     def test_an_escalation_outranks_a_recorded_clearance(self):
         state = {"outcome": "green", "escalation": {"reason": "head_changed"}}
         self.assertEqual("escalated", MODULE.stage_outcome(state))
+
+    def test_a_spent_iteration_cap_is_carried(self):
+        self.assertEqual(
+            "carried",
+            MODULE.stage_outcome(
+                {"escalation": {"reason": "max_iterations_reached"}}
+            ),
+        )
 
     def test_a_clearance_always_travels_with_the_head_it_was_measured_at(self):
         """The orchestrator refuses a clearance whose marker names another head.
