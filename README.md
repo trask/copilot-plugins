@@ -66,8 +66,10 @@ Resolves the merge conflicts on a pull request and repeats until GitHub reports
 it mergeable. It reads the history behind each conflicted file first, then keeps
 what both sides meant to do rather than picking a side, and records why in the
 merge commit. It stops and reports when the two sides genuinely contradict each
-other, and it refuses to push when another open pull request stacks on the
-branch. It never posts anything to GitHub.
+other. It refuses to rewrite an ordinary branch with dependents. For a native
+GitHub stack, it rebases every descendant in a throwaway clone and publishes the
+complete stack with one atomic, exact-lease push. It never posts anything to
+GitHub.
 
 ### Optional PR Flight State Sharing
 

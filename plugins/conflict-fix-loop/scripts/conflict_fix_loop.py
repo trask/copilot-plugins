@@ -54,23 +54,7 @@ DELETION_CONFLICT_CODES = {"DD", "UD", "DU"}
 
 STRATEGIES = ("auto", "merge", "rebase")
 STACK_ENTRIES_PAGE = 100
-# Documented `gh stack` exit codes, keyed by name so a caller reads the cause
-# instead of a bare number. Public preview, so the numbers may move; they are
-# named here once and nowhere else.
-GH_STACK_EXIT = {
-    0: "success",
-    1: "generic error",
-    2: "not in a stack, or the stack was not found",
-    3: "rebase conflict",
-    4: "GitHub API failure",
-    5: "invalid arguments or flags",
-    6: "the branch belongs to more than one stack",
-    7: "a rebase is already in progress",
-    8: "the stack is locked by another process",
-    9: "stacked pull requests are not enabled for this repository",
-    10: "a modify session was interrupted and needs recovery",
-}
-GH_STACK_CONFLICT_EXIT = 3
+STACK_CONFLICT_EXIT = 3
 ESCALATION_KINDS = (
     "contradiction",
     "max_iterations",
@@ -215,12 +199,8 @@ def base_ref_tip(repo_name: str, base_branch: str) -> str:
 def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
     """Turn a GraphQL ``PullRequestStack`` into an ordered member snapshot.
 
-    A stack entry can name a pull request the reader cannot see; that entry is
-    skipped rather than failing the whole detection, because a cascade acts on
-    the members it can read and the missing one is reported by its absence. Every
-    readable member must carry the four fields the cascade and its verification
-    depend on, so a member missing one of those is a hard error rather than a
-    silently thinned snapshot.
+    Every member must be readable. Cascading only the visible subset would rewrite
+    branches around an unknown layer, so an unreadable entry is a hard error.
     """
     trunk = raw.get("baseRefName")
     if not isinstance(trunk, str) or not trunk:
@@ -230,14 +210,15 @@ def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
     members: list[dict[str, Any]] = []
     for node in nodes or []:
         if not isinstance(node, dict):
-            continue
+            raise WorkflowError("the native stack has an unreadable member")
         member = node.get("pullRequest")
         if not isinstance(member, dict):
-            continue
+            raise WorkflowError("the native stack has an unreadable member")
         number = member.get("number")
         head_branch = member.get("headRefName")
         base_branch = member.get("baseRefName")
         head_sha = member.get("headRefOid")
+        base_sha = member.get("baseRefOid")
         if (
             not isinstance(number, int)
             or not isinstance(head_branch, str)
@@ -246,6 +227,8 @@ def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
             or not base_branch
             or not isinstance(head_sha, str)
             or not head_sha
+            or not isinstance(base_sha, str)
+            or not base_sha
         ):
             raise WorkflowError(
                 f"native stack member {number!r} is missing a required field"
@@ -258,15 +241,21 @@ def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
                 "base_branch": base_branch,
                 "mergeable": member.get("mergeable"),
                 "head_sha": head_sha,
+                "base_sha": base_sha,
             }
         )
     members.sort(
         key=lambda item: (item["position"] is None, item["position"], item["number"])
     )
+    size = raw.get("size")
+    if not isinstance(size, int) or size != len(members):
+        raise WorkflowError(
+            f"the native stack reports {size!r} members but exposes {len(members)}"
+        )
     return {
         "id": raw.get("id"),
         "number": raw.get("number"),
-        "size": raw.get("size"),
+        "size": size,
         "trunk": trunk,
         "members": members,
     }
@@ -292,7 +281,7 @@ def stack_membership(pr: dict[str, Any]) -> dict[str, Any]:
         "          nodes {"
         "            position"
         "            pullRequest {"
-        "              number headRefName baseRefName mergeable headRefOid"
+        "              number headRefName baseRefName mergeable headRefOid baseRefOid"
         "            }"
         "          }"
         "        }"
@@ -430,23 +419,6 @@ def require_tools() -> None:
     missing = [name for name in ("git", "gh") if shutil.which(name) is None]
     if missing:
         raise WorkflowError(f"required tools not found: {', '.join(missing)}")
-
-
-def require_gh_stack() -> None:
-    """Fail clearly when the `gh stack` extension is not usable.
-
-    A cascade is driven entirely by `gh stack`. A missing or broken extension is
-    a setup problem, not a conflict-resolution failure, so it is named here as
-    the extension rather than surfacing later as an opaque `gh` error mid-rebase.
-    """
-    result = run(["gh", "stack", "--help"], check=False)
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "no output"
-        raise WorkflowError(
-            "the `gh stack` extension is required to resolve a native GitHub "
-            "stack; install it with `gh extension install github/gh-stack`: "
-            f"{detail}"
-        )
 
 
 def normalize_cli_path(value: str, *, windows: bool) -> str:
@@ -1397,7 +1369,10 @@ def collect_stack_conflicts(repo_root: Path) -> list[dict[str, Any]]:
 def rebase_in_progress(repo_root: Path) -> bool:
     for name in ("rebase-merge", "rebase-apply"):
         location = git_try(repo_root, "rev-parse", "--git-path", name)
-        if location.returncode == 0 and Path(location.stdout.strip()).exists():
+        path = Path(location.stdout.strip())
+        if not path.is_absolute():
+            path = Path(repo_root) / path
+        if location.returncode == 0 and path.exists():
             return True
     return False
 
@@ -1896,6 +1871,7 @@ def planned_stack_attempt(
             "base_branch": member["base_branch"],
             "mergeable": member.get("mergeable"),
             "head_sha": member["head_sha"],
+            "base_sha": member["base_sha"],
         }
         for member in stack["members"]
     ]
@@ -1937,6 +1913,8 @@ def command_preflight(args: argparse.Namespace) -> None:
     target = resolve_target(args.target, repo_root)
     state_path = cli_path(args.state) if args.state else default_state_path(target)
     state = load_state(state_path) if state_path.is_file() else None
+    if state is not None:
+        cleanup_replaced_stack_attempt(state)
 
     require_clean_worktree(repo_root)
     require_no_integration_in_progress(repo_root)
@@ -2836,12 +2814,12 @@ def create_stack_workspace(pr: dict[str, Any], reference: Path | None = None) ->
     worktrees forbid because git refuses to check one branch out in two worktrees
     of a repository. A separate clone has independent refs, so it can claim every
     branch, and it holds none the App's worktrees hold. The clone is safe to
-    discard at any point because ``gh stack rebase`` rebases locally and pushes
-    nothing, so nothing on the remote moves until an explicit publish.
+    discard at any point because the helper rebases locally and pushes nothing,
+    so nothing on the remote moves until an explicit publish.
 
     ``gh repo clone`` forwards everything after ``--`` to ``git clone`` while
-    keeping ``gh``'s own credential setup, which ``gh stack push`` later depends
-    on. When ``reference`` names an on-disk object store, it is forwarded as
+    keeping ``gh``'s credential setup for the later git push. When ``reference``
+    names an on-disk object store, it is forwarded as
     ``--reference-if-able`` so the clone borrows those objects instead of
     downloading the whole repository, which for a large upstream is minutes and
     gigabytes per cascade. ``--reference-if-able`` degrades to a full clone on its
@@ -2894,13 +2872,12 @@ def dissociate_workspace(workspace: Path) -> str | None:
     A ``--reference`` clone borrows objects through
     ``.git/objects/info/alternates`` rather than owning them. That is fine for a
     scratch clone deleted at the end of a cascade, but a workspace preserved after
-    a partial publish can outlive the source it borrows from -- worktrees vanish
-    from disk in this environment, and even a surviving source can prune the
-    borrowed objects, which its garbage collection does without knowing about an
-    outside borrower. Either way the preserved workspace becomes a corrupt
-    repository at exactly the moment someone needs it to recover a half-published
-    stack. Repack to copy the objects in, drop the alternates file, and prove HEAD
-    still resolves.
+    a rejected or unverifiable publish can outlive the source it borrows from --
+    worktrees vanish from disk in this environment, and even a surviving source
+    can prune the borrowed objects, which its garbage collection does without
+    knowing about an outside borrower. Either way the preserved workspace becomes
+    corrupt at exactly the moment someone needs it for diagnosis. Repack to copy
+    the objects in, drop the alternates file, and prove HEAD still resolves.
 
     Returns None once the workspace stands on its own, or a message naming the
     still-borrowed source when the workspace could not be dissociated.
@@ -2942,15 +2919,344 @@ def remove_stack_workspace(attempt: dict[str, Any]) -> None:
         stack["workspace"] = None
 
 
-def run_gh_stack_rebase(
-    workspace: Path, extra: list[str]
+def cleanup_replaced_stack_attempt(state: dict[str, Any]) -> None:
+    """Dispose of a preserved failed-publish clone before a new preflight."""
+    attempt = state.get("attempt") or {}
+    if attempt.get("strategy") != "stack":
+        return
+    stack = attempt.get("stack") or {}
+    workspace = stack.get("workspace")
+    status = attempt.get("status")
+    if status == "published_refs":
+        raise WorkflowError(
+            "the stack refs are already published; re-run stack-publish before "
+            "starting a new preflight"
+        )
+    if status != "resolved":
+        raise WorkflowError(
+            f"the previous stack cascade is still {status}; run stack-abort before "
+            "starting a new preflight"
+        )
+    if workspace and Path(workspace).exists():
+        remove_stack_workspace(attempt)
+
+
+def validate_stack_snapshot(stack: dict[str, Any]) -> None:
+    """Require a complete, linear stack before any local branch moves."""
+    members = stack.get("members") or []
+    if not members:
+        raise WorkflowError("the native stack has no members")
+    if stack.get("size") != len(members):
+        raise WorkflowError(
+            f"the native stack reports {stack.get('size')!r} members but the "
+            f"cascade received {len(members)}"
+        )
+    seen_numbers: set[int] = set()
+    seen_branches: set[str] = set()
+    expected_base = stack.get("trunk")
+    for member in members:
+        number = member.get("number")
+        branch = member.get("head_branch")
+        base = member.get("base_branch")
+        head = member.get("head_sha")
+        historical_base = member.get("base_sha")
+        if (
+            not isinstance(number, int)
+            or not isinstance(branch, str)
+            or not branch
+            or not isinstance(base, str)
+            or not base
+            or not isinstance(head, str)
+            or not head
+            or not isinstance(historical_base, str)
+            or not historical_base
+        ):
+            raise WorkflowError("the native stack snapshot has an incomplete member")
+        if number in seen_numbers or branch in seen_branches:
+            raise WorkflowError(
+                f"the native stack repeats pull request #{number} or branch {branch!r}"
+            )
+        if base != expected_base:
+            raise WorkflowError(
+                f"the native stack is not linear at #{number}: {branch!r} targets "
+                f"{base!r}, expected {expected_base!r}"
+            )
+        seen_numbers.add(number)
+        seen_branches.add(branch)
+        expected_base = branch
+    invoked = stack.get("invoked_number")
+    if invoked not in seen_numbers:
+        raise WorkflowError(
+            f"the invoked pull request #{invoked} is missing from the native stack"
+        )
+
+
+def prepare_stack_cascade(
+    workspace: Path, stack: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Freeze branch refs and recover one safe historical boundary per layer."""
+    validate_stack_snapshot(stack)
+    trunk = stack["trunk"]
+    trunk_ref = f"refs/remotes/origin/{trunk}"
+    try:
+        trunk_sha = git(workspace, "rev-parse", trunk_ref)
+    except WorkflowError as error:
+        raise WorkflowError(
+            f"the cascade clone has no remote-tracking ref for trunk {trunk!r}"
+        ) from error
+
+    members = stack["members"]
+    for member in members:
+        branch = member["head_branch"]
+        valid = git_try(workspace, "check-ref-format", "--branch", branch)
+        if valid.returncode != 0:
+            raise WorkflowError(f"native stack branch {branch!r} is not a valid ref")
+        try:
+            remote_tip = git(
+                workspace, "rev-parse", f"refs/remotes/origin/{branch}"
+            )
+        except WorkflowError as error:
+            raise WorkflowError(
+                f"native stack branch {branch!r} is missing from the cascade clone"
+            ) from error
+        if remote_tip != member["head_sha"]:
+            raise WorkflowError(
+                f"native stack branch {branch!r} moved before the cascade started: "
+                f"expected {member['head_sha']}, found {remote_tip}"
+            )
+
+    plan = []
+    for index, member in enumerate(members):
+        if index == 0:
+            parent_branch = trunk
+            parent_sha = trunk_sha
+            new_base = trunk_ref
+            new_base_ref = trunk_ref
+        else:
+            parent = members[index - 1]
+            parent_branch = parent["head_branch"]
+            parent_sha = parent["head_sha"]
+            new_base = parent_branch
+            new_base_ref = f"refs/heads/{parent_branch}"
+        child_sha = member["head_sha"]
+        if is_ancestor(workspace, parent_sha, child_sha):
+            old_base = parent_sha
+        else:
+            historical_base = member["base_sha"]
+            try:
+                merge_bases = [
+                    line
+                    for line in git(
+                        workspace, "merge-base", "--all", parent_sha, child_sha
+                    ).splitlines()
+                    if line
+                ]
+            except WorkflowError as error:
+                raise WorkflowError(
+                    f"no safe lineage connects {member['head_branch']!r} to its "
+                    f"declared parent {parent_branch!r}"
+                ) from error
+            if not merge_bases:
+                raise WorkflowError(
+                    f"no safe lineage connects {member['head_branch']!r} to its "
+                    f"declared parent {parent_branch!r}"
+                )
+            if len(merge_bases) != 1:
+                raise WorkflowError(
+                    f"the lineage between {member['head_branch']!r} and "
+                    f"{parent_branch!r} is ambiguous: multiple merge bases exist"
+                )
+            old_base = merge_bases[0]
+            if old_base != historical_base:
+                raise WorkflowError(
+                    f"the declared parent {parent_branch!r} no longer descends from "
+                    f"the historical base {historical_base} of "
+                    f"{member['head_branch']!r}; the parent may have been rewritten"
+                )
+            if not (
+                is_ancestor(workspace, historical_base, parent_sha)
+                and is_ancestor(workspace, historical_base, child_sha)
+            ):
+                raise WorkflowError(
+                    f"the historical base {historical_base} is not an ancestor of both "
+                    f"{parent_branch!r} and {member['head_branch']!r}"
+                )
+        plan.append(
+            {
+                "index": index,
+                "number": member["number"],
+                "branch": member["head_branch"],
+                "branch_ref": f"refs/heads/{member['head_branch']}",
+                "head_sha": member["head_sha"],
+                "new_base": new_base,
+                "new_base_ref": new_base_ref,
+                "old_base": old_base,
+            }
+        )
+
+    for member in members:
+        update = git_try(
+            workspace,
+            "update-ref",
+            f"refs/heads/{member['head_branch']}",
+            member["head_sha"],
+        )
+        if update.returncode != 0:
+            detail = update.stderr.strip() or update.stdout.strip() or "no output"
+            raise WorkflowError(
+                f"could not create local branch {member['head_branch']!r}: {detail}"
+            )
+    stack["trunk_sha"] = trunk_sha
+    stack["plan"] = plan
+    stack["current_index"] = None
+    return plan
+
+
+def run_stack_member_rebase(
+    workspace: Path, member: dict[str, Any]
 ) -> subprocess.CompletedProcess[str]:
     environment = {**os.environ, "GIT_EDITOR": "true", "GIT_SEQUENCE_EDITOR": "true"}
     return run(
-        ["gh", "stack", "rebase", *extra],
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "rebase",
+            "--onto",
+            member["new_base_ref"],
+            member["old_base"],
+            member["branch_ref"],
+        ],
+        check=False,
+        env=environment,
+    )
+
+
+def record_rebased_member(workspace: Path, member: dict[str, Any]) -> None:
+    """Move the planned local branch to the detached rebase result."""
+    rebased = git(workspace, "rev-parse", "HEAD")
+    current = git(workspace, "rev-parse", member["branch_ref"])
+    if current == rebased:
+        return
+    if current != member["head_sha"]:
+        raise WorkflowError(
+            f"local branch {member['branch']!r} moved during its rebase: expected "
+            f"{member['head_sha']}, found {current}"
+        )
+    update = git_try(
+        workspace,
+        "update-ref",
+        member["branch_ref"],
+        rebased,
+        member["head_sha"],
+    )
+    if update.returncode != 0:
+        detail = update.stderr.strip() or update.stdout.strip() or "no output"
+        raise WorkflowError(
+            f"could not record rebased branch {member['branch']!r}: {detail}"
+        )
+
+
+def run_stack_cascade(
+    workspace: Path, stack: dict[str, Any], start_index: int = 0
+) -> subprocess.CompletedProcess[str]:
+    """Rebase each planned layer and stop at the first conflict or hard error."""
+    output = []
+    plan = stack.get("plan") or []
+    for member in plan[start_index:]:
+        if is_ancestor(workspace, member["new_base_ref"], member["branch_ref"]):
+            continue
+        process = run_stack_member_rebase(workspace, member)
+        output.extend(part for part in (process.stdout, process.stderr) if part)
+        if process.returncode == 0:
+            try:
+                record_rebased_member(workspace, member)
+            except WorkflowError as error:
+                return subprocess.CompletedProcess(
+                    process.args,
+                    1,
+                    stdout="".join(output),
+                    stderr=str(error),
+                )
+            continue
+        if rebase_in_progress(workspace) and unmerged_entries(workspace):
+            stack["current_index"] = member["index"]
+            return subprocess.CompletedProcess(
+                process.args,
+                STACK_CONFLICT_EXIT,
+                stdout="".join(output),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            process.args,
+            process.returncode,
+            stdout="".join(output),
+            stderr="",
+        )
+    stack["current_index"] = None
+    return subprocess.CompletedProcess(
+        ["stack-cascade"], 0, stdout="".join(output), stderr=""
+    )
+
+
+def continue_stack_cascade(
+    workspace: Path, stack: dict[str, Any]
+) -> subprocess.CompletedProcess[str]:
+    """Continue the conflicted member, then resume the remaining cascade."""
+    current = stack.get("current_index")
+    if not isinstance(current, int):
+        raise WorkflowError("the stack cascade has no conflicted member to continue")
+    environment = {**os.environ, "GIT_EDITOR": "true", "GIT_SEQUENCE_EDITOR": "true"}
+    continued = run(
+        ["git", "-C", str(workspace), "rebase", "--continue"],
         cwd=workspace,
         check=False,
         env=environment,
+    )
+    if continued.returncode != 0:
+        output = continued.stdout + continued.stderr
+        if (
+            "no changes" in output.lower()
+            and rebase_in_progress(workspace)
+            and not unmerged_entries(workspace)
+        ):
+            skipped = run(
+                ["git", "-C", str(workspace), "rebase", "--skip"],
+                check=False,
+                env=environment,
+            )
+            if skipped.returncode != 0:
+                if rebase_in_progress(workspace) and unmerged_entries(workspace):
+                    return subprocess.CompletedProcess(
+                        skipped.args,
+                        STACK_CONFLICT_EXIT,
+                        stdout=output + skipped.stdout,
+                        stderr=skipped.stderr,
+                    )
+                return skipped
+            record_rebased_member(workspace, stack["plan"][current])
+            remainder = run_stack_cascade(workspace, stack, current + 1)
+            return subprocess.CompletedProcess(
+                remainder.args,
+                remainder.returncode,
+                stdout=output + skipped.stdout + remainder.stdout,
+                stderr=skipped.stderr + remainder.stderr,
+            )
+        if rebase_in_progress(workspace) and unmerged_entries(workspace):
+            return subprocess.CompletedProcess(
+                continued.args,
+                STACK_CONFLICT_EXIT,
+                stdout=continued.stdout,
+                stderr=continued.stderr,
+            )
+        return continued
+    record_rebased_member(workspace, stack["plan"][current])
+    remainder = run_stack_cascade(workspace, stack, current + 1)
+    return subprocess.CompletedProcess(
+        remainder.args,
+        remainder.returncode,
+        stdout=continued.stdout + remainder.stdout,
+        stderr=continued.stderr + remainder.stderr,
     )
 
 
@@ -2982,6 +3288,22 @@ def capture_member_tips(
     return tips
 
 
+def validate_rebased_stack(
+    workspace: Path, stack: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Prove every rebased member contains its intended local parent."""
+    tips = capture_member_tips(workspace, stack)
+    parent = f"refs/remotes/origin/{stack['trunk']}"
+    for member in tips:
+        if not is_ancestor(workspace, parent, member["head_sha"]):
+            raise WorkflowError(
+                f"rebased branch {member['head_branch']!r} does not contain its "
+                f"expected parent {parent!r}"
+            )
+        parent = f"refs/heads/{member['head_branch']}"
+    return tips
+
+
 def finish_stack_rebase(
     state_path: Path,
     state: dict[str, Any],
@@ -2990,7 +3312,7 @@ def finish_stack_rebase(
     process: subprocess.CompletedProcess[str],
     verb: str,
 ) -> None:
-    """Interpret a `gh stack rebase` (or `--continue`) result and record it.
+    """Interpret a helper-owned cascade (or continuation) and record it.
 
     Exit 0 means the whole cascade is clean; exit 3 means it stopped on a
     conflict a person or the resolution machinery must clear before continuing;
@@ -3002,7 +3324,14 @@ def finish_stack_rebase(
     stack = attempt["stack"]
 
     if code == 0:
-        attempt["stack"]["members_after"] = capture_member_tips(workspace, stack)
+        try:
+            attempt["stack"]["members_after"] = validate_rebased_stack(
+                workspace, stack
+            )
+        except WorkflowError:
+            remove_stack_workspace(attempt)
+            save_state(state_path, state)
+            raise
         attempt["status"] = "resolved"
         attempt["command_output"] = output
         save_state(state_path, state)
@@ -3017,8 +3346,17 @@ def finish_stack_rebase(
         )
         return
 
-    if code == GH_STACK_CONFLICT_EXIT:
+    if code == STACK_CONFLICT_EXIT:
         conflicts = collect_stack_conflicts(workspace)
+        if not conflicts:
+            if rebase_in_progress(workspace):
+                git_try(workspace, "rebase", "--abort")
+            remove_stack_workspace(attempt)
+            save_state(state_path, state)
+            raise WorkflowError(
+                f"the stack {verb} stopped without any unmerged paths: "
+                f"{output or 'no output'}"
+            )
         attempt["conflicts"] = conflicts
         attempt["conflict_signature"] = conflict_signature(
             conflict["path"] for conflict in conflicts
@@ -3052,23 +3390,19 @@ def finish_stack_rebase(
         )
         return
 
-    # Any other documented exit is a setup or state failure, not a conflict. The
-    # workspace is aborted and removed so a half-cascaded stack is never left
-    # behind, and the message names the cause instead of reading as a failed
-    # resolution.
-    cause = GH_STACK_EXIT.get(code, f"exit code {code}")
+    # Any other exit is a setup or state failure, not a conflict. The workspace
+    # is removed so a half-cascaded local stack is never mistaken for publishable.
     if rebase_in_progress(workspace):
-        run_gh_stack_rebase(workspace, ["--abort"])
+        git_try(workspace, "rebase", "--abort")
     remove_stack_workspace(attempt)
     save_state(state_path, state)
     raise WorkflowError(
-        f"`gh stack {verb}` failed ({cause}): {output or 'no output'}"
+        f"the stack {verb} failed (exit code {code}): {output or 'no output'}"
     )
 
 
 def command_stack_rebase(args: argparse.Namespace) -> None:
     require_tools()
-    require_gh_stack()
     state_path = cli_path(args.state)
     state = load_state(state_path)
     attempt = active_attempt(state)
@@ -3090,26 +3424,20 @@ def command_stack_rebase(args: argparse.Namespace) -> None:
     # and remove it even if this process is interrupted mid-cascade.
     save_state(state_path, state)
 
-    checkout = run(
-        ["gh", "stack", "checkout", str(stack["invoked_number"])],
-        cwd=workspace,
-        check=False,
-    )
-    if checkout.returncode != 0:
-        detail = checkout.stderr.strip() or checkout.stdout.strip() or "no output"
+    try:
+        prepare_stack_cascade(workspace, stack)
+    except WorkflowError:
         remove_stack_workspace(attempt)
         save_state(state_path, state)
-        raise WorkflowError(
-            f"could not check out the stack in the cascade workspace: {detail}"
-        )
+        raise
+    save_state(state_path, state)
 
-    process = run_gh_stack_rebase(workspace, [])
+    process = run_stack_cascade(workspace, stack)
     finish_stack_rebase(state_path, state, attempt, workspace, process, "rebase")
 
 
 def command_stack_continue(args: argparse.Namespace) -> None:
     require_tools()
-    require_gh_stack()
     state_path = cli_path(args.state)
     state = load_state(state_path)
     attempt = active_attempt(state)
@@ -3133,7 +3461,7 @@ def command_stack_continue(args: argparse.Namespace) -> None:
         raise WorkflowError(
             f"git still reports these paths as unmerged: {still_unmerged}"
         )
-    process = run_gh_stack_rebase(workspace, ["--continue"])
+    process = continue_stack_cascade(workspace, attempt["stack"])
     finish_stack_rebase(state_path, state, attempt, workspace, process, "rebase --continue")
 
 
@@ -3142,15 +3470,16 @@ def command_stack_abort(args: argparse.Namespace) -> None:
     state = load_state(state_path)
     attempt = state.get("attempt")
     undone = None
+    if attempt is not None and attempt.get("status") == "published_refs":
+        raise WorkflowError(
+            "the stack refs are already published; re-run stack-publish to finish "
+            "recording the result"
+        )
     if attempt is not None and attempt.get("strategy") == "stack":
         workspace = (attempt.get("stack") or {}).get("workspace")
         if workspace and Path(workspace).exists():
             if rebase_in_progress(Path(workspace)):
-                run(
-                    ["gh", "stack", "rebase", "--abort"],
-                    cwd=Path(workspace),
-                    check=False,
-                )
+                git_try(Path(workspace), "rebase", "--abort")
                 undone = "stack-rebase"
             remove_stack_workspace(attempt)
     if attempt is not None and attempt.get("status") not in {"published"}:
@@ -3167,54 +3496,79 @@ def command_stack_abort(args: argparse.Namespace) -> None:
     )
 
 
-def stack_branch_flags(workspace: Path) -> dict[str, dict[str, bool]]:
-    """Read each branch's merged and queued flags from `gh stack view --json`.
+def atomic_stack_push(
+    workspace: Path, stack: dict[str, Any]
+) -> subprocess.CompletedProcess[str]:
+    """Publish only stack members, atomically, with exact pre-cascade leases."""
+    intended = stack.get("members_after") or []
+    baseline = {
+        member["head_branch"]: member["head_sha"] for member in stack["members"]
+    }
+    command = ["git", "-C", str(workspace), "push", "--atomic"]
+    for member in intended:
+        branch = member["head_branch"]
+        command.append(
+            f"--force-with-lease=refs/heads/{branch}:{baseline[branch]}"
+        )
+    command.append("origin")
+    command.extend(
+        f"{member['head_sha']}:refs/heads/{member['head_branch']}"
+        for member in intended
+    )
+    return run(command, check=False)
 
-    `gh stack push` skips a branch that is already merged or queued, so a member
-    that publish must not expect to move is read here rather than mistaken for one
-    that failed to land. The view carries no pull request numbers and no head
-    SHAs, so it is keyed by branch name, which is what publish reconciles by.
-    """
-    result = run(["gh", "stack", "view", "--json"], cwd=workspace, check=False)
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+
+def stack_snapshot_key(stack: dict[str, Any]) -> tuple[Any, ...]:
+    """The live facts whose change invalidates a planned cascade."""
+    return (
+        stack.get("number"),
+        stack.get("size"),
+        stack.get("trunk"),
+        tuple(
+            (
+                member.get("number"),
+                member.get("head_branch"),
+                member.get("base_branch"),
+                member.get("head_sha"),
+            )
+            for member in stack.get("members") or []
+        ),
+    )
+
+
+def require_current_stack_snapshot(pr: dict[str, Any], stack: dict[str, Any]) -> None:
+    """Refuse publication when stack membership or dependents changed."""
+    current = stack_membership(pr).get("stack")
+    if current is None or stack_snapshot_key(current) != stack_snapshot_key(stack):
         raise WorkflowError(
-            f"could not read `gh stack view` before publishing: {detail}"
+            "the native stack changed during the cascade; no branch was published"
         )
-    try:
-        payload = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError as error:
+    dependents = external_stack_dependents(pr, current)
+    if dependents:
+        listed = "; ".join(
+            f"#{item['number']} (targets {item['base_branch']})"
+            for item in dependents
+        )
         raise WorkflowError(
-            f"could not parse `gh stack view --json` output: {error}"
+            "new pull requests outside the native stack now depend on branches "
+            f"the cascade would rewrite: {listed}; no branch was published"
         )
-    flags: dict[str, dict[str, bool]] = {}
-    for branch in payload.get("branches") or []:
-        name = branch.get("name")
-        if name is None:
-            continue
-        flags[name] = {
-            "merged": bool(branch.get("isMerged")),
-            "queued": bool(branch.get("isQueued")),
-        }
-    return flags
 
 
 def command_stack_publish(args: argparse.Namespace) -> None:
     require_tools()
-    require_gh_stack()
     state_path = cli_path(args.state)
     state = load_state(state_path)
     attempt = active_attempt(state)
     pr = state["pr"]
     if attempt.get("strategy") != "stack":
         raise WorkflowError("this attempt is not a native-stack cascade")
-    if attempt["status"] != "resolved":
+    if attempt["status"] not in {"resolved", "published_refs"}:
         raise WorkflowError(
-            f"only a resolved stack cascade can be published; this one is "
+            f"only a resolved stack cascade can be published or finalized; this one is "
             f"{attempt['status']}"
         )
     stack = attempt["stack"]
-    workspace = attempt_repo_root(state, attempt)
     intended = stack.get("members_after")
     if not intended:
         raise WorkflowError(
@@ -3222,133 +3576,106 @@ def command_stack_publish(args: argparse.Namespace) -> None:
             "before publishing"
         )
 
-    # Pre-cascade head SHAs. A member found still on its old commit is one that
-    # `gh stack push` never moved, which reads differently from one another actor
-    # moved out from under the cascade.
-    baseline = {member["number"]: member["head_sha"] for member in stack["members"]}
-    skip_flags = stack_branch_flags(workspace)
+    if attempt["status"] == "resolved":
+        workspace = attempt_repo_root(state, attempt)
+        captured = validate_rebased_stack(workspace, stack)
+        if captured != intended:
+            raise WorkflowError(
+                "a stack branch moved in the cascade workspace after validation; "
+                "run stack-rebase again"
+            )
+        require_current_stack_snapshot(pr, stack)
+        trunk_remote = remote_head(
+            pr["upstream_owner"], pr["upstream_repo"], stack["trunk"]
+        )
+        if trunk_remote != stack.get("trunk_sha"):
+            raise WorkflowError(
+                f"the stack trunk {stack['trunk']!r} moved during the cascade: "
+                f"expected {stack.get('trunk_sha')}, found {trunk_remote}; no branch "
+                "was published"
+            )
 
-    # The user approved rewriting every member of the stack, including ones that
-    # are currently mergeable and under review, so `gh stack push` force-pushes
-    # each branch. The push is not atomic: a branch may update even when another
-    # is rejected, and that partial state exits non-zero. So the remote is the
-    # authority on what landed, and every member is verified regardless of the
-    # exit code rather than the verification being skipped on the partial failure
-    # it exists to describe.
-    push = run(["gh", "stack", "push"], cwd=workspace, check=False)
-    push_detail = push.stderr.strip() or push.stdout.strip() or "no output"
-
-    landed = []
-    pending = []
-    skipped = []
-    for member in intended:
-        flags = skip_flags.get(member["head_branch"]) or {}
-        if flags.get("merged") or flags.get("queued"):
-            # `gh stack push` skips a merged or queued branch by design, so it is
-            # not expected to move and is not a mismatch. It is still named in a
-            # partial-publish report so a reader counting members against the
-            # landed and not-landed groups can account for every one.
-            skipped.append(
+        push = atomic_stack_push(workspace, stack)
+        push_detail = push.stderr.strip() or push.stdout.strip() or "no output"
+        mismatched = []
+        for member in intended:
+            remote = wait_for_remote_head(
+                pr["upstream_owner"],
+                pr["upstream_repo"],
+                member["head_branch"],
+                member["head_sha"],
+            )
+            if remote == member["head_sha"]:
+                continue
+            mismatched.append(
                 {
                     "number": member["number"],
                     "head_branch": member["head_branch"],
-                    "reason": "merged" if flags.get("merged") else "queued",
+                    "expected": member["head_sha"],
+                    "actual": remote,
                 }
             )
-            continue
-        remote = wait_for_remote_head(
-            pr["upstream_owner"],
-            pr["upstream_repo"],
-            member["head_branch"],
-            member["head_sha"],
+        trunk_after = remote_head(
+            pr["upstream_owner"], pr["upstream_repo"], stack["trunk"]
         )
-        if remote == member["head_sha"]:
-            landed.append(member)
-            continue
-        if remote == baseline.get(member["number"]):
-            cause = "`gh stack push` did not move it"
-        else:
-            cause = (
-                "another actor moved this branch while the cascade ran, so its "
-                "force-with-lease was rejected"
+        if mismatched:
+            # The atomic push either moves every member or none. Preserve a
+            # self-contained workspace for inspection and require a new preflight.
+            borrow = dissociate_workspace(Path(workspace))
+            mismatch_desc = "; ".join(
+                f"#{item['number']} {item['head_branch']} is at "
+                f"{item['actual'] or 'a missing branch'} not {item['expected']}"
+                for item in mismatched
             )
-        pending.append(
-            {
-                "number": member["number"],
-                "head_branch": member["head_branch"],
-                "expected": member["head_sha"],
-                "actual": remote,
-                "cause": cause,
-            }
-        )
+            message = (
+                "the atomic stack publish did not land the complete intended stack. "
+                f"Remote verification: {mismatch_desc}. The cascade workspace is "
+                f"preserved at {workspace}. Run preflight again before another "
+                f"publish. Git reported: {push_detail}"
+            )
+            if borrow is not None:
+                message += f" ({borrow})"
+            save_state(state_path, state)
+            raise WorkflowError(message)
 
-    if pending:
-        # A partial publish is the case this verification exists for, so the
-        # workspace is preserved on purpose rather than removed, and re-running
-        # publish is the documented recovery. A `--reference` clone is made
-        # self-contained first; otherwise the preserved workspace rots when its
-        # borrowed object source is pruned or deleted.
-        borrow = dissociate_workspace(Path(workspace))
-        landed_desc = (
-            ", ".join(f"#{item['number']} {item['head_branch']}" for item in landed)
-            or "none"
+        invoked = next(
+            (
+                member
+                for member in intended
+                if member["number"] == stack["invoked_number"]
+            ),
+            None,
         )
-        pending_desc = "; ".join(
-            f"#{item['number']} {item['head_branch']} is at "
-            f"{item['actual'] or 'a missing branch'} not {item['expected']} "
-            f"because {item['cause']}"
-            for item in pending
-        )
-        message = (
-            "the stack publish landed only some members. "
-            f"Landed: {landed_desc}. Not landed: {pending_desc}. "
-            f"The cascade workspace is preserved at {workspace} for recovery; "
-            "re-run stack-publish to retry the members that did not land."
-        )
-        if skipped:
-            skipped_desc = "; ".join(
-                f"#{item['number']} {item['head_branch']} ({item['reason']})"
-                for item in skipped
-            )
-            message += f" Skipped by `gh stack push`: {skipped_desc}."
+        notes = []
         if push.returncode != 0:
-            message += f" `gh stack push` reported: {push_detail}"
-        if borrow is not None:
-            message += f" ({borrow})"
+            notes.append(f"git reported after all refs landed: {push_detail}")
+        if trunk_after != stack.get("trunk_sha"):
+            notes.append(
+                f"the trunk moved from {stack.get('trunk_sha')} to {trunk_after} "
+                "during publication"
+            )
+        attempt["status"] = "published_refs"
+        attempt["stack_push_detail"] = "; ".join(notes) if notes else None
+        attempt["published_head_sha"] = None if invoked is None else invoked["head_sha"]
+        attempt["stack"]["members_published"] = intended
+        attempt["stack"]["trunk_after_publish"] = trunk_after
         save_state(state_path, state)
-        raise WorkflowError(message)
 
-    invoked = next(
-        (
-            member
-            for member in intended
-            if member["number"] == stack["invoked_number"]
-        ),
-        None,
-    )
-    # Every member landed on its intended tip, so this publishes. But a non-zero
-    # `gh stack push` that nonetheless moved every ref means the tool reported
-    # something after the pushes succeeded, and a clean publish must not be
-    # byte-identical to one where the tool errored. Carry the detail through
-    # rather than blocking, since re-running would be a no-op and the remote is
-    # already on the intended tips.
-    push_detail_note = push_detail if push.returncode != 0 else None
-    attempt["status"] = "published"
-    attempt["stack_push_detail"] = push_detail_note
-    attempt["published_head_sha"] = None if invoked is None else invoked["head_sha"]
-    attempt["stack"]["members_published"] = intended
     remove_stack_workspace(attempt)
-    state["iterations"] = int(state.get("iterations", 0)) + 1
+    save_state(state_path, state)
 
     target = parse_target(pr["pr_url"])
-    final = live_mergeability(target)
-    mergeability = classify_mergeability(final)
+    expected_invoked = attempt["published_head_sha"]
+    final = live_mergeability(target, expected_head=expected_invoked)
+    mergeability = classify_mergeability(final, expected_head=expected_invoked)
+    attempt["status"] = "published"
     attempt["mergeable"] = final.get("mergeable")
     attempt["merge_state_status"] = final.get("merge_state_status")
     attempt["mergeable_at_head_sha"] = (
         attempt["published_head_sha"] if mergeability == "mergeable" else None
     )
     state["pr"] = final
+    state["iterations"] = int(state.get("iterations", 0)) + 1
     archive_attempt(state)
     save_state(state_path, state)
     emit(
@@ -3361,8 +3688,8 @@ def command_stack_publish(args: argparse.Namespace) -> None:
             "mergeable_at_head_sha": attempt["mergeable_at_head_sha"],
             "iterations": state["iterations"],
             **(
-                {"push_detail": push_detail_note}
-                if push_detail_note is not None
+                {"push_detail": attempt["stack_push_detail"]}
+                if attempt.get("stack_push_detail")
                 else {}
             ),
         }

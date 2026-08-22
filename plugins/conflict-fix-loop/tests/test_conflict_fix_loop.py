@@ -48,6 +48,7 @@ def native_stack_detection(default_branch="main", trunk="main", members=None):
                 "base_branch": "main",
                 "mergeable": "MERGEABLE",
                 "head_sha": "aaa",
+                "base_sha": "base1",
             },
             {
                 "position": 1,
@@ -56,6 +57,7 @@ def native_stack_detection(default_branch="main", trunk="main", members=None):
                 "base_branch": "v143",
                 "mergeable": "CONFLICTING",
                 "head_sha": "head1",
+                "base_sha": "old-a",
             },
         ]
     return {
@@ -440,22 +442,22 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
-    def test_documents_the_partial_publish_recovery(self):
+    def test_documents_the_atomic_stack_publish(self):
         self.assertIn(
-            "verifies every member from the remote whatever `gh stack push` "
-            "returns",
+            "one atomic git push with an exact expected-head lease for each branch",
+            self.instructions,
+        )
+        self.assertIn("durable `published_refs` checkpoint", self.instructions)
+        self.assertIn(
+            "The remote accepts every member update or none",
             self.instructions,
         )
         self.assertIn(
-            "a member still on its pre-cascade commit and a member another actor "
-            "moved are named as distinct causes",
+            "keeps a self-contained throwaway workspace for inspection",
             self.instructions,
         )
         self.assertIn(
-            "keeps the throwaway workspace instead of removing it", self.instructions
-        )
-        self.assertIn(
-            "re-running `stack-publish` retries the members that did not land",
+            "requires a new preflight before another publish",
             self.instructions,
         )
 
@@ -467,6 +469,10 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn(
             "the cascade runs in a throwaway clone", self.instructions
+        )
+        self.assertIn(
+            "computes each child boundary from `baseRefOid` and the original graph",
+            self.instructions,
         )
         self.assertIn(
             "force-pushes every member of the stack, including ones that are "
@@ -1660,6 +1666,19 @@ class WorktreeStateTest(unittest.TestCase):
         with mock.patch.object(MODULE, "git_try", side_effect=fake_git_try):
             self.assertTrue(MODULE.rebase_in_progress(directory))
 
+    def test_a_relative_rebase_path_is_resolved_inside_the_repository(self):
+        directory = temporary_directory(self)
+        (directory / ".git" / "rebase-merge").mkdir(parents=True)
+        with mock.patch.object(
+            MODULE,
+            "git_try",
+            side_effect=[
+                completed(0, ".git/rebase-merge"),
+                completed(0, ".git/rebase-apply"),
+            ],
+        ):
+            self.assertTrue(MODULE.rebase_in_progress(directory))
+
     def test_no_rebase_when_neither_directory_exists(self):
         directory = temporary_directory(self)
         with mock.patch.object(
@@ -2307,6 +2326,7 @@ class PreflightTest(unittest.TestCase):
                         "base_branch": "main",
                         "mergeable": "MERGEABLE",
                         "head_sha": "aaa",
+                        "base_sha": "base1",
                     },
                     {
                         "position": 1,
@@ -2315,6 +2335,7 @@ class PreflightTest(unittest.TestCase):
                         "base_branch": "v143",
                         "mergeable": "CONFLICTING",
                         "head_sha": "head1",
+                        "base_sha": "old-a",
                     },
                 ],
             },
@@ -2353,6 +2374,7 @@ class PreflightTest(unittest.TestCase):
                         "base_branch": "release",
                         "mergeable": "CONFLICTING",
                         "head_sha": "head1",
+                        "base_sha": "base1",
                     }
                 ],
             },
@@ -4628,6 +4650,7 @@ def stack_attempt_record(**overrides):
                     "base_branch": "main",
                     "mergeable": "MERGEABLE",
                     "head_sha": "aaa",
+                    "base_sha": "base1",
                 },
                 {
                     "number": 7,
@@ -4635,10 +4658,12 @@ def stack_attempt_record(**overrides):
                     "base_branch": "v143",
                     "mergeable": "CONFLICTING",
                     "head_sha": "head1",
+                    "base_sha": "old-a",
                 },
             ],
             "workspace": None,
             "members_after": None,
+            "trunk_sha": "base1",
         },
     }
     stack_overrides = overrides.pop("stack", None)
@@ -4648,7 +4673,9 @@ def stack_attempt_record(**overrides):
     return attempt
 
 
-def stack_entry(position, number, head, base, mergeable="MERGEABLE", oid=None):
+def stack_entry(
+    position, number, head, base, mergeable="MERGEABLE", oid=None, base_oid=None
+):
     return {
         "position": position,
         "pullRequest": {
@@ -4657,6 +4684,7 @@ def stack_entry(position, number, head, base, mergeable="MERGEABLE", oid=None):
             "baseRefName": base,
             "mergeable": mergeable,
             "headRefOid": oid or f"oid{number}",
+            "baseRefOid": base_oid or f"baseoid{number}",
         },
     }
 
@@ -4684,13 +4712,13 @@ class ParseStackTest(unittest.TestCase):
         self.assertEqual("main", stack["trunk"])
         self.assertEqual("oid7", stack["members"][1]["head_sha"])
 
-    def test_an_unreadable_member_is_skipped_not_fatal(self):
+    def test_an_unreadable_member_is_a_hard_error(self):
         nodes = [
             stack_entry(0, 5, "v143", "main"),
             {"position": 1, "pullRequest": None},
         ]
-        stack = MODULE.parse_stack(self.raw(nodes))
-        self.assertEqual([5], [member["number"] for member in stack["members"]])
+        with self.assertRaisesRegex(MODULE.WorkflowError, "unreadable member"):
+            MODULE.parse_stack(self.raw(nodes))
 
     def test_a_member_missing_a_required_field_is_a_hard_error(self):
         node = stack_entry(0, 5, "v143", "main")
@@ -4810,21 +4838,6 @@ class AdHocEscalationTest(unittest.TestCase):
     def test_clean_against_both_is_reported_honestly(self):
         result = self.escalate([], [])
         self.assertIn("neither merge", result["reason"])
-
-
-class RequireGhStackTest(unittest.TestCase):
-    def test_a_missing_extension_names_itself_not_a_conflict_failure(self):
-        with mock.patch.object(
-            MODULE, "run", return_value=completed(1, stderr="unknown command stack")
-        ):
-            with self.assertRaisesRegex(
-                MODULE.WorkflowError, "`gh stack` extension is required"
-            ):
-                MODULE.require_gh_stack()
-
-    def test_a_usable_extension_passes(self):
-        with mock.patch.object(MODULE, "run", return_value=completed(0)):
-            self.assertIsNone(MODULE.require_gh_stack())
 
 
 class AttemptRepoRootTest(unittest.TestCase):
@@ -4949,35 +4962,585 @@ class DissociateWorkspaceTest(unittest.TestCase):
         self.assertTrue(self.alternates.exists())
 
 
-class StackBranchFlagsTest(unittest.TestCase):
-    def flags(self, payload, returncode=0):
-        with mock.patch.object(
-            MODULE, "run", return_value=completed(returncode, stdout=json.dumps(payload))
-        ):
-            return MODULE.stack_branch_flags(Path("/workspace"))
+class CleanupReplacedStackAttemptTest(unittest.TestCase):
+    def workspace(self):
+        workspace = temporary_directory(self) / "stack"
+        workspace.mkdir()
+        return workspace
 
-    def test_reads_merged_and_queued_keyed_by_branch(self):
-        payload = {
-            "branches": [
-                {"name": "v143", "isMerged": True, "isQueued": False},
-                {"name": "feature", "isMerged": False, "isQueued": True},
-            ]
+    def test_a_preserved_failed_publish_workspace_is_removed(self):
+        workspace = self.workspace()
+        state = {
+            "attempt": stack_attempt_record(
+                status="resolved", stack={"workspace": str(workspace)}
+            )
         }
-        flags = self.flags(payload)
-        self.assertTrue(flags["v143"]["merged"])
-        self.assertFalse(flags["v143"]["queued"])
-        self.assertTrue(flags["feature"]["queued"])
+        MODULE.cleanup_replaced_stack_attempt(state)
+        self.assertFalse(workspace.exists())
+        self.assertIsNone(state["attempt"]["stack"]["workspace"])
 
-    def test_skips_a_branch_with_no_name(self):
-        flags = self.flags({"branches": [{"isMerged": True}]})
-        self.assertEqual({}, flags)
+    def test_an_active_cascade_must_be_aborted_explicitly(self):
+        workspace = self.workspace()
+        state = {
+            "attempt": stack_attempt_record(
+                status="conflicted", stack={"workspace": str(workspace)}
+            )
+        }
+        with self.assertRaisesRegex(MODULE.WorkflowError, "run stack-abort"):
+            MODULE.cleanup_replaced_stack_attempt(state)
+        self.assertTrue(workspace.exists())
 
-    def test_a_failed_view_is_a_hard_error(self):
+    def test_published_refs_must_be_finalized_not_replaced(self):
+        workspace = self.workspace()
+        state = {
+            "attempt": stack_attempt_record(
+                status="published_refs", stack={"workspace": str(workspace)}
+            )
+        }
+        with self.assertRaisesRegex(MODULE.WorkflowError, "re-run stack-publish"):
+            MODULE.cleanup_replaced_stack_attempt(state)
+        self.assertTrue(workspace.exists())
+
+    def test_published_refs_still_block_preflight_after_cleanup(self):
+        state = {
+            "attempt": stack_attempt_record(
+                status="published_refs", stack={"workspace": None}
+            )
+        }
+        with self.assertRaisesRegex(MODULE.WorkflowError, "re-run stack-publish"):
+            MODULE.cleanup_replaced_stack_attempt(state)
+
+
+class StackCascadePlanTest(unittest.TestCase):
+    def setUp(self):
+        self.stack = stack_attempt_record()["stack"]
+
+    def test_a_child_uses_the_unique_merge_base_when_its_parent_advanced(self):
+        ancestry = {
+            ("base1", "aaa"): True,
+            ("aaa", "head1"): False,
+            ("old-a", "aaa"): True,
+            ("old-a", "head1"): True,
+        }
+
+        def ancestor(_root, left, right):
+            return ancestry.get((left, right), False)
+
+        def git_call(_root, *args):
+            tips = {
+                "refs/remotes/origin/main": "base1",
+                "refs/remotes/origin/v143": "aaa",
+                "refs/remotes/origin/feature": "head1",
+            }
+            if args[0] == "rev-parse" and args[1] in tips:
+                return tips[args[1]]
+            if args[0] == "merge-base":
+                self.assertEqual(
+                    ("merge-base", "--all", "aaa", "head1"), args
+                )
+                return "old-a"
+            raise AssertionError(f"unexpected git call: {args}")
+
+        with mock.patch.object(MODULE, "git", side_effect=git_call), mock.patch.object(
+            MODULE, "is_ancestor", side_effect=ancestor
+        ), mock.patch.object(MODULE, "git_try", return_value=completed(0)):
+            plan = MODULE.prepare_stack_cascade(Path("/workspace"), self.stack)
+
+        self.assertEqual("old-a", plan[1]["old_base"])
+        self.assertEqual("v143", plan[1]["new_base"])
+
+    def test_multiple_merge_bases_are_rejected_as_ambiguous(self):
+        def git_call(_root, *args):
+            tips = {
+                "refs/remotes/origin/main": "base1",
+                "refs/remotes/origin/v143": "aaa",
+                "refs/remotes/origin/feature": "head1",
+            }
+            if args[0] == "rev-parse" and args[1] in tips:
+                return tips[args[1]]
+            if args[0] == "merge-base":
+                return "old-a\nother-a"
+            raise AssertionError(f"unexpected git call: {args}")
+
+        with mock.patch.object(MODULE, "git", side_effect=git_call), mock.patch.object(
+            MODULE, "is_ancestor", return_value=False
+        ), mock.patch.object(MODULE, "git_try", return_value=completed(0)):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "ambiguous"):
+                MODULE.prepare_stack_cascade(Path("/workspace"), self.stack)
+
+    def test_unrelated_parent_and_child_are_rejected(self):
+        def git_call(_root, *args):
+            tips = {
+                "refs/remotes/origin/main": "base1",
+                "refs/remotes/origin/v143": "aaa",
+                "refs/remotes/origin/feature": "head1",
+            }
+            if args[0] == "rev-parse" and args[1] in tips:
+                return tips[args[1]]
+            if args[0] == "merge-base":
+                raise MODULE.WorkflowError("no merge base")
+            raise AssertionError(f"unexpected git call: {args}")
+
+        with mock.patch.object(MODULE, "git", side_effect=git_call), mock.patch.object(
+            MODULE, "is_ancestor", return_value=False
+        ), mock.patch.object(MODULE, "git_try", return_value=completed(0)):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "no safe lineage"):
+                MODULE.prepare_stack_cascade(Path("/workspace"), self.stack)
+
+    def test_a_stale_remote_head_is_rejected_before_local_refs_move(self):
+        def git_call(_root, *args):
+            tips = {
+                "refs/remotes/origin/main": "base1",
+                "refs/remotes/origin/v143": "someoneelse",
+            }
+            if args[0] == "rev-parse" and args[1] in tips:
+                return tips[args[1]]
+            raise AssertionError(f"unexpected git call: {args}")
+
+        with mock.patch.object(MODULE, "git", side_effect=git_call), mock.patch.object(
+            MODULE, "git_try", return_value=completed(0)
+        ) as git_try:
+            with self.assertRaisesRegex(MODULE.WorkflowError, "moved before"):
+                MODULE.prepare_stack_cascade(Path("/workspace"), self.stack)
+        self.assertFalse(
+            any(call.args[1:2] == ("update-ref",) for call in git_try.call_args_list)
+        )
+
+
+class AtomicStackPushTest(unittest.TestCase):
+    def test_every_member_uses_an_exact_lease_in_one_atomic_push(self):
+        stack = stack_attempt_record(
+            status="resolved",
+            stack={
+                "members_after": [
+                    {"number": 19483, "head_branch": "v143", "head_sha": "newa"},
+                    {"number": 7, "head_branch": "feature", "head_sha": "newf"},
+                ]
+            },
+        )["stack"]
         with mock.patch.object(
-            MODULE, "run", return_value=completed(2, stderr="not a stack")
+            MODULE, "run", return_value=completed(0)
+        ) as runner:
+            result = MODULE.atomic_stack_push(Path("/workspace"), stack)
+        self.assertEqual(0, result.returncode)
+        command = runner.call_args.args[0]
+        self.assertEqual(
+            ["git", "-C", str(Path("/workspace")), "push", "--atomic"],
+            command[:5],
+        )
+        self.assertIn("--force-with-lease=refs/heads/v143:aaa", command)
+        self.assertIn("--force-with-lease=refs/heads/feature:head1", command)
+        self.assertIn("newa:refs/heads/v143", command)
+        self.assertIn("newf:refs/heads/feature", command)
+        self.assertNotIn("refs/heads/v143:refs/heads/v143", command)
+        self.assertNotIn("refs/heads/feature:refs/heads/feature", command)
+        self.assertFalse(any("main" in argument for argument in command))
+
+
+class ValidateRebasedStackTest(unittest.TestCase):
+    def test_a_descendant_that_misses_its_rebased_parent_is_rejected(self):
+        stack = stack_attempt_record()["stack"]
+        tips = [
+            {"number": 19483, "head_branch": "v143", "head_sha": "newa"},
+            {"number": 7, "head_branch": "feature", "head_sha": "newf"},
+        ]
+        with mock.patch.object(
+            MODULE, "capture_member_tips", return_value=tips
+        ), mock.patch.object(
+            MODULE, "is_ancestor", side_effect=[True, False]
         ):
-            with self.assertRaisesRegex(MODULE.WorkflowError, "gh stack view"):
-                MODULE.stack_branch_flags(Path("/workspace"))
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "does not contain.*expected parent"
+            ):
+                MODULE.validate_rebased_stack(Path("/workspace"), stack)
+
+
+class CurrentStackSnapshotTest(unittest.TestCase):
+    def setUp(self):
+        self.stack = stack_attempt_record()["stack"]
+
+    def test_an_unchanged_stack_with_no_new_dependents_passes(self):
+        with mock.patch.object(
+            MODULE,
+            "stack_membership",
+            return_value={"default_branch": "main", "stack": self.stack},
+        ), mock.patch.object(
+            MODULE, "external_stack_dependents", return_value=[]
+        ):
+            self.assertIsNone(
+                MODULE.require_current_stack_snapshot(pr_metadata(), self.stack)
+            )
+
+    def test_changed_membership_is_rejected_before_publication(self):
+        changed = json.loads(json.dumps(self.stack))
+        changed["members"][1]["base_branch"] = "other"
+        with mock.patch.object(
+            MODULE,
+            "stack_membership",
+            return_value={"default_branch": "main", "stack": changed},
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "stack changed"):
+                MODULE.require_current_stack_snapshot(pr_metadata(), self.stack)
+
+    def test_a_new_external_dependent_is_rejected_before_publication(self):
+        dependent = {
+            "number": 99,
+            "url": "https://github.com/owner/repo/pull/99",
+            "head_branch": "outside",
+            "base_branch": "v143",
+        }
+        with mock.patch.object(
+            MODULE,
+            "stack_membership",
+            return_value={"default_branch": "main", "stack": self.stack},
+        ), mock.patch.object(
+            MODULE, "external_stack_dependents", return_value=[dependent]
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "#99.*v143"):
+                MODULE.require_current_stack_snapshot(pr_metadata(), self.stack)
+
+
+@unittest.skipUnless(shutil.which("git"), "git is not installed")
+class StackCascadeTopologyTest(unittest.TestCase):
+    def setUp(self):
+        self.root = temporary_directory(self)
+        self.remote = self.root / "remote.git"
+        self.source = self.root / "source"
+        self.workspace = self.root / "workspace"
+        self.git(
+            self.root, "init", "--bare", "--initial-branch", "main", str(self.remote)
+        )
+        self.source.mkdir()
+        self.git(self.source, "init", "--initial-branch", "main")
+        self.git(self.source, "config", "user.name", "Stack Test")
+        self.git(self.source, "config", "user.email", "stack@example.invalid")
+        self.git(self.source, "config", "commit.gpgsign", "false")
+        self.write(self.source, "base.txt", "base\n")
+        self.commit(self.source, "base")
+        self.main_head = self.git(self.source, "rev-parse", "HEAD")
+
+        self.git(self.source, "checkout", "-b", "lower")
+        self.write(self.source, "lower.txt", "lower one\n")
+        self.commit(self.source, "lower one")
+        self.lower_old = self.git(self.source, "rev-parse", "HEAD")
+
+        self.git(self.source, "checkout", "-b", "child")
+        self.write(self.source, "child.txt", "child\n")
+        self.commit(self.source, "child")
+        self.child_head = self.git(self.source, "rev-parse", "HEAD")
+
+        self.git(self.source, "checkout", "-b", "grandchild")
+        self.write(self.source, "grandchild.txt", "grandchild\n")
+        self.commit(self.source, "grandchild")
+        self.grandchild_head = self.git(self.source, "rev-parse", "HEAD")
+
+        self.git(self.source, "checkout", "lower")
+        self.write(self.source, "lower.txt", "lower one\nlower two\n")
+        self.commit(self.source, "lower two")
+        self.lower_head = self.git(self.source, "rev-parse", "HEAD")
+
+        self.git(self.source, "checkout", "main")
+        self.git(self.source, "checkout", "-b", "unrelated")
+        self.write(self.source, "unrelated.txt", "unrelated\n")
+        self.commit(self.source, "unrelated")
+        self.unrelated_head = self.git(self.source, "rev-parse", "HEAD")
+        self.git(self.source, "checkout", "main")
+        self.git(self.source, "remote", "add", "origin", str(self.remote))
+        self.git(
+            self.source,
+            "push",
+            "origin",
+            "main",
+            "lower",
+            "child",
+            "grandchild",
+            "unrelated",
+        )
+        self.clone_workspace()
+        self.stack = {
+            "number": 10,
+            "size": 3,
+            "trunk": "main",
+            "invoked_number": 3,
+            "members": [
+                {
+                    "number": 1,
+                    "head_branch": "lower",
+                    "base_branch": "main",
+                    "head_sha": self.lower_head,
+                    "base_sha": self.main_head,
+                },
+                {
+                    "number": 2,
+                    "head_branch": "child",
+                    "base_branch": "lower",
+                    "head_sha": self.child_head,
+                    "base_sha": self.lower_old,
+                },
+                {
+                    "number": 3,
+                    "head_branch": "grandchild",
+                    "base_branch": "child",
+                    "head_sha": self.grandchild_head,
+                    "base_sha": self.child_head,
+                },
+            ],
+            "workspace": str(self.workspace),
+            "members_after": None,
+        }
+
+    def git(self, root, *args, check=True):
+        process = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if check and process.returncode != 0:
+            self.fail(
+                f"git {' '.join(args)} failed ({process.returncode}): "
+                f"{process.stderr or process.stdout}"
+            )
+        return process.stdout.strip() if check else process
+
+    def write(self, root, name, content):
+        (root / name).write_text(content, encoding="utf-8", newline="\n")
+
+    def commit(self, root, message):
+        self.git(root, "add", "--all")
+        self.git(root, "commit", "--no-gpg-sign", "--message", message)
+
+    def clone_workspace(self):
+        if self.workspace.exists():
+            MODULE.force_rmtree(self.workspace)
+        self.git(
+            self.root,
+            "clone",
+            "--no-single-branch",
+            str(self.remote),
+            str(self.workspace),
+        )
+        self.git(self.workspace, "config", "user.name", "Stack Test")
+        self.git(self.workspace, "config", "user.email", "stack@example.invalid")
+        self.git(self.workspace, "config", "commit.gpgsign", "false")
+
+    def remote_head(self, branch):
+        process = subprocess.run(
+            [
+                "git",
+                f"--git-dir={self.remote}",
+                "rev-parse",
+                f"refs/heads/{branch}",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if process.returncode != 0:
+            self.fail(process.stderr or process.stdout)
+        return process.stdout.strip()
+
+    def prepare_and_rebase(self):
+        plan = MODULE.prepare_stack_cascade(self.workspace, self.stack)
+        process = MODULE.run_stack_cascade(self.workspace, self.stack)
+        if process.returncode == 0:
+            self.stack["members_after"] = MODULE.capture_member_tips(
+                self.workspace, self.stack
+            )
+        return plan, process
+
+    def test_a_moved_lower_branch_cascades_through_every_descendant(self):
+        self.git(self.workspace, "tag", "lower", "refs/remotes/origin/main")
+        self.git(self.workspace, "tag", "child", "refs/remotes/origin/main")
+        plan, process = self.prepare_and_rebase()
+        self.assertEqual(0, process.returncode, process.stderr or process.stdout)
+        self.assertEqual(self.lower_old, plan[1]["old_base"])
+        tips = {
+            member["head_branch"]: member["head_sha"]
+            for member in self.stack["members_after"]
+        }
+        self.assertTrue(MODULE.is_ancestor(self.workspace, tips["lower"], tips["child"]))
+        self.assertTrue(
+            MODULE.is_ancestor(self.workspace, tips["child"], tips["grandchild"])
+        )
+        self.assertEqual(
+            "child",
+            self.git(self.workspace, "show", f"{tips['child']}:child.txt"),
+        )
+        self.assertEqual(
+            "grandchild",
+            self.git(
+                self.workspace,
+                "show",
+                f"{tips['grandchild']}:grandchild.txt",
+            ),
+        )
+        self.assertEqual(
+            "lower one\nlower two",
+            self.git(self.workspace, "show", f"{tips['child']}:lower.txt"),
+        )
+        self.assertEqual(self.lower_head, self.remote_head("lower"))
+        self.assertEqual(self.child_head, self.remote_head("child"))
+        self.assertEqual(self.grandchild_head, self.remote_head("grandchild"))
+
+        pushed = MODULE.atomic_stack_push(self.workspace, self.stack)
+        self.assertEqual(0, pushed.returncode, pushed.stderr or pushed.stdout)
+        self.assertEqual(tips["lower"], self.remote_head("lower"))
+        self.assertEqual(tips["child"], self.remote_head("child"))
+        self.assertEqual(tips["grandchild"], self.remote_head("grandchild"))
+        self.assertEqual(self.unrelated_head, self.remote_head("unrelated"))
+
+    def test_a_conflict_stops_with_zero_publication(self):
+        self.git(self.source, "checkout", "main")
+        self.write(self.source, "lower.txt", "main changed this path\n")
+        self.commit(self.source, "main conflict")
+        self.git(self.source, "push", "origin", "main")
+        self.clone_workspace()
+
+        _plan, process = self.prepare_and_rebase()
+        self.assertEqual(
+            MODULE.STACK_CONFLICT_EXIT,
+            process.returncode,
+            process.stderr or process.stdout,
+        )
+        self.assertTrue(MODULE.rebase_in_progress(self.workspace))
+        self.assertEqual(self.lower_head, self.remote_head("lower"))
+        self.assertEqual(self.child_head, self.remote_head("child"))
+        self.assertEqual(self.grandchild_head, self.remote_head("grandchild"))
+
+    def test_a_stale_member_lease_rejects_every_update_atomically(self):
+        _plan, process = self.prepare_and_rebase()
+        self.assertEqual(0, process.returncode, process.stderr or process.stdout)
+
+        self.git(self.source, "checkout", "child")
+        self.write(self.source, "actor.txt", "actor\n")
+        self.commit(self.source, "actor moves child")
+        actor_head = self.git(self.source, "rev-parse", "HEAD")
+        self.git(self.source, "push", "origin", "child")
+
+        pushed = MODULE.atomic_stack_push(self.workspace, self.stack)
+        self.assertNotEqual(0, pushed.returncode)
+        self.assertEqual(self.lower_head, self.remote_head("lower"))
+        self.assertEqual(actor_head, self.remote_head("child"))
+        self.assertEqual(self.grandchild_head, self.remote_head("grandchild"))
+        self.assertEqual(self.unrelated_head, self.remote_head("unrelated"))
+
+    def test_a_force_rewritten_parent_is_rejected_as_unproven_lineage(self):
+        self.git(self.source, "checkout", "main")
+        self.git(self.source, "checkout", "-b", "rewritten-lower")
+        self.write(self.source, "replacement.txt", "replacement lower\n")
+        self.commit(self.source, "rewrite lower")
+        rewritten = self.git(self.source, "rev-parse", "HEAD")
+        self.git(self.source, "push", "--force", "origin", "HEAD:lower")
+        self.stack["members"][0]["head_sha"] = rewritten
+        self.clone_workspace()
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "may have been rewritten"):
+            MODULE.prepare_stack_cascade(self.workspace, self.stack)
+        self.assertEqual(rewritten, self.remote_head("lower"))
+        self.assertEqual(self.child_head, self.remote_head("child"))
+
+
+class ContinueStackCascadeTest(unittest.TestCase):
+    def setUp(self):
+        self.workspace = Path("/workspace")
+        self.stack = {
+            "current_index": 0,
+            "plan": [
+                {
+                    "index": 0,
+                    "branch": "feature",
+                    "branch_ref": "refs/heads/feature",
+                    "head_sha": "old",
+                }
+            ],
+        }
+
+    def test_an_empty_resolved_commit_is_skipped_before_the_cascade_resumes(self):
+        with mock.patch.object(
+            MODULE,
+            "run",
+            side_effect=[
+                completed(1, stderr="No changes - did you forget to use 'git add'?"),
+                completed(0),
+            ],
+        ) as runner, mock.patch.object(
+            MODULE, "rebase_in_progress", return_value=True
+        ), mock.patch.object(
+            MODULE, "unmerged_entries", return_value=[]
+        ), mock.patch.object(
+            MODULE, "record_rebased_member"
+        ) as record, mock.patch.object(
+            MODULE, "run_stack_cascade", return_value=completed(0)
+        ) as cascade:
+            result = MODULE.continue_stack_cascade(self.workspace, self.stack)
+        self.assertEqual(0, result.returncode)
+        self.assertEqual(
+            ["git", "-C", str(self.workspace), "rebase", "--skip"],
+            runner.call_args_list[1].args[0],
+        )
+        record.assert_called_once_with(self.workspace, self.stack["plan"][0])
+        cascade.assert_called_once_with(self.workspace, self.stack, 1)
+
+    def test_a_skip_that_reaches_another_conflict_reports_that_conflict(self):
+        with mock.patch.object(
+            MODULE,
+            "run",
+            side_effect=[
+                completed(1, stderr="No changes"),
+                completed(1, stderr="CONFLICT"),
+            ],
+        ), mock.patch.object(
+            MODULE, "rebase_in_progress", return_value=True
+        ), mock.patch.object(
+            MODULE,
+            "unmerged_entries",
+            side_effect=[[], [{"path": "next.txt"}]],
+        ):
+            result = MODULE.continue_stack_cascade(self.workspace, self.stack)
+        self.assertEqual(MODULE.STACK_CONFLICT_EXIT, result.returncode)
+        self.assertIn("CONFLICT", result.stderr)
+
+    def test_a_non_conflict_continue_failure_is_not_an_empty_conflict(self):
+        with mock.patch.object(
+            MODULE, "run", return_value=completed(1, stderr="signing failed")
+        ), mock.patch.object(
+            MODULE, "rebase_in_progress", return_value=True
+        ), mock.patch.object(
+            MODULE, "unmerged_entries", return_value=[]
+        ):
+            result = MODULE.continue_stack_cascade(self.workspace, self.stack)
+        self.assertEqual(1, result.returncode)
+        self.assertIn("signing failed", result.stderr)
+
+    def test_a_non_conflict_initial_failure_is_not_an_empty_conflict(self):
+        stack = {
+            "current_index": None,
+            "plan": [
+                {
+                    "index": 0,
+                    "branch": "feature",
+                    "branch_ref": "refs/heads/feature",
+                    "head_sha": "old",
+                    "new_base_ref": "refs/remotes/origin/main",
+                    "old_base": "base",
+                }
+            ],
+        }
+        with mock.patch.object(
+            MODULE, "is_ancestor", return_value=False
+        ), mock.patch.object(
+            MODULE,
+            "run_stack_member_rebase",
+            return_value=completed(1, stderr="hook failed"),
+        ), mock.patch.object(
+            MODULE, "rebase_in_progress", return_value=True
+        ), mock.patch.object(
+            MODULE, "unmerged_entries", return_value=[]
+        ):
+            result = MODULE.run_stack_cascade(self.workspace, stack)
+        self.assertEqual(1, result.returncode)
+        self.assertIsNone(stack["current_index"])
 
 
 class StackRebaseCommandTest(unittest.TestCase):
@@ -4985,30 +5548,20 @@ class StackRebaseCommandTest(unittest.TestCase):
         self.directory = temporary_directory(self)
         self.workspace = temporary_directory(self)
 
-    def run_rebase(self, *, checkout=None, rebase=None, members_after=None,
+    def run_rebase(self, *, rebase=None, members_after=None,
                    conflicts=None, rebase_in_progress=False, attempt=None):
         attempt = attempt or stack_attempt_record()
         state_path = write_state(self.directory, attempt=attempt)
 
-        def fake_run(cmd, **kwargs):
-            head = cmd[:3]
-            if head == ["gh", "stack", "checkout"]:
-                return checkout or completed(0)
-            if head == ["gh", "stack", "rebase"]:
-                if "--abort" in cmd:
-                    return completed(0)
-                return rebase or completed(0)
-            return completed(0)
-
         args = SimpleNamespace(state=str(state_path))
         with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
-            MODULE, "require_gh_stack"
-        ), mock.patch.object(
             MODULE, "create_stack_workspace", return_value=self.workspace
         ), mock.patch.object(
-            MODULE, "run", side_effect=fake_run
+            MODULE, "prepare_stack_cascade", return_value=[]
         ), mock.patch.object(
-            MODULE, "capture_member_tips", return_value=members_after or []
+            MODULE, "run_stack_cascade", return_value=rebase or completed(0)
+        ), mock.patch.object(
+            MODULE, "validate_rebased_stack", return_value=members_after or []
         ), mock.patch.object(
             MODULE, "collect_stack_conflicts", return_value=conflicts or []
         ), mock.patch.object(
@@ -5045,7 +5598,7 @@ class StackRebaseCommandTest(unittest.TestCase):
 
     def test_a_rebase_conflict_surfaces_the_conflicted_files(self):
         payload = self.run_rebase(
-            rebase=completed(MODULE.GH_STACK_CONFLICT_EXIT, stderr="CONFLICT"),
+            rebase=completed(MODULE.STACK_CONFLICT_EXIT, stderr="CONFLICT"),
             conflicts=[conflict_record("docs/list.yaml")],
         )
         self.assertEqual("conflicted", payload["result"])
@@ -5053,10 +5606,20 @@ class StackRebaseCommandTest(unittest.TestCase):
         self.assertEqual("resolved", payload["next"])
         self.assertEqual("conflicted", self.saved()["attempt"]["status"])
 
-    def test_stacks_not_enabled_fails_by_cause_and_removes_the_workspace(self):
-        self.run_rebase(rebase=completed(9, stderr="not enabled"))
+    def test_a_hard_rebase_failure_removes_the_workspace(self):
+        self.run_rebase(rebase=completed(1, stderr="bad lineage"))
         self.assertIsNotNone(self.error)
-        self.assertIn("stacked pull requests are not enabled", str(self.error))
+        self.assertIn("bad lineage", str(self.error))
+        self.remove.assert_called_once()
+
+    def test_a_rebase_failure_without_unmerged_paths_is_not_a_conflict(self):
+        self.run_rebase(
+            rebase=completed(MODULE.STACK_CONFLICT_EXIT, stderr="signing failed"),
+            conflicts=[],
+            rebase_in_progress=True,
+        )
+        self.assertIsNotNone(self.error)
+        self.assertIn("without any unmerged paths", str(self.error))
         self.remove.assert_called_once()
 
 
@@ -5069,46 +5632,37 @@ class StackPublishCommandTest(unittest.TestCase):
             {"number": 7, "head_branch": "feature", "head_sha": "newf"},
         ]
 
-    def publish(self, *, push=None, view=None, landed=None, members_after="default",
-                final=None, dissociate=None):
+    def publish(self, *, push=None, landed=None, members_after="default",
+                final=None, dissociate=None, trunk="base1", status="resolved"):
         if members_after == "default":
             members_after = self.intended
         attempt = stack_attempt_record(
-            status="resolved",
+            status=status,
+            published_head_sha="newf" if status == "published_refs" else None,
             stack={
                 "workspace": str(self.workspace),
                 "members_after": members_after,
+                "trunk_sha": "base1",
             },
         )
         state_path = write_state(self.directory, attempt=attempt)
         if landed is None:
             landed = {member["head_branch"]: member["head_sha"]
                       for member in (members_after or [])}
-        view_payload = view if view is not None else {
-            "trunk": "main",
-            "branches": [
-                {"name": "v143", "isMerged": False, "isQueued": False},
-                {"name": "feature", "isMerged": False, "isQueued": False},
-            ],
-        }
-
-        def fake_run(cmd, **kwargs):
-            head = cmd[:3]
-            if head == ["gh", "stack", "view"]:
-                return completed(0, stdout=json.dumps(view_payload))
-            if head == ["gh", "stack", "push"]:
-                return push or completed(0)
-            return completed(0)
 
         def fake_wait(owner, repo, branch, expected):
             return landed.get(branch)
 
         args = SimpleNamespace(state=str(state_path))
         with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
-            MODULE, "require_gh_stack"
+            MODULE, "validate_rebased_stack", return_value=members_after or []
         ), mock.patch.object(
-            MODULE, "run", side_effect=fake_run
+            MODULE, "remote_head", return_value=trunk
         ), mock.patch.object(
+            MODULE, "require_current_stack_snapshot"
+        ), mock.patch.object(
+            MODULE, "atomic_stack_push", return_value=push or completed(0)
+        ) as atomic, mock.patch.object(
             MODULE, "wait_for_remote_head", side_effect=fake_wait
         ), mock.patch.object(
             MODULE, "dissociate_workspace", return_value=dissociate
@@ -5116,7 +5670,10 @@ class StackPublishCommandTest(unittest.TestCase):
             MODULE, "remove_stack_workspace"
         ) as remove, mock.patch.object(
             MODULE, "live_mergeability",
-            return_value=final or pr_metadata(mergeable="MERGEABLE"),
+            side_effect=final if isinstance(final, Exception) else None,
+            return_value=final
+            if final is not None and not isinstance(final, Exception)
+            else pr_metadata(head_sha="newf", mergeable="MERGEABLE"),
         ), mock.patch.object(
             MODULE, "emit"
         ) as emit:
@@ -5128,6 +5685,7 @@ class StackPublishCommandTest(unittest.TestCase):
         self.state_path = state_path
         self.remove = remove
         self.dissociate = dissociate_mock
+        self.atomic = atomic
         return emitted(emit) if emit.called else None
 
     def saved(self):
@@ -5140,104 +5698,62 @@ class StackPublishCommandTest(unittest.TestCase):
         self.assertEqual("mergeable", payload["mergeability"])
         self.remove.assert_called_once()
         self.assertEqual("published", self.saved()["attempt"]["status"])
-        # A clean, zero-exit push carries no reported detail, so a publish that
-        # errored is distinguishable from one that did not.
         self.assertNotIn("push_detail", payload)
         self.assertIsNone(self.saved()["attempt"]["stack_push_detail"])
 
-    def test_a_partial_push_that_still_landed_every_member_publishes(self):
-        # `gh stack push` exits non-zero on a partial push, but the remote shows
-        # every member on its intended commit, so the remote is believed over the
-        # exit code and the per-member verification is what decides.
-        payload = self.publish(push=completed(1, stderr="one branch rejected"))
-        self.assertIsNone(self.error)
-        self.assertEqual("published", payload["result"])
-        self.remove.assert_called_once()
-        self.assertEqual("published", self.saved()["attempt"]["status"])
-
-    def test_a_member_left_on_its_pre_cascade_commit_preserves_the_workspace(self):
-        # `feature` is still at its pre-cascade commit head1, so the push never
-        # moved it. The workspace is preserved for a re-run rather than removed.
-        self.publish(landed={"v143": "newa", "feature": "head1"})
+    def test_a_rejected_atomic_push_preserves_the_workspace_and_publishes_nothing(self):
+        self.publish(
+            push=completed(1, stderr="stale info"),
+            landed={"v143": "aaa", "feature": "head1"},
+        )
         self.assertIsNotNone(self.error)
         message = str(self.error)
-        self.assertIn("#7 feature", message)
-        self.assertIn("did not move it", message)
-        self.assertIn("landed only some members", message)
+        self.assertIn("did not land the complete intended stack", message)
+        self.assertIn("stale info", message)
         self.assertIn(str(self.workspace), message)
-        self.assertIn("re-run stack-publish", message)
         self.remove.assert_not_called()
         self.dissociate.assert_called_once()
         self.assertEqual("resolved", self.saved()["attempt"]["status"])
 
-    def test_a_member_moved_by_another_actor_is_named_as_such(self):
-        # `feature` is on neither its intended tip nor its pre-cascade commit, so
-        # something moved it while the cascade ran and the lease was rejected.
-        self.publish(landed={"v143": "newa", "feature": "someoneelse"})
+    def test_a_stale_remote_member_is_named_after_atomic_rejection(self):
+        self.publish(
+            push=completed(1, stderr="stale info"),
+            landed={"v143": "aaa", "feature": "someoneelse"},
+        )
         self.assertIsNotNone(self.error)
         message = str(self.error)
         self.assertIn("#7 feature", message)
-        self.assertIn("force-with-lease was rejected", message)
+        self.assertIn("someoneelse", message)
         self.remove.assert_not_called()
 
-    def test_a_skipped_merged_member_is_not_a_mismatch(self):
-        # v143 is already merged, so `gh stack push` skips it and the remote will
-        # not carry a rebased tip. That is expected, not a member that failed to
-        # land, so the publish still succeeds.
-        view = {
-            "trunk": "main",
-            "branches": [
-                {"name": "v143", "isMerged": True, "isQueued": False},
-                {"name": "feature", "isMerged": False, "isQueued": False},
-            ],
-        }
-        payload = self.publish(
-            view=view, landed={"v143": "aaa", "feature": "newf"}
-        )
+    def test_a_moved_trunk_stops_before_the_atomic_push(self):
+        self.publish(trunk="newbase")
+        self.assertIsNotNone(self.error)
+        self.assertIn("trunk", str(self.error))
+        self.assertIn("no branch was published", str(self.error))
+        self.atomic.assert_not_called()
+
+    def test_transport_failure_after_every_ref_landed_still_finalizes(self):
+        payload = self.publish(push=completed(1, stderr="connection reset"))
         self.assertIsNone(self.error)
         self.assertEqual("published", payload["result"])
+        self.assertIn("connection reset", payload["push_detail"])
+        self.assertIn(
+            "connection reset", self.saved()["attempt"]["stack_push_detail"]
+        )
+
+    def test_finalization_failure_keeps_a_durable_published_refs_checkpoint(self):
+        self.publish(final=MODULE.WorkflowError("api unavailable"))
+        self.assertIsNotNone(self.error)
+        self.assertIn("api unavailable", str(self.error))
+        self.assertEqual("published_refs", self.saved()["attempt"]["status"])
         self.remove.assert_called_once()
 
-    def test_a_partial_push_names_the_push_output_when_a_member_is_pending(self):
-        self.publish(
-            push=completed(1, stderr="remote rejected feature"),
-            landed={"v143": "newa", "feature": "head1"},
-        )
-        self.assertIsNotNone(self.error)
-        self.assertIn("remote rejected feature", str(self.error))
-
-    def test_a_non_zero_push_with_every_member_landed_surfaces_the_detail(self):
-        # `gh stack push` exited non-zero but every member is on its intended tip,
-        # so this publishes rather than failing. The tool still reported something
-        # after the pushes succeeded, so that detail is carried onto the attempt
-        # and into the emitted result; a clean publish and an errored one must not
-        # be byte-identical from outside.
-        payload = self.publish(push=completed(1, stderr="post-push hook failed"))
+    def test_a_published_refs_checkpoint_finalizes_without_pushing_again(self):
+        payload = self.publish(status="published_refs")
+        self.assertIsNone(self.error)
         self.assertEqual("published", payload["result"])
-        self.assertIn("push_detail", payload)
-        self.assertIn("post-push hook failed", payload["push_detail"])
-        self.assertIn(
-            "post-push hook failed", self.saved()["attempt"]["stack_push_detail"]
-        )
-
-    def test_a_partial_publish_names_a_skipped_member(self):
-        # v143 is merged so `gh stack push` skips it, and feature stayed on its
-        # pre-cascade commit so it did not land. The skipped member is named as its
-        # own group so a reader counting members against landed and not-landed can
-        # account for every one.
-        view = {
-            "trunk": "main",
-            "branches": [
-                {"name": "v143", "isMerged": True, "isQueued": False},
-                {"name": "feature", "isMerged": False, "isQueued": False},
-            ],
-        }
-        self.publish(view=view, landed={"v143": "aaa", "feature": "head1"})
-        self.assertIsNotNone(self.error)
-        message = str(self.error)
-        self.assertIn("Skipped by `gh stack push`", message)
-        self.assertIn("#19483 v143 (merged)", message)
-        self.assertIn("#7 feature", message)
+        self.atomic.assert_not_called()
 
     def test_publishing_without_recorded_tips_is_refused(self):
         self.publish(members_after=None)
@@ -5251,9 +5767,9 @@ class StackAbortCommandTest(unittest.TestCase):
         self.directory = temporary_directory(self)
         self.workspace = temporary_directory(self)
 
-    def abort(self, *, rebase_in_progress=True):
+    def abort(self, *, rebase_in_progress=True, status="conflicted"):
         attempt = stack_attempt_record(
-            status="conflicted",
+            status=status,
             stack={"workspace": str(self.workspace)},
         )
         state_path = write_state(self.directory, attempt=attempt)
@@ -5261,17 +5777,21 @@ class StackAbortCommandTest(unittest.TestCase):
         with mock.patch.object(
             MODULE, "rebase_in_progress", return_value=rebase_in_progress
         ), mock.patch.object(
-            MODULE, "run"
-        ) as run, mock.patch.object(
+            MODULE, "git_try", return_value=completed(0)
+        ) as git_try, mock.patch.object(
             MODULE, "remove_stack_workspace"
         ) as remove, mock.patch.object(
             MODULE, "emit"
         ) as emit:
-            MODULE.command_stack_abort(args)
-        self.run = run
+            self.error = None
+            try:
+                MODULE.command_stack_abort(args)
+            except MODULE.WorkflowError as error:
+                self.error = error
+        self.git_try = git_try
         self.remove = remove
         self.state_path = state_path
-        return emitted(emit)
+        return emitted(emit) if emit.called else None
 
     def saved(self):
         return json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -5280,11 +5800,7 @@ class StackAbortCommandTest(unittest.TestCase):
         payload = self.abort(rebase_in_progress=True)
         self.assertEqual("aborted", payload["result"])
         self.assertEqual("stack-rebase", payload["undone"])
-        abort_calls = [
-            call for call in self.run.call_args_list
-            if call.args[0][:4] == ["gh", "stack", "rebase", "--abort"]
-        ]
-        self.assertEqual(1, len(abort_calls))
+        self.git_try.assert_called_once_with(self.workspace, "rebase", "--abort")
         self.remove.assert_called_once()
         self.assertIsNone(self.saved()["attempt"])
 
@@ -5293,3 +5809,9 @@ class StackAbortCommandTest(unittest.TestCase):
         self.assertEqual("aborted", payload["result"])
         self.assertIsNone(payload["undone"])
         self.remove.assert_called_once()
+
+    def test_refs_that_already_published_cannot_be_aborted(self):
+        self.abort(status="published_refs")
+        self.assertIsNotNone(self.error)
+        self.assertIn("already published", str(self.error))
+        self.remove.assert_not_called()
