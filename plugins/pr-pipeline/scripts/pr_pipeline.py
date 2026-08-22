@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -52,12 +53,13 @@ DEFAULT_EFFORT = "high"
 # that by default. ``--allow-all-urls`` is deliberately left off: stages reach
 # GitHub through the ``gh`` CLI, which is a shell tool rather than a URL fetch.
 STAGE_PERMISSION_FLAGS = ("--allow-all-tools", "--allow-all-paths")
+STAGE_AUTOPILOT_FLAGS = ("--autopilot", "--max-autopilot-continues", "5")
 
-# How long the pipeline waits on one stage before it stops calling the stage
-# alive. A check wait inside ``ci-fix-loop`` can run for an hour, so the ceiling
-# is generous. It exists to bound a wedged stage, not to cut a working one short.
-STAGE_WAIT_CEILING_SECONDS = 7200
+# One wait invocation returns control regularly, while activity determines
+# whether the stage itself may keep running.
+STAGE_WAIT_SLICE_SECONDS = 300
 STAGE_WAIT_POLL_SECONDS = 15
+STAGE_INACTIVITY_LIMIT_SECONDS = 1800
 
 # Execution order. This is the pipeline's own order and is deliberately not the
 # bottleneck chain any dashboard shows. The conflict stage leads because a
@@ -185,10 +187,9 @@ ESCALATION_ACTIONS = {
         "process ended before its helper recorded an outcome, so the log is the "
         "only account of what it did."
     ),
-    "wait_timeout_exceeded": (
-        "Read the tail of the stage log named in the escalation. The stage ran "
-        "past the wait ceiling without finishing, so decide whether to let it "
-        "keep going or to stop it yourself."
+    "stage_inactive": (
+        "Read the tail of the stage log named in the escalation. The stage process "
+        "tree was terminated after 30 minutes with no observable activity."
     ),
     "stage_abandoned": (
         "Read the tail of the stage log named in the escalation. The stage "
@@ -298,17 +299,24 @@ def run(
     cwd: Path | None = None,
     input_text: str | None = None,
     check: bool = True,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    process = subprocess.run(
-        command,
-        cwd=str(cwd) if cwd else None,
-        input=input_text,
-        text=True,
-        encoding="utf-8",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    try:
+        process = subprocess.run(
+            command,
+            cwd=str(cwd) if cwd else None,
+            input=input_text,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise WorkflowError(
+            f"{' '.join(command)} did not return within {timeout} seconds"
+        ) from error
     if check and process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip() or "no output"
         raise WorkflowError(
@@ -363,6 +371,7 @@ def _process_create_time_native(pid: int) -> float | None:
                 ],
                 text=True,
                 capture_output=True,
+                timeout=10,
             )
         except Exception:
             return None
@@ -420,6 +429,563 @@ def process_alive(pid: int, create_time: float | None) -> bool:
     ):
         return False
     return True
+
+
+def _psutil_process_tree_snapshot(
+    pid: int, create_time: float | None
+) -> dict[str, Any] | None:
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        return None
+    try:
+        root = psutil.Process(pid)
+        if create_time is not None and (
+            abs(float(root.create_time()) - create_time) > PROCESS_IDENTITY_TOLERANCE
+        ):
+            return None
+        processes = [root, *root.children(recursive=True)]
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return None
+
+    identities: list[str] = []
+    process_cpu: dict[str, float] = {}
+    cpu_seconds = 0.0
+    for process in processes:
+        try:
+            identity = f"{process.pid}:psutil:{float(process.create_time()):.6f}"
+            cpu = process.cpu_times()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+        identities.append(identity)
+        used_cpu = float(cpu.user) + float(cpu.system)
+        process_cpu[identity] = round(used_cpu, 6)
+        cpu_seconds += used_cpu
+    return {
+        "process_tree": sorted(identities),
+        "process_cpu": process_cpu,
+        "cpu_seconds": round(cpu_seconds, 6),
+    }
+
+
+def _native_process_rows() -> list[dict[str, Any]] | None:
+    if IS_WINDOWS:
+        command = (
+            "Get-CimInstance Win32_Process | "
+            "Select-Object ProcessId,ParentProcessId,CreationDate,"
+            "KernelModeTime,UserModeTime | ConvertTo-Json -Compress"
+        )
+        try:
+            completed = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", command],
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        if completed.returncode != 0 or not completed.stdout.strip():
+            return None
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            return None
+        rows = payload if isinstance(payload, list) else [payload]
+        return [row for row in rows if isinstance(row, dict)]
+
+    rows: list[dict[str, Any]] = []
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return None
+    for path in proc.iterdir():
+        if not path.name.isdigit():
+            continue
+        try:
+            fields = (path / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        try:
+            rows.append(
+                {
+                    "ProcessId": int(path.name),
+                    "ParentProcessId": int(fields[1]),
+                    "ProcessGroupId": int(fields[2]),
+                    "State": fields[0],
+                    "CreationDate": fields[19],
+                    "KernelModeTime": float(fields[12]),
+                    "UserModeTime": float(fields[11]),
+                }
+            )
+        except (ValueError, IndexError):
+            continue
+    return rows
+
+
+def _descendant_rows(rows: list[dict[str, Any]], root_pid: int) -> list[dict[str, Any]]:
+    by_parent: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        try:
+            parent = int(row["ParentProcessId"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        by_parent.setdefault(parent, []).append(row)
+    selected: list[dict[str, Any]] = []
+    pending = [root_pid]
+    seen = {root_pid}
+    while pending:
+        parent = pending.pop()
+        for row in by_parent.get(parent, []):
+            try:
+                child = int(row["ProcessId"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if child in seen:
+                continue
+            seen.add(child)
+            selected.append(row)
+            pending.append(child)
+    root = next(
+        (
+            row
+            for row in rows
+            if str(row.get("ProcessId")) == str(root_pid)
+        ),
+        None,
+    )
+    return ([root] if root is not None else []) + selected
+
+
+def process_tree_snapshot(
+    pid: int, create_time: float | None
+) -> dict[str, Any] | None:
+    if IS_WINDOWS:
+        snapshot = _psutil_process_tree_snapshot(pid, create_time)
+        if snapshot is not None:
+            return snapshot
+    current_create_time = _process_create_time_native(pid)
+    root_reused = current_create_time is not None and (
+        create_time is not None
+        and abs(current_create_time - create_time) > PROCESS_IDENTITY_TOLERANCE
+    )
+    rows = _native_process_rows()
+    if rows is None:
+        return None
+    if IS_WINDOWS:
+        selected = _descendant_rows(rows, pid)
+        if root_reused:
+            selected = []
+    else:
+        selected = [
+            row
+            for row in rows
+            if str(row.get("ProcessGroupId")) == str(pid)
+            and str(row.get("State") or "").upper() != "Z"
+        ]
+    identities: list[str] = []
+    process_cpu: dict[str, float] = {}
+    cpu_seconds = 0.0
+    divisor = 10_000_000.0 if IS_WINDOWS else float(os.sysconf("SC_CLK_TCK"))
+    for row in selected:
+        try:
+            process_id = int(row["ProcessId"])
+            identity = str(row.get("CreationDate") or "")
+            kernel = float(row.get("KernelModeTime") or 0)
+            user = float(row.get("UserModeTime") or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        process_identity = f"{process_id}:native:{identity}"
+        used_cpu = (kernel + user) / divisor
+        identities.append(process_identity)
+        process_cpu[process_identity] = round(used_cpu, 6)
+        cpu_seconds += used_cpu
+    return {
+        "process_tree": sorted(identities),
+        "process_cpu": process_cpu,
+        "cpu_seconds": round(cpu_seconds, 6),
+    }
+
+
+def matching_known_process_ids(identities: Iterable[str]) -> tuple[list[int], bool]:
+    parsed: list[tuple[int, str, str]] = []
+    for identity in identities:
+        parts = identity.split(":", 2)
+        if len(parts) != 3:
+            continue
+        try:
+            parsed.append((int(parts[0]), parts[1], parts[2]))
+        except ValueError:
+            continue
+
+    unknown = False
+    matches: list[int] = []
+    psutil_entries = [entry for entry in parsed if entry[1] == "psutil"]
+    if psutil_entries:
+        try:
+            import psutil  # type: ignore
+        except ImportError:
+            unknown = True
+        else:
+            for process_id, _, token in psutil_entries:
+                try:
+                    process = psutil.Process(process_id)
+                    same = (
+                        abs(float(process.create_time()) - float(token))
+                        <= PROCESS_IDENTITY_TOLERANCE
+                    )
+                    if (
+                        same
+                        and process.is_running()
+                        and process.status() != psutil.ZOMBIE
+                    ):
+                        matches.append(process_id)
+                except (ValueError, psutil.NoSuchProcess, psutil.ZombieProcess):
+                    continue
+                except psutil.AccessDenied:
+                    unknown = True
+
+    native_entries = [entry for entry in parsed if entry[1] == "native"]
+    if native_entries:
+        rows = _native_process_rows()
+        if rows is None:
+            unknown = True
+        else:
+            current = {
+                int(row["ProcessId"]): str(row.get("CreationDate") or "")
+                for row in rows
+                if row.get("ProcessId") is not None
+                and str(row.get("State") or "").upper() != "Z"
+            }
+            for process_id, _, token in native_entries:
+                if current.get(process_id) == token:
+                    matches.append(process_id)
+    return sorted(set(matches)), unknown
+
+
+def known_processes_alive(identities: Iterable[str]) -> tuple[bool, bool]:
+    matches, unknown = matching_known_process_ids(identities)
+    return bool(matches), unknown
+
+
+def known_process_snapshot(identities: Iterable[str]) -> dict[str, Any]:
+    parsed: list[tuple[int, str, str, str]] = []
+    for identity in identities:
+        parts = identity.split(":", 2)
+        if len(parts) != 3:
+            continue
+        try:
+            parsed.append((int(parts[0]), parts[1], parts[2], identity))
+        except ValueError:
+            continue
+
+    live_identities: list[str] = []
+    process_cpu: dict[str, float] = {}
+    cpu_seconds = 0.0
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        psutil = None  # type: ignore
+    if psutil is not None:
+        for process_id, source, token, identity in parsed:
+            if source != "psutil":
+                continue
+            try:
+                process = psutil.Process(process_id)
+                if (
+                    abs(float(process.create_time()) - float(token))
+                    > PROCESS_IDENTITY_TOLERANCE
+                    or not process.is_running()
+                    or process.status() == psutil.ZOMBIE
+                ):
+                    continue
+                cpu = process.cpu_times()
+            except (
+                ValueError,
+                psutil.NoSuchProcess,
+                psutil.AccessDenied,
+                psutil.ZombieProcess,
+            ):
+                continue
+            live_identities.append(identity)
+            used_cpu = float(cpu.user) + float(cpu.system)
+            process_cpu[identity] = round(used_cpu, 6)
+            cpu_seconds += used_cpu
+
+    native = [entry for entry in parsed if entry[1] == "native"]
+    if native:
+        rows = _native_process_rows() or []
+        by_pid = {
+            int(row["ProcessId"]): row
+            for row in rows
+            if row.get("ProcessId") is not None
+            and str(row.get("State") or "").upper() != "Z"
+        }
+        divisor = 10_000_000.0 if IS_WINDOWS else float(os.sysconf("SC_CLK_TCK"))
+        for process_id, _, token, identity in native:
+            row = by_pid.get(process_id)
+            if row is None or str(row.get("CreationDate") or "") != token:
+                continue
+            live_identities.append(identity)
+            used_cpu = (
+                float(row.get("KernelModeTime") or 0)
+                + float(row.get("UserModeTime") or 0)
+            ) / divisor
+            process_cpu[identity] = round(used_cpu, 6)
+            cpu_seconds += used_cpu
+    return {
+        "process_tree": sorted(set(live_identities)),
+        "process_cpu": process_cpu,
+        "cpu_seconds": round(cpu_seconds, 6),
+    }
+
+
+def stage_process_tree_alive(
+    pid: int,
+    create_time: float | None,
+    tracker: dict[str, Any] | None = None,
+) -> bool:
+    if process_alive(pid, create_time):
+        return True
+    snapshot = process_tree_snapshot(pid, create_time)
+    if snapshot is None:
+        return True
+    if snapshot.get("process_tree"):
+        return True
+    known = []
+    if isinstance(tracker, dict):
+        known = tracker.get("known_processes") or tracker.get("process_tree") or []
+    alive, unknown = known_processes_alive(known)
+    return alive or unknown
+
+
+def terminate_process_tree(
+    pid: int,
+    create_time: float | None,
+    tracker: dict[str, Any] | None = None,
+) -> list[int] | None:
+    current_create_time = process_create_time(pid)
+    if (
+        current_create_time is not None
+        and create_time is not None
+        and abs(current_create_time - create_time) > PROCESS_IDENTITY_TOLERANCE
+    ):
+        raise WorkflowError("the inactive stage pid now belongs to another process")
+    if not IS_WINDOWS:
+        snapshot = process_tree_snapshot(pid, create_time)
+        process_ids = [
+            int(identity.split(":", 1)[0])
+            for identity in (snapshot or {}).get("process_tree") or []
+        ]
+        known = (
+            tracker.get("known_processes") or tracker.get("process_tree") or []
+            if isinstance(tracker, dict)
+            else []
+        )
+        known_ids, known_unknown = matching_known_process_ids(known)
+        process_ids = sorted(set(process_ids) | set(known_ids))
+        signaled = False
+        try:
+            os.killpg(pid, signal.SIGTERM)
+            signaled = True
+        except ProcessLookupError:
+            pass
+        except PermissionError as error:
+            raise WorkflowError(
+                f"could not terminate the inactive stage process tree: {error}"
+            ) from error
+        for process_id in known_ids:
+            try:
+                os.kill(process_id, signal.SIGTERM)
+                signaled = True
+            except ProcessLookupError:
+                continue
+            except PermissionError as error:
+                raise WorkflowError(
+                    f"could not terminate inactive stage process {process_id}: {error}"
+                ) from error
+        if not signaled:
+            return None
+        deadline = time.monotonic() + 10
+        while (
+            stage_process_tree_alive(pid, create_time, tracker)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.1)
+        if stage_process_tree_alive(pid, create_time, tracker):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            for process_id in known_ids:
+                try:
+                    os.kill(process_id, signal.SIGKILL)
+                except ProcessLookupError:
+                    continue
+                except PermissionError as error:
+                    raise WorkflowError(
+                        f"could not kill inactive stage process {process_id}: {error}"
+                    ) from error
+        if stage_process_tree_alive(pid, create_time, tracker) or known_unknown:
+            raise WorkflowError("inactive stage process group did not exit")
+        return process_ids
+
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        psutil = None  # type: ignore
+    if psutil is not None:
+        processes: list[Any] = []
+        try:
+            root = psutil.Process(pid)
+            if create_time is not None and (
+                abs(float(root.create_time()) - create_time)
+                > PROCESS_IDENTITY_TOLERANCE
+            ):
+                raise WorkflowError("the inactive stage pid now belongs to another process")
+            processes = [*root.children(recursive=True), root]
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            psutil = None  # type: ignore
+        except psutil.AccessDenied as error:
+            raise WorkflowError(
+                f"could not inspect the inactive stage process tree: {error}"
+            ) from error
+        if psutil is not None:
+            known = (
+                tracker.get("known_processes") or tracker.get("process_tree") or []
+                if isinstance(tracker, dict)
+                else []
+            )
+            known_ids, known_unknown = matching_known_process_ids(known)
+            represented = {process.pid for process in processes}
+            for known_id in known_ids:
+                if known_id in represented:
+                    continue
+                try:
+                    processes.insert(-1, psutil.Process(known_id))
+                except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                    continue
+                except psutil.AccessDenied:
+                    known_unknown = True
+            process_ids = [process.pid for process in processes]
+            for process in processes:
+                try:
+                    process.terminate()
+                except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                    continue
+                except psutil.AccessDenied as error:
+                    raise WorkflowError(
+                        f"could not terminate inactive stage process {process.pid}: "
+                        f"{error}"
+                    ) from error
+            _, alive = psutil.wait_procs(processes, timeout=10)
+            for process in alive:
+                try:
+                    process.kill()
+                except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                    continue
+                except psutil.AccessDenied as error:
+                    raise WorkflowError(
+                        f"could not kill inactive stage process {process.pid}: {error}"
+                    ) from error
+            if alive:
+                _, alive = psutil.wait_procs(alive, timeout=10)
+            if alive:
+                raise WorkflowError(
+                    "inactive stage processes did not exit: "
+                    + ", ".join(str(process.pid) for process in alive)
+                )
+            if known_unknown:
+                raise WorkflowError(
+                    "could not confirm that every observed stage process exited"
+                )
+            return process_ids
+
+    if IS_WINDOWS:
+        rows = _native_process_rows()
+        if rows is None:
+            raise WorkflowError("could not inspect the inactive stage process tree")
+        selected_rows = list(reversed(_descendant_rows(rows, pid)))
+        selected_identities = {
+            int(row["ProcessId"]): str(row.get("CreationDate") or "")
+            for row in selected_rows
+            if row.get("ProcessId") is not None
+        }
+        known = (
+            tracker.get("known_processes") or tracker.get("process_tree") or []
+            if isinstance(tracker, dict)
+            else []
+        )
+        known_ids, known_unknown = matching_known_process_ids(known)
+        fresh_rows = _native_process_rows()
+        if fresh_rows is None:
+            raise WorkflowError(
+                "could not revalidate the inactive stage process tree"
+            )
+        fresh_identities = {
+            int(row["ProcessId"]): str(row.get("CreationDate") or "")
+            for row in fresh_rows
+            if row.get("ProcessId") is not None
+        }
+        process_ids = sorted(
+            {
+                process_id
+                for process_id, identity in selected_identities.items()
+                if fresh_identities.get(process_id) == identity
+            }
+            | set(known_ids),
+            reverse=True,
+        )
+        if not process_ids:
+            if known_unknown:
+                raise WorkflowError(
+                    "could not confirm that every observed stage process exited"
+                )
+            return None
+        literal_ids = ",".join(str(process_id) for process_id in process_ids)
+        command = (
+            f"@({literal_ids}) | ForEach-Object "
+            "{ Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }"
+        )
+        try:
+            completed = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", command],
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise WorkflowError(
+                "timed out terminating the inactive stage process tree"
+            ) from error
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or "no error detail"
+            raise WorkflowError(
+                f"could not terminate the inactive stage process tree: {detail}"
+            )
+        remaining_rows = _native_process_rows()
+        if remaining_rows is None:
+            raise WorkflowError(
+                "could not confirm that the inactive stage process tree exited"
+            )
+        remaining_ids = {
+            int(row["ProcessId"])
+            for row in remaining_rows
+            if row.get("ProcessId") is not None
+        }
+        survivors = sorted(set(process_ids) & remaining_ids)
+        if survivors:
+            raise WorkflowError(
+                "inactive stage processes did not exit: "
+                + ", ".join(str(process_id) for process_id in survivors)
+            )
+        if known_unknown:
+            raise WorkflowError(
+                "could not confirm that every observed stage process exited"
+            )
+        return process_ids
 
 
 def worktree_dirt(repo_root: Path) -> str:
@@ -1502,10 +2068,19 @@ def run_stage_status(
         return {**result, "ok": False, "reason": "helper_missing"}
     if not state_path.is_file():
         return {**result, "ok": False, "reason": "no_state"}
-    process = run(
-        [sys.executable, str(script), "status", "--state", str(state_path)],
-        check=False,
-    )
+    try:
+        process = run(
+            [sys.executable, str(script), "status", "--state", str(state_path)],
+            check=False,
+            timeout=30,
+        )
+    except WorkflowError as error:
+        return {
+            **result,
+            "ok": False,
+            "reason": "status_timeout",
+            "detail": str(error),
+        }
     if process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip() or "no output"
         return {**result, "ok": False, "reason": "status_failed", "detail": detail}
@@ -2246,6 +2821,7 @@ def launch_plan(
             model,
             "--effort",
             effort,
+            *STAGE_AUTOPILOT_FLAGS,
             *STAGE_PERMISSION_FLAGS,
         ],
     }
@@ -2320,6 +2896,28 @@ def begin_run(state: dict[str, Any]) -> dict[str, Any]:
     never gets to tidy up after itself, and that is exactly the run that leaves
     state behind, so the tidying has to happen where a dead run cannot skip it.
     """
+
+    unterminated = state.get("unterminated_process")
+    if isinstance(unterminated, dict):
+        try:
+            process_id = int(str(unterminated.get("process_id")))
+            process_created = float(unterminated.get("process_create_time"))
+        except (TypeError, ValueError):
+            raise WorkflowError(
+                "the previous run could not confirm that its inactive process tree "
+                "terminated; inspect it before starting another run"
+            )
+        activity = unterminated.get("activity")
+        if stage_process_tree_alive(
+            process_id,
+            process_created,
+            activity if isinstance(activity, dict) else None,
+        ):
+            raise WorkflowError(
+                "the previous run's inactive stage process tree may still be alive; "
+                "do not start another run in this worktree"
+            )
+        state.pop("unterminated_process", None)
 
     abandoned = state.get("running")
     if not isinstance(abandoned, dict) or not abandoned:
@@ -2506,9 +3104,10 @@ def probe_running_stage(state: dict[str, Any]) -> dict[str, Any] | None:
     in the command every later caller passes through, rather than in the one that
     already stopped.
 
-    The recorded result is read before the process, because a stage that wrote
-    its outcome and then exited is finished rather than abandoned. Probing first
-    would turn every completed stage into an escalation.
+    The whole process tree must be gone before a recorded result is called
+    finished. A stage writes its outcome before it finishes publishing and
+    summarizing, so the result alone never permits another stage into the shared
+    worktree.
 
     Identity is the pid **and** its creation time, never the pid alone. Pids are
     recycled, so a bare existence check reads whichever program later inherited
@@ -2532,6 +3131,25 @@ def probe_running_stage(state: dict[str, Any]) -> dict[str, Any] | None:
         "head_sha": running.get("head_sha"),
     }
 
+    try:
+        pid = int(str(probe["pid"]))
+    except (TypeError, ValueError):
+        probe["verdict"] = RUNNING_STAGE_UNVERIFIABLE
+        probe["reason"] = "no_process_id_recorded"
+        return probe
+    if probe["process_create_time"] is None:
+        probe["verdict"] = RUNNING_STAGE_UNVERIFIABLE
+        probe["reason"] = "no_process_create_time_recorded"
+        return probe
+
+    if stage_process_tree_alive(
+        pid,
+        float(probe["process_create_time"]),
+        running.get("activity") if isinstance(running.get("activity"), dict) else None,
+    ):
+        probe["verdict"] = RUNNING_STAGE_ALIVE
+        return probe
+
     entry = STAGE_BY_NAME.get(stage) if isinstance(stage, str) else None
     if entry is not None:
         reading = read_stage_outcome(
@@ -2544,23 +3162,7 @@ def probe_running_stage(state: dict[str, Any]) -> dict[str, Any] | None:
             probe["verdict"] = RUNNING_STAGE_FINISHED
             probe["outcome"] = reading.get("outcome")
             return probe
-
-    try:
-        pid = int(str(probe["pid"]))
-    except (TypeError, ValueError):
-        probe["verdict"] = RUNNING_STAGE_UNVERIFIABLE
-        probe["reason"] = "no_process_id_recorded"
-        return probe
-    if probe["process_create_time"] is None:
-        probe["verdict"] = RUNNING_STAGE_UNVERIFIABLE
-        probe["reason"] = "no_process_create_time_recorded"
-        return probe
-
-    probe["verdict"] = (
-        RUNNING_STAGE_ALIVE
-        if process_alive(pid, float(probe["process_create_time"]))
-        else RUNNING_STAGE_ABANDONED
-    )
+    probe["verdict"] = RUNNING_STAGE_ABANDONED
     return probe
 
 
@@ -2955,10 +3557,187 @@ def command_launch(args: argparse.Namespace) -> None:
     )
 
 
-def command_wait(args: argparse.Namespace) -> None:
-    """Block until the stage process exits, then report the outcome it recorded.
+def observe_stage_activity(
+    entry: dict[str, Any],
+    target: dict[str, Any],
+    log_path: Path | None,
+    pid: int,
+    create_time: float | None,
+    known_processes: Iterable[str] = (),
+) -> dict[str, Any]:
+    helper_stamp = None
+    reading = run_stage_status(entry, target)
+    payload = reading.get("payload") if reading.get("ok") else None
+    if isinstance(payload, dict):
+        stamp = payload.get("last_helper_activity")
+        helper_stamp = stamp if isinstance(stamp, str) and stamp else None
 
-    The healthy path returns only after the process has **exited**. The stage
+    log_size = None
+    if log_path is not None:
+        try:
+            log_size = log_path.stat().st_size
+        except FileNotFoundError:
+            log_size = 0
+        except OSError:
+            log_size = None
+
+    process_snapshot = process_tree_snapshot(pid, create_time) or {}
+    known_snapshot = known_process_snapshot(known_processes)
+    process_tree = sorted(
+        {
+            *(process_snapshot.get("process_tree") or []),
+            *(known_snapshot.get("process_tree") or []),
+        }
+    )
+    process_cpu = {
+        **(process_snapshot.get("process_cpu") or {}),
+        **(known_snapshot.get("process_cpu") or {}),
+    }
+    return {
+        "helper_stamp": helper_stamp,
+        "log_size": log_size,
+        "process_tree": process_tree,
+        "process_cpu": process_cpu,
+        "cpu_seconds": (
+            round(sum(process_cpu.values()), 6) if process_cpu else None
+        ),
+    }
+
+
+def update_activity_tracker(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    observed_at: str,
+) -> tuple[dict[str, Any], list[str]]:
+    signals: list[str] = []
+    previous_helper = previous.get("helper_stamp")
+    current_helper = current.get("helper_stamp")
+    if current_helper is not None and current_helper != previous_helper:
+        signals.append("helper_state")
+
+    previous_log = previous.get("log_size")
+    current_log = current.get("log_size")
+    if (
+        isinstance(current_log, int)
+        and isinstance(previous_log, int)
+        and current_log > previous_log
+    ):
+        signals.append("stage_log")
+
+    previous_tree = previous.get("process_tree")
+    current_tree = current.get("process_tree")
+    if (
+        isinstance(previous_tree, list)
+        and isinstance(current_tree, list)
+        and current_tree != previous_tree
+    ):
+        signals.append("process_tree")
+
+    previous_process_cpu = previous.get("process_cpu")
+    current_process_cpu = current.get("process_cpu")
+    process_cpu_progress = (
+        isinstance(previous_process_cpu, dict)
+        and isinstance(current_process_cpu, dict)
+        and any(
+            isinstance(used_cpu, (int, float))
+            and isinstance(previous_process_cpu.get(identity), (int, float))
+            and used_cpu > previous_process_cpu[identity]
+            for identity, used_cpu in current_process_cpu.items()
+        )
+    )
+    previous_cpu = previous.get("cpu_seconds")
+    current_cpu = current.get("cpu_seconds")
+    aggregate_cpu_progress = (
+        not isinstance(previous_process_cpu, dict)
+        and isinstance(previous_cpu, (int, float))
+        and isinstance(current_cpu, (int, float))
+        and current_cpu > previous_cpu
+    )
+    if process_cpu_progress or aggregate_cpu_progress:
+        signals.append("process_cpu")
+
+    known_processes = sorted(
+        {
+            *(
+                previous.get("known_processes")
+                or previous.get("process_tree")
+                or []
+            ),
+            *(current.get("process_tree") or []),
+        }
+    )
+    tracker = {
+        "last_activity_at": (
+            observed_at if signals else previous.get("last_activity_at") or observed_at
+        ),
+        **current,
+        "known_processes": known_processes,
+    }
+    if signals:
+        tracker["last_signals"] = signals
+    elif previous.get("last_signals"):
+        tracker["last_signals"] = previous["last_signals"]
+    return tracker, signals
+
+
+def record_inactive_stage(
+    state: dict[str, Any],
+    running: dict[str, Any],
+    *,
+    pid: int,
+    terminated_processes: list[int],
+    silent_seconds: float,
+    termination_error: str | None = None,
+) -> dict[str, Any]:
+    stage = running.get("stage")
+    detail = (
+        f"{stage} showed no helper-state change, log growth, process-tree change, "
+        f"or root/descendant CPU progress for {int(silent_seconds)} seconds; "
+        f"the pipeline terminated process tree {terminated_processes or [pid]}"
+    )
+    if termination_error:
+        detail = (
+            f"{detail}, but termination could not be confirmed: {termination_error}"
+        )
+    state.setdefault("history", []).append(
+        {
+            "stage": stage,
+            "outcome": "escalated",
+            "run_id": state.get("run_id"),
+            "outcome_source": "pipeline",
+            "outcome_reason": "stage_inactive",
+            "iteration": running.get("iteration"),
+            "started_head_sha": running.get("head_sha"),
+            "head_sha": running.get("head_sha"),
+            "started_at": running.get("started_at"),
+            "ended_at": utc_now(),
+            "process_id": pid,
+            "log_path": running.get("log_path"),
+            "detail": detail,
+            "repeat": False,
+        }
+    )
+    if termination_error:
+        state["unterminated_process"] = dict(running)
+    else:
+        state.pop("unterminated_process", None)
+    state["running"] = None
+    return record_escalation(
+        state,
+        {
+            "stage": stage,
+            "reason": "stage_inactive",
+            "detail": detail,
+            "next_action": ESCALATION_ACTIONS["stage_inactive"],
+            "head_sha": running.get("head_sha"),
+        },
+    )
+
+
+def command_wait(args: argparse.Namespace) -> None:
+    """Wait for one bounded slice, while active stages remain unbounded.
+
+    The healthy path returns only after the process tree has **exited**. The stage
     helper writes its terminal outcome before the stage agent finishes
     summarizing and pushing, so returning the moment an outcome appears would let
     the next stage launch into the shared worktree while this one is still
@@ -2980,12 +3759,32 @@ def command_wait(args: argparse.Namespace) -> None:
         if args.process_create_time is not None
         else None
     )
-    ceiling = float(args.timeout or STAGE_WAIT_CEILING_SECONDS)
-    poll = float(args.poll or STAGE_WAIT_POLL_SECONDS)
+    if create_time is None:
+        raise WorkflowError(
+            "wait requires --process-create-time so a recycled pid cannot be "
+            "monitored or terminated as the stage"
+        )
+    wait_slice = (
+        float(args.timeout) if args.timeout is not None else STAGE_WAIT_SLICE_SECONDS
+    )
+    poll = float(args.poll) if args.poll is not None else STAGE_WAIT_POLL_SECONDS
     started = time.monotonic()
+    running = state.get("running")
+    running = running if isinstance(running, dict) else {}
+    tracker = running.get("activity")
+    if not isinstance(tracker, dict):
+        tracker = {
+            "last_activity_at": running.get("started_at") or utc_now(),
+            "helper_stamp": None,
+            "log_size": 0,
+            "process_tree": None,
+            "cpu_seconds": 0.0,
+        }
+    log_value = running.get("log_path")
+    log_path = cli_path(log_value) if isinstance(log_value, str) and log_value else None
 
     while True:
-        alive = process_alive(pid, create_time)
+        alive = stage_process_tree_alive(pid, create_time, tracker)
         if not alive:
             # Exit observed first. Only now read the outcome, so a stage that
             # wrote its outcome and exited within a poll window is not mistaken
@@ -3021,18 +3820,71 @@ def command_wait(args: argparse.Namespace) -> None:
                 }
             )
             return
-        if time.monotonic() - started >= ceiling:
+
+        observed_at = utc_now()
+        observation = observe_stage_activity(
+            entry,
+            target,
+            log_path,
+            pid,
+            create_time,
+            tracker.get("known_processes") or tracker.get("process_tree") or [],
+        )
+        updated_tracker, signals = update_activity_tracker(
+            tracker, observation, observed_at
+        )
+        if updated_tracker != tracker:
+            tracker = updated_tracker
+            if running:
+                running["activity"] = tracker
+                state["running"] = running
+                save_state(cli_path(args.state), state)
+        silent_seconds = elapsed_seconds(tracker.get("last_activity_at"), observed_at)
+        if (
+            silent_seconds is not None
+            and silent_seconds >= STAGE_INACTIVITY_LIMIT_SECONDS
+        ):
+            termination_error = None
+            try:
+                terminated = terminate_process_tree(pid, create_time, tracker)
+            except WorkflowError as error:
+                terminated = []
+                termination_error = str(error)
+            if termination_error is None and terminated is None:
+                continue
+            escalation = record_inactive_stage(
+                state,
+                running,
+                pid=pid,
+                terminated_processes=terminated,
+                silent_seconds=silent_seconds,
+                termination_error=termination_error,
+            )
+            save_state(cli_path(args.state), state)
             emit(
                 {
                     "result": "escalate",
-                    "reason": "wait_timeout_exceeded",
+                    "reason": "stage_inactive",
                     "stage": args.stage,
                     "pid": pid,
-                    "detail": (
-                        f"the {args.stage} process was still running after "
-                        f"{int(ceiling)} seconds"
-                    ),
-                    "next_action": ESCALATION_ACTIONS["wait_timeout_exceeded"],
+                    "detail": escalation["detail"],
+                    "next_action": escalation["next_action"],
+                    "terminated_processes": terminated,
+                    "termination_error": termination_error,
+                    "waited_seconds": round(time.monotonic() - started, 3),
+                }
+            )
+            return
+        if time.monotonic() - started >= wait_slice:
+            emit(
+                {
+                    "result": "still_running",
+                    "stage": args.stage,
+                    "pid": pid,
+                    "activity_signals": signals,
+                    "last_activity_at": tracker.get("last_activity_at"),
+                    "silent_for_seconds": silent_seconds,
+                    "next_action": "Run wait again while the stage process remains active.",
                     "waited_seconds": round(time.monotonic() - started, 3),
                 }
             )

@@ -322,7 +322,9 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "`resolve --state <path> --outcome no_checks`", self.instructions
+            "the helper already recorded the terminal skip in the same atomic state "
+            "write that observed it",
+            self.instructions,
         )
         self.assertIn(
             "A broken continuous integration configuration must never look like a "
@@ -1026,12 +1028,12 @@ class DecideTest(unittest.TestCase):
         decision = self.decide([check("check:a", klass="running")])
         self.assertEqual("waiting", decision["decision"])
 
-    def test_a_running_check_escalates_once_the_wait_runs_out(self):
+    def test_a_running_check_remains_nonterminal_when_the_poll_slice_ends(self):
         decision = self.decide(
             [check("check:a", klass="running")], deadline_expired=True
         )
-        self.assertEqual("escalate", decision["decision"])
-        self.assertEqual("timeout", decision["reason"])
+        self.assertEqual("waiting", decision["decision"])
+        self.assertEqual("still_running", decision["reason"])
 
     def test_an_approval_blocked_check_escalates_before_anything_else(self):
         decision = self.decide(
@@ -2064,16 +2066,29 @@ class ChecksCommandTest(unittest.TestCase):
 
     def test_reports_green(self):
         path = write_state(self.root)
-        payload = self.read(path, ("head1", [check("check:a", klass="passed")]))
+        with mock.patch.object(MODULE, "save_state", wraps=MODULE.save_state) as save:
+            payload = self.read(path, ("head1", [check("check:a", klass="passed")]))
         self.assertEqual("green", payload["result"])
         self.assertEqual(1, payload["counts"]["passed"])
         self.assertTrue(Path(payload["checks_path"]).is_file())
+        self.assertEqual(1, save.call_count)
+        saved = save.call_args.args[1]
+        self.assertEqual("green", saved["outcome"])
+        self.assertEqual("head1", saved["clean_at_head_sha"])
+        self.assertEqual("green", saved["run"]["outcome"])
 
     def test_reports_a_repository_with_no_checks(self):
         path = write_state(self.root)
-        payload = self.read(path, ("head1", []))
+        with mock.patch.object(MODULE, "save_state", wraps=MODULE.save_state) as save:
+            payload = self.read(path, ("head1", []))
         self.assertEqual("no_checks", payload["result"])
         self.assertEqual("no_applicable_checks", payload["reason"])
+        self.assertEqual(1, save.call_count)
+        self.assertEqual("no_checks", save.call_args.args[1]["outcome"])
+        state = MODULE.load_state(path)
+        self.assertEqual("no_checks", state["outcome"])
+        self.assertEqual("head1", state["clean_at_head_sha"])
+        self.assertIn("no applicable checks", state["skip_note"])
 
     def test_asks_for_a_verdict_when_the_base_evidence_is_silent(self):
         path = write_state(self.root)
@@ -2112,6 +2127,22 @@ class ChecksCommandTest(unittest.TestCase):
         path = write_state(self.root)
         payload = self.read(path, ("head1", [check("check:a", klass="running")]))
         self.assertEqual("waiting", payload["result"])
+        self.assertIsNone(MODULE.load_state(path)["escalation"])
+
+    def test_wait_returns_still_running_after_the_default_five_minute_slice(self):
+        self.assertEqual(300, MODULE.DEFAULT_POLL_TIMEOUT)
+        path = write_state(self.root)
+        rollup = ("head1", [check("check:a", klass="running")])
+        with (
+            mock.patch.object(MODULE, "fetch_rollup", return_value=rollup),
+            mock.patch.object(MODULE, "baseline_conclusions", return_value={}),
+            mock.patch.object(MODULE, "time") as clock,
+        ):
+            clock.monotonic.side_effect = [0.0, 0.0, 300.0]
+            clock.sleep.return_value = None
+            payload = call("checks", "--state", str(path), "--wait")
+        self.assertEqual("waiting", payload["result"])
+        self.assertEqual("still_running", payload["reason"])
         self.assertIsNone(MODULE.load_state(path)["escalation"])
 
     def test_escalates_an_approval_blocked_fork_run(self):

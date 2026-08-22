@@ -22,7 +22,7 @@ STATE_VERSION = 1
 DEFAULT_MAX_ITERATIONS = 5
 DEFAULT_PIPELINE_MAX_ITERATIONS = 2
 DEFAULT_POLL_INTERVAL = 60
-DEFAULT_POLL_TIMEOUT = 5400
+DEFAULT_POLL_TIMEOUT = 300
 DEFAULT_NOT_STARTED_GRACE = 900
 MAX_RERUNS_PER_CHECK = 1
 PR_HEAD_LAG_RETRY_DELAY = 1
@@ -1090,11 +1090,11 @@ def decide(
     if pending:
         if deadline_expired:
             return {
-                "decision": "escalate",
-                "reason": "timeout",
+                "decision": "waiting",
+                "reason": "still_running",
                 "checks": pending,
                 "detail": (
-                    "these checks had not finished when the wait ran out of time: "
+                    "these checks are still running after this polling slice: "
                     f"{describe_checks(checks, pending)}"
                 ),
             }
@@ -2117,6 +2117,28 @@ def snapshot_checks(
     }
 
 
+def record_terminal_outcome(
+    state: dict[str, Any], run_state: dict[str, Any], outcome: str
+) -> str | None:
+    if outcome not in ("green", "no_checks"):
+        raise WorkflowError(f"cannot record nonterminal checks outcome {outcome!r}")
+    pinned = run_state["head_sha"]
+    run_state["outcome"] = outcome
+    run_state["clean_at_head_sha"] = pinned
+    state["clean_at_head_sha"] = pinned
+    state["outcome"] = outcome
+    state["escalation"] = None
+    note = (
+        f"CI Fix Loop skipped {state['pr']['repo_name']}#{state['pr']['number']}: "
+        "the pull request head reports no applicable checks, so this repository ran "
+        "no CI on it."
+        if outcome == "no_checks"
+        else None
+    )
+    state["skip_note"] = note
+    return note
+
+
 def command_checks(args: argparse.Namespace) -> None:
     require_tools()
     path = cli_path(args.state)
@@ -2132,7 +2154,7 @@ def command_checks(args: argparse.Namespace) -> None:
             not_started_grace=args.not_started_grace,
             deadline_expired=expired,
         )
-        if snapshot["decision"]["decision"] != "waiting":
+        if snapshot["decision"]["decision"] != "waiting" or expired:
             break
         if not args.wait:
             break
@@ -2159,6 +2181,8 @@ def command_checks(args: argparse.Namespace) -> None:
             "head_sha": run_state["head_sha"],
             "recorded_at": utc_now(),
         }
+    if action["action"] in ("green", "no_checks"):
+        record_terminal_outcome(state, run_state, action["action"])
     save_state(path, state)
 
     checks_path = checks_path_for(path)
@@ -2487,19 +2511,7 @@ def command_resolve(args: argparse.Namespace) -> None:
             f"{decision['detail']}"
         )
     run_state["checks"] = checks
-    run_state["outcome"] = args.outcome
-    run_state["clean_at_head_sha"] = pinned
-    state["clean_at_head_sha"] = pinned
-    state["outcome"] = args.outcome
-    state["escalation"] = None
-    note = (
-        f"CI Fix Loop skipped {state['pr']['repo_name']}#{state['pr']['number']}: "
-        "the pull request head reports no applicable checks, so this repository ran "
-        "no CI on it."
-        if args.outcome == "no_checks"
-        else None
-    )
-    state["skip_note"] = note
+    note = record_terminal_outcome(state, run_state, args.outcome)
     save_state(path, state)
     emit(
         {

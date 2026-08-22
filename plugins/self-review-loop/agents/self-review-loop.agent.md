@@ -167,8 +167,8 @@ Each verdict names the decision it failed and the evidence behind that decision.
 
 Candidate evaluations do not depend on each other, so run them at the same time rather than one after another.
 
-- Launch each candidate's evaluator with the task tool in `mode: background`, and keep at most **5 evaluators in flight**. As each one finishes, launch the next until you have evaluated every registered candidate.
-- Waiting on those evaluators is the run's only remaining work, so this overrides the general guidance against launching a background agent and then reading its result. Collect every verdict with `read_agent`.
+- Launch every evaluator as a synchronous task call, and issue the calls together in one tool-call response so they execute concurrently. Each synchronous call returns its completed verdict in that response.
+- Never create a persistent background evaluator handle, and never use a later result-read call to collect evaluator verdicts. If there are more candidates than one response can launch safely, send another concurrent synchronous batch only after the preceding batch has returned.
 - Running evaluators at the same time never relaxes the isolation rule: one candidate per evaluator, a fresh agent for each, and no shared context between them. Never widen a running evaluator to cover a second candidate.
 - Evaluators only read. They must not edit a file, run a git command that writes, stage, commit, push, or change GitHub. A focused probe must only read, must write any artifact outside the repository under its own unique temporary location, and must delete that location afterward, so evaluators running at the same time cannot collide in this shared worktree.
 - Only this agent calls the helper. Consume the collected verdicts in candidate ID order whatever order they finish in, so the `drop` rationales, the batching, the commits, and the dropped-candidate block stay the same every time.

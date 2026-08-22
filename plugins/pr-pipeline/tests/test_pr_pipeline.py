@@ -2400,6 +2400,15 @@ class LaunchPlanTest(unittest.TestCase):
         )
         self.assertEqual("high", plan["command"][plan["command"].index("--effort") + 1])
 
+    def test_every_stage_launches_in_capped_autopilot_mode(self):
+        for stage in MODULE.STAGE_NAMES:
+            with self.subTest(stage=stage):
+                command = MODULE.launch_plan(build_state(), stage)["command"]
+                self.assertEqual(1, command.count("--autopilot"))
+                self.assertEqual(1, command.count("--max-autopilot-continues"))
+                cap_index = command.index("--max-autopilot-continues")
+                self.assertEqual("5", command[cap_index + 1])
+
     def test_a_per_stage_model_override_reaches_the_plan(self):
         state = build_state(stage_models={MODULE.STAGE_CI: "claude-opus-4.8"})
         plan = MODULE.launch_plan(state, MODULE.STAGE_CI)
@@ -4707,6 +4716,196 @@ class StartLogRoundTripTest(CommandTestCase):
         self.assertEqual("session", state["running"]["launch"])
 
 
+class ProcessTreeActivityTest(unittest.TestCase):
+    class ProcessError(Exception):
+        pass
+
+    def fake_psutil(self, root, *, wait_results=None):
+        wait_results = list(wait_results or [([], [])])
+
+        def wait_procs(processes, timeout):
+            return wait_results.pop(0)
+
+        return SimpleNamespace(
+            Process=lambda pid: root,
+            NoSuchProcess=self.ProcessError,
+            AccessDenied=self.ProcessError,
+            ZombieProcess=self.ProcessError,
+            wait_procs=wait_procs,
+        )
+
+    def test_cpu_progress_includes_the_root_and_every_descendant(self):
+        child = SimpleNamespace(
+            pid=4343,
+            create_time=lambda: 101.0,
+            cpu_times=lambda: SimpleNamespace(user=3.0, system=4.0),
+        )
+        root = SimpleNamespace(
+            pid=4242,
+            create_time=lambda: 100.0,
+            cpu_times=lambda: SimpleNamespace(user=1.0, system=2.0),
+            children=lambda recursive: [child],
+        )
+        psutil = self.fake_psutil(root)
+        with mock.patch.dict(sys.modules, {"psutil": psutil}):
+            snapshot = MODULE._psutil_process_tree_snapshot(4242, 100.0)
+        self.assertEqual(
+            ["4242:psutil:100.000000", "4343:psutil:101.000000"],
+            snapshot["process_tree"],
+        )
+        self.assertEqual(10.0, snapshot["cpu_seconds"])
+
+    def test_cpu_progress_is_compared_per_process_after_a_descendant_detaches(self):
+        previous = {
+            "last_activity_at": "2026-01-01T00:00:00Z",
+            "process_tree": ["1:psutil:1.0", "2:psutil:2.0"],
+            "known_processes": ["1:psutil:1.0", "2:psutil:2.0"],
+            "process_cpu": {"1:psutil:1.0": 10.0, "2:psutil:2.0": 5.0},
+            "cpu_seconds": 15.0,
+        }
+        current = {
+            "process_tree": ["2:psutil:2.0"],
+            "process_cpu": {"2:psutil:2.0": 6.0},
+            "cpu_seconds": 6.0,
+        }
+        tracker, signals = MODULE.update_activity_tracker(
+            previous, current, "2026-01-01T00:20:00Z"
+        )
+        self.assertIn("process_cpu", signals)
+        self.assertEqual("2026-01-01T00:20:00Z", tracker["last_activity_at"])
+
+    def test_native_tree_selection_includes_nested_descendants_only(self):
+        rows = [
+            {"ProcessId": 1, "ParentProcessId": 0},
+            {"ProcessId": 2, "ParentProcessId": 1},
+            {"ProcessId": 3, "ParentProcessId": 2},
+            {"ProcessId": 9, "ParentProcessId": 0},
+        ]
+        selected = MODULE._descendant_rows(rows, 1)
+        self.assertEqual([1, 2, 3], [row["ProcessId"] for row in selected])
+
+    def test_a_descendant_keeps_the_stage_alive_after_the_root_exits(self):
+        with (
+            mock.patch.object(MODULE, "process_alive", return_value=False),
+            mock.patch.object(
+                MODULE,
+                "process_tree_snapshot",
+                return_value={
+                    "process_tree": ["4343:101.000000"],
+                    "cpu_seconds": 3.0,
+                },
+            ),
+        ):
+            self.assertTrue(MODULE.stage_process_tree_alive(4242, 100.0))
+
+    def test_a_previously_observed_descendant_survives_broken_parent_links(self):
+        child = SimpleNamespace(
+            pid=4343,
+            create_time=lambda: 101.0,
+            is_running=lambda: True,
+            status=lambda: "running",
+            cpu_times=lambda: SimpleNamespace(user=2.0, system=3.0),
+        )
+        psutil = self.fake_psutil(child)
+        psutil.ZOMBIE = "zombie"
+        with (
+            mock.patch.dict(sys.modules, {"psutil": psutil}),
+            mock.patch.object(MODULE, "process_alive", return_value=False),
+            mock.patch.object(
+                MODULE,
+                "process_tree_snapshot",
+                return_value={"process_tree": [], "cpu_seconds": 0.0},
+            ),
+        ):
+            self.assertTrue(
+                MODULE.stage_process_tree_alive(
+                    4242,
+                    100.0,
+                    {"known_processes": ["4343:psutil:101.000000"]},
+                )
+            )
+            snapshot = MODULE.known_process_snapshot(
+                ["4343:psutil:101.000000"]
+            )
+            self.assertEqual(["4343:psutil:101.000000"], snapshot["process_tree"])
+            self.assertEqual(5.0, snapshot["cpu_seconds"])
+
+    def test_termination_stops_descendants_before_the_root(self):
+        calls = []
+
+        def process(pid, created):
+            return SimpleNamespace(
+                pid=pid,
+                create_time=lambda: created,
+                terminate=lambda: calls.append(("terminate", pid)),
+                kill=lambda: calls.append(("kill", pid)),
+            )
+
+        child = process(4343, 101.0)
+        root = process(4242, 100.0)
+        root.children = lambda recursive: [child]
+        psutil = self.fake_psutil(root)
+        with mock.patch.dict(sys.modules, {"psutil": psutil}):
+            terminated = MODULE.terminate_process_tree(4242, 100.0)
+        self.assertEqual([4343, 4242], terminated)
+        self.assertEqual([("terminate", 4343), ("terminate", 4242)], calls)
+
+    def test_termination_includes_a_previously_observed_detached_descendant(self):
+        calls = []
+
+        def process(pid, created):
+            return SimpleNamespace(
+                pid=pid,
+                create_time=lambda: created,
+                is_running=lambda: True,
+                status=lambda: "running",
+                children=lambda recursive: [],
+                terminate=lambda: calls.append(("terminate", pid)),
+                kill=lambda: calls.append(("kill", pid)),
+            )
+
+        root = process(4242, 100.0)
+        child = process(4343, 101.0)
+        processes = {4242: root, 4343: child}
+        psutil = SimpleNamespace(
+            Process=lambda pid: processes[pid],
+            NoSuchProcess=self.ProcessError,
+            AccessDenied=self.ProcessError,
+            ZombieProcess=self.ProcessError,
+            ZOMBIE="zombie",
+            wait_procs=lambda processes, timeout: (processes, []),
+        )
+        tracker = {"known_processes": ["4343:psutil:101.000000"]}
+        with mock.patch.dict(sys.modules, {"psutil": psutil}):
+            terminated = MODULE.terminate_process_tree(4242, 100.0, tracker)
+        self.assertEqual([4343, 4242], terminated)
+        self.assertEqual([("terminate", 4343), ("terminate", 4242)], calls)
+
+    def test_termination_refuses_a_reused_root_pid(self):
+        root = SimpleNamespace(pid=4242, create_time=lambda: 200.0)
+        psutil = self.fake_psutil(root)
+        with mock.patch.dict(sys.modules, {"psutil": psutil}):
+            with self.assertRaises(MODULE.WorkflowError):
+                MODULE.terminate_process_tree(4242, 100.0)
+
+    def test_a_process_that_ignores_terminate_is_killed(self):
+        calls = []
+        root = SimpleNamespace(
+            pid=4242,
+            create_time=lambda: 100.0,
+            children=lambda recursive: [],
+            terminate=lambda: calls.append("terminate"),
+            kill=lambda: calls.append("kill"),
+        )
+        psutil = self.fake_psutil(
+            root,
+            wait_results=[([], [root]), ([root], [])],
+        )
+        with mock.patch.dict(sys.modules, {"psutil": psutil}):
+            MODULE.terminate_process_tree(4242, 100.0)
+        self.assertEqual(["terminate", "kill"], calls)
+
+
 class WaitCommandTest(CommandTestCase):
     def wait_args(self, path, **overrides):
         base = dict(
@@ -4723,7 +4922,7 @@ class WaitCommandTest(CommandTestCase):
     def test_it_returns_the_outcome_only_after_the_process_exits(self):
         path = write_state(self.root)
         self.stage_reading = {"available": True, "outcome": "cleared"}
-        with mock.patch.object(MODULE, "process_alive", return_value=False):
+        with mock.patch.object(MODULE, "stage_process_tree_alive", return_value=False):
             with mock.patch.object(MODULE, "time") as clock:
                 clock.monotonic.side_effect = [0.0, 0.0]
                 MODULE.command_wait(self.wait_args(path))
@@ -4734,7 +4933,7 @@ class WaitCommandTest(CommandTestCase):
     def test_a_process_gone_without_an_outcome_is_carried(self):
         path = write_state(self.root)
         self.stage_reading = {"available": False, "reason": "not_reported"}
-        with mock.patch.object(MODULE, "process_alive", return_value=False):
+        with mock.patch.object(MODULE, "stage_process_tree_alive", return_value=False):
             with mock.patch.object(MODULE, "time") as clock:
                 clock.monotonic.side_effect = [0.0, 0.0]
                 MODULE.command_wait(self.wait_args(path))
@@ -4742,17 +4941,249 @@ class WaitCommandTest(CommandTestCase):
         self.assertEqual("carry", result["result"])
         self.assertEqual("process_exited_without_outcome", result["reason"])
 
-    def test_a_process_still_alive_at_the_ceiling_escalates(self):
+    def test_wait_refuses_a_pid_without_its_creation_time(self):
         path = write_state(self.root)
-        with mock.patch.object(MODULE, "process_alive", return_value=True):
-            with mock.patch.object(MODULE, "time") as clock:
-                # first sample under ceiling schedules a sleep, second is over it
-                clock.monotonic.side_effect = [0.0, 0.0, 999999.0, 999999.0]
-                clock.sleep.return_value = None
-                MODULE.command_wait(self.wait_args(path, timeout="10"))
+        with self.assertRaises(MODULE.WorkflowError):
+            MODULE.command_wait(
+                self.wait_args(path, process_create_time=None)
+            )
+
+    def test_a_live_process_returns_control_after_a_five_minute_slice(self):
+        now = "2026-01-01T00:10:00Z"
+        path = write_state(
+            self.root,
+            running={
+                "stage": MODULE.STAGE_CI,
+                "started_at": "2026-01-01T00:00:00Z",
+                "activity": {
+                    "last_activity_at": now,
+                    "helper_stamp": None,
+                    "log_size": 0,
+                    "process_tree": ["4242:100.0"],
+                    "cpu_seconds": 4.0,
+                },
+            },
+        )
+        observation = {
+            "helper_stamp": None,
+            "log_size": 0,
+            "process_tree": ["4242:100.0"],
+            "cpu_seconds": 4.0,
+        }
+        with (
+            mock.patch.object(MODULE, "stage_process_tree_alive", return_value=True),
+            mock.patch.object(MODULE, "observe_stage_activity", return_value=observation),
+            mock.patch.object(MODULE, "utc_now", return_value=now),
+            mock.patch.object(MODULE, "time") as clock,
+        ):
+            clock.monotonic.side_effect = [0.0, 301.0, 301.0]
+            MODULE.command_wait(self.wait_args(path))
+        result = self.emitted[-1]
+        self.assertEqual("still_running", result["result"])
+        self.assertEqual(300, MODULE.STAGE_WAIT_SLICE_SECONDS)
+        self.assertEqual(301.0, result["waited_seconds"])
+
+    def test_a_stage_has_no_absolute_wall_clock_ceiling(self):
+        self.assertFalse(hasattr(MODULE, "STAGE_WAIT_CEILING_SECONDS"))
+        now = "2026-01-01T03:00:00Z"
+        path = write_state(
+            self.root,
+            running={
+                "stage": MODULE.STAGE_CI,
+                "started_at": "2026-01-01T00:00:00Z",
+                "activity": {
+                    "last_activity_at": now,
+                    "helper_stamp": "2026-01-01T03:00:00Z",
+                    "log_size": 100,
+                    "process_tree": ["4242:100.0"],
+                    "cpu_seconds": 10.0,
+                },
+            },
+        )
+        observation = {
+            "helper_stamp": "2026-01-01T03:00:00Z",
+            "log_size": 100,
+            "process_tree": ["4242:100.0"],
+            "cpu_seconds": 10.0,
+        }
+        with (
+            mock.patch.object(MODULE, "stage_process_tree_alive", return_value=True),
+            mock.patch.object(MODULE, "observe_stage_activity", return_value=observation),
+            mock.patch.object(MODULE, "utc_now", return_value=now),
+            mock.patch.object(MODULE, "time") as clock,
+        ):
+            clock.monotonic.side_effect = [0.0, 301.0, 301.0]
+            MODULE.command_wait(self.wait_args(path))
+        self.assertEqual("still_running", self.emitted[-1]["result"])
+
+    def test_each_observable_signal_resets_the_inactivity_clock(self):
+        previous = {
+            "last_activity_at": "2026-01-01T00:00:00Z",
+            "helper_stamp": "2026-01-01T00:00:00Z",
+            "log_size": 10,
+            "process_tree": ["4242:100.0"],
+            "cpu_seconds": 3.0,
+        }
+        changes = {
+            "helper_state": {"helper_stamp": "2026-01-01T00:01:00Z"},
+            "stage_log": {"log_size": 11},
+            "process_tree": {
+                "process_tree": ["4242:100.0", "4343:101.0"],
+            },
+            "process_cpu": {"cpu_seconds": 3.5},
+        }
+        for expected_signal, delta in changes.items():
+            with self.subTest(signal=expected_signal):
+                current = {
+                    key: value
+                    for key, value in previous.items()
+                    if key != "last_activity_at"
+                }
+                current.update(delta)
+                tracker, signals = MODULE.update_activity_tracker(
+                    previous, current, "2026-01-01T00:20:00Z"
+                )
+                self.assertEqual([expected_signal], signals)
+                self.assertEqual(
+                    "2026-01-01T00:20:00Z", tracker["last_activity_at"]
+                )
+
+    def test_thirty_minutes_of_total_silence_terminates_and_escalates(self):
+        now = "2026-01-01T00:30:00Z"
+        activity = {
+            "last_activity_at": "2026-01-01T00:00:00Z",
+            "helper_stamp": None,
+            "log_size": 0,
+            "process_tree": ["4242:100.0"],
+            "cpu_seconds": 0.0,
+        }
+        path = write_state(
+            self.root,
+            running={
+                "stage": MODULE.STAGE_CI,
+                "head_sha": HEAD,
+                "iteration": 1,
+                "started_at": "2026-01-01T00:00:00Z",
+                "process_id": "4242",
+                "process_create_time": 100.0,
+                "log_path": "stage.log",
+                "activity": activity,
+            },
+        )
+        observation = {
+            key: value for key, value in activity.items() if key != "last_activity_at"
+        }
+        with (
+            mock.patch.object(MODULE, "stage_process_tree_alive", return_value=True),
+            mock.patch.object(MODULE, "observe_stage_activity", return_value=observation),
+            mock.patch.object(
+                MODULE, "terminate_process_tree", return_value=[4343, 4242]
+            ) as terminate,
+            mock.patch.object(MODULE, "utc_now", return_value=now),
+            mock.patch.object(MODULE, "time") as clock,
+        ):
+            clock.monotonic.side_effect = [0.0, 0.0, 0.0]
+            MODULE.command_wait(self.wait_args(path))
+        terminate.assert_called_once()
+        self.assertEqual((4242, 100.0), terminate.call_args.args[:2])
+        self.assertEqual(
+            activity["last_activity_at"],
+            terminate.call_args.args[2]["last_activity_at"],
+        )
         result = self.emitted[-1]
         self.assertEqual("escalate", result["result"])
-        self.assertEqual("wait_timeout_exceeded", result["reason"])
+        self.assertEqual("stage_inactive", result["reason"])
+        state = MODULE.load_state(path)
+        self.assertIsNone(state["running"])
+        self.assertEqual("stage_inactive", state["escalation"]["reason"])
+        self.assertEqual("escalated", state["history"][-1]["outcome"])
+
+    def test_termination_failure_still_records_the_terminal_escalation(self):
+        now = "2026-01-01T00:30:00Z"
+        activity = {
+            "last_activity_at": "2026-01-01T00:00:00Z",
+            "helper_stamp": None,
+            "log_size": 0,
+            "process_tree": ["4242:100.0"],
+            "cpu_seconds": 0.0,
+        }
+        path = write_state(
+            self.root,
+            running={
+                "stage": MODULE.STAGE_CI,
+                "head_sha": HEAD,
+                "iteration": 1,
+                "started_at": "2026-01-01T00:00:00Z",
+                "process_id": "4242",
+                "process_create_time": 100.0,
+                "activity": activity,
+            },
+        )
+        observation = {
+            key: value for key, value in activity.items() if key != "last_activity_at"
+        }
+        with (
+            mock.patch.object(MODULE, "stage_process_tree_alive", return_value=True),
+            mock.patch.object(MODULE, "observe_stage_activity", return_value=observation),
+            mock.patch.object(
+                MODULE,
+                "terminate_process_tree",
+                side_effect=MODULE.WorkflowError("access denied"),
+            ),
+            mock.patch.object(MODULE, "utc_now", return_value=now),
+            mock.patch.object(MODULE, "time") as clock,
+        ):
+            clock.monotonic.side_effect = [0.0, 0.0, 0.0]
+            MODULE.command_wait(self.wait_args(path))
+        result = self.emitted[-1]
+        self.assertEqual("escalate", result["result"])
+        self.assertEqual("access denied", result["termination_error"])
+        state = MODULE.load_state(path)
+        self.assertIsNone(state["running"])
+        self.assertEqual("stage_inactive", state["escalation"]["reason"])
+        self.assertEqual("4242", state["unterminated_process"]["process_id"])
+        with mock.patch.object(MODULE, "stage_process_tree_alive", return_value=True):
+            with self.assertRaises(MODULE.WorkflowError):
+                MODULE.begin_run(state)
+
+    def test_natural_exit_during_inactivity_termination_is_still_carried(self):
+        now = "2026-01-01T00:30:00Z"
+        activity = {
+            "last_activity_at": "2026-01-01T00:00:00Z",
+            "helper_stamp": None,
+            "log_size": 0,
+            "process_tree": ["4242:psutil:100.000000"],
+            "cpu_seconds": 0.0,
+        }
+        path = write_state(
+            self.root,
+            running={
+                "stage": MODULE.STAGE_CI,
+                "started_at": "2026-01-01T00:00:00Z",
+                "activity": activity,
+            },
+        )
+        observation = {
+            key: value for key, value in activity.items() if key != "last_activity_at"
+        }
+        alive = [True, False, False]
+        with (
+            mock.patch.object(
+                MODULE,
+                "stage_process_tree_alive",
+                side_effect=lambda *_: alive.pop(0),
+            ),
+            mock.patch.object(MODULE, "observe_stage_activity", return_value=observation),
+            mock.patch.object(MODULE, "terminate_process_tree", return_value=None),
+            mock.patch.object(MODULE, "utc_now", return_value=now),
+            mock.patch.object(MODULE, "time") as clock,
+        ):
+            clock.monotonic.side_effect = [0.0, 0.0]
+            MODULE.command_wait(self.wait_args(path))
+        self.assertEqual("carry", self.emitted[-1]["result"])
+        self.assertEqual(
+            "process_exited_without_outcome", self.emitted[-1]["reason"]
+        )
 
     def test_seeing_an_outcome_while_alive_is_not_a_reason_to_return(self):
         # The load-bearing ordering: exit is observed before the outcome is
@@ -4764,7 +5195,7 @@ class WaitCommandTest(CommandTestCase):
         self.stage_reading = {"available": True, "outcome": "cleared"}
         alive_states = [True, False]
         with mock.patch.object(
-            MODULE, "process_alive", side_effect=lambda *_: alive_states.pop(0)
+            MODULE, "stage_process_tree_alive", side_effect=lambda *_: alive_states.pop(0)
         ):
             with mock.patch.object(MODULE, "time") as clock:
                 clock.monotonic.side_effect = [0.0, 0.0, 0.0, 0.0]
@@ -5730,6 +6161,20 @@ class NextProbesTheStageProcessTest(CommandTestCase):
 
         self.assertEqual("stage_running", still_there["result"])
         self.assertEqual(MODULE.RUNNING_STAGE_ALIVE, still_there["verdict"])
+
+    def test_a_recorded_outcome_does_not_finish_a_live_process_tree(self):
+        repo = self.make_repo("session")
+        path = self.preflight_state(repo)
+        log = self.root / "stage.log"
+        process = self.sleeping_process()
+        create_time = MODULE.process_create_time(process.pid)
+        self.record_running(path, pid=process.pid, create_time=create_time, log=log)
+        self.stage_says(MODULE.CLEARING_OUTCOMES[0])
+
+        emitted = self.ask_next(path)
+
+        self.assertEqual("stage_running", emitted["result"])
+        self.assertEqual(MODULE.RUNNING_STAGE_ALIVE, emitted["verdict"])
 
     def test_a_stage_that_recorded_its_result_before_exiting_is_not_abandoned(self):
         # Order matters. Probing before reading the recorded result would turn

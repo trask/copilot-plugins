@@ -319,15 +319,17 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "Launch each candidate's evaluator with the task tool in `mode: "
-            "background`, and keep at most **5 evaluators in flight**",
+            "Launch every evaluator as a synchronous task call, and issue the calls "
+            "together in one tool-call response",
             self.instructions,
         )
         self.assertIn(
-            "overrides the general guidance against launching a background agent and "
-            "then reading its result",
+            "Each synchronous call returns its completed verdict",
             self.instructions,
         )
+        self.assertIn("Never create a persistent background evaluator handle", self.instructions)
+        self.assertNotIn("`mode: background`", self.instructions)
+        self.assertNotIn("`read_agent`", self.instructions)
         self.assertIn(
             "Running evaluators at the same time never relaxes the isolation rule", self.instructions
         )
