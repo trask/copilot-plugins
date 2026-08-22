@@ -431,6 +431,34 @@ def process_alive(pid: int, create_time: float | None) -> bool:
     return True
 
 
+def process_exited(pid: int, create_time: float | None) -> bool:
+    """Whether the recorded process is confirmed gone rather than merely unreadable."""
+
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        current = _process_create_time_native(pid)
+        return current is not None and (
+            create_time is not None
+            and abs(current - create_time) > PROCESS_IDENTITY_TOLERANCE
+        )
+    try:
+        process = psutil.Process(pid)
+        current = float(process.create_time())
+        running = process.is_running()
+        status = process.status()
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return True
+    except psutil.AccessDenied:
+        return False
+    if (
+        create_time is not None
+        and abs(current - create_time) > PROCESS_IDENTITY_TOLERANCE
+    ):
+        return True
+    return not running or status == psutil.ZOMBIE
+
+
 def _psutil_process_tree_snapshot(
     pid: int, create_time: float | None
 ) -> dict[str, Any] | None:
@@ -3142,15 +3170,28 @@ def probe_running_stage(state: dict[str, Any]) -> dict[str, Any] | None:
         probe["reason"] = "no_process_create_time_recorded"
         return probe
 
+    create_time = float(probe["process_create_time"])
+    entry = STAGE_BY_NAME.get(stage) if isinstance(stage, str) else None
+    if process_exited(pid, create_time) and entry is not None:
+        reading = read_stage_outcome(
+            entry,
+            build_target(
+                state["pr"]["owner"], state["pr"]["repo"], state["pr"]["number"]
+            ),
+        )
+        if reading.get("available"):
+            probe["verdict"] = RUNNING_STAGE_FINISHED
+            probe["outcome"] = reading.get("outcome")
+            return probe
+
     if stage_process_tree_alive(
         pid,
-        float(probe["process_create_time"]),
+        create_time,
         running.get("activity") if isinstance(running.get("activity"), dict) else None,
     ):
         probe["verdict"] = RUNNING_STAGE_ALIVE
         return probe
 
-    entry = STAGE_BY_NAME.get(stage) if isinstance(stage, str) else None
     if entry is not None:
         reading = read_stage_outcome(
             entry,
@@ -3764,11 +3805,13 @@ def command_wait(args: argparse.Namespace) -> None:
             "wait requires --process-create-time so a recycled pid cannot be "
             "monitored or terminated as the stage"
         )
-    wait_slice = (
-        float(args.timeout) if args.timeout is not None else STAGE_WAIT_SLICE_SECONDS
+    wait_slice = min(
+        float(args.timeout) if args.timeout is not None else STAGE_WAIT_SLICE_SECONDS,
+        float(STAGE_WAIT_SLICE_SECONDS),
     )
     poll = float(args.poll) if args.poll is not None else STAGE_WAIT_POLL_SECONDS
     started = time.monotonic()
+    deadline = started + max(0.0, wait_slice)
     running = state.get("running")
     running = running if isinstance(running, dict) else {}
     tracker = running.get("activity")
@@ -3784,6 +3827,35 @@ def command_wait(args: argparse.Namespace) -> None:
     log_path = cli_path(log_value) if isinstance(log_value, str) and log_value else None
 
     while True:
+        if time.monotonic() >= deadline:
+            emit(
+                {
+                    "result": "still_running",
+                    "stage": args.stage,
+                    "pid": pid,
+                    "activity_signals": [],
+                    "last_activity_at": tracker.get("last_activity_at"),
+                    "silent_for_seconds": elapsed_seconds(
+                        tracker.get("last_activity_at"), utc_now()
+                    ),
+                    "next_action": "Run wait again while the stage process remains active.",
+                    "waited_seconds": round(time.monotonic() - started, 3),
+                }
+            )
+            return
+        if process_exited(pid, create_time):
+            reading = read_stage_outcome(entry, target)
+            if reading.get("available"):
+                emit(
+                    {
+                        "result": "finished",
+                        "stage": args.stage,
+                        "outcome": reading.get("outcome"),
+                        "pid": pid,
+                        "waited_seconds": round(time.monotonic() - started, 3),
+                    }
+                )
+                return
         alive = stage_process_tree_alive(pid, create_time, tracker)
         if not alive:
             # Exit observed first. Only now read the outcome, so a stage that
@@ -3889,7 +3961,7 @@ def command_wait(args: argparse.Namespace) -> None:
                 }
             )
             return
-        time.sleep(poll)
+        time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
 
 
 def command_reset(args: argparse.Namespace) -> None:

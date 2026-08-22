@@ -4924,18 +4924,31 @@ class WaitCommandTest(CommandTestCase):
         self.stage_reading = {"available": True, "outcome": "cleared"}
         with mock.patch.object(MODULE, "stage_process_tree_alive", return_value=False):
             with mock.patch.object(MODULE, "time") as clock:
-                clock.monotonic.side_effect = [0.0, 0.0]
+                clock.monotonic.return_value = 0.0
                 MODULE.command_wait(self.wait_args(path))
         result = self.emitted[-1]
         self.assertEqual("finished", result["result"])
         self.assertEqual("cleared", result["outcome"])
+
+    def test_terminal_outcome_wins_after_root_exit_despite_lingering_descendants(self):
+        path = write_state(self.root)
+        self.stage_reading = {"available": True, "outcome": "cleared"}
+        with (
+            mock.patch.object(MODULE, "process_exited", return_value=True),
+            mock.patch.object(MODULE, "stage_process_tree_alive", return_value=True),
+            mock.patch.object(MODULE, "time") as clock,
+        ):
+            clock.monotonic.return_value = 0.0
+            MODULE.command_wait(self.wait_args(path))
+        self.assertEqual("finished", self.emitted[-1]["result"])
+        self.assertEqual("cleared", self.emitted[-1]["outcome"])
 
     def test_a_process_gone_without_an_outcome_is_carried(self):
         path = write_state(self.root)
         self.stage_reading = {"available": False, "reason": "not_reported"}
         with mock.patch.object(MODULE, "stage_process_tree_alive", return_value=False):
             with mock.patch.object(MODULE, "time") as clock:
-                clock.monotonic.side_effect = [0.0, 0.0]
+                clock.monotonic.return_value = 0.0
                 MODULE.command_wait(self.wait_args(path))
         result = self.emitted[-1]
         self.assertEqual("carry", result["result"])
@@ -4982,6 +4995,36 @@ class WaitCommandTest(CommandTestCase):
         self.assertEqual("still_running", result["result"])
         self.assertEqual(300, MODULE.STAGE_WAIT_SLICE_SECONDS)
         self.assertEqual(301.0, result["waited_seconds"])
+
+    def test_activity_does_not_extend_the_five_minute_wait_slice(self):
+        path = write_state(self.root)
+        observations = [
+            {
+                "helper_stamp": None,
+                "log_size": size,
+                "process_tree": ["4242:psutil:100.000000"],
+                "process_cpu": {"4242:psutil:100.000000": float(size)},
+                "cpu_seconds": float(size),
+            }
+            for size in (1, 2)
+        ]
+        monotonic = iter([0.0, 0.0, 0.0, 299.0, 299.0, 300.0, 300.0])
+        with (
+            mock.patch.object(MODULE, "process_exited", return_value=False),
+            mock.patch.object(MODULE, "stage_process_tree_alive", return_value=True),
+            mock.patch.object(
+                MODULE,
+                "observe_stage_activity",
+                side_effect=lambda *args: observations.pop(0),
+            ),
+            mock.patch.object(MODULE, "time") as clock,
+        ):
+            clock.monotonic.side_effect = lambda: next(monotonic)
+            clock.sleep.return_value = None
+            MODULE.command_wait(self.wait_args(path))
+        self.assertEqual([], observations)
+        self.assertEqual("still_running", self.emitted[-1]["result"])
+        self.assertEqual(300.0, self.emitted[-1]["waited_seconds"])
 
     def test_a_stage_has_no_absolute_wall_clock_ceiling(self):
         self.assertFalse(hasattr(MODULE, "STAGE_WAIT_CEILING_SECONDS"))
@@ -5169,6 +5212,9 @@ class WaitCommandTest(CommandTestCase):
         alive = [True, False, False]
         with (
             mock.patch.object(
+                MODULE, "process_exited", side_effect=[False, True]
+            ),
+            mock.patch.object(
                 MODULE,
                 "stage_process_tree_alive",
                 side_effect=lambda *_: alive.pop(0),
@@ -5178,7 +5224,7 @@ class WaitCommandTest(CommandTestCase):
             mock.patch.object(MODULE, "utc_now", return_value=now),
             mock.patch.object(MODULE, "time") as clock,
         ):
-            clock.monotonic.side_effect = [0.0, 0.0]
+            clock.monotonic.return_value = 0.0
             MODULE.command_wait(self.wait_args(path))
         self.assertEqual("carry", self.emitted[-1]["result"])
         self.assertEqual(
@@ -5193,12 +5239,17 @@ class WaitCommandTest(CommandTestCase):
         # redundant liveness check; it is not, and must not be simplified away.
         path = write_state(self.root)
         self.stage_reading = {"available": True, "outcome": "cleared"}
-        alive_states = [True, False]
-        with mock.patch.object(
-            MODULE, "stage_process_tree_alive", side_effect=lambda *_: alive_states.pop(0)
+        alive_states = [True]
+        with (
+            mock.patch.object(MODULE, "process_exited", side_effect=[False, True]),
+            mock.patch.object(
+                MODULE,
+                "stage_process_tree_alive",
+                side_effect=lambda *_: alive_states.pop(0),
+            ),
         ):
             with mock.patch.object(MODULE, "time") as clock:
-                clock.monotonic.side_effect = [0.0, 0.0, 0.0, 0.0]
+                clock.monotonic.return_value = 0.0
                 clock.sleep.return_value = None
                 MODULE.command_wait(self.wait_args(path))
         # It looped once while alive, then returned finished only after exit.
