@@ -2061,6 +2061,20 @@ class ModelGateTest(unittest.TestCase):
         self.assertEqual("other", MODULE.model_family("mystery-1"))
         self.assertEqual("other", MODULE.model_family(""))
 
+    def test_the_stage_defaults_name_the_chosen_models(self):
+        models = MODULE.default_stage_models()
+        self.assertEqual("claude-opus-5", models[MODULE.STAGE_SELF_REVIEW])
+        for stage in MODULE.STAGE_NAMES:
+            if stage == MODULE.STAGE_SELF_REVIEW:
+                continue
+            with self.subTest(stage=stage):
+                self.assertEqual("gpt-5.6-sol", models[stage])
+
+    def test_the_stage_defaults_clear_the_family_gate(self):
+        gate = MODULE.gate_stage_models(MODULE.default_stage_models(), can_pin=True)
+        self.assertEqual("ready", gate["result"])
+        self.assertEqual([], gate["blocked"])
+
     def test_stage_models_fall_back_to_the_default(self):
         models = MODULE.stage_models(build_state(stage_models={}))
         self.assertEqual(MODULE.default_stage_models(), models)

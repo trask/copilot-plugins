@@ -41,7 +41,7 @@ STAGE_CI = "ci-fix-loop"
 STAGE_DESCRIPTION = "pr-description"
 
 CLAUDE_FAMILY = "claude"
-DEFAULT_STAGE_MODEL = "claude-sonnet-4.6"
+DEFAULT_STAGE_MODEL = "gpt-5.6-sol"
 DEFAULT_EFFORT = "high"
 
 # Every stage runs as a non-interactive subprocess with no person to answer a
@@ -71,9 +71,11 @@ STAGE_WAIT_POLL_SECONDS = 15
 # back for them, which starts the next pass.
 #
 # ``model`` names the model this stage runs best on. A stage that leaves it None
-# runs on DEFAULT_STAGE_MODEL. It is a starting point rather than a rule: a
-# ``--stage-model`` override at preflight beats it, and the ``requires_family``
-# gate still checks whatever model the stage ends up with.
+# runs on DEFAULT_STAGE_MODEL. ``self-review-loop`` carries its own because its
+# fixed GPT evaluator has to stay in a different family from the agent it grades.
+# A per-stage model is a starting point rather than a rule: a ``--stage-model``
+# override at preflight beats it, and the ``requires_family`` gate still checks
+# whatever model the stage ends up with.
 STAGES: tuple[dict[str, Any], ...] = (
     {
         "stage": STAGE_CONFLICT,
@@ -92,7 +94,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "module": "self_review_loop",
         "evidence": "helper",
         "requires_family": CLAUDE_FAMILY,
-        "model": None,
+        "model": "claude-opus-5",
         "summary": "review the diff and commit the verified fixes",
     },
     {
