@@ -1565,6 +1565,47 @@ def find_conflicts(
     return [by_path[path] for path in paths]
 
 
+def replayed_commit_paths(repo_root: Path) -> set[str]:
+    result = git_try(
+        repo_root,
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "-r",
+        "--root",
+        "-z",
+        "REBASE_HEAD",
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WorkflowError(f"could not read the commit being replayed: {detail}")
+    return {path for path in result.stdout.split("\0") if path}
+
+
+def normalize_companion_path(path: str) -> str:
+    normalized = path.replace("\\", "/")
+    if (
+        not normalized
+        or normalized.startswith("/")
+        or re.match(r"^[A-Za-z]:", normalized)
+        or ".." in normalized.split("/")
+    ):
+        raise WorkflowError(f"companion path must be relative to the repository: {path}")
+    return normalized
+
+
+def literal_pathspec(path: str) -> str:
+    return f":(literal){path}"
+
+
+def path_has_unstaged_changes(repo_root: Path, path: str) -> bool:
+    result = git_try(repo_root, "diff", "--quiet", "--", literal_pathspec(path))
+    if result.returncode not in {0, 1}:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WorkflowError(f"could not inspect {path}: {detail}")
+    return result.returncode == 1
+
+
 def archive_attempt(state: dict[str, Any]) -> None:
     """Fold a finished attempt into the durable history."""
     attempt = state.get("attempt")
@@ -1596,6 +1637,7 @@ def archive_attempt(state: dict[str, Any]) -> None:
                 for conflict in attempt.get("conflicts") or []
                 if conflict.get("status") == "resolved"
             ],
+            "companion_resolutions": attempt.get("companion_resolutions") or [],
             "started_at": attempt.get("started_at"),
             "ended_at": utc_now(),
         }
@@ -2372,13 +2414,39 @@ def command_resolved(args: argparse.Namespace) -> None:
         )
     repo_root = attempt_repo_root(state, attempt)
     conflicts = find_conflicts(attempt, args.paths)
+    companion_paths = list(
+        dict.fromkeys(
+            normalize_companion_path(path)
+            for path in (getattr(args, "companion_paths", None) or [])
+        )
+    )
+    conflict_paths = {
+        conflict["path"] for conflict in (attempt.get("conflicts") or [])
+    }
+    overlap = [path for path in companion_paths if path in conflict_paths]
+    if overlap:
+        raise WorkflowError(
+            f"companion paths are already recorded as conflicted paths: {overlap}"
+        )
+    if companion_paths and attempt.get("strategy") not in {"rebase", "stack"}:
+        raise WorkflowError(
+            "companion paths are allowed only while a rebase is replaying a commit"
+        )
+    if companion_paths:
+        replayed_paths = replayed_commit_paths(repo_root)
+        unrelated = [path for path in companion_paths if path not in replayed_paths]
+        if unrelated:
+            raise WorkflowError(
+                "companion paths are not touched by the commit currently being "
+                f"replayed: {unrelated}"
+            )
     rationale = (
         load_text_input(args.rationale_file, "rationale")
         if args.rationale_file
         else args.rationale
     )
 
-    recorded = []
+    validated_conflicts = []
     for conflict in conflicts:
         path = conflict["path"]
         blobs = stage_blobs(repo_root, path)
@@ -2427,18 +2495,87 @@ def command_resolved(args: argparse.Namespace) -> None:
                 "restore the original line endings, or pass --accept-line-endings with "
                 "the reason the file has to change style"
             )
-        add = git_try(repo_root, "add", "--all", "--", path)
-        if add.returncode != 0:
-            detail = add.stderr.strip() or add.stdout.strip() or "no output"
-            raise WorkflowError(f"could not stage {path}: {detail}")
+        validated_conflicts.append(
+            {
+                "conflict": conflict,
+                "path": path,
+                "one_side": one_side,
+                "deleted": deleted,
+            }
+        )
+
+    validated_companions = []
+    for path in companion_paths:
+        target = repo_root / path
+        deleted = not target.exists()
+        if deleted and not args.accept_deletion:
+            raise WorkflowError(
+                f"{path} no longer exists in the worktree; a companion deletion needs "
+                "--accept-deletion together with the reason both sides allow it"
+            )
+        if not deleted:
+            text = read_worktree_text(target)
+            if text is not None:
+                markers = parse_conflict_markers(text)
+                if markers["regions"] or markers["problems"]:
+                    raise WorkflowError(f"{path} still holds conflict markers")
+        if not path_has_unstaged_changes(repo_root, path):
+            raise WorkflowError(f"companion path has no unstaged resolution change: {path}")
+        validated_companions.append({"path": path, "deleted": deleted})
+
+    stage_paths = [
+        entry["path"] for entry in validated_conflicts + validated_companions
+    ]
+    add = git_try(
+        repo_root,
+        "add",
+        "--all",
+        "--",
+        *(literal_pathspec(path) for path in stage_paths),
+    )
+    if add.returncode != 0:
+        detail = add.stderr.strip() or add.stdout.strip() or "no output"
+        raise WorkflowError(
+            f"could not stage {', '.join(stage_paths)}: {detail}"
+        )
+
+    recorded = []
+    resolved_at = utc_now()
+    for entry in validated_conflicts:
+        conflict = entry["conflict"]
         conflict["status"] = "resolved"
         conflict["rationale"] = rationale
-        conflict["one_side"] = one_side
-        conflict["deleted"] = deleted
-        conflict["resolved_at"] = utc_now()
+        conflict["one_side"] = entry["one_side"]
+        conflict["deleted"] = entry["deleted"]
+        conflict["resolved_at"] = resolved_at
         recorded.append(
-            {"path": path, "one_side": one_side, "deleted": deleted}
+            {
+                "path": entry["path"],
+                "one_side": entry["one_side"],
+                "deleted": entry["deleted"],
+            }
         )
+
+    companion_resolutions = list(attempt.get("companion_resolutions") or [])
+    companions = []
+    for entry in validated_companions:
+        path = entry["path"]
+        companion_resolutions[:] = [
+            existing
+            for existing in companion_resolutions
+            if existing.get("path") != path
+        ]
+        companion_resolutions.append(
+            {
+                "path": path,
+                "rationale": rationale,
+                "deleted": entry["deleted"],
+                "resolved_at": resolved_at,
+            }
+        )
+        companions.append({"path": path, "deleted": entry["deleted"]})
+    if companion_resolutions:
+        attempt["companion_resolutions"] = companion_resolutions
 
     save_state(state_path, state)
     remaining = [
@@ -2451,6 +2588,7 @@ def command_resolved(args: argparse.Namespace) -> None:
             "result": "recorded",
             "state": str(state_path),
             "resolved": recorded,
+            "companions": companions,
             "remaining_conflicts": remaining,
             "next": "continue" if not remaining else "resolved",
         }
@@ -3919,6 +4057,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resolved.add_argument("--state", required=True)
     resolved.add_argument("--paths", nargs="+", required=True)
+    resolved.add_argument(
+        "--companion-paths",
+        nargs="+",
+        help=(
+            "non-conflicted files that the commit being replayed also touches and "
+            "that must change to preserve both sides"
+        ),
+    )
     rationale = resolved.add_mutually_exclusive_group(required=True)
     rationale.add_argument("--rationale")
     rationale.add_argument(

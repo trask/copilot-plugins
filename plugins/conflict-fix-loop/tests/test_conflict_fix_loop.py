@@ -2742,6 +2742,7 @@ class ResolvedTest(unittest.TestCase):
         self,
         *,
         paths=("app.py",),
+        companion_paths=(),
         rationale="kept the rename and the new call",
         rationale_file=None,
         accept_one_side=False,
@@ -2754,6 +2755,7 @@ class ResolvedTest(unittest.TestCase):
         args = SimpleNamespace(
             state=str(state_path),
             paths=list(paths),
+            companion_paths=list(companion_paths),
             rationale=rationale,
             rationale_file=rationale_file,
             accept_one_side=accept_one_side,
@@ -2789,7 +2791,8 @@ class ResolvedTest(unittest.TestCase):
         self.assertEqual("kept the rename and the new call", conflict["rationale"])
         self.assertIsNone(conflict["one_side"])
         self.assertEqual(
-            ("add", "--all", "--", "app.py"), self.git_try.call_args[0][1:]
+            ("add", "--all", "--", ":(literal)app.py"),
+            self.git_try.call_args[0][1:],
         )
 
     def test_remaining_conflicts_keep_the_loop_on_resolved(self):
@@ -2891,6 +2894,120 @@ class ResolvedTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.WorkflowError, "not conflicted in this attempt"):
             self.resolve(paths=("other.py",))
 
+    def test_a_companion_path_from_the_replayed_commit_is_staged_and_recorded(self):
+        self.write("app.py", b"ours\ntheirs\n")
+        self.write("moved.py", b"preserved base behavior\n")
+        with mock.patch.object(
+            MODULE,
+            "replayed_commit_paths",
+            return_value={"app.py", "moved.py"},
+        ), mock.patch.object(MODULE, "path_has_unstaged_changes", return_value=True):
+            payload = self.resolve(
+                companion_paths=("moved.py",),
+                attempt=attempt_record(
+                    strategy="rebase",
+                    conflicts=[conflict_record("app.py")],
+                ),
+            )
+        self.assertEqual([{"path": "moved.py", "deleted": False}], payload["companions"])
+        companion = self.saved()["attempt"]["companion_resolutions"][0]
+        self.assertEqual("moved.py", companion["path"])
+        self.assertEqual("kept the rename and the new call", companion["rationale"])
+        self.assertEqual(
+            (
+                "add",
+                "--all",
+                "--",
+                ":(literal)app.py",
+                ":(literal)moved.py",
+            ),
+            self.git_try.call_args[0][1:],
+        )
+
+    def test_a_companion_path_outside_the_replayed_commit_is_refused(self):
+        self.write("app.py", b"ours\ntheirs\n")
+        self.write("unrelated.py", b"unrelated edit\n")
+        with mock.patch.object(
+            MODULE,
+            "replayed_commit_paths",
+            return_value={"app.py"},
+        ), self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "not touched by the commit currently being replayed",
+        ):
+            self.resolve(
+                companion_paths=("unrelated.py",),
+                attempt=attempt_record(
+                    strategy="rebase",
+                    conflicts=[conflict_record("app.py")],
+                ),
+            )
+
+    def test_a_companion_path_is_refused_for_a_merge(self):
+        self.write("app.py", b"ours\ntheirs\n")
+        self.write("moved.py", b"companion edit\n")
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "only while a rebase is replaying a commit",
+        ):
+            self.resolve(companion_paths=("moved.py",))
+
+    def test_another_conflicted_path_cannot_be_a_companion(self):
+        self.write("app.py", b"ours\ntheirs\n")
+        self.write("other.py", b"companion edit\n")
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "already recorded as conflicted paths",
+        ):
+            self.resolve(
+                companion_paths=("other.py",),
+                attempt=attempt_record(
+                    strategy="rebase",
+                    conflicts=[
+                        conflict_record("app.py"),
+                        conflict_record("other.py"),
+                    ],
+                ),
+            )
+
+    def test_companion_pathspecs_are_literal(self):
+        self.write("app.py", b"ours\ntheirs\n")
+        self.write("[ab].py", b"companion edit\n")
+        with mock.patch.object(
+            MODULE,
+            "replayed_commit_paths",
+            return_value={"app.py", "[ab].py"},
+        ), mock.patch.object(
+            MODULE, "path_has_unstaged_changes", return_value=True
+        ):
+            self.resolve(
+                companion_paths=("[ab].py",),
+                attempt=attempt_record(
+                    strategy="rebase",
+                    conflicts=[conflict_record("app.py")],
+                ),
+            )
+        self.assertEqual(
+            (
+                "add",
+                "--all",
+                "--",
+                ":(literal)app.py",
+                ":(literal)[ab].py",
+            ),
+            self.git_try.call_args[0][1:],
+        )
+
+    def test_replayed_commit_paths_preserve_unicode_names(self):
+        with mock.patch.object(
+            MODULE,
+            "git_try",
+            return_value=completed(0, "app.py\0caf\u00e9.py\0"),
+        ) as git_try:
+            paths = MODULE.replayed_commit_paths(self.directory)
+        self.assertEqual({"app.py", "caf\u00e9.py"}, paths)
+        self.assertIn("-z", git_try.call_args[0])
+
     def test_an_attempt_with_no_conflicts_recorded_is_refused(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "no conflicted files are recorded"):
             self.resolve(attempt=attempt_record(status="planned"))
@@ -2904,6 +3021,120 @@ class ResolvedTest(unittest.TestCase):
         self.write("app.py", b"ours\ntheirs\n")
         with self.assertRaisesRegex(MODULE.WorkflowError, "could not stage app.py"):
             self.resolve(add=completed(1, "", "fatal: pathspec"))
+
+
+class CompanionPathIntegrationTest(unittest.TestCase):
+    def setUp(self):
+        self.repo = temporary_directory(self)
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.name", "Test")
+        self.git("config", "user.email", "test@example.com")
+        self.write("legacy.py", "legacy_behavior = True\n")
+        self.git("add", "legacy.py")
+        self.git("commit", "-q", "-m", "base")
+
+        self.git("checkout", "-q", "-b", "feature")
+        (self.repo / "legacy.py").unlink()
+        self.write(
+            "moved.py",
+            "def extracted_behavior():\n"
+            "    return {'feature': True}\n",
+        )
+        self.git("add", "--all")
+        self.git("commit", "-q", "-m", "extract behavior")
+
+        self.git("checkout", "-q", "main")
+        self.write(
+            "legacy.py",
+            "legacy_behavior = True\n"
+            "base_behavior = True\n",
+        )
+        self.git("commit", "-q", "-am", "extend legacy behavior")
+        self.git("checkout", "-q", "feature")
+        rebase = self.git_try("rebase", "main")
+        self.assertNotEqual(0, rebase.returncode)
+        self.assertTrue((self.repo / "legacy.py").exists())
+        self.assertTrue((self.repo / "moved.py").exists())
+
+    def git(self, *arguments):
+        return subprocess.run(
+            ["git", "-C", str(self.repo), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "GIT_AUTHOR_NAME": "Test",
+                "GIT_AUTHOR_EMAIL": "test@example.com",
+                "GIT_COMMITTER_NAME": "Test",
+                "GIT_COMMITTER_EMAIL": "test@example.com",
+            },
+        ).stdout.strip()
+
+    def git_try(self, *arguments):
+        return subprocess.run(
+            ["git", "-C", str(self.repo), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "GIT_AUTHOR_NAME": "Test",
+                "GIT_AUTHOR_EMAIL": "test@example.com",
+                "GIT_COMMITTER_NAME": "Test",
+                "GIT_COMMITTER_EMAIL": "test@example.com",
+            },
+        )
+
+    def write(self, path, content):
+        (self.repo / path).write_text(content, encoding="utf-8", newline="\n")
+
+    def test_move_destination_can_preserve_the_base_change(self):
+        (self.repo / "legacy.py").unlink()
+        self.write(
+            "moved.py",
+            "def extracted_behavior():\n"
+            "    return {'feature': True, 'base': True}\n",
+        )
+        state_path = write_state(
+            self.repo,
+            repo_root=str(self.repo),
+            attempt=attempt_record(
+                strategy="rebase",
+                conflicts=[
+                    conflict_record(
+                        "legacy.py",
+                        code="UD",
+                        kind="deleted by them",
+                        deletion=True,
+                    )
+                ],
+            ),
+        )
+        args = SimpleNamespace(
+            state=str(state_path),
+            paths=["legacy.py"],
+            companion_paths=["moved.py"],
+            rationale=(
+                "the feature moved the behavior into moved.py; the destination keeps "
+                "the base branch's added behavior"
+            ),
+            rationale_file=None,
+            accept_one_side=False,
+            accept_deletion=True,
+            accept_line_endings=False,
+        )
+        with mock.patch.object(MODULE, "emit") as emit:
+            MODULE.command_resolved(args)
+
+        payload = emitted(emit)
+        self.assertEqual([{"path": "moved.py", "deleted": False}], payload["companions"])
+        self.assertEqual([], payload["remaining_conflicts"])
+        staged = set(self.git("diff", "--cached", "--name-only").splitlines())
+        self.assertEqual({"legacy.py", "moved.py"}, staged)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        companion = state["attempt"]["companion_resolutions"][0]
+        self.assertEqual("moved.py", companion["path"])
 
 
 class ContinueTest(unittest.TestCase):
