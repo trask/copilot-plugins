@@ -1,7 +1,7 @@
 {
   "name": "pr-reviewer",
   "description": "Review a GitHub pull request and create a verified pending review with high-confidence inline comments.",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "author": {
     "name": "Trask Stalnaker"
   },

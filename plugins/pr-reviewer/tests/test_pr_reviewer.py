@@ -202,6 +202,66 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
 
+    def test_compares_changed_code_with_strong_repository_precedents(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "For each changed area, find the closest existing implementations in "
+            "the same repository",
+            instructions,
+        )
+        self.assertIn(
+            "especially sibling implementations of the same feature or "
+            "instrumentation",
+            instructions,
+        )
+        self.assertIn(
+            "Read enough of them to tell whether they establish a strong, directly "
+            "applicable precedent",
+            instructions,
+        )
+        self.assertIn(
+            "Compare each changed area with the closest implementations you found",
+            instructions,
+        )
+        self.assertIn(
+            "multiple comparable implementations use the same pattern",
+            instructions,
+        )
+        self.assertIn(
+            "comparable code uses one canonical shared helper or structure",
+            instructions,
+        )
+        self.assertIn(
+            "when it solves the same problem under the same relevant constraints",
+            instructions,
+        )
+        self.assertIn(
+            "Record the paths and symbols that establish the precedent, the exact "
+            "way this PR departs from it",
+            instructions,
+        )
+        self.assertIn(
+            "A single similar file, a broad style preference, or novelty by itself "
+            "establishes nothing",
+            instructions,
+        )
+        self.assertIn(
+            "build a candidate even when no written repository instruction names "
+            "the pattern and the departure has not caused a runtime defect",
+            instructions,
+        )
+        self.assertIn(
+            "demonstrated impact or exact precedent departure",
+            instructions,
+        )
+        self.assertIn(
+            "For a precedent candidate, also give it the cited paths and symbols, "
+            "the pattern they establish, why that pattern applies here, the exact "
+            "departure",
+            instructions,
+        )
+
     def test_runs_candidate_evaluations_in_parallel(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
@@ -286,13 +346,29 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
+            "an unexplained departure from a strong, directly applicable repository "
+            "precedent, when the evaluator can cite the precedent and show why it "
+            "applies",
+            instructions,
+        )
+        self.assertIn(
+            '"Unexplained" means the repository instructions, PR context, linked '
+            "work, maintainer comments, and code constraints give no concrete "
+            "reason for the difference",
+            instructions,
+        )
+        self.assertIn(
+            "It never means the author had to write a rationale",
+            instructions,
+        )
+        self.assertIn(
             "documentation, naming, or a test that this PR makes wrong or "
             "misleading",
             instructions,
         )
         self.assertIn(
-            "A preference with no repository instruction behind it does not "
-            "clear it",
+            "A preference with no repository instruction or strong, directly "
+            "applicable precedent behind it does not clear decision 2",
             instructions,
         )
 
