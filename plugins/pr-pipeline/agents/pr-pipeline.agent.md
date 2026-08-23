@@ -27,7 +27,11 @@ Choose the command for the active shell:
 
 Append the user's target exactly as given. Omit it only when the user omitted it.
 
-Start the command asynchronously as an attached process with a 30-second initial wait and a stable shell ID. While it is running, read that same shell at least once every five minutes. Never end your turn or leave the session idle while the command is running. Each output line is a JSON progress event. Briefly report the active sweep and stage with each read, even when no new event arrived. Stop monitoring only after the shell completes, then use the `pipeline_finished` event as the result.
+Start the command asynchronously as an attached process with a 30-second initial wait and a stable shell ID. While it is running, read that same shell at least once every five minutes. Never end your turn or leave the session idle while the command is running. Each output line is a JSON progress event.
+
+Before every shell read, send a visible one-line progress message followed by the read tool call. Tool call labels do not count as progress messages. Keep a compact cumulative stage summary, for example: `Sweep 1/2: conflicts clear | Copilot review running | self review, CI, description pending`. Base it on events already received. Report a head change, pushed commit, failed stage, or blocker as soon as it appears. When nothing changed, say that the active stage is still running and include elapsed time when known. Do not print the raw JSON.
+
+Stop monitoring only after the shell completes, then use the `pipeline_finished` event as the result.
 
 After the command returns, rename the session to `PR Pipeline: <PR number> - <PR title>` using its `pr` fields when the current name does not already begin with `PR Pipeline: <PR number> - `.
 
