@@ -35,7 +35,7 @@
     {
       "name": "pr-pipeline",
       "description": "Drive an open draft pull request through conflict resolution, Copilot review, self review, check fixing, and description validation until every stage is green at the same head commit.",
-      "version": "1.2.1",
+      "version": "1.2.2",
       "source": "./plugins/pr-pipeline"
     },
     {
