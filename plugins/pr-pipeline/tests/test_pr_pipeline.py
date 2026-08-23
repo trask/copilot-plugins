@@ -46,6 +46,7 @@ def clear_stage(stage: str, head: str = HEAD) -> dict:
         "reason": None,
         "installed": True,
         "status_state": "state.json",
+        "status": {},
     }
 
 
@@ -58,6 +59,7 @@ def uncleared_stage(stage: str, outcome: str | None = "carried") -> dict:
         "reason": outcome or "not_cleared",
         "installed": True,
         "status_state": "state.json",
+        "status": {},
     }
 
 
@@ -67,6 +69,44 @@ class TargetTest(unittest.TestCase):
         self.assertEqual(expected, MODULE.parse_target(expected["pr_url"]))
         self.assertEqual(expected, MODULE.parse_target("owner/repo#7"))
         self.assertEqual(expected, MODULE.parse_target("#7", "owner/repo"))
+
+    def test_reads_commit_links_for_the_pull_request(self):
+        with mock.patch.object(
+            MODULE,
+            "gh_json",
+            return_value={
+                "commits": [
+                    {
+                        "oid": HEAD,
+                        "messageHeadline": "Fix the thing",
+                    }
+                ]
+            },
+        ):
+            self.assertEqual(
+                [
+                    {
+                        "sha": HEAD,
+                        "title": "Fix the thing",
+                        "url": f"{target()['pr_url']}/commits/{HEAD}",
+                    }
+                ],
+                MODULE.read_pr_commits(target()),
+            )
+
+    def test_marks_rewritten_history_and_lists_replacement_commits(self):
+        replacement = {
+            "sha": NEXT_HEAD,
+            "title": "Rebased commit",
+            "url": f"{target()['pr_url']}/commits/{NEXT_HEAD}",
+        }
+        added, errors, rewritten = MODULE.commits_added(
+            {"commits": [{"sha": HEAD, "title": "Old commit"}]},
+            {"commits": [replacement]},
+        )
+        self.assertEqual([replacement], added)
+        self.assertEqual([], errors)
+        self.assertTrue(rewritten)
 
     def test_bare_number_needs_repository_context(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "repository context"):
@@ -180,6 +220,23 @@ class MarkerTest(unittest.TestCase):
         self.assertFalse(result["clear"])
         self.assertEqual("carried", result["reason"])
 
+    def test_preserves_stage_status_details(self):
+        escalation = {
+            "reason": "unfixable_failure",
+            "detail": "library defect",
+            "checks": ["check:test"],
+        }
+        result = self.status(
+            MODULE.STAGE_CI,
+            {
+                "stage_outcome": "escalated",
+                "escalation": escalation,
+                "counts": {"failed": 1},
+            },
+        )
+        self.assertEqual(escalation, result["status"]["escalation"])
+        self.assertEqual({"failed": 1}, result["status"]["counts"])
+
 
 class SweepTest(unittest.TestCase):
     def setUp(self):
@@ -196,6 +253,9 @@ class SweepTest(unittest.TestCase):
             mock.patch.object(MODULE, "settle_after_stage", side_effect=self.settle),
             mock.patch.object(MODULE, "inspect_stage", side_effect=self.inspect),
             mock.patch.object(MODULE, "inspect_stages", side_effect=self.inspect_all),
+            mock.patch.object(
+                MODULE, "snapshot_pr_commits", side_effect=self.snapshot_commits
+            ),
         ]
         for patch in self.patches:
             patch.start()
@@ -221,6 +281,18 @@ class SweepTest(unittest.TestCase):
             "log_path": f"{sweep}-{entry['stage']}.log",
             "started_at": "start",
             "ended_at": "end",
+        }
+
+    def snapshot_commits(self, _target):
+        head = self.sync_heads[-1]
+        return {
+            "commits": [
+                {
+                    "sha": head,
+                    "title": f"Commit {head[0]}",
+                    "url": f"https://github.com/owner/repo/pull/7/commits/{head}",
+                }
+            ]
         }
 
     def settle(self, _repo, _target, *, started_head_sha):
@@ -312,6 +384,24 @@ class SweepTest(unittest.TestCase):
         self.assertIn((MODULE.STAGE_CONFLICT, 2), self.launched)
         self.assertIn((MODULE.STAGE_SELF_REVIEW, 2), self.launched)
         self.assertNotIn((MODULE.STAGE_COPILOT_REVIEW, 2), self.launched)
+        copilot_run = next(
+            run
+            for run in result["runs"]
+            if run["stage"] == MODULE.STAGE_COPILOT_REVIEW and run["sweep"] == 1
+        )
+        self.assertEqual(
+            [
+                {
+                    "sha": NEXT_HEAD,
+                    "title": "Commit b",
+                    "url": (
+                        "https://github.com/owner/repo/pull/7/commits/"
+                        f"{NEXT_HEAD}"
+                    ),
+                }
+            ],
+            copilot_run["published_commits"],
+        )
 
     def test_second_sweep_retries_an_uncleared_stage(self):
         def move_and_stall(entry, *args, **kwargs):
@@ -381,6 +471,46 @@ class SweepTest(unittest.TestCase):
         self.assertEqual("blocked", result["result"])
         self.assertEqual("stage_left_dirty_worktree", result["reason"])
         self.assertEqual([(MODULE.STAGE_CONFLICT, 1)], self.launched)
+
+    def test_blocked_stage_preserves_escalation_and_retained_commits(self):
+        local_head = "c" * 40
+        escalation = {
+            "reason": "unfixable_failure",
+            "detail": "upstream defect",
+            "checks": ["check:test"],
+            "next_action": "Decide the fix.",
+        }
+        MODULE.settle_after_stage.side_effect = None
+        MODULE.settle_after_stage.return_value = {
+            "result": "blocked",
+            "reason": "stage_left_unpublished_commits",
+            "detail": "local commit was not pushed",
+            "local_head_sha": local_head,
+            "pr_head_sha": HEAD,
+        }
+        MODULE.inspect_stages.side_effect = None
+        MODULE.inspect_stages.return_value = [
+            {
+                **uncleared_stage(stage, "escalated"),
+                "status": {"escalation": escalation},
+            }
+            if stage == MODULE.STAGE_CONFLICT
+            else uncleared_stage(stage)
+            for stage in MODULE.STAGE_NAMES
+        ]
+        retained = [{"sha": local_head, "title": "Keep partial fix"}]
+        with mock.patch.object(
+            MODULE, "local_commits_between", return_value=retained
+        ):
+            result = self.execute()
+
+        self.assertEqual("blocked", result["result"])
+        self.assertEqual("stage_left_unpublished_commits", result["reason"])
+        self.assertEqual(local_head, result["local_head_sha"])
+        self.assertEqual(retained, result["retained_commits"])
+        self.assertEqual(escalation, result["stage_result"]["status"]["escalation"])
+        self.assertEqual(retained, result["runs"][0]["retained_commits"])
+        self.assertEqual(5, len(result["stages"]))
 
     def test_closed_pull_request_runs_nothing(self):
         MODULE.read_pull_request.side_effect = lambda _target: pull_request(
@@ -551,6 +681,25 @@ class WorktreeSafetyTest(unittest.TestCase):
             self.assertEqual("ready", result["result"])
             self.assertEqual(final_head, self.git(local, "rev-parse", "HEAD"))
 
+    def test_lists_retained_first_parent_commits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            self.git(repo, "init", "-q", "-b", "main")
+            self.git(repo, "commit", "-q", "--allow-empty", "-m", "base")
+            base = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "commit", "-q", "--allow-empty", "-m", "first fix")
+            first = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "commit", "-q", "--allow-empty", "-m", "second fix")
+            second = self.git(repo, "rev-parse", "HEAD")
+
+            self.assertEqual(
+                [
+                    {"sha": first, "title": "first fix"},
+                    {"sha": second, "title": "second fix"},
+                ],
+                MODULE.local_commits_between(repo, base, second),
+            )
+
 
 class AgentInstructionTest(unittest.TestCase):
     def test_agent_has_one_helper_command_and_no_manual_lifecycle(self):
@@ -564,6 +713,11 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertIn("30-second initial wait", text)
         self.assertIn("same shell at least once every five minutes", text)
         self.assertIn("Never end your turn", text)
+        self.assertIn("### Sweep 1", text)
+        self.assertIn("### Sweep 2", text)
+        self.assertIn("published_commits", text)
+        self.assertIn("retained_commits", text)
+        self.assertIn("stage_result.status", text)
 
 
 class CommandOutputTest(unittest.TestCase):

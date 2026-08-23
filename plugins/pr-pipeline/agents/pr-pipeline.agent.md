@@ -33,11 +33,22 @@ After the command returns, rename the session to `PR Pipeline: <PR number> - <PR
 
 Never mark the pull request ready for review, approve it, create a pull request, or post a comment.
 
-Report:
+Write a detailed final report from the complete `pipeline_finished` event. Do not reduce it to the result, reason, and head.
 
-- `complete`: name the final head and say all five stages are clear there.
-- `incomplete`: name each uncleared stage, its outcome or reason, and its latest log path.
-- `blocked`: state the reason and detail exactly. Name the stage and log when present.
-- `error`: state the error exactly.
+Open with the pull request link, result, final pull request head, sweep count, and local head when it differs. For `blocked`, preserve the top-level safety reason and detail exactly, then report the stage's underlying outcome, reason, escalation detail, affected checks, and next action from `stage_result.status`.
+
+Group the work under `### Sweep 1` and `### Sweep 2`. Omit only a sweep that never started. Within each sweep, add one `#### <stage>` section for every entry in `runs`, in execution order. Each stage section must include:
+
+- whether it launched, was already clear, or was unavailable
+- its outcome, reason, model, return code, head transition, and log path when present
+- every entry in `published_commits` as a Markdown link using its `url`, short SHA, and title; write `Pushed commits: none` when the list is empty
+- when `history_rewritten` is true, say that the subagent rewrote branch history and that `published_commits` lists the replacement commits, not only newly authored work
+- every entry in `retained_commits` as an unpublished local commit with short SHA and title
+- useful stage-specific facts from `status`, such as iteration and candidate counts, review URLs, validation, escalation detail, affected checks, and the next action
+- any `commit_tracking_errors`, without claiming that no commits were pushed
+
+After the sweeps, add `### Final stage status` whenever `stages` is present. List all five entries with their outcome, clear marker, reason, and state path. Make every uncleared stage easy to spot.
+
+For `error`, state the error exactly. Never hide a retained commit or an escalation behind a shorter pipeline reason.
 
 The terminal response is the run's last message.

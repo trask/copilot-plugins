@@ -343,6 +343,101 @@ def read_pull_request(target: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def commit_url(target: dict[str, Any], sha: str) -> str:
+    return f"{target['pr_url']}/commits/{sha}"
+
+
+def read_pr_commits(target: dict[str, Any]) -> list[dict[str, Any]]:
+    payload = gh_json(
+        [
+            "pr",
+            "view",
+            str(target["number"]),
+            "--repo",
+            target["repo_name"],
+            "--json",
+            "commits",
+        ]
+    )
+    commits = payload.get("commits") if isinstance(payload, dict) else None
+    if not isinstance(commits, list):
+        raise WorkflowError(f"could not read commits for {target['pr_url']}")
+    result = []
+    for commit in commits:
+        if not isinstance(commit, dict):
+            continue
+        sha = commit.get("oid")
+        if not isinstance(sha, str) or not sha:
+            continue
+        result.append(
+            {
+                "sha": sha,
+                "title": commit.get("messageHeadline") or sha,
+                "url": commit_url(target, sha),
+            }
+        )
+    return result
+
+
+def snapshot_pr_commits(target: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return {"commits": read_pr_commits(target)}
+    except WorkflowError as error:
+        return {"commits": [], "error": str(error)}
+
+
+def commits_added(
+    before: dict[str, Any], after: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[str], bool]:
+    errors = [
+        snapshot["error"]
+        for snapshot in (before, after)
+        if isinstance(snapshot.get("error"), str)
+    ]
+    if errors:
+        return [], errors, False
+    before_shas = {
+        commit["sha"]
+        for commit in before["commits"]
+        if isinstance(commit.get("sha"), str)
+    }
+    after_shas = {
+        commit["sha"]
+        for commit in after["commits"]
+        if isinstance(commit.get("sha"), str)
+    }
+    before_head = before["commits"][-1].get("sha") if before["commits"] else None
+    history_rewritten = bool(before_head and before_head not in after_shas)
+    return [
+        commit for commit in after["commits"] if commit.get("sha") not in before_shas
+    ], [], history_rewritten
+
+
+def local_commits_between(
+    repo_root: Path, base_sha: str | None, head_sha: str | None
+) -> list[dict[str, str]]:
+    if not base_sha or not head_sha or base_sha == head_sha:
+        return []
+    if not git_succeeds(repo_root, "merge-base", "--is-ancestor", base_sha, head_sha):
+        base_sha = git_or_none(repo_root, "merge-base", base_sha, head_sha)
+        if not base_sha:
+            return []
+    output = git_or_none(
+        repo_root,
+        "log",
+        "--reverse",
+        "--first-parent",
+        "--format=%H%x09%s",
+        f"{base_sha}..{head_sha}",
+    )
+    commits = []
+    for line in (output or "").splitlines():
+        sha, separator, title = line.partition("\t")
+        if separator and sha:
+            commits.append({"sha": sha, "title": title or sha})
+    return commits
+
+
 def target_remote(repo_root: Path, target: dict[str, Any]) -> str:
     wanted = target["repo_name"].lower()
     listing = git_or_none(repo_root, "remote", "-v") or ""
@@ -497,7 +592,13 @@ def settle_after_stage(
         return fetched
     remote = fetched["head_sha"]
     if local == remote:
-        return {"result": "ready", "head_sha": remote, "changed": remote != started_head_sha}
+        return {
+            "result": "ready",
+            "head_sha": remote,
+            "local_head_sha": local,
+            "pr_head_sha": remote,
+            "changed": remote != started_head_sha,
+        }
 
     published = git_succeeds(
         repo_root, "merge-base", "--is-ancestor", local, remote
@@ -506,6 +607,8 @@ def settle_after_stage(
         return {
             "result": "blocked",
             "reason": "stage_left_unpublished_commits",
+            "local_head_sha": local,
+            "pr_head_sha": remote,
             "detail": (
                 f"a stage moved the local head from {started_head_sha} to {local}, "
                 f"but the pull request head is {remote}"
@@ -516,6 +619,8 @@ def settle_after_stage(
         return checked_out
     return {
         **checked_out,
+        "local_head_sha": local,
+        "pr_head_sha": remote,
         "changed": checked_out["head_sha"] != started_head_sha,
         "previous_head_sha": local,
     }
@@ -603,6 +708,34 @@ def string_at(payload: dict[str, Any], path: tuple[str, ...]) -> str | None:
     return None
 
 
+STAGE_STATUS_FIELDS = (
+    "attempt",
+    "counts",
+    "escalation",
+    "iterations",
+    "last_helper_activity",
+    "local_validation",
+    "mergeable_at_head_sha",
+    "monitoring",
+    "outcome",
+    "proposal",
+    "proposal_count",
+    "queue",
+    "review",
+    "run",
+    "skip_note",
+    "validation",
+    "validated_head_sha",
+    "verdicts",
+)
+
+
+def stage_status_summary(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    return {key: payload[key] for key in STAGE_STATUS_FIELDS if key in payload}
+
+
 def inspect_stage(
     entry: dict[str, Any], target: dict[str, Any], head_sha: str
 ) -> dict[str, Any]:
@@ -627,6 +760,7 @@ def inspect_stage(
         "reason": reason,
         "installed": status["installed"],
         "status_state": status["state"],
+        "status": stage_status_summary(payload),
         **({"detail": status["detail"]} if status.get("detail") else {}),
     }
 
@@ -789,8 +923,12 @@ def blocked_result(
     reason: str,
     detail: str,
     stage: str | None = None,
+    stage_result: dict[str, Any] | None = None,
+    local_head_sha: str | None = None,
+    retained_commits: list[dict[str, str]] | None = None,
+    stages: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "result": "blocked",
         "run_id": run_id,
         "pr": pr,
@@ -801,6 +939,15 @@ def blocked_result(
         "reason": reason,
         "detail": detail,
     }
+    if stage_result is not None:
+        payload["stage_result"] = stage_result
+    if local_head_sha is not None:
+        payload["local_head_sha"] = local_head_sha
+    if retained_commits:
+        payload["retained_commits"] = retained_commits
+    if stages is not None:
+        payload["stages"] = stages
+    return payload
 
 
 def run_pipeline(
@@ -895,6 +1042,10 @@ def run_pipeline(
                     "started_head_sha": current_head,
                     "ended_head_sha": current_head,
                     "outcome": before["outcome"],
+                    "clear": True,
+                    "stage_reason": before["reason"],
+                    "status": before["status"],
+                    "published_commits": [],
                 }
                 runs.append(record)
                 report_event(report, "stage_finished", run_id=run_id, **record)
@@ -907,6 +1058,10 @@ def run_pipeline(
                     "started_head_sha": current_head,
                     "ended_head_sha": current_head,
                     "outcome": None,
+                    "clear": False,
+                    "stage_reason": before["reason"],
+                    "status": before["status"],
+                    "published_commits": [],
                 }
                 runs.append(record)
                 report_event(report, "stage_finished", run_id=run_id, **record)
@@ -921,6 +1076,7 @@ def run_pipeline(
                 head_sha=current_head,
                 started_at=utc_now(),
             )
+            commits_before = snapshot_pr_commits(target)
             launched = run_stage(
                 entry,
                 target,
@@ -935,16 +1091,50 @@ def run_pipeline(
                 target,
                 started_head_sha=current_head,
             )
+            commits_after = snapshot_pr_commits(target)
+            published_commits, commit_tracking_errors, history_rewritten = commits_added(
+                commits_before, commits_after
+            )
             record = {
                 "stage": entry["stage"],
                 "sweep": sweep,
                 "action": "launched",
                 "model": models[entry["stage"]],
                 "started_head_sha": current_head,
+                "published_commits": published_commits,
                 **launched,
             }
+            if commit_tracking_errors:
+                record["commit_tracking_errors"] = commit_tracking_errors
+            if history_rewritten:
+                record["history_rewritten"] = True
             if settled["result"] != "ready":
-                record["ended_head_sha"] = git_or_none(repo_root, "rev-parse", "HEAD")
+                local_head = settled.get("local_head_sha") or git_or_none(
+                    repo_root, "rev-parse", "HEAD"
+                )
+                pr_head = settled.get("pr_head_sha") or current_head
+                stages = inspect_stages(target, pr_head)
+                stage_result = next(
+                    result for result in stages if result["stage"] == entry["stage"]
+                )
+                published_shas = {commit["sha"] for commit in published_commits}
+                retained_commits = [
+                    commit
+                    for commit in local_commits_between(
+                        repo_root, current_head, local_head
+                    )
+                    if commit["sha"] not in published_shas
+                ]
+                record.update(
+                    {
+                        "ended_head_sha": local_head,
+                        "outcome": stage_result["outcome"],
+                        "clear": stage_result["clear"],
+                        "stage_reason": stage_result["reason"],
+                        "status": stage_result["status"],
+                        "retained_commits": retained_commits,
+                    }
+                )
                 runs.append(record)
                 report_event(report, "stage_finished", run_id=run_id, **record)
                 return blocked_result(
@@ -955,6 +1145,10 @@ def run_pipeline(
                     stage=entry["stage"],
                     reason=settled["reason"],
                     detail=settled["detail"],
+                    stage_result=stage_result,
+                    local_head_sha=local_head,
+                    retained_commits=retained_commits,
+                    stages=stages,
                 )
 
             ended_head = settled["head_sha"]
@@ -966,6 +1160,8 @@ def run_pipeline(
                     "ended_head_sha": ended_head,
                     "outcome": after["outcome"],
                     "clear": after["clear"],
+                    "stage_reason": after["reason"],
+                    "status": after["status"],
                 }
             )
             runs.append(record)
