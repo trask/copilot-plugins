@@ -49,6 +49,12 @@
       "description": "Fix the failing continuous integration checks a pull request caused, re-run a suspected flake once, and push the fixes until the checks are green.",
       "version": "1.0.11",
       "source": "./plugins/ci-fix-loop"
+    },
+    {
+      "name": "historical-pr-audit",
+      "description": "Audit an already-merged GitHub pull request against its own historical snapshot, verify each finding independently, and commit the fixes on a separate audit branch.",
+      "version": "1.0.0",
+      "source": "./plugins/historical-pr-audit"
     }
   ]
 }

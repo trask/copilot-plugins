@@ -18,6 +18,7 @@ copilot plugin install copilot-review-loop@trask-plugins
 copilot plugin install self-review-loop@trask-plugins
 copilot plugin install pr-description@trask-plugins
 copilot plugin install conflict-fix-loop@trask-plugins
+copilot plugin install historical-pr-audit@trask-plugins
 ```
 
 Restart Copilot after you install or update a plugin.
@@ -71,6 +72,26 @@ GitHub stack, it rebases every descendant in a throwaway clone and publishes the
 complete stack with one atomic, exact-lease push. It never posts anything to
 GitHub.
 
+### Historical PR Audit
+
+Audits a pull request that already merged, without changing it. It pins the
+exact base and head commits that pull request merged from, captures the diff and
+the discussion GitHub reported for that snapshot, and moves a fresh session
+branch to the historical head so the code around it is the code the author
+wrote. It checks each possible finding with its own separate evaluator, commits
+the fixes on a branch named `trask-pr-audit-<number>`, and audits the new head
+again until a whole pass finds nothing.
+
+It also compares each changed area with the closest sibling implementations in
+that historical tree, and treats an unexplained departure from a strong,
+directly applicable precedent as a finding worth raising.
+
+The merged pull request never changes. The audit branch is the only thing this
+agent pushes, and a first pass that finds nothing pushes no branch at all.
+
+Run this agent on a Claude model. It checks its own findings with GPT-5.6 Sol,
+and that check only works when the evaluator comes from another model family.
+
 ### Optional PR Flight State Sharing
 
 Self Review Loop and PR Description can copy the few completion facts that
@@ -100,6 +121,7 @@ copilot plugin update copilot-review-loop
 copilot plugin update self-review-loop
 copilot plugin update pr-description
 copilot plugin update conflict-fix-loop
+copilot plugin update historical-pr-audit
 ```
 
 ## Requirements
