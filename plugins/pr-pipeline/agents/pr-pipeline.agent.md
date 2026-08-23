@@ -1,6 +1,6 @@
 ---
 name: PR Pipeline
-description: "Use to drive an open draft pull request through conflict resolution, self review, Copilot review, check fixing, and description validation until every stage is green at the same head commit."
+description: "Use to drive an open draft pull request through conflict resolution, Copilot review, self review, check fixing, and description validation until every stage is green at the same head commit."
 argument-hint: "PR URL, PR number, or owner/repo#number; omit only from a worktree attached to the PR's branch"
 tools: [execute, rename_session]
 user-invocable: true
@@ -12,8 +12,8 @@ Run the bundled pipeline helper once and report its final JSON event. The helper
 The helper runs at most two foreground sweeps in this order:
 
 1. `conflict-fix-loop`
-2. `self-review-loop`
-3. `copilot-review-loop`
+2. `copilot-review-loop`
+3. `self-review-loop`
 4. `ci-fix-loop`
 5. `pr-description`
 

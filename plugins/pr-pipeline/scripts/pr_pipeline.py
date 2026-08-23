@@ -47,6 +47,14 @@ STAGES: tuple[dict[str, Any], ...] = (
         "model": DEFAULT_STAGE_MODEL,
     },
     {
+        "stage": STAGE_COPILOT_REVIEW,
+        "plugin": STAGE_COPILOT_REVIEW,
+        "agent": f"{STAGE_COPILOT_REVIEW}:{STAGE_COPILOT_REVIEW}",
+        "module": "copilot_review_loop",
+        "marker": ("clean_at_head_sha",),
+        "model": DEFAULT_STAGE_MODEL,
+    },
+    {
         "stage": STAGE_SELF_REVIEW,
         "plugin": STAGE_SELF_REVIEW,
         "agent": f"{STAGE_SELF_REVIEW}:{STAGE_SELF_REVIEW}",
@@ -54,14 +62,6 @@ STAGES: tuple[dict[str, Any], ...] = (
         "marker": ("review", "clean_at_head_sha"),
         "model": "claude-opus-5",
         "requires_family": CLAUDE_FAMILY,
-    },
-    {
-        "stage": STAGE_COPILOT_REVIEW,
-        "plugin": STAGE_COPILOT_REVIEW,
-        "agent": f"{STAGE_COPILOT_REVIEW}:{STAGE_COPILOT_REVIEW}",
-        "module": "copilot_review_loop",
-        "marker": ("clean_at_head_sha",),
-        "model": DEFAULT_STAGE_MODEL,
     },
     {
         "stage": STAGE_CI,

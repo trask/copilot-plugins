@@ -127,8 +127,8 @@ class StageContractTest(unittest.TestCase):
         self.assertEqual(
             (
                 "conflict-fix-loop",
-                "self-review-loop",
                 "copilot-review-loop",
+                "self-review-loop",
                 "ci-fix-loop",
                 "pr-description",
             ),
@@ -372,7 +372,7 @@ class SweepTest(unittest.TestCase):
             first_sweep_calls += 1
             if first_sweep_calls == 3:
                 self.sync_heads.append(NEXT_HEAD)
-                for stage in (MODULE.STAGE_CONFLICT, MODULE.STAGE_SELF_REVIEW):
+                for stage in (MODULE.STAGE_CONFLICT, MODULE.STAGE_COPILOT_REVIEW):
                     self.clear_at[stage] = None
             result = self.run_stage(entry, *args, **kwargs)
             return result
@@ -382,12 +382,12 @@ class SweepTest(unittest.TestCase):
         self.assertEqual("complete", result["result"])
         self.assertEqual(2, result["sweeps"])
         self.assertIn((MODULE.STAGE_CONFLICT, 2), self.launched)
-        self.assertIn((MODULE.STAGE_SELF_REVIEW, 2), self.launched)
-        self.assertNotIn((MODULE.STAGE_COPILOT_REVIEW, 2), self.launched)
-        copilot_run = next(
+        self.assertIn((MODULE.STAGE_COPILOT_REVIEW, 2), self.launched)
+        self.assertNotIn((MODULE.STAGE_SELF_REVIEW, 2), self.launched)
+        self_review_run = next(
             run
             for run in result["runs"]
-            if run["stage"] == MODULE.STAGE_COPILOT_REVIEW and run["sweep"] == 1
+            if run["stage"] == MODULE.STAGE_SELF_REVIEW and run["sweep"] == 1
         )
         self.assertEqual(
             [
@@ -400,7 +400,7 @@ class SweepTest(unittest.TestCase):
                     ),
                 }
             ],
-            copilot_run["published_commits"],
+            self_review_run["published_commits"],
         )
 
     def test_second_sweep_retries_an_uncleared_stage(self):
@@ -718,6 +718,10 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertIn("published_commits", text)
         self.assertIn("retained_commits", text)
         self.assertIn("stage_result.status", text)
+        self.assertLess(
+            text.index("2. `copilot-review-loop`"),
+            text.index("3. `self-review-loop`"),
+        )
 
 
 class CommandOutputTest(unittest.TestCase):
