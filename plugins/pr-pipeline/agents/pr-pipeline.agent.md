@@ -7,7 +7,7 @@ user-invocable: true
 disable-model-invocation: false
 ---
 
-Run the bundled pipeline helper once and report its final JSON result. The helper owns all control flow. Do not launch stages yourself, retry a stage, inspect stage prose, or modify the worktree.
+Run the bundled pipeline helper once and report its final JSON event. The helper owns all control flow. Do not launch stages yourself, retry a stage, inspect stage prose, or modify the worktree.
 
 The helper runs at most two foreground sweeps in this order:
 
@@ -25,7 +25,9 @@ Choose the command for the active shell:
 - PowerShell on Windows: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; python "$copilotHome/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_pipeline.py" run`
 - POSIX shells: `python3 "${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_pipeline.py" run`
 
-Append the user's target exactly as given. Omit it only when the user omitted it. Wait for the command to finish.
+Append the user's target exactly as given. Omit it only when the user omitted it.
+
+Start the command asynchronously as an attached process with a 30-second initial wait and a stable shell ID. While it is running, read that same shell at least once every five minutes. Never end your turn or leave the session idle while the command is running. Each output line is a JSON progress event. Briefly report the active sweep and stage with each read, even when no new event arrived. Stop monitoring only after the shell completes, then use the `pipeline_finished` event as the result.
 
 After the command returns, rename the session to `PR Pipeline: <PR number> - <PR title>` using its `pr` fields when the current name does not already begin with `PR Pipeline: <PR number> - `.
 

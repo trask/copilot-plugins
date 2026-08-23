@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import sys
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 
 MAX_SWEEPS = 2
@@ -147,7 +147,16 @@ def git_succeeds(repo_root: Path, *arguments: str) -> bool:
 
 
 def emit(payload: dict[str, Any]) -> None:
-    print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
+    print(json.dumps(payload, sort_keys=True), flush=True)
+
+
+def report_event(
+    report: Callable[[dict[str, Any]], None] | None,
+    event: str,
+    **fields: Any,
+) -> None:
+    if report is not None:
+        report({"event": event, **fields})
 
 
 def gh_json(arguments: list[str]) -> Any:
@@ -800,11 +809,13 @@ def run_pipeline(
     *,
     models: dict[str, str],
     effort: str,
+    report: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     run_id = uuid.uuid4().hex
     runs: list[dict[str, Any]] = []
     known_safe_head: str | None = None
     completed_sweeps = 0
+    report_event(report, "pipeline_started", run_id=run_id, target=target["pr_url"])
 
     for sweep in range(1, MAX_SWEEPS + 1):
         pr = read_pull_request(target)
@@ -835,6 +846,13 @@ def run_pipeline(
         known_safe_head = synced["head_sha"]
         sweep_started_head = known_safe_head
         head_changed = False
+        report_event(
+            report,
+            "sweep_started",
+            run_id=run_id,
+            sweep=sweep,
+            head_sha=sweep_started_head,
+        )
 
         for entry in STAGES:
             pr = read_pull_request(target)
@@ -870,30 +888,39 @@ def run_pipeline(
 
             before = inspect_stage(entry, target, current_head)
             if before["clear"]:
-                runs.append(
-                    {
-                        "stage": entry["stage"],
-                        "sweep": sweep,
-                        "action": "already_clear",
-                        "started_head_sha": current_head,
-                        "ended_head_sha": current_head,
-                        "outcome": before["outcome"],
-                    }
-                )
+                record = {
+                    "stage": entry["stage"],
+                    "sweep": sweep,
+                    "action": "already_clear",
+                    "started_head_sha": current_head,
+                    "ended_head_sha": current_head,
+                    "outcome": before["outcome"],
+                }
+                runs.append(record)
+                report_event(report, "stage_finished", run_id=run_id, **record)
                 continue
             if not before["installed"]:
-                runs.append(
-                    {
-                        "stage": entry["stage"],
-                        "sweep": sweep,
-                        "action": "plugin_not_installed",
-                        "started_head_sha": current_head,
-                        "ended_head_sha": current_head,
-                        "outcome": None,
-                    }
-                )
+                record = {
+                    "stage": entry["stage"],
+                    "sweep": sweep,
+                    "action": "plugin_not_installed",
+                    "started_head_sha": current_head,
+                    "ended_head_sha": current_head,
+                    "outcome": None,
+                }
+                runs.append(record)
+                report_event(report, "stage_finished", run_id=run_id, **record)
                 continue
 
+            report_event(
+                report,
+                "stage_started",
+                run_id=run_id,
+                stage=entry["stage"],
+                sweep=sweep,
+                head_sha=current_head,
+                started_at=utc_now(),
+            )
             launched = run_stage(
                 entry,
                 target,
@@ -919,6 +946,7 @@ def run_pipeline(
             if settled["result"] != "ready":
                 record["ended_head_sha"] = git_or_none(repo_root, "rev-parse", "HEAD")
                 runs.append(record)
+                report_event(report, "stage_finished", run_id=run_id, **record)
                 return blocked_result(
                     pr=read_pull_request(target),
                     run_id=run_id,
@@ -941,6 +969,7 @@ def run_pipeline(
                 }
             )
             runs.append(record)
+            report_event(report, "stage_finished", run_id=run_id, **record)
 
         completed_sweeps = sweep
         pr = read_pull_request(target)
@@ -963,6 +992,17 @@ def run_pipeline(
         known_safe_head = final_head
         head_changed = head_changed or final_head != sweep_started_head
         stages = inspect_stages(target, final_head)
+        report_event(
+            report,
+            "sweep_finished",
+            run_id=run_id,
+            sweep=sweep,
+            head_sha=final_head,
+            head_changed=head_changed,
+            uncleared_stages=[
+                stage["stage"] for stage in stages if not stage["clear"]
+            ],
+        )
         if all(stage["clear"] for stage in stages):
             return {
                 "result": "complete",
@@ -1008,8 +1048,9 @@ def command_run(args: argparse.Namespace) -> None:
         repo_root,
         models=stage_models(args.stage_model),
         effort=args.effort,
+        report=emit,
     )
-    emit(result)
+    emit({"event": "pipeline_finished", **result})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1042,10 +1083,10 @@ def main() -> int:
         args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:
-        emit({"result": "error", "error": str(error)})
+        emit({"event": "pipeline_finished", "result": "error", "error": str(error)})
         return 1
     except KeyboardInterrupt:
-        emit({"result": "error", "error": "interrupted"})
+        emit({"event": "pipeline_finished", "result": "error", "error": "interrupted"})
         return 130
 
 

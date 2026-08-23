@@ -1,4 +1,6 @@
+from contextlib import redirect_stdout
 import importlib.util
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -185,6 +187,7 @@ class SweepTest(unittest.TestCase):
         self.sync_heads = [HEAD]
         self.clear_at = {stage: None for stage in MODULE.STAGE_NAMES}
         self.launched: list[tuple[str, int]] = []
+        self.events: list[dict] = []
 
         self.patches = [
             mock.patch.object(MODULE, "read_pull_request", side_effect=self.read_pr),
@@ -241,6 +244,7 @@ class SweepTest(unittest.TestCase):
             self.repo,
             models=MODULE.stage_models(None),
             effort="high",
+            report=self.events.append,
         )
 
     def test_one_sweep_runs_all_stages_in_order(self):
@@ -251,6 +255,24 @@ class SweepTest(unittest.TestCase):
             [(stage, 1) for stage in MODULE.STAGE_NAMES],
             self.launched,
         )
+
+    def test_reports_sweep_and_stage_progress_in_order(self):
+        self.execute()
+        self.assertEqual(
+            [
+                "pipeline_started",
+                "sweep_started",
+                *(["stage_started", "stage_finished"] * len(MODULE.STAGES)),
+                "sweep_finished",
+            ],
+            [event["event"] for event in self.events],
+        )
+        stage_events = [
+            event["stage"]
+            for event in self.events
+            if event["event"] == "stage_started"
+        ]
+        self.assertEqual(list(MODULE.STAGE_NAMES), stage_events)
 
     def test_capped_stage_does_not_block_later_stages(self):
         original = self.run_stage
@@ -538,6 +560,68 @@ class AgentInstructionTest(unittest.TestCase):
             self.assertNotIn(command, text)
         self.assertIn("at most two foreground sweeps", text)
         self.assertIn("reaches its limit does not block", text)
+        self.assertIn("asynchronously as an attached process", text)
+        self.assertIn("30-second initial wait", text)
+        self.assertIn("same shell at least once every five minutes", text)
+        self.assertIn("Never end your turn", text)
+
+
+class CommandOutputTest(unittest.TestCase):
+    def test_run_emits_json_lines_ending_with_pipeline_result(self):
+        def fake_pipeline(_target, _repo, *, models, effort, report):
+            self.assertIsNotNone(models)
+            self.assertEqual("high", effort)
+            report({"event": "pipeline_started", "run_id": "run-1"})
+            report(
+                {
+                    "event": "stage_started",
+                    "stage": MODULE.STAGE_CONFLICT,
+                    "sweep": 1,
+                }
+            )
+            return {
+                "result": "complete",
+                "run_id": "run-1",
+                "head_sha": HEAD,
+            }
+
+        args = MODULE.build_parser().parse_args(["run", "owner/repo#7"])
+        output = StringIO()
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=Path("C:/repo")),
+            mock.patch.object(MODULE, "resolve_target", return_value=target()),
+            mock.patch.object(MODULE, "run_pipeline", side_effect=fake_pipeline),
+            redirect_stdout(output),
+        ):
+            MODULE.command_run(args)
+
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(
+            ["pipeline_started", "stage_started", "pipeline_finished"],
+            [event["event"] for event in events],
+        )
+        self.assertEqual("complete", events[-1]["result"])
+        self.assertEqual(HEAD, events[-1]["head_sha"])
+
+    def test_error_is_a_terminal_json_event(self):
+        output = StringIO()
+        with (
+            mock.patch.object(
+                MODULE, "require_tools", side_effect=MODULE.WorkflowError("broken")
+            ),
+            mock.patch.object(
+                __import__("sys"), "argv", ["pr_pipeline.py", "run", "owner/repo#7"]
+            ),
+            redirect_stdout(output),
+        ):
+            result = MODULE.main()
+
+        self.assertEqual(1, result)
+        event = json.loads(output.getvalue())
+        self.assertEqual("pipeline_finished", event["event"])
+        self.assertEqual("error", event["result"])
+        self.assertEqual("broken", event["error"])
 
 
 class ParserTest(unittest.TestCase):
