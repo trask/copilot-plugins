@@ -5483,6 +5483,12 @@ class RepairNativeStackTopologyTest(unittest.TestCase):
             "trunk": "main",
             "members": self.stack["members"][1:],
         }
+        self.singleton = {
+            "number": 102,
+            "size": 1,
+            "trunk": "main",
+            "members": self.stack["members"][:1],
+        }
 
     def test_members_split_into_maximal_direct_base_chains(self):
         self.assertEqual(
@@ -5584,11 +5590,11 @@ class RepairNativeStackTopologyTest(unittest.TestCase):
             self.stack,
             self.stack,
             self.stack,
+            self.singleton,
             None,
             None,
             None,
-            None,
-            None,
+            self.singleton,
             self.repaired,
         ]
         with mock.patch.object(
@@ -5605,15 +5611,15 @@ class RepairNativeStackTopologyTest(unittest.TestCase):
 
     def test_retry_accepts_an_already_recreated_segment(self):
         observed = [
-            None,
+            self.singleton,
             self.repaired,
             self.repaired,
             self.repaired,
-            None,
+            self.singleton,
             self.repaired,
             self.repaired,
             self.repaired,
-            None,
+            self.singleton,
             self.repaired,
         ]
         with mock.patch.object(
@@ -5627,6 +5633,32 @@ class RepairNativeStackTopologyTest(unittest.TestCase):
         self.assertEqual([[1], [2, 3, 4]], segments)
         unstack.assert_not_called()
         create.assert_not_called()
+
+    def test_a_one_member_native_stack_is_an_effective_unstacked_singleton(self):
+        self.assertIsNone(MODULE.effective_stack_group(self.singleton, 1))
+        self.assertEqual(
+            (2, 3, 4), MODULE.effective_stack_group(self.repaired, 2)
+        )
+
+    def test_a_singleton_wrapper_with_changed_metadata_is_rejected(self):
+        changed = json.loads(json.dumps(self.singleton))
+        changed["members"][0]["head_sha"] = "changed"
+        observed = [
+            changed,
+            self.repaired,
+            self.repaired,
+            self.repaired,
+            changed,
+            self.repaired,
+            self.repaired,
+            self.repaired,
+            changed,
+        ]
+        with mock.patch.object(MODULE, "member_stack", side_effect=observed):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "singleton stack wrapper"
+            ):
+                MODULE.repair_native_stack_topology(pr_metadata(), self.stack)
 
     def test_unstack_uses_the_versioned_native_stacks_endpoint(self):
         with mock.patch.object(

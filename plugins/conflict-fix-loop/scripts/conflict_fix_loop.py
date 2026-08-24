@@ -3199,6 +3199,16 @@ def member_stack(pr: dict[str, Any], number: int) -> dict[str, Any] | None:
     return stack_membership({**pr, "number": number}).get("stack")
 
 
+def effective_stack_group(
+    stack: dict[str, Any] | None, number: int
+) -> tuple[int, ...] | None:
+    """Treat GitHub's retained one-member stack wrapper as unstacked."""
+    if stack is None:
+        return None
+    numbers = tuple(member["number"] for member in stack["members"])
+    return None if numbers == (number,) else numbers
+
+
 def unstack_native_stack(pr: dict[str, Any], number: int) -> None:
     """Remove every unlocked pull request from one malformed native stack."""
     repo_name = f"{pr['upstream_owner']}/{pr['upstream_repo']}"
@@ -3260,11 +3270,7 @@ def repair_native_stack_topology(
     }
     original = tuple(member["number"] for member in stack["members"])
     observed = {
-        number: (
-            None
-            if (current := member_stack(pr, number)) is None
-            else tuple(member["number"] for member in current["members"])
-        )
+        number: effective_stack_group(member_stack(pr, number), number)
         for number in original
     }
     if all(group == original for group in observed.values()):
@@ -3279,11 +3285,7 @@ def repair_native_stack_topology(
         )
 
     observed = {
-        number: (
-            None
-            if (current := member_stack(pr, number)) is None
-            else tuple(member["number"] for member in current["members"])
-        )
+        number: effective_stack_group(member_stack(pr, number), number)
         for number in original
     }
     for segment in segments:
@@ -3305,10 +3307,23 @@ def repair_native_stack_topology(
         numbers = [member["number"] for member in segment]
         current = member_stack(pr, numbers[0])
         if len(numbers) == 1:
-            if current is not None:
+            if effective_stack_group(current, numbers[0]) is not None:
                 raise WorkflowError(
                     f"pull request #{numbers[0]} remained in a native stack after repair"
                 )
+            if current is not None:
+                member = current["members"][0]
+                frozen = by_number[numbers[0]]
+                if (
+                    current["trunk"] != frozen["base_branch"]
+                    or member["head_branch"] != frozen["head_branch"]
+                    or member["base_branch"] != frozen["base_branch"]
+                    or member["head_sha"] != frozen["head_sha"]
+                ):
+                    raise WorkflowError(
+                        f"pull request #{numbers[0]} changed while its singleton stack "
+                        "wrapper was being verified"
+                    )
             continue
         if current is None:
             raise WorkflowError(f"repaired native stack {numbers} is missing")
