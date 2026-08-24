@@ -18,7 +18,10 @@ pull request. See [Publication](#publication) for the rest of the flow.
 
 ## Validation
 
-1. Run the narrowest tests the change affects, then `python -m pytest`.
+1. Run the narrowest tests that cover the change. Run `python -m pytest` only
+   for shared repository infrastructure, marketplace-wide changes, or when
+   targeted tests expose a cross-plugin concern. CI runs the full suite after
+   every push.
 2. Run `git diff --check`, read `git status`, and review the final diff.
 3. To check a plugin change, install the plugin from the marketplace. That
    requires publishing it first. The Copilot CLI cannot install from a local
