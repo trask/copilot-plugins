@@ -85,6 +85,46 @@ def temporary_directory(test: unittest.TestCase) -> Path:
     return directory
 
 
+class GitTestCase(unittest.TestCase):
+    @staticmethod
+    def git_in(root, *args, check=True, input_bytes=None):
+        text_options = (
+            {"text": True, "encoding": "utf-8"}
+            if input_bytes is None
+            else {"input": input_bytes}
+        )
+        process = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            **text_options,
+        )
+        stdout = (
+            process.stdout
+            if isinstance(process.stdout, str)
+            else process.stdout.decode("utf-8")
+        )
+        stderr = (
+            process.stderr
+            if isinstance(process.stderr, str)
+            else process.stderr.decode("utf-8")
+        )
+        if check and process.returncode != 0:
+            raise AssertionError(
+                f"git {' '.join(args)} failed ({process.returncode}): "
+                f"{stderr or stdout}"
+            )
+        return stdout.strip() if check else process
+
+    @staticmethod
+    def write_in(root, name, content):
+        (root / name).write_text(content, encoding="utf-8", newline="\n")
+
+    @classmethod
+    def commit_in(cls, root, message):
+        cls.git_in(root, "add", "--all")
+        cls.git_in(root, "commit", "--no-gpg-sign", "--message", message)
+
+
 def pr_metadata(**overrides):
     metadata = {
         "number": 7,
@@ -4138,51 +4178,85 @@ class MainTest(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("git"), "git is not installed")
-class RealGitConflictTest(unittest.TestCase):
+class RealGitConflictTest(GitTestCase):
     """Drive the git plumbing against a repository that really is conflicted."""
 
+    @classmethod
+    def setUpClass(cls):
+        cls.template = tempfile.TemporaryDirectory()
+        cls.template_repo = Path(cls.template.name).resolve() / "repo"
+        cls.template_repo.mkdir()
+        cls.git_in(cls.template_repo, "init", "--initial-branch", "main")
+        cls.git_in(cls.template_repo, "config", "user.name", "Conflict Fix Loop")
+        cls.git_in(
+            cls.template_repo,
+            "config",
+            "user.email",
+            "conflict-fix-loop@example.invalid",
+        )
+        cls.git_in(cls.template_repo, "config", "core.autocrlf", "false")
+        cls.git_in(cls.template_repo, "config", "commit.gpgsign", "false")
+
+        cls.write_in(cls.template_repo, "app.py", "def greet():\n    return 'hello'\n")
+        cls.write_in(cls.template_repo, "notes.md", "notes\n")
+        cls.commit_in(cls.template_repo, "Add the greeting")
+        cls.merge_base = cls.git_in(cls.template_repo, "rev-parse", "HEAD")
+
+        cls.git_in(cls.template_repo, "checkout", "-b", "feature")
+        cls.write_in(
+            cls.template_repo,
+            "app.py",
+            "def greet(name):\n    return f'hello {name}'\n",
+        )
+        cls.commit_in(cls.template_repo, "Take a name")
+        cls.head_sha = cls.git_in(cls.template_repo, "rev-parse", "HEAD")
+
+        cls.git_in(cls.template_repo, "checkout", "main")
+        cls.write_in(cls.template_repo, "app.py", "def greet():\n    return 'hello!'\n")
+        cls.commit_in(cls.template_repo, "Add the exclamation mark")
+        cls.base_sha = cls.git_in(cls.template_repo, "rev-parse", "HEAD")
+        cls.git_in(cls.template_repo, "tag", "fixture-feature", cls.head_sha)
+        cls.git_in(cls.template_repo, "branch", "--delete", "--force", "feature")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.template.cleanup()
+
     def setUp(self):
-        self.repo = temporary_directory(self)
-        self.git("init", "--initial-branch", "main")
-        self.git("config", "user.name", "Conflict Fix Loop")
-        self.git("config", "user.email", "conflict-fix-loop@example.invalid")
-        self.git("config", "core.autocrlf", "false")
-        self.git("config", "commit.gpgsign", "false")
+        root = temporary_directory(self)
+        self.repo = root / "repo"
+        self.git_in(
+            self.template_repo,
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "feature",
+            str(self.repo),
+            "fixture-feature",
+        )
+        self.addCleanup(self.remove_worktree)
 
-        self.write("app.py", "def greet():\n    return 'hello'\n")
-        self.write("notes.md", "notes\n")
-        self.commit("Add the greeting")
-        self.merge_base = self.git("rev-parse", "HEAD")
-
-        self.git("checkout", "-b", "feature")
-        self.write("app.py", "def greet(name):\n    return f'hello {name}'\n")
-        self.commit("Take a name")
-        self.head_sha = self.git("rev-parse", "HEAD")
-
-        self.git("checkout", "main")
-        self.write("app.py", "def greet():\n    return 'hello!'\n")
-        self.commit("Add the exclamation mark")
-        self.base_sha = self.git("rev-parse", "HEAD")
-
-        self.git("checkout", "feature")
+    def remove_worktree(self):
+        self.git_in(
+            self.template_repo,
+            "worktree",
+            "remove",
+            "--force",
+            str(self.repo),
+        )
+        self.git_in(
+            self.template_repo, "branch", "--delete", "--force", "feature"
+        )
 
     def git(self, *arguments):
-        process = subprocess.run(
-            ["git", "-C", str(self.repo), *arguments],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
-        if process.returncode != 0:
-            self.fail(f"git {' '.join(arguments)} failed: {process.stderr}")
-        return process.stdout.strip()
+        return self.git_in(self.repo, *arguments)
 
     def write(self, name, text):
-        (self.repo / name).write_text(text, encoding="utf-8", newline="\n")
+        self.write_in(self.repo, name, text)
 
     def commit(self, message):
-        self.git("add", "--all")
-        self.git("commit", "--no-gpg-sign", "--message", message)
+        self.commit_in(self.repo, message)
 
     def start_merge(self):
         subprocess.run(
@@ -4368,6 +4442,7 @@ class RealGitConflictTest(unittest.TestCase):
 
     def test_the_repository_remote_is_found_by_its_github_url(self):
         self.git("remote", "add", "origin", "https://github.com/owner/repo.git")
+        self.addCleanup(self.git, "remote", "remove", "origin")
         self.assertEqual("origin", MODULE.find_remote(self.repo, "Owner/Repo", push=False))
         with self.assertRaises(MODULE.WorkflowError):
             MODULE.find_remote(self.repo, "other/repo", push=False)
@@ -5682,61 +5757,78 @@ class RepairNativeStackTopologyTest(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("git"), "git is not installed")
-class StackCascadeTopologyTest(unittest.TestCase):
+class StackCascadeTopologyTest(GitTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.template = tempfile.TemporaryDirectory()
+        cls.template_repo = Path(cls.template.name).resolve() / "repo"
+        cls.template_repo.mkdir()
+        cls.git_in(cls.template_repo, "init", "--initial-branch", "main")
+        cls.git_in(cls.template_repo, "config", "user.name", "Stack Test")
+        cls.git_in(cls.template_repo, "config", "user.email", "stack@example.invalid")
+        cls.git_in(cls.template_repo, "config", "commit.gpgsign", "false")
+        cls.write_in(cls.template_repo, "base.txt", "base\n")
+        cls.commit_in(cls.template_repo, "base")
+        cls.main_head = cls.git_in(cls.template_repo, "rev-parse", "HEAD")
+
+        cls.git_in(cls.template_repo, "checkout", "-b", "lower")
+        cls.write_in(cls.template_repo, "lower.txt", "lower one\n")
+        cls.commit_in(cls.template_repo, "lower one")
+        cls.lower_old = cls.git_in(cls.template_repo, "rev-parse", "HEAD")
+
+        cls.git_in(cls.template_repo, "checkout", "-b", "child")
+        cls.write_in(cls.template_repo, "child.txt", "child\n")
+        cls.commit_in(cls.template_repo, "child")
+        cls.child_head = cls.git_in(cls.template_repo, "rev-parse", "HEAD")
+
+        cls.git_in(cls.template_repo, "checkout", "-b", "grandchild")
+        cls.write_in(cls.template_repo, "grandchild.txt", "grandchild\n")
+        cls.commit_in(cls.template_repo, "grandchild")
+        cls.grandchild_head = cls.git_in(cls.template_repo, "rev-parse", "HEAD")
+
+        cls.git_in(cls.template_repo, "checkout", "lower")
+        cls.write_in(cls.template_repo, "lower.txt", "lower one\nlower two\n")
+        cls.commit_in(cls.template_repo, "lower two")
+        cls.lower_head = cls.git_in(cls.template_repo, "rev-parse", "HEAD")
+
+        cls.git_in(cls.template_repo, "checkout", "main")
+        cls.git_in(cls.template_repo, "checkout", "-b", "unrelated")
+        cls.write_in(cls.template_repo, "unrelated.txt", "unrelated\n")
+        cls.commit_in(cls.template_repo, "unrelated")
+        cls.unrelated_head = cls.git_in(cls.template_repo, "rev-parse", "HEAD")
+        cls.git_in(cls.template_repo, "checkout", "--detach", "main")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.template.cleanup()
+
     def setUp(self):
         self.root = temporary_directory(self)
         self.remote = self.root / "remote.git"
         self.source = self.root / "source"
         self.workspace = self.root / "workspace"
         self.git(
-            self.root, "init", "--bare", "--initial-branch", "main", str(self.remote)
+            self.root,
+            "clone",
+            "--quiet",
+            "--bare",
+            "--shared",
+            str(self.template_repo),
+            str(self.remote),
         )
-        self.source.mkdir()
-        self.git(self.source, "init", "--initial-branch", "main")
-        self.git(self.source, "config", "user.name", "Stack Test")
-        self.git(self.source, "config", "user.email", "stack@example.invalid")
-        self.git(self.source, "config", "commit.gpgsign", "false")
-        self.write(self.source, "base.txt", "base\n")
-        self.commit(self.source, "base")
-        self.main_head = self.git(self.source, "rev-parse", "HEAD")
-
-        self.git(self.source, "checkout", "-b", "lower")
-        self.write(self.source, "lower.txt", "lower one\n")
-        self.commit(self.source, "lower one")
-        self.lower_old = self.git(self.source, "rev-parse", "HEAD")
-
-        self.git(self.source, "checkout", "-b", "child")
-        self.write(self.source, "child.txt", "child\n")
-        self.commit(self.source, "child")
-        self.child_head = self.git(self.source, "rev-parse", "HEAD")
-
-        self.git(self.source, "checkout", "-b", "grandchild")
-        self.write(self.source, "grandchild.txt", "grandchild\n")
-        self.commit(self.source, "grandchild")
-        self.grandchild_head = self.git(self.source, "rev-parse", "HEAD")
-
-        self.git(self.source, "checkout", "lower")
-        self.write(self.source, "lower.txt", "lower one\nlower two\n")
-        self.commit(self.source, "lower two")
-        self.lower_head = self.git(self.source, "rev-parse", "HEAD")
-
-        self.git(self.source, "checkout", "main")
-        self.git(self.source, "checkout", "-b", "unrelated")
-        self.write(self.source, "unrelated.txt", "unrelated\n")
-        self.commit(self.source, "unrelated")
-        self.unrelated_head = self.git(self.source, "rev-parse", "HEAD")
-        self.git(self.source, "checkout", "main")
-        self.git(self.source, "remote", "add", "origin", str(self.remote))
+        (self.remote / "HEAD").write_text(
+            "ref: refs/heads/main\n", encoding="utf-8", newline="\n"
+        )
         self.git(
-            self.source,
-            "push",
-            "origin",
+            self.template_repo,
+            "worktree",
+            "add",
+            "--quiet",
+            str(self.source),
             "main",
-            "lower",
-            "child",
-            "grandchild",
-            "unrelated",
         )
+        self.addCleanup(self.reset_template)
+        self.git(self.source, "remote", "add", "origin", str(self.remote))
         self.clone_workspace()
         self.stack = {
             "number": 10,
@@ -5770,26 +5862,41 @@ class StackCascadeTopologyTest(unittest.TestCase):
             "members_after": None,
         }
 
-    def git(self, root, *args, check=True):
-        process = subprocess.run(
-            ["git", "-C", str(root), *args],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
+    def reset_template(self):
+        self.git(self.source, "remote", "remove", "origin")
+        self.git(
+            self.template_repo,
+            "worktree",
+            "remove",
+            "--force",
+            str(self.source),
         )
-        if check and process.returncode != 0:
-            self.fail(
-                f"git {' '.join(args)} failed ({process.returncode}): "
-                f"{process.stderr or process.stdout}"
+        updates = "".join(
+            f"update refs/heads/{branch} {head}\n"
+            for branch, head in (
+                ("main", self.main_head),
+                ("lower", self.lower_head),
+                ("child", self.child_head),
+                ("grandchild", self.grandchild_head),
+                ("unrelated", self.unrelated_head),
             )
-        return process.stdout.strip() if check else process
+        )
+        updates += "delete refs/heads/rewritten-lower\n"
+        self.git_in(
+            self.template_repo,
+            "update-ref",
+            "--stdin",
+            input_bytes=updates.encode("ascii"),
+        )
+
+    def git(self, root, *args, check=True):
+        return self.git_in(root, *args, check=check)
 
     def write(self, root, name, content):
-        (root / name).write_text(content, encoding="utf-8", newline="\n")
+        self.write_in(root, name, content)
 
     def commit(self, root, message):
-        self.git(root, "add", "--all")
-        self.git(root, "commit", "--no-gpg-sign", "--message", message)
+        self.commit_in(root, message)
 
     def clone_workspace(self):
         if self.workspace.exists():
