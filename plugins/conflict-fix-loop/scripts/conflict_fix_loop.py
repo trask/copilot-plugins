@@ -3129,6 +3129,213 @@ def validate_stack_snapshot(stack: dict[str, Any]) -> None:
         )
 
 
+def stack_base_mismatches(stack: dict[str, Any]) -> list[dict[str, Any]]:
+    """Name members whose direct PR base disagrees with native stack order."""
+    mismatches = []
+    expected_base = stack.get("trunk")
+    for member in stack.get("members") or []:
+        if member.get("base_branch") != expected_base:
+            mismatches.append(
+                {
+                    "number": member.get("number"),
+                    "head_branch": member.get("head_branch"),
+                    "base_branch": member.get("base_branch"),
+                    "expected_base": expected_base,
+                }
+            )
+        expected_base = member.get("head_branch")
+    return mismatches
+
+
+def linear_stack_segments(stack: dict[str, Any]) -> list[list[dict[str, Any]]]:
+    """Split members into maximal vertex-disjoint direct-base chains."""
+    members = stack.get("members") or []
+    by_head = {member["head_branch"]: member for member in members}
+    checked: set[int] = set()
+    for member in members:
+        path: set[int] = set()
+        current = member
+        while current is not None and current["number"] not in checked:
+            if current["number"] in path:
+                raise WorkflowError(
+                    "the malformed native stack contains a direct-base cycle"
+                )
+            path.add(current["number"])
+            current = by_head.get(current["base_branch"])
+        checked.update(path)
+
+    children = {member["head_branch"]: [] for member in members}
+    for member in members:
+        parent = by_head.get(member["base_branch"])
+        if parent is not None:
+            children[parent["head_branch"]].append(member)
+
+    starts = [
+        member
+        for member in members
+        if member["base_branch"] not in by_head
+        or len(children[member["base_branch"]]) != 1
+    ]
+    segments: list[list[dict[str, Any]]] = []
+    visited: set[int] = set()
+    for start in starts:
+        segment = []
+        current = start
+        while current["number"] not in visited:
+            segment.append(current)
+            visited.add(current["number"])
+            descendants = children[current["head_branch"]]
+            if len(descendants) != 1:
+                break
+            current = descendants[0]
+        segments.append(segment)
+    if len(visited) != len(members):
+        raise WorkflowError("the malformed native stack could not be split into chains")
+    return segments
+
+
+def member_stack(pr: dict[str, Any], number: int) -> dict[str, Any] | None:
+    """Read native stack membership for another member of the same repository."""
+    return stack_membership({**pr, "number": number}).get("stack")
+
+
+def unstack_native_stack(pr: dict[str, Any], number: int) -> None:
+    """Remove every unlocked pull request from one malformed native stack."""
+    repo_name = f"{pr['upstream_owner']}/{pr['upstream_repo']}"
+    result = run(
+        [
+            "gh",
+            "api",
+            "--method",
+            "POST",
+            "-H",
+            "X-GitHub-Api-Version: 2026-03-10",
+            f"repos/{repo_name}/stacks/{number}/unstack",
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WorkflowError(
+            f"could not dissolve malformed native stack {number}: {detail}"
+        )
+
+
+def create_native_stack(pr: dict[str, Any], numbers: list[int]) -> None:
+    """Create one native stack from a verified direct-base chain."""
+    repo_name = f"{pr['upstream_owner']}/{pr['upstream_repo']}"
+    result = run(
+        [
+            "gh",
+            "api",
+            "--method",
+            "POST",
+            "-H",
+            "X-GitHub-Api-Version: 2026-03-10",
+            f"repos/{repo_name}/stacks",
+            "--input",
+            "-",
+        ],
+        input_text=json.dumps({"pull_requests": numbers}),
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WorkflowError(
+            f"could not create repaired native stack {numbers}: {detail}"
+        )
+
+
+def repair_native_stack_topology(
+    pr: dict[str, Any], stack: dict[str, Any]
+) -> list[list[int]]:
+    """Replace one malformed stack with the direct-base chains it contains."""
+    segments = linear_stack_segments(stack)
+    desired = {
+        member["number"]: (
+            tuple(item["number"] for item in segment) if len(segment) > 1 else None
+        )
+        for segment in segments
+        for member in segment
+    }
+    original = tuple(member["number"] for member in stack["members"])
+    observed = {
+        number: (
+            None
+            if (current := member_stack(pr, number)) is None
+            else tuple(member["number"] for member in current["members"])
+        )
+        for number in original
+    }
+    if all(group == original for group in observed.values()):
+        unstack_native_stack(pr, stack["number"])
+    elif any(
+        group is not None and group != desired[number]
+        for number, group in observed.items()
+    ):
+        raise WorkflowError(
+            "native stack membership changed while its malformed topology was being "
+            "repaired"
+        )
+
+    observed = {
+        number: (
+            None
+            if (current := member_stack(pr, number)) is None
+            else tuple(member["number"] for member in current["members"])
+        )
+        for number in original
+    }
+    for segment in segments:
+        numbers = [member["number"] for member in segment]
+        if len(numbers) < 2:
+            continue
+        groups = {observed[number] for number in numbers}
+        expected = tuple(numbers)
+        if groups == {expected}:
+            continue
+        if groups != {None}:
+            raise WorkflowError(
+                f"native stack segment {numbers} is only partly repaired"
+            )
+        create_native_stack(pr, numbers)
+
+    by_number = {member["number"]: member for member in stack["members"]}
+    for segment in segments:
+        numbers = [member["number"] for member in segment]
+        current = member_stack(pr, numbers[0])
+        if len(numbers) == 1:
+            if current is not None:
+                raise WorkflowError(
+                    f"pull request #{numbers[0]} remained in a native stack after repair"
+                )
+            continue
+        if current is None:
+            raise WorkflowError(f"repaired native stack {numbers} is missing")
+        current_numbers = [member["number"] for member in current["members"]]
+        if current_numbers != numbers:
+            raise WorkflowError(
+                f"repaired native stack has members {current_numbers}, expected {numbers}"
+            )
+        if current["trunk"] != segment[0]["base_branch"]:
+            raise WorkflowError(
+                f"repaired native stack {numbers} targets {current['trunk']!r}, expected "
+                f"{segment[0]['base_branch']!r}"
+            )
+        for member in current["members"]:
+            frozen = by_number[member["number"]]
+            if (
+                member["head_branch"] != frozen["head_branch"]
+                or member["base_branch"] != frozen["base_branch"]
+                or member["head_sha"] != frozen["head_sha"]
+            ):
+                raise WorkflowError(
+                    f"pull request #{member['number']} changed while its native stack "
+                    "topology was being repaired"
+                )
+    return [[member["number"] for member in segment] for segment in segments]
+
+
 def prepare_stack_cascade(
     workspace: Path, stack: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -3555,6 +3762,34 @@ def command_stack_rebase(args: argparse.Namespace) -> None:
             "start the next one"
         )
     stack = attempt["stack"]
+    mismatches = stack_base_mismatches(stack)
+    if mismatches:
+        stack["topology_mismatches"] = mismatches
+        stack["repair_segments"] = [
+            [member["number"] for member in segment]
+            for segment in linear_stack_segments(stack)
+        ]
+        save_state(state_path, state)
+        segments = repair_native_stack_topology(state["pr"], stack)
+        attempt["status"] = "aborted"
+        attempt["stack_repair"] = {
+            "mismatches": mismatches,
+            "segments": segments,
+        }
+        state["last_stack_repair"] = attempt["stack_repair"]
+        archive_attempt(state)
+        state["attempt"] = None
+        save_state(state_path, state)
+        emit(
+            {
+                "result": "stack_repaired",
+                "state": str(state_path),
+                "mismatches": mismatches,
+                "segments": segments,
+                "next": "preflight",
+            }
+        )
+        return
     reference = local_object_source(Path(state["repo_root"]))
     workspace = create_stack_workspace(state["pr"], reference=reference)
     stack["workspace"] = str(workspace)

@@ -471,7 +471,15 @@ class AgentInstructionsTest(unittest.TestCase):
             "the cascade runs in a throwaway clone", self.instructions
         )
         self.assertIn(
-            "computes each child boundary from `baseRefOid` and the original graph",
+            "compares native order with direct PR bases",
+            self.instructions,
+        )
+        self.assertIn(
+            "split through GitHub's stacks API along those direct-base chains",
+            self.instructions,
+        )
+        self.assertIn(
+            "Do not run `stack-abort` for a topology repair failure",
             self.instructions,
         )
         self.assertIn(
@@ -5431,6 +5439,216 @@ class CurrentStackSnapshotTest(unittest.TestCase):
                 MODULE.require_current_stack_snapshot(pr_metadata(), self.stack)
 
 
+class RepairNativeStackTopologyTest(unittest.TestCase):
+    def setUp(self):
+        self.stack = {
+            "number": 100,
+            "size": 4,
+            "trunk": "main",
+            "invoked_number": 2,
+            "members": [
+                {
+                    "number": 1,
+                    "head_branch": "lower",
+                    "base_branch": "main",
+                    "head_sha": "one",
+                    "base_sha": "base",
+                },
+                {
+                    "number": 2,
+                    "head_branch": "feature",
+                    "base_branch": "main",
+                    "head_sha": "two",
+                    "base_sha": "base",
+                },
+                {
+                    "number": 3,
+                    "head_branch": "child",
+                    "base_branch": "feature",
+                    "head_sha": "three",
+                    "base_sha": "two",
+                },
+                {
+                    "number": 4,
+                    "head_branch": "grandchild",
+                    "base_branch": "child",
+                    "head_sha": "four",
+                    "base_sha": "three",
+                },
+            ],
+        }
+        self.repaired = {
+            "number": 101,
+            "size": 3,
+            "trunk": "main",
+            "members": self.stack["members"][1:],
+        }
+
+    def test_members_split_into_maximal_direct_base_chains(self):
+        self.assertEqual(
+            [[1], [2, 3, 4]],
+            [
+                [member["number"] for member in segment]
+                for segment in MODULE.linear_stack_segments(self.stack)
+            ],
+        )
+        self.assertEqual(
+            [
+                {
+                    "number": 2,
+                    "head_branch": "feature",
+                    "base_branch": "main",
+                    "expected_base": "lower",
+                }
+            ],
+            MODULE.stack_base_mismatches(self.stack),
+        )
+
+    def test_a_nonadjacent_parent_and_child_remain_in_one_repaired_chain(self):
+        self.stack["members"] = [
+            self.stack["members"][0],
+            self.stack["members"][1],
+            {
+                "number": 3,
+                "head_branch": "child",
+                "base_branch": "lower",
+                "head_sha": "three",
+                "base_sha": "one",
+            },
+        ]
+        self.assertEqual(
+            [[1, 3], [2]],
+            [
+                [member["number"] for member in segment]
+                for segment in MODULE.linear_stack_segments(self.stack)
+            ],
+        )
+
+    def test_a_fork_starts_new_chains_below_the_shared_parent(self):
+        self.stack["members"] = [
+            self.stack["members"][0],
+            {
+                "number": 2,
+                "head_branch": "left",
+                "base_branch": "lower",
+                "head_sha": "two",
+                "base_sha": "one",
+            },
+            {
+                "number": 3,
+                "head_branch": "right",
+                "base_branch": "lower",
+                "head_sha": "three",
+                "base_sha": "one",
+            },
+            {
+                "number": 4,
+                "head_branch": "left-child",
+                "base_branch": "left",
+                "head_sha": "four",
+                "base_sha": "two",
+            },
+        ]
+        self.assertEqual(
+            [[1], [2, 4], [3]],
+            [
+                [member["number"] for member in segment]
+                for segment in MODULE.linear_stack_segments(self.stack)
+            ],
+        )
+
+    def test_a_cycle_with_a_fork_is_rejected_before_stack_membership_changes(self):
+        self.stack["members"] = [
+            {
+                "number": 1,
+                "head_branch": "a",
+                "base_branch": "b",
+            },
+            {
+                "number": 2,
+                "head_branch": "b",
+                "base_branch": "c",
+            },
+            {
+                "number": 3,
+                "head_branch": "c",
+                "base_branch": "b",
+            },
+        ]
+        with self.assertRaisesRegex(MODULE.WorkflowError, "direct-base cycle"):
+            MODULE.linear_stack_segments(self.stack)
+
+    def test_a_malformed_stack_is_dissolved_and_linear_segments_are_recreated(self):
+        observed = [
+            self.stack,
+            self.stack,
+            self.stack,
+            self.stack,
+            None,
+            None,
+            None,
+            None,
+            None,
+            self.repaired,
+        ]
+        with mock.patch.object(
+            MODULE, "member_stack", side_effect=observed
+        ), mock.patch.object(MODULE, "unstack_native_stack") as unstack, mock.patch.object(
+            MODULE, "create_native_stack"
+        ) as create:
+            segments = MODULE.repair_native_stack_topology(
+                pr_metadata(), self.stack
+            )
+        self.assertEqual([[1], [2, 3, 4]], segments)
+        unstack.assert_called_once_with(pr_metadata(), 100)
+        create.assert_called_once_with(pr_metadata(), [2, 3, 4])
+
+    def test_retry_accepts_an_already_recreated_segment(self):
+        observed = [
+            None,
+            self.repaired,
+            self.repaired,
+            self.repaired,
+            None,
+            self.repaired,
+            self.repaired,
+            self.repaired,
+            None,
+            self.repaired,
+        ]
+        with mock.patch.object(
+            MODULE, "member_stack", side_effect=observed
+        ), mock.patch.object(MODULE, "unstack_native_stack") as unstack, mock.patch.object(
+            MODULE, "create_native_stack"
+        ) as create:
+            segments = MODULE.repair_native_stack_topology(
+                pr_metadata(), self.stack
+            )
+        self.assertEqual([[1], [2, 3, 4]], segments)
+        unstack.assert_not_called()
+        create.assert_not_called()
+
+    def test_unstack_uses_the_versioned_native_stacks_endpoint(self):
+        with mock.patch.object(
+            MODULE, "run", return_value=completed(0)
+        ) as runner:
+            MODULE.unstack_native_stack(pr_metadata(), 100)
+        command = runner.call_args.args[0]
+        self.assertIn("X-GitHub-Api-Version: 2026-03-10", command)
+        self.assertIn("repos/owner/repo/stacks/100/unstack", command)
+
+    def test_create_sends_the_ordered_pull_request_numbers_as_json(self):
+        with mock.patch.object(
+            MODULE, "run", return_value=completed(0)
+        ) as runner:
+            MODULE.create_native_stack(pr_metadata(), [2, 3, 4])
+        self.assertIn("repos/owner/repo/stacks", runner.call_args.args[0])
+        self.assertEqual(
+            {"pull_requests": [2, 3, 4]},
+            json.loads(runner.call_args.kwargs["input_text"]),
+        )
+
+
 @unittest.skipUnless(shutil.which("git"), "git is not installed")
 class StackCascadeTopologyTest(unittest.TestCase):
     def setUp(self):
@@ -5779,15 +5997,27 @@ class StackRebaseCommandTest(unittest.TestCase):
         self.directory = temporary_directory(self)
         self.workspace = temporary_directory(self)
 
-    def run_rebase(self, *, rebase=None, members_after=None,
-                   conflicts=None, rebase_in_progress=False, attempt=None):
+    def run_rebase(
+        self,
+        *,
+        rebase=None,
+        members_after=None,
+        conflicts=None,
+        rebase_in_progress=False,
+        attempt=None,
+        repair_segments=None,
+    ):
         attempt = attempt or stack_attempt_record()
         state_path = write_state(self.directory, attempt=attempt)
 
         args = SimpleNamespace(state=str(state_path))
         with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
             MODULE, "create_stack_workspace", return_value=self.workspace
-        ), mock.patch.object(
+        ) as create_workspace, mock.patch.object(
+            MODULE,
+            "repair_native_stack_topology",
+            return_value=repair_segments or [],
+        ) as repair, mock.patch.object(
             MODULE, "prepare_stack_cascade", return_value=[]
         ), mock.patch.object(
             MODULE, "run_stack_cascade", return_value=rebase or completed(0)
@@ -5810,6 +6040,8 @@ class StackRebaseCommandTest(unittest.TestCase):
         self.state_path = state_path
         self.remove = remove
         self.emit = emit
+        self.create_workspace = create_workspace
+        self.repair = repair
         return emitted(emit) if emit.called else None
 
     def saved(self):
@@ -5826,6 +6058,21 @@ class StackRebaseCommandTest(unittest.TestCase):
         state = self.saved()
         self.assertEqual("resolved", state["attempt"]["status"])
         self.assertEqual(tips, state["attempt"]["stack"]["members_after"])
+
+    def test_a_malformed_native_stack_is_split_then_returns_to_preflight(self):
+        attempt = stack_attempt_record()
+        attempt["stack"]["members"][1]["base_branch"] = "main"
+        payload = self.run_rebase(
+            attempt=attempt, repair_segments=[[19483], [7]]
+        )
+        self.assertEqual("stack_repaired", payload["result"])
+        self.assertEqual("preflight", payload["next"])
+        self.assertEqual([[19483], [7]], payload["segments"])
+        self.create_workspace.assert_not_called()
+        self.repair.assert_called_once()
+        state = self.saved()
+        self.assertIsNone(state["attempt"])
+        self.assertEqual([[19483], [7]], state["last_stack_repair"]["segments"])
 
     def test_a_rebase_conflict_surfaces_the_conflicted_files(self):
         payload = self.run_rebase(
