@@ -17,7 +17,7 @@ The helper runs at most two foreground sweeps in this order:
 4. `ci-fix-loop`
 5. `pr-description`
 
-Each stage owns its internal loop. A stage that reaches its limit does not block the stages after it. The helper runs a second sweep only when the pull request head changed during the first and some stage is not clear at the final head.
+Each stage owns its internal loop. A stage that reaches its limit does not block the stages after it. The helper runs a second sweep only when the pull request head or base changed during the first and some stage is not clear at the final revisions.
 
 Choose the command for the active shell:
 

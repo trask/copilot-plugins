@@ -19,6 +19,8 @@ SPEC.loader.exec_module(MODULE)
 
 HEAD = "a" * 40
 NEXT_HEAD = "b" * 40
+BASE = "c" * 40
+NEXT_BASE = "d" * 40
 
 
 def target() -> dict:
@@ -33,6 +35,7 @@ def pull_request(head: str = HEAD, state: str = "OPEN") -> dict:
         "is_draft": True,
         "head_branch": "feature",
         "base_branch": "main",
+        "base_sha": BASE,
         "head_sha": head,
     }
 
@@ -93,6 +96,31 @@ class TargetTest(unittest.TestCase):
                 ],
                 MODULE.read_pr_commits(target()),
             )
+
+    def test_reads_the_live_base_branch_tip(self):
+        payload = {
+            "number": 7,
+            "title": "Add a thing",
+            "url": target()["pr_url"],
+            "state": "OPEN",
+            "isDraft": True,
+            "headRefName": "feature",
+            "baseRefName": "main",
+            "headRefOid": HEAD,
+        }
+        with mock.patch.object(
+            MODULE,
+            "gh_json",
+            side_effect=[payload, {"object": {"sha": BASE}}],
+        ):
+            result = MODULE.read_pull_request(target())
+
+        self.assertEqual(BASE, result["base_sha"])
+
+    def test_rejects_a_base_ref_without_a_commit(self):
+        with mock.patch.object(MODULE, "gh_json", return_value={"object": {}}):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "has no commit SHA"):
+                MODULE.base_ref_tip("owner/repo", "main")
 
     def test_marks_rewritten_history_and_lists_replacement_commits(self):
         replacement = {
@@ -175,7 +203,7 @@ class StageContractTest(unittest.TestCase):
 
 
 class MarkerTest(unittest.TestCase):
-    def status(self, stage: str, payload: dict) -> dict:
+    def status(self, stage: str, payload: dict, base_sha: str = BASE) -> dict:
         entry = MODULE.STAGE_BY_NAME[stage]
         with mock.patch.object(
             MODULE,
@@ -191,11 +219,14 @@ class MarkerTest(unittest.TestCase):
                 },
             },
         ):
-            return MODULE.inspect_stage(entry, target(), HEAD)
+            return MODULE.inspect_stage(entry, target(), HEAD, base_sha)
 
     def test_reads_every_stage_marker(self):
         payloads = {
-            MODULE.STAGE_CONFLICT: {"mergeable_at_head_sha": HEAD},
+            MODULE.STAGE_CONFLICT: {
+                "mergeable_at_head_sha": HEAD,
+                "attempt": {"base_sha": BASE},
+            },
             MODULE.STAGE_SELF_REVIEW: {
                 "review": {"outcome": "clean", "clean_at_head_sha": HEAD}
             },
@@ -214,6 +245,19 @@ class MarkerTest(unittest.TestCase):
         )
         self.assertFalse(result["clear"])
         self.assertEqual("clearance_is_for_an_older_head", result["reason"])
+
+    def test_conflict_clearance_for_an_older_base_is_not_clear(self):
+        result = self.status(
+            MODULE.STAGE_CONFLICT,
+            {
+                "mergeable_at_head_sha": HEAD,
+                "attempt": {"base_sha": BASE},
+            },
+            NEXT_BASE,
+        )
+        self.assertFalse(result["clear"])
+        self.assertEqual("clearance_is_for_an_older_base", result["reason"])
+        self.assertEqual(BASE, result["clear_at_base_sha"])
 
     def test_cap_is_incomplete_not_blocked(self):
         result = self.status(MODULE.STAGE_CI, {"stage_outcome": "carried"})
@@ -242,7 +286,9 @@ class SweepTest(unittest.TestCase):
     def setUp(self):
         self.repo = Path("C:/repo")
         self.sync_heads = [HEAD]
+        self.base_sha = BASE
         self.clear_at = {stage: None for stage in MODULE.STAGE_NAMES}
+        self.clear_base_at = None
         self.launched: list[tuple[str, int]] = []
         self.events: list[dict] = []
 
@@ -262,7 +308,7 @@ class SweepTest(unittest.TestCase):
             self.addCleanup(patch.stop)
 
     def read_pr(self, _target):
-        return pull_request(self.sync_heads[-1])
+        return {**pull_request(self.sync_heads[-1]), "base_sha": self.base_sha}
 
     def sync(self, _repo, _target, _pr, *, known_safe_head):
         return {
@@ -276,6 +322,8 @@ class SweepTest(unittest.TestCase):
     ):
         self.launched.append((entry["stage"], sweep))
         self.clear_at[entry["stage"]] = self.sync_heads[-1]
+        if entry["stage"] == MODULE.STAGE_CONFLICT:
+            self.clear_base_at = self.base_sha
         return {
             "returncode": 0,
             "log_path": f"{sweep}-{entry['stage']}.log",
@@ -302,13 +350,18 @@ class SweepTest(unittest.TestCase):
             "changed": self.sync_heads[-1] != started_head_sha,
         }
 
-    def inspect(self, entry, _target, head):
-        if self.clear_at[entry["stage"]] == head:
+    def inspect(self, entry, _target, head, base_sha):
+        if self.clear_at[entry["stage"]] == head and (
+            entry["stage"] != MODULE.STAGE_CONFLICT
+            or self.clear_base_at == base_sha
+        ):
             return clear_stage(entry["stage"], head)
         return uncleared_stage(entry["stage"])
 
-    def inspect_all(self, _target, head):
-        return [self.inspect(entry, _target, head) for entry in MODULE.STAGES]
+    def inspect_all(self, _target, head, base_sha):
+        return [
+            self.inspect(entry, _target, head, base_sha) for entry in MODULE.STAGES
+        ]
 
     def execute(self):
         return MODULE.run_pipeline(
@@ -401,6 +454,32 @@ class SweepTest(unittest.TestCase):
                 }
             ],
             self_review_run["published_commits"],
+        )
+
+    def test_base_change_reruns_conflict_stage_without_a_head_change(self):
+        original = self.run_stage
+
+        def move_base(entry, *args, **kwargs):
+            result = original(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_DESCRIPTION:
+                self.base_sha = NEXT_BASE
+            return result
+
+        MODULE.run_stage.side_effect = move_base
+        result = self.execute()
+
+        self.assertEqual("complete", result["result"])
+        self.assertEqual(2, result["sweeps"])
+        self.assertEqual(
+            [
+                (MODULE.STAGE_CONFLICT, 1),
+                (MODULE.STAGE_CONFLICT, 2),
+            ],
+            [
+                launch
+                for launch in self.launched
+                if launch[0] == MODULE.STAGE_CONFLICT
+            ],
         )
 
     def test_second_sweep_retries_an_uncleared_stage(self):

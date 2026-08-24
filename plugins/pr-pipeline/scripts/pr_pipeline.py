@@ -44,6 +44,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "agent": f"{STAGE_CONFLICT}:{STAGE_CONFLICT}",
         "module": "conflict_fix_loop",
         "marker": ("mergeable_at_head_sha",),
+        "base_marker": ("attempt", "base_sha"),
         "model": DEFAULT_STAGE_MODEL,
     },
     {
@@ -328,6 +329,9 @@ def read_pull_request(target: dict[str, Any]) -> dict[str, Any]:
     )
     if not isinstance(payload, dict):
         raise WorkflowError(f"could not read {target['pr_url']}")
+    base_branch = payload.get("baseRefName")
+    if not isinstance(base_branch, str) or not base_branch:
+        raise WorkflowError(f"{target['pr_url']} has no base branch")
     return {
         "number": payload.get("number"),
         "title": payload.get("title"),
@@ -338,9 +342,21 @@ def read_pull_request(target: dict[str, Any]) -> dict[str, Any]:
         "state": payload.get("state"),
         "is_draft": bool(payload.get("isDraft")),
         "head_branch": payload.get("headRefName"),
-        "base_branch": payload.get("baseRefName"),
+        "base_branch": base_branch,
+        "base_sha": base_ref_tip(target["repo_name"], base_branch),
         "head_sha": payload.get("headRefOid"),
     }
+
+
+def base_ref_tip(repo_name: str, base_branch: str) -> str:
+    payload = gh_json(["api", f"repos/{repo_name}/git/ref/heads/{base_branch}"])
+    obj = payload.get("object") if isinstance(payload, dict) else None
+    sha = obj.get("sha") if isinstance(obj, dict) else None
+    if not isinstance(sha, str) or not sha:
+        raise WorkflowError(
+            f"the tip of base branch {base_branch!r} in {repo_name} has no commit SHA"
+        )
+    return sha
 
 
 def commit_url(target: dict[str, Any], sha: str) -> str:
@@ -737,25 +753,41 @@ def stage_status_summary(payload: Any) -> dict[str, Any]:
 
 
 def inspect_stage(
-    entry: dict[str, Any], target: dict[str, Any], head_sha: str
+    entry: dict[str, Any],
+    target: dict[str, Any],
+    head_sha: str,
+    base_sha: str | None = None,
 ) -> dict[str, Any]:
     status = read_stage_status(entry, target)
     payload = status.get("payload")
     marker = (
         string_at(payload, entry["marker"]) if isinstance(payload, dict) else None
     )
+    base_marker_path = entry.get("base_marker")
+    base_marker = (
+        string_at(payload, base_marker_path)
+        if isinstance(payload, dict) and isinstance(base_marker_path, tuple)
+        else None
+    )
     outcome = payload.get("stage_outcome") if isinstance(payload, dict) else None
-    clear = marker == head_sha and outcome in CLEARING_OUTCOMES
+    head_is_clear = marker == head_sha
+    base_is_clear = base_marker_path is None or (
+        base_sha is not None and base_marker == base_sha
+    )
+    clear = head_is_clear and base_is_clear and outcome in CLEARING_OUTCOMES
     if clear:
         reason = None
-    elif marker:
+    elif marker and not head_is_clear:
         reason = "clearance_is_for_an_older_head"
+    elif base_marker_path is not None and base_marker != base_sha:
+        reason = "clearance_is_for_an_older_base"
     else:
         reason = status.get("reason") or outcome or "not_cleared"
     return {
         "stage": entry["stage"],
         "clear": clear,
         "clear_at_head_sha": marker,
+        "clear_at_base_sha": base_marker,
         "outcome": outcome,
         "reason": reason,
         "installed": status["installed"],
@@ -766,9 +798,9 @@ def inspect_stage(
 
 
 def inspect_stages(
-    target: dict[str, Any], head_sha: str
+    target: dict[str, Any], head_sha: str, base_sha: str
 ) -> list[dict[str, Any]]:
-    return [inspect_stage(entry, target, head_sha) for entry in STAGES]
+    return [inspect_stage(entry, target, head_sha, base_sha) for entry in STAGES]
 
 
 def stage_models(overrides: list[str] | None) -> dict[str, str]:
@@ -992,7 +1024,9 @@ def run_pipeline(
             )
         known_safe_head = synced["head_sha"]
         sweep_started_head = known_safe_head
+        sweep_started_base = pr["base_sha"]
         head_changed = False
+        base_changed = False
         report_event(
             report,
             "sweep_started",
@@ -1031,9 +1065,10 @@ def run_pipeline(
                 )
             current_head = synced["head_sha"]
             head_changed = head_changed or current_head != known_safe_head
+            base_changed = base_changed or pr["base_sha"] != sweep_started_base
             known_safe_head = current_head
 
-            before = inspect_stage(entry, target, current_head)
+            before = inspect_stage(entry, target, current_head, pr["base_sha"])
             if before["clear"]:
                 record = {
                     "stage": entry["stage"],
@@ -1113,7 +1148,8 @@ def run_pipeline(
                     repo_root, "rev-parse", "HEAD"
                 )
                 pr_head = settled.get("pr_head_sha") or current_head
-                stages = inspect_stages(target, pr_head)
+                current_pr = read_pull_request(target)
+                stages = inspect_stages(target, pr_head, current_pr["base_sha"])
                 stage_result = next(
                     result for result in stages if result["stage"] == entry["stage"]
                 )
@@ -1154,7 +1190,13 @@ def run_pipeline(
             ended_head = settled["head_sha"]
             known_safe_head = ended_head
             head_changed = head_changed or ended_head != current_head
-            after = inspect_stage(entry, target, ended_head)
+            current_pr = read_pull_request(target)
+            after = inspect_stage(
+                entry,
+                target,
+                ended_head,
+                current_pr["base_sha"],
+            )
             record.update(
                 {
                     "ended_head_sha": ended_head,
@@ -1187,7 +1229,8 @@ def run_pipeline(
         final_head = synced["head_sha"]
         known_safe_head = final_head
         head_changed = head_changed or final_head != sweep_started_head
-        stages = inspect_stages(target, final_head)
+        base_changed = base_changed or pr["base_sha"] != sweep_started_base
+        stages = inspect_stages(target, final_head, pr["base_sha"])
         report_event(
             report,
             "sweep_finished",
@@ -1195,6 +1238,8 @@ def run_pipeline(
             sweep=sweep,
             head_sha=final_head,
             head_changed=head_changed,
+            base_sha=pr["base_sha"],
+            base_changed=base_changed,
             uncleared_stages=[
                 stage["stage"] for stage in stages if not stage["clear"]
             ],
@@ -1220,7 +1265,7 @@ def run_pipeline(
                 "stages": stages,
                 "runs": runs,
             }
-        if not head_changed:
+        if not head_changed and not base_changed:
             return {
                 "result": "incomplete",
                 "reason": "stages_not_clear",
