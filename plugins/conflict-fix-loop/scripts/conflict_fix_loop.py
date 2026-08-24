@@ -219,6 +219,17 @@ def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
         base_branch = member.get("baseRefName")
         head_sha = member.get("headRefOid")
         base_sha = member.get("baseRefOid")
+        timeline = member.get("timelineItems")
+        events = timeline.get("nodes") if isinstance(timeline, dict) else None
+        retargeted_from = None
+        for event in events or []:
+            if (
+                isinstance(event, dict)
+                and event.get("newBase") == base_branch
+                and isinstance(event.get("oldBase"), str)
+                and event["oldBase"]
+            ):
+                retargeted_from = event["oldBase"]
         if (
             not isinstance(number, int)
             or not isinstance(head_branch, str)
@@ -242,6 +253,7 @@ def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
                 "mergeable": member.get("mergeable"),
                 "head_sha": head_sha,
                 "base_sha": base_sha,
+                "retargeted_from": retargeted_from,
             }
         )
     members.sort(
@@ -259,6 +271,60 @@ def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
         "trunk": trunk,
         "members": members,
     }
+
+
+def merged_predecessor(
+    pr: dict[str, Any], member: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Resolve the merged PR that caused GitHub to retarget a stack member."""
+    old_base = member.get("retargeted_from")
+    if not isinstance(old_base, str) or not old_base:
+        return None
+    repo_name = f"{pr['upstream_owner']}/{pr['upstream_repo']}"
+    payload = gh_json(
+        [
+            "api",
+            "--paginate",
+            "--method",
+            "GET",
+            f"repos/{repo_name}/pulls",
+            "-f",
+            "state=closed",
+            "-f",
+            f"head={pr['upstream_owner']}:{old_base}",
+        ]
+    )
+    if not isinstance(payload, list):
+        raise WorkflowError(
+            f"could not read the merged predecessor branch {old_base!r}"
+        )
+    matches = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        head = item.get("head")
+        if (
+            item.get("merged_at")
+            and item.get("merge_commit_sha") == member["base_sha"]
+            and isinstance(head, dict)
+            and head.get("ref") == old_base
+            and isinstance(head.get("sha"), str)
+            and head["sha"]
+        ):
+            matches.append(
+                {
+                    "number": item.get("number"),
+                    "head_branch": old_base,
+                    "head_sha": head["sha"],
+                    "merge_sha": item["merge_commit_sha"],
+                }
+            )
+    if len(matches) > 1:
+        raise WorkflowError(
+            f"multiple merged pull requests match historical base {member['base_sha']} "
+            f"for {old_base!r}"
+        )
+    return matches[0] if matches else None
 
 
 def stack_membership(pr: dict[str, Any]) -> dict[str, Any]:
@@ -282,6 +348,14 @@ def stack_membership(pr: dict[str, Any]) -> dict[str, Any]:
         "            position"
         "            pullRequest {"
         "              number headRefName baseRefName mergeable headRefOid baseRefOid"
+        "              timelineItems(first: $first,"
+        "                itemTypes: [AUTOMATIC_BASE_CHANGE_SUCCEEDED_EVENT]) {"
+        "                nodes {"
+        "                  ... on AutomaticBaseChangeSucceededEvent {"
+        "                    oldBase newBase createdAt"
+        "                  }"
+        "                }"
+        "              }"
         "            }"
         "          }"
         "        }"
@@ -317,6 +391,11 @@ def stack_membership(pr: dict[str, Any]) -> dict[str, Any]:
         raise WorkflowError("the stack query returned no pull request")
     raw_stack = pull.get("stack")
     stack = parse_stack(raw_stack) if isinstance(raw_stack, dict) else None
+    if stack is not None:
+        for index, member in enumerate(stack["members"]):
+            member["merged_predecessor"] = (
+                merged_predecessor(pr, member) if index == 0 else None
+            )
     return {"default_branch": default_branch, "stack": stack}
 
 
@@ -1914,6 +1993,7 @@ def planned_stack_attempt(
             "mergeable": member.get("mergeable"),
             "head_sha": member["head_sha"],
             "base_sha": member["base_sha"],
+            "merged_predecessor": member.get("merged_predecessor"),
         }
         for member in stack["members"]
     ]
@@ -3351,6 +3431,28 @@ def repair_native_stack_topology(
     return [[member["number"] for member in segment] for segment in segments]
 
 
+def fetch_merged_predecessor(workspace: Path, predecessor: dict[str, Any]) -> None:
+    """Fetch and verify a merged PR's frozen original head through its pull ref."""
+    number = predecessor.get("number")
+    expected = predecessor.get("head_sha")
+    if not isinstance(number, int) or not isinstance(expected, str) or not expected:
+        raise WorkflowError("the merged stack predecessor is incomplete")
+    fetched = git_try(
+        workspace, "fetch", "--no-tags", "origin", f"refs/pull/{number}/head"
+    )
+    if fetched.returncode != 0:
+        detail = fetched.stderr.strip() or fetched.stdout.strip() or "no output"
+        raise WorkflowError(
+            f"could not fetch merged predecessor pull request #{number}: {detail}"
+        )
+    actual = git(workspace, "rev-parse", "FETCH_HEAD")
+    if actual != expected:
+        raise WorkflowError(
+            f"merged predecessor pull request #{number} now resolves to {actual}, "
+            f"expected {expected}"
+        )
+
+
 def prepare_stack_cascade(
     workspace: Path, stack: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -3366,7 +3468,7 @@ def prepare_stack_cascade(
         ) from error
 
     members = stack["members"]
-    for member in members:
+    for index, member in enumerate(members):
         branch = member["head_branch"]
         valid = git_try(workspace, "check-ref-format", "--branch", branch)
         if valid.returncode != 0:
@@ -3384,6 +3486,9 @@ def prepare_stack_cascade(
                 f"native stack branch {branch!r} moved before the cascade started: "
                 f"expected {member['head_sha']}, found {remote_tip}"
             )
+        predecessor = member.get("merged_predecessor") if index == 0 else None
+        if predecessor is not None:
+            fetch_merged_predecessor(workspace, predecessor)
 
     plan = []
     for index, member in enumerate(members):
@@ -3401,6 +3506,20 @@ def prepare_stack_cascade(
         child_sha = member["head_sha"]
         if is_ancestor(workspace, parent_sha, child_sha):
             old_base = parent_sha
+        elif index == 0 and member.get("merged_predecessor") is not None:
+            predecessor = member["merged_predecessor"]
+            old_base = predecessor["head_sha"]
+            if predecessor.get("merge_sha") != member["base_sha"]:
+                raise WorkflowError(
+                    f"merged predecessor pull request #{predecessor['number']} does not "
+                    f"match historical base {member['base_sha']}"
+                )
+            if not is_ancestor(workspace, old_base, child_sha):
+                raise WorkflowError(
+                    f"the original head {old_base} of merged predecessor pull request "
+                    f"#{predecessor['number']} is not an ancestor of "
+                    f"{member['head_branch']!r}"
+                )
         else:
             historical_base = member["base_sha"]
             try:

@@ -4988,9 +4988,16 @@ def stack_attempt_record(**overrides):
 
 
 def stack_entry(
-    position, number, head, base, mergeable="MERGEABLE", oid=None, base_oid=None
+    position,
+    number,
+    head,
+    base,
+    mergeable="MERGEABLE",
+    oid=None,
+    base_oid=None,
+    retargeted_from=None,
 ):
-    return {
+    entry = {
         "position": position,
         "pullRequest": {
             "number": number,
@@ -5001,6 +5008,17 @@ def stack_entry(
             "baseRefOid": base_oid or f"baseoid{number}",
         },
     }
+    if retargeted_from is not None:
+        entry["pullRequest"]["timelineItems"] = {
+            "nodes": [
+                {
+                    "oldBase": retargeted_from,
+                    "newBase": base,
+                    "createdAt": "2026-08-24T06:06:04Z",
+                }
+            ]
+        }
+    return entry
 
 
 class ParseStackTest(unittest.TestCase):
@@ -5025,6 +5043,23 @@ class ParseStackTest(unittest.TestCase):
         self.assertEqual([5, 7], [member["number"] for member in stack["members"]])
         self.assertEqual("main", stack["trunk"])
         self.assertEqual("oid7", stack["members"][1]["head_sha"])
+
+    def test_an_automatic_base_retarget_records_the_previous_branch(self):
+        stack = MODULE.parse_stack(
+            self.raw(
+                [
+                    stack_entry(
+                        0,
+                        7,
+                        "feature",
+                        "main",
+                        base_oid="merged",
+                        retargeted_from="lower",
+                    )
+                ]
+            )
+        )
+        self.assertEqual("lower", stack["members"][0]["retargeted_from"])
 
     def test_an_unreadable_member_is_a_hard_error(self):
         nodes = [
@@ -5089,6 +5124,114 @@ class StackMembershipTest(unittest.TestCase):
         self.membership(stack=None)
         variables = self.query.call_args[0][1]
         self.assertEqual(MODULE.STACK_ENTRIES_PAGE, variables["first"])
+
+    def test_a_retargeted_member_is_enriched_with_its_merged_predecessor(self):
+        raw = {
+            "id": "S_1",
+            "number": 100,
+            "size": 1,
+            "baseRefName": "main",
+            "entries": {
+                "nodes": [
+                    stack_entry(
+                        0,
+                        7,
+                        "feature",
+                        "main",
+                        base_oid="merged",
+                        retargeted_from="lower",
+                    )
+                ]
+            },
+        }
+        predecessor = {
+            "number": 5,
+            "head_branch": "lower",
+            "head_sha": "old-lower",
+            "merge_sha": "merged",
+        }
+        with mock.patch.object(
+            MODULE, "merged_predecessor", return_value=predecessor
+        ) as resolve:
+            result = self.membership(stack=raw)
+        self.assertEqual(
+            predecessor, result["stack"]["members"][0]["merged_predecessor"]
+        )
+        resolve.assert_called_once()
+
+    def test_only_the_bottom_member_resolves_a_merged_predecessor(self):
+        raw = {
+            "id": "S_1",
+            "number": 100,
+            "size": 2,
+            "baseRefName": "main",
+            "entries": {
+                "nodes": [
+                    stack_entry(0, 5, "lower", "main"),
+                    stack_entry(
+                        1,
+                        7,
+                        "feature",
+                        "lower-renamed",
+                        retargeted_from="lower",
+                    ),
+                ]
+            },
+        }
+        with mock.patch.object(
+            MODULE, "merged_predecessor", return_value=None
+        ) as resolve:
+            result = self.membership(stack=raw)
+        resolve.assert_called_once_with(
+            pr_metadata(), result["stack"]["members"][0]
+        )
+        self.assertIsNone(
+            result["stack"]["members"][1]["merged_predecessor"]
+        )
+
+
+class MergedPredecessorTest(unittest.TestCase):
+    def test_matches_the_retarget_event_to_the_exact_merge_result(self):
+        member = {
+            "retargeted_from": "lower",
+            "base_sha": "merged",
+        }
+        pulls = [
+            {
+                "number": 5,
+                "merged_at": "2026-08-24T06:06:03Z",
+                "merge_commit_sha": "merged",
+                "head": {"ref": "lower", "sha": "old-lower"},
+            }
+        ]
+        with mock.patch.object(MODULE, "gh_json", return_value=pulls) as gh:
+            predecessor = MODULE.merged_predecessor(pr_metadata(), member)
+        self.assertEqual(
+            {
+                "number": 5,
+                "head_branch": "lower",
+                "head_sha": "old-lower",
+                "merge_sha": "merged",
+            },
+            predecessor,
+        )
+        self.assertIn("--paginate", gh.call_args.args[0])
+
+    def test_a_different_merge_result_is_not_used_as_the_old_base(self):
+        member = {
+            "retargeted_from": "lower",
+            "base_sha": "expected",
+        }
+        pulls = [
+            {
+                "number": 5,
+                "merged_at": "2026-08-24T06:06:03Z",
+                "merge_commit_sha": "other",
+                "head": {"ref": "lower", "sha": "old-lower"},
+            }
+        ]
+        with mock.patch.object(MODULE, "gh_json", return_value=pulls):
+            self.assertIsNone(MODULE.merged_predecessor(pr_metadata(), member))
 
 
 class MergeTreeConflictsTest(unittest.TestCase):
@@ -5363,6 +5506,73 @@ class StackCascadePlanTest(unittest.TestCase):
         self.assertEqual("old-a", plan[1]["old_base"])
         self.assertEqual("v143", plan[1]["new_base"])
 
+    def test_a_retargeted_bottom_member_uses_the_merged_predecessor_head(self):
+        self.stack["members"][0]["base_sha"] = "merged-lower"
+        self.stack["members"][0]["merged_predecessor"] = {
+            "number": 4,
+            "head_branch": "old-lower",
+            "head_sha": "old-lower-head",
+            "merge_sha": "merged-lower",
+        }
+        ancestry = {
+            ("base1", "aaa"): False,
+            ("old-lower-head", "aaa"): True,
+            ("aaa", "head1"): True,
+        }
+
+        def ancestor(_root, left, right):
+            return ancestry.get((left, right), False)
+
+        def git_call(_root, *args):
+            tips = {
+                "refs/remotes/origin/main": "base1",
+                "refs/remotes/origin/v143": "aaa",
+                "refs/remotes/origin/feature": "head1",
+            }
+            if args[0] == "rev-parse" and args[1] in tips:
+                return tips[args[1]]
+            raise AssertionError(f"unexpected git call: {args}")
+
+        with mock.patch.object(MODULE, "git", side_effect=git_call), mock.patch.object(
+            MODULE, "is_ancestor", side_effect=ancestor
+        ), mock.patch.object(MODULE, "git_try", return_value=completed(0)), mock.patch.object(
+            MODULE, "fetch_merged_predecessor"
+        ) as fetch:
+            plan = MODULE.prepare_stack_cascade(Path("/workspace"), self.stack)
+
+        self.assertEqual("old-lower-head", plan[0]["old_base"])
+        self.assertEqual("refs/remotes/origin/main", plan[0]["new_base_ref"])
+        fetch.assert_called_once_with(
+            Path("/workspace"), self.stack["members"][0]["merged_predecessor"]
+        )
+
+    def test_a_retargeted_bottom_member_rejects_an_unrelated_predecessor_head(self):
+        self.stack["members"][0]["base_sha"] = "merged-lower"
+        self.stack["members"][0]["merged_predecessor"] = {
+            "number": 4,
+            "head_branch": "old-lower",
+            "head_sha": "old-lower-head",
+            "merge_sha": "merged-lower",
+        }
+
+        def git_call(_root, *args):
+            tips = {
+                "refs/remotes/origin/main": "base1",
+                "refs/remotes/origin/v143": "aaa",
+                "refs/remotes/origin/feature": "head1",
+            }
+            if args[0] == "rev-parse" and args[1] in tips:
+                return tips[args[1]]
+            raise AssertionError(f"unexpected git call: {args}")
+
+        with mock.patch.object(MODULE, "git", side_effect=git_call), mock.patch.object(
+            MODULE, "is_ancestor", return_value=False
+        ), mock.patch.object(MODULE, "git_try", return_value=completed(0)), mock.patch.object(
+            MODULE, "fetch_merged_predecessor"
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "not an ancestor"):
+                MODULE.prepare_stack_cascade(Path("/workspace"), self.stack)
+
     def test_multiple_merge_bases_are_rejected_as_ambiguous(self):
         def git_call(_root, *args):
             tips = {
@@ -5419,6 +5629,34 @@ class StackCascadePlanTest(unittest.TestCase):
         self.assertFalse(
             any(call.args[1:2] == ("update-ref",) for call in git_try.call_args_list)
         )
+
+
+class FetchMergedPredecessorTest(unittest.TestCase):
+    def test_fetches_the_frozen_pull_ref_and_verifies_its_head(self):
+        predecessor = {"number": 4, "head_sha": "old-lower-head"}
+        with mock.patch.object(
+            MODULE, "git_try", return_value=completed(0)
+        ) as fetch, mock.patch.object(
+            MODULE, "git", return_value="old-lower-head"
+        ):
+            MODULE.fetch_merged_predecessor(Path("/workspace"), predecessor)
+        fetch.assert_called_once_with(
+            Path("/workspace"),
+            "fetch",
+            "--no-tags",
+            "origin",
+            "refs/pull/4/head",
+        )
+
+    def test_a_changed_pull_ref_is_rejected(self):
+        predecessor = {"number": 4, "head_sha": "expected"}
+        with mock.patch.object(
+            MODULE, "git_try", return_value=completed(0)
+        ), mock.patch.object(MODULE, "git", return_value="changed"):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "expected"):
+                MODULE.fetch_merged_predecessor(
+                    Path("/workspace"), predecessor
+                )
 
 
 class AtomicStackPushTest(unittest.TestCase):
