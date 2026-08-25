@@ -5592,6 +5592,129 @@ class StackCascadePlanTest(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.WorkflowError, "ambiguous"):
                 MODULE.prepare_stack_cascade(Path("/workspace"), self.stack)
 
+    def test_a_rewritten_parent_uses_its_patch_equivalent_prefix_as_the_boundary(self):
+        self.stack["members"][1]["base_sha"] = "rewritten-parent"
+        ancestry = {
+            ("base1", "aaa"): True,
+            ("aaa", "head1"): False,
+            ("rewritten-parent", "aaa"): True,
+        }
+
+        def ancestor(_root, left, right):
+            return ancestry.get((left, right), False)
+
+        def git_call(_root, *args):
+            tips = {
+                "refs/remotes/origin/main": "base1",
+                "refs/remotes/origin/v143": "aaa",
+                "refs/remotes/origin/feature": "head1",
+            }
+            if args[0] == "rev-parse" and args[1] in tips:
+                return tips[args[1]]
+            if args[0] == "merge-base":
+                return "shared"
+            if args[0] == "rev-list":
+                return (
+                    "old-parent-one shared\n"
+                    "old-parent-two old-parent-one\n"
+                    "child-one old-parent-two\n"
+                    "child-two child-one"
+                )
+            if args[0] == "cherry":
+                return (
+                    "- old-parent-one\n"
+                    "- old-parent-two\n"
+                    "+ child-one\n"
+                    "+ child-two"
+                )
+            raise AssertionError(f"unexpected git call: {args}")
+
+        with mock.patch.object(MODULE, "git", side_effect=git_call), mock.patch.object(
+            MODULE, "is_ancestor", side_effect=ancestor
+        ), mock.patch.object(MODULE, "git_try", return_value=completed(0)):
+            plan = MODULE.prepare_stack_cascade(Path("/workspace"), self.stack)
+
+        self.assertEqual("old-parent-two", plan[1]["old_base"])
+
+    def test_a_rewritten_parent_rejects_interleaved_patch_equivalence(self):
+        with mock.patch.object(
+            MODULE,
+            "is_ancestor",
+            return_value=True,
+        ), mock.patch.object(
+            MODULE,
+            "git",
+            side_effect=[
+                "old-parent shared\nchild-one old-parent\nparent-again child-one",
+                "- old-parent\n+ child-one\n- parent-again",
+            ],
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "interleaved"):
+                MODULE.recover_rewritten_parent_boundary(
+                    Path("/workspace"),
+                    parent_sha="parent",
+                    child_sha="child",
+                    merge_base="shared",
+                    historical_base="recorded",
+                    parent_branch="parent-branch",
+                    child_branch="child-branch",
+                )
+
+    def test_a_rewritten_parent_rejects_nonlinear_child_history(self):
+        with mock.patch.object(
+            MODULE,
+            "is_ancestor",
+            return_value=True,
+        ), mock.patch.object(
+            MODULE,
+            "git",
+            return_value="merge shared second-parent",
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "not linear"):
+                MODULE.recover_rewritten_parent_boundary(
+                    Path("/workspace"),
+                    parent_sha="parent",
+                    child_sha="child",
+                    merge_base="shared",
+                    historical_base="recorded",
+                    parent_branch="parent-branch",
+                    child_branch="child-branch",
+                )
+
+    def test_a_rewritten_parent_requires_a_parent_prefix_and_child_suffix(self):
+        cases = {
+            "no equivalent prefix": (
+                "child-one shared\nchild-two child-one",
+                "+ child-one\n+ child-two",
+            ),
+            "no child suffix": (
+                "old-one shared\nold-two old-one",
+                "- old-one\n- old-two",
+            ),
+        }
+        for label, (history, cherry) in cases.items():
+            with self.subTest(label=label), mock.patch.object(
+                MODULE,
+                "is_ancestor",
+                return_value=True,
+            ), mock.patch.object(
+                MODULE,
+                "git",
+                side_effect=[history, cherry],
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError, "parent-equivalent prefix"
+                ):
+                    MODULE.recover_rewritten_parent_boundary(
+                        Path("/workspace"),
+                        parent_sha="parent",
+                        child_sha="child",
+                        merge_base="shared",
+                        historical_base="recorded",
+                        parent_branch="parent-branch",
+                        child_branch="child-branch",
+                    )
+
     def test_unrelated_parent_and_child_are_rejected(self):
         def git_call(_root, *args):
             tips = {
@@ -6265,6 +6388,33 @@ class StackCascadeTopologyTest(GitTestCase):
             MODULE.prepare_stack_cascade(self.workspace, self.stack)
         self.assertEqual(rewritten, self.remote_head("lower"))
         self.assertEqual(self.child_head, self.remote_head("child"))
+
+    def test_a_patch_equivalent_parent_rewrite_recovers_the_child_boundary(self):
+        self.git(self.source, "checkout", "main")
+        self.git(self.source, "checkout", "-b", "rewritten-lower")
+        self.git(self.source, "cherry-pick", self.lower_old)
+        self.git(self.source, "commit", "--amend", "-m", "rewritten lower one")
+        rewritten_base = self.git(self.source, "rev-parse", "HEAD")
+        self.write(self.source, "lower.txt", "lower one\nlower two\n")
+        self.commit(self.source, "rewritten lower two")
+        rewritten_head = self.git(self.source, "rev-parse", "HEAD")
+        self.git(self.source, "push", "--force", "origin", "HEAD:lower")
+        self.stack["members"][0]["head_sha"] = rewritten_head
+        self.stack["members"][1]["base_sha"] = rewritten_base
+        self.clone_workspace()
+
+        plan, process = self.prepare_and_rebase()
+
+        self.assertEqual(0, process.returncode, process.stderr or process.stdout)
+        self.assertEqual(self.lower_old, plan[1]["old_base"])
+        self.assertEqual(
+            "lower one\nlower two",
+            self.git(self.workspace, "show", "refs/heads/child:lower.txt"),
+        )
+        self.assertEqual(
+            "child",
+            self.git(self.workspace, "show", "refs/heads/child:child.txt"),
+        )
 
 
 class ContinueStackCascadeTest(unittest.TestCase):

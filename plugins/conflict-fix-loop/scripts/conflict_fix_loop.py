@@ -3453,6 +3453,80 @@ def fetch_merged_predecessor(workspace: Path, predecessor: dict[str, Any]) -> No
         )
 
 
+def recover_rewritten_parent_boundary(
+    workspace: Path,
+    *,
+    parent_sha: str,
+    child_sha: str,
+    merge_base: str,
+    historical_base: str,
+    parent_branch: str,
+    child_branch: str,
+) -> str:
+    """Find the old parent tip when its commits were replayed onto new history."""
+    if not is_ancestor(workspace, historical_base, parent_sha):
+        raise WorkflowError(
+            f"the declared parent {parent_branch!r} no longer descends from "
+            f"the historical base {historical_base} of {child_branch!r}; "
+            "the parent may have been rewritten"
+        )
+
+    history = []
+    expected_parent = merge_base
+    for line in git(
+        workspace,
+        "rev-list",
+        "--reverse",
+        "--parents",
+        f"{merge_base}..{child_sha}",
+    ).splitlines():
+        parts = line.split()
+        if len(parts) != 2 or parts[1] != expected_parent:
+            raise WorkflowError(
+                f"cannot recover the old parent boundary for {child_branch!r}: "
+                "its divergent history is not linear"
+            )
+        history.append(parts[0])
+        expected_parent = parts[0]
+
+    cherry = []
+    for line in git(
+        workspace, "cherry", parent_sha, child_sha, merge_base
+    ).splitlines():
+        parts = line.split()
+        if len(parts) != 2 or parts[0] not in {"+", "-"}:
+            raise WorkflowError(
+                f"cannot recover the old parent boundary for {child_branch!r}: "
+                "git cherry returned an unreadable result"
+            )
+        cherry.append((parts[0], parts[1]))
+    if [sha for _sign, sha in cherry] != history:
+        raise WorkflowError(
+            f"cannot recover the old parent boundary for {child_branch!r}: "
+            "patch comparison did not cover its linear divergent history"
+        )
+
+    boundary = None
+    saw_child_commit = False
+    for sign, sha in cherry:
+        if sign == "-":
+            if saw_child_commit:
+                raise WorkflowError(
+                    f"cannot recover the old parent boundary for {child_branch!r}: "
+                    "parent-equivalent and child-only commits are interleaved"
+                )
+            boundary = sha
+        else:
+            saw_child_commit = True
+    if boundary is None or not saw_child_commit:
+        raise WorkflowError(
+            f"cannot recover the old parent boundary for {child_branch!r}: "
+            "the divergent history does not have a parent-equivalent prefix "
+            "followed by child-only commits"
+        )
+    return boundary
+
+
 def prepare_stack_cascade(
     workspace: Path, stack: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -3547,12 +3621,16 @@ def prepare_stack_cascade(
                 )
             old_base = merge_bases[0]
             if old_base != historical_base:
-                raise WorkflowError(
-                    f"the declared parent {parent_branch!r} no longer descends from "
-                    f"the historical base {historical_base} of "
-                    f"{member['head_branch']!r}; the parent may have been rewritten"
+                old_base = recover_rewritten_parent_boundary(
+                    workspace,
+                    parent_sha=parent_sha,
+                    child_sha=child_sha,
+                    merge_base=old_base,
+                    historical_base=historical_base,
+                    parent_branch=parent_branch,
+                    child_branch=member["head_branch"],
                 )
-            if not (
+            elif not (
                 is_ancestor(workspace, historical_base, parent_sha)
                 and is_ancestor(workspace, historical_base, child_sha)
             ):
