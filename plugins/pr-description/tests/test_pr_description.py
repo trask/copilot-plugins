@@ -808,6 +808,7 @@ class SharedStateBackendTest(unittest.TestCase):
             )
 
         payload = json.loads(run.call_args_list[1].kwargs["input_text"])
+        self.assertEqual(payload["message"], "Update PR Flight state")
         self.assertNotIn("sha", payload)
         published = json.loads(
             MODULE.base64.b64decode(payload["content"]).decode("utf-8")

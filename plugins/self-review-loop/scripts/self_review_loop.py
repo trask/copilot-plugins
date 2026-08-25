@@ -400,7 +400,7 @@ def write_shared_state(
 ) -> subprocess.CompletedProcess[str]:
     owner, repo = repository.split("/", 1)
     payload = {
-        "message": f"Update PR Flight state for {repository}#{number}",
+        "message": "Update PR Flight state",
         "content": base64.b64encode(content).decode("ascii"),
     }
     if sha is not None:
