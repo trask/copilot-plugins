@@ -1161,10 +1161,10 @@ def read_utf8(path: Path) -> str:
         raise WorkflowError(f"body file is not valid UTF-8: {path}") from error
 
 
-def normalize_newlines(value: str) -> str:
-    # The body file's line endings never decide what reaches GitHub: CRLF and CR
-    # are folded to LF so a proposal written on any platform sends the same bytes.
-    return value.replace("\r\n", "\n").replace("\r", "\n")
+def normalize_body(value: str) -> str:
+    # A leading UTF-8 BOM is a transport marker, not pull request body content.
+    # Line endings are folded to LF so every platform sends the same bytes.
+    return value.removeprefix("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def command_propose(args: argparse.Namespace) -> None:
@@ -1175,7 +1175,7 @@ def command_propose(args: argparse.Namespace) -> None:
     run_id = require_run_id(state, args.expected_run_id)
     body_path = cli_path(args.body_file)
     raw_body = read_utf8(body_path)
-    body = normalize_newlines(raw_body)
+    body = normalize_body(raw_body)
     count = proposal_count(state) + 1
     proposal = {
         "number": count,

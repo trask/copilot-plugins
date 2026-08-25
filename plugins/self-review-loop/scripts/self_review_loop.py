@@ -22,7 +22,6 @@ from typing import Any, Iterable
 STATE_VERSION = 1
 DEFAULT_MAX_ITERATIONS = 5
 DEFAULT_PIPELINE_MAX_ITERATIONS = 2
-PR_HEAD_LAG_RETRY_DELAY = 1
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
 IS_WINDOWS = os.name == "nt"
 PR_URL_PATTERN = re.compile(
@@ -1065,6 +1064,8 @@ def archive_review(state: dict[str, Any]) -> None:
     review = state.get("review")
     if not review:
         return
+    if review.get("status") == "head_moved":
+        return
     history = state.setdefault("history", [])
     recorded = {entry["id"] for entry in history}
     for candidate in review.get("candidates") or []:
@@ -1563,10 +1564,17 @@ def command_resolve(args: argparse.Namespace) -> None:
     target = parse_target(state["pr"]["pr_url"])
     live_head = metadata_for(target)["head_sha"]
     if live_head != review["head_sha"]:
-        raise WorkflowError(
-            f"PR head changed before clean resolution: expected {review['head_sha']}, "
-            f"got {live_head}"
+        review["status"] = "head_moved"
+        save_state(path, state)
+        emit(
+            {
+                "result": "head_moved",
+                "state": str(path),
+                "expected_head_sha": review["head_sha"],
+                "live_head_sha": live_head,
+            }
         )
+        return
     review["outcome"] = args.outcome
     previous_clean_at_head_sha = review.get("clean_at_head_sha")
     review["clean_at_head_sha"] = review["head_sha"]
@@ -1757,8 +1765,10 @@ def command_publish(args: argparse.Namespace) -> None:
     if pushed_head != local_head:
         raise WorkflowError(f"fork ref mismatch: local {local_head}, remote {pushed_head}")
     pr_head = metadata_for(parse_target(pr["pr_url"]))["head_sha"]
-    if pr_head != local_head:
-        time.sleep(PR_HEAD_LAG_RETRY_DELAY)
+    for delay in REMOTE_REF_LAG_RETRY_DELAYS:
+        if pr_head == local_head:
+            break
+        time.sleep(delay)
         pr_head = metadata_for(parse_target(pr["pr_url"]))["head_sha"]
     if pr_head != local_head:
         raise WorkflowError(f"PR head mismatch: local {local_head}, PR head {pr_head}")

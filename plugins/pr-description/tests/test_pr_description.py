@@ -110,7 +110,35 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn("After preflight succeeds, call `rename_session` exactly once", self.instructions)
         self.assertIn("`PR Description: <number> - <title>`", self.instructions)
+        self.assertIn(
+            "when the runtime exposes that tool", self.instructions
+        )
+        self.assertIn(
+            "If the tool is unavailable, continue without renaming and do not report "
+            "its absence as retrospective friction",
+            self.instructions,
+        )
         self.assertIn("never rename again during this run", self.instructions)
+
+    def test_preserves_validated_state_and_removes_only_transient_files(self):
+        self.assertIn(
+            "Preserve validated helper state on normal completion so an orchestrator "
+            "can read its outcome",
+            self.instructions,
+        )
+        self.assertIn(
+            "keep the returned path, read the authoritative diff from that file, and "
+            "delete the file before the terminal response",
+            self.instructions,
+        )
+        self.assertNotIn("Keep the exact diff bytes for this run", self.instructions)
+        self.assertIn(
+            "Do not call helper `cleanup` after a normal validation or apply",
+            self.instructions,
+        )
+        self.assertIn(
+            "deletion of transient body and saved-diff files", self.instructions
+        )
 
     def test_unslops_every_replacement_before_automatic_apply(self):
         self.assertIn(
@@ -356,7 +384,8 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn(
             "If the command output is too large for one tool read and the tool "
-            "saves it to a file, read the authoritative diff from that saved file",
+            "saves it to a file, keep the returned path, read the authoritative diff "
+            "from that file",
             self.instructions,
         )
         for forbidden_header in ("`Summary`", "`Details`", "`Testing`"):
@@ -432,10 +461,11 @@ class AgentInstructionsTest(unittest.TestCase):
             "UTF-8 to a body file outside the repository", self.instructions
         )
         self.assertIn(
-            "the helper turns CRLF and CR into LF", self.instructions
+            "The helper removes one leading UTF-8 BOM and turns CRLF and CR into LF",
+            self.instructions,
         )
         self.assertIn(
-            "Never read the helper's source to choose a line ending",
+            "Never read the helper's source to choose an encoding or line ending",
             self.instructions,
         )
         self.assertIn(
@@ -561,7 +591,7 @@ class AgentInstructionsTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.27")
+        self.assertEqual(plugin["version"], "1.0.28")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -1096,6 +1126,29 @@ class StatePersistenceTest(unittest.TestCase):
 
         self.assertEqual(self.emitted[-1]["body_newline"], "lf")
         self.assertFalse(self.emitted[-1]["body_normalized"])
+
+    def test_propose_strips_one_leading_utf8_bom(self):
+        path = write_state(self.directory)
+        body_path = self.directory / "body.md"
+        body_path.write_text(
+            "\ufeffFirst paragraph.\n\n- One\ufeffTwo",
+            encoding="utf-8",
+        )
+
+        MODULE.command_propose(
+            SimpleNamespace(
+                state=str(path),
+                expected_run_id="run-1",
+                title="Title",
+                body_file=str(body_path),
+            )
+        )
+
+        state = MODULE.load_state(path)
+        self.assertEqual(
+            state["proposal"]["body"], "First paragraph.\n\n- One\ufeffTwo"
+        )
+        self.assertTrue(self.emitted[-1]["body_normalized"])
 
     def test_propose_rejects_a_body_file_that_is_not_utf8(self):
         path = write_state(self.directory)

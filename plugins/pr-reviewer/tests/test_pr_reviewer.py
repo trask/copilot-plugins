@@ -58,15 +58,40 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn("do not call `rename_session`", instructions)
-        self.assertIn("Otherwise call `rename_session` once", instructions)
         self.assertIn(
-            "accept that result and continue without retrying or reporting it as "
-            "retrospective friction",
+            "Otherwise call `rename_session` once with the name you want when the "
+            "runtime exposes that tool",
+            instructions,
+        )
+        self.assertIn(
+            "If the tool is unavailable, or it reports that it skipped the rename",
+            instructions,
+        )
+        self.assertIn(
+            "continue without retrying or reporting it as retrospective friction",
             instructions,
         )
         self.assertIn("Never use an interim number-only name", instructions)
         self.assertNotIn("call `rename_session` again", instructions)
         self.assertNotIn("immediately call `rename_session`", instructions)
+
+    def test_allows_only_honest_changed_line_proxies_for_unchanged_code(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "A changed line may anchor a defect whose complete cause or fix also "
+            "involves unchanged code",
+            instructions,
+        )
+        self.assertIn(
+            "only when that changed line genuinely demonstrates the defect or "
+            "incomplete fix",
+            instructions,
+        )
+        self.assertIn(
+            "never use an unrelated changed line as a proxy",
+            instructions,
+        )
 
     def test_bare_pr_reference_starts_the_review(self):
         instructions = AGENT.read_text(encoding="utf-8")

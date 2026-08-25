@@ -134,10 +134,17 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn("do not call `rename_session`", self.instructions)
-        self.assertIn("Otherwise call `rename_session` once", self.instructions)
         self.assertIn(
-            "accept that result and continue without retrying or reporting it as "
-            "retrospective friction",
+            "Otherwise call `rename_session` once with the name you want when the "
+            "runtime exposes that tool",
+            self.instructions,
+        )
+        self.assertIn(
+            "If the tool is unavailable, or it reports that it skipped the rename",
+            self.instructions,
+        )
+        self.assertIn(
+            "continue without retrying or reporting it as retrospective friction",
             self.instructions,
         )
         self.assertIn("Never use an interim number-only name", self.instructions)
@@ -179,12 +186,15 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "After each successful `publish`, and before the next `preflight`, read "
-            "the live title and description again against the newly published diff",
+            "applies at every terminal outcome", self.instructions
+        )
+        self.assertIn(
+            "whether the inaccuracy predates this loop or a loop commit introduced it",
             self.instructions,
         )
         self.assertIn(
-            "If a commit from this loop made either one materially false or misleading",
+            "After each successful `publish`, and before the next `preflight`, read "
+            "the live title and description again against the newly published diff",
             self.instructions,
         )
         self.assertIn(
@@ -192,6 +202,42 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn(
             "If you cannot make a required metadata correction safely, stop",
+            self.instructions,
+        )
+        self.assertIn(
+            "`**PR metadata:** corrected <title, description, or title and description>.`",
+            self.instructions,
+        )
+
+    def test_allows_only_honest_changed_line_anchors_for_unchanged_code(self):
+        self.assertIn(
+            "A changed line may anchor a defect whose complete cause or fix also "
+            "involves unchanged code",
+            self.instructions,
+        )
+        self.assertIn(
+            "only when that changed line genuinely demonstrates the defect or "
+            "incomplete fix",
+            self.instructions,
+        )
+        self.assertIn(
+            "Never choose an unrelated changed line merely because the helper accepts it",
+            self.instructions,
+        )
+
+    def test_restarts_after_resolve_observes_a_moved_head(self):
+        self.assertIn(
+            "Whenever either clean-exit `resolve` call reports `head_moved`, discard "
+            "the old snapshot and start again with a fresh `preflight`",
+            self.instructions,
+        )
+        self.assertIn(
+            "The helper supersedes that stale review so its dropped candidates do not "
+            "enter history",
+            self.instructions,
+        )
+        self.assertIn(
+            "No publication occurred, so this does not consume an iteration",
             self.instructions,
         )
 
@@ -2037,19 +2083,44 @@ class StateCommandTest(unittest.TestCase):
         self.assertEqual(self.emitted[-1]["result"], "resolved")
         self.assertIn("network unavailable", stderr.getvalue())
 
-    def test_resolve_refuses_a_stale_live_pr_head(self):
-        path = write_state(self.directory)
+    def test_resolve_supersedes_a_stale_review_without_archiving_its_drops(self):
+        path = write_state(
+            self.directory,
+            review={
+                "id": "pr-7-iteration-1",
+                "status": "active",
+                "iteration": 1,
+                "head_sha": "head1",
+                "diff_path": str(self.directory / "state.json.diff"),
+                "anchors": {"app.py": {"LEFT": [2], "RIGHT": [2, 3]}},
+                "candidates": [
+                    {
+                        "id": "F-1",
+                        "path": "app.py",
+                        "line": 2,
+                        "side": "RIGHT",
+                        "body": "Problem.",
+                        "status": "dropped",
+                        "rationale": "Not actionable.",
+                    }
+                ],
+                "batches": [],
+            },
+        )
 
-        with (
-            mock.patch.object(
-                MODULE, "metadata_for", return_value={"head_sha": "head2"}
-            ),
-            self.assertRaisesRegex(MODULE.WorkflowError, "PR head changed"),
+        with mock.patch.object(
+            MODULE, "metadata_for", return_value={"head_sha": "head2"}
         ):
             MODULE.command_resolve(SimpleNamespace(state=str(path), outcome="clean"))
 
-        state = json.loads(path.read_text(encoding="utf-8"))
+        state = MODULE.load_state(path)
+        self.assertEqual(self.emitted[-1]["result"], "head_moved")
+        self.assertEqual(self.emitted[-1]["expected_head_sha"], "head1")
+        self.assertEqual(self.emitted[-1]["live_head_sha"], "head2")
+        self.assertEqual(state["review"]["status"], "head_moved")
         self.assertNotIn("outcome", state["review"])
+        MODULE.archive_review(state)
+        self.assertEqual(state["history"], [])
 
     def test_resolve_requires_no_candidates_or_all_dropped(self):
         for status in ("pending", "planned", "handled", "skipped"):
@@ -2379,8 +2450,11 @@ class PublishTest(unittest.TestCase):
                 MODULE.command_publish(publish_args(path))
 
         self.assertIn("PR head mismatch", str(error.exception))
-        self.assertEqual(metadata.call_count, 2)
-        sleep.assert_called_once_with(MODULE.PR_HEAD_LAG_RETRY_DELAY)
+        self.assertEqual(metadata.call_count, 4)
+        self.assertEqual(
+            sleep.call_args_list,
+            [mock.call(delay) for delay in MODULE.REMOTE_REF_LAG_RETRY_DELAYS],
+        )
 
     def test_retries_a_stale_pr_head_after_confirming_the_pushed_ref(self):
         path = self.state_with([self.candidate()])
@@ -2403,6 +2477,7 @@ class PublishTest(unittest.TestCase):
                 "metadata_for",
                 side_effect=[
                     {"head_sha": "oldhead"},
+                    {"head_sha": "oldhead"},
                     {"head_sha": "newhead"},
                 ],
             ) as metadata,
@@ -2414,8 +2489,8 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(
             run.call_args.args[0][-3:], ["push", "origin", "HEAD:feature"]
         )
-        self.assertEqual(metadata.call_count, 2)
-        sleep.assert_called_once_with(MODULE.PR_HEAD_LAG_RETRY_DELAY)
+        self.assertEqual(metadata.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(1), mock.call(2)])
         self.assertEqual(self.emitted[-1]["result"], "published")
 
 

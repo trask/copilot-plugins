@@ -11,7 +11,7 @@
     {
       "name": "pr-reviewer",
       "description": "Review a GitHub pull request and create a verified pending review with high-confidence inline comments.",
-      "version": "1.5.4",
+      "version": "1.5.5",
       "source": "./plugins/pr-reviewer"
     },
     {
@@ -23,13 +23,13 @@
     {
       "name": "self-review-loop",
       "description": "Review a GitHub pull request, verify each finding independently, and commit the fixes without posting review comments.",
-      "version": "1.1.15",
+      "version": "1.1.16",
       "source": "./plugins/self-review-loop"
     },
     {
       "name": "pr-description",
       "description": "Review and automatically update a pull request title and description with head verification.",
-      "version": "1.0.27",
+      "version": "1.0.28",
       "source": "./plugins/pr-description"
     },
     {
