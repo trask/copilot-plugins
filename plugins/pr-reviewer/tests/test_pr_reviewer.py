@@ -154,7 +154,10 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn("GPT-5.6 Sol", instructions)
         self.assertIn("reasoning effort **max**", instructions)
-        self.assertIn("for **each candidate separately**", instructions)
+        self.assertIn(
+            "for **each distinct accumulated candidate separately**",
+            instructions,
+        )
         self.assertIn("Never add a top-level review body", instructions)
         self.assertIn("Skip local tests by default", instructions)
         self.assertIn("Record every dropped candidate", instructions)
@@ -284,6 +287,102 @@ class AgentInstructionsTest(unittest.TestCase):
             "For a precedent candidate, also give it the cited paths and symbols, "
             "the pattern they establish, why that pattern applies here, the exact "
             "departure",
+            instructions,
+        )
+
+    def test_runs_fresh_discovery_passes_with_an_exclusion_ledger(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn("## Iterative Discovery", instructions)
+        self.assertIn(
+            "Discovery is sequential because each pass excludes what all earlier "
+            "passes found",
+            instructions,
+        )
+        self.assertIn(
+            "Run at most **5 valid discovery passes**",
+            instructions,
+        )
+        self.assertIn(
+            "Launch every pass as a fresh subagent using model **Claude Opus 5** "
+            "with reasoning effort **max**",
+            instructions,
+        )
+        self.assertIn(
+            "Give it the fixed evidence packet from workflow step 2, the complete "
+            "authoritative diff, the full review context from workflow step 3",
+            instructions,
+        )
+        self.assertIn(
+            "Write each ledger entry as a concise root-cause exclusion with its "
+            "demonstrated impact, path and line or range",
+            instructions,
+        )
+        self.assertIn(
+            "It must not return, reword, expand, or spend its result explaining one "
+            "of those findings",
+            instructions,
+        )
+        self.assertIn(
+            "Rediscovering a ledger entry is a cue to keep reviewing, not a reason "
+            "to finish",
+            instructions,
+        )
+        self.assertIn(
+            "Merge the same root cause before adding distinct candidates to the "
+            "accumulated list and exclusion ledger",
+            instructions,
+        )
+        self.assertIn(
+            "A response that returns only ledger duplicates, stops after discussing "
+            "a known finding, skips a changed area, or gives no explicit clean result "
+            "is invalid",
+            instructions,
+        )
+        self.assertIn(
+            "Retry an invalid or failed pass once with a new subagent and the same "
+            "pass number",
+            instructions,
+        )
+        self.assertIn(
+            "Stop after the first valid clean pass",
+            instructions,
+        )
+        self.assertIn(
+            "If pass 5 adds candidates, keep them all and proceed without a sixth "
+            "pass",
+            instructions,
+        )
+        self.assertIn(
+            "Never apply proposed fixes locally between passes",
+            instructions,
+        )
+        self.assertIn(
+            "The loop never creates a partial pending review",
+            instructions,
+        )
+
+    def test_evaluates_every_distinct_accumulated_candidate_once(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "After discovery ends, launch a fresh independent subagent for **each "
+            "distinct accumulated candidate separately**",
+            instructions,
+        )
+        self.assertIn(
+            "never evaluate the same root cause twice",
+            instructions,
+        )
+        self.assertIn(
+            "Only after this loop ends may you search related open pull requests for "
+            "each distinct accumulated candidate, run **Parallel Evaluation**, "
+            "rewrite surviving comments, or call `post`",
+            instructions,
+        )
+        self.assertIn(
+            "Run `post <target> --expected-head <recorded-head_sha> --comments "
+            "<file-or->` exactly once",
             instructions,
         )
 
