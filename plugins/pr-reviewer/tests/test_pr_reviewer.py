@@ -152,8 +152,10 @@ class AgentInstructionsTest(unittest.TestCase):
             "Delete both written files after you post the review",
             instructions,
         )
-        self.assertIn("GPT-5.6 Sol", instructions)
-        self.assertIn("reasoning effort **max**", instructions)
+        self.assertIn(
+            "using model **Claude Opus 5** with reasoning effort **high**",
+            instructions,
+        )
         self.assertIn(
             "for **each distinct accumulated candidate separately**",
             instructions,
@@ -304,8 +306,8 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn(
-            "Launch every pass as a fresh subagent using model **Claude Opus 5** "
-            "with reasoning effort **max**",
+            "Launch every pass as a fresh subagent using model **GPT-5.6 Sol** "
+            "with reasoning effort **high**",
             instructions,
         )
         self.assertIn(
@@ -554,13 +556,15 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertNotIn("a triviality, a style preference", instructions)
 
-    def test_requires_a_claude_model_gate_before_any_review_work(self):
+    def test_requires_a_gpt_model_gate_before_any_review_work(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn("## Model Gate", instructions)
-        self.assertIn("Run only on a Claude model", instructions)
+        self.assertIn("Run only on a GPT-family model", instructions)
         self.assertIn("Clear the **Model Gate**", instructions)
-        self.assertIn("definitely a Claude model", instructions)
+        self.assertIn("definitely a GPT-family model", instructions)
+        self.assertIn("fixed Claude Opus 5 evaluator", instructions)
+        self.assertIn("run the agent again on a GPT-family model", instructions)
         self.assertIn("before `check` and before you fetch any pull request data", instructions)
         self.assertIn("If you cannot work out which model you run as, the gate has failed", instructions)
         self.assertIn("only when the user explicitly tells you to proceed anyway", instructions)
