@@ -1422,16 +1422,24 @@ def collect_conflicts(
     return sorted(conflicts, key=lambda item: item["path"])
 
 
-def collect_stack_conflicts(repo_root: Path) -> list[dict[str, Any]]:
-    """Report the conflicted files a cascading rebase left, without commit lists.
+def collect_stack_conflicts(
+    repo_root: Path, stack: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Report conflicts against the current stack layer's frozen boundaries."""
+    current = stack.get("current_index")
+    plan = stack.get("plan") or []
+    if not isinstance(current, int) or current < 0 or current >= len(plan):
+        raise WorkflowError("the stack cascade has no conflicted member to inspect")
+    member = plan[current]
+    old_base = member.get("old_base")
+    head_sha = member.get("head_sha")
+    new_base_ref = member.get("new_base_ref")
+    if not all(
+        isinstance(value, str) and value
+        for value in (old_base, head_sha, new_base_ref)
+    ):
+        raise WorkflowError("the conflicted stack member has incomplete history")
 
-    ``collect_conflicts`` frames each file with two-sided commit lists computed
-    against the pull request's declared base. A cascade conflicts against a stack
-    layer that is not that base, so those lists would attribute the conflict to
-    the wrong commits. The plainer signal the rebase itself leaves — the
-    conflicted files and their markers — is reported instead, in the same record
-    shape so ``resolved`` and the conflicts result reader need no special case.
-    """
     conflicts = []
     for entry in unmerged_entries(repo_root):
         path = entry["path"]
@@ -1454,8 +1462,12 @@ def collect_stack_conflicts(repo_root: Path) -> list[dict[str, Any]]:
                 "present_stages": sorted(
                     name for name, blob in blobs.items() if blob is not None
                 ),
-                "head_commits": [],
-                "base_commits": [],
+                "head_commits": commits_touching(
+                    repo_root, f"{old_base}..{head_sha}", path
+                ),
+                "base_commits": commits_touching(
+                    repo_root, f"{old_base}..{new_base_ref}", path
+                ),
                 "status": "conflicted",
                 "rationale": None,
                 "one_side": None,
@@ -3929,7 +3941,7 @@ def finish_stack_rebase(
         return
 
     if code == STACK_CONFLICT_EXIT:
-        conflicts = collect_stack_conflicts(workspace)
+        conflicts = collect_stack_conflicts(workspace, stack)
         if not conflicts:
             if rebase_in_progress(workspace):
                 git_try(workspace, "rebase", "--abort")

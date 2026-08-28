@@ -6414,6 +6414,15 @@ class StackCascadeTopologyTest(GitTestCase):
             process.stderr or process.stdout,
         )
         self.assertTrue(MODULE.rebase_in_progress(self.workspace))
+        conflicts = MODULE.collect_stack_conflicts(self.workspace, self.stack)
+        self.assertEqual(
+            ["lower two", "lower one"],
+            [commit["subject"] for commit in conflicts[0]["head_commits"]],
+        )
+        self.assertEqual(
+            ["main conflict"],
+            [commit["subject"] for commit in conflicts[0]["base_commits"]],
+        )
         self.assertEqual(self.lower_head, self.remote_head("lower"))
         self.assertEqual(self.child_head, self.remote_head("child"))
         self.assertEqual(self.grandchild_head, self.remote_head("grandchild"))

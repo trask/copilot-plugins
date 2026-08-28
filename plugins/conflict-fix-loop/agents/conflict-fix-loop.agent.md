@@ -146,7 +146,9 @@ Never widen the single-branch push guards to let a cascade through. The cascade 
 - `head_commits`: the commits on the pull request's own branch that touched this file since the merge base.
 - `base_commits`: the commits on the base branch that touched this file since the merge base.
 
-Use those names. Git's own `ours` and `theirs` swap meaning between a merge and a rebase, and reading them the wrong way round is how a resolution silently deletes the wrong side's work. The helper computes both lists from explicit commit ranges, so they mean the same thing under either strategy.
+For a stack cascade, the same names are scoped to the member currently being replayed: `head_commits` covers that member's original commits since its frozen parent boundary, while `base_commits` covers the newly rebased parent from that boundary.
+
+Use those names. Git's own `ours` and `theirs` swap meaning between a merge and a rebase, and reading them the wrong way round is how a resolution silently deletes the wrong side's work. The helper computes both lists from explicit commit ranges, so their meaning stays stable under every strategy.
 
 For every conflicted file, before you change a single line:
 
