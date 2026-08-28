@@ -32,10 +32,7 @@ finding with its own separate evaluator. It then creates a pending review that
 holds only the findings it can confirm, and verifies that every inline comment
 points at a real line of that diff.
 
-Ask it to spin up sessions for a list or search of pull requests to run those
-reviews independently and in parallel.
-
-Run this agent on a GPT model. It checks its own findings with Claude Opus 5,
+Run this agent on a Claude model. It checks its own findings with GPT-5.6 Sol,
 and that check only works when the evaluator comes from another model family.
 
 ### Copilot Review Loop
