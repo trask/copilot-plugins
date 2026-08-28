@@ -10,8 +10,8 @@
   "plugins": [
     {
       "name": "pr-reviewer",
-      "description": "Review a GitHub pull request and create a verified pending review with high-confidence inline comments.",
-      "version": "1.5.7",
+      "description": "Create a verified pending PR review or launch independent reviewer sessions for multiple pull requests.",
+      "version": "1.5.8",
       "source": "./plugins/pr-reviewer"
     },
     {

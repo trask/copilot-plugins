@@ -46,7 +46,10 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_names_the_session_from_check_metadata_idempotently(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn("tools: [read, search, execute, agent, rename_session]", instructions)
+        self.assertIn(
+            "tools: [read, search, execute, agent, rename_session, open_pr_session]",
+            instructions,
+        )
         self.assertIn("## Session Naming", instructions)
         self.assertIn(
             "ensure the session name is `PR Review: <PR number> - <PR title>`",
@@ -74,6 +77,34 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("Never use an interim number-only name", instructions)
         self.assertNotIn("call `rename_session` again", instructions)
         self.assertNotIn("immediately call `rename_session`", instructions)
+
+    def test_opens_one_independent_review_session_per_requested_pr(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn("## Multiple PRs: Open Review Sessions", instructions)
+        self.assertIn("A batch dispatch is not itself a review run", instructions)
+        self.assertIn(
+            "GitHub pull request list or search URLs, and plain-language filters",
+            instructions,
+        )
+        self.assertIn("Deduplicate the results by `owner/repo#number`", instructions)
+        self.assertIn(
+            "Call `open_pr_session` exactly once for each resolved pull request",
+            instructions,
+        )
+        self.assertIn("set `coordinate_with_creator` to `false`", instructions)
+        self.assertIn(
+            "this `pr-reviewer` agent in `autopilot` mode on model `gpt-5.6-sol` "
+            "with reasoning effort `high`",
+            instructions,
+        )
+        self.assertIn("Use the canonical PR URL as the kickoff prompt", instructions)
+        self.assertIn("Each child must own one PR", instructions)
+        self.assertIn("Do not wait for the child sessions to finish", instructions)
+        self.assertIn(
+            "never replace them with local task subagents",
+            instructions,
+        )
 
     def test_allows_only_honest_changed_line_proxies_for_unchanged_code(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -556,12 +587,17 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertNotIn("a triviality, a style preference", instructions)
 
-    def test_requires_a_gpt_model_gate_before_any_review_work(self):
+    def test_requires_a_gpt_model_gate_before_any_single_pr_review_work(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn("## Model Gate", instructions)
-        self.assertIn("Run only on a GPT-family model", instructions)
+        self.assertIn("Run a single-PR review only on a GPT-family model", instructions)
         self.assertIn("Clear the **Model Gate**", instructions)
+        self.assertIn(
+            "For a single-PR review, work out which model runs this agent before "
+            "you do any review work",
+            instructions,
+        )
         self.assertIn("definitely a GPT-family model", instructions)
         self.assertIn("fixed Claude Opus 5 evaluator", instructions)
         self.assertIn("run the agent again on a GPT-family model", instructions)
