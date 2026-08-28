@@ -221,8 +221,19 @@ def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
         base_sha = member.get("baseRefOid")
         timeline = member.get("timelineItems")
         events = timeline.get("nodes") if isinstance(timeline, dict) else None
+        page_info = timeline.get("pageInfo") if isinstance(timeline, dict) else None
+        if isinstance(page_info, dict) and page_info.get("hasNextPage") is True:
+            raise WorkflowError(
+                f"native stack member #{number} has incomplete branch history"
+            )
         retargeted_from = None
+        force_pushed = False
         for event in events or []:
+            if (
+                isinstance(event, dict)
+                and event.get("__typename") == "HeadRefForcePushedEvent"
+            ):
+                force_pushed = True
             if (
                 isinstance(event, dict)
                 and event.get("newBase") == base_branch
@@ -254,6 +265,7 @@ def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
                 "head_sha": head_sha,
                 "base_sha": base_sha,
                 "retargeted_from": retargeted_from,
+                "force_pushed": force_pushed,
             }
         )
     members.sort(
@@ -348,11 +360,18 @@ def stack_membership(pr: dict[str, Any]) -> dict[str, Any]:
         "            position"
         "            pullRequest {"
         "              number headRefName baseRefName mergeable headRefOid baseRefOid"
-        "              timelineItems(first: $first,"
-        "                itemTypes: [AUTOMATIC_BASE_CHANGE_SUCCEEDED_EVENT]) {"
+        "              timelineItems(first: $first, itemTypes: ["
+        "                AUTOMATIC_BASE_CHANGE_SUCCEEDED_EVENT,"
+        "                HEAD_REF_FORCE_PUSHED_EVENT"
+        "              ]) {"
+        "                pageInfo { hasNextPage }"
         "                nodes {"
+        "                  __typename"
         "                  ... on AutomaticBaseChangeSucceededEvent {"
         "                    oldBase newBase createdAt"
+        "                  }"
+        "                  ... on HeadRefForcePushedEvent {"
+        "                    createdAt beforeCommit { oid } afterCommit { oid }"
         "                  }"
         "                }"
         "              }"
@@ -3620,7 +3639,13 @@ def prepare_stack_cascade(
                     f"{parent_branch!r} is ambiguous: multiple merge bases exist"
                 )
             old_base = merge_bases[0]
-            if old_base != historical_base:
+            if index == 0:
+                # A PR's baseRefOid is a base-branch observation, not its fork point.
+                # The bottom layer's merge base is the exact range GitHub reviews.
+                old_base = merge_bases[0]
+            elif old_base != historical_base and members[index - 1].get(
+                "force_pushed"
+            ):
                 old_base = recover_rewritten_parent_boundary(
                     workspace,
                     parent_sha=parent_sha,
@@ -3630,7 +3655,7 @@ def prepare_stack_cascade(
                     parent_branch=parent_branch,
                     child_branch=member["head_branch"],
                 )
-            elif not (
+            elif old_base == historical_base and not (
                 is_ancestor(workspace, historical_base, parent_sha)
                 and is_ancestor(workspace, historical_base, child_sha)
             ):

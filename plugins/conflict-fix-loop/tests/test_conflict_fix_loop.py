@@ -4996,6 +4996,7 @@ def stack_entry(
     oid=None,
     base_oid=None,
     retargeted_from=None,
+    force_pushed=False,
 ):
     entry = {
         "position": position,
@@ -5008,15 +5009,29 @@ def stack_entry(
             "baseRefOid": base_oid or f"baseoid{number}",
         },
     }
+    events = []
     if retargeted_from is not None:
+        events.append(
+            {
+                "__typename": "AutomaticBaseChangeSucceededEvent",
+                "oldBase": retargeted_from,
+                "newBase": base,
+                "createdAt": "2026-08-24T06:06:04Z",
+            }
+        )
+    if force_pushed:
+        events.append(
+            {
+                "__typename": "HeadRefForcePushedEvent",
+                "createdAt": "2026-08-24T07:06:04Z",
+                "beforeCommit": {"oid": "before"},
+                "afterCommit": {"oid": "after"},
+            }
+        )
+    if events:
         entry["pullRequest"]["timelineItems"] = {
-            "nodes": [
-                {
-                    "oldBase": retargeted_from,
-                    "newBase": base,
-                    "createdAt": "2026-08-24T06:06:04Z",
-                }
-            ]
+            "pageInfo": {"hasNextPage": False},
+            "nodes": events,
         }
     return entry
 
@@ -5060,6 +5075,18 @@ class ParseStackTest(unittest.TestCase):
             )
         )
         self.assertEqual("lower", stack["members"][0]["retargeted_from"])
+
+    def test_a_force_push_is_recorded_for_lineage_recovery(self):
+        stack = MODULE.parse_stack(
+            self.raw([stack_entry(0, 7, "feature", "main", force_pushed=True)])
+        )
+        self.assertTrue(stack["members"][0]["force_pushed"])
+
+    def test_incomplete_branch_history_is_rejected(self):
+        entry = stack_entry(0, 7, "feature", "main", force_pushed=True)
+        entry["pullRequest"]["timelineItems"]["pageInfo"]["hasNextPage"] = True
+        with self.assertRaisesRegex(MODULE.WorkflowError, "incomplete branch history"):
+            MODULE.parse_stack(self.raw([entry]))
 
     def test_an_unreadable_member_is_a_hard_error(self):
         nodes = [
@@ -5124,6 +5151,9 @@ class StackMembershipTest(unittest.TestCase):
         self.membership(stack=None)
         variables = self.query.call_args[0][1]
         self.assertEqual(MODULE.STACK_ENTRIES_PAGE, variables["first"])
+        query = self.query.call_args[0][0]
+        self.assertIn("HEAD_REF_FORCE_PUSHED_EVENT", query)
+        self.assertIn("pageInfo { hasNextPage }", query)
 
     def test_a_retargeted_member_is_enriched_with_its_merged_predecessor(self):
         raw = {
@@ -5594,6 +5624,7 @@ class StackCascadePlanTest(unittest.TestCase):
 
     def test_a_rewritten_parent_uses_its_patch_equivalent_prefix_as_the_boundary(self):
         self.stack["members"][1]["base_sha"] = "rewritten-parent"
+        self.stack["members"][0]["force_pushed"] = True
         ancestry = {
             ("base1", "aaa"): True,
             ("aaa", "head1"): False,
@@ -6339,6 +6370,36 @@ class StackCascadeTopologyTest(GitTestCase):
         self.assertEqual(tips["grandchild"], self.remote_head("grandchild"))
         self.assertEqual(self.unrelated_head, self.remote_head("unrelated"))
 
+    def test_a_fast_forwarded_parent_uses_the_child_merge_base(self):
+        self.stack["members"][1]["base_sha"] = self.lower_head
+
+        plan, process = self.prepare_and_rebase()
+
+        self.assertEqual(0, process.returncode, process.stderr or process.stdout)
+        self.assertEqual(self.lower_old, plan[1]["old_base"])
+        self.assertEqual(
+            "child",
+            self.git(self.workspace, "show", "refs/heads/child:child.txt"),
+        )
+
+    def test_an_advanced_trunk_uses_the_bottom_member_merge_base(self):
+        self.git(self.source, "checkout", "main")
+        self.write(self.source, "main.txt", "main advanced\n")
+        self.commit(self.source, "advance main")
+        advanced_main = self.git(self.source, "rev-parse", "HEAD")
+        self.git(self.source, "push", "origin", "main")
+        self.stack["members"][0]["base_sha"] = advanced_main
+        self.clone_workspace()
+
+        plan, process = self.prepare_and_rebase()
+
+        self.assertEqual(0, process.returncode, process.stderr or process.stdout)
+        self.assertEqual(self.main_head, plan[0]["old_base"])
+        self.assertEqual(
+            "main advanced",
+            self.git(self.workspace, "show", "refs/heads/lower:main.txt"),
+        )
+
     def test_a_conflict_stops_with_zero_publication(self):
         self.git(self.source, "checkout", "main")
         self.write(self.source, "lower.txt", "main changed this path\n")
@@ -6382,6 +6443,7 @@ class StackCascadeTopologyTest(GitTestCase):
         rewritten = self.git(self.source, "rev-parse", "HEAD")
         self.git(self.source, "push", "--force", "origin", "HEAD:lower")
         self.stack["members"][0]["head_sha"] = rewritten
+        self.stack["members"][0]["force_pushed"] = True
         self.clone_workspace()
 
         with self.assertRaisesRegex(MODULE.WorkflowError, "may have been rewritten"):
@@ -6400,6 +6462,7 @@ class StackCascadeTopologyTest(GitTestCase):
         rewritten_head = self.git(self.source, "rev-parse", "HEAD")
         self.git(self.source, "push", "--force", "origin", "HEAD:lower")
         self.stack["members"][0]["head_sha"] = rewritten_head
+        self.stack["members"][0]["force_pushed"] = True
         self.stack["members"][1]["base_sha"] = rewritten_base
         self.clone_workspace()
 
