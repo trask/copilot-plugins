@@ -2337,6 +2337,27 @@ class PublishCommandTest(unittest.TestCase):
         state = MODULE.load_state(path)
         self.assertEqual("published", state["run"]["status"])
         self.assertEqual({}, state["reruns"])
+        checkpoint = payload["accepted_push"]
+        self.assertEqual("head1", checkpoint["previous_head_sha"])
+        self.assertEqual("local1", checkpoint["head_sha"])
+        self.assertEqual(["local1"], checkpoint["commits"])
+        self.assertEqual([checkpoint], state["accepted_pushes"])
+
+    def test_status_exposes_accepted_pushes_to_orchestrators(self):
+        checkpoint = {
+            "id": "push-1",
+            "accepted_at": "2026-01-01T00:00:00Z",
+            "previous_head_sha": "head1",
+            "head_sha": "head2",
+            "commits": ["head2"],
+            "pipeline_run": "stack-run",
+            "pipeline_iteration": 1,
+        }
+        path = write_state(self.root, accepted_pushes=[checkpoint])
+
+        payload = call("status", "--state", str(path))
+
+        self.assertEqual([checkpoint], payload["accepted_pushes"])
 
     def test_records_the_local_validation_behind_the_push(self):
         """The state has to say what ran, or a live run proves nothing.

@@ -17,7 +17,9 @@ copilot plugin install pr-reviewer@trask-plugins
 copilot plugin install copilot-review-loop@trask-plugins
 copilot plugin install self-review-loop@trask-plugins
 copilot plugin install pr-description@trask-plugins
+copilot plugin install pr-pipeline@trask-plugins
 copilot plugin install conflict-fix-loop@trask-plugins
+copilot plugin install ci-fix-loop@trask-plugins
 copilot plugin install historical-pr-audit@trask-plugins
 ```
 
@@ -61,6 +63,29 @@ validates ideal text unchanged or automatically applies a better title and
 description. It checks every outcome against the pinned pull request head and
 the exact live text.
 
+### PR Pipeline
+
+Runs conflict handling, Copilot review, self review, CI repair, and description
+validation for one pull request. The same plugin includes PR Stack Pipeline,
+which applies those existing agents to a selected suffix of a native GitHub
+stack with at most two passes.
+
+PR Flight starts the stack agent with one JSON object:
+
+```json
+{"version":1,"repository":"owner/repo","stackNumber":77,"startPullRequest":11,"pullRequests":[11,12]}
+```
+
+`pullRequests` is the ordered, base-to-tip selected suffix beginning at
+`startPullRequest`. The helper checks that identity and order against the live
+native stack before it starts. Sessions use the title prefix
+`PR Stack Pipeline: <repository> stack <stackNumber> from #<startPullRequest>`.
+Durable state lives under `~/.copilot/run/pr-stack-pipeline/` and exposes the run
+ID, topology fingerprint, selected suffix, expected heads and bases, current
+pass and phase, per-PR stage state, dispatch nonces, result, and timestamps.
+PR Flight only needs to mark the action in flight; its existing stage chips
+remain the progress display.
+
 ### Conflict Fix Loop
 
 Resolves the merge conflicts on a pull request and repeats until GitHub reports
@@ -70,7 +95,16 @@ merge commit. It stops and reports when the two sides genuinely contradict each
 other. It refuses to rewrite an ordinary branch with dependents. For a native
 GitHub stack, it rebases every descendant in a throwaway clone and publishes the
 complete stack with one atomic, exact-lease push. It never posts anything to
-GitHub.
+GitHub. Its machine-facing descendant propagation operation uses the same
+topology checks and atomic publisher after a lower stack member receives a CI
+fix.
+
+### CI Fix Loop
+
+Fixes only failures attributable to the pull request, with five charged
+iterations per outer pipeline pass and an absolute ten across a two-pass run.
+Each accepted push records a durable machine-readable checkpoint so a stack
+orchestrator can propagate the new parent immediately.
 
 ### Historical PR Audit
 
@@ -120,7 +154,9 @@ copilot plugin update pr-reviewer
 copilot plugin update copilot-review-loop
 copilot plugin update self-review-loop
 copilot plugin update pr-description
+copilot plugin update pr-pipeline
 copilot plugin update conflict-fix-loop
+copilot plugin update ci-fix-loop
 copilot plugin update historical-pr-audit
 ```
 

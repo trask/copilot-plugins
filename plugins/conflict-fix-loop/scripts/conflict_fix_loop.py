@@ -566,6 +566,16 @@ def status_path_for(state_path: Path) -> Path:
     return state_path.parent / f"{state_path.name}.status.json"
 
 
+def default_propagation_state_path(
+    target: dict[str, Any], stack_number: int, fixed_number: int
+) -> Path:
+    name = (
+        f"{target['owner']}--{target['repo']}--stack-{stack_number}"
+        f"--after-{fixed_number}.json"
+    )
+    return Path.home() / ".copilot" / "run" / "conflict-fix-loop" / "propagation" / name
+
+
 def write_result_file(path: Path, payload: dict[str, Any], label: str) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2060,6 +2070,37 @@ def planned_stack_attempt(
     }
 
 
+def stack_member_target(pr: dict[str, Any], number: int) -> dict[str, Any]:
+    target = parse_target(pr["pr_url"])
+    return {
+        **target,
+        "number": number,
+        "pr_url": (
+            f"https://github.com/{target['owner']}/{target['repo']}/pull/{number}"
+        ),
+    }
+
+
+def stack_is_mergeable(
+    pr: dict[str, Any], stack: dict[str, Any], invoked: dict[str, Any]
+) -> bool:
+    for member in stack["members"]:
+        metadata = (
+            invoked
+            if member["number"] == invoked["number"]
+            else live_mergeability(
+                stack_member_target(pr, member["number"]),
+                expected_head=member["head_sha"],
+            )
+        )
+        if (
+            classify_mergeability(metadata, expected_head=member["head_sha"])
+            != "mergeable"
+        ):
+            return False
+    return True
+
+
 def command_preflight(args: argparse.Namespace) -> None:
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
@@ -2120,6 +2161,12 @@ def command_preflight(args: argparse.Namespace) -> None:
     # baseline against it would restart the numbering and lose an entry.
     iteration = state["iterations"] + 1
     mergeability = classify_mergeability(metadata)
+    whole_stack = bool(getattr(args, "whole_stack", False))
+    whole_stack_mergeable = (
+        whole_stack
+        and stack is not None
+        and stack_is_mergeable(metadata, stack, metadata)
+    )
 
     strategy_choice: dict[str, Any] | None = None
     strategy_error: str | None = None
@@ -2134,7 +2181,9 @@ def command_preflight(args: argparse.Namespace) -> None:
         result = "unsafe_push"
     elif exhausted:
         result = "max_iterations_reached"
-    elif mergeability == "mergeable":
+    elif whole_stack_mergeable:
+        result = "stack_mergeable"
+    elif mergeability == "mergeable" and not (whole_stack and stack is not None):
         result = "mergeable"
     elif stack is not None and external_dependents:
         # The cascade would force-push branches that open pull requests outside
@@ -2159,10 +2208,14 @@ def command_preflight(args: argparse.Namespace) -> None:
     else:
         result = "ready"
 
-    if result in {"mergeable", "ready"}:
+    if result in {"mergeable", "stack_mergeable", "ready"}:
         attempt = {
             "id": f"pr-{metadata['number']}-iteration-{iteration}",
-            "status": "mergeable" if result == "mergeable" else "planned",
+            "status": (
+                "mergeable"
+                if result in {"mergeable", "stack_mergeable"}
+                else "planned"
+            ),
             "iteration": iteration,
             "strategy": None if strategy_choice is None else strategy_choice["strategy"],
             "strategy_reason": None
@@ -2180,9 +2233,11 @@ def command_preflight(args: argparse.Namespace) -> None:
             "conflicts": [],
             "conflict_signature": None,
             "published_head_sha": None,
-            "mergeable_at_head_sha": metadata["head_sha"]
-            if result == "mergeable"
-            else None,
+            "mergeable_at_head_sha": (
+                metadata["head_sha"]
+                if result in {"mergeable", "stack_mergeable"}
+                else None
+            ),
         }
         state["attempt"] = attempt
     elif result == "stack_rebase":
@@ -2238,10 +2293,12 @@ def command_preflight(args: argparse.Namespace) -> None:
             ),
             iteration=iteration,
         )
-    elif result in {"mergeable", "ready", "stack_rebase"}:
+    elif result in {"mergeable", "stack_mergeable", "ready", "stack_rebase"}:
         state["escalation"] = None
 
     save_state(state_path, state)
+    if result == "stack_mergeable":
+        record_stack_member_clearances(state, stack["members"], metadata["number"])
 
     preflight_path = preflight_path_for(state_path)
     payload = {
@@ -4158,6 +4215,25 @@ def stack_snapshot_key(stack: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def stack_snapshot_fingerprint(stack: dict[str, Any]) -> str:
+    encoded = json.dumps(stack_snapshot_key(stack), separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def propagated_stack_fingerprint(
+    stack: dict[str, Any], intended: list[dict[str, Any]]
+) -> str:
+    heads = {member["number"]: member["head_sha"] for member in intended}
+    updated = {
+        **stack,
+        "members": [
+            {**member, "head_sha": heads.get(member["number"], member["head_sha"])}
+            for member in stack["members"]
+        ],
+    }
+    return stack_snapshot_fingerprint(updated)
+
+
 def require_current_stack_snapshot(pr: dict[str, Any], stack: dict[str, Any]) -> None:
     """Refuse publication when stack membership or dependents changed."""
     current = stack_membership(pr).get("stack")
@@ -4175,6 +4251,298 @@ def require_current_stack_snapshot(pr: dict[str, Any], stack: dict[str, Any]) ->
             "new pull requests outside the native stack now depend on branches "
             f"the cascade would rewrite: {listed}; no branch was published"
         )
+
+
+def propagation_stack(
+    stack: dict[str, Any], fixed_number: int, expected_head: str
+) -> dict[str, Any]:
+    """Select only descendants above a fixed stack member."""
+    validated = {**stack, "invoked_number": fixed_number}
+    validate_stack_snapshot(validated)
+    members = stack["members"]
+    fixed_index = next(
+        (index for index, member in enumerate(members) if member["number"] == fixed_number),
+        None,
+    )
+    if fixed_index is None:
+        raise WorkflowError(
+            f"fixed pull request #{fixed_number} is not a member of native stack "
+            f"{stack.get('number')}"
+        )
+    fixed = members[fixed_index]
+    if fixed["head_sha"] != expected_head:
+        raise WorkflowError(
+            f"fixed pull request #{fixed_number} moved from {expected_head} to "
+            f"{fixed['head_sha']}"
+        )
+    descendants = [dict(member) for member in members[fixed_index + 1 :]]
+    return {
+        "number": stack["number"],
+        "size": len(descendants),
+        "trunk": fixed["head_branch"],
+        "invoked_number": descendants[0]["number"] if descendants else None,
+        "members": descendants,
+        "source_snapshot": stack_snapshot_fingerprint(stack),
+        "fixed_number": fixed_number,
+        "fixed_head_sha": expected_head,
+    }
+
+
+def propagation_landed(
+    pr: dict[str, Any], intended: list[dict[str, Any]], *, wait: bool = False
+) -> bool:
+    return bool(intended) and all(
+        (
+            wait_for_remote_head(
+                pr["upstream_owner"],
+                pr["upstream_repo"],
+                member["head_branch"],
+                member["head_sha"],
+            )
+            if wait
+            else remote_head(
+                pr["upstream_owner"],
+                pr["upstream_repo"],
+                member["head_branch"],
+            )
+        )
+        == member["head_sha"]
+        for member in intended
+    )
+
+
+def command_descendant_propagate(args: argparse.Namespace) -> None:
+    """Rebase and atomically publish only members above a named fixed PR."""
+    require_tools()
+    repo_root = resolve_repo_root(args.repo_root)
+    target_value = args.target
+    if target_value is None and args.repo and args.pull_request is not None:
+        target_value = f"{args.repo}#{args.pull_request}"
+    if target_value is None:
+        raise WorkflowError(
+            "descendant-propagate needs a target or both --repo and --pull-request"
+        )
+    target = parse_target(target_value)
+    fixed_pr = args.fixed_pr if args.fixed_pr is not None else args.pull_request
+    expected_head = args.expected_head or args.head_sha
+    if fixed_pr is None or not expected_head:
+        raise WorkflowError(
+            "descendant-propagate needs --fixed-pr and --expected-head, or "
+            "--pull-request and --head-sha"
+        )
+    pr = metadata_for(target)
+    require_open_pull_request(pr)
+    detection = stack_membership(pr)
+    stack = detection.get("stack")
+    if stack is None:
+        raise WorkflowError(f"{target['pr_url']} is not in a native GitHub stack")
+    if args.stack_number is not None and stack.get("number") != args.stack_number:
+        raise WorkflowError(
+            f"pull request #{target['number']} is in native stack {stack.get('number')}, "
+            f"not {args.stack_number}"
+        )
+    partial = propagation_stack(stack, fixed_pr, expected_head)
+    if not partial["members"]:
+        emit(
+            {
+                "result": "no_descendants",
+                "stack_number": stack["number"],
+                "fixed_pr": fixed_pr,
+                "fixed_head_sha": expected_head,
+                "members_published": [],
+            }
+        )
+        return
+    external = external_stack_dependents(pr, partial)
+    if external:
+        listed = "; ".join(
+            f"#{item['number']} (targets {item['base_branch']})" for item in external
+        )
+        raise WorkflowError(
+            "pull requests outside the native stack depend on branches the propagation "
+            f"would rewrite: {listed}"
+        )
+
+    state_path = (
+        cli_path(args.state)
+        if args.state
+        else default_propagation_state_path(target, stack["number"], fixed_pr)
+    )
+    prior = load_state(state_path) if state_path.is_file() else None
+    resume_resolved = False
+    if prior is not None and prior.get("operation") == "descendant_propagation":
+        intended = prior.get("members_after") or []
+        if (
+            prior.get("expected_post_fingerprint")
+            == stack_snapshot_fingerprint(stack)
+            and propagation_landed(pr, intended)
+        ):
+            workspace = prior.get("workspace")
+            if isinstance(workspace, str) and Path(workspace).exists():
+                force_rmtree(Path(workspace))
+            prior["status"] = "published"
+            prior["workspace"] = None
+            save_state(state_path, prior)
+            emit(
+                {
+                    "result": "published",
+                    "recovered": True,
+                    "state": str(state_path),
+                    "stack_number": stack["number"],
+                    "fixed_pr": fixed_pr,
+                    "fixed_head_sha": expected_head,
+                    "members_published": intended,
+                }
+            )
+            return
+        prior_workspace = prior.get("workspace")
+        if (
+            prior.get("status") == "resolved"
+            and prior.get("stack_number") == stack["number"]
+            and prior.get("fixed_pr") == fixed_pr
+            and prior.get("fixed_head_sha") == expected_head
+            and isinstance(prior_workspace, str)
+            and Path(prior_workspace).exists()
+        ):
+            resume_resolved = True
+        if (
+            not resume_resolved
+            and prior.get("status") in {"planned", "resolved", "published_refs"}
+            and isinstance(prior_workspace, str)
+            and Path(prior_workspace).exists()
+        ):
+            raise WorkflowError(
+                "an earlier descendant propagation still owns a preserved workspace "
+                f"at {prior_workspace}; recover or remove that run before starting another"
+            )
+
+    if resume_resolved:
+        state = prior
+        workspace = Path(state["workspace"])
+        intended = state.get("members_after") or []
+        partial["members_after"] = intended
+        if not intended:
+            raise WorkflowError(
+                "the resolved descendant propagation has no recorded member tips"
+            )
+    else:
+        state = {
+            "version": STATE_VERSION,
+            "created_at": utc_now(),
+            "operation": "descendant_propagation",
+            "status": "planned",
+            "repo_root": str(repo_root),
+            "pr": pr,
+            "stack_number": stack["number"],
+            "fixed_pr": fixed_pr,
+            "fixed_head_sha": expected_head,
+            "source_snapshot": stack_snapshot_fingerprint(stack),
+            "members_before": partial["members"],
+            "members_after": None,
+            "expected_post_fingerprint": None,
+            "workspace": None,
+        }
+        save_state(state_path, state)
+        workspace = create_stack_workspace(
+            pr, reference=local_object_source(repo_root)
+        )
+        state["workspace"] = str(workspace)
+        save_state(state_path, state)
+    try:
+        if not resume_resolved:
+            prepare_stack_cascade(workspace, partial)
+            process = run_stack_cascade(workspace, partial)
+            if process.returncode == STACK_CONFLICT_EXIT:
+                state["status"] = "conflicted"
+                state["detail"] = (process.stdout + process.stderr).strip()
+                remove_stack_workspace({"stack": state})
+                save_state(state_path, state)
+                emit(
+                    {
+                        "result": "conflicted",
+                        "state": str(state_path),
+                        "stack_number": stack["number"],
+                        "fixed_pr": fixed_pr,
+                        "members_published": [],
+                    }
+                )
+                return
+            if process.returncode != 0:
+                detail = (process.stdout + process.stderr).strip() or "no output"
+                raise WorkflowError(
+                    f"descendant propagation failed before publication "
+                    f"(exit code {process.returncode}): {detail}"
+                )
+            intended = validate_rebased_stack(workspace, partial)
+            partial["members_after"] = intended
+            state["members_after"] = intended
+            state["expected_post_fingerprint"] = propagated_stack_fingerprint(
+                stack, intended
+            )
+            state["status"] = "resolved"
+            save_state(state_path, state)
+        else:
+            captured = validate_rebased_stack(workspace, partial)
+            if captured != intended:
+                raise WorkflowError(
+                    "the preserved descendant propagation workspace changed after "
+                    "resolution; start a new whole-stack pass"
+                )
+
+        current_pr = metadata_for(target)
+        require_open_pull_request(current_pr)
+        current = stack_membership(current_pr).get("stack")
+        if current is None or stack_snapshot_key(current) != stack_snapshot_key(stack):
+            raise WorkflowError(
+                "the native stack changed during descendant propagation; no branch "
+                "was published"
+            )
+        current_partial = propagation_stack(current, fixed_pr, expected_head)
+        current_external = external_stack_dependents(current_pr, current_partial)
+        if current_external:
+            listed = "; ".join(
+                f"#{item['number']} (targets {item['base_branch']})"
+                for item in current_external
+            )
+            raise WorkflowError(
+                "pull requests outside the native stack began depending on branches "
+                f"the propagation would rewrite: {listed}"
+            )
+        push = atomic_stack_push(workspace, partial)
+        if push.returncode != 0 and not propagation_landed(pr, intended):
+            detail = push.stderr.strip() or push.stdout.strip() or "no output"
+            raise WorkflowError(f"atomic descendant propagation failed: {detail}")
+        if not propagation_landed(pr, intended, wait=True):
+            raise WorkflowError(
+                "the atomic descendant propagation did not land every intended ref"
+            )
+        state["status"] = "published_refs"
+        save_state(state_path, state)
+        force_rmtree(workspace)
+        state["workspace"] = None
+        state["status"] = "published"
+        save_state(state_path, state)
+        emit(
+            {
+                "result": "published",
+                "recovered": False,
+                "state": str(state_path),
+                "stack_number": stack["number"],
+                "fixed_pr": fixed_pr,
+                "fixed_head_sha": expected_head,
+                "members_published": intended,
+            }
+        )
+    except BaseException:
+        if state.get("status") not in {"resolved", "published_refs"}:
+            if workspace.exists():
+                force_rmtree(workspace)
+            state["workspace"] = None
+            save_state(state_path, state)
+        elif workspace.exists():
+            dissociate_workspace(workspace)
+            save_state(state_path, state)
+        raise
 
 
 def command_stack_publish(args: argparse.Namespace) -> None:
@@ -4290,6 +4658,7 @@ def command_stack_publish(args: argparse.Namespace) -> None:
     expected_invoked = attempt["published_head_sha"]
     final = live_mergeability(target, expected_head=expected_invoked)
     mergeability = classify_mergeability(final, expected_head=expected_invoked)
+    record_stack_member_clearances(state, intended, stack["invoked_number"])
     attempt["status"] = "published"
     attempt["mergeable"] = final.get("mergeable")
     attempt["merge_state_status"] = final.get("merge_state_status")
@@ -4316,6 +4685,47 @@ def command_stack_publish(args: argparse.Namespace) -> None:
             ),
         }
     )
+
+
+def record_stack_member_clearances(
+    stack_state: dict[str, Any],
+    members: list[dict[str, Any]],
+    invoked_number: int,
+) -> None:
+    """Persist ordinary conflict-stage clearance for each published stack member."""
+    for member in members:
+        if member["number"] == invoked_number:
+            continue
+        target = stack_member_target(stack_state["pr"], member["number"])
+        metadata = live_mergeability(target, expected_head=member["head_sha"])
+        mergeability = classify_mergeability(
+            metadata, expected_head=member["head_sha"]
+        )
+        path = default_state_path(target)
+        prior = load_state(path) if path.is_file() else None
+        projected = prior or {
+            "version": STATE_VERSION,
+            "created_at": utc_now(),
+            "iterations": 0,
+            "history": [],
+        }
+        archive_attempt(projected)
+        projected["pr"] = metadata
+        projected["escalation"] = None
+        projected["iterations"] = int(projected.get("iterations", 0)) + 1
+        projected["attempt"] = {
+            "iteration": projected["iterations"],
+            "status": "mergeable" if mergeability == "mergeable" else "escalated",
+            "base_sha": metadata.get("base_sha"),
+            "mergeable_at_head_sha": (
+                member["head_sha"] if mergeability == "mergeable" else None
+            ),
+            "published_head_sha": member["head_sha"],
+            "strategy": "stack",
+            "stack_source_pr": invoked_number,
+        }
+        archive_attempt(projected)
+        save_state(path, projected)
 
 
 def cleared_head_sha(state: dict[str, Any] | None) -> str | None:
@@ -4507,6 +4917,14 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--repo-root")
     preflight.add_argument("--state")
     preflight.add_argument("--strategy", choices=list(STRATEGIES), default="auto")
+    preflight.add_argument(
+        "--whole-stack",
+        action="store_true",
+        help=(
+            "inspect every native-stack member even when the invoked pull request "
+            "is already mergeable"
+        ),
+    )
     preflight.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS)
     preflight.add_argument(
         "--pipeline-run",
@@ -4629,6 +5047,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stack_publish.add_argument("--state", required=True)
     stack_publish.set_defaults(function=command_stack_publish)
+
+    propagate = subparsers.add_parser(
+        "descendant-propagate",
+        help="atomically rebase and publish only descendants above a fixed stack PR",
+    )
+    propagate.add_argument(
+        "target",
+        nargs="?",
+        help=(
+            "PR URL or owner/repo#number; omit only from a worktree attached to "
+            "the PR's branch"
+        ),
+    )
+    propagate.add_argument("--repo")
+    propagate.add_argument("--pull-request", type=int)
+    propagate.add_argument("--head-sha")
+    propagate.add_argument("--stack-number", type=int)
+    propagate.add_argument("--fixed-pr", type=int)
+    propagate.add_argument("--expected-head")
+    propagate.add_argument("--repo-root")
+    propagate.add_argument("--state")
+    propagate.set_defaults(function=command_descendant_propagate)
 
     status = subparsers.add_parser("status", help="print compact workflow state")
     status_source = status.add_mutually_exclusive_group(required=True)

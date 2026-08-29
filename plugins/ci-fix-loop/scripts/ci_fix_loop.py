@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Iterable
+import uuid
 
 
 STATE_VERSION = 1
@@ -2693,6 +2694,16 @@ def command_publish(args: argparse.Namespace) -> None:
 
     run_state["status"] = "published"
     run_state["published_head_sha"] = local_head
+    accepted_push = {
+        "id": uuid.uuid4().hex,
+        "accepted_at": utc_now(),
+        "previous_head_sha": pinned,
+        "head_sha": local_head,
+        "commits": commits,
+        "pipeline_run": (state.get("pipeline_budget") or {}).get("run"),
+        "pipeline_iteration": (state.get("pipeline_budget") or {}).get("iteration"),
+    }
+    state.setdefault("accepted_pushes", []).append(accepted_push)
     validation = local_validation_entry(args, local_head)
     state.setdefault("local_validation", []).append(validation)
     # The published head is new, so nothing this loop learned about the old head's
@@ -2707,6 +2718,7 @@ def command_publish(args: argparse.Namespace) -> None:
             "state": str(path),
             "head_sha": local_head,
             "commits": commits,
+            "accepted_push": accepted_push,
             "iterations": state["iterations"],
             "local_validation": validation,
         }
@@ -2773,6 +2785,7 @@ def status_payload(state: dict[str, Any], path: Path) -> dict[str, Any]:
         "skip_note": state.get("skip_note"),
         "iterations": int(state.get("iterations", 0)),
         "pipeline_budget": state.get("pipeline_budget"),
+        "accepted_pushes": state.get("accepted_pushes") or [],
         "last_helper_activity": last_helper_activity(state),
     }
 
@@ -2851,6 +2864,7 @@ def command_status(args: argparse.Namespace) -> None:
                 **class_counts(checks),
             },
             "iterations": int(state.get("iterations", 0)),
+            "accepted_pushes": state.get("accepted_pushes") or [],
             "last_helper_activity": last_helper_activity(state),
         }
     )

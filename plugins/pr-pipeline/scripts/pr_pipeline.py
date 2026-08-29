@@ -4,539 +4,126 @@
 from __future__ import annotations
 
 import argparse
-import datetime as dt
+import importlib.util
 import json
-import os
 from pathlib import Path
-import re
-import shutil
-import subprocess
 import sys
 import uuid
 from typing import Any, Callable
 
 
+COMMON_MODULE_NAME = "pr_pipeline_common"
+COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
+
+
+def load_common() -> Any:
+    """Load the shared pipeline module that sits beside this script.
+
+    The helper runs from an installed plugin directory that is not on
+    ``sys.path``, so the shared module is loaded from its own file location and
+    cached under a stable name.
+    """
+    cached = sys.modules.get(COMMON_MODULE_NAME)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(COMMON_MODULE_NAME, COMMON_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load {COMMON_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[COMMON_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+common = load_common()
+
+WorkflowError = common.WorkflowError
+
 MAX_SWEEPS = 2
-DEFAULT_STAGE_MODEL = "gpt-5.6-sol"
-DEFAULT_EFFORT = "high"
-CLAUDE_FAMILY = "claude"
-IS_WINDOWS = os.name == "nt"
+DEFAULT_STAGE_MODEL = common.DEFAULT_STAGE_MODEL
+DEFAULT_EFFORT = common.DEFAULT_EFFORT
+CLAUDE_FAMILY = common.CLAUDE_FAMILY
+IS_WINDOWS = common.IS_WINDOWS
 
-PR_URL_PATTERN = re.compile(
-    r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
-    r"/?(?:#\S*)?$"
-)
-SHORT_TARGET_PATTERN = re.compile(
-    r"^(?P<owner>[^/\s]+)/(?P<repo>[^#/\s]+)#(?P<number>\d+)$"
-)
-BARE_NUMBER_PATTERN = re.compile(r"^#?(?P<number>\d+)$")
+STAGE_CONFLICT = common.STAGE_CONFLICT
+STAGE_SELF_REVIEW = common.STAGE_SELF_REVIEW
+STAGE_COPILOT_REVIEW = common.STAGE_COPILOT_REVIEW
+STAGE_CI = common.STAGE_CI
+STAGE_DESCRIPTION = common.STAGE_DESCRIPTION
 
-STAGE_CONFLICT = "conflict-fix-loop"
-STAGE_SELF_REVIEW = "self-review-loop"
-STAGE_COPILOT_REVIEW = "copilot-review-loop"
-STAGE_CI = "ci-fix-loop"
-STAGE_DESCRIPTION = "pr-description"
+STAGES = common.STAGES
+STAGE_NAMES = common.STAGE_NAMES
+STAGE_BY_NAME = common.STAGE_BY_NAME
 
-STAGES: tuple[dict[str, Any], ...] = (
-    {
-        "stage": STAGE_CONFLICT,
-        "plugin": STAGE_CONFLICT,
-        "agent": f"{STAGE_CONFLICT}:{STAGE_CONFLICT}",
-        "module": "conflict_fix_loop",
-        "marker": ("mergeable_at_head_sha",),
-        "base_marker": ("attempt", "base_sha"),
-        "model": DEFAULT_STAGE_MODEL,
-    },
-    {
-        "stage": STAGE_COPILOT_REVIEW,
-        "plugin": STAGE_COPILOT_REVIEW,
-        "agent": f"{STAGE_COPILOT_REVIEW}:{STAGE_COPILOT_REVIEW}",
-        "module": "copilot_review_loop",
-        "marker": ("clean_at_head_sha",),
-        "model": DEFAULT_STAGE_MODEL,
-    },
-    {
-        "stage": STAGE_SELF_REVIEW,
-        "plugin": STAGE_SELF_REVIEW,
-        "agent": f"{STAGE_SELF_REVIEW}:{STAGE_SELF_REVIEW}",
-        "module": "self_review_loop",
-        "marker": ("review", "clean_at_head_sha"),
-        "model": "claude-opus-5",
-        "requires_family": CLAUDE_FAMILY,
-    },
-    {
-        "stage": STAGE_CI,
-        "plugin": STAGE_CI,
-        "agent": f"{STAGE_CI}:{STAGE_CI}",
-        "module": "ci_fix_loop",
-        "marker": ("clean_at_head_sha",),
-        "model": DEFAULT_STAGE_MODEL,
-    },
-    {
-        "stage": STAGE_DESCRIPTION,
-        "plugin": STAGE_DESCRIPTION,
-        "agent": f"{STAGE_DESCRIPTION}:{STAGE_DESCRIPTION}",
-        "module": "pr_description",
-        "marker": ("validated_head_sha",),
-        "model": DEFAULT_STAGE_MODEL,
-    },
-)
-STAGE_NAMES = tuple(entry["stage"] for entry in STAGES)
-STAGE_BY_NAME = {entry["stage"]: entry for entry in STAGES}
+STAGE_PERMISSION_FLAGS = common.STAGE_PERMISSION_FLAGS
+STAGE_AUTOPILOT_FLAGS = common.STAGE_AUTOPILOT_FLAGS
+PIPELINE_RUN_FLAG = common.PIPELINE_RUN_FLAG
+PIPELINE_ITERATION_FLAG = common.PIPELINE_ITERATION_FLAG
+PIPELINE_MAX_ITERATIONS_FLAG = common.PIPELINE_MAX_ITERATIONS_FLAG
+CLEARING_OUTCOMES = common.CLEARING_OUTCOMES
+STAGE_STATUS_FIELDS = common.STAGE_STATUS_FIELDS
 
-STAGE_PERMISSION_FLAGS = ("--allow-all-tools", "--allow-all-paths")
-STAGE_AUTOPILOT_FLAGS = ("--autopilot", "--max-autopilot-continues", "5")
-PIPELINE_RUN_FLAG = "--pipeline-run"
-PIPELINE_ITERATION_FLAG = "--pipeline-iteration"
-PIPELINE_MAX_ITERATIONS_FLAG = "--pipeline-max-iterations"
-CLEARING_OUTCOMES = frozenset({"cleared", "skipped"})
-
-
-class WorkflowError(RuntimeError):
-    pass
-
-
-def run(
-    command: list[str],
-    *,
-    cwd: Path | None = None,
-    check: bool = True,
-    timeout: float | None = None,
-) -> subprocess.CompletedProcess[str]:
-    try:
-        process = subprocess.run(
-            command,
-            cwd=str(cwd) if cwd else None,
-            text=True,
-            encoding="utf-8",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise WorkflowError(
-            f"{' '.join(command)} did not return within {timeout} seconds"
-        ) from error
-    if check and process.returncode != 0:
-        detail = process.stderr.strip() or process.stdout.strip() or "no output"
-        raise WorkflowError(
-            f"{' '.join(command)} failed ({process.returncode}): {detail}"
-        )
-    return process
-
-
-def git(repo_root: Path, *arguments: str) -> str:
-    return run(["git", "-C", str(repo_root), *arguments]).stdout.strip()
-
-
-def git_or_none(repo_root: Path, *arguments: str) -> str | None:
-    result = run(
-        ["git", "-C", str(repo_root), *arguments],
-        check=False,
-    )
-    if result.returncode != 0:
-        return None
-    value = result.stdout.strip()
-    return value or None
-
-
-def git_succeeds(repo_root: Path, *arguments: str) -> bool:
-    return (
-        run(["git", "-C", str(repo_root), *arguments], check=False).returncode == 0
-    )
-
-
-def emit(payload: dict[str, Any]) -> None:
-    print(json.dumps(payload, sort_keys=True), flush=True)
-
-
-def report_event(
-    report: Callable[[dict[str, Any]], None] | None,
-    event: str,
-    **fields: Any,
-) -> None:
-    if report is not None:
-        report({"event": event, **fields})
+run = common.run
+git = common.git
+git_or_none = common.git_or_none
+git_succeeds = common.git_succeeds
+emit = common.emit
+report_event = common.report_event
+utc_now = common.utc_now
+normalize_cli_path = common.normalize_cli_path
+copilot_home = common.copilot_home
+require_tools = common.require_tools
+path_image = common.path_image
+resolve_launch_program = common.resolve_launch_program
+build_target = common.build_target
+parse_target = common.parse_target
+resolve_repo_root = common.resolve_repo_root
+github_repo_from_remote = common.github_repo_from_remote
+repo_name_for = common.repo_name_for
+commit_url = common.commit_url
+commits_added = common.commits_added
+local_commits_between = common.local_commits_between
+target_remote = common.target_remote
+worktree_dirt = common.worktree_dirt
+unreachable_commit_count = common.unreachable_commit_count
+stage_script_path = common.stage_script_path
+stage_state_path = common.stage_state_path
+string_at = common.string_at
+stage_status_summary = common.stage_status_summary
+stage_models = common.stage_models
+stage_prompt = common.stage_prompt
 
 
 def gh_json(arguments: list[str]) -> Any:
-    process = run(["gh", *arguments])
-    try:
-        return json.loads(process.stdout) if process.stdout.strip() else None
-    except json.JSONDecodeError as error:
-        raise WorkflowError(f"gh returned invalid JSON: {error}") from error
-
-
-def utc_now() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def normalize_cli_path(value: str, *, windows: bool) -> str:
-    if windows:
-        match = re.fullmatch(r"/([A-Za-z])(?:/(.*))?", value)
-        if match:
-            drive, remainder = match.groups()
-            return f"{drive.upper()}:/{remainder or ''}"
-    return value
-
-
-def copilot_home() -> Path:
-    value = os.environ.get("COPILOT_HOME", "").strip()
-    return (
-        Path(normalize_cli_path(value, windows=IS_WINDOWS))
-        if value
-        else Path.home() / ".copilot"
-    )
-
-
-def require_tools() -> None:
-    missing = [name for name in ("git", "gh", "copilot") if shutil.which(name) is None]
-    if missing:
-        raise WorkflowError(f"required tools not found: {', '.join(missing)}")
-
-
-SHIM_SUFFIXES = (".cmd", ".bat")
-
-
-def path_image(name: str) -> str | None:
-    suffixes = [
-        suffix
-        for suffix in os.environ.get("PATHEXT", ".EXE").split(os.pathsep)
-        if suffix and suffix.lower() not in SHIM_SUFFIXES
-    ]
-    for directory in os.environ.get("PATH", "").split(os.pathsep):
-        if not directory:
-            continue
-        for suffix in suffixes:
-            candidate = Path(directory) / f"{name}{suffix}"
-            if candidate.is_file():
-                return str(candidate)
-    return None
-
-
-def resolve_launch_program(name: str) -> str:
-    if not IS_WINDOWS:
-        return name
-    if os.sep in name or (os.altsep and os.altsep in name):
-        if Path(name).suffix.lower() in SHIM_SUFFIXES:
-            raise WorkflowError(f"the stage program {name} is a command shim")
-        return name
-    if Path(name).suffix:
-        resolved = shutil.which(name)
-        if resolved is None:
-            raise WorkflowError(f"the stage program {name} is not on PATH")
-        if Path(resolved).suffix.lower() in SHIM_SUFFIXES:
-            raise WorkflowError(f"the stage program {name} resolves to a command shim")
-        return resolved
-    image = path_image(name)
-    if image is not None:
-        return image
-    resolved = shutil.which(name)
-    if resolved is None:
-        raise WorkflowError(f"the stage program {name} is not on PATH")
-    raise WorkflowError(
-        f"the stage program {name} resolves only to the command shim {resolved}"
-    )
-
-
-def build_target(owner: str, repo: str, number: int) -> dict[str, Any]:
-    return {
-        "owner": owner,
-        "repo": repo,
-        "number": number,
-        "repo_name": f"{owner}/{repo}",
-        "pr_url": f"https://github.com/{owner}/{repo}/pull/{number}",
-    }
-
-
-def parse_target(target: str, repo_name: str | None = None) -> dict[str, Any]:
-    match = PR_URL_PATTERN.fullmatch(target) or SHORT_TARGET_PATTERN.fullmatch(target)
-    if match:
-        values = match.groupdict()
-        return build_target(values["owner"], values["repo"], int(values["number"]))
-    bare = BARE_NUMBER_PATTERN.fullmatch(target)
-    if bare and repo_name:
-        owner, separator, repo = repo_name.partition("/")
-        if separator and owner and repo:
-            return build_target(owner, repo, int(bare.group("number")))
-    if bare:
-        raise WorkflowError("a bare PR number requires repository context")
-    raise WorkflowError(
-        "target must be a GitHub PR URL, owner/repo#number, or bare PR number"
-    )
-
-
-def resolve_repo_root() -> Path:
-    root = run(["git", "rev-parse", "--show-toplevel"]).stdout.strip()
-    if not root:
-        raise WorkflowError("the current directory is not in a git repository")
-    return Path(root).resolve()
-
-
-def github_repo_from_remote(url: str) -> str | None:
-    match = re.search(
-        r"(?:github\.com[/:])(?P<owner>[^/:\s]+)/(?P<repo>[^/\s]+?)(?:\.git)?$",
-        url.strip(),
-        re.IGNORECASE,
-    )
-    if not match:
-        return None
-    return f"{match.group('owner')}/{match.group('repo')}"
-
-
-def repo_name_for(repo_root: Path) -> str | None:
-    result = run(
-        ["gh", "repo", "view", "--json", "nameWithOwner"],
-        cwd=repo_root,
-        check=False,
-    )
-    if result.returncode == 0:
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            payload = None
-        name = payload.get("nameWithOwner") if isinstance(payload, dict) else None
-        if isinstance(name, str) and "/" in name:
-            return name
-    remote = git_or_none(repo_root, "remote", "get-url", "origin")
-    return github_repo_from_remote(remote or "")
+    return common.gh_json(arguments)
 
 
 def resolve_target(value: str | None, repo_root: Path) -> dict[str, Any]:
-    if value:
-        return parse_target(value, repo_name_for(repo_root))
-    payload = gh_json(["pr", "view", "--json", "url"])
-    url = payload.get("url") if isinstance(payload, dict) else None
-    if not isinstance(url, str):
-        raise WorkflowError(
-            "no pull request was named and the checked-out branch has no pull request"
-        )
-    return parse_target(url)
-
-
-def read_pull_request(target: dict[str, Any]) -> dict[str, Any]:
-    payload = gh_json(
-        [
-            "pr",
-            "view",
-            str(target["number"]),
-            "--repo",
-            target["repo_name"],
-            "--json",
-            "number,title,url,state,isDraft,headRefName,baseRefName,headRefOid",
-        ]
-    )
-    if not isinstance(payload, dict):
-        raise WorkflowError(f"could not read {target['pr_url']}")
-    base_branch = payload.get("baseRefName")
-    if not isinstance(base_branch, str) or not base_branch:
-        raise WorkflowError(f"{target['pr_url']} has no base branch")
-    return {
-        "number": payload.get("number"),
-        "title": payload.get("title"),
-        "pr_url": payload.get("url") or target["pr_url"],
-        "repo_name": target["repo_name"],
-        "owner": target["owner"],
-        "repo": target["repo"],
-        "state": payload.get("state"),
-        "is_draft": bool(payload.get("isDraft")),
-        "head_branch": payload.get("headRefName"),
-        "base_branch": base_branch,
-        "base_sha": base_ref_tip(target["repo_name"], base_branch),
-        "head_sha": payload.get("headRefOid"),
-    }
+    return common.resolve_target(value, repo_root, api=gh_json)
 
 
 def base_ref_tip(repo_name: str, base_branch: str) -> str:
-    payload = gh_json(["api", f"repos/{repo_name}/git/ref/heads/{base_branch}"])
-    obj = payload.get("object") if isinstance(payload, dict) else None
-    sha = obj.get("sha") if isinstance(obj, dict) else None
-    if not isinstance(sha, str) or not sha:
-        raise WorkflowError(
-            f"the tip of base branch {base_branch!r} in {repo_name} has no commit SHA"
-        )
-    return sha
+    return common.base_ref_tip(repo_name, base_branch, api=gh_json)
 
 
-def commit_url(target: dict[str, Any], sha: str) -> str:
-    return f"{target['pr_url']}/commits/{sha}"
+def read_pull_request(target: dict[str, Any]) -> dict[str, Any]:
+    return common.read_pull_request(target, api=gh_json, base_tip=base_ref_tip)
 
 
 def read_pr_commits(target: dict[str, Any]) -> list[dict[str, Any]]:
-    payload = gh_json(
-        [
-            "pr",
-            "view",
-            str(target["number"]),
-            "--repo",
-            target["repo_name"],
-            "--json",
-            "commits",
-        ]
-    )
-    commits = payload.get("commits") if isinstance(payload, dict) else None
-    if not isinstance(commits, list):
-        raise WorkflowError(f"could not read commits for {target['pr_url']}")
-    result = []
-    for commit in commits:
-        if not isinstance(commit, dict):
-            continue
-        sha = commit.get("oid")
-        if not isinstance(sha, str) or not sha:
-            continue
-        result.append(
-            {
-                "sha": sha,
-                "title": commit.get("messageHeadline") or sha,
-                "url": commit_url(target, sha),
-            }
-        )
-    return result
+    return common.read_pr_commits(target, api=gh_json)
 
 
 def snapshot_pr_commits(target: dict[str, Any]) -> dict[str, Any]:
-    try:
-        return {"commits": read_pr_commits(target)}
-    except WorkflowError as error:
-        return {"commits": [], "error": str(error)}
-
-
-def commits_added(
-    before: dict[str, Any], after: dict[str, Any]
-) -> tuple[list[dict[str, Any]], list[str], bool]:
-    errors = [
-        snapshot["error"]
-        for snapshot in (before, after)
-        if isinstance(snapshot.get("error"), str)
-    ]
-    if errors:
-        return [], errors, False
-    before_shas = {
-        commit["sha"]
-        for commit in before["commits"]
-        if isinstance(commit.get("sha"), str)
-    }
-    after_shas = {
-        commit["sha"]
-        for commit in after["commits"]
-        if isinstance(commit.get("sha"), str)
-    }
-    before_head = before["commits"][-1].get("sha") if before["commits"] else None
-    history_rewritten = bool(before_head and before_head not in after_shas)
-    return [
-        commit for commit in after["commits"] if commit.get("sha") not in before_shas
-    ], [], history_rewritten
-
-
-def local_commits_between(
-    repo_root: Path, base_sha: str | None, head_sha: str | None
-) -> list[dict[str, str]]:
-    if not base_sha or not head_sha or base_sha == head_sha:
-        return []
-    if not git_succeeds(repo_root, "merge-base", "--is-ancestor", base_sha, head_sha):
-        base_sha = git_or_none(repo_root, "merge-base", base_sha, head_sha)
-        if not base_sha:
-            return []
-    output = git_or_none(
-        repo_root,
-        "log",
-        "--reverse",
-        "--first-parent",
-        "--format=%H%x09%s",
-        f"{base_sha}..{head_sha}",
-    )
-    commits = []
-    for line in (output or "").splitlines():
-        sha, separator, title = line.partition("\t")
-        if separator and sha:
-            commits.append({"sha": sha, "title": title or sha})
-    return commits
-
-
-def target_remote(repo_root: Path, target: dict[str, Any]) -> str:
-    wanted = target["repo_name"].lower()
-    listing = git_or_none(repo_root, "remote", "-v") or ""
-    for line in listing.splitlines():
-        fields = line.split()
-        if len(fields) >= 2:
-            name = github_repo_from_remote(fields[1])
-            if name and name.lower() == wanted:
-                return fields[0]
-    return f"https://github.com/{target['repo_name']}.git"
-
-
-def worktree_dirt(repo_root: Path) -> str:
-    return git(repo_root, "status", "--porcelain=v1")
-
-
-def unreachable_commit_count(repo_root: Path) -> int:
-    value = git_or_none(
-        repo_root,
-        "rev-list",
-        "--count",
-        "HEAD",
-        "--not",
-        "--branches",
-        "--remotes",
-        "--tags",
-    )
-    try:
-        return int(value or "0")
-    except ValueError:
-        return 0
+    return common.snapshot_pr_commits(target, read=read_pr_commits)
 
 
 def fetch_pr_head(repo_root: Path, target: dict[str, Any]) -> dict[str, Any]:
-    remote = target_remote(repo_root, target)
-    reference = f"refs/pull/{target['number']}/head"
-    result = run(
-        ["git", "-C", str(repo_root), "fetch", "--quiet", remote, reference],
-        check=False,
-    )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "no output"
-        return {
-            "result": "blocked",
-            "reason": "checkout_failed",
-            "detail": f"could not fetch {reference}: {detail}",
-        }
-    landed = git_or_none(repo_root, "rev-parse", "FETCH_HEAD")
-    if not landed:
-        return {
-            "result": "blocked",
-            "reason": "checkout_failed",
-            "detail": f"fetching {reference} did not produce FETCH_HEAD",
-        }
-    return {"result": "ready", "head_sha": landed}
+    return common.fetch_pr_head(repo_root, target, remote_for=target_remote)
 
 
 def checkout_fetched_head(repo_root: Path, head_sha: str) -> dict[str, Any]:
-    result = run(
-        ["git", "-C", str(repo_root), "checkout", "--quiet", "--detach", head_sha],
-        check=False,
-    )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "no output"
-        return {
-            "result": "blocked",
-            "reason": "checkout_failed",
-            "detail": f"could not check out pull request head {head_sha}: {detail}",
-        }
-    landed = git_or_none(repo_root, "rev-parse", "HEAD")
-    if landed != head_sha:
-        return {
-            "result": "blocked",
-            "reason": "checkout_failed",
-            "detail": (
-                f"the worktree is on {landed} after checking out pull request "
-                f"head {head_sha}"
-            ),
-        }
-    return {
-        "result": "ready",
-        "head_sha": landed,
-    }
+    return common.checkout_fetched_head(repo_root, head_sha)
 
 
 def sync_worktree(
@@ -546,47 +133,14 @@ def sync_worktree(
     *,
     known_safe_head: str | None,
 ) -> dict[str, Any]:
-    dirt = worktree_dirt(repo_root)
-    if dirt:
-        return {
-            "result": "blocked",
-            "reason": "dirty_worktree",
-            "detail": f"the worktree has uncommitted changes:\n{dirt}",
-        }
-    fetched = fetch_pr_head(repo_root, target)
-    if fetched["result"] != "ready":
-        return fetched
-    desired = fetched["head_sha"]
-    local = git(repo_root, "rev-parse", "HEAD")
-    if local == desired:
-        return {"result": "ready", "head_sha": local, "changed": False}
-
-    branch = git_or_none(repo_root, "branch", "--show-current") or ""
-    safe_to_move = local == known_safe_head
-    safe_to_move = safe_to_move or git_succeeds(
-        repo_root, "merge-base", "--is-ancestor", local, desired
+    return common.sync_worktree(
+        repo_root,
+        target,
+        pr,
+        known_safe_head=known_safe_head,
+        fetch=fetch_pr_head,
+        checkout=checkout_fetched_head,
     )
-    if branch and branch != pr.get("head_branch"):
-        safe_to_move = True
-    if not safe_to_move and unreachable_commit_count(repo_root) == 0:
-        safe_to_move = branch != pr.get("head_branch")
-    if not safe_to_move:
-        return {
-            "result": "blocked",
-            "reason": "local_head_not_published",
-            "detail": (
-                f"the worktree head {local} is not the pull request head {desired}; "
-                "moving it could hide local commits"
-            ),
-        }
-    checked_out = checkout_fetched_head(repo_root, desired)
-    if checked_out["result"] != "ready":
-        return checked_out
-    return {
-        **checked_out,
-        "changed": True,
-        "previous_head_sha": local,
-    }
 
 
 def settle_after_stage(
@@ -595,161 +149,19 @@ def settle_after_stage(
     *,
     started_head_sha: str,
 ) -> dict[str, Any]:
-    dirt = worktree_dirt(repo_root)
-    if dirt:
-        return {
-            "result": "blocked",
-            "reason": "stage_left_dirty_worktree",
-            "detail": f"a stage left uncommitted changes:\n{dirt}",
-        }
-    local = git(repo_root, "rev-parse", "HEAD")
-    fetched = fetch_pr_head(repo_root, target)
-    if fetched["result"] != "ready":
-        return fetched
-    remote = fetched["head_sha"]
-    if local == remote:
-        return {
-            "result": "ready",
-            "head_sha": remote,
-            "local_head_sha": local,
-            "pr_head_sha": remote,
-            "changed": remote != started_head_sha,
-        }
-
-    published = git_succeeds(
-        repo_root, "merge-base", "--is-ancestor", local, remote
+    return common.settle_after_stage(
+        repo_root,
+        target,
+        started_head_sha=started_head_sha,
+        fetch=fetch_pr_head,
+        checkout=checkout_fetched_head,
     )
-    if local != started_head_sha and not published:
-        return {
-            "result": "blocked",
-            "reason": "stage_left_unpublished_commits",
-            "local_head_sha": local,
-            "pr_head_sha": remote,
-            "detail": (
-                f"a stage moved the local head from {started_head_sha} to {local}, "
-                f"but the pull request head is {remote}"
-            ),
-        }
-    checked_out = checkout_fetched_head(repo_root, remote)
-    if checked_out["result"] != "ready":
-        return checked_out
-    return {
-        **checked_out,
-        "local_head_sha": local,
-        "pr_head_sha": remote,
-        "changed": checked_out["head_sha"] != started_head_sha,
-        "previous_head_sha": local,
-    }
-
-
-def stage_script_path(entry: dict[str, Any]) -> Path:
-    return (
-        copilot_home()
-        / "installed-plugins"
-        / "trask-plugins"
-        / entry["plugin"]
-        / "scripts"
-        / f"{entry['module']}.py"
-    )
-
-
-def stage_state_path(entry: dict[str, Any], target: dict[str, Any]) -> Path:
-    name = f"{target['owner']}--{target['repo']}--{target['number']}.json"
-    return Path.home() / ".copilot" / "run" / entry["plugin"] / name
 
 
 def read_stage_status(
     entry: dict[str, Any], target: dict[str, Any]
 ) -> dict[str, Any]:
-    script = stage_script_path(entry)
-    state = stage_state_path(entry, target)
-    common = {
-        "installed": script.is_file(),
-        "script": str(script),
-        "state": str(state),
-        "payload": None,
-    }
-    if not script.is_file():
-        return {**common, "ok": False, "reason": "plugin_not_installed"}
-    if not state.is_file():
-        return {**common, "ok": False, "reason": "no_state"}
-    try:
-        process = run(
-            [sys.executable, str(script), "status", "--state", str(state)],
-            check=False,
-            timeout=30,
-        )
-    except WorkflowError as error:
-        return {
-            **common,
-            "ok": False,
-            "reason": "status_timeout",
-            "detail": str(error),
-        }
-    if process.returncode != 0:
-        detail = process.stderr.strip() or process.stdout.strip() or "no output"
-        return {
-            **common,
-            "ok": False,
-            "reason": "status_failed",
-            "detail": detail,
-        }
-    try:
-        payload = json.loads(process.stdout)
-    except json.JSONDecodeError as error:
-        return {
-            **common,
-            "ok": False,
-            "reason": "invalid_status_json",
-            "detail": str(error),
-        }
-    if not isinstance(payload, dict) or payload.get("result") != "ready":
-        return {
-            **common,
-            "ok": False,
-            "reason": "status_not_ready",
-            "payload": payload,
-        }
-    return {**common, "ok": True, "payload": payload}
-
-
-def string_at(payload: dict[str, Any], path: tuple[str, ...]) -> str | None:
-    value: Any = payload
-    for key in path:
-        if not isinstance(value, dict):
-            return None
-        value = value.get(key)
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
-
-
-STAGE_STATUS_FIELDS = (
-    "attempt",
-    "counts",
-    "escalation",
-    "iterations",
-    "last_helper_activity",
-    "local_validation",
-    "mergeable_at_head_sha",
-    "monitoring",
-    "outcome",
-    "proposal",
-    "proposal_count",
-    "queue",
-    "review",
-    "run",
-    "skip_note",
-    "validation",
-    "validated_head_sha",
-    "verdicts",
-)
-
-
-def stage_status_summary(payload: Any) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        return {}
-    return {key: payload[key] for key in STAGE_STATUS_FIELDS if key in payload}
+    return common.read_stage_status(entry, target)
 
 
 def inspect_stage(
@@ -758,102 +170,28 @@ def inspect_stage(
     head_sha: str,
     base_sha: str | None = None,
 ) -> dict[str, Any]:
-    status = read_stage_status(entry, target)
-    payload = status.get("payload")
-    marker = (
-        string_at(payload, entry["marker"]) if isinstance(payload, dict) else None
+    return common.inspect_stage(
+        entry, target, head_sha, base_sha, read_status=read_stage_status
     )
-    base_marker_path = entry.get("base_marker")
-    base_marker = (
-        string_at(payload, base_marker_path)
-        if isinstance(payload, dict) and isinstance(base_marker_path, tuple)
-        else None
-    )
-    outcome = payload.get("stage_outcome") if isinstance(payload, dict) else None
-    head_is_clear = marker == head_sha
-    base_is_clear = base_marker_path is None or (
-        base_sha is not None and base_marker == base_sha
-    )
-    clear = head_is_clear and base_is_clear and outcome in CLEARING_OUTCOMES
-    if clear:
-        reason = None
-    elif marker and not head_is_clear:
-        reason = "clearance_is_for_an_older_head"
-    elif base_marker_path is not None and base_marker != base_sha:
-        reason = "clearance_is_for_an_older_base"
-    else:
-        reason = status.get("reason") or outcome or "not_cleared"
-    return {
-        "stage": entry["stage"],
-        "clear": clear,
-        "clear_at_head_sha": marker,
-        "clear_at_base_sha": base_marker,
-        "outcome": outcome,
-        "reason": reason,
-        "installed": status["installed"],
-        "status_state": status["state"],
-        "status": stage_status_summary(payload),
-        **({"detail": status["detail"]} if status.get("detail") else {}),
-    }
 
 
 def inspect_stages(
     target: dict[str, Any], head_sha: str, base_sha: str
 ) -> list[dict[str, Any]]:
-    return [inspect_stage(entry, target, head_sha, base_sha) for entry in STAGES]
-
-
-def stage_models(overrides: list[str] | None) -> dict[str, str]:
-    models = {entry["stage"]: entry["model"] for entry in STAGES}
-    for assignment in overrides or []:
-        stage, separator, model = assignment.partition("=")
-        if not separator or stage not in STAGE_BY_NAME or not model.strip():
-            raise WorkflowError(
-                f"--stage-model expects <stage>=<model> for a known stage: {assignment}"
-            )
-        models[stage] = model.strip()
-    for entry in STAGES:
-        family = entry.get("requires_family")
-        if family and family not in models[entry["stage"]].lower():
-            raise WorkflowError(
-                f"{entry['stage']} requires a {family} model, not "
-                f"{models[entry['stage']]}"
-            )
-    return models
+    return common.inspect_stages(target, head_sha, base_sha, inspect=inspect_stage)
 
 
 def stage_accepts_pipeline_position(entry: dict[str, Any]) -> bool:
-    try:
-        return PIPELINE_RUN_FLAG in stage_script_path(entry).read_text(encoding="utf-8")
-    except OSError:
-        return False
+    return common.stage_accepts_pipeline_position(entry)
 
 
-def pipeline_arguments(
-    entry: dict[str, Any], run_id: str, sweep: int
-) -> list[str]:
-    if not stage_accepts_pipeline_position(entry):
-        return []
-    return [
-        PIPELINE_RUN_FLAG,
+def pipeline_arguments(entry: dict[str, Any], run_id: str, sweep: int) -> list[str]:
+    return common.pipeline_arguments(
+        entry,
         run_id,
-        PIPELINE_ITERATION_FLAG,
-        str(sweep),
-        PIPELINE_MAX_ITERATIONS_FLAG,
-        str(MAX_SWEEPS),
-    ]
-
-
-def stage_prompt(target: dict[str, Any], arguments: list[str]) -> str:
-    name = f"{target['repo_name']}#{target['number']}"
-    if not arguments:
-        return name
-    pairs = zip(arguments[::2], arguments[1::2])
-    position = " ".join(f"{flag.lstrip('-')}: {value}" for flag, value in pairs)
-    return (
-        f"{name}\n\n{position}\n\n"
-        "Add these arguments to your preflight command, exactly as written, "
-        f"and change nothing else about how you run: {' '.join(arguments)}"
+        sweep,
+        MAX_SWEEPS,
+        accepts=stage_accepts_pipeline_position,
     )
 
 
@@ -866,20 +204,13 @@ def stage_command(
     run_id: str,
     sweep: int,
 ) -> list[str]:
-    prompt = stage_prompt(target, pipeline_arguments(entry, run_id, sweep))
-    return [
-        resolve_launch_program("copilot"),
-        "-p",
-        prompt,
-        "--agent",
-        entry["agent"],
-        "--model",
-        model,
-        "--effort",
-        effort,
-        *STAGE_AUTOPILOT_FLAGS,
-        *STAGE_PERMISSION_FLAGS,
-    ]
+    return common.stage_command(
+        entry,
+        target,
+        model=model,
+        effort=effort,
+        arguments=pipeline_arguments(entry, run_id, sweep),
+    )
 
 
 def stage_log_path(
@@ -905,45 +236,18 @@ def run_stage(
     run_id: str,
     sweep: int,
 ) -> dict[str, Any]:
-    log_path = stage_log_path(target, run_id, sweep, entry)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    command = stage_command(
-        entry,
-        target,
-        model=model,
-        effort=effort,
-        run_id=run_id,
-        sweep=sweep,
+    return common.run_foreground(
+        stage_command(
+            entry,
+            target,
+            model=model,
+            effort=effort,
+            run_id=run_id,
+            sweep=sweep,
+        ),
+        cwd=repo_root,
+        log_path=stage_log_path(target, run_id, sweep, entry),
     )
-    started_at = utc_now()
-    try:
-        with open(log_path, "w", encoding="utf-8", newline="\n") as log:
-            kwargs: dict[str, Any] = {
-                "cwd": str(repo_root),
-                "stdin": subprocess.DEVNULL,
-                "stdout": log,
-                "stderr": subprocess.STDOUT,
-                "check": False,
-            }
-            if IS_WINDOWS:
-                kwargs["creationflags"] = getattr(
-                    subprocess, "CREATE_NO_WINDOW", 0
-                )
-            process = subprocess.run(command, **kwargs)
-        return {
-            "returncode": process.returncode,
-            "log_path": str(log_path),
-            "started_at": started_at,
-            "ended_at": utc_now(),
-        }
-    except OSError as error:
-        return {
-            "returncode": None,
-            "log_path": str(log_path),
-            "started_at": started_at,
-            "ended_at": utc_now(),
-            "error": str(error),
-        }
 
 
 def blocked_result(

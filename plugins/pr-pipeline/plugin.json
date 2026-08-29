@@ -1,7 +1,7 @@
 {
   "name": "pr-pipeline",
-  "description": "Drive an open draft pull request through conflict resolution, Copilot review, self review, check fixing, and description validation until every stage is green at the same head commit.",
-  "version": "1.2.4",
+  "description": "Drive one pull request or a selected native-stack suffix through conflict resolution, review, CI fixing, and description validation.",
+  "version": "1.3.0",
   "author": {
     "name": "Trask Stalnaker"
   },

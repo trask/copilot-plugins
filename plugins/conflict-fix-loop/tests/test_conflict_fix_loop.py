@@ -2195,6 +2195,8 @@ class PreflightTest(unittest.TestCase):
         detection=None,
         ad_hoc=None,
         external=None,
+        whole_stack=False,
+        whole_stack_mergeable=False,
     ):
         args = SimpleNamespace(
             target="owner/repo#7",
@@ -2202,6 +2204,7 @@ class PreflightTest(unittest.TestCase):
             state=str(state or self.state_path),
             strategy=strategy,
             max_iterations=max_iterations,
+            whole_stack=whole_stack,
         )
         ad_hoc = ad_hoc or {
             "reason": "the head conflicts with develop in docs/list.yaml",
@@ -2236,6 +2239,10 @@ class PreflightTest(unittest.TestCase):
         ), mock.patch.object(
             MODULE, "external_stack_dependents", return_value=external or []
         ), mock.patch.object(
+            MODULE, "stack_is_mergeable", return_value=whole_stack_mergeable
+        ), mock.patch.object(
+            MODULE, "record_stack_member_clearances"
+        ) as record_stack_clearances, mock.patch.object(
             MODULE,
             "repository_merge_methods",
             return_value=dict(merge_methods or ALL_MERGE_METHODS),
@@ -2244,6 +2251,7 @@ class PreflightTest(unittest.TestCase):
         ) as emit:
             MODULE.command_preflight(args)
         self.checkout = checkout
+        self.record_stack_clearances = record_stack_clearances
         return emitted(emit)
 
     def saved(self, path=None):
@@ -2402,6 +2410,49 @@ class PreflightTest(unittest.TestCase):
         )
         # The baseline head SHAs are captured so publish can prove what moved.
         self.assertEqual("aaa", attempt["stack"]["members"][0]["head_sha"])
+
+    def test_whole_stack_preflight_records_clean_members_without_a_cascade(self):
+        members = [
+            {
+                "position": 0,
+                "number": 19483,
+                "head_branch": "v143",
+                "base_branch": "main",
+                "head_sha": "aaa",
+                "base_sha": "base1",
+            },
+            {
+                "position": 1,
+                "number": 7,
+                "head_branch": "feature",
+                "base_branch": "v143",
+                "head_sha": "head1",
+                "base_sha": "aaa",
+            },
+        ]
+        detection = {
+            "default_branch": "main",
+            "stack": {
+                "id": "S_1",
+                "number": 19578,
+                "size": 2,
+                "trunk": "main",
+                "members": members,
+            },
+        }
+
+        payload = self.preflight(
+            metadata=pr_metadata(mergeable="MERGEABLE"),
+            detection=detection,
+            whole_stack=True,
+            whole_stack_mergeable=True,
+        )
+
+        self.assertEqual("stack_mergeable", payload["result"])
+        self.assertEqual("mergeable", self.saved()["attempt"]["status"])
+        self.record_stack_clearances.assert_called_once_with(
+            mock.ANY, members, 7
+        )
 
     def test_a_native_stack_reads_its_default_branch_from_the_api(self):
         # The trunk here is not the repository default branch, and neither is
@@ -6731,6 +6782,20 @@ class StackPublishCommandTest(unittest.TestCase):
             return landed.get(branch)
 
         args = SimpleNamespace(state=str(state_path))
+        projected_path = self.directory / "19483.json"
+        if callable(final):
+            final_side_effect = final
+            final_return = None
+        elif isinstance(final, Exception):
+            final_side_effect = final
+            final_return = None
+        else:
+            final_side_effect = None
+            final_return = (
+                final
+                if final is not None
+                else pr_metadata(head_sha="newf", mergeable="MERGEABLE")
+            )
         with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
             MODULE, "validate_rebased_stack", return_value=members_after or []
         ), mock.patch.object(
@@ -6747,10 +6812,12 @@ class StackPublishCommandTest(unittest.TestCase):
             MODULE, "remove_stack_workspace"
         ) as remove, mock.patch.object(
             MODULE, "live_mergeability",
-            side_effect=final if isinstance(final, Exception) else None,
-            return_value=final
-            if final is not None and not isinstance(final, Exception)
-            else pr_metadata(head_sha="newf", mergeable="MERGEABLE"),
+            side_effect=final_side_effect,
+            return_value=final_return,
+        ), mock.patch.object(
+            MODULE,
+            "default_state_path",
+            side_effect=lambda target: projected_path,
         ), mock.patch.object(
             MODULE, "emit"
         ) as emit:
@@ -6763,6 +6830,7 @@ class StackPublishCommandTest(unittest.TestCase):
         self.remove = remove
         self.dissociate = dissociate_mock
         self.atomic = atomic
+        self.projected_path = projected_path
         return emitted(emit) if emit.called else None
 
     def saved(self):
@@ -6777,6 +6845,22 @@ class StackPublishCommandTest(unittest.TestCase):
         self.assertEqual("published", self.saved()["attempt"]["status"])
         self.assertNotIn("push_detail", payload)
         self.assertIsNone(self.saved()["attempt"]["stack_push_detail"])
+
+    def test_publishing_records_clearance_for_each_other_stack_member(self):
+        def final(target, *, expected_head=None):
+            return pr_metadata(
+                number=target["number"],
+                head_sha=expected_head,
+                base_sha="base1",
+                mergeable="MERGEABLE",
+            )
+
+        self.publish(final=final)
+
+        projected = json.loads(self.projected_path.read_text(encoding="utf-8"))
+        self.assertEqual("newa", projected["attempt"]["mergeable_at_head_sha"])
+        self.assertEqual("base1", projected["attempt"]["base_sha"])
+        self.assertEqual(7, projected["attempt"]["stack_source_pr"])
 
     def test_a_rejected_atomic_push_preserves_the_workspace_and_publishes_nothing(self):
         self.publish(
@@ -6892,3 +6976,127 @@ class StackAbortCommandTest(unittest.TestCase):
         self.assertIsNotNone(self.error)
         self.assertIn("already published", str(self.error))
         self.remove.assert_not_called()
+
+
+class DescendantPropagationTest(unittest.TestCase):
+    def stack(self):
+        return {
+            "id": "S_1",
+            "number": 77,
+            "size": 3,
+            "trunk": "main",
+            "members": [
+                {
+                    "position": 0,
+                    "number": 10,
+                    "head_branch": "lower",
+                    "base_branch": "main",
+                    "head_sha": "lower-head",
+                    "base_sha": "base",
+                },
+                {
+                    "position": 1,
+                    "number": 11,
+                    "head_branch": "fixed",
+                    "base_branch": "lower",
+                    "head_sha": "fixed-head",
+                    "base_sha": "lower-head",
+                },
+                {
+                    "position": 2,
+                    "number": 12,
+                    "head_branch": "tip",
+                    "base_branch": "fixed",
+                    "head_sha": "tip-head",
+                    "base_sha": "fixed-head",
+                },
+            ],
+        }
+
+    def test_selects_only_members_strictly_above_the_fixed_pr(self):
+        result = MODULE.propagation_stack(self.stack(), 11, "fixed-head")
+
+        self.assertEqual("fixed", result["trunk"])
+        self.assertEqual([12], [member["number"] for member in result["members"]])
+        self.assertNotIn(10, [member["number"] for member in result["members"]])
+        self.assertNotIn(11, [member["number"] for member in result["members"]])
+
+    def test_rejects_a_stale_fixed_head(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "moved from stale"):
+            MODULE.propagation_stack(self.stack(), 11, "stale")
+
+    def test_atomic_push_leases_only_descendants(self):
+        partial = MODULE.propagation_stack(self.stack(), 11, "fixed-head")
+        partial["members_after"] = [
+            {"number": 12, "head_branch": "tip", "head_sha": "new-tip"}
+        ]
+        with mock.patch.object(
+            MODULE, "run", return_value=completed(0)
+        ) as runner:
+            MODULE.atomic_stack_push(Path("/workspace"), partial)
+
+        command = runner.call_args.args[0]
+        self.assertIn("--force-with-lease=refs/heads/tip:tip-head", command)
+        self.assertNotIn("refs/heads/fixed", " ".join(command))
+        self.assertNotIn("refs/heads/lower", " ".join(command))
+
+    def test_post_propagation_fingerprint_changes_only_descendant_heads(self):
+        stack = self.stack()
+        expected = {
+            **stack,
+            "members": [
+                *stack["members"][:2],
+                {**stack["members"][2], "head_sha": "new-tip"},
+            ],
+        }
+        self.assertEqual(
+            MODULE.stack_snapshot_fingerprint(expected),
+            MODULE.propagated_stack_fingerprint(
+                stack,
+                [{"number": 12, "head_branch": "tip", "head_sha": "new-tip"}],
+            ),
+        )
+
+    def test_parser_exposes_machine_facing_operation(self):
+        args = MODULE.build_parser().parse_args(
+            [
+                "descendant-propagate",
+                "owner/repo#11",
+                "--stack-number",
+                "77",
+                "--fixed-pr",
+                "11",
+                "--expected-head",
+                "fixed-head",
+            ]
+        )
+        self.assertIs(args.function, MODULE.command_descendant_propagate)
+
+    def test_tip_propagation_creates_no_workspace_and_rewrites_nothing(self):
+        args = SimpleNamespace(
+            target="owner/repo#12",
+            stack_number=77,
+            fixed_pr=12,
+            expected_head="tip-head",
+            repo_root=None,
+            state=None,
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "resolve_repo_root", return_value=Path("/repo")
+        ), mock.patch.object(
+            MODULE, "metadata_for", return_value=pr_metadata(number=12)
+        ), mock.patch.object(
+            MODULE,
+            "stack_membership",
+            return_value={"default_branch": "main", "stack": self.stack()},
+        ), mock.patch.object(
+            MODULE, "external_stack_dependents", return_value=[]
+        ), mock.patch.object(
+            MODULE, "create_stack_workspace"
+        ) as create_workspace, mock.patch.object(
+            MODULE, "emit"
+        ) as emit_mock:
+            MODULE.command_descendant_propagate(args)
+
+        self.assertEqual("no_descendants", emitted(emit_mock)["result"])
+        create_workspace.assert_not_called()
