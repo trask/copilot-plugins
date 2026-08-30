@@ -66,6 +66,81 @@ def uncleared_stage(stage: str, outcome: str | None = "carried") -> dict:
     }
 
 
+class WindowsSubprocessTest(unittest.TestCase):
+    def test_run_hides_windows_console_processes(self):
+        completed = subprocess.CompletedProcess(["tasklist"], 0, "", "")
+        with (
+            mock.patch.object(MODULE.common, "IS_WINDOWS", True),
+            mock.patch.object(
+                MODULE.common.subprocess,
+                "CREATE_NO_WINDOW",
+                0x08000000,
+                create=True,
+            ),
+            mock.patch.object(
+                MODULE.common.subprocess, "run", return_value=completed
+            ) as run,
+        ):
+            MODULE.common.run(["tasklist"], check=False)
+
+        self.assertEqual(0x08000000, run.call_args.kwargs["creationflags"])
+
+    def test_detached_scheduler_uses_no_window_without_detached_process(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                mock.patch.object(MODULE.common, "IS_WINDOWS", True),
+                mock.patch.object(
+                    MODULE.common.subprocess,
+                    "CREATE_NO_WINDOW",
+                    0x08000000,
+                    create=True,
+                ),
+                mock.patch.object(
+                    MODULE.common.subprocess,
+                    "CREATE_NEW_PROCESS_GROUP",
+                    0x00000200,
+                    create=True,
+                ),
+                mock.patch.object(
+                    MODULE.common.subprocess,
+                    "CREATE_BREAKAWAY_FROM_JOB",
+                    0x01000000,
+                    create=True,
+                ),
+                mock.patch.object(
+                    MODULE.common.subprocess,
+                    "DETACHED_PROCESS",
+                    0x00000008,
+                    create=True,
+                ),
+                mock.patch.object(MODULE.common.subprocess, "Popen") as popen,
+            ):
+                MODULE.common.start_detached(
+                    ["python", "scheduler.py"],
+                    cwd=root,
+                    log_path=root / "scheduler.log",
+                )
+
+        flags = popen.call_args.kwargs["creationflags"]
+        self.assertEqual(0x08000000, flags & 0x08000000)
+        self.assertEqual(0, flags & 0x00000008)
+
+    def test_windows_liveness_check_uses_the_windows_api(self):
+        with (
+            mock.patch.object(MODULE.common, "IS_WINDOWS", True),
+            mock.patch.object(
+                MODULE.common, "windows_process_is_alive", return_value=True
+            ) as windows_query,
+            mock.patch.object(
+                MODULE.common, "run", side_effect=AssertionError("spawned a command")
+            ),
+        ):
+            self.assertTrue(MODULE.common.process_is_alive(123))
+
+        windows_query.assert_called_once_with(123)
+
+
 class TargetTest(unittest.TestCase):
     def test_parses_supported_targets(self):
         expected = target()

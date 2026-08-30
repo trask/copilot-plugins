@@ -16,6 +16,14 @@ pull request. See [Publication](#publication) for the rest of the flow.
 - Keep agent definitions, scripts, and tests inside their plugin directory.
 - A plugin's version in `plugin.json` and the marketplace entry must match.
 
+## Windows subprocesses
+
+- Every background or monitor path that starts a console program on Windows must
+  use `CREATE_NO_WINDOW`, preferably through the plugin's shared launch helper,
+  and must have regression coverage for the creation flags.
+- Poll process state through the Windows API. Do not run `tasklist` or another
+  console utility from a polling loop.
+
 ## Validation
 
 1. Run the narrowest tests that cover the change. Run `python -m pytest` only

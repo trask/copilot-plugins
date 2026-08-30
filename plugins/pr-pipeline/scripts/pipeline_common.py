@@ -112,6 +112,12 @@ class WorkflowError(RuntimeError):
     pass
 
 
+def windows_no_window_options() -> dict[str, int]:
+    if not IS_WINDOWS:
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+
+
 def run(
     command: list[str],
     *,
@@ -129,6 +135,7 @@ def run(
             stderr=subprocess.PIPE,
             check=False,
             timeout=timeout,
+            **windows_no_window_options(),
         )
     except subprocess.TimeoutExpired as error:
         raise WorkflowError(
@@ -432,7 +439,6 @@ def start_detached(
     if IS_WINDOWS:
         options["creationflags"] = (
             getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "DETACHED_PROCESS", 0)
             | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
             | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
@@ -1270,8 +1276,7 @@ def launch_options(log: Any, cwd: Path) -> dict[str, Any]:
         "stdout": log,
         "stderr": subprocess.STDOUT,
     }
-    if IS_WINDOWS:
-        options["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    options.update(windows_no_window_options())
     return options
 
 
@@ -1313,19 +1318,49 @@ def start_background(
         log.close()
 
 
+def windows_process_is_alive(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    synchronize = 0x00100000
+    wait_object_0 = 0x00000000
+    wait_timeout = 0x00000102
+    error_access_denied = 5
+    error_invalid_parameter = 87
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(synchronize, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == error_access_denied:
+            return True
+        if error == error_invalid_parameter:
+            return False
+        raise OSError(error, f"failed to query process {pid}")
+    try:
+        result = kernel32.WaitForSingleObject(handle, 0)
+        if result == wait_timeout:
+            return True
+        if result == wait_object_0:
+            return False
+        error = ctypes.get_last_error()
+        raise OSError(error, f"failed to query process {pid}")
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def process_is_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     if IS_WINDOWS:
-        try:
-            result = run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                check=False,
-                timeout=10,
-            )
-        except WorkflowError:
-            return True
-        return str(pid) in (result.stdout or "")
+        return windows_process_is_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
