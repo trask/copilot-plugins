@@ -781,21 +781,27 @@ class WorktreeSafetyTest(unittest.TestCase):
 
 
 class AgentInstructionTest(unittest.TestCase):
-    def test_agent_has_one_helper_command_and_no_manual_lifecycle(self):
+    def test_agent_uses_the_durable_start_and_watch_protocol(self):
         text = AGENT.read_text(encoding="utf-8")
-        self.assertIn("pr_pipeline.py\" run", text)
-        for command in ("`next`", "`start`", "`wait`", "`finish`", "`reset`"):
-            self.assertNotIn(command, text)
+        self.assertIn("pr_pipeline.py\" start", text)
+        self.assertIn("pr_pipeline.py\" watch", text)
         self.assertIn("at most two foreground sweeps", text)
         self.assertIn("reaches its limit does not block", text)
-        self.assertIn("asynchronously as an attached process", text)
-        self.assertIn("30-second initial wait", text)
-        self.assertIn("same shell at least once every five minutes", text)
+        self.assertIn("Run `start` synchronously exactly once", text)
+        self.assertIn("--wait-seconds 300", text)
+        self.assertIn("no more than one per five minutes", text)
         self.assertIn("Never end your turn", text)
-        self.assertIn("Before every shell read, send a visible one-line progress message", text)
-        self.assertIn("Tool call labels do not count as progress messages", text)
-        self.assertIn("compact cumulative stage summary", text)
-        self.assertIn("active stage is still running", text)
+        self.assertIn("visible assistant line in this session conversation", text)
+        self.assertIn("Waiting: <wait_reason>.", text)
+        self.assertIn("Next: <next_action>.", text)
+        self.assertIn("Do not send these updates to the PR Flight canvas", text)
+        self.assertIn("If `updates` is empty, call `watch` again", text)
+        self.assertIn("`final_event`", text)
+        watch_lines = [
+            line for line in text.splitlines() if "pr_pipeline.py" in line and " watch " in line
+        ]
+        self.assertTrue(any("copilot_home=" in line for line in watch_lines))
+        self.assertTrue(any("$copilotHome =" in line for line in watch_lines))
         self.assertIn("A clean run that pushed no commits", text)
         self.assertIn("Do not organize the response by sweep", text)
         self.assertNotIn("### Sweep 1", text)
@@ -868,16 +874,136 @@ class CommandOutputTest(unittest.TestCase):
         self.assertEqual("error", event["result"])
         self.assertEqual("broken", event["error"])
 
+    def test_watch_errors_are_not_reported_as_pipeline_outcomes(self):
+        output = StringIO()
+        with (
+            mock.patch.object(
+                __import__("sys"),
+                "argv",
+                [
+                    "pr_pipeline.py",
+                    "watch",
+                    "owner/repo#7",
+                    "--run-id",
+                    "invalid",
+                ],
+            ),
+            redirect_stdout(output),
+        ):
+            result = MODULE.main()
+
+        self.assertEqual(1, result)
+        event = json.loads(output.getvalue())
+        self.assertEqual(MODULE.PROGRESS_UPDATE_EVENT, event["event"])
+        self.assertFalse(event["finished"])
+        self.assertIn("run-id", event["monitor_failure"])
+        self.assertNotEqual("pipeline_finished", event["event"])
+
+
+class ProgressProtocolTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.event_log = self.root / "progress.jsonl"
+
+    def test_stage_transitions_include_sweep_pr_wait_and_next_action(self):
+        output = []
+        reporter = MODULE.ProgressReporter(
+            target=target(),
+            event_log=self.event_log,
+            output=output.append,
+            wall_time=lambda: 1000.0,
+        )
+        reporter(
+            {
+                "event": "stage_started",
+                "stage": MODULE.STAGE_CI,
+                "sweep": 1,
+            }
+        )
+        reporter(
+            {
+                "event": "stage_finished",
+                "stage": MODULE.STAGE_CI,
+                "sweep": 1,
+                "action": "launched",
+                "clear": False,
+                "stage_reason": "checks_failed",
+            }
+        )
+
+        updates = MODULE.common.read_progress_log(self.event_log)
+        self.assertEqual(2, len(output))
+        self.assertIn("Sweep 1/2", updates[0]["message"])
+        self.assertIn("#7", updates[0]["message"])
+        self.assertEqual(MODULE.STAGE_CI, updates[0]["stage"])
+        self.assertEqual("waiting for CI remediation", updates[0]["wait_reason"])
+        self.assertTrue(updates[0]["next_action"])
+        self.assertIn("not clear: checks_failed", updates[1]["message"])
+
+    def test_scheduler_command_carries_the_monitor_handle_and_options(self):
+        args = MODULE.build_parser().parse_args(
+            [
+                "start",
+                "owner/repo#7",
+                "--stage-model",
+                "ci-fix-loop=claude-sonnet-5",
+                "--effort",
+                "high",
+            ]
+        )
+        command = MODULE.scheduler_command(
+            args,
+            target(),
+            "a" * 32,
+            self.event_log,
+        )
+
+        self.assertIn("run", command)
+        self.assertIn("--run-id", command)
+        self.assertIn("a" * 32, command)
+        self.assertIn("--event-log", command)
+        self.assertIn("ci-fix-loop=claude-sonnet-5", command)
+
+    def test_start_writes_a_durable_launch_record_before_returning(self):
+        args = MODULE.build_parser().parse_args(["start", "owner/repo#7"])
+        process = mock.Mock(pid=4321)
+        output = StringIO()
+        with (
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.root),
+            mock.patch.object(MODULE, "resolve_target", return_value=target()),
+            mock.patch.object(MODULE, "copilot_home", return_value=self.root),
+            mock.patch.object(MODULE.common, "start_detached", return_value=process),
+            mock.patch.object(MODULE.uuid, "uuid4", return_value=mock.Mock(hex="a" * 32)),
+            redirect_stdout(output),
+        ):
+            MODULE.command_start(args)
+
+        launch = MODULE.common.read_json(
+            self.root
+            / "run"
+            / MODULE.RUN_KIND
+            / MODULE.run_slug(target())
+            / ("a" * 32)
+            / "launch.json"
+        )
+        event = json.loads(output.getvalue())
+        self.assertEqual(4321, launch["pid"])
+        self.assertEqual("a" * 32, launch["run_id"])
+        self.assertEqual("pipeline_launched", event["event"])
+        self.assertEqual("owner/repo#7", event["target"])
+
 
 class ParserTest(unittest.TestCase):
-    def test_run_is_the_only_command(self):
+    def test_the_progress_protocol_adds_start_and_watch_commands(self):
         parser = MODULE.build_parser()
         action = next(
             action
             for action in parser._actions
             if isinstance(action, __import__("argparse")._SubParsersAction)
         )
-        self.assertEqual({"run"}, set(action.choices))
+        self.assertEqual({"run", "start", "watch"}, set(action.choices))
 
     def test_run_accepts_model_overrides(self):
         args = MODULE.build_parser().parse_args(
@@ -890,6 +1016,23 @@ class ParserTest(unittest.TestCase):
         )
         self.assertEqual("owner/repo#7", args.target)
         self.assertEqual(["ci-fix-loop=claude-sonnet-5"], args.stage_model)
+
+    def test_watch_accepts_the_canonical_target_cursor_and_bounded_wait(self):
+        args = MODULE.build_parser().parse_args(
+            [
+                "watch",
+                "owner/repo#7",
+                "--run-id",
+                "a" * 32,
+                "--cursor",
+                "4",
+                "--wait-seconds",
+                "300",
+            ]
+        )
+        self.assertEqual("owner/repo#7", args.target)
+        self.assertEqual(4, args.cursor)
+        self.assertEqual(300, args.wait_seconds)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import time
 import uuid
 from typing import Any, Callable
 
@@ -68,7 +69,7 @@ git = common.git
 git_or_none = common.git_or_none
 git_succeeds = common.git_succeeds
 emit = common.emit
-report_event = common.report_event
+report_event = common.report_safely
 utc_now = common.utc_now
 normalize_cli_path = common.normalize_cli_path
 copilot_home = common.copilot_home
@@ -92,6 +93,166 @@ string_at = common.string_at
 stage_status_summary = common.stage_status_summary
 stage_models = common.stage_models
 stage_prompt = common.stage_prompt
+
+RUN_KIND = "pr-pipeline"
+PROGRESS_EVENT = common.PROGRESS_EVENT
+PROGRESS_UPDATE_EVENT = common.PROGRESS_UPDATE_EVENT
+PROGRESS_HEARTBEAT_INTERVAL = common.PROGRESS_HEARTBEAT_INTERVAL
+STAGE_LABELS = {
+    STAGE_CONFLICT: "conflict resolution",
+    STAGE_COPILOT_REVIEW: "Copilot review",
+    STAGE_SELF_REVIEW: "self review",
+    STAGE_CI: "CI remediation",
+    STAGE_DESCRIPTION: "description validation",
+}
+
+
+def run_slug(target: dict[str, Any]) -> str:
+    return f"{target['owner']}--{target['repo']}--pr-{target['number']}"
+
+
+def run_root() -> Path:
+    return copilot_home() / "run" / RUN_KIND
+
+
+def run_directory_for(target: dict[str, Any], run_id: str) -> Path:
+    return run_root() / run_slug(target) / run_id
+
+
+def progress_log_path(target: dict[str, Any], run_id: str) -> Path:
+    return run_directory_for(target, run_id) / "progress.jsonl"
+
+
+def launch_state_path(target: dict[str, Any], run_id: str) -> Path:
+    return run_directory_for(target, run_id) / "launch.json"
+
+
+def observer_state_path(target: dict[str, Any], run_id: str) -> Path:
+    return run_directory_for(target, run_id) / "observer.json"
+
+
+def scheduler_log_path(target: dict[str, Any], run_id: str) -> Path:
+    return run_directory_for(target, run_id) / "scheduler.log"
+
+
+def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
+    event = payload.get("event")
+    sweep = payload.get("sweep")
+    stage = payload.get("stage")
+    label = STAGE_LABELS.get(stage, str(stage or "pipeline"))
+    prefix = f"Sweep {sweep}/{MAX_SWEEPS}: " if isinstance(sweep, int) else ""
+    target_url = payload.get("target")
+    number = payload.get("number")
+    scope = f" for #{number}" if isinstance(number, int) else ""
+
+    update: dict[str, Any]
+    if event == "pipeline_started":
+        update = {
+            "message": f"PR pipeline starting for {target_url}.",
+            "next_action": "Read the live pull request and synchronize its worktree.",
+            "waiting": True,
+            "wait_reason": "reading pull request state from GitHub",
+        }
+    elif event == "sweep_started":
+        update = {
+            "message": f"{prefix}started.",
+            "next_action": f"Inspect and run {STAGE_LABELS[STAGE_CONFLICT]}.",
+            "waiting": True,
+            "wait_reason": "checking the current pull request head and stage markers",
+        }
+    elif event == "stage_started":
+        update = {
+            "message": f"{prefix}{label} running{scope}.",
+            "next_action": "Wait for the stage agent result.",
+            "waiting": True,
+            "wait_reason": f"waiting for {label}",
+        }
+    elif event == "stage_finished":
+        clear = payload.get("clear")
+        action = payload.get("action")
+        if action == "already_clear":
+            outcome = "already clear"
+        elif clear:
+            outcome = "complete"
+        else:
+            reason = payload.get("stage_reason") or payload.get("outcome")
+            outcome = f"not clear: {reason}" if reason else "not clear"
+        update = {
+            "message": f"{prefix}{label} {outcome}{scope}.",
+            "next_action": "Inspect and run the next stage.",
+            "waiting": True,
+            "wait_reason": "checking GitHub state before the next stage",
+        }
+    elif event == "sweep_finished":
+        uncleared = payload.get("uncleared_stages") or []
+        update = {
+            "message": (
+                f"{prefix}complete"
+                + (
+                    f"; still uncleared: {', '.join(uncleared)}."
+                    if uncleared
+                    else "; all stages are clear."
+                )
+            ),
+            "next_action": (
+                "Finish the run."
+                if not uncleared
+                else "Start another sweep only if the head or base changed."
+            ),
+            "waiting": False,
+        }
+    elif event == "pipeline_finished":
+        result = payload.get("result", "unknown")
+        update = {
+            "message": (
+                f"PR pipeline {result}"
+                + (f": {payload.get('reason')}." if payload.get("reason") else ".")
+            ),
+            "next_action": "Report the final pipeline result.",
+            "waiting": False,
+            "terminal": True,
+            "result": result,
+            "final_event": payload,
+        }
+    else:
+        return None
+
+    update.update(
+        {
+            "event": PROGRESS_EVENT,
+            "kind": "transition",
+            "source_event": event,
+            "sweep": sweep,
+            "iteration": sweep,
+            "stage": stage,
+            "pull_requests": (
+                [payload["number"]] if isinstance(payload.get("number"), int) else []
+            ),
+        }
+    )
+    return {key: value for key, value in update.items() if value is not None}
+
+
+class ProgressReporter(common.ConversationProgressReporter):
+    def __init__(
+        self,
+        *,
+        target: dict[str, Any] | None = None,
+        event_log: Path | None = None,
+        output: Callable[[dict[str, Any]], None] = emit,
+        wall_time: Callable[[], float] = time.time,
+    ) -> None:
+        def transition(payload: dict[str, Any]) -> dict[str, Any] | None:
+            if target is not None:
+                payload = {**payload, "number": target["number"]}
+            return progress_transition(payload)
+
+        super().__init__(
+            transition=transition,
+            event_log=event_log,
+            output=output,
+            wall_time=wall_time,
+        )
 
 
 def gh_json(arguments: list[str]) -> Any:
@@ -292,9 +453,10 @@ def run_pipeline(
     *,
     models: dict[str, str],
     effort: str,
+    run_id: str | None = None,
     report: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    run_id = uuid.uuid4().hex
+    run_id = run_id or uuid.uuid4().hex
     runs: list[dict[str, Any]] = []
     known_safe_head: str | None = None
     completed_sweeps = 0
@@ -584,27 +746,118 @@ def run_pipeline(
     raise WorkflowError("the pipeline ended without a result")
 
 
+def scheduler_command(
+    args: argparse.Namespace,
+    target: dict[str, Any],
+    run_id: str,
+    event_log: Path,
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "run",
+        f"{target['owner']}/{target['repo']}#{target['number']}",
+        "--run-id",
+        run_id,
+        "--event-log",
+        str(event_log),
+        "--effort",
+        args.effort,
+    ]
+    for override in args.stage_model or []:
+        command.extend(["--stage-model", override])
+    return command
+
+
+def command_start(args: argparse.Namespace) -> None:
+    repo_root = resolve_repo_root()
+    target = resolve_target(args.target, repo_root)
+    run_id = uuid.uuid4().hex
+    event_log = progress_log_path(target, run_id)
+    launch_path = launch_state_path(target, run_id)
+    started_at_epoch = time.time()
+    common.write_json_atomically(
+        launch_path,
+        {
+            "kind": RUN_KIND,
+            "run_id": run_id,
+            "target": target,
+            "pid": None,
+            "event_log": str(event_log),
+            "started_at": utc_now(),
+            "started_at_epoch": started_at_epoch,
+        },
+    )
+    process = common.start_detached(
+        scheduler_command(args, target, run_id, event_log),
+        cwd=repo_root,
+        log_path=scheduler_log_path(target, run_id),
+    )
+    try:
+        common.write_json_atomically(
+            launch_path,
+            {
+                "kind": RUN_KIND,
+                "run_id": run_id,
+                "target": target,
+                "pid": process.pid,
+                "event_log": str(event_log),
+                "started_at": utc_now(),
+                "started_at_epoch": started_at_epoch,
+            },
+        )
+    except OSError:
+        process.terminate()
+        raise
+    emit(
+        {
+            "event": "pipeline_launched",
+            "run_id": run_id,
+            "target": f"{target['owner']}/{target['repo']}#{target['number']}",
+            "pid": process.pid,
+            "cursor": 0,
+        }
+    )
+
+
+def command_watch(args: argparse.Namespace) -> None:
+    target = parse_target(args.target)
+    run_id = common.validate_run_id(args.run_id)
+    emit(
+        common.watch_progress(
+            event_log=progress_log_path(target, run_id),
+            launch_path=launch_state_path(target, run_id),
+            observer_path=observer_state_path(target, run_id),
+            cursor=args.cursor,
+            wait_seconds=args.wait_seconds,
+        )
+    )
+
+
 def command_run(args: argparse.Namespace) -> None:
     require_tools()
     repo_root = resolve_repo_root()
     target = resolve_target(args.target, repo_root)
-    result = run_pipeline(
-        target,
-        repo_root,
-        models=stage_models(args.stage_model),
-        effort=args.effort,
-        report=emit,
-    )
-    emit({"event": "pipeline_finished", **result})
+    event_log = Path(args.event_log).resolve() if args.event_log else None
+    reporter = ProgressReporter(target=target, event_log=event_log)
+    options = {
+        "models": stage_models(args.stage_model),
+        "effort": args.effort,
+        "report": reporter,
+    }
+    if args.run_id:
+        options["run_id"] = common.validate_run_id(args.run_id)
+    result = run_pipeline(target, repo_root, **options)
+    reporter({"event": "pipeline_finished", **result})
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    command = subparsers.add_parser(
+    run_command = subparsers.add_parser(
         "run", help="run up to two foreground sweeps over the five stages"
     )
-    command.add_argument(
+    run_command.add_argument(
         "target",
         nargs="?",
         help=(
@@ -612,13 +865,47 @@ def build_parser() -> argparse.ArgumentParser:
             "known; omit only from a branch attached to the pull request"
         ),
     )
-    command.add_argument(
+    run_command.add_argument(
         "--stage-model",
         action="append",
         help="pin one stage's model as <stage>=<model>; repeatable",
     )
-    command.add_argument("--effort", default=DEFAULT_EFFORT)
-    command.set_defaults(function=command_run)
+    run_command.add_argument("--effort", default=DEFAULT_EFFORT)
+    run_command.add_argument("--run-id", help=argparse.SUPPRESS)
+    run_command.add_argument("--event-log", help=argparse.SUPPRESS)
+    run_command.set_defaults(function=command_run)
+
+    start = subparsers.add_parser(
+        "start", help="launch the scheduler and return a durable monitor handle"
+    )
+    start.add_argument(
+        "target",
+        nargs="?",
+        help=(
+            "PR URL, owner/repo#number, or a bare number when the repository is "
+            "known; omit only from a branch attached to the pull request"
+        ),
+    )
+    start.add_argument(
+        "--stage-model",
+        action="append",
+        help="pin one stage's model as <stage>=<model>; repeatable",
+    )
+    start.add_argument("--effort", default=DEFAULT_EFFORT)
+    start.set_defaults(function=command_start)
+
+    watch = subparsers.add_parser(
+        "watch", help="wait for progress or one five-minute heartbeat"
+    )
+    watch.add_argument("target", help="the canonical owner/repo#number from start")
+    watch.add_argument("--run-id", required=True)
+    watch.add_argument("--cursor", type=int, default=0)
+    watch.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=PROGRESS_HEARTBEAT_INTERVAL,
+    )
+    watch.set_defaults(function=command_watch)
     return parser
 
 
@@ -628,10 +915,48 @@ def main() -> int:
         args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:
-        emit({"event": "pipeline_finished", "result": "error", "error": str(error)})
+        if args.command == "watch":
+            emit(
+                {
+                    "event": PROGRESS_UPDATE_EVENT,
+                    "updates": [],
+                    "finished": False,
+                    "monitor_failure": str(error),
+                }
+            )
+            return 1
+        if args.command == "start":
+            emit({"event": "pipeline_launch_failed", "error": str(error)})
+            return 1
+        event = {"event": "pipeline_finished", "result": "error", "error": str(error)}
+        event_log = getattr(args, "event_log", None)
+        ProgressReporter(
+            event_log=Path(event_log).resolve() if event_log else None
+        )(event)
         return 1
     except KeyboardInterrupt:
-        emit({"event": "pipeline_finished", "result": "error", "error": "interrupted"})
+        if args.command == "watch":
+            emit(
+                {
+                    "event": PROGRESS_UPDATE_EVENT,
+                    "updates": [],
+                    "finished": False,
+                    "monitor_failure": "interrupted",
+                }
+            )
+            return 130
+        if args.command == "start":
+            emit({"event": "pipeline_launch_failed", "error": "interrupted"})
+            return 130
+        event = {
+            "event": "pipeline_finished",
+            "result": "error",
+            "error": "interrupted",
+        }
+        event_log = getattr(args, "event_log", None)
+        ProgressReporter(
+            event_log=Path(event_log).resolve() if event_log else None
+        )(event)
         return 130
 
 

@@ -1090,6 +1090,263 @@ class StateTest(unittest.TestCase):
         self.assertTrue(path.exists())
 
 
+class ProgressProtocolTest(StackFixture):
+    def setUp(self):
+        super().setUp()
+        self.event_log = self.root / "progress.jsonl"
+
+    def reporter(self, now=1000.0):
+        output = []
+        reporter = MODULE.ProgressReporter(
+            event_log=self.event_log,
+            output=output.append,
+            wall_time=lambda: now,
+        )
+        return reporter, output
+
+    def test_transitions_include_pass_pr_stage_wait_and_next_action(self):
+        reporter, output = self.reporter()
+        reporter(
+            {
+                "event": "phase_started",
+                "phase": MODULE.STAGE_COPILOT_REVIEW,
+                "pull_request_pass": 1,
+                "numbers": [11, 12],
+            }
+        )
+        reporter(
+            {
+                "event": "worker_finished",
+                "stage": MODULE.STAGE_COPILOT_REVIEW,
+                "pull_request_pass": 1,
+                "number": 11,
+                "returncode": 1,
+                "accepted": True,
+            }
+        )
+
+        updates = MODULE.read_progress_log(self.event_log)
+        self.assertEqual(2, len(updates))
+        self.assertEqual(2, len(output))
+        self.assertIn("Pass 1/2", updates[0]["message"])
+        self.assertIn("#11, #12", updates[0]["message"])
+        self.assertEqual(MODULE.STAGE_COPILOT_REVIEW, updates[0]["stage"])
+        self.assertIn("starting workers", updates[0]["wait_reason"])
+        self.assertTrue(updates[0]["next_action"])
+        self.assertIn("failed for #11", updates[1]["message"])
+
+    def test_real_scheduler_events_keep_pass_and_pull_request_context(self):
+        self.clear_everything()
+        reporter, _ = self.reporter()
+        pipeline = self.pipeline(report=reporter)
+
+        pipeline.execute()
+
+        updates = MODULE.read_progress_log(self.event_log)
+        finished = next(
+            update
+            for update in updates
+            if update["source_event"] == "worker_finished"
+        )
+        phase = next(
+            update
+            for update in updates
+            if update["source_event"] == "phase_finished"
+        )
+        self.assertEqual(1, finished["pull_request_pass"])
+        self.assertEqual([11], finished["pull_requests"])
+        self.assertEqual(1, phase["pull_request_pass"])
+        self.assertEqual([11], phase["pull_requests"])
+
+    def test_unchanged_wait_transitions_are_coalesced(self):
+        reporter, _ = self.reporter()
+        event = {
+            "event": "worker_wait_started",
+            "stage": MODULE.STAGE_CI,
+            "pull_request_pass": 1,
+            "number": 11,
+        }
+        reporter(event)
+        reporter(event)
+
+        self.assertEqual(1, len(MODULE.read_progress_log(self.event_log)))
+
+    def test_reporting_failures_do_not_escape_into_pipeline_control_flow(self):
+        def fail(_payload):
+            raise OSError("closed output")
+
+        reporter = MODULE.ProgressReporter(
+            event_log=self.root,
+            output=fail,
+        )
+        reporter({"event": "pass_started", "pull_request_pass": 1})
+        MODULE.report_safely(fail, "worker_active", number=11)
+
+    def test_scheduler_command_carries_the_monitor_handle_and_options(self):
+        args = MODULE.build_parser().parse_args(
+            [
+                "start",
+                "--kickoff",
+                json.dumps(kickoff()),
+                "--stage-model",
+                "ci-fix-loop=claude-sonnet-5",
+                "--effort",
+                "high",
+            ]
+        )
+        command = MODULE.scheduler_command(
+            args,
+            kickoff(),
+            self.root,
+            "a" * 32,
+            self.event_log,
+        )
+
+        self.assertIn("run", command)
+        self.assertIn("--run-id", command)
+        self.assertIn("a" * 32, command)
+        self.assertIn("--event-log", command)
+        self.assertIn("ci-fix-loop=claude-sonnet-5", command)
+
+    def test_watch_emits_one_heartbeat_only_after_five_unchanged_minutes(self):
+        class Clock:
+            def __init__(self):
+                self.value = 1000.0
+
+            def now(self):
+                return self.value
+
+            def sleep(self, seconds):
+                self.value += seconds
+
+        clock = Clock()
+        reporter = MODULE.ProgressReporter(
+            event_log=self.event_log,
+            output=lambda _payload: None,
+            wall_time=clock.now,
+        )
+        reporter(
+            {
+                "event": "worker_wait_started",
+                "stage": MODULE.STAGE_CI,
+                "pull_request_pass": 1,
+                "number": 11,
+            }
+        )
+        launch = self.root / "launch.json"
+        observer = self.root / "observer.json"
+        COMMON.write_json_atomically(launch, {"pid": 123})
+
+        initial = MODULE.watch_progress(
+            event_log=self.event_log,
+            launch_path=launch,
+            observer_path=observer,
+            cursor=0,
+            wait_seconds=1,
+            wall_time=clock.now,
+            monotonic=clock.now,
+            sleep=clock.sleep,
+            alive=lambda _pid: True,
+        )
+        with mock.patch.object(COMMON, "PROGRESS_WATCH_POLL_INTERVAL", 299):
+            early = MODULE.watch_progress(
+                event_log=self.event_log,
+                launch_path=launch,
+                observer_path=observer,
+                cursor=initial["cursor"],
+                wait_seconds=299,
+                wall_time=clock.now,
+                monotonic=clock.now,
+                sleep=clock.sleep,
+                alive=lambda _pid: True,
+            )
+        due = MODULE.watch_progress(
+            event_log=self.event_log,
+            launch_path=launch,
+            observer_path=observer,
+            cursor=initial["cursor"],
+            wait_seconds=1,
+            wall_time=clock.now,
+            monotonic=clock.now,
+            sleep=clock.sleep,
+            alive=lambda _pid: True,
+        )
+        again = MODULE.watch_progress(
+            event_log=self.event_log,
+            launch_path=launch,
+            observer_path=observer,
+            cursor=initial["cursor"],
+            wait_seconds=1,
+            wall_time=clock.now,
+            monotonic=clock.now,
+            sleep=clock.sleep,
+            alive=lambda _pid: True,
+        )
+
+        self.assertEqual(1, len(initial["updates"]))
+        self.assertEqual([], early["updates"])
+        self.assertEqual("heartbeat", due["updates"][0]["kind"])
+        self.assertEqual(300, due["updates"][0]["elapsed_seconds"])
+        self.assertEqual([], again["updates"])
+
+    def test_watch_rechecks_the_journal_after_the_scheduler_exits(self):
+        reporter, _ = self.reporter()
+        reporter(
+            {
+                "event": "worker_wait_started",
+                "stage": MODULE.STAGE_CI,
+                "pull_request_pass": 1,
+                "number": 11,
+            }
+        )
+        launch = self.root / "launch.json"
+        observer = self.root / "observer.json"
+        COMMON.write_json_atomically(launch, {"pid": 123})
+        MODULE.watch_progress(
+            event_log=self.event_log,
+            launch_path=launch,
+            observer_path=observer,
+            cursor=0,
+            wait_seconds=1,
+            alive=lambda _pid: True,
+        )
+
+        def finish_before_exit(_pid):
+            reporter(
+                {
+                    "event": "stack_pipeline_finished",
+                    "result": "complete",
+                    "run_id": "run-1",
+                }
+            )
+            return False
+
+        result = MODULE.watch_progress(
+            event_log=self.event_log,
+            launch_path=launch,
+            observer_path=observer,
+            cursor=1,
+            wait_seconds=1,
+            alive=finish_before_exit,
+        )
+
+        self.assertTrue(result["finished"])
+        self.assertNotIn("monitor_failure", result)
+        self.assertEqual("complete", result["updates"][0]["final_event"]["result"])
+
+    def test_missing_launch_record_stops_the_monitor(self):
+        result = MODULE.watch_progress(
+            event_log=self.event_log,
+            launch_path=self.root / "missing.json",
+            observer_path=self.root / "observer.json",
+            cursor=0,
+            wait_seconds=1,
+        )
+
+        self.assertTrue(result["finished"])
+        self.assertEqual("launch_record_missing", result["monitor_failure"])
+
+
 class DependencyTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -1287,20 +1544,35 @@ class AgentInstructionTest(unittest.TestCase):
         self.text = AGENT.read_text(encoding="utf-8")
 
     def test_the_agent_only_runs_and_reports_the_helper(self):
-        self.assertIn('pr_stack_pipeline.py" run --kickoff', self.text)
+        self.assertIn('pr_stack_pipeline.py" start --kickoff', self.text)
+        self.assertIn('pr_stack_pipeline.py" watch --kickoff', self.text)
         self.assertIn("The helper owns all control flow", self.text)
-        self.assertIn("asynchronously as an attached process", self.text)
-        self.assertIn("30-second initial wait", self.text)
-        self.assertIn("same shell at least once every five minutes", self.text)
+        self.assertIn("Run `start` synchronously exactly once", self.text)
+        self.assertIn("--wait-seconds 300", self.text)
+        self.assertIn("no more than one per five minutes", self.text)
         self.assertIn("Never end your turn", self.text)
-        self.assertIn("stack_pipeline_finished", self.text)
+        self.assertIn("`final_event`", self.text)
+        watch_lines = [
+            line
+            for line in self.text.splitlines()
+            if "pr_stack_pipeline.py" in line and " watch " in line
+        ]
+        self.assertTrue(any("copilot_home=" in line for line in watch_lines))
+        self.assertTrue(any("$copilotHome =" in line for line in watch_lines))
+
+    def test_progress_belongs_in_the_session_conversation(self):
+        self.assertIn("visible assistant line in this session conversation", self.text)
+        self.assertIn("Waiting: <wait_reason>.", self.text)
+        self.assertIn("Next: <next_action>.", self.text)
+        self.assertIn("Do not send these updates to the PR Flight canvas", self.text)
+        self.assertIn("If `updates` is empty, call `watch` again", self.text)
 
     def test_the_agent_states_the_session_title(self):
         self.assertIn(
             "PR Stack Pipeline: #<startPullRequest> - <PR title>",
             self.text,
         )
-        self.assertIn("After the command returns, rename the session", self.text)
+        self.assertIn("After monitoring finishes, rename the session", self.text)
 
     def test_the_agent_documents_the_kickoff_schema(self):
         self.assertIn('"version":1', self.text)
@@ -1329,14 +1601,14 @@ class AgentInstructionTest(unittest.TestCase):
 
 
 class ParserTest(unittest.TestCase):
-    def test_run_is_the_only_command(self):
+    def test_the_progress_protocol_adds_start_and_watch_commands(self):
         parser = MODULE.build_parser()
         action = next(
             action
             for action in parser._actions
             if isinstance(action, __import__("argparse")._SubParsersAction)
         )
-        self.assertEqual({"run"}, set(action.choices))
+        self.assertEqual({"run", "start", "watch"}, set(action.choices))
 
     def test_run_accepts_a_kickoff_payload_and_model_overrides(self):
         args = MODULE.build_parser().parse_args(
@@ -1350,6 +1622,23 @@ class ParserTest(unittest.TestCase):
         )
         self.assertEqual(kickoff(), MODULE.load_kickoff(args))
         self.assertEqual(["ci-fix-loop=claude-sonnet-5"], args.stage_model)
+
+    def test_watch_accepts_a_bounded_wait_and_cursor(self):
+        args = MODULE.build_parser().parse_args(
+            [
+                "watch",
+                "--kickoff",
+                json.dumps(kickoff()),
+                "--run-id",
+                "a" * 32,
+                "--cursor",
+                "4",
+                "--wait-seconds",
+                "300",
+            ]
+        )
+        self.assertEqual(4, args.cursor)
+        self.assertEqual(300, args.wait_seconds)
 
     def test_the_run_emits_json_lines_ending_with_the_final_event(self):
         args = MODULE.build_parser().parse_args(

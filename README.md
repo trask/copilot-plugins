@@ -70,6 +70,11 @@ validation for one pull request. The same plugin includes PR Stack Pipeline,
 which applies those existing agents to a selected suffix of a native GitHub
 stack with at most two passes.
 
+Both parent agents launch their scheduler once and use a durable monitor
+protocol to report every stage transition and one coalesced heartbeat per five
+minutes of unchanged waiting in their own session conversation. Progress does
+not depend on opening a terminal card or PR Flight.
+
 PR Flight starts the stack agent with one JSON object:
 
 ```json
@@ -81,11 +86,9 @@ PR Flight starts the stack agent with one JSON object:
 native stack before it starts. After the run, the session is named
 `PR Stack Pipeline: #<startPullRequest> - <PR title>` from the starting pull
 request's live metadata.
-Durable state lives under `~/.copilot/run/pr-stack-pipeline/` and exposes the run
+Stack state lives under `~/.copilot/run/pr-stack-pipeline/` and exposes the run
 ID, topology fingerprint, selected suffix, expected heads and bases, current
 pass and phase, per-PR stage state, dispatch nonces, result, and timestamps.
-PR Flight only needs to mark the action in flight; its existing stage chips
-remain the progress display.
 
 ### Conflict Fix Loop
 

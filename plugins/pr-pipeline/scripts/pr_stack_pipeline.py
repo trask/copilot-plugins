@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -56,6 +57,9 @@ STACK_ENTRIES_PAGE = 50
 RUN_KIND = "pr-stack-pipeline"
 OWNERSHIP_SUFFIX = ".worktree.json"
 CONFLICT_PROPAGATE_COMMAND = "descendant-propagate"
+PROGRESS_EVENT = common.PROGRESS_EVENT
+PROGRESS_UPDATE_EVENT = common.PROGRESS_UPDATE_EVENT
+PROGRESS_HEARTBEAT_INTERVAL = common.PROGRESS_HEARTBEAT_INTERVAL
 
 STAGE_CONFLICT = common.STAGE_CONFLICT
 STAGE_COPILOT_REVIEW = common.STAGE_COPILOT_REVIEW
@@ -85,6 +89,16 @@ PHASE_NAMES = tuple(phase["phase"] for phase in PHASES)
 PHASE_AGENTS = {
     phase["phase"]: STAGE_BY_NAME[phase["stage"]]["agent"] for phase in PHASES
 }
+STAGE_LABELS = {
+    STAGE_CONFLICT: "conflict resolution",
+    STAGE_COPILOT_REVIEW: "Copilot review",
+    STAGE_SELF_REVIEW: "self review",
+    STAGE_CI: "CI remediation",
+    STAGE_DESCRIPTION: "description validation",
+}
+
+
+report_safely = common.report_safely
 
 
 # Thin wrappers keep every shared call a seam a test can replace by name.
@@ -218,6 +232,220 @@ def lock_path_for(kickoff: dict[str, Any]) -> Path:
 
 def run_directory_for(kickoff: dict[str, Any], run_id: str) -> Path:
     return run_root() / run_slug(kickoff) / run_id
+
+
+def progress_log_path(kickoff: dict[str, Any], run_id: str) -> Path:
+    return run_directory_for(kickoff, run_id) / "progress.jsonl"
+
+
+def launch_state_path(kickoff: dict[str, Any], run_id: str) -> Path:
+    return run_directory_for(kickoff, run_id) / "launch.json"
+
+
+def observer_state_path(kickoff: dict[str, Any], run_id: str) -> Path:
+    return run_directory_for(kickoff, run_id) / "observer.json"
+
+
+def scheduler_log_path(kickoff: dict[str, Any], run_id: str) -> Path:
+    return run_directory_for(kickoff, run_id) / "scheduler.log"
+
+
+def format_pull_requests(numbers: list[int]) -> str:
+    return ", ".join(f"#{number}" for number in numbers)
+
+
+def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
+    event = payload.get("event")
+    pass_number = payload.get("pull_request_pass")
+    stage = payload.get("phase") or payload.get("stage")
+    label = STAGE_LABELS.get(stage, str(stage or "pipeline"))
+    number = payload.get("number")
+    numbers = payload.get("numbers")
+    if not isinstance(numbers, list):
+        numbers = [number] if isinstance(number, int) else []
+    prefix = (
+        f"Pass {pass_number}/{MAX_PASSES}: "
+        if isinstance(pass_number, int)
+        else ""
+    )
+
+    update: dict[str, Any]
+    if event == "stack_pipeline_started":
+        selected = payload.get("selected") or []
+        numbers = selected
+        update = {
+            "message": (
+                f"Stack #{payload.get('stack_number')} pipeline starting for "
+                f"{format_pull_requests(selected)}."
+            ),
+            "next_action": "Validate the live native stack topology.",
+            "waiting": True,
+            "wait_reason": "validating the stack with GitHub",
+        }
+    elif event == "topology_validated":
+        selected = payload.get("selected") or []
+        numbers = selected
+        update = {
+            "message": f"Stack topology validated for {format_pull_requests(selected)}.",
+            "next_action": "Start pass 1.",
+            "waiting": False,
+        }
+    elif event == "pass_started":
+        update = {
+            "message": f"{prefix}started.",
+            "next_action": f"Start {STAGE_LABELS[STAGE_CONFLICT]}.",
+            "waiting": False,
+        }
+    elif event == "phase_started":
+        update = {
+            "message": (
+                f"{prefix}{label} starting for {format_pull_requests(numbers)}."
+            ),
+            "next_action": "Create, verify, and start the required worker processes.",
+            "waiting": True,
+            "wait_reason": "starting workers and checking GitHub state",
+        }
+    elif event == "worker_starting":
+        update = {
+            "message": f"{prefix}{label} worker starting for #{number}.",
+            "next_action": "Verify the worktree and wait for durable worker readiness.",
+            "waiting": True,
+            "wait_reason": f"starting the {label} worker for #{number}",
+        }
+    elif event == "worker_active":
+        update = {
+            "message": f"{prefix}{label} running for #{number}.",
+            "next_action": "Wait for the worker result.",
+            "waiting": True,
+            "wait_reason": f"waiting for the {label} worker on #{number}",
+        }
+    elif event == "worker_wait_started":
+        update = {
+            "message": f"{prefix}{label} still running for #{number}.",
+            "next_action": "Collect the worker result when it exits.",
+            "waiting": True,
+            "wait_reason": f"waiting for the {label} worker on #{number}",
+        }
+    elif event == "worker_finished":
+        returncode = payload.get("returncode")
+        accepted = payload.get("accepted")
+        if returncode not in {None, 0}:
+            outcome = f"failed for #{number} with exit code {returncode}"
+            next_action = "Finish the stage and preserve the failure in the pipeline result."
+        elif not accepted:
+            outcome = f"finished for #{number}, but its stale result was ignored"
+            next_action = "Continue with evidence for the current pull request head."
+        else:
+            outcome = f"completed for #{number}"
+            next_action = "Collect any remaining worker results."
+        update = {
+            "message": f"{prefix}{label} {outcome}.",
+            "next_action": next_action,
+            "waiting": True,
+            "wait_reason": "finishing the current stage",
+        }
+    elif event == "worker_launch_stopped":
+        update = {
+            "message": (
+                f"{prefix}{label} failed to launch for #{number}: "
+                f"{payload.get('reason', payload.get('step', 'unknown reason'))}."
+            ),
+            "next_action": "Stop the run without retrying or duplicating the worker.",
+            "waiting": False,
+        }
+    elif event == "push_propagated":
+        update = {
+            "message": (
+                f"{prefix}accepted CI push from #{number} propagation "
+                f"{payload.get('result')}."
+            ),
+            "next_action": "Continue bottom-up CI remediation.",
+            "waiting": True,
+            "wait_reason": "waiting for the current CI worker or descendant propagation",
+        }
+    elif event == "phase_finished":
+        stopped = payload.get("stopped")
+        blocked = payload.get("blocked")
+        if stopped:
+            outcome = "failed"
+            next_action = "Stop the pipeline and report the launch failure."
+        elif blocked:
+            outcome = f"blocked: {blocked.get('reason', 'unknown reason')}"
+            next_action = "Continue to the snapshot or next bounded pass."
+        else:
+            outcome = "complete"
+            next_action = "Revalidate the stack, then start the next stage."
+        update = {
+            "message": f"{prefix}{label} {outcome}.",
+            "next_action": next_action,
+            "waiting": not bool(stopped),
+            "wait_reason": (
+                "revalidating the stack before the next stage"
+                if not stopped
+                else None
+            ),
+        }
+    elif event == "snapshot_taken":
+        update = {
+            "message": (
+                f"{prefix}snapshot {payload.get('result')}"
+                + (
+                    f": {payload.get('reason')}."
+                    if payload.get("reason")
+                    else "."
+                )
+            ),
+            "next_action": (
+                "Finish the run."
+                if payload.get("result") == "complete"
+                else "Start the next pass if the two-pass budget allows."
+            ),
+            "waiting": True,
+            "wait_reason": "cleaning up worker worktrees and finalizing the result",
+        }
+    elif event == "stack_pipeline_finished":
+        result = payload.get("result", "unknown")
+        update = {
+            "message": (
+                f"Stack pipeline {result}"
+                + (f": {payload.get('reason')}." if payload.get("reason") else ".")
+            ),
+            "next_action": "Report the final pipeline result.",
+            "waiting": False,
+            "terminal": True,
+            "result": result,
+            "final_event": payload,
+        }
+    else:
+        return None
+
+    update.update(
+        {
+            "event": PROGRESS_EVENT,
+            "kind": "transition",
+            "source_event": event,
+            "pull_request_pass": pass_number,
+            "stage": stage,
+            "pull_requests": numbers,
+        }
+    )
+    return {key: value for key, value in update.items() if value is not None}
+
+
+class ProgressReporter(common.ConversationProgressReporter):
+    def __init__(
+        self,
+        *,
+        event_log: Path | None = None,
+        output: Callable[[dict[str, Any]], None] = common.emit,
+        wall_time: Callable[[], float] = time.time,
+    ) -> None:
+        super().__init__(
+            transition=progress_transition,
+            event_log=event_log,
+            output=output,
+            wall_time=wall_time,
+        )
 
 
 STACK_QUERY = (
@@ -926,6 +1154,13 @@ def launch_workers(
     workers: list[dict[str, Any]] = []
     stopped: dict[str, Any] | None = None
     for request in requests:
+        report_safely(
+            report,
+            "worker_starting",
+            number=request["number"],
+            stage=request["stage"],
+            pull_request_pass=request["pass"],
+        )
         created = launcher.create(request)
         if created.get("result") != "ready":
             stopped = {"step": "create", "number": request["number"], **created}
@@ -969,7 +1204,7 @@ def launch_workers(
         workers.append(worker)
         if on_active is not None:
             on_active(worker)
-        common.report_event(
+        report_safely(
             report,
             "worker_active",
             number=worker["number"],
@@ -980,7 +1215,7 @@ def launch_workers(
         )
     if stopped is not None:
         stopped.pop("handle", None)
-        common.report_event(report, "worker_launch_stopped", **stopped)
+        report_safely(report, "worker_launch_stopped", **stopped)
     return {"workers": workers, "stopped": stopped}
 
 
@@ -1134,7 +1369,7 @@ class StackPipeline:
     # State ---------------------------------------------------------------
 
     def emit(self, event: str, **fields: Any) -> None:
-        common.report_event(self.report, event, run_id=self.run_id, **fields)
+        report_safely(self.report, event, run_id=self.run_id, **fields)
 
     def save(self) -> None:
         save_state(self.state_path, self.state)
@@ -1258,6 +1493,12 @@ class StackPipeline:
     def finish_worker(
         self, worker: dict[str, Any], request: dict[str, Any]
     ) -> dict[str, Any]:
+        self.emit(
+            "worker_wait_started",
+            number=worker["number"],
+            stage=worker["stage"],
+            pull_request_pass=request["pass"],
+        )
         finished = self.launcher.wait(worker)
         completion = {
             "number": worker["number"],
@@ -1277,6 +1518,7 @@ class StackPipeline:
             "worker_finished",
             number=completion["number"],
             stage=completion["stage"],
+            pull_request_pass=request["pass"],
             returncode=completion.get("returncode"),
             accepted=completion["accepted"],
         )
@@ -1346,7 +1588,12 @@ class StackPipeline:
             "completions": completions,
             "stopped": launched["stopped"],
         }
-        self.emit("phase_finished", **summarize_phase(result))
+        self.emit(
+            "phase_finished",
+            pull_request_pass=pass_number,
+            numbers=[clicked["number"]],
+            **summarize_phase(result),
+        )
         return result
 
     def run_parallel_phase(
@@ -1392,7 +1639,12 @@ class StackPipeline:
             "completions": completions,
             "stopped": launched["stopped"],
         }
-        self.emit("phase_finished", **summarize_phase(result))
+        self.emit(
+            "phase_finished",
+            pull_request_pass=pass_number,
+            numbers=[member["number"] for member in selected],
+            **summarize_phase(result),
+        )
         return result
 
     def ci_gate(
@@ -1447,6 +1699,12 @@ class StackPipeline:
         def sweep() -> None:
             propagations.extend(self.propagate_ci_pushes(request, seen))
 
+        self.emit(
+            "worker_wait_started",
+            number=worker["number"],
+            stage=worker["stage"],
+            pull_request_pass=request["pass"],
+        )
         while self.launcher.is_running(worker):
             sweep()
             self.sleep(self.monitor_interval)
@@ -1500,6 +1758,8 @@ class StackPipeline:
             self.emit(
                 "push_propagated",
                 number=request["number"],
+                stage=STAGE_CI,
+                pull_request_pass=request["pass"],
                 head_sha=head_sha,
                 result=result,
             )
@@ -1641,7 +1901,12 @@ class StackPipeline:
             "propagations": propagations,
             "stopped": stopped,
         }
-        self.emit("phase_finished", **summarize_phase(result))
+        self.emit(
+            "phase_finished",
+            pull_request_pass=pass_number,
+            numbers=[member["number"] for member in current_selected],
+            **summarize_phase(result),
+        )
         return result
 
     # Snapshot ------------------------------------------------------------
@@ -1983,44 +2248,194 @@ def load_kickoff(args: argparse.Namespace) -> dict[str, Any]:
     return parse_kickoff(payload)
 
 
+validate_run_id = common.validate_run_id
+read_progress_log = common.read_progress_log
+watch_progress = common.watch_progress
+
+
+def scheduler_command(
+    args: argparse.Namespace,
+    kickoff: dict[str, Any],
+    repo_root: Path,
+    run_id: str,
+    event_log: Path,
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "run",
+        "--kickoff",
+        json.dumps(kickoff, separators=(",", ":")),
+        "--repo-root",
+        str(repo_root),
+        "--run-id",
+        run_id,
+        "--event-log",
+        str(event_log),
+        "--effort",
+        args.effort,
+    ]
+    for override in args.stage_model or []:
+        command.extend(["--stage-model", override])
+    return command
+
+
+def start_scheduler(
+    command: list[str], *, repo_root: Path, log_path: Path
+) -> subprocess.Popen[Any]:
+    return common.start_detached(command, cwd=repo_root, log_path=log_path)
+
+
+def command_start(args: argparse.Namespace) -> None:
+    kickoff = load_kickoff(args)
+    repo_root = (
+        Path(args.repo_root).resolve() if args.repo_root else common.resolve_repo_root()
+    )
+    run_id = uuid.uuid4().hex
+    event_log = progress_log_path(kickoff, run_id)
+    launch_path = launch_state_path(kickoff, run_id)
+    started_at_epoch = time.time()
+    common.write_json_atomically(
+        launch_path,
+        {
+            "kind": RUN_KIND,
+            "run_id": run_id,
+            "kickoff": kickoff,
+            "pid": None,
+            "event_log": str(event_log),
+            "started_at": utc_now(),
+            "started_at_epoch": started_at_epoch,
+        },
+    )
+    command = scheduler_command(args, kickoff, repo_root, run_id, event_log)
+    process = start_scheduler(
+        command,
+        repo_root=repo_root,
+        log_path=scheduler_log_path(kickoff, run_id),
+    )
+    try:
+        common.write_json_atomically(
+            launch_path,
+            {
+                "kind": RUN_KIND,
+                "run_id": run_id,
+                "kickoff": kickoff,
+                "pid": process.pid,
+                "event_log": str(event_log),
+                "started_at": utc_now(),
+                "started_at_epoch": started_at_epoch,
+            },
+        )
+    except OSError:
+        process.terminate()
+        raise
+    common.emit(
+        {
+            "event": "stack_pipeline_launched",
+            "run_id": run_id,
+            "pid": process.pid,
+            "cursor": 0,
+        }
+    )
+
+
+def command_watch(args: argparse.Namespace) -> None:
+    kickoff = load_kickoff(args)
+    run_id = validate_run_id(args.run_id)
+    common.emit(
+        watch_progress(
+            event_log=progress_log_path(kickoff, run_id),
+            launch_path=launch_state_path(kickoff, run_id),
+            observer_path=observer_state_path(kickoff, run_id),
+            cursor=args.cursor,
+            wait_seconds=args.wait_seconds,
+        )
+    )
+
+
 def command_run(args: argparse.Namespace) -> None:
     common.require_tools()
     kickoff = load_kickoff(args)
     repo_root = Path(args.repo_root).resolve() if args.repo_root else common.resolve_repo_root()
+    event_log = Path(args.event_log).resolve() if args.event_log else None
+    reporter = ProgressReporter(event_log=event_log)
     pipeline = StackPipeline(
         kickoff,
         repo_root,
         models=common.stage_models(args.stage_model),
         effort=args.effort,
-        report=common.emit,
+        run_id=validate_run_id(args.run_id) if args.run_id else None,
+        report=reporter,
     )
     result = pipeline.execute()
-    common.emit({"event": "stack_pipeline_finished", **result})
+    reporter({"event": "stack_pipeline_finished", **result})
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    command = subparsers.add_parser(
+    run = subparsers.add_parser(
         "run", help="run up to two bounded passes over one native stack"
     )
-    command.add_argument(
+    run.add_argument(
         "--kickoff",
         help="the structured kickoff JSON; omit to read it from standard input",
     )
-    command.add_argument(
+    run.add_argument(
         "--kickoff-file", help="read the structured kickoff JSON from this file"
     )
-    command.add_argument(
+    run.add_argument(
         "--repo-root", help="the repository clone the run works from"
     )
-    command.add_argument(
+    run.add_argument(
         "--stage-model",
         action="append",
         help="pin one stage's model as <stage>=<model>; repeatable",
     )
-    command.add_argument("--effort", default=DEFAULT_EFFORT)
-    command.set_defaults(function=command_run)
+    run.add_argument("--effort", default=DEFAULT_EFFORT)
+    run.add_argument("--run-id", help=argparse.SUPPRESS)
+    run.add_argument("--event-log", help=argparse.SUPPRESS)
+    run.set_defaults(function=command_run)
+
+    start = subparsers.add_parser(
+        "start", help="launch the scheduler and return a durable monitor handle"
+    )
+    start.add_argument(
+        "--kickoff",
+        help="the structured kickoff JSON; omit to read it from standard input",
+    )
+    start.add_argument(
+        "--kickoff-file", help="read the structured kickoff JSON from this file"
+    )
+    start.add_argument(
+        "--repo-root", help="the repository clone the run works from"
+    )
+    start.add_argument(
+        "--stage-model",
+        action="append",
+        help="pin one stage's model as <stage>=<model>; repeatable",
+    )
+    start.add_argument("--effort", default=DEFAULT_EFFORT)
+    start.set_defaults(function=command_start)
+
+    watch = subparsers.add_parser(
+        "watch", help="wait for progress or one five-minute heartbeat"
+    )
+    watch.add_argument(
+        "--kickoff",
+        help="the structured kickoff JSON; omit to read it from standard input",
+    )
+    watch.add_argument(
+        "--kickoff-file", help="read the structured kickoff JSON from this file"
+    )
+    watch.add_argument("--run-id", required=True)
+    watch.add_argument("--cursor", type=int, default=0)
+    watch.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=PROGRESS_HEARTBEAT_INTERVAL,
+    )
+    watch.set_defaults(function=command_watch)
     return parser
 
 
@@ -2030,22 +2445,62 @@ def main() -> int:
         args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:
-        common.emit(
-            {
-                "event": "stack_pipeline_finished",
-                "result": "error",
-                "error": str(error),
-            }
-        )
+        if args.command == "watch":
+            common.emit(
+                {
+                    "event": PROGRESS_UPDATE_EVENT,
+                    "updates": [],
+                    "finished": False,
+                    "monitor_failure": str(error),
+                }
+            )
+            return 1
+        if args.command == "start":
+            common.emit(
+                {
+                    "event": "stack_pipeline_launch_failed",
+                    "error": str(error),
+                }
+            )
+            return 1
+        event = {
+            "event": "stack_pipeline_finished",
+            "result": "error",
+            "error": str(error),
+        }
+        event_log = getattr(args, "event_log", None)
+        ProgressReporter(
+            event_log=Path(event_log).resolve() if event_log else None
+        )(event)
         return 1
     except KeyboardInterrupt:
-        common.emit(
-            {
-                "event": "stack_pipeline_finished",
-                "result": "error",
-                "error": "interrupted",
-            }
-        )
+        if args.command == "watch":
+            common.emit(
+                {
+                    "event": PROGRESS_UPDATE_EVENT,
+                    "updates": [],
+                    "finished": False,
+                    "monitor_failure": "interrupted",
+                }
+            )
+            return 130
+        if args.command == "start":
+            common.emit(
+                {
+                    "event": "stack_pipeline_launch_failed",
+                    "error": "interrupted",
+                }
+            )
+            return 130
+        event = {
+            "event": "stack_pipeline_finished",
+            "result": "error",
+            "error": "interrupted",
+        }
+        event_log = getattr(args, "event_log", None)
+        ProgressReporter(
+            event_log=Path(event_log).resolve() if event_log else None
+        )(event)
         return 130
 
 

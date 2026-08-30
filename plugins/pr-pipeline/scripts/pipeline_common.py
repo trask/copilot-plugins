@@ -12,6 +12,7 @@ reaching inside an implementation.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from typing import Any, Callable
 
 
@@ -96,6 +98,12 @@ PIPELINE_RUN_FLAG = "--pipeline-run"
 PIPELINE_ITERATION_FLAG = "--pipeline-iteration"
 PIPELINE_MAX_ITERATIONS_FLAG = "--pipeline-max-iterations"
 CLEARING_OUTCOMES = frozenset({"cleared", "skipped"})
+PROGRESS_EVENT = "pipeline_progress"
+PROGRESS_UPDATE_EVENT = "pipeline_update"
+PROGRESS_HEARTBEAT_INTERVAL = 300.0
+PROGRESS_WATCH_POLL_INTERVAL = 1.0
+PROGRESS_LIVENESS_INTERVAL = 15.0
+RUN_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
 
 SHIM_SUFFIXES = (".cmd", ".bat")
 
@@ -166,6 +174,274 @@ def report_event(
 ) -> None:
     if report is not None:
         report({"event": event, **fields})
+
+
+def report_safely(
+    report: Callable[[dict[str, Any]], None] | None,
+    event: str,
+    **fields: Any,
+) -> None:
+    try:
+        report_event(report, event, **fields)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+class ConversationProgressReporter:
+    """Mirror raw events and journal concise updates for a parent agent."""
+
+    def __init__(
+        self,
+        *,
+        transition: Callable[[dict[str, Any]], dict[str, Any] | None],
+        event_log: Path | None = None,
+        output: Callable[[dict[str, Any]], None] = emit,
+        wall_time: Callable[[], float] = time.time,
+    ) -> None:
+        self.transition = transition
+        self.event_log = event_log
+        self.output = output
+        self.wall_time = wall_time
+        self.last_wait_signature: str | None = None
+
+    def __call__(self, payload: dict[str, Any]) -> None:
+        try:
+            self.output(payload)
+        except (OSError, TypeError, ValueError):
+            pass
+        if self.event_log is None:
+            return
+        update = self.transition(payload)
+        if update is None:
+            return
+        signature = json.dumps(update, sort_keys=True)
+        if update.get("waiting") and signature == self.last_wait_signature:
+            return
+        self.last_wait_signature = signature if update.get("waiting") else None
+        now = self.wall_time()
+        update["reported_at_epoch"] = now
+        if update.get("waiting"):
+            update["wait_started_at_epoch"] = now
+            update["wait_id"] = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:16]
+        try:
+            self.event_log.parent.mkdir(parents=True, exist_ok=True)
+            with self.event_log.open("a", encoding="utf-8", newline="\n") as stream:
+                stream.write(json.dumps(update, sort_keys=True) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except (OSError, TypeError, ValueError):
+            pass
+
+
+def validate_run_id(run_id: str) -> str:
+    if not RUN_ID_PATTERN.fullmatch(run_id):
+        raise WorkflowError("run-id must be 32 lowercase hexadecimal characters")
+    return run_id
+
+
+def read_progress_log(path: Path) -> list[dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    records: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("event") == PROGRESS_EVENT:
+            records.append(payload)
+    return records
+
+
+def heartbeat_update(progress: dict[str, Any], now: float) -> dict[str, Any]:
+    started = progress.get("wait_started_at_epoch", progress.get("reported_at_epoch"))
+    elapsed = max(0, int(now - started)) if isinstance(started, (int, float)) else 0
+    minutes = max(1, elapsed // 60)
+    message = progress.get("message", "The pipeline is still running.").rstrip(".")
+    return {
+        **{
+            key: progress.get(key)
+            for key in (
+                "iteration",
+                "pull_request_pass",
+                "sweep",
+                "stage",
+                "pull_requests",
+                "wait_id",
+                "wait_reason",
+                "next_action",
+            )
+            if progress.get(key) is not None
+        },
+        "event": PROGRESS_EVENT,
+        "kind": "heartbeat",
+        "message": f"{message} ({minutes} minutes elapsed).",
+        "elapsed_seconds": elapsed,
+        "waiting": True,
+        "reported_at_epoch": now,
+    }
+
+
+def progress_update(
+    records: list[dict[str, Any]],
+    cursor: int,
+    observer_path: Path,
+    now: float,
+) -> dict[str, Any]:
+    updates = records[cursor:]
+    latest = updates[-1]
+    write_json_atomically(
+        observer_path,
+        {
+            "cursor": len(records),
+            "last_reported_at_epoch": now,
+            "wait_id": latest.get("wait_id") if latest.get("waiting") else None,
+        },
+    )
+    return {
+        "event": PROGRESS_UPDATE_EVENT,
+        "cursor": len(records),
+        "updates": updates,
+        "finished": any(update.get("terminal") for update in updates),
+    }
+
+
+def watch_progress(
+    *,
+    event_log: Path,
+    launch_path: Path,
+    observer_path: Path,
+    cursor: int,
+    wait_seconds: float,
+    wall_time: Callable[[], float] = time.time,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    alive: Callable[[int], bool] = lambda pid: process_is_alive(pid),
+) -> dict[str, Any]:
+    if cursor < 0:
+        raise WorkflowError("cursor cannot be negative")
+    if wait_seconds <= 0 or wait_seconds > PROGRESS_HEARTBEAT_INTERVAL:
+        raise WorkflowError(
+            f"wait-seconds must be greater than zero and at most "
+            f"{int(PROGRESS_HEARTBEAT_INTERVAL)}"
+        )
+    deadline = monotonic() + wait_seconds
+    last_liveness_check = float("-inf")
+    while True:
+        records = read_progress_log(event_log)
+        cursor = min(cursor, len(records))
+        if len(records) > cursor:
+            return progress_update(records, cursor, observer_path, wall_time())
+        latest = records[-1] if records else None
+        if latest is not None and latest.get("terminal"):
+            return {
+                "event": PROGRESS_UPDATE_EVENT,
+                "cursor": len(records),
+                "updates": [],
+                "finished": True,
+            }
+
+        launch = read_json(launch_path)
+        if not isinstance(launch, dict):
+            return {
+                "event": PROGRESS_UPDATE_EVENT,
+                "cursor": len(records),
+                "updates": [],
+                "finished": True,
+                "monitor_failure": "launch_record_missing",
+            }
+        pid = launch.get("pid")
+        current_monotonic = monotonic()
+        if (
+            isinstance(pid, int)
+            and current_monotonic - last_liveness_check >= PROGRESS_LIVENESS_INTERVAL
+        ):
+            last_liveness_check = current_monotonic
+            if not alive(pid):
+                records = read_progress_log(event_log)
+                cursor = min(cursor, len(records))
+                if len(records) > cursor:
+                    return progress_update(records, cursor, observer_path, wall_time())
+                if records and records[-1].get("terminal"):
+                    return {
+                        "event": PROGRESS_UPDATE_EVENT,
+                        "cursor": len(records),
+                        "updates": [],
+                        "finished": True,
+                    }
+                return {
+                    "event": PROGRESS_UPDATE_EVENT,
+                    "cursor": len(records),
+                    "updates": [],
+                    "finished": True,
+                    "monitor_failure": "scheduler_exited_without_final_event",
+                }
+
+        observer = read_json(observer_path)
+        last_reported = (
+            observer.get("last_reported_at_epoch")
+            if isinstance(observer, dict)
+            else launch.get("started_at_epoch")
+        )
+        now = wall_time()
+        if (
+            latest is not None
+            and isinstance(last_reported, (int, float))
+            and now - last_reported >= PROGRESS_HEARTBEAT_INTERVAL
+        ):
+            heartbeat = heartbeat_update(latest, now)
+            write_json_atomically(
+                observer_path,
+                {
+                    "cursor": len(records),
+                    "last_reported_at_epoch": now,
+                    "wait_id": latest.get("wait_id"),
+                },
+            )
+            return {
+                "event": PROGRESS_UPDATE_EVENT,
+                "cursor": len(records),
+                "updates": [heartbeat],
+                "finished": False,
+            }
+
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return {
+                "event": PROGRESS_UPDATE_EVENT,
+                "cursor": len(records),
+                "updates": [],
+                "finished": False,
+            }
+        sleep(min(PROGRESS_WATCH_POLL_INTERVAL, remaining))
+
+
+def start_detached(
+    command: list[str], *, cwd: Path, log_path: Path
+) -> subprocess.Popen[Any]:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log = log_path.open("w", encoding="utf-8", newline="\n")
+    options: dict[str, Any] = {
+        "cwd": str(cwd),
+        "stdin": subprocess.DEVNULL,
+        "stdout": log,
+        "stderr": subprocess.STDOUT,
+    }
+    if IS_WINDOWS:
+        options["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+    else:
+        options["start_new_session"] = True
+    try:
+        return subprocess.Popen(command, **options)
+    finally:
+        log.close()
 
 
 def gh_json(arguments: list[str]) -> Any:
@@ -1041,10 +1317,14 @@ def process_is_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     if IS_WINDOWS:
-        result = run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-            check=False,
-        )
+        try:
+            result = run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                check=False,
+                timeout=10,
+            )
+        except WorkflowError:
+            return True
         return str(pid) in (result.stdout or "")
     try:
         os.kill(pid, 0)
