@@ -51,6 +51,7 @@ def stack(members=(11, 12, 13), number=77, heads=None) -> dict:
             {
                 "position": index,
                 "number": member,
+                "title": f"Pull request {member}",
                 "head_branch": f"branch-{member}",
                 "base_branch": "main" if index == 0 else f"branch-{members[index - 1]}",
                 "head_sha": heads.get(member, head_of(member)),
@@ -155,8 +156,8 @@ class KickoffTest(unittest.TestCase):
 
     def test_session_title_is_exact(self):
         self.assertEqual(
-            "PR Stack Pipeline: owner/repo stack 77 from #11",
-            MODULE.session_title(kickoff()),
+            "PR Stack Pipeline: #11 - Add a thing",
+            MODULE.session_title(kickoff(), "Add a thing"),
         )
 
     def test_rejects_payloads_that_are_not_this_schema(self):
@@ -339,6 +340,7 @@ class TopologyTest(unittest.TestCase):
                                         "position": 0,
                                         "pullRequest": {
                                             "number": 11,
+                                            "title": "Pull request 11",
                                             "headRefName": "branch-11",
                                             "baseRefName": "main",
                                             "headRefOid": head_of(11),
@@ -878,7 +880,7 @@ class StackRunTest(StackFixture):
         self.assertIn("worker_start_failed", result["detail"])
         self.assertEqual(0, result["passes"])
         self.assertEqual(
-            "PR Stack Pipeline: owner/repo stack 77 from #11", result["session_title"]
+            "PR Stack Pipeline: #11 - Pull request 11", result["session_title"]
         )
 
     def test_the_run_cleans_up_the_worktrees_it_created(self):
@@ -1295,9 +1297,10 @@ class AgentInstructionTest(unittest.TestCase):
 
     def test_the_agent_states_the_session_title(self):
         self.assertIn(
-            "PR Stack Pipeline: <repository> stack <stackNumber> from #<startPullRequest>",
+            "PR Stack Pipeline: #<startPullRequest> - <PR title>",
             self.text,
         )
+        self.assertIn("After the command returns, rename the session", self.text)
 
     def test_the_agent_documents_the_kickoff_schema(self):
         self.assertIn('"version":1', self.text)

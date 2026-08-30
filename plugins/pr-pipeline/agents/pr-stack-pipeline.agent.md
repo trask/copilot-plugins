@@ -19,8 +19,6 @@ The prompt is exactly one JSON object and nothing else:
 
 `pullRequests` is the ordered selected suffix of the stack and starts at `startPullRequest`. Draft and non-draft members are both included. Pass the object to the helper exactly as received. Never edit it, reorder it, add a member, or drop a member. If it is missing, malformed, or not version 1, say so and stop.
 
-Immediately rename the session to `PR Stack Pipeline: <repository> stack <stackNumber> from #<startPullRequest>`, taking the values from the kickoff object, unless the current name already begins with that text.
-
 ## Running the helper
 
 Choose the command for the active shell, and pass the kickoff JSON as the single `--kickoff` value:
@@ -34,6 +32,8 @@ Start the command asynchronously as an attached process with a 30-second initial
 Before every shell read, send a visible one-line progress message followed by the read tool call. Tool call labels do not count as progress messages. Keep a compact cumulative summary across pull requests and phases, for example: `Pass 1/2: conflicts dispatched | Copilot review running on #11 #12 | self review, CI, descriptions pending`. Base it on events already received. Report a launch that stopped, a pushed commit propagated up the stack, a failed phase, or a blocker as soon as it appears. When nothing changed, say which phase is still running and include elapsed time when known. Do not print the raw JSON.
 
 Stop monitoring only after the shell completes, then use the `stack_pipeline_finished` event as the result.
+
+After the command returns, rename the session to the event's `session_title` when that field is present and the current name does not already begin with `PR Stack Pipeline: #<startPullRequest> - `. The helper builds the name as `PR Stack Pipeline: #<startPullRequest> - <PR title>` from the starting pull request's live metadata. If `session_title` is absent because the helper could not read that metadata, continue without renaming.
 
 ## What the helper does
 

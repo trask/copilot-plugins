@@ -189,10 +189,10 @@ def parse_kickoff(payload: Any) -> dict[str, Any]:
     }
 
 
-def session_title(kickoff: dict[str, Any]) -> str:
+def session_title(kickoff: dict[str, Any], pull_request_title: str) -> str:
     return (
-        f"PR Stack Pipeline: {kickoff['repository']} stack "
-        f"{kickoff['stackNumber']} from #{kickoff['startPullRequest']}"
+        f"PR Stack Pipeline: #{kickoff['startPullRequest']} - "
+        f"{pull_request_title}"
     )
 
 
@@ -230,7 +230,7 @@ STACK_QUERY = (
     "          nodes {"
     "            position"
     "            pullRequest {"
-    "              number headRefName baseRefName headRefOid isDraft state"
+    "              number title headRefName baseRefName headRefOid isDraft state"
     "            }"
     "          }"
     "        }"
@@ -260,11 +260,14 @@ def parse_stack(raw: Any) -> dict[str, Any] | None:
         if not isinstance(member, dict):
             raise WorkflowError("the native stack has an unreadable member")
         number = member.get("number")
+        title = member.get("title")
         head_branch = member.get("headRefName")
         base_branch = member.get("baseRefName")
         head_sha = member.get("headRefOid")
         if (
             not isinstance(number, int)
+            or not isinstance(title, str)
+            or not title
             or not isinstance(head_branch, str)
             or not head_branch
             or not isinstance(base_branch, str)
@@ -279,6 +282,7 @@ def parse_stack(raw: Any) -> dict[str, Any] | None:
             {
                 "position": node.get("position"),
                 "number": number,
+                "title": title,
                 "head_branch": head_branch,
                 "base_branch": base_branch,
                 "head_sha": head_sha,
@@ -1125,6 +1129,7 @@ class StackPipeline:
         self.state: dict[str, Any] = {}
         self.touched: set[int] = set()
         self.propagations: list[dict[str, Any]] = []
+        self.session_title: str | None = None
 
     # State ---------------------------------------------------------------
 
@@ -1146,6 +1151,17 @@ class StackPipeline:
 
     def revalidate(self) -> dict[str, Any]:
         stack = self.read_stack(self.repository, self.kickoff["startPullRequest"])
+        if stack is not None:
+            start = next(
+                (
+                    member
+                    for member in stack["members"]
+                    if member["number"] == self.kickoff["startPullRequest"]
+                ),
+                None,
+            )
+            if start is not None:
+                self.session_title = session_title(self.kickoff, start["title"])
         validation = validate_selection(self.kickoff, stack)
         if validation["result"] != "ready":
             return validation
@@ -1735,7 +1751,6 @@ class StackPipeline:
             "stack_number": self.kickoff["stackNumber"],
             "start_pull_request": self.kickoff["startPullRequest"],
             "selected": list(self.kickoff["pullRequests"]),
-            "session_title": session_title(self.kickoff),
             "passes": passes,
             "state_path": str(self.state_path),
             "pull_requests": self.state.get("pull_requests", {}),
@@ -1749,6 +1764,8 @@ class StackPipeline:
             payload["detail"] = detail
         if snapshot is not None:
             payload["snapshot"] = snapshot
+        if self.session_title is not None:
+            payload["session_title"] = self.session_title
         release_lock(self.lock_path, self.run_id)
         return payload
 
@@ -1759,7 +1776,6 @@ class StackPipeline:
             stack_number=self.kickoff["stackNumber"],
             start_pull_request=self.kickoff["startPullRequest"],
             selected=list(self.kickoff["pullRequests"]),
-            session_title=session_title(self.kickoff),
         )
         opening = self.revalidate()
         if opening["result"] != "ready":
@@ -1780,8 +1796,12 @@ class StackPipeline:
                 "repository": self.repository,
                 "stack_number": self.kickoff["stackNumber"],
                 "holder": lock["holder"],
-                "session_title": session_title(self.kickoff),
                 "state_path": str(self.state_path),
+                **(
+                    {"session_title": self.session_title}
+                    if self.session_title is not None
+                    else {}
+                ),
             }
         self.state = resume_state(
             self.state_path, self.kickoff, self.run_id, fingerprint
@@ -1804,8 +1824,12 @@ class StackPipeline:
                 "repository": self.repository,
                 "stack_number": self.kickoff["stackNumber"],
                 "workers": active_workers,
-                "session_title": session_title(self.kickoff),
                 "state_path": str(self.state_path),
+                **(
+                    {"session_title": self.session_title}
+                    if self.session_title is not None
+                    else {}
+                ),
             }
         self.state["active_workers"] = []
         self.state["run_directory"] = str(self.run_directory)

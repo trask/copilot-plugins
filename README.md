@@ -78,8 +78,9 @@ PR Flight starts the stack agent with one JSON object:
 
 `pullRequests` is the ordered, base-to-tip selected suffix beginning at
 `startPullRequest`. The helper checks that identity and order against the live
-native stack before it starts. Sessions use the title prefix
-`PR Stack Pipeline: <repository> stack <stackNumber> from #<startPullRequest>`.
+native stack before it starts. After the run, the session is named
+`PR Stack Pipeline: #<startPullRequest> - <PR title>` from the starting pull
+request's live metadata.
 Durable state lives under `~/.copilot/run/pr-stack-pipeline/` and exposes the run
 ID, topology fingerprint, selected suffix, expected heads and bases, current
 pass and phase, per-PR stage state, dispatch nonces, result, and timestamps.
