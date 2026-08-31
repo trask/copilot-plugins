@@ -32,9 +32,18 @@ DIFF = """diff --git a/app.py b/app.py
 """
 
 
-def check(key, name=None, klass="failed", url=None, completed_at=None):
+def check(
+    key,
+    name=None,
+    klass="failed",
+    url=None,
+    completed_at=None,
+    *,
+    kind="check_run",
+    description=None,
+):
     return {
-        "kind": "check_run",
+        "kind": kind,
         "key": key,
         "name": name or key.split(":", 1)[-1],
         "workflow": None,
@@ -45,7 +54,7 @@ def check(key, name=None, klass="failed", url=None, completed_at=None):
         "url": url,
         "started_at": None,
         "completed_at": completed_at,
-        "description": None,
+        "description": description,
     }
 
 
@@ -1035,7 +1044,7 @@ class DecideTest(unittest.TestCase):
         self.assertEqual("waiting", decision["decision"])
         self.assertEqual("still_running", decision["reason"])
 
-    def test_an_approval_blocked_check_escalates_before_anything_else(self):
+    def test_a_concrete_failure_precedes_other_check_states(self):
         decision = self.decide(
             [
                 check("check:a", klass="approval_blocked"),
@@ -1044,8 +1053,9 @@ class DecideTest(unittest.TestCase):
                 check("check:d", klass="unknown"),
             ]
         )
-        self.assertEqual("escalate", decision["decision"])
-        self.assertEqual("approval_required", decision["reason"])
+        self.assertEqual("failures", decision["decision"])
+        self.assertEqual(["check:c"], decision["checks"])
+        self.assertEqual(["check:b"], decision["pending_checks"])
 
     def test_an_empty_rollup_with_blocked_runs_escalates_for_approval(self):
         decision = self.decide(
@@ -1085,19 +1095,41 @@ class DecideTest(unittest.TestCase):
         self.assertEqual("checks_never_started", decision["reason"])
         self.assertEqual(["check:a"], decision["checks"])
 
-    def test_a_never_started_check_escalates_even_beside_a_failure(self):
+    def test_a_failure_precedes_a_never_started_check(self):
         tracking = {"check:a": {"not_started_since": stamp(30)}}
         decision = self.decide(
             [check("check:a", klass="not_started"), check("check:b", klass="failed")],
             tracking=tracking,
         )
-        self.assertEqual("checks_never_started", decision["reason"])
+        self.assertEqual("failures", decision["decision"])
+        self.assertEqual(["check:b"], decision["checks"])
+        self.assertEqual(["check:a"], decision["pending_checks"])
 
-    def test_a_running_check_defers_the_failure_decision(self):
+    def test_a_running_check_is_preserved_beside_the_failure_decision(self):
         decision = self.decide(
             [check("check:a", klass="running"), check("check:b", klass="failed")]
         )
-        self.assertEqual("waiting", decision["decision"])
+        self.assertEqual("failures", decision["decision"])
+        self.assertEqual(["check:b"], decision["checks"])
+        self.assertEqual(["check:a"], decision["pending_checks"])
+
+    def test_an_aggregate_failure_is_not_an_independent_root_cause(self):
+        decision = self.decide(
+            [
+                check("check:a", name="build"),
+                check(
+                    "status:required-status-check",
+                    name="required-status-check",
+                    kind="status",
+                ),
+                check("check:b", klass="running"),
+            ]
+        )
+        self.assertEqual(["check:a"], decision["checks"])
+        self.assertEqual(
+            ["status:required-status-check"], decision["aggregate_checks"]
+        )
+        self.assertEqual(["check:b"], decision["pending_checks"])
 
     def test_the_grace_period_is_configurable(self):
         tracking = {"check:a": {"not_started_since": stamp(5)}}
@@ -1250,6 +1282,60 @@ class NextActionTest(unittest.TestCase):
         self.assertEqual("fix", action["action"])
         self.assertEqual(["check:b"], action["checks"])
 
+    def test_a_fixable_failure_comes_before_unattributed_diagnostics(self):
+        action = self.action(
+            ["check:a", "check:b"],
+            {
+                "check:a": attribution("check:a", "unknown"),
+                "check:b": attribution("check:b", "pr_caused"),
+            },
+        )
+        self.assertEqual("fix", action["action"])
+        self.assertEqual(["check:b"], action["checks"])
+
+    def test_pre_existing_failure_waits_for_pending_checks(self):
+        state = {
+            "reruns": {},
+            "run": {
+                "attributions": {
+                    "check:a": attribution("check:a", "pre_existing")
+                },
+                "batches": [],
+            },
+        }
+        decision = {
+            "decision": "failures",
+            "reason": "checks_failed",
+            "checks": ["check:a"],
+            "pending_checks": ["check:b"],
+            "detail": "",
+        }
+        action = MODULE.next_action(state, decision)
+        self.assertEqual("waiting", action["action"])
+        self.assertEqual(["check:b"], action["checks"])
+
+    def test_pre_existing_failure_does_not_hide_an_overdue_check(self):
+        state = {
+            "reruns": {},
+            "run": {
+                "attributions": {
+                    "check:a": attribution("check:a", "pre_existing")
+                },
+                "batches": [],
+            },
+        }
+        decision = {
+            "decision": "failures",
+            "reason": "checks_failed",
+            "checks": ["check:a"],
+            "pending_checks": ["check:b"],
+            "overdue_checks": ["check:b"],
+            "detail": "",
+        }
+        action = MODULE.next_action(state, decision)
+        self.assertEqual("escalate", action["action"])
+        self.assertEqual("checks_never_started", action["reason"])
+
     def test_escalates_a_failure_that_survived_its_recorded_fix(self):
         action = self.action(
             ["check:a"],
@@ -1259,7 +1345,7 @@ class NextActionTest(unittest.TestCase):
         self.assertEqual("escalate", action["action"])
         self.assertEqual("unfixable_failure", action["reason"])
 
-    def test_attribution_comes_before_every_other_action(self):
+    def test_attribution_follows_an_already_attributed_fix(self):
         action = self.action(
             ["check:a", "check:b"],
             {
@@ -1267,7 +1353,8 @@ class NextActionTest(unittest.TestCase):
                 "check:b": attribution("check:b", "pr_caused"),
             },
         )
-        self.assertEqual("attribute", action["action"])
+        self.assertEqual("fix", action["action"])
+        self.assertEqual(["check:b"], action["checks"])
 
 
 class RunReferenceTest(unittest.TestCase):
@@ -1618,6 +1705,45 @@ class RerunCommandTest(unittest.TestCase):
         self.assertEqual(1, payload["reruns"])
         self.assertEqual(1, MODULE.load_state(path)["reruns"]["check:a"]["count"])
 
+    def test_permission_denial_uses_the_empty_commit_fallback(self):
+        path = self.state_with()
+
+        def fallback(*_arguments, **_options):
+            MODULE.emit({"result": "empty_commit_published"})
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "rerun_failed_jobs",
+                side_effect=MODULE.RerunPermissionDenied(
+                    "must have write access to the repository"
+                ),
+            ),
+            mock.patch.object(
+                MODULE, "publish_empty_rerun_commit", side_effect=fallback
+            ) as publish,
+        ):
+            payload = call("rerun", "--state", str(path), "--check", "check:a")
+
+        self.assertEqual("empty_commit_published", payload["result"])
+        publish.assert_called_once()
+
+    def test_transient_rerun_failure_stays_retryable_without_an_empty_commit(self):
+        path = self.state_with()
+        with (
+            mock.patch.object(
+                MODULE,
+                "rerun_failed_jobs",
+                side_effect=MODULE.WorkflowError("GitHub timed out"),
+            ),
+            mock.patch.object(MODULE, "publish_empty_rerun_commit") as publish,
+        ):
+            with self.assertRaises(MODULE.WorkflowError):
+                call("rerun", "--state", str(path), "--check", "check:a")
+
+        publish.assert_not_called()
+        self.assertEqual({}, MODULE.load_state(path)["reruns"])
+
     def test_refuses_a_second_rerun_of_the_same_check(self):
         path = self.state_with(reruns={"check:a": {"count": 1}})
         with mock.patch.object(MODULE, "rerun_failed_jobs") as request:
@@ -1675,6 +1801,241 @@ class RerunCommandTest(unittest.TestCase):
         with mock.patch.object(MODULE, "rerun_failed_jobs"):
             call("rerun", "--state", str(path), "--check", "check:a")
         self.assertEqual("head1", MODULE.load_state(path)["reruns"]["check:a"]["head_sha"])
+
+    def test_only_explicit_permission_errors_are_permission_denials(self):
+        permission = SimpleNamespace(
+            returncode=1,
+            stderr="HTTP 403: must have write access to the repository",
+            stdout="",
+        )
+        transient = SimpleNamespace(
+            returncode=1,
+            stderr="HTTP 503: service unavailable",
+            stdout="",
+        )
+        with mock.patch.object(MODULE, "run", return_value=permission):
+            with self.assertRaises(MODULE.RerunPermissionDenied):
+                MODULE.rerun_failed_jobs(
+                    {"upstream_owner": "owner", "upstream_repo": "repo"}, 5
+                )
+        with mock.patch.object(MODULE, "run", return_value=transient):
+            with self.assertRaises(MODULE.WorkflowError) as error:
+                MODULE.rerun_failed_jobs(
+                    {"upstream_owner": "owner", "upstream_repo": "repo"}, 5
+                )
+        self.assertNotIsInstance(error.exception, MODULE.RerunPermissionDenied)
+
+    def test_empty_commit_fallback_refuses_a_dirty_worktree(self):
+        path = self.state_with()
+        state = MODULE.load_state(path)
+        with mock.patch.object(
+            MODULE, "git", return_value=" M app.py"
+        ), self.assertRaises(MODULE.WorkflowError) as error:
+            MODULE.publish_empty_rerun_commit(
+                path,
+                state,
+                "check:a",
+                state["run"]["attributions"]["check:a"],
+                run_id=5,
+                permission_detail="must have write access",
+            )
+        self.assertIn("worktree is not clean", str(error.exception))
+        self.assertEqual({}, MODULE.load_state(path)["reruns"])
+
+    def test_empty_commit_fallback_refuses_a_moved_head(self):
+        path = self.state_with()
+        state = MODULE.load_state(path)
+
+        def fake_git(_root, *arguments):
+            if arguments[0] == "status":
+                return ""
+            if arguments[:2] == ("rev-parse", "HEAD"):
+                return "head1"
+            if arguments[:2] == ("branch", "--show-current"):
+                return ""
+            raise AssertionError(arguments)
+
+        with (
+            mock.patch.object(MODULE, "git", side_effect=fake_git),
+            mock.patch.object(MODULE, "metadata_for", return_value={"head_sha": "head9"}),
+            self.assertRaises(MODULE.WorkflowError) as error,
+        ):
+            MODULE.publish_empty_rerun_commit(
+                path,
+                state,
+                "check:a",
+                state["run"]["attributions"]["check:a"],
+                run_id=5,
+                permission_detail="must have write access",
+            )
+        self.assertIn("PR head moved", str(error.exception))
+        self.assertEqual({}, MODULE.load_state(path)["reruns"])
+
+    def test_empty_commit_fallback_refuses_the_base_branch(self):
+        path = self.state_with()
+        state = MODULE.load_state(path)
+        state["pr"]["head_branch"] = "main"
+
+        def fake_git(_root, *arguments):
+            if arguments[0] == "status":
+                return ""
+            if arguments[:2] == ("rev-parse", "HEAD"):
+                return "head1"
+            raise AssertionError(arguments)
+
+        with (
+            mock.patch.object(MODULE, "git", side_effect=fake_git),
+            mock.patch.object(MODULE, "metadata_for", return_value={"head_sha": "head1"}),
+            self.assertRaises(MODULE.WorkflowError) as error,
+        ):
+            MODULE.publish_empty_rerun_commit(
+                path,
+                state,
+                "check:a",
+                state["run"]["attributions"]["check:a"],
+                run_id=5,
+                permission_detail="must have write access",
+            )
+        self.assertIn("not safely writable", str(error.exception))
+
+    def test_empty_commit_fallback_requires_one_parent_and_an_identical_tree(self):
+        cases = (
+            ("head2 head1 other", "tree1", "tree1"),
+            ("head2 head1", "tree2", "tree1"),
+        )
+        for parents, commit_tree, pinned_tree in cases:
+            with self.subTest(parents=parents, commit_tree=commit_tree):
+                trees = iter([commit_tree, pinned_tree])
+
+                def fake_git(_root, *arguments):
+                    if arguments[0] == "rev-list":
+                        return parents
+                    if arguments[0] == "rev-parse":
+                        return next(trees)
+                    raise AssertionError(arguments)
+
+                with (
+                    mock.patch.object(MODULE, "git", side_effect=fake_git),
+                    self.assertRaises(MODULE.WorkflowError),
+                ):
+                    MODULE.require_empty_child(self.root, "head2", "head1")
+
+    def test_empty_commit_fallback_records_an_accepted_pipeline_push(self):
+        path = self.state_with()
+        state = MODULE.load_state(path)
+        state["pipeline_budget"] = {"run": "stack-run", "iteration": 1}
+        MODULE.save_state(path, state)
+        committed = False
+        commands = []
+
+        def fake_git(_root, *arguments):
+            if arguments[0] == "status":
+                return ""
+            if arguments[:2] == ("rev-parse", "HEAD"):
+                return "head2" if committed else "head1"
+            if arguments[0] == "rev-list":
+                return "head2 head1"
+            if arguments[0] == "rev-parse" and str(arguments[1]).endswith("^{tree}"):
+                return "tree1"
+            if arguments[:2] == ("branch", "--show-current"):
+                return ""
+            raise AssertionError(arguments)
+
+        def fake_run(command, **_options):
+            nonlocal committed
+            commands.append(command)
+            if "commit" in command:
+                committed = True
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        metadata = [{"head_sha": "head1"}, {"head_sha": "head2"}]
+        with (
+            mock.patch.object(MODULE, "git", side_effect=fake_git),
+            mock.patch.object(MODULE, "metadata_for", side_effect=metadata),
+            mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
+            mock.patch.object(MODULE, "remote_head", return_value="head1"),
+            mock.patch.object(MODULE, "wait_for_remote_head", return_value="head2"),
+            mock.patch.object(MODULE, "run", side_effect=fake_run),
+        ):
+            stream = io.StringIO()
+            with contextlib.redirect_stdout(stream):
+                MODULE.publish_empty_rerun_commit(
+                    path,
+                    state,
+                    "check:a",
+                    state["run"]["attributions"]["check:a"],
+                    run_id=5,
+                    permission_detail="must have write access",
+                )
+            payload = json.loads(stream.getvalue())
+
+        self.assertEqual("empty_commit_published", payload["result"])
+        commit_command = next(command for command in commands if "commit" in command)
+        self.assertIn("--no-verify", commit_command)
+        self.assertTrue(any("push" in command for command in commands))
+        saved = MODULE.load_state(path)
+        checkpoint = saved["accepted_pushes"][0]
+        self.assertEqual("ci_rerun", checkpoint["kind"])
+        self.assertEqual("head1", checkpoint["previous_head_sha"])
+        self.assertEqual("head2", checkpoint["head_sha"])
+        self.assertEqual(["head2"], checkpoint["commits"])
+        self.assertEqual("stack-run", checkpoint["pipeline_run"])
+        self.assertEqual("published", saved["run"]["status"])
+
+    def test_interrupted_empty_commit_fallback_is_finalized_without_duplication(self):
+        path = self.state_with(
+            reruns={
+                "check:a": {
+                    "count": 1,
+                    "name": "build",
+                    "run_id": 5,
+                    "head_sha": "head1",
+                    "requested_at": stamp(),
+                    "method": "empty_commit",
+                    "status": "pushed",
+                    "commit_sha": "head2",
+                    "permission_detail": "must have write access",
+                }
+            }
+        )
+        state = MODULE.load_state(path)
+
+        def fake_git(_root, *arguments):
+            if arguments[0] == "status":
+                return ""
+            if arguments[:2] == ("rev-parse", "HEAD"):
+                return "head2"
+            if arguments[:2] == ("branch", "--show-current"):
+                return ""
+            if arguments[0] == "rev-list":
+                return "head2 head1"
+            if arguments[0] == "rev-parse" and str(arguments[1]).endswith("^{tree}"):
+                return "tree1"
+            raise AssertionError(arguments)
+
+        with (
+            mock.patch.object(MODULE, "git", side_effect=fake_git),
+            mock.patch.object(MODULE, "metadata_for", return_value={"head_sha": "head2"}),
+            mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
+            mock.patch.object(MODULE, "remote_head", return_value="head2"),
+            mock.patch.object(MODULE, "wait_for_remote_head", return_value="head2"),
+            mock.patch.object(MODULE, "run") as run,
+        ):
+            stream = io.StringIO()
+            with contextlib.redirect_stdout(stream):
+                MODULE.publish_empty_rerun_commit(
+                    path,
+                    state,
+                    "check:a",
+                    state["run"]["attributions"]["check:a"],
+                    run_id=5,
+                    permission_detail="must have write access",
+                )
+
+        run.assert_not_called()
+        saved = MODULE.load_state(path)
+        self.assertEqual("published", saved["reruns"]["check:a"]["status"])
+        self.assertEqual(1, len(saved["accepted_pushes"]))
 
 
 class RerunWatermarkTest(unittest.TestCase):
@@ -2097,6 +2458,32 @@ class ChecksCommandTest(unittest.TestCase):
         self.assertEqual(["check:a"], payload["action_checks"])
         self.assertEqual("build", payload["failing"][0]["name"])
 
+    def test_reports_a_concrete_failure_while_other_checks_are_pending(self):
+        path = write_state(self.root)
+        payload = self.read(
+            path,
+            (
+                "head1",
+                [
+                    check("check:a", name="build"),
+                    check("check:b", klass="running"),
+                    check(
+                        "status:required-status-check",
+                        name="required-status-check",
+                        kind="status",
+                    ),
+                ],
+            ),
+        )
+        self.assertEqual("attribute", payload["result"])
+        self.assertEqual(["check:a"], payload["action_checks"])
+        self.assertEqual(["check:b"], payload["pending_checks"])
+        self.assertEqual(
+            ["status:required-status-check"], payload["aggregate_checks"]
+        )
+        saved = MODULE.load_state(path)["run"]["decision"]
+        self.assertEqual(["check:b"], saved["pending_checks"])
+
     def test_escalates_without_editing_when_the_base_already_fails(self):
         path = write_state(self.root)
         payload = self.read(
@@ -2144,6 +2531,28 @@ class ChecksCommandTest(unittest.TestCase):
         self.assertEqual("waiting", payload["result"])
         self.assertEqual("still_running", payload["reason"])
         self.assertIsNone(MODULE.load_state(path)["escalation"])
+
+    def test_wait_keeps_polling_after_a_pre_existing_failure(self):
+        path = write_state(self.root)
+        rollup = (
+            "head1",
+            [
+                check("check:a", name="build"),
+                check("check:b", klass="running"),
+            ],
+        )
+        with (
+            mock.patch.object(MODULE, "fetch_rollup", return_value=rollup) as fetch,
+            mock.patch.object(
+                MODULE, "baseline_conclusions", return_value={"build": "FAILURE"}
+            ),
+            mock.patch.object(MODULE, "time") as clock,
+        ):
+            clock.monotonic.side_effect = [0.0, 0.0, 300.0]
+            clock.sleep.return_value = None
+            payload = call("checks", "--state", str(path), "--wait")
+        self.assertEqual("waiting", payload["result"])
+        self.assertEqual(2, fetch.call_count)
 
     def test_escalates_an_approval_blocked_fork_run(self):
         path = write_state(self.root)
@@ -2358,6 +2767,26 @@ class PublishCommandTest(unittest.TestCase):
         payload = call("status", "--state", str(path))
 
         self.assertEqual([checkpoint], payload["accepted_pushes"])
+
+    def test_status_distinguishes_diagnostics_from_waiting(self):
+        path = write_state(
+            self.root,
+            run={
+                "decision": {
+                    "decision": "failures",
+                    "action": "attribute",
+                    "reason": "unattributed_failures",
+                    "checks": ["check:a"],
+                    "action_checks": ["check:a"],
+                    "pending_checks": ["check:b"],
+                    "observed_at": "2026-01-01T00:00:00Z",
+                }
+            },
+        )
+        payload = call("status", "--state", str(path))
+        self.assertEqual("diagnosing", payload["progress"]["phase"])
+        self.assertEqual(["check:a"], payload["progress"]["action_checks"])
+        self.assertEqual(["check:b"], payload["progress"]["pending_checks"])
 
     def test_records_the_local_validation_behind_the_push(self):
         """The state has to say what ran, or a live run proves nothing.

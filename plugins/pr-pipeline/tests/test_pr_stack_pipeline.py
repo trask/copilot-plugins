@@ -373,6 +373,7 @@ class StackFixture(unittest.TestCase):
         self.clear: set[tuple[int, str]] = set()
         self.nonce_count = 0
         self.checkpoint_map: dict[int, list[dict]] = {}
+        self.worker_progress_map: dict[int, dict] = {}
         self.propagated: list[tuple[int, str]] = []
         self.contains_pairs: set[tuple[str, str]] | None = None
 
@@ -399,6 +400,9 @@ class StackFixture(unittest.TestCase):
 
     def checkpoints(self, repository, number):
         return self.checkpoint_map.get(number, [])
+
+    def worker_progress(self, repository, number):
+        return self.worker_progress_map.get(number)
 
     def propagate(self, repository, number, head_sha, stack_number):
         self.propagated.append((number, head_sha))
@@ -429,6 +433,7 @@ class StackFixture(unittest.TestCase):
             "base_tip": lambda repository, branch: BASE,
             "contains": self.contains,
             "checkpoints": self.checkpoints,
+            "worker_progress": self.worker_progress,
             "propagate": self.propagate,
             "dependencies": lambda: [],
             "sleep": lambda _seconds: None,
@@ -784,6 +789,30 @@ class StackRunTest(StackFixture):
         pipeline.monitor_ci_worker(launched["workers"][0], request)
 
         self.assertEqual([(11, "1" * 40)], self.propagated)
+
+    def test_ci_monitor_reports_known_failure_diagnostics_once(self):
+        self.launcher = FakeLauncher(alive_polls=2)
+        self.worker_progress_map[11] = {
+            "phase": "diagnosing",
+            "action": "attribute",
+            "reason": "unattributed_failures",
+            "action_checks": ["check:build"],
+            "pending_checks": ["check:test"],
+            "head_sha": head_of(11),
+        }
+        pipeline = self.pipeline()
+        member = self.stack["members"][0]
+        request = pipeline.request_for(member, MODULE.STAGE_CI, 1)
+        launched = pipeline.dispatch([request], MODULE.STAGE_CI, 1)
+
+        pipeline.monitor_ci_worker(launched["workers"][0], request)
+
+        progress = [
+            event for event in self.events if event["event"] == "worker_progress"
+        ]
+        self.assertEqual(1, len(progress))
+        self.assertEqual("diagnosing", progress[0]["phase"])
+        self.assertEqual(["check:test"], progress[0]["pending_checks"])
 
     def test_stale_push_checkpoints_are_ignored(self):
         self.launcher = FakeLauncher(alive_polls=1)
@@ -1350,6 +1379,23 @@ class ProgressProtocolTest(StackFixture):
         self.assertIn("starting workers", updates[0]["wait_reason"])
         self.assertTrue(updates[0]["next_action"])
         self.assertIn("failed for #11", updates[1]["message"])
+
+    def test_worker_progress_names_known_failure_diagnostics(self):
+        reporter, _ = self.reporter()
+        reporter(
+            {
+                "event": "worker_progress",
+                "stage": MODULE.STAGE_CI,
+                "pull_request_pass": 1,
+                "number": 11,
+                "phase": "diagnosing",
+                "action_checks": ["check:build"],
+                "pending_checks": ["check:test"],
+            }
+        )
+        update = MODULE.read_progress_log(self.event_log)[0]
+        self.assertIn("diagnosing 1 known failure", update["message"])
+        self.assertIn("diagnosing a known CI failure", update["wait_reason"])
 
     def test_real_scheduler_events_keep_pass_and_pull_request_context(self):
         self.clear_everything()

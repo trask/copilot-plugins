@@ -326,6 +326,32 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
             "waiting": True,
             "wait_reason": f"waiting for the {label} worker on #{number}",
         }
+    elif event == "worker_progress":
+        phase = payload.get("phase")
+        action_checks = payload.get("action_checks") or []
+        pending_checks = payload.get("pending_checks") or []
+        if phase == "diagnosing":
+            message = f"{prefix}{label} diagnosing {len(action_checks)} known failure(s) for #{number}."
+            next_action = "Attribute the known failure from its logs and the pinned diff."
+        elif phase == "fixing":
+            message = f"{prefix}{label} fixing {len(action_checks)} attributed failure(s) for #{number}."
+            next_action = "Validate, commit, and publish the fix."
+        elif phase == "rerunning":
+            message = f"{prefix}{label} retrying {len(action_checks)} suspected flake(s) for #{number}."
+            next_action = "Request one safe retry, then inspect its result."
+        else:
+            message = f"{prefix}{label} monitoring {len(pending_checks)} pending check(s) for #{number}."
+            next_action = "Inspect the next concrete failure as soon as it completes."
+        update = {
+            "message": message,
+            "next_action": next_action,
+            "waiting": True,
+            "wait_reason": (
+                f"{phase} a known CI failure for #{number}"
+                if phase != "waiting"
+                else f"waiting for remaining CI checks on #{number}"
+            ),
+        }
     elif event == "worker_finished":
         returncode = payload.get("returncode")
         accepted = payload.get("accepted")
@@ -1250,6 +1276,11 @@ def accepted_push_checkpoints(
     return [push for push in pushes or [] if isinstance(push, dict)]
 
 
+def ci_worker_progress(repository: str, number: int) -> dict[str, Any] | None:
+    target = common.target_for(repository, number)
+    return common.stage_live_progress(STAGE_BY_NAME[STAGE_CI], target)
+
+
 def propagate_descendants(
     repository: str,
     number: int,
@@ -1341,6 +1372,7 @@ class StackPipeline:
         base_tip: Callable[[str, str], str] = base_ref_tip,
         contains: Callable[[Path, str, str], bool] | None = None,
         checkpoints: Callable[..., list[dict[str, Any]]] = accepted_push_checkpoints,
+        worker_progress: Callable[[str, int], dict[str, Any] | None] = ci_worker_progress,
         propagate: Callable[..., dict[str, Any]] = propagate_descendants,
         dependencies: Callable[[], list[str]] = missing_dependencies,
         sleep: Callable[[float], None] = time.sleep,
@@ -1374,6 +1406,7 @@ class StackPipeline:
             )
         )
         self.checkpoints = checkpoints
+        self.worker_progress = worker_progress
         self.propagate = propagate
         self.dependencies = dependencies
         self.sleep = sleep
@@ -1726,9 +1759,25 @@ class StackPipeline:
         """
         seen: set[str] = set()
         propagations: list[dict[str, Any]] = []
+        last_progress_signature: str | None = None
 
         def sweep() -> None:
+            nonlocal last_progress_signature
             propagations.extend(self.propagate_ci_pushes(request, seen))
+            progress = self.worker_progress(self.repository, request["number"])
+            if progress is None:
+                return
+            signature = json.dumps(progress, sort_keys=True)
+            if signature == last_progress_signature:
+                return
+            last_progress_signature = signature
+            self.emit(
+                "worker_progress",
+                number=request["number"],
+                stage=STAGE_CI,
+                pull_request_pass=request["pass"],
+                **progress,
+            )
 
         self.emit(
             "worker_wait_started",

@@ -140,6 +140,67 @@ class WindowsSubprocessTest(unittest.TestCase):
 
         windows_query.assert_called_once_with(123)
 
+    def test_owned_stage_monitor_polls_and_reaps_the_child_handle(self):
+        process = mock.Mock()
+        process.poll.side_effect = [None, 0]
+        process.wait.return_value = 0
+        progress = mock.Mock()
+        sleep = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = MODULE.common.run_monitored(
+                ["copilot"],
+                cwd=root,
+                log_path=root / "stage.log",
+                progress=progress,
+                interval=0,
+                start=mock.Mock(return_value=process),
+                sleep=sleep,
+            )
+        self.assertEqual(0, result["returncode"])
+        self.assertEqual(2, progress.call_count)
+        sleep.assert_called_once_with(0)
+        process.wait.assert_called_once()
+
+    def test_owned_stage_monitor_terminates_and_reaps_on_interruption(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaises(KeyboardInterrupt):
+                MODULE.common.run_monitored(
+                    ["copilot"],
+                    cwd=root,
+                    log_path=root / "stage.log",
+                    progress=mock.Mock(side_effect=KeyboardInterrupt),
+                    start=mock.Mock(return_value=process),
+                )
+        process.terminate.assert_called_once()
+        process.wait.assert_called_once_with(timeout=10)
+
+    def test_owned_stage_monitor_kills_a_child_that_ignores_termination(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [
+            subprocess.TimeoutExpired(["copilot"], 10),
+            1,
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaises(KeyboardInterrupt):
+                MODULE.common.run_monitored(
+                    ["copilot"],
+                    cwd=root,
+                    log_path=root / "stage.log",
+                    progress=mock.Mock(side_effect=KeyboardInterrupt),
+                    start=mock.Mock(return_value=process),
+                )
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+        self.assertEqual(
+            [mock.call(timeout=10), mock.call()], process.wait.call_args_list
+        )
+
 
 class TargetTest(unittest.TestCase):
     def test_parses_supported_targets(self):
@@ -276,6 +337,34 @@ class StageContractTest(unittest.TestCase):
             arguments,
         )
 
+    def test_ci_live_progress_reads_the_action_and_pending_checks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "ci.json"
+            state.write_text(
+                json.dumps(
+                    {
+                        "run": {
+                            "head_sha": "head1",
+                            "decision": {
+                                "action": "attribute",
+                                "reason": "unattributed_failures",
+                                "action_checks": ["check:build"],
+                                "pending_checks": ["check:test"],
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            progress = MODULE.common.stage_live_progress(
+                MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
+                target(),
+                state_for=lambda _entry, _target: state,
+            )
+        self.assertEqual("diagnosing", progress["phase"])
+        self.assertEqual(["check:build"], progress["action_checks"])
+        self.assertEqual(["check:test"], progress["pending_checks"])
+
 
 class MarkerTest(unittest.TestCase):
     def status(self, stage: str, payload: dict, base_sha: str = BASE) -> dict:
@@ -393,7 +482,7 @@ class SweepTest(unittest.TestCase):
         }
 
     def run_stage(
-        self, entry, _target, _repo, *, model, effort, run_id, sweep
+        self, entry, _target, _repo, *, model, effort, run_id, sweep, report=None
     ):
         self.launched.append((entry["stage"], sweep))
         self.clear_at[entry["stage"]] = self.sync_heads[-1]
@@ -1016,6 +1105,29 @@ class ProgressProtocolTest(unittest.TestCase):
         self.assertEqual("waiting for CI remediation", updates[0]["wait_reason"])
         self.assertTrue(updates[0]["next_action"])
         self.assertIn("not clear: checks_failed", updates[1]["message"])
+
+    def test_stage_progress_distinguishes_diagnostics_from_check_waiting(self):
+        output = []
+        reporter = MODULE.ProgressReporter(
+            target=target(),
+            event_log=self.event_log,
+            output=output.append,
+            wall_time=lambda: 1000.0,
+        )
+        reporter(
+            {
+                "event": "stage_progress",
+                "stage": MODULE.STAGE_CI,
+                "sweep": 1,
+                "number": 7,
+                "phase": "diagnosing",
+                "action_checks": ["check:build"],
+                "pending_checks": ["check:test"],
+            }
+        )
+        update = MODULE.common.read_progress_log(self.event_log)[0]
+        self.assertIn("diagnosing 1 known failure", update["message"])
+        self.assertIn("diagnosing a known CI failure", update["wait_reason"])
 
     def test_scheduler_command_carries_the_monitor_handle_and_options(self):
         args = MODULE.build_parser().parse_args(

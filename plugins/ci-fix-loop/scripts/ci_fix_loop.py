@@ -28,6 +28,7 @@ DEFAULT_NOT_STARTED_GRACE = 900
 MAX_RERUNS_PER_CHECK = 1
 PR_HEAD_LAG_RETRY_DELAY = 1
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
+EMPTY_RERUN_COMMIT_MESSAGE = "ci: rerun checks"
 IS_WINDOWS = os.name == "nt"
 PR_URL_PATTERN = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
@@ -40,6 +41,18 @@ NON_FAST_FORWARD_PATTERN = re.compile(r"fast[- ]forward|divergent", re.IGNORECAS
 RUN_URL_PATTERN = re.compile(r"/actions/runs/(?P<run>\d+)")
 JOB_URL_PATTERN = re.compile(r"/(?:job|jobs)/(?P<job>\d+)")
 LEGACY_JOB_URL_PATTERN = re.compile(r"/runs/(?P<job>\d+)(?:$|[/?#])")
+RERUN_PERMISSION_PATTERNS = (
+    re.compile(r"\bresource not accessible by integration\b", re.IGNORECASE),
+    re.compile(r"\bpermission denied\b", re.IGNORECASE),
+    re.compile(r"\binsufficient permissions?\b", re.IGNORECASE),
+    re.compile(
+        r"\bmust have\b.*\b(?:access|permission|rights?)\b", re.IGNORECASE
+    ),
+    re.compile(
+        r"\b(?:write|push|admin)\s+(?:access|permission|rights?)\s+(?:is|are)\s+required\b",
+        re.IGNORECASE,
+    ),
+)
 
 # One classified vocabulary for every check, whatever GitHub calls it. Anything
 # this loop does not recognize becomes "unknown", which escalates rather than
@@ -217,6 +230,10 @@ ESCALATION_ACTIONS = {
 
 
 class WorkflowError(RuntimeError):
+    pass
+
+
+class RerunPermissionDenied(WorkflowError):
     pass
 
 
@@ -963,6 +980,29 @@ def describe_checks(checks: list[dict[str, Any]], keys: Iterable[str]) -> str:
     return ", ".join(by_key[key]["name"] for key in keys if key in by_key)
 
 
+def is_aggregate_check(check: dict[str, Any]) -> bool:
+    """Recognize checks whose result summarizes other status checks."""
+    name = re.sub(r"[^a-z0-9]+", " ", str(check.get("name") or "").lower()).strip()
+    description = re.sub(
+        r"[^a-z0-9]+", " ", str(check.get("description") or "").lower()
+    ).strip()
+    return (
+        name in {"required status check", "required status checks", "all checks"}
+        or name.startswith("required status checks ")
+        or "aggregate status check" in name
+        or "required status checks" in description
+    )
+
+
+def failure_sets(
+    checks: list[dict[str, Any]], failed: Iterable[str]
+) -> tuple[list[str], list[str]]:
+    by_key = {check["key"]: check for check in checks}
+    concrete = sorted(key for key in failed if not is_aggregate_check(by_key[key]))
+    aggregate = sorted(key for key in failed if is_aggregate_check(by_key[key]))
+    return (concrete or aggregate), (aggregate if concrete else [])
+
+
 def update_check_tracking(
     tracking: Any, checks: list[dict[str, Any]], now: dt.datetime
 ) -> dict[str, Any]:
@@ -1020,6 +1060,37 @@ def decide(
     """
     approval_runs = approval_runs or []
     grouped = group_by_class(checks)
+    pending = sorted(grouped["running"] + grouped["not_started"])
+    not_started = grouped["not_started"]
+    overdue = sorted(
+        key
+        for key in not_started
+        if not_started_seconds(tracking, key, now) >= not_started_grace
+    )
+    failed, aggregate = failure_sets(checks, grouped["failed"])
+
+    if failed:
+        pending_detail = (
+            f"; {len(pending)} other check(s) are still pending" if pending else ""
+        )
+        aggregate_detail = (
+            f"; ignored aggregate failures backed by those jobs: "
+            f"{describe_checks(checks, aggregate)}"
+            if aggregate
+            else ""
+        )
+        return {
+            "decision": "failures",
+            "reason": "checks_failed",
+            "checks": failed,
+            "pending_checks": pending,
+            "overdue_checks": overdue,
+            "aggregate_checks": aggregate,
+            "detail": (
+                f"these concrete checks failed: {describe_checks(checks, failed)}"
+                f"{pending_detail}{aggregate_detail}"
+            ),
+        }
 
     approval_blocked = grouped["approval_blocked"]
     if approval_blocked:
@@ -1070,12 +1141,6 @@ def decide(
             ),
         }
 
-    not_started = grouped["not_started"]
-    overdue = sorted(
-        key
-        for key in not_started
-        if not_started_seconds(tracking, key, now) >= not_started_grace
-    )
     if overdue:
         return {
             "decision": "escalate",
@@ -1087,13 +1152,13 @@ def decide(
             ),
         }
 
-    pending = sorted(grouped["running"] + not_started)
     if pending:
         if deadline_expired:
             return {
                 "decision": "waiting",
                 "reason": "still_running",
                 "checks": pending,
+                "pending_checks": pending,
                 "detail": (
                     "these checks are still running after this polling slice: "
                     f"{describe_checks(checks, pending)}"
@@ -1103,6 +1168,7 @@ def decide(
             "decision": "waiting",
             "reason": "checks_running",
             "checks": pending,
+            "pending_checks": pending,
             "detail": f"waiting for {len(pending)} check(s) to finish",
         }
 
@@ -1115,15 +1181,6 @@ def decide(
                 "the pull request head reports no status checks at all, so this "
                 "repository runs no checks on it"
             ),
-        }
-
-    failed = sorted(grouped["failed"])
-    if failed:
-        return {
-            "decision": "failures",
-            "reason": "checks_failed",
-            "checks": failed,
-            "detail": f"these checks failed: {describe_checks(checks, failed)}",
         }
 
     return {
@@ -1373,22 +1430,22 @@ def next_action(state: dict[str, Any], decision: dict[str, Any]) -> dict[str, An
     run_state = state.get("run") or {}
     attributions = run_state.get("attributions") or {}
     failing = list(decision["checks"])
+    pending = list(decision.get("pending_checks") or [])
     already_handled = handled_checks(state)
 
-    unattributed = sorted(
+    fixable = sorted(
         key
         for key in failing
-        if str((attributions.get(key) or {}).get("verdict") or "unknown") == "unknown"
+        if (attributions.get(key) or {}).get("verdict") == "pr_caused"
+        and key not in already_handled
     )
-    if unattributed:
+    if fixable:
         return {
-            "action": "attribute",
-            "reason": "unattributed_failures",
-            "checks": unattributed,
-            "detail": (
-                "the base branch evidence does not settle these failures, so each one "
-                "needs a verdict before this loop may touch it"
-            ),
+            "action": "fix",
+            "reason": "pr_caused_failures",
+            "checks": fixable,
+            "pending_checks": pending,
+            "detail": "this pull request plausibly caused these failures",
         }
 
     flakes = sorted(
@@ -1402,7 +1459,25 @@ def next_action(state: dict[str, Any], decision: dict[str, Any]) -> dict[str, An
             "action": "rerun",
             "reason": "suspected_flake",
             "checks": flakes,
+            "pending_checks": pending,
             "detail": "re-run each suspected flake exactly once",
+        }
+
+    unattributed = sorted(
+        key
+        for key in failing
+        if str((attributions.get(key) or {}).get("verdict") or "unknown") == "unknown"
+    )
+    if unattributed:
+        return {
+            "action": "attribute",
+            "reason": "unattributed_failures",
+            "checks": unattributed,
+            "pending_checks": pending,
+            "detail": (
+                "the base branch evidence does not settle these failures, so each one "
+                "needs a verdict before this loop may touch it"
+            ),
         }
 
     exhausted = sorted(
@@ -1416,29 +1491,42 @@ def next_action(state: dict[str, Any], decision: dict[str, Any]) -> dict[str, An
             "action": "escalate",
             "reason": "flake_failed_twice",
             "checks": exhausted,
+            "pending_checks": pending,
             "detail": (
                 "these checks failed again after their one automatic re-run, so they "
                 "are not flakes"
             ),
         }
 
-    fixable = sorted(
-        key
-        for key in failing
-        if attributions[key]["verdict"] == "pr_caused" and key not in already_handled
-    )
-    if fixable:
-        return {
-            "action": "fix",
-            "reason": "pr_caused_failures",
-            "checks": fixable,
-            "detail": "this pull request plausibly caused these failures",
-        }
-
     pre_existing = sorted(
         key for key in failing if attributions[key]["verdict"] == "pre_existing"
     )
     if pre_existing:
+        overdue = list(decision.get("overdue_checks") or [])
+        if overdue:
+            return {
+                "action": "escalate",
+                "reason": "checks_never_started",
+                "checks": overdue,
+                "pending_checks": pending,
+                "ignored_checks": pre_existing,
+                "detail": (
+                    "the known failures are pre-existing, but these checks did not "
+                    f"start within the grace period: {', '.join(overdue)}"
+                ),
+            }
+        if pending:
+            return {
+                "action": "waiting",
+                "reason": "checks_running",
+                "checks": pending,
+                "pending_checks": pending,
+                "ignored_checks": pre_existing,
+                "detail": (
+                    "the known failures are pre-existing; waiting for the remaining "
+                    f"{len(pending)} check(s)"
+                ),
+            }
         return {
             "action": "escalate",
             "reason": "pre_existing_failures",
@@ -1780,7 +1868,7 @@ def resolve_run_id(pr: dict[str, Any], reference: dict[str, int]) -> int:
 
 
 def rerun_failed_jobs(pr: dict[str, Any], run_id: int) -> None:
-    run(
+    process = run(
         [
             "gh",
             "api",
@@ -1788,8 +1876,15 @@ def rerun_failed_jobs(pr: dict[str, Any], run_id: int) -> None:
             "POST",
             f"repos/{pr['upstream_owner']}/{pr['upstream_repo']}/actions/runs/"
             f"{run_id}/rerun-failed-jobs",
-        ]
+        ],
+        check=False,
     )
+    if process.returncode == 0:
+        return
+    detail = process.stderr.strip() or process.stdout.strip() or "no output"
+    if any(pattern.search(detail) for pattern in RERUN_PERMISSION_PATTERNS):
+        raise RerunPermissionDenied(detail)
+    raise WorkflowError(f"GitHub could not re-run workflow {run_id}: {detail}")
 
 
 def active_run(state: dict[str, Any]) -> dict[str, Any]:
@@ -2100,8 +2195,9 @@ def snapshot_checks(
     )
     attributions = run_state.get("attributions") or {}
     if decision["decision"] == "failures":
+        actionable = set(decision["checks"])
         attributions = attribute_failures(
-            checks,
+            [check for check in checks if check["key"] in actionable],
             baseline_conclusions(pr, run_state["base_sha"]),
             attributions,
         )
@@ -2155,7 +2251,7 @@ def command_checks(args: argparse.Namespace) -> None:
             not_started_grace=args.not_started_grace,
             deadline_expired=expired,
         )
-        if snapshot["decision"]["decision"] != "waiting" or expired:
+        if snapshot["action"]["action"] != "waiting" or expired:
             break
         if not args.wait:
             break
@@ -2169,6 +2265,10 @@ def command_checks(args: argparse.Namespace) -> None:
     run_state["decision"] = {
         **decision,
         "action": action["action"],
+        "action_checks": action["checks"],
+        "pending_checks": action.get("pending_checks")
+        or decision.get("pending_checks")
+        or [],
         "observed_at": utc_now(),
     }
     if action["action"] in WORKING_ACTIONS:
@@ -2213,6 +2313,10 @@ def command_checks(args: argparse.Namespace) -> None:
             "reason": action["reason"],
             "detail": action["detail"],
             "action_checks": action["checks"],
+            "pending_checks": action.get("pending_checks")
+            or decision.get("pending_checks")
+            or [],
+            "aggregate_checks": decision.get("aggregate_checks") or [],
             "counts": {
                 "total": len(snapshot["checks"]),
                 **class_counts(snapshot["checks"]),
@@ -2293,6 +2397,23 @@ def command_rerun(args: argparse.Namespace) -> None:
             f"only a check attributed as a flake may be re-run; {entry['name']} is "
             f"attributed {entry.get('verdict')!r}"
         )
+    reruns = state.get("reruns")
+    previous = reruns.get(args.check) if isinstance(reruns, dict) else None
+    if (
+        isinstance(previous, dict)
+        and previous.get("method") == "empty_commit"
+        and previous.get("head_sha") == run_state["head_sha"]
+        and previous.get("status") != "published"
+    ):
+        publish_empty_rerun_commit(
+            path,
+            state,
+            args.check,
+            entry,
+            run_id=int(previous.get("run_id") or 0),
+            permission_detail=str(previous.get("permission_detail") or ""),
+        )
+        return
     already = rerun_count(state, args.check)
     if already >= MAX_RERUNS_PER_CHECK:
         raise WorkflowError(
@@ -2334,7 +2455,18 @@ def command_rerun(args: argparse.Namespace) -> None:
     # Stamp the watermark before asking GitHub to re-run, so a run that starts
     # quickly cannot finish inside the gap and be mistaken for the old result.
     requested_at = utc_now()
-    rerun_failed_jobs(state["pr"], run_id)
+    try:
+        rerun_failed_jobs(state["pr"], run_id)
+    except RerunPermissionDenied as error:
+        publish_empty_rerun_commit(
+            path,
+            state,
+            args.check,
+            entry,
+            run_id=run_id,
+            permission_detail=str(error),
+        )
+        return
     reruns = state.setdefault("reruns", {})
     reruns[args.check] = {
         "count": already + 1,
@@ -2571,6 +2703,227 @@ def require_fork_head(pr: dict[str, Any]) -> None:
         )
 
 
+def accepted_push_checkpoint(
+    state: dict[str, Any],
+    *,
+    previous_head: str,
+    head_sha: str,
+    commits: list[str],
+    kind: str = "fix",
+) -> dict[str, Any]:
+    checkpoint = {
+        "id": uuid.uuid4().hex,
+        "accepted_at": utc_now(),
+        "previous_head_sha": previous_head,
+        "head_sha": head_sha,
+        "commits": commits,
+        "kind": kind,
+        "pipeline_run": (state.get("pipeline_budget") or {}).get("run"),
+        "pipeline_iteration": (state.get("pipeline_budget") or {}).get("iteration"),
+    }
+    state.setdefault("accepted_pushes", []).append(checkpoint)
+    return checkpoint
+
+
+def require_empty_child(repo_root: Path, commit_sha: str, pinned: str) -> None:
+    parents = git(repo_root, "rev-list", "--parents", "-n", "1", commit_sha).split()
+    same_tree = git(repo_root, "rev-parse", f"{commit_sha}^{{tree}}") == git(
+        repo_root, "rev-parse", f"{pinned}^{{tree}}"
+    )
+    if parents != [commit_sha, pinned] or not same_tree:
+        raise WorkflowError(
+            "the empty-commit fallback did not create exactly one tree-identical child "
+            "of the pinned head; refusing to push"
+        )
+
+
+def publish_empty_rerun_commit(
+    path: Path,
+    state: dict[str, Any],
+    check_key: str,
+    attribution: dict[str, Any],
+    *,
+    run_id: int,
+    permission_detail: str,
+) -> None:
+    """Publish one empty commit when GitHub explicitly denies a workflow re-run."""
+    run_state = active_run(state)
+    reruns = state.setdefault("reruns", {})
+    fallback = reruns.get(check_key)
+    if fallback is not None and (
+        not isinstance(fallback, dict)
+        or fallback.get("method") != "empty_commit"
+        or fallback.get("head_sha") != run_state["head_sha"]
+        or fallback.get("status") == "published"
+    ):
+        raise WorkflowError(f"{attribution['name']} already used its one retry")
+
+    repo_root = Path(state["repo_root"])
+    dirty = git(repo_root, "status", "--porcelain=v1")
+    if dirty:
+        raise WorkflowError(
+            "GitHub denied the workflow re-run, but the empty-commit fallback is "
+            f"unsafe because the worktree is not clean:\n{dirty}"
+        )
+
+    pr = state["pr"]
+    pinned = run_state["head_sha"]
+    local_head = git(repo_root, "rev-parse", "HEAD")
+    branch = pr.get("head_branch")
+    if (
+        not isinstance(branch, str)
+        or not branch
+        or branch == pr.get("base_branch")
+    ):
+        raise WorkflowError(
+            "GitHub denied the workflow re-run, but the PR head branch is not safely "
+            "writable"
+        )
+    local_branch = git(repo_root, "branch", "--show-current")
+    if local_branch and local_branch != branch:
+        raise WorkflowError(
+            "GitHub denied the workflow re-run, but the empty-commit fallback is "
+            f"unsafe from local branch {local_branch!r}; expected {branch!r} or detached"
+        )
+    refreshed = metadata_for(parse_target(pr["pr_url"]))
+    pr_head = refreshed["head_sha"]
+    if fallback is None and pr_head != pinned:
+        raise WorkflowError(
+            "GitHub denied the workflow re-run, but the empty-commit fallback is "
+            f"unsafe because the PR head moved from {pinned} to {pr_head}"
+        )
+    require_fork_head(pr)
+    remote = find_push_remote(repo_root, pr["head_owner"], pr["head_repo"])
+    remote_current = remote_head(pr["head_owner"], pr["head_repo"], branch)
+
+    if fallback is None:
+        if local_head != pinned:
+            raise WorkflowError(
+                "GitHub denied the workflow re-run, but the empty-commit fallback is "
+                f"unsafe because local HEAD is {local_head}, not pinned head {pinned}"
+            )
+        if pr_head != pinned or remote_current != pinned:
+            raise WorkflowError(
+                "GitHub denied the workflow re-run, but the empty-commit fallback is "
+                "unsafe because the PR or remote head moved"
+            )
+        fallback = {
+            "count": 1,
+            "name": attribution["name"],
+            "run_id": run_id,
+            "head_sha": pinned,
+            "requested_at": utc_now(),
+            "method": "empty_commit",
+            "status": "creating",
+            "permission_detail": permission_detail,
+        }
+        reruns[check_key] = fallback
+        save_state(path, state)
+
+    commit_sha = fallback.get("commit_sha")
+    if not isinstance(commit_sha, str) or not commit_sha:
+        if local_head == pinned:
+            if pr_head != pinned or remote_current != pinned:
+                raise WorkflowError(
+                    "the PR head moved before the empty commit was created"
+                )
+            run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_root),
+                    "commit",
+                    "--allow-empty",
+                    "--no-verify",
+                    "-m",
+                    EMPTY_RERUN_COMMIT_MESSAGE,
+                ]
+            )
+            commit_sha = git(repo_root, "rev-parse", "HEAD")
+        else:
+            commit_sha = local_head
+    require_empty_child(repo_root, commit_sha, pinned)
+    if fallback.get("commit_sha") != commit_sha or fallback.get("status") == "creating":
+        fallback["commit_sha"] = commit_sha
+        fallback["status"] = "prepared"
+        save_state(path, state)
+
+    if remote_current == pinned:
+        if pr_head != pinned:
+            raise WorkflowError(
+                "the PR and remote heads disagree; refusing the empty-commit fallback"
+            )
+        if git(repo_root, "rev-parse", "HEAD") != commit_sha:
+            raise WorkflowError(
+                "the prepared empty commit is no longer checked out; refusing to push"
+            )
+        run(["git", "-C", str(repo_root), "push", remote, f"HEAD:{branch}"])
+        fallback["status"] = "pushed"
+        save_state(path, state)
+    elif remote_current != commit_sha:
+        raise WorkflowError(
+            "the remote head moved to an unexpected commit; refusing the empty-commit "
+            "fallback"
+        )
+
+    pushed_head = wait_for_remote_head(
+        pr["head_owner"], pr["head_repo"], branch, commit_sha
+    )
+    if pushed_head != commit_sha:
+        raise WorkflowError(
+            f"empty-commit fallback head mismatch: expected {commit_sha}, remote "
+            f"{pushed_head}"
+        )
+    pr_head = metadata_for(parse_target(pr["pr_url"]))["head_sha"]
+    if pr_head != commit_sha:
+        time.sleep(PR_HEAD_LAG_RETRY_DELAY)
+        pr_head = metadata_for(parse_target(pr["pr_url"]))["head_sha"]
+    if pr_head != commit_sha:
+        raise WorkflowError(
+            f"empty-commit fallback PR head mismatch: expected {commit_sha}, PR head "
+            f"{pr_head}"
+        )
+
+    fallback["status"] = "published"
+    fallback["published_head_sha"] = commit_sha
+    run_state["status"] = "published"
+    run_state["published_head_sha"] = commit_sha
+    accepted_push = next(
+        (
+            checkpoint
+            for checkpoint in state.get("accepted_pushes") or []
+            if checkpoint.get("kind") == "ci_rerun"
+            and checkpoint.get("previous_head_sha") == pinned
+            and checkpoint.get("head_sha") == commit_sha
+        ),
+        None,
+    )
+    if accepted_push is None:
+        accepted_push = accepted_push_checkpoint(
+            state,
+            previous_head=pinned,
+            head_sha=commit_sha,
+            commits=[commit_sha],
+            kind="ci_rerun",
+        )
+    state["clean_at_head_sha"] = None
+    archive_run(state)
+    save_state(path, state)
+    emit(
+        {
+            "result": "empty_commit_published",
+            "state": str(path),
+            "check": check_key,
+            "name": attribution["name"],
+            "run_id": run_id,
+            "head_sha": commit_sha,
+            "reruns": 1,
+            "max_reruns": MAX_RERUNS_PER_CHECK,
+            "accepted_push": accepted_push,
+        }
+    )
+
+
 def local_validation_entry(args: argparse.Namespace, head_sha: str) -> dict[str, Any]:
     """Describe the local validation behind one publication.
 
@@ -2694,16 +3047,12 @@ def command_publish(args: argparse.Namespace) -> None:
 
     run_state["status"] = "published"
     run_state["published_head_sha"] = local_head
-    accepted_push = {
-        "id": uuid.uuid4().hex,
-        "accepted_at": utc_now(),
-        "previous_head_sha": pinned,
-        "head_sha": local_head,
-        "commits": commits,
-        "pipeline_run": (state.get("pipeline_budget") or {}).get("run"),
-        "pipeline_iteration": (state.get("pipeline_budget") or {}).get("iteration"),
-    }
-    state.setdefault("accepted_pushes", []).append(accepted_push)
+    accepted_push = accepted_push_checkpoint(
+        state,
+        previous_head=pinned,
+        head_sha=local_head,
+        commits=commits,
+    )
     validation = local_validation_entry(args, local_head)
     state.setdefault("local_validation", []).append(validation)
     # The published head is new, so nothing this loop learned about the old head's
@@ -2767,6 +3116,33 @@ def stage_outcome_fields(state: dict[str, Any]) -> dict[str, str]:
     return {"stage_outcome": outcome} if outcome else {}
 
 
+def work_progress(state: dict[str, Any]) -> dict[str, Any] | None:
+    run_state = state.get("run") or {}
+    decision = run_state.get("decision")
+    if not isinstance(decision, dict):
+        return None
+    action = decision.get("action")
+    phase = {
+        "attribute": "diagnosing",
+        "fix": "fixing",
+        "rerun": "rerunning",
+        "waiting": "waiting",
+    }.get(action)
+    if phase is None:
+        return None
+    action_checks = decision.get("action_checks") or decision.get("checks") or []
+    pending_checks = decision.get("pending_checks") or []
+    return {
+        "phase": phase,
+        "action": action,
+        "reason": decision.get("reason"),
+        "action_checks": action_checks,
+        "pending_checks": pending_checks,
+        "observed_at": decision.get("observed_at"),
+        "detail": decision.get("detail"),
+    }
+
+
 def status_payload(state: dict[str, Any], path: Path) -> dict[str, Any]:
     pr = state["pr"]
     run_state = state.get("run") or {}
@@ -2786,6 +3162,7 @@ def status_payload(state: dict[str, Any], path: Path) -> dict[str, Any]:
         "iterations": int(state.get("iterations", 0)),
         "pipeline_budget": state.get("pipeline_budget"),
         "accepted_pushes": state.get("accepted_pushes") or [],
+        "progress": work_progress(state),
         "last_helper_activity": last_helper_activity(state),
     }
 
@@ -2865,6 +3242,7 @@ def command_status(args: argparse.Namespace) -> None:
             },
             "iterations": int(state.get("iterations", 0)),
             "accepted_pushes": state.get("accepted_pushes") or [],
+            "progress": work_progress(state),
             "last_helper_activity": last_helper_activity(state),
         }
     )

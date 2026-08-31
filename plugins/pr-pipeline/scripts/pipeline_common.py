@@ -1001,6 +1001,37 @@ def stage_state_path(entry: dict[str, Any], target: dict[str, Any]) -> Path:
     return Path.home() / ".copilot" / "run" / entry["plugin"] / name
 
 
+def stage_live_progress(
+    entry: dict[str, Any],
+    target: dict[str, Any],
+    *,
+    state_for: Callable[[dict[str, Any], dict[str, Any]], Path] = stage_state_path,
+) -> dict[str, Any] | None:
+    payload = read_json(state_for(entry, target))
+    run_state = payload.get("run") if isinstance(payload, dict) else None
+    decision = run_state.get("decision") if isinstance(run_state, dict) else None
+    if not isinstance(decision, dict):
+        return None
+    action = decision.get("action")
+    phase = {
+        "attribute": "diagnosing",
+        "fix": "fixing",
+        "rerun": "rerunning",
+        "waiting": "waiting",
+    }.get(action)
+    if phase is None:
+        return None
+    return {
+        "phase": phase,
+        "action": action,
+        "reason": decision.get("reason"),
+        "action_checks": decision.get("action_checks") or decision.get("checks") or [],
+        "pending_checks": decision.get("pending_checks") or [],
+        "observed_at": decision.get("observed_at"),
+        "head_sha": run_state.get("head_sha"),
+    }
+
+
 def read_stage_status(
     entry: dict[str, Any],
     target: dict[str, Any],
@@ -1089,6 +1120,7 @@ STAGE_STATUS_FIELDS = (
     "outcome",
     "proposal",
     "proposal_count",
+    "progress",
     "queue",
     "review",
     "run",
@@ -1316,6 +1348,49 @@ def start_background(
         return subprocess.Popen(command, **launch_options(log, cwd))
     finally:
         log.close()
+
+
+def run_monitored(
+    command: list[str],
+    *,
+    cwd: Path,
+    log_path: Path,
+    progress: Callable[[], None],
+    interval: float = 5.0,
+    start: Callable[..., subprocess.Popen[Any]] = start_background,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    started_at = utc_now()
+    try:
+        process = start(command, cwd=cwd, log_path=log_path)
+    except OSError as error:
+        return {
+            "returncode": None,
+            "log_path": str(log_path),
+            "started_at": started_at,
+            "ended_at": utc_now(),
+            "error": str(error),
+        }
+    try:
+        progress()
+        while process.poll() is None:
+            sleep(interval)
+            progress()
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        raise
+    return {
+        "returncode": process.wait(),
+        "log_path": str(log_path),
+        "started_at": started_at,
+        "ended_at": utc_now(),
+    }
 
 
 def windows_process_is_alive(pid: int) -> bool:

@@ -167,6 +167,32 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
             "waiting": True,
             "wait_reason": f"waiting for {label}",
         }
+    elif event == "stage_progress":
+        phase = payload.get("phase")
+        action_checks = payload.get("action_checks") or []
+        pending_checks = payload.get("pending_checks") or []
+        if phase == "diagnosing":
+            message = f"{prefix}{label} diagnosing {len(action_checks)} known failure(s){scope}."
+            next_action = "Attribute the known failure from its logs and the pinned diff."
+        elif phase == "fixing":
+            message = f"{prefix}{label} fixing {len(action_checks)} attributed failure(s){scope}."
+            next_action = "Validate, commit, and publish the fix."
+        elif phase == "rerunning":
+            message = f"{prefix}{label} retrying {len(action_checks)} suspected flake(s){scope}."
+            next_action = "Request one safe retry, then inspect its result."
+        else:
+            message = f"{prefix}{label} monitoring {len(pending_checks)} pending check(s){scope}."
+            next_action = "Inspect the next concrete failure as soon as it completes."
+        update = {
+            "message": message,
+            "next_action": next_action,
+            "waiting": True,
+            "wait_reason": (
+                f"{phase} a known CI failure"
+                if phase != "waiting"
+                else "waiting for remaining CI checks"
+            ),
+        }
     elif event == "stage_finished":
         clear = payload.get("clear")
         action = payload.get("action")
@@ -396,18 +422,46 @@ def run_stage(
     effort: str,
     run_id: str,
     sweep: int,
+    report: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    return common.run_foreground(
-        stage_command(
-            entry,
-            target,
-            model=model,
-            effort=effort,
+    command = stage_command(
+        entry,
+        target,
+        model=model,
+        effort=effort,
+        run_id=run_id,
+        sweep=sweep,
+    )
+    log_path = stage_log_path(target, run_id, sweep, entry)
+    if entry["stage"] != STAGE_CI:
+        return common.run_foreground(command, cwd=repo_root, log_path=log_path)
+
+    last_signature: str | None = None
+
+    def progress() -> None:
+        nonlocal last_signature
+        current = common.stage_live_progress(entry, target)
+        if current is None:
+            return
+        signature = json.dumps(current, sort_keys=True)
+        if signature == last_signature:
+            return
+        last_signature = signature
+        report_event(
+            report,
+            "stage_progress",
             run_id=run_id,
+            stage=entry["stage"],
             sweep=sweep,
-        ),
+            number=target["number"],
+            **current,
+        )
+
+    return common.run_monitored(
+        command,
         cwd=repo_root,
-        log_path=stage_log_path(target, run_id, sweep, entry),
+        log_path=log_path,
+        progress=progress,
     )
 
 
@@ -586,6 +640,7 @@ def run_pipeline(
                 effort=effort,
                 run_id=run_id,
                 sweep=sweep,
+                report=report,
             )
             settled = settle_after_stage(
                 repo_root,
