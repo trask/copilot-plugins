@@ -1485,7 +1485,11 @@ class StackPipeline:
         entry = STAGE_BY_NAME[stage]
         target = common.target_for(self.repository, member["number"])
         arguments = common.pipeline_arguments(
-            entry, self.run_id, pass_number, MAX_PASSES
+            entry,
+            self.run_id,
+            pass_number,
+            MAX_PASSES,
+            accepts=common.stage_accepts_pipeline_position,
         )
         return {
             "number": member["number"],
