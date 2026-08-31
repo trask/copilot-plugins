@@ -354,11 +354,29 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
             "waiting": False,
         }
     elif event == "push_propagated":
-        update = {
-            "message": (
+        trigger = payload.get("trigger")
+        if trigger == "obsolete_checkpoint":
+            message = (
+                f"{prefix}obsolete CI push from #{number} was superseded by its "
+                "current head."
+            )
+        elif trigger == "checkpoint_revalidation":
+            message = (
+                f"{prefix}CI push from #{number} could not be revalidated against "
+                "its current head."
+            )
+        elif trigger == "predecessor_alignment":
+            message = (
+                f"{prefix}live head from #{number} descendant alignment "
+                f"{payload.get('result')}."
+            )
+        else:
+            message = (
                 f"{prefix}accepted CI push from #{number} propagation "
                 f"{payload.get('result')}."
-            ),
+            )
+        update = {
+            "message": message,
             "next_action": "Continue bottom-up CI remediation.",
             "waiting": True,
             "wait_reason": "waiting for the current CI worker or descendant propagation",
@@ -1408,6 +1426,19 @@ class StackPipeline:
         except WorkflowError:
             return None
 
+    def live_head_for(self, number: int) -> str | None:
+        current = self.revalidate()
+        if (
+            current["result"] != "ready"
+            or current["fingerprint"] != self.state.get("topology_fingerprint")
+        ):
+            return None
+        member = next(
+            (entry for entry in current["selected"] if entry["number"] == number),
+            None,
+        )
+        return None if member is None else member["head_sha"]
+
     # Dispatch ------------------------------------------------------------
 
     def request_for(
@@ -1732,6 +1763,51 @@ class StackPipeline:
                 or iteration > request["pass"]
             ):
                 continue
+            live_head = self.live_head_for(request["number"])
+            if live_head is None:
+                outcome = {
+                    "result": "failed",
+                    "reason": "source_head_unknown",
+                    "number": request["number"],
+                    "head_sha": head_sha,
+                    "trigger": "checkpoint_revalidation",
+                }
+                outcomes.append(outcome)
+                seen.add(identity)
+                self.emit(
+                    "push_propagated",
+                    number=request["number"],
+                    stage=STAGE_CI,
+                    pull_request_pass=request["pass"],
+                    head_sha=head_sha,
+                    result=outcome["result"],
+                    trigger=outcome["trigger"],
+                )
+                continue
+            if head_sha != live_head:
+                outcome = {
+                    "result": "superseded",
+                    "reason": "source_head_moved",
+                    "number": request["number"],
+                    "head_sha": head_sha,
+                    "superseded_by": live_head,
+                    "trigger": "obsolete_checkpoint",
+                }
+                outcomes.append(outcome)
+                completed.add(identity)
+                self.state["propagated_pushes"] = sorted(completed)
+                self.save()
+                seen.add(identity)
+                self.emit(
+                    "push_propagated",
+                    number=request["number"],
+                    stage=STAGE_CI,
+                    pull_request_pass=request["pass"],
+                    head_sha=head_sha,
+                    result=outcome["result"],
+                    trigger=outcome["trigger"],
+                )
+                continue
             outcome = self.propagate(
                 self.repository,
                 request["number"],
@@ -1785,36 +1861,128 @@ class StackPipeline:
         previous: dict[str, Any] | None = None
         previous_state: dict[str, Any] | None = None
         for index in range(len(current_selected)):
-            member = current_selected[index]
-            request = self.request_for(member, STAGE_CI, pass_number)
-            pending = self.propagate_ci_pushes(request, set())
-            propagations.extend(pending)
-            failed_propagations = [
-                outcome
-                for outcome in pending
-                if outcome.get("result") not in {"published", "no_descendants"}
-                and "superseded_by" not in outcome
-            ]
-            if failed_propagations:
-                blocked = {
-                    "number": member["number"],
-                    "reason": "descendant_propagation_incomplete",
-                    "propagations": failed_propagations,
-                }
+            gate: dict[str, Any] | None = None
+            request: dict[str, Any] | None = None
+            while True:
+                member = current_selected[index]
+                previous = current_selected[index - 1] if index else None
+                if (
+                    previous is not None
+                    and previous_state is not None
+                    and previous["head_sha"] != previous_state["head_sha"]
+                ):
+                    previous_state = {
+                        "green": False,
+                        "head_sha": previous["head_sha"],
+                    }
+                gate = self.ci_gate(member, previous, previous_state)
+                if (
+                    not gate["ready"]
+                    and gate["reason"] == "predecessor_head_is_not_contained"
+                ):
+                    predecessor_head = gate["predecessor_head_sha"]
+                    alignment = {
+                        **self.propagate(
+                            self.repository,
+                            previous["number"],
+                            predecessor_head,
+                            self.kickoff["stackNumber"],
+                        ),
+                        "trigger": "predecessor_alignment",
+                    }
+                    propagations.append(alignment)
+                    self.propagations.append(alignment)
+                    self.emit(
+                        "push_propagated",
+                        number=previous["number"],
+                        stage=STAGE_CI,
+                        pull_request_pass=pass_number,
+                        head_sha=predecessor_head,
+                        result=alignment.get("result"),
+                        trigger=alignment["trigger"],
+                    )
+                    if alignment.get("result") in {"published", "no_descendants"}:
+                        refreshed = self.refresh_selection(current_selected)
+                        if refreshed is None:
+                            stopped = {
+                                "step": "revalidate",
+                                "number": member["number"],
+                                "reason": "topology_changed",
+                            }
+                            break
+                        current_selected = refreshed
+                        member = current_selected[index]
+                        previous = current_selected[index - 1]
+                        if previous["head_sha"] != predecessor_head:
+                            previous_state = {
+                                "green": False,
+                                "head_sha": previous["head_sha"],
+                            }
+                        gate = self.ci_gate(member, previous, previous_state)
+                    else:
+                        self.record_stage(
+                            member["number"],
+                            STAGE_CI,
+                            {
+                                "pass": pass_number,
+                                "action": "waiting",
+                                "reason": "descendant_propagation_incomplete",
+                                "predecessor": previous["number"],
+                            },
+                        )
+                        blocked = {
+                            "number": member["number"],
+                            "reason": "descendant_propagation_incomplete",
+                            "propagations": [alignment],
+                        }
+                        break
+                if not gate["ready"]:
+                    self.record_stage(
+                        member["number"],
+                        STAGE_CI,
+                        {"pass": pass_number, "action": "waiting", **gate},
+                    )
+                    blocked = {
+                        "number": member["number"],
+                        "reason": gate["reason"],
+                    }
+                    break
+                request = self.request_for(member, STAGE_CI, pass_number)
+                pending = self.propagate_ci_pushes(request, set())
+                propagations.extend(pending)
+                failed_propagations = [
+                    outcome
+                    for outcome in pending
+                    if outcome.get("result") not in {"published", "no_descendants"}
+                    and "superseded_by" not in outcome
+                ]
+                if failed_propagations:
+                    blocked = {
+                        "number": member["number"],
+                        "reason": "descendant_propagation_incomplete",
+                        "propagations": failed_propagations,
+                    }
+                    break
+                if any(
+                    outcome.get("result") in {"published", "superseded"}
+                    for outcome in pending
+                ):
+                    refreshed = self.refresh_selection(current_selected)
+                    if refreshed is None:
+                        stopped = {
+                            "step": "revalidate",
+                            "number": member["number"],
+                            "reason": "topology_changed",
+                        }
+                        break
+                    current_selected = refreshed
+                    continue
                 break
-            gate = self.ci_gate(member, previous, previous_state)
-            gates.append({"number": member["number"], **gate})
-            if not gate["ready"]:
-                self.record_stage(
-                    member["number"],
-                    STAGE_CI,
-                    {"pass": pass_number, "action": "waiting", **gate},
-                )
-                blocked = {
-                    "number": member["number"],
-                    "reason": gate["reason"],
-                }
+            if gate is not None:
+                gates.append({"number": member["number"], **gate})
+            if blocked is not None or stopped is not None:
                 break
+            assert request is not None
             base_sha = self.base_sha_for(member)
             before = self.inspect(
                 entry,

@@ -637,21 +637,76 @@ class StackRunTest(StackFixture):
         self.assertEqual(12, result["blocked"]["number"])
         self.assertIsNone(result["stopped"])
 
-    def test_a_child_that_does_not_contain_its_predecessor_waits(self):
+    def test_a_child_that_does_not_contain_its_predecessor_is_aligned(self):
         self.contains_pairs = set()
         pipeline = self.pipeline()
-        self.launcher.on_start = lambda request: self.clear.add(
-            (request["number"], MODULE.STAGE_CI)
-        )
+        for number in (11, 12, 13):
+            self.clear.add((number, MODULE.STAGE_CI))
+
+        def align(repository, number, head_sha, stack_number):
+            self.propagated.append((number, head_sha))
+            self.stack = stack(heads={12: "a" * 40, 13: "c" * 40})
+            self.contains_pairs.update(
+                {
+                    (head_of(11), "a" * 40),
+                    ("a" * 40, "c" * 40),
+                }
+            )
+            return {"result": "published"}
+
+        pipeline.propagate = align
 
         result = pipeline.run_ci_phase(1, self.stack["members"])
 
         self.assertEqual(
-            [11], [call[1] for call in self.launcher.calls if call[0] == "start"]
+            [], [call[1] for call in self.launcher.calls if call[0] == "start"]
         )
+        self.assertEqual([(11, head_of(11))], self.propagated)
+        self.assertIsNone(result["blocked"])
         self.assertEqual(
-            "predecessor_head_is_not_contained", result["gates"][-1]["reason"]
+            ["lowest_selected", "predecessor_is_green", "predecessor_is_green"],
+            [gate["reason"] for gate in result["gates"]],
         )
+
+    def test_alignment_rebuilds_the_ci_request_for_the_rebased_child(self):
+        self.contains_pairs = set()
+        pipeline = self.pipeline()
+        self.clear.add((11, MODULE.STAGE_CI))
+
+        def align(repository, number, head_sha, stack_number):
+            self.stack = stack(heads={12: "a" * 40, 13: "c" * 40})
+            self.contains_pairs.update(
+                {
+                    (head_of(11), "a" * 40),
+                    ("a" * 40, "c" * 40),
+                }
+            )
+            return {"result": "published"}
+
+        pipeline.propagate = align
+        self.launcher.on_start = lambda request: self.clear.add(
+            (request["number"], MODULE.STAGE_CI)
+        )
+
+        pipeline.run_ci_phase(1, self.stack["members"])
+
+        self.assertEqual(
+            ["a" * 40, "c" * 40],
+            [request["head_sha"] for request in self.launcher.started],
+        )
+
+    def test_a_conflicted_live_head_alignment_blocks_the_descendants(self):
+        self.contains_pairs = set()
+        pipeline = self.pipeline()
+        self.clear.add((11, MODULE.STAGE_CI))
+        pipeline.propagate = lambda *args: {"result": "conflicted"}
+
+        result = pipeline.run_ci_phase(1, self.stack["members"])
+
+        self.assertEqual("descendant_propagation_incomplete", result["blocked"]["reason"])
+        self.assertEqual(12, result["blocked"]["number"])
+        self.assertEqual("predecessor_head_is_not_contained", result["gates"][-1]["reason"])
+        self.assertEqual("predecessor_alignment", result["propagations"][-1]["trigger"])
 
     def test_an_already_clear_member_is_green_without_a_worker(self):
         self.clear.add((11, MODULE.STAGE_CI))
@@ -699,6 +754,7 @@ class StackRunTest(StackFixture):
         member = self.stack["members"][0]
         request = pipeline.request_for(member, MODULE.STAGE_CI, 1)
         launched = pipeline.dispatch([request], MODULE.STAGE_CI, 1)
+        self.stack = stack(heads={11: "1" * 40})
 
         monitored = pipeline.monitor_ci_worker(launched["workers"][0], request)
 
@@ -723,6 +779,7 @@ class StackRunTest(StackFixture):
         member = self.stack["members"][0]
         request = pipeline.request_for(member, MODULE.STAGE_CI, 1)
         launched = pipeline.dispatch([request], MODULE.STAGE_CI, 1)
+        self.stack = stack(heads={11: "1" * 40})
 
         pipeline.monitor_ci_worker(launched["workers"][0], request)
 
@@ -754,11 +811,13 @@ class StackRunTest(StackFixture):
         self.assertEqual([], self.propagated)
 
     def test_a_failed_propagation_checkpoint_is_retried_in_the_next_pass(self):
+        current_head = "1" * 40
+        self.stack = stack(heads={11: current_head})
         pipeline = self.pipeline()
         self.checkpoint_map[11] = [
             {
                 "id": "push-1",
-                "head_sha": "1" * 40,
+                "head_sha": current_head,
                 "pipeline_run": "run-1",
                 "pipeline_iteration": 1,
             }
@@ -783,7 +842,164 @@ class StackRunTest(StackFixture):
         self.assertEqual("published", second[0]["result"])
         self.assertEqual(["push-1"], pipeline.state["propagated_pushes"])
 
+    def test_a_failed_checkpoint_is_retired_after_its_source_head_moves(self):
+        self.stack = stack(heads={11: "2" * 40})
+        pipeline = self.pipeline()
+        self.checkpoint_map[11] = [
+            {
+                "id": "push-1",
+                "head_sha": "1" * 40,
+                "pipeline_run": "run-1",
+                "pipeline_iteration": 1,
+            }
+        ]
+        pipeline.propagate = mock.Mock(side_effect=AssertionError("must not retry"))
+        member = self.stack["members"][0]
+
+        outcomes = pipeline.propagate_ci_pushes(
+            pipeline.request_for(member, MODULE.STAGE_CI, 2), set()
+        )
+
+        self.assertEqual("superseded", outcomes[0]["result"])
+        self.assertEqual("source_head_moved", outcomes[0]["reason"])
+        self.assertEqual("2" * 40, outcomes[0]["superseded_by"])
+        self.assertEqual(["push-1"], pipeline.state["propagated_pushes"])
+        pipeline.propagate.assert_not_called()
+
+    def test_a_checkpoint_matching_the_live_head_survives_a_stale_request(self):
+        self.stack = stack(heads={11: "1" * 40})
+        pipeline = self.pipeline()
+        member = self.stack["members"][0]
+        request = pipeline.request_for(member, MODULE.STAGE_CI, 2)
+        self.stack = stack(heads={11: "2" * 40})
+        self.checkpoint_map[11] = [
+            {
+                "id": "push-1",
+                "head_sha": "2" * 40,
+                "pipeline_run": "run-1",
+                "pipeline_iteration": 1,
+            }
+        ]
+
+        outcomes = pipeline.propagate_ci_pushes(request, set())
+
+        self.assertEqual("published", outcomes[0]["result"])
+        self.assertEqual([(11, "2" * 40)], self.propagated)
+
+    def test_a_current_pass_checkpoint_matching_the_stale_request_is_retired(self):
+        self.stack = stack(heads={11: "1" * 40})
+        pipeline = self.pipeline()
+        request = pipeline.request_for(
+            self.stack["members"][0], MODULE.STAGE_CI, 2
+        )
+        self.stack = stack(heads={11: "2" * 40})
+        self.checkpoint_map[11] = [
+            {
+                "id": "push-1",
+                "head_sha": "1" * 40,
+                "pipeline_run": "run-1",
+                "pipeline_iteration": 2,
+            }
+        ]
+        pipeline.propagate = mock.Mock(side_effect=AssertionError("must not retry"))
+
+        outcomes = pipeline.propagate_ci_pushes(request, set())
+
+        self.assertEqual("superseded", outcomes[0]["result"])
+        self.assertEqual("2" * 40, outcomes[0]["superseded_by"])
+        pipeline.propagate.assert_not_called()
+
+    def test_retiring_a_stale_checkpoint_rebuilds_the_ci_worker_request(self):
+        self.stack = stack(members=(11,), heads={11: "1" * 40})
+        pipeline = self.pipeline(kickoff(numbers=(11,)))
+        selected = self.stack["members"]
+        self.stack = stack(members=(11,), heads={11: "2" * 40})
+        self.checkpoint_map[11] = [
+            {
+                "id": "push-1",
+                "head_sha": "1" * 40,
+                "pipeline_run": "run-1",
+                "pipeline_iteration": 1,
+            }
+        ]
+        pipeline.propagate = mock.Mock(side_effect=AssertionError("must not retry"))
+        self.launcher.on_start = lambda request: self.clear.add(
+            (request["number"], MODULE.STAGE_CI)
+        )
+
+        result = pipeline.run_ci_phase(2, selected)
+
+        self.assertIsNone(result["blocked"])
+        self.assertEqual(
+            ["2" * 40],
+            [request["head_sha"] for request in self.launcher.started],
+        )
+        pipeline.propagate.assert_not_called()
+
+    def test_an_old_checkpoint_is_not_retried_without_a_live_source_head(self):
+        self.stack = stack(heads={11: "1" * 40})
+        pipeline = self.pipeline(read_stack=lambda repository, number: None)
+        self.checkpoint_map[11] = [
+            {
+                "id": "push-1",
+                "head_sha": "1" * 40,
+                "pipeline_run": "run-1",
+                "pipeline_iteration": 1,
+            }
+        ]
+        pipeline.propagate = mock.Mock(side_effect=AssertionError("must not retry"))
+
+        outcomes = pipeline.propagate_ci_pushes(
+            pipeline.request_for(self.stack["members"][0], MODULE.STAGE_CI, 2),
+            set(),
+        )
+
+        self.assertEqual("failed", outcomes[0]["result"])
+        self.assertEqual("source_head_unknown", outcomes[0]["reason"])
+        pipeline.propagate.assert_not_called()
+
+    def test_alignment_retires_the_child_checkpoint_from_its_old_head(self):
+        self.contains_pairs = set()
+        self.stack = stack()
+        pipeline = self.pipeline()
+        for number in (11, 12, 13):
+            self.clear.add((number, MODULE.STAGE_CI))
+        self.checkpoint_map[12] = [
+            {
+                "id": "child-push",
+                "head_sha": head_of(12),
+                "pipeline_run": "run-1",
+                "pipeline_iteration": 1,
+            }
+        ]
+
+        def align(repository, number, head_sha, stack_number):
+            self.propagated.append((number, head_sha))
+            self.stack = stack(heads={12: "a" * 40, 13: "c" * 40})
+            self.contains_pairs.update(
+                {
+                    (head_of(11), "a" * 40),
+                    ("a" * 40, "c" * 40),
+                }
+            )
+            return {"result": "published"}
+
+        pipeline.propagate = align
+
+        result = pipeline.run_ci_phase(2, self.stack["members"])
+
+        self.assertIsNone(result["blocked"])
+        self.assertEqual([(11, head_of(11))], self.propagated)
+        self.assertEqual(["child-push"], pipeline.state["propagated_pushes"])
+        retired = [
+            outcome
+            for outcome in result["propagations"]
+            if outcome.get("reason") == "source_head_moved"
+        ]
+        self.assertEqual("a" * 40, retired[0]["superseded_by"])
+
     def test_a_newer_successful_push_retires_an_older_failed_checkpoint(self):
+        self.stack = stack(heads={11: "2" * 40})
         pipeline = self.pipeline()
         self.checkpoint_map[11] = [
             {
@@ -799,8 +1015,7 @@ class StackRunTest(StackFixture):
                 "pipeline_iteration": 1,
             },
         ]
-        outcomes = iter([{"result": "failed"}, {"result": "published"}])
-        pipeline.propagate = lambda *args: next(outcomes)
+        pipeline.propagate = lambda *args: {"result": "published"}
 
         propagated = pipeline.propagate_ci_pushes(
             pipeline.request_for(
@@ -809,7 +1024,8 @@ class StackRunTest(StackFixture):
             set(),
         )
 
-        self.assertEqual("push-2", propagated[0]["superseded_by"])
+        self.assertEqual("2" * 40, propagated[0]["superseded_by"])
+        self.assertEqual("published", propagated[1]["result"])
         self.assertEqual(
             ["push-1", "push-2"], pipeline.state["propagated_pushes"]
         )
