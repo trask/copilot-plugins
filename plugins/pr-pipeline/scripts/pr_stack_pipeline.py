@@ -10,6 +10,7 @@ when a result counts, while each stage decides what to do.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from contextlib import contextmanager
 import hashlib
 import importlib.util
@@ -56,6 +57,9 @@ MONITOR_POLL_INTERVAL = 15.0
 STACK_ENTRIES_PAGE = 50
 RUN_KIND = "pr-stack-pipeline"
 OWNERSHIP_SUFFIX = ".worktree.json"
+WINDOWS_WORKTREE_DIRECTORY = "cpw"
+WINDOWS_WORKTREE_PATH_BUDGET = 120
+WINDOWS_PR_NUMBER_RESERVE = 10
 CONFLICT_PROPAGATE_COMMAND = "descendant-propagate"
 PROGRESS_EVENT = common.PROGRESS_EVENT
 PROGRESS_UPDATE_EVENT = common.PROGRESS_UPDATE_EVENT
@@ -232,6 +236,37 @@ def lock_path_for(kickoff: dict[str, Any]) -> Path:
 
 def run_directory_for(kickoff: dict[str, Any], run_id: str) -> Path:
     return run_root() / run_slug(kickoff) / run_id
+
+
+def validate_worktree_root(root: Path, *, platform_name: str | None = None) -> Path:
+    platform_name = platform_name or os.name
+    if platform_name != "nt":
+        return root
+    longest_path = root / ("9" * WINDOWS_PR_NUMBER_RESERVE)
+    if len(str(longest_path)) > WINDOWS_WORKTREE_PATH_BUDGET:
+        raise WorkflowError(
+            "the Windows worker worktree root exceeds the "
+            f"{WINDOWS_WORKTREE_PATH_BUDGET}-character path budget: {root}"
+        )
+    return root
+
+
+def worktree_root_for(
+    run_directory: Path,
+    run_id: str,
+    *,
+    platform_name: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    platform_name = platform_name or os.name
+    if platform_name != "nt":
+        return run_directory / "worktrees"
+    environment = os.environ if environ is None else environ
+    local_app_data = environment.get("LOCALAPPDATA")
+    if not local_app_data:
+        raise WorkflowError("LOCALAPPDATA is required for Windows worker worktrees")
+    root = (Path(local_app_data) / WINDOWS_WORKTREE_DIRECTORY / run_id).resolve()
+    return validate_worktree_root(root, platform_name=platform_name)
 
 
 def progress_log_path(kickoff: dict[str, Any], run_id: str) -> Path:
@@ -862,8 +897,16 @@ def worktree_ownership_path(run_directory: Path, number: int) -> Path:
     return run_directory / "worktrees" / f"{number}{OWNERSHIP_SUFFIX}"
 
 
-def worktree_path(run_directory: Path, number: int) -> Path:
-    return run_directory / "worktrees" / str(number)
+def worktree_path(worktree_root: Path, number: int) -> Path:
+    return worktree_root / str(number)
+
+
+def owns_worktree(record: Any, run_id: str, path: Path) -> bool:
+    return (
+        isinstance(record, dict)
+        and record.get("run_id") == run_id
+        and record.get("path") == str(path)
+    )
 
 
 def worker_prompt(
@@ -891,6 +934,7 @@ class WorkerLauncher:
         repository: str,
         run_id: str,
         run_directory: Path,
+        worktree_root: Path | None = None,
         models: dict[str, str],
         effort: str,
         readiness_timeout: float = READINESS_TIMEOUT,
@@ -902,6 +946,9 @@ class WorkerLauncher:
         self.repository = repository
         self.run_id = run_id
         self.run_directory = run_directory
+        self.worktree_root = validate_worktree_root(
+            worktree_root or worktree_root_for(run_directory, run_id)
+        )
         self.models = models
         self.effort = effort
         self.readiness_timeout = readiness_timeout
@@ -911,14 +958,10 @@ class WorkerLauncher:
 
     def create(self, request: dict[str, Any]) -> dict[str, Any]:
         number = request["number"]
-        path = worktree_path(self.run_directory, number)
+        path = worktree_path(self.worktree_root, number)
         record_path = worktree_ownership_path(self.run_directory, number)
         record = common.read_json(record_path)
-        if path.exists() and not (
-            isinstance(record, dict)
-            and record.get("run_id") == self.run_id
-            and record.get("path") == str(path)
-        ):
+        if path.exists() and not owns_worktree(record, self.run_id, path):
             return {
                 "result": "failed",
                 "reason": "worktree_is_not_owned_by_this_run",
@@ -952,6 +995,7 @@ class WorkerLauncher:
             record["updated_at"] = utc_now()
             common.write_json_atomically(record_path, record)
             return {"result": "ready", "worktree": path, "reused": True}
+        self.worktree_root.mkdir(parents=True, exist_ok=True)
         added = common.run(
             [
                 "git",
@@ -987,7 +1031,7 @@ class WorkerLauncher:
 
     def verify(self, request: dict[str, Any], worktree: Path) -> dict[str, Any]:
         record = common.read_json(worktree_ownership_path(self.run_directory, request["number"]))
-        if not isinstance(record, dict) or record.get("run_id") != self.run_id:
+        if not owns_worktree(record, self.run_id, worktree):
             return {"result": "failed", "reason": "worktree_ownership_missing"}
         root = common.git_or_none(worktree, "rev-parse", "--show-toplevel")
         if root is None or Path(root).resolve() != worktree.resolve():
@@ -1151,9 +1195,17 @@ class WorkerLauncher:
         return {"returncode": returncode, "ended_at": utc_now()}
 
     def cleanup(self, number: int) -> dict[str, Any]:
-        path = worktree_path(self.run_directory, number)
+        path = worktree_path(self.worktree_root, number)
+        record_path = worktree_ownership_path(self.run_directory, number)
         if not path.exists():
             return {"result": "absent", "number": number}
+        record = common.read_json(record_path)
+        if not owns_worktree(record, self.run_id, path):
+            return {
+                "result": "failed",
+                "reason": "worktree_is_not_owned_by_this_run",
+                "number": number,
+            }
         removed = common.run(
             [
                 "git",
@@ -1168,11 +1220,15 @@ class WorkerLauncher:
         )
         if removed.returncode != 0 and path.exists():
             shutil.rmtree(path, ignore_errors=True)
-        record = worktree_ownership_path(self.run_directory, number)
-        try:
-            record.unlink()
-        except OSError:
-            pass
+        if not path.exists():
+            try:
+                record_path.unlink()
+            except OSError:
+                pass
+            try:
+                self.worktree_root.rmdir()
+            except OSError:
+                pass
         return {
             "result": "removed" if not path.exists() else "failed",
             "number": number,

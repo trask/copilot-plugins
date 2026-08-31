@@ -1335,6 +1335,95 @@ class StateTest(unittest.TestCase):
         self.assertTrue(path.exists())
 
 
+class WorktreePathTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def test_windows_worktrees_use_a_short_run_id_root(self):
+        run_directory = self.root / ("repository-and-stack-slug-" * 10) / "run-id"
+        run_id = "0b5659a09b3a4f3bb5ba1a7f467bbe38"
+
+        root = MODULE.worktree_root_for(
+            run_directory,
+            run_id,
+            platform_name="nt",
+            environ={"LOCALAPPDATA": str(self.root / "local")},
+        )
+
+        self.assertEqual((self.root / "local" / "cpw" / run_id).resolve(), root)
+        self.assertNotIn("repository-and-stack-slug", str(root))
+        self.assertLessEqual(
+            len(str(MODULE.worktree_path(root, 19871))),
+            MODULE.WINDOWS_WORKTREE_PATH_BUDGET,
+        )
+
+    def test_windows_roots_keep_the_full_run_id_unique(self):
+        environment = {"LOCALAPPDATA": str(self.root / "local")}
+
+        first = MODULE.worktree_root_for(
+            self.root / "run",
+            "00000000000000000000000000000001",
+            platform_name="nt",
+            environ=environment,
+        )
+        second = MODULE.worktree_root_for(
+            self.root / "run",
+            "00000000000000000000000000000002",
+            platform_name="nt",
+            environ=environment,
+        )
+
+        self.assertNotEqual(first, second)
+        self.assertEqual("00000000000000000000000000000001", first.name)
+        self.assertEqual("00000000000000000000000000000002", second.name)
+
+    def test_windows_resume_reuses_the_same_physical_root(self):
+        arguments = {
+            "run_directory": self.root / ("long-run-directory-" * 10),
+            "run_id": "0b5659a09b3a4f3bb5ba1a7f467bbe38",
+            "platform_name": "nt",
+            "environ": {"LOCALAPPDATA": str(self.root / "local")},
+        }
+
+        original = MODULE.worktree_root_for(**arguments)
+        resumed = MODULE.worktree_root_for(**arguments)
+
+        self.assertEqual(original, resumed)
+
+    def test_windows_rejects_a_root_that_exhausts_the_path_budget(self):
+        local_app_data = self.root / ("long-local-app-data-" * 10)
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "path budget"):
+            MODULE.worktree_root_for(
+                self.root / "run",
+                "0" * 32,
+                platform_name="nt",
+                environ={"LOCALAPPDATA": str(local_app_data)},
+            )
+
+    def test_non_windows_worktrees_stay_in_the_run_directory(self):
+        run_directory = self.root / "run"
+
+        worktree_root = MODULE.worktree_root_for(
+            run_directory,
+            "0" * 32,
+            platform_name="posix",
+            environ={},
+        )
+
+        self.assertEqual(run_directory / "worktrees", worktree_root)
+
+    def test_ownership_records_stay_in_the_run_directory(self):
+        run_directory = self.root / ("long-run-directory-" * 10)
+
+        self.assertEqual(
+            run_directory / "worktrees" / "19871.worktree.json",
+            MODULE.worktree_ownership_path(run_directory, 19871),
+        )
+
+
 class ProgressProtocolTest(StackFixture):
     def setUp(self):
         super().setUp()
@@ -1704,6 +1793,7 @@ class LauncherTest(unittest.TestCase):
             repository="owner/repo",
             run_id="run-1",
             run_directory=self.root / "run",
+            worktree_root=self.root / "worktrees",
             models=COMMON.stage_models(None),
             effort="high",
             readiness_timeout=1.0,
@@ -1729,7 +1819,7 @@ class LauncherTest(unittest.TestCase):
         }
 
     def test_a_worktree_this_run_does_not_own_is_refused(self):
-        path = MODULE.worktree_path(self.launcher.run_directory, 11)
+        path = MODULE.worktree_path(self.launcher.worktree_root, 11)
         path.mkdir(parents=True)
 
         created = self.launcher.create(self.request())
@@ -1739,10 +1829,47 @@ class LauncherTest(unittest.TestCase):
 
     def test_verification_needs_this_run_s_ownership_record(self):
         verified = self.launcher.verify(
-            self.request(), MODULE.worktree_path(self.launcher.run_directory, 11)
+            self.request(), MODULE.worktree_path(self.launcher.worktree_root, 11)
         )
         self.assertEqual("failed", verified["result"])
         self.assertEqual("worktree_ownership_missing", verified["reason"])
+
+    def test_cleanup_refuses_a_worktree_owned_by_another_run(self):
+        path = MODULE.worktree_path(self.launcher.worktree_root, 11)
+        path.mkdir(parents=True)
+        record = MODULE.worktree_ownership_path(self.launcher.run_directory, 11)
+        COMMON.write_json_atomically(
+            record,
+            {"run_id": "another-run", "path": str(path)},
+        )
+
+        cleaned = self.launcher.cleanup(11)
+
+        self.assertEqual("failed", cleaned["result"])
+        self.assertEqual("worktree_is_not_owned_by_this_run", cleaned["reason"])
+        self.assertTrue(path.exists())
+
+    def test_cleanup_removes_the_short_root_but_keeps_run_metadata(self):
+        path = MODULE.worktree_path(self.launcher.worktree_root, 11)
+        path.mkdir(parents=True)
+        record = MODULE.worktree_ownership_path(self.launcher.run_directory, 11)
+        COMMON.write_json_atomically(
+            record,
+            {"run_id": self.launcher.run_id, "path": str(path)},
+        )
+
+        def remove_worktree(_command, *, check):
+            self.assertFalse(check)
+            path.rmdir()
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(COMMON, "run", side_effect=remove_worktree):
+            cleaned = self.launcher.cleanup(11)
+
+        self.assertEqual("removed", cleaned["result"])
+        self.assertFalse(self.launcher.worktree_root.exists())
+        self.assertFalse(record.exists())
+        self.assertTrue(self.launcher.run_directory.exists())
 
     def test_readiness_needs_durable_evidence(self):
         request = self.request()
