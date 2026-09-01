@@ -4,6 +4,7 @@ from io import StringIO
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -119,16 +120,23 @@ class FakeLauncher:
         if self.on_start is not None:
             self.on_start(request)
         self.started.append(request)
+        polls = (
+            self.alive_polls.get(request["number"], 0)
+            if isinstance(self.alive_polls, dict)
+            else self.alive_polls
+        )
         return {
             "result": "started",
-            "handle": FakeHandle(alive_polls=self.alive_polls),
+            "handle": FakeHandle(alive_polls=polls),
             "pid": 1000 + request["number"],
             "log_path": Path(f"/logs/{request['number']}.log"),
             "record_path": Path(f"/records/{request['number']}.json"),
         }
 
-    def confirm_ready(self, request, started):
+    def confirm_ready(self, request, started, *, should_cancel=None):
         self.calls.append(("confirm_ready", request["number"]))
+        if should_cancel is not None and should_cancel():
+            return {"result": "cancelled"}
         if self._fails("readiness", request):
             return {"result": "failed", "reason": "worker_readiness_timeout"}
         return {"result": "active", "evidence": {"pid": started["pid"]}}
@@ -136,7 +144,7 @@ class FakeLauncher:
     def cancel(self, started):
         number = started["pid"] - 1000
         self.calls.append(("cancel", number))
-        started["handle"].wait()
+        return {"returncode": started["handle"].wait()}
 
     def is_running(self, worker):
         return worker["handle"].poll() is None
@@ -401,7 +409,7 @@ class StackFixture(unittest.TestCase):
     def checkpoints(self, repository, number):
         return self.checkpoint_map.get(number, [])
 
-    def worker_progress(self, repository, number):
+    def worker_progress(self, repository, number, stage):
         return self.worker_progress_map.get(number)
 
     def propagate(self, repository, number, head_sha, stack_number):
@@ -523,6 +531,60 @@ class StackRunTest(StackFixture):
         )
         self.assertLess(last_start, first_wait)
 
+    def test_parallel_workers_are_collected_in_completion_order(self):
+        self.launcher = FakeLauncher(alive_polls={11: 3, 12: 0, 13: 1})
+        pipeline = self.pipeline()
+
+        result = pipeline.run_parallel_phase(
+            MODULE.STAGE_COPILOT_REVIEW, 1, self.stack["members"]
+        )
+
+        self.assertEqual(
+            [12, 13, 11],
+            [event["number"] for event in self.events_named("worker_finished")],
+        )
+        self.assertEqual(
+            [11, 12, 13],
+            [completion["number"] for completion in result["completions"]],
+        )
+
+    def test_finished_worker_is_removed_before_its_event_is_emitted(self):
+        pipeline = self.pipeline()
+        active_at_finish = {}
+
+        def report(event):
+            if event["event"] == "worker_finished":
+                active_at_finish[event["number"]] = [
+                    worker["number"]
+                    for worker in pipeline.state.get("active_workers", [])
+                ]
+
+        pipeline.report = report
+        pipeline.run_parallel_phase(
+            MODULE.STAGE_COPILOT_REVIEW, 1, self.stack["members"]
+        )
+
+        for number in (11, 12, 13):
+            self.assertNotIn(number, active_at_finish[number])
+
+    def test_parallel_worker_progress_is_polled_and_coalesced_for_every_worker(self):
+        self.launcher = FakeLauncher(alive_polls=2)
+        for number in (11, 12, 13):
+            self.worker_progress_map[number] = {
+                "phase": "addressing_comments",
+                "observed_at": "2026-08-31T12:00:00Z",
+            }
+        pipeline = self.pipeline()
+
+        pipeline.run_parallel_phase(
+            MODULE.STAGE_COPILOT_REVIEW, 1, self.stack["members"]
+        )
+
+        self.assertEqual(
+            [11, 12, 13],
+            [event["number"] for event in self.events_named("worker_progress")],
+        )
+
     def test_a_failed_launch_stops_later_launches_and_is_never_retried(self):
         self.launcher = FakeLauncher(fail_step="verify", fail_number=12)
         pipeline = self.pipeline()
@@ -554,6 +616,68 @@ class StackRunTest(StackFixture):
         self.assertEqual([], result["completions"])
         self.assertNotIn(("create", 12), self.launcher.calls)
         self.assertIn(("cancel", 11), self.launcher.calls)
+        self.assertEqual([], pipeline.state["active_workers"])
+
+    def test_cancellation_during_serialized_launch_stops_later_workers(self):
+        pipeline = self.pipeline()
+
+        def request_cancel(request):
+            if request["number"] == 11:
+                COMMON.write_json_atomically(
+                    pipeline.cancellation_path,
+                    {
+                        "kind": MODULE.RUN_KIND,
+                        "run_id": pipeline.run_id,
+                        "kickoff": pipeline.kickoff,
+                        "status": "requested",
+                    },
+                )
+
+        self.launcher.on_start = request_cancel
+        requests = [
+            pipeline.request_for(member, MODULE.STAGE_COPILOT_REVIEW, 1)
+            for member in self.stack["members"]
+        ]
+
+        with self.assertRaises(MODULE.PipelineCancelled):
+            pipeline.dispatch(requests, MODULE.STAGE_COPILOT_REVIEW, 1)
+
+        self.assertEqual(
+            [11], [call[1] for call in self.launcher.calls if call[0] == "start"]
+        )
+        self.assertIn(("cancel", 11), self.launcher.calls)
+        self.assertEqual([], pipeline.state["active_workers"])
+
+    def test_cancellation_during_parallel_execution_stops_all_live_workers(self):
+        self.launcher = FakeLauncher(alive_polls=100)
+        pipeline = self.pipeline()
+        requested = False
+
+        def cancel_on_first_wait(_seconds):
+            nonlocal requested
+            if not requested:
+                requested = True
+                COMMON.write_json_atomically(
+                    pipeline.cancellation_path,
+                    {
+                        "kind": MODULE.RUN_KIND,
+                        "run_id": pipeline.run_id,
+                        "kickoff": pipeline.kickoff,
+                        "status": "requested",
+                    },
+                )
+
+        pipeline.sleep = cancel_on_first_wait
+        with self.assertRaises(MODULE.PipelineCancelled):
+            pipeline.run_parallel_phase(
+                MODULE.STAGE_COPILOT_REVIEW, 1, self.stack["members"]
+            )
+        pipeline.cancel_active_workers()
+
+        self.assertEqual(
+            [11, 12, 13],
+            [call[1] for call in self.launcher.calls if call[0] == "cancel"],
+        )
         self.assertEqual([], pipeline.state["active_workers"])
 
     # Stale results ------------------------------------------------------
@@ -713,6 +837,25 @@ class StackRunTest(StackFixture):
         self.assertEqual("predecessor_head_is_not_contained", result["gates"][-1]["reason"])
         self.assertEqual("predecessor_alignment", result["propagations"][-1]["trigger"])
 
+    def test_cancellation_prevents_predecessor_alignment(self):
+        self.contains_pairs = set()
+        pipeline = self.pipeline()
+        self.clear.add((11, MODULE.STAGE_CI))
+        COMMON.write_json_atomically(
+            pipeline.cancellation_path,
+            {
+                "kind": MODULE.RUN_KIND,
+                "run_id": pipeline.run_id,
+                "kickoff": pipeline.kickoff,
+                "status": "requested",
+            },
+        )
+
+        with self.assertRaises(MODULE.PipelineCancelled):
+            pipeline.run_ci_phase(1, self.stack["members"])
+
+        self.assertEqual([], self.propagated)
+
     def test_an_already_clear_member_is_green_without_a_worker(self):
         self.clear.add((11, MODULE.STAGE_CI))
         pipeline = self.pipeline()
@@ -789,6 +932,34 @@ class StackRunTest(StackFixture):
         pipeline.monitor_ci_worker(launched["workers"][0], request)
 
         self.assertEqual([(11, "1" * 40)], self.propagated)
+
+    def test_cancellation_prevents_a_final_ci_propagation_after_worker_exit(self):
+        pipeline = self.pipeline()
+        member = self.stack["members"][0]
+        request = pipeline.request_for(member, MODULE.STAGE_CI, 1)
+        launched = pipeline.dispatch([request], MODULE.STAGE_CI, 1)
+        self.checkpoint_map[11] = [
+            {
+                "id": "push-1",
+                "head_sha": head_of(11),
+                "pipeline_run": "run-1",
+                "pipeline_iteration": 1,
+            }
+        ]
+        COMMON.write_json_atomically(
+            pipeline.cancellation_path,
+            {
+                "kind": MODULE.RUN_KIND,
+                "run_id": pipeline.run_id,
+                "kickoff": pipeline.kickoff,
+                "status": "requested",
+            },
+        )
+
+        with self.assertRaises(MODULE.PipelineCancelled):
+            pipeline.monitor_ci_worker(launched["workers"][0], request)
+
+        self.assertEqual([], self.propagated)
 
     def test_ci_monitor_reports_known_failure_diagnostics_once(self):
         self.launcher = FakeLauncher(alive_polls=2)
@@ -1114,6 +1285,29 @@ class StackRunTest(StackFixture):
         self.assertEqual("missing_dependencies", result["reason"])
         self.assertEqual([], self.launcher.calls)
 
+    def test_cancellation_before_first_launch_finishes_the_run_as_cancelled(self):
+        pipeline = self.pipeline()
+        COMMON.write_json_atomically(
+            pipeline.cancellation_path,
+            {
+                "kind": MODULE.RUN_KIND,
+                "run_id": pipeline.run_id,
+                "kickoff": pipeline.kickoff,
+                "status": "requested",
+            },
+        )
+
+        result = pipeline.execute()
+
+        self.assertEqual("cancelled", result["result"])
+        self.assertEqual("cancel_requested", result["reason"])
+        self.assertEqual([], self.launcher.calls)
+        self.assertEqual(
+            "cancelled",
+            COMMON.read_json(pipeline.result_path)["pipeline_result"]["result"],
+        )
+        self.assertFalse(pipeline.lock_path.exists())
+
     def test_a_stopped_launch_ends_the_run_with_a_partial_summary(self):
         self.launcher = FakeLauncher(fail_step="start", fail_number=11)
         pipeline = self.pipeline()
@@ -1128,6 +1322,27 @@ class StackRunTest(StackFixture):
             "PR Stack Pipeline: #11 - Pull request 11", result["session_title"]
         )
 
+    def test_runtime_error_cancels_workers_and_releases_the_lock(self):
+        self.launcher = FakeLauncher(alive_polls=100)
+
+        def fail_progress(_repository, _number, _stage):
+            raise MODULE.WorkflowError("GitHub unavailable")
+
+        pipeline = self.pipeline(worker_progress=fail_progress)
+
+        result = pipeline.execute()
+
+        self.assertEqual("error", result["result"])
+        self.assertEqual("scheduler_error", result["reason"])
+        self.assertIn("GitHub unavailable", result["detail"])
+        self.assertIn(("cancel", 11), self.launcher.calls)
+        self.assertEqual([], pipeline.state["active_workers"])
+        self.assertFalse(pipeline.lock_path.exists())
+        self.assertEqual(
+            "error",
+            COMMON.read_json(pipeline.result_path)["pipeline_result"]["result"],
+        )
+
     def test_the_run_cleans_up_the_worktrees_it_created(self):
         self.clear_everything()
         pipeline = self.pipeline()
@@ -1140,6 +1355,18 @@ class StackRunTest(StackFixture):
             result["cleanup"],
         )
 
+    def test_finish_releases_the_lock_when_result_persistence_fails(self):
+        pipeline = self.pipeline()
+        MODULE.acquire_lock(pipeline.lock_path, pipeline.run_id)
+        with (
+            mock.patch.object(
+                pipeline, "persist_result", side_effect=OSError("disk full")
+            ),
+            self.assertRaisesRegex(OSError, "disk full"),
+        ):
+            pipeline.finish("cancelled")
+        self.assertFalse(pipeline.lock_path.exists())
+
     def test_a_duplicate_run_stops_on_the_lock(self):
         self.clear_everything()
         first = self.pipeline()
@@ -1150,6 +1377,10 @@ class StackRunTest(StackFixture):
         self.assertEqual("stopped", result["result"])
         self.assertEqual("another_run_holds_the_lock", result["reason"])
         self.assertEqual([], self.launcher.calls)
+        self.assertEqual(
+            "stopped",
+            COMMON.read_json(first.result_path)["pipeline_result"]["result"],
+        )
 
     def test_recovery_does_not_duplicate_a_still_active_worker(self):
         pipeline = self.pipeline()
@@ -1176,6 +1407,10 @@ class StackRunTest(StackFixture):
         self.assertEqual("incomplete", result["result"])
         self.assertEqual("previous_workers_still_active", result["reason"])
         self.assertEqual([], self.launcher.calls)
+        self.assertEqual(
+            "incomplete",
+            COMMON.read_json(pipeline.result_path)["pipeline_result"]["result"],
+        )
 
     def test_progress_events_name_every_phase(self):
         self.clear_everything()
@@ -1485,6 +1720,34 @@ class ProgressProtocolTest(StackFixture):
         update = MODULE.read_progress_log(self.event_log)[0]
         self.assertIn("diagnosing 1 known failure", update["message"])
         self.assertIn("diagnosing a known CI failure", update["wait_reason"])
+
+    def test_copilot_review_progress_names_all_live_substates(self):
+        expectations = {
+            "waiting_for_review": "waiting for Copilot's review",
+            "addressing_comments": "addressing Copilot review comments",
+            "validating": "validating Copilot review fixes",
+        }
+        for phase, phrase in expectations.items():
+            with self.subTest(phase=phase):
+                event_log = self.root / f"{phase}.jsonl"
+                reporter = MODULE.ProgressReporter(
+                    event_log=event_log,
+                    output=lambda _payload: None,
+                    wall_time=lambda: 1000.0,
+                )
+                reporter(
+                    {
+                        "event": "worker_progress",
+                        "stage": MODULE.STAGE_COPILOT_REVIEW,
+                        "pull_request_pass": 1,
+                        "number": 11,
+                        "phase": phase,
+                    }
+                )
+                update = MODULE.read_progress_log(event_log)[0]
+                self.assertIn("#11", update["message"])
+                self.assertIn(phrase, update["message"])
+                self.assertIn("#11", update["wait_reason"])
 
     def test_real_scheduler_events_keep_pass_and_pull_request_context(self):
         self.clear_everything()
@@ -1935,6 +2198,8 @@ class AgentInstructionTest(unittest.TestCase):
     def test_the_agent_only_runs_and_reports_the_helper(self):
         self.assertIn('pr_stack_pipeline.py" start --kickoff', self.text)
         self.assertIn('pr_stack_pipeline.py" watch --kickoff', self.text)
+        self.assertIn('pr_stack_pipeline.py" cancel --kickoff', self.text)
+        self.assertIn("Interrupting `watch` does not cancel", self.text)
         self.assertIn("The helper owns all control flow", self.text)
         self.assertIn("Run `start` synchronously exactly once", self.text)
         self.assertIn("--wait-seconds 300", self.text)
@@ -1989,6 +2254,92 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertNotIn("clean_at_head_sha", self.text)
 
 
+class CancelCommandTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.payload = kickoff()
+        self.run_id = "a" * 32
+        self.run_root = mock.patch.object(MODULE, "run_root", return_value=self.root)
+        self.run_root.start()
+        self.addCleanup(self.run_root.stop)
+
+    def args(self):
+        return SimpleNamespace(
+            kickoff=json.dumps(self.payload),
+            kickoff_file=None,
+            run_id=self.run_id,
+            wait_seconds=0,
+        )
+
+    def write_launch(self, **overrides):
+        launch = {
+            "kind": MODULE.RUN_KIND,
+            "run_id": self.run_id,
+            "kickoff": self.payload,
+            "pid": 123,
+        }
+        launch.update(overrides)
+        COMMON.write_json_atomically(
+            MODULE.launch_state_path(self.payload, self.run_id), launch
+        )
+
+    def invoke(self, *, alive=True):
+        output = StringIO()
+        with (
+            mock.patch.object(COMMON, "process_is_alive", return_value=alive),
+            redirect_stdout(output),
+        ):
+            MODULE.command_cancel(self.args())
+        return json.loads(output.getvalue())
+
+    def test_unknown_run_is_safe_and_deterministic(self):
+        result = self.invoke()
+        self.assertEqual("unknown_run", result["result"])
+
+    def test_wrong_run_identity_is_rejected(self):
+        self.write_launch(run_id="b" * 32)
+        self.assertEqual("run_identity_mismatch", self.invoke()["result"])
+
+    def test_stale_run_records_a_safe_terminal_cancellation_result(self):
+        self.write_launch()
+        self.assertEqual("stale_run", self.invoke(alive=False)["result"])
+        request = COMMON.read_json(
+            MODULE.cancellation_request_path(self.payload, self.run_id)
+        )
+        self.assertEqual("stale", request["status"])
+
+    def test_repeated_cancellation_is_idempotent(self):
+        self.write_launch()
+        self.assertEqual("requested", self.invoke()["result"])
+        self.assertEqual("already_requested", self.invoke()["result"])
+
+    def test_finished_run_is_not_changed(self):
+        self.write_launch()
+        pipeline_result = {"result": "complete", "passes": 1}
+        COMMON.write_json_atomically(
+            MODULE.run_result_path(self.payload, self.run_id),
+            {
+                "kind": MODULE.RUN_KIND,
+                "run_id": self.run_id,
+                "kickoff": self.payload,
+                "pipeline_result": pipeline_result,
+            },
+        )
+        result = self.invoke()
+        self.assertEqual("already_finished", result["result"])
+        self.assertEqual(pipeline_result, result["pipeline_result"])
+
+    def test_malformed_existing_cancellation_record_is_not_overwritten(self):
+        self.write_launch()
+        path = MODULE.cancellation_request_path(self.payload, self.run_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[]\n", encoding="utf-8")
+        self.assertEqual("cancellation_record_malformed", self.invoke()["result"])
+        self.assertEqual([], COMMON.read_json(path))
+
+
 class ParserTest(unittest.TestCase):
     def test_the_progress_protocol_adds_start_and_watch_commands(self):
         parser = MODULE.build_parser()
@@ -1997,7 +2348,7 @@ class ParserTest(unittest.TestCase):
             for action in parser._actions
             if isinstance(action, __import__("argparse")._SubParsersAction)
         )
-        self.assertEqual({"run", "start", "watch"}, set(action.choices))
+        self.assertEqual({"run", "start", "watch", "cancel"}, set(action.choices))
 
     def test_run_accepts_a_kickoff_payload_and_model_overrides(self):
         args = MODULE.build_parser().parse_args(

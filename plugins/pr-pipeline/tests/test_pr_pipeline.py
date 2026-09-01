@@ -201,6 +201,70 @@ class WindowsSubprocessTest(unittest.TestCase):
             [mock.call(timeout=10), mock.call()], process.wait.call_args_list
         )
 
+    def test_windows_owned_process_terminates_the_job_before_reaping(self):
+        process = mock.Mock()
+        process.pid = 123
+        process.poll.return_value = None
+
+        def finish(timeout=None):
+            process.poll.return_value = 1
+            return 1
+
+        process.wait.side_effect = finish
+        owner = mock.Mock()
+        owned = MODULE.common.OwnedProcess(process, owner)
+        with mock.patch.object(MODULE.common, "IS_WINDOWS", True):
+            result = MODULE.common.terminate_process_tree(owned)
+
+        self.assertEqual(1, result)
+        owner.terminate.assert_called_once()
+        owner.close.assert_called_once()
+        process.terminate.assert_not_called()
+
+    def test_windows_background_worker_is_assigned_before_it_resumes(self):
+        process = mock.Mock(pid=123)
+        owner = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                mock.patch.object(MODULE.common, "IS_WINDOWS", True),
+                mock.patch.object(
+                    MODULE.common.subprocess,
+                    "CREATE_NO_WINDOW",
+                    0x08000000,
+                    create=True,
+                ),
+                mock.patch.object(
+                    MODULE.common.subprocess,
+                    "CREATE_NEW_PROCESS_GROUP",
+                    0x00000200,
+                    create=True,
+                ),
+                mock.patch.object(
+                    MODULE.common.subprocess,
+                    "CREATE_BREAKAWAY_FROM_JOB",
+                    0x01000000,
+                    create=True,
+                ),
+                mock.patch.object(
+                    MODULE.common.subprocess, "Popen", return_value=process
+                ) as popen,
+                mock.patch.object(
+                    MODULE.common, "create_windows_kill_job", return_value=owner
+                ) as create_job,
+                mock.patch.object(MODULE.common, "resume_windows_process") as resume,
+            ):
+                started = MODULE.common.start_background(
+                    ["copilot"],
+                    cwd=root,
+                    log_path=root / "worker.log",
+                )
+
+        self.assertIs(process, started.process)
+        create_job.assert_called_once_with(123)
+        resume.assert_called_once_with(123)
+        self.assertEqual(0x09000204, popen.call_args.kwargs["creationflags"])
+
 
 class TargetTest(unittest.TestCase):
     def test_parses_supported_targets(self):
@@ -364,6 +428,29 @@ class StageContractTest(unittest.TestCase):
         self.assertEqual("diagnosing", progress["phase"])
         self.assertEqual(["check:build"], progress["action_checks"])
         self.assertEqual(["check:test"], progress["pending_checks"])
+
+    def test_live_progress_prefers_a_stage_s_structured_substate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "review.json"
+            state.write_text(
+                json.dumps(
+                    {
+                        "stage_progress": {
+                            "phase": "validating",
+                            "detail": "targeted tests",
+                            "observed_at": "2026-08-31T12:00:00Z",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            progress = MODULE.common.stage_live_progress(
+                MODULE.STAGE_BY_NAME[MODULE.STAGE_COPILOT_REVIEW],
+                target(),
+                state_for=lambda _entry, _target: state,
+            )
+        self.assertEqual("validating", progress["phase"])
+        self.assertEqual("targeted tests", progress["detail"])
 
 
 class MarkerTest(unittest.TestCase):

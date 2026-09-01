@@ -29,6 +29,9 @@ GH_REVIEWER_ALIAS_VERSION = (2, 88, 0)
 COPILOT_REQUEST_RETRY_DELAYS = (2, 4, 8, 16)
 STATE_VERSION = 3
 DEFAULT_MAX_ITERATIONS = 5
+STAGE_PROGRESS_PHASES = frozenset(
+    {"waiting_for_review", "addressing_comments", "validating"}
+)
 # How many of its own iterations an outer loop is assumed to allow when it names no
 # cap of its own. Only the ceiling derived from it is affected, never the per-iteration
 # budget, so a caller cannot lift the bound by leaving the value out.
@@ -263,6 +266,17 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def set_stage_progress(
+    state: dict[str, Any], phase: str, detail: str | None = None
+) -> None:
+    if phase not in STAGE_PROGRESS_PHASES:
+        raise WorkflowError(f"unsupported stage progress phase: {phase}")
+    progress = {"phase": phase, "observed_at": utc_now()}
+    if detail:
+        progress["detail"] = detail
+    state["stage_progress"] = progress
 
 
 def require_tools() -> None:
@@ -1032,6 +1046,8 @@ def watcher_result(
 
     state["monitoring"].update({"status": status, "result": result})
     state["last_result"] = result["result"]
+    if result["result"] == WATCHER_REVIEW_COMMENTS:
+        set_stage_progress(state, "addressing_comments")
     return result
 
 
@@ -1197,6 +1213,10 @@ def command_preflight(args: argparse.Namespace) -> None:
     clean_at_head_sha = head if result in CLEAN_PREFLIGHT_RESULTS else None
     state["clean_at_head_sha"] = clean_at_head_sha
     state["last_result"] = result
+    if result == "ready":
+        set_stage_progress(state, "addressing_comments")
+    elif result == "review_required":
+        set_stage_progress(state, "waiting_for_review")
     save_state(state_path, state)
     emit(
         {
@@ -1256,6 +1276,7 @@ def command_plan(args: argparse.Namespace) -> None:
     queue["batches"].append(batch)
     for comment in comments:
         comment["batch"] = args.batch
+    set_stage_progress(state, "addressing_comments")
     save_state(path, state)
     emit({"result": "planned", "state": str(path), "batch": batch})
 
@@ -1300,6 +1321,7 @@ def command_refresh(args: argparse.Namespace) -> None:
             }
         )
         refreshed.append(stored)
+    set_stage_progress(state, "addressing_comments")
     save_state(path, state)
     emit({"result": "refreshed", "state": str(path), "comments": refreshed})
 
@@ -1341,6 +1363,7 @@ def command_record(args: argparse.Namespace) -> None:
     for batch in queue["batches"]:
         if batch["id"] == args.batch:
             batch["status"] = "approved"
+    set_stage_progress(state, "addressing_comments")
     save_state(path, state)
     emit(
         {
@@ -1370,6 +1393,7 @@ def command_skip(args: argparse.Namespace) -> None:
     for batch in queue["batches"]:
         if batch["id"] == args.batch:
             batch.update({"status": "skipped", "stash_ref": args.stash_ref})
+    set_stage_progress(state, "addressing_comments")
     save_state(path, state)
     emit(
         {
@@ -1981,6 +2005,7 @@ def command_publish(args: argparse.Namespace) -> None:
         state.setdefault("local_validation", []).append(validation)
     state["iterations"] = int(state.get("iterations", 0)) + 1
     state["clean_at_head_sha"] = None
+    set_stage_progress(state, "waiting_for_review")
     save_state(path, state)
     emit(
         {
@@ -2001,6 +2026,20 @@ def command_cancel_watch(args: argparse.Namespace) -> None:
     result = request_watch_cancellation(state) or "cancelled_locally"
     save_state(path, state)
     emit({"result": result, "state": str(path)})
+
+
+def command_progress(args: argparse.Namespace) -> None:
+    path = cli_path(args.state)
+    state = load_state(path)
+    set_stage_progress(state, args.phase, args.detail)
+    save_state(path, state)
+    emit(
+        {
+            "result": "progress_recorded",
+            "state": str(path),
+            "stage_progress": state["stage_progress"],
+        }
+    )
 
 
 def command_await_watch(args: argparse.Namespace) -> None:
@@ -2072,6 +2111,7 @@ def command_watch(args: argparse.Namespace) -> None:
     monitoring.update(
         {"status": "running", "pid": os.getpid(), "cancel_requested": False}
     )
+    set_stage_progress(state, "waiting_for_review")
     save_state(path, state)
     emit(
         {
@@ -2221,6 +2261,7 @@ def command_status(args: argparse.Namespace) -> None:
         "clean_at_head_sha": state.get("clean_at_head_sha"),
         "local_validation": state.get("local_validation") or [],
         "last_helper_activity": last_helper_activity(state),
+        "stage_progress": state.get("stage_progress"),
     }
     if outcome:
         payload["stage_outcome"] = outcome
@@ -2358,6 +2399,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cancel.add_argument("--state", required=True)
     cancel.set_defaults(function=command_cancel_watch)
+
+    progress = subparsers.add_parser(
+        "progress", help="record the review loop's current structured substate"
+    )
+    progress.add_argument("--state", required=True)
+    progress.add_argument("--phase", choices=sorted(STAGE_PROGRESS_PHASES), required=True)
+    progress.add_argument("--detail")
+    progress.set_defaults(function=command_progress)
 
     await_watch = subparsers.add_parser(
         "await-watch", help="wait for an active watcher to persist its terminal result"

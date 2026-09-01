@@ -29,6 +29,14 @@ Choose the command for the active shell, and pass the kickoff JSON as the single
 
 Run `start` synchronously exactly once. It returns `stack_pipeline_launched` with a `run_id` and cursor. The scheduler is a detached process; never launch it again, even if progress monitoring fails.
 
+`watch` only observes the detached scheduler. Interrupting `watch` does not cancel the run. When the user explicitly asks to stop the run, invoke the matching `cancel` command once with the exact kickoff and run ID:
+
+- Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; python "$copilot_home/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" cancel --kickoff '<json>' --run-id '<run_id>'`
+- PowerShell on Windows: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; python "$copilotHome/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" cancel --kickoff '<json>' --run-id '<run_id>'`
+- POSIX shells: `python3 "${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" cancel --kickoff '<json>' --run-id '<run_id>'`
+
+Cancellation is durable and idempotent. Report the command's exact result; never substitute process-name killing or infer cancellation from an interrupted observer.
+
 ## Monitoring progress
 
 After `start`, repeatedly run `watch` synchronously with the exact kickoff, returned `run_id`, latest cursor, and `--wait-seconds 300`:

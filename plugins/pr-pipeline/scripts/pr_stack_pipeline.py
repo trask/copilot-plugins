@@ -47,6 +47,11 @@ common = load_common()
 
 WorkflowError = common.WorkflowError
 
+
+class PipelineCancelled(RuntimeError):
+    pass
+
+
 KICKOFF_VERSION = 1
 STATE_VERSION = 1
 MAX_PASSES = 2
@@ -285,6 +290,14 @@ def scheduler_log_path(kickoff: dict[str, Any], run_id: str) -> Path:
     return run_directory_for(kickoff, run_id) / "scheduler.log"
 
 
+def cancellation_request_path(kickoff: dict[str, Any], run_id: str) -> Path:
+    return run_directory_for(kickoff, run_id) / "cancel-request.json"
+
+
+def run_result_path(kickoff: dict[str, Any], run_id: str) -> Path:
+    return run_directory_for(kickoff, run_id) / "result.json"
+
+
 def format_pull_requests(numbers: list[int]) -> str:
     return ", ".join(f"#{number}" for number in numbers)
 
@@ -365,7 +378,16 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
         phase = payload.get("phase")
         action_checks = payload.get("action_checks") or []
         pending_checks = payload.get("pending_checks") or []
-        if phase == "diagnosing":
+        if phase == "waiting_for_review":
+            message = f"{prefix}#{number} is waiting for Copilot's review."
+            next_action = "Collect the review, then address any comments it contains."
+        elif phase == "addressing_comments":
+            message = f"{prefix}#{number} is addressing Copilot review comments."
+            next_action = "Finish the current comment batch and validate its changes."
+        elif phase == "validating":
+            message = f"{prefix}#{number} is validating Copilot review fixes."
+            next_action = "Fix any validation failure, then publish the reviewed changes."
+        elif phase == "diagnosing":
             message = f"{prefix}{label} diagnosing {len(action_checks)} known failure(s) for #{number}."
             next_action = "Attribute the known failure from its logs and the pinned diff."
         elif phase == "fixing":
@@ -377,11 +399,16 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
         else:
             message = f"{prefix}{label} monitoring {len(pending_checks)} pending check(s) for #{number}."
             next_action = "Inspect the next concrete failure as soon as it completes."
+        wait_reason = {
+            "waiting_for_review": f"waiting for Copilot's review on #{number}",
+            "addressing_comments": f"addressing Copilot review comments on #{number}",
+            "validating": f"validating Copilot review fixes on #{number}",
+        }.get(phase)
         update = {
             "message": message,
             "next_action": next_action,
             "waiting": True,
-            "wait_reason": (
+            "wait_reason": wait_reason or (
                 f"{phase} a known CI failure for #{number}"
                 if phase != "waiting"
                 else f"waiting for remaining CI checks on #{number}"
@@ -413,6 +440,20 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
             ),
             "next_action": "Stop the run without retrying or duplicating the worker.",
             "waiting": False,
+        }
+    elif event == "worker_cancelled":
+        update = {
+            "message": f"{prefix}{label} worker cancelled for #{number}.",
+            "next_action": "Reap the remaining owned workers and finalize cancellation.",
+            "waiting": True,
+            "wait_reason": "cancelling the stack pipeline",
+        }
+    elif event == "stack_pipeline_cancelling":
+        update = {
+            "message": "Stack pipeline cancellation requested.",
+            "next_action": "Stop and reap every active worker owned by this run.",
+            "waiting": True,
+            "wait_reason": "cancelling the stack pipeline",
         }
     elif event == "push_propagated":
         trigger = payload.get("trigger")
@@ -1125,7 +1166,11 @@ class WorkerLauncher:
         }
 
     def confirm_ready(
-        self, request: dict[str, Any], started: dict[str, Any]
+        self,
+        request: dict[str, Any],
+        started: dict[str, Any],
+        *,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Require durable evidence that this worker is running before the next.
 
@@ -1139,6 +1184,8 @@ class WorkerLauncher:
         log_path = Path(started["log_path"])
         deadline = self.monotonic() + self.readiness_timeout
         while True:
+            if should_cancel is not None and should_cancel():
+                return {"result": "cancelled"}
             exited = handle.poll()
             log_size = log_path.stat().st_size if log_path.exists() else 0
             if record_path.is_file() and (log_size > 0 or exited == 0):
@@ -1170,22 +1217,21 @@ class WorkerLauncher:
                 }
             self.sleep(self.poll_interval)
 
-    def cancel(self, started: dict[str, Any]) -> None:
+    def cancel(self, started: dict[str, Any]) -> dict[str, Any]:
         handle = started["handle"]
-        if handle.poll() is None:
-            handle.terminate()
-            try:
-                handle.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                handle.kill()
-                handle.wait()
-        record_path = Path(started["record_path"])
+        returncode = common.terminate_process_tree(handle)
+        record_path = Path(
+            started.get("record_path")
+            or (started.get("evidence") or {}).get("record_path")
+            or ""
+        )
         record = common.read_json(record_path)
         if isinstance(record, dict):
             common.write_json_atomically(
                 record_path,
                 {**record, "status": "cancelled", "ended_at": utc_now()},
             )
+        return {"returncode": returncode, "ended_at": utc_now()}
 
     def is_running(self, worker: dict[str, Any]) -> bool:
         return worker["handle"].poll() is None
@@ -1243,6 +1289,8 @@ def launch_workers(
     on_started: Callable[[dict[str, Any]], None] | None = None,
     on_active: Callable[[dict[str, Any]], None] | None = None,
     on_stopped: Callable[[dict[str, Any]], None] | None = None,
+    on_created: Callable[[dict[str, Any]], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Start workers strictly one at a time, verifying each before the next.
 
@@ -1253,7 +1301,11 @@ def launch_workers(
     """
     workers: list[dict[str, Any]] = []
     stopped: dict[str, Any] | None = None
+    cancelled = False
     for request in requests:
+        if should_cancel is not None and should_cancel():
+            cancelled = True
+            break
         report_safely(
             report,
             "worker_starting",
@@ -1265,10 +1317,18 @@ def launch_workers(
         if created.get("result") != "ready":
             stopped = {"step": "create", "number": request["number"], **created}
             break
+        if on_created is not None:
+            on_created(request)
+        if should_cancel is not None and should_cancel():
+            cancelled = True
+            break
         worktree = created["worktree"]
         verified = launcher.verify(request, worktree)
         if verified.get("result") != "verified":
             stopped = {"step": "verify", "number": request["number"], **verified}
+            break
+        if should_cancel is not None and should_cancel():
+            cancelled = True
             break
         started = launcher.start(request, worktree)
         if started.get("result") != "started":
@@ -1284,6 +1344,7 @@ def launch_workers(
             "handle": started["handle"],
             "pid": started.get("pid"),
             "log_path": str(started.get("log_path", "")),
+            "record_path": str(started.get("record_path", "")),
             "evidence": {
                 "record_path": str(started.get("record_path", "")),
                 "pid": started.get("pid"),
@@ -1293,7 +1354,35 @@ def launch_workers(
         }
         if on_started is not None:
             on_started(worker)
-        ready = launcher.confirm_ready(request, started)
+        if should_cancel is not None and should_cancel():
+            launcher.cancel(worker)
+            if on_stopped is not None:
+                on_stopped(worker)
+            report_safely(
+                report,
+                "worker_cancelled",
+                number=worker["number"],
+                stage=worker["stage"],
+                pull_request_pass=worker["pass"],
+            )
+            cancelled = True
+            break
+        ready = launcher.confirm_ready(
+            request, started, should_cancel=should_cancel
+        )
+        if ready.get("result") == "cancelled":
+            launcher.cancel(worker)
+            if on_stopped is not None:
+                on_stopped(worker)
+            report_safely(
+                report,
+                "worker_cancelled",
+                number=worker["number"],
+                stage=worker["stage"],
+                pull_request_pass=worker["pass"],
+            )
+            cancelled = True
+            break
         if ready.get("result") != "active":
             launcher.cancel(started)
             if on_stopped is not None:
@@ -1313,10 +1402,13 @@ def launch_workers(
             pid=worker["pid"],
             head_sha=worker["head_sha"],
         )
+        if should_cancel is not None and should_cancel():
+            cancelled = True
+            break
     if stopped is not None:
         stopped.pop("handle", None)
         report_safely(report, "worker_launch_stopped", **stopped)
-    return {"workers": workers, "stopped": stopped}
+    return {"workers": workers, "stopped": stopped, "cancelled": cancelled}
 
 
 def accepted_push_checkpoints(
@@ -1332,9 +1424,11 @@ def accepted_push_checkpoints(
     return [push for push in pushes or [] if isinstance(push, dict)]
 
 
-def ci_worker_progress(repository: str, number: int) -> dict[str, Any] | None:
+def worker_live_progress(
+    repository: str, number: int, stage: str
+) -> dict[str, Any] | None:
     target = common.target_for(repository, number)
-    return common.stage_live_progress(STAGE_BY_NAME[STAGE_CI], target)
+    return common.stage_live_progress(STAGE_BY_NAME[stage], target)
 
 
 def propagate_descendants(
@@ -1423,12 +1517,14 @@ class StackPipeline:
         state_path: Path | None = None,
         lock_path: Path | None = None,
         run_directory: Path | None = None,
+        cancellation_path: Path | None = None,
+        result_path: Path | None = None,
         read_stack: Callable[..., dict[str, Any] | None] = read_native_stack,
         inspect: Callable[..., dict[str, Any]] = inspect_stage,
         base_tip: Callable[[str, str], str] = base_ref_tip,
         contains: Callable[[Path, str, str], bool] | None = None,
         checkpoints: Callable[..., list[dict[str, Any]]] = accepted_push_checkpoints,
-        worker_progress: Callable[[str, int], dict[str, Any] | None] = ci_worker_progress,
+        worker_progress: Callable[[str, int, str], dict[str, Any] | None] = worker_live_progress,
         propagate: Callable[..., dict[str, Any]] = propagate_descendants,
         dependencies: Callable[[], list[str]] = missing_dependencies,
         sleep: Callable[[float], None] = time.sleep,
@@ -1445,6 +1541,10 @@ class StackPipeline:
         self.state_path = state_path or state_path_for(kickoff)
         self.lock_path = lock_path or lock_path_for(kickoff)
         self.run_directory = run_directory or run_directory_for(kickoff, self.run_id)
+        self.cancellation_path = cancellation_path or (
+            self.run_directory / "cancel-request.json"
+        )
+        self.result_path = result_path or (self.run_directory / "result.json")
         self.launcher = launcher or WorkerLauncher(
             repo_root=repo_root,
             repository=self.repository,
@@ -1472,6 +1572,11 @@ class StackPipeline:
         self.touched: set[int] = set()
         self.propagations: list[dict[str, Any]] = []
         self.session_title: str | None = None
+        self.running_workers: dict[str, dict[str, Any]] = {}
+        self.worker_requests: dict[str, dict[str, Any]] = {}
+        self.progress_signatures: dict[str, str] = {}
+        self.completed_phases: list[dict[str, Any]] = []
+        self.completed_passes = 0
 
     # State ---------------------------------------------------------------
 
@@ -1488,6 +1593,73 @@ class StackPipeline:
         record = pull_requests.setdefault(str(number), {"stages": {}})
         record["stages"][stage] = {**payload, "updated_at": utc_now()}
         self.save()
+
+    def cancellation_requested(self) -> bool:
+        request = common.read_json(self.cancellation_path)
+        return (
+            isinstance(request, dict)
+            and request.get("kind") == RUN_KIND
+            and request.get("run_id") == self.run_id
+            and request.get("kickoff") == self.kickoff
+            and request.get("status") == "requested"
+        )
+
+    def check_cancellation(self) -> None:
+        if self.cancellation_requested():
+            raise PipelineCancelled()
+
+    def worker_progress_update(
+        self, worker: dict[str, Any], request: dict[str, Any]
+    ) -> None:
+        progress = self.worker_progress(
+            self.repository, request["number"], request["stage"]
+        )
+        if progress is None:
+            return
+        signature = json.dumps(progress, sort_keys=True)
+        nonce = worker["nonce"]
+        if signature == self.progress_signatures.get(nonce):
+            return
+        self.progress_signatures[nonce] = signature
+        self.emit(
+            "worker_progress",
+            number=request["number"],
+            stage=request["stage"],
+            pull_request_pass=request["pass"],
+            **progress,
+        )
+
+    def cancel_active_workers(self) -> list[dict[str, Any]]:
+        errors: list[dict[str, Any]] = []
+        self.emit(
+            "stack_pipeline_cancelling",
+            numbers=sorted(worker["number"] for worker in self.running_workers.values()),
+        )
+        for nonce, worker in list(self.running_workers.items()):
+            request = self.worker_requests[nonce]
+            if not self.launcher.is_running(worker):
+                self.finish_worker(worker, request, announce_wait=False)
+                continue
+            try:
+                finished = self.launcher.cancel(worker)
+            except (OSError, subprocess.SubprocessError) as error:
+                errors.append(
+                    {
+                        "number": worker["number"],
+                        "stage": worker["stage"],
+                        "error": str(error),
+                    }
+                )
+                continue
+            self.emit(
+                "worker_cancelled",
+                number=worker["number"],
+                stage=worker["stage"],
+                pull_request_pass=request["pass"],
+                returncode=finished.get("returncode"),
+            )
+            self.remove_active_worker(worker)
+        return errors
 
     # Topology ------------------------------------------------------------
 
@@ -1574,8 +1746,15 @@ class StackPipeline:
             "dispatched_at": utc_now(),
         }
         self.save()
+        for request in requests:
+            self.worker_requests[request["nonce"]] = request
+
+        def record_created(request: dict[str, Any]) -> None:
+            self.touched.add(request["number"])
+
         def record_started(worker: dict[str, Any]) -> None:
             self.touched.add(worker["number"])
+            self.running_workers[worker["nonce"]] = worker
             self.state.setdefault("active_workers", []).append(
                 {
                     "nonce": worker["nonce"],
@@ -1597,12 +1776,7 @@ class StackPipeline:
             self.save()
 
         def record_stopped(worker: dict[str, Any]) -> None:
-            self.state["active_workers"] = [
-                active
-                for active in self.state.get("active_workers", [])
-                if active.get("nonce") != worker["nonce"]
-            ]
-            self.save()
+            self.remove_active_worker(worker)
 
         launched = launch_workers(
             requests,
@@ -1611,18 +1785,39 @@ class StackPipeline:
             on_started=record_started,
             on_active=record_active,
             on_stopped=record_stopped,
+            on_created=record_created,
+            should_cancel=self.cancellation_requested,
         )
+        if launched["cancelled"]:
+            raise PipelineCancelled()
         return launched
 
+    def remove_active_worker(self, worker: dict[str, Any]) -> None:
+        nonce = worker["nonce"]
+        self.running_workers.pop(nonce, None)
+        self.worker_requests.pop(nonce, None)
+        self.progress_signatures.pop(nonce, None)
+        self.state["active_workers"] = [
+            active
+            for active in self.state.get("active_workers", [])
+            if active.get("nonce") != nonce
+        ]
+        self.save()
+
     def finish_worker(
-        self, worker: dict[str, Any], request: dict[str, Any]
+        self,
+        worker: dict[str, Any],
+        request: dict[str, Any],
+        *,
+        announce_wait: bool = True,
     ) -> dict[str, Any]:
-        self.emit(
-            "worker_wait_started",
-            number=worker["number"],
-            stage=worker["stage"],
-            pull_request_pass=request["pass"],
-        )
+        if announce_wait:
+            self.emit(
+                "worker_wait_started",
+                number=worker["number"],
+                stage=worker["stage"],
+                pull_request_pass=request["pass"],
+            )
         finished = self.launcher.wait(worker)
         completion = {
             "number": worker["number"],
@@ -1638,6 +1833,7 @@ class StackPipeline:
             expected_nonce=expected_nonce,
             expected_head_sha=expected_head,
         )
+        self.remove_active_worker(worker)
         self.emit(
             "worker_finished",
             number=completion["number"],
@@ -1646,13 +1842,53 @@ class StackPipeline:
             returncode=completion.get("returncode"),
             accepted=completion["accepted"],
         )
-        self.state["active_workers"] = [
-            active
-            for active in self.state.get("active_workers", [])
-            if active.get("nonce") != worker["nonce"]
-        ]
-        self.save()
         return completion
+
+    def collect_parallel_workers(
+        self, workers: list[dict[str, Any]], requests: dict[int, dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        pending = list(workers)
+        completions: list[dict[str, Any]] = []
+        order = {worker["number"]: index for index, worker in enumerate(workers)}
+        for worker in pending:
+            self.emit(
+                "worker_wait_started",
+                number=worker["number"],
+                stage=worker["stage"],
+                pull_request_pass=requests[worker["number"]]["pass"],
+            )
+        while pending:
+            finished = [
+                worker for worker in pending if not self.launcher.is_running(worker)
+            ]
+            for worker in finished:
+                request = requests[worker["number"]]
+                completions.append(
+                    self.finish_worker(worker, request, announce_wait=False)
+                )
+                pending.remove(worker)
+            if not pending:
+                break
+            self.check_cancellation()
+            for worker in pending:
+                self.worker_progress_update(worker, requests[worker["number"]])
+            self.sleep(self.monitor_interval)
+        return sorted(completions, key=lambda item: order[item["number"]])
+
+    def monitor_worker(
+        self, worker: dict[str, Any], request: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.emit(
+            "worker_wait_started",
+            number=worker["number"],
+            stage=worker["stage"],
+            pull_request_pass=request["pass"],
+        )
+        while self.launcher.is_running(worker):
+            self.check_cancellation()
+            self.worker_progress_update(worker, request)
+            self.sleep(self.monitor_interval)
+        return self.finish_worker(worker, request, announce_wait=False)
 
     def clearance(
         self, number: int, stage: str, head_sha: str, base_sha: str | None
@@ -1692,7 +1928,7 @@ class StackPipeline:
         )
         launched = self.dispatch([request], STAGE_CONFLICT, pass_number)
         completions = [
-            self.finish_worker(worker, request) for worker in launched["workers"]
+            self.monitor_worker(worker, request) for worker in launched["workers"]
         ]
         for completion in completions:
             self.record_stage(
@@ -1741,10 +1977,7 @@ class StackPipeline:
         )
         launched = self.dispatch(requests, phase, pass_number)
         by_number = {request["number"]: request for request in requests}
-        completions = [
-            self.finish_worker(worker, by_number[worker["number"]])
-            for worker in launched["workers"]
-        ]
+        completions = self.collect_parallel_workers(launched["workers"], by_number)
         for completion in completions:
             self.record_stage(
                 completion["number"],
@@ -1819,25 +2052,10 @@ class StackPipeline:
         """
         seen: set[str] = set()
         propagations: list[dict[str, Any]] = []
-        last_progress_signature: str | None = None
-
         def sweep() -> None:
-            nonlocal last_progress_signature
+            self.check_cancellation()
             propagations.extend(self.propagate_ci_pushes(request, seen))
-            progress = self.worker_progress(self.repository, request["number"])
-            if progress is None:
-                return
-            signature = json.dumps(progress, sort_keys=True)
-            if signature == last_progress_signature:
-                return
-            last_progress_signature = signature
-            self.emit(
-                "worker_progress",
-                number=request["number"],
-                stage=STAGE_CI,
-                pull_request_pass=request["pass"],
-                **progress,
-            )
+            self.worker_progress_update(worker, request)
 
         self.emit(
             "worker_wait_started",
@@ -1846,8 +2064,10 @@ class StackPipeline:
             pull_request_pass=request["pass"],
         )
         while self.launcher.is_running(worker):
+            self.check_cancellation()
             sweep()
             self.sleep(self.monitor_interval)
+        self.check_cancellation()
         sweep()
         completion = self.finish_worker(worker, request)
         return {"completion": completion, "propagations": propagations}
@@ -1859,6 +2079,7 @@ class StackPipeline:
         completed = set(self.state.get("propagated_pushes", []))
         unsuccessful: list[tuple[str, dict[str, Any]]] = []
         for checkpoint in self.checkpoints(self.repository, request["number"]):
+            self.check_cancellation()
             identity = checkpoint.get("id") or checkpoint.get("head_sha")
             head_sha = checkpoint.get("head_sha")
             iteration = checkpoint.get("pipeline_iteration")
@@ -1917,6 +2138,7 @@ class StackPipeline:
                     trigger=outcome["trigger"],
                 )
                 continue
+            self.check_cancellation()
             outcome = self.propagate(
                 self.repository,
                 request["number"],
@@ -1990,6 +2212,7 @@ class StackPipeline:
                     and gate["reason"] == "predecessor_head_is_not_contained"
                 ):
                     predecessor_head = gate["predecessor_head_sha"]
+                    self.check_cancellation()
                     alignment = {
                         **self.propagate(
                             self.repository,
@@ -2271,7 +2494,35 @@ class StackPipeline:
     # Run -----------------------------------------------------------------
 
     def cleanup(self) -> list[dict[str, Any]]:
-        return [self.launcher.cleanup(number) for number in sorted(self.touched)]
+        active = {
+            worker["number"]
+            for worker in self.state.get("active_workers", [])
+            if isinstance(worker, dict) and isinstance(worker.get("number"), int)
+        }
+        return [
+            (
+                {
+                    "result": "preserved",
+                    "reason": "worker_still_active",
+                    "number": number,
+                }
+                if number in active
+                else self.launcher.cleanup(number)
+            )
+            for number in sorted(self.touched)
+        ]
+
+    def persist_result(self, payload: dict[str, Any]) -> None:
+        common.write_json_atomically(
+            self.result_path,
+            {
+                "kind": RUN_KIND,
+                "run_id": self.run_id,
+                "kickoff": self.kickoff,
+                "finished_at": utc_now(),
+                "pipeline_result": payload,
+            },
+        )
 
     def finish(
         self,
@@ -2308,10 +2559,62 @@ class StackPipeline:
             payload["snapshot"] = snapshot
         if self.session_title is not None:
             payload["session_title"] = self.session_title
-        release_lock(self.lock_path, self.run_id)
+        try:
+            self.persist_result(payload)
+            cancellation = common.read_json(self.cancellation_path)
+            if (
+                isinstance(cancellation, dict)
+                and cancellation.get("run_id") == self.run_id
+                and cancellation.get("kickoff") == self.kickoff
+            ):
+                common.write_json_atomically(
+                    self.cancellation_path,
+                    {
+                        **cancellation,
+                        "status": "completed",
+                        "completed_at": utc_now(),
+                        "pipeline_result": result,
+                    },
+                )
+        finally:
+            release_lock(self.lock_path, self.run_id)
         return payload
 
     def execute(self) -> dict[str, Any]:
+        try:
+            return self._execute()
+        except PipelineCancelled:
+            if not self.state:
+                self.state = new_state(self.kickoff, self.run_id, "")
+            errors = self.cancel_active_workers()
+            return self.finish(
+                "cancelled",
+                reason="cancel_requested",
+                detail=json.dumps(errors, sort_keys=True) if errors else None,
+                passes=self.completed_passes,
+                phases=self.completed_phases,
+            )
+        except (
+            WorkflowError,
+            json.JSONDecodeError,
+            OSError,
+            subprocess.SubprocessError,
+        ) as error:
+            if not self.state:
+                self.state = new_state(self.kickoff, self.run_id, "")
+            cancellation_errors = self.cancel_active_workers()
+            detail = {"error": str(error)}
+            if cancellation_errors:
+                detail["cancellation_errors"] = cancellation_errors
+            return self.finish(
+                "error",
+                reason="scheduler_error",
+                detail=json.dumps(detail, sort_keys=True),
+                passes=self.completed_passes,
+                phases=self.completed_phases,
+            )
+
+    def _execute(self) -> dict[str, Any]:
         self.emit(
             "stack_pipeline_started",
             repository=self.repository,
@@ -2319,6 +2622,7 @@ class StackPipeline:
             start_pull_request=self.kickoff["startPullRequest"],
             selected=list(self.kickoff["pullRequests"]),
         )
+        self.check_cancellation()
         opening = self.revalidate()
         if opening["result"] != "ready":
             self.state = new_state(self.kickoff, self.run_id, "")
@@ -2331,7 +2635,7 @@ class StackPipeline:
         lock = acquire_lock(self.lock_path, self.run_id)
         if lock["result"] != "acquired":
             self.state = new_state(self.kickoff, self.run_id, fingerprint)
-            return {
+            result = {
                 "result": "stopped",
                 "reason": "another_run_holds_the_lock",
                 "run_id": self.run_id,
@@ -2345,9 +2649,12 @@ class StackPipeline:
                     else {}
                 ),
             }
+            self.persist_result(result)
+            return result
         self.state = resume_state(
             self.state_path, self.kickoff, self.run_id, fingerprint
         )
+        self.check_cancellation()
         prior_run_directory = self.state.get("run_directory")
         active_workers = live_recorded_workers(self.state)
         if isinstance(prior_run_directory, str):
@@ -2358,8 +2665,7 @@ class StackPipeline:
                 if worker.get("nonce") not in known_nonces
             )
         if active_workers:
-            release_lock(self.lock_path, self.run_id)
-            return {
+            result = {
                 "result": "incomplete",
                 "reason": "previous_workers_still_active",
                 "run_id": self.run_id,
@@ -2373,6 +2679,11 @@ class StackPipeline:
                     else {}
                 ),
             }
+            try:
+                self.persist_result(result)
+            finally:
+                release_lock(self.lock_path, self.run_id)
+            return result
         self.state["active_workers"] = []
         self.state["run_directory"] = str(self.run_directory)
         self.state["expected_heads"] = {
@@ -2401,6 +2712,7 @@ class StackPipeline:
         snapshot: dict[str, Any] | None = None
         completed_passes = 0
         for pass_number in range(1, MAX_PASSES + 1):
+            self.check_cancellation()
             current = self.revalidate()
             if current["result"] != "ready":
                 return self.finish(
@@ -2426,6 +2738,7 @@ class StackPipeline:
             self.emit("pass_started", pull_request_pass=pass_number)
 
             for phase in PHASES:
+                self.check_cancellation()
                 if phase["mode"] == PHASE_STACK_DISPATCH:
                     outcome = self.run_conflict_phase(pass_number, selected)
                 elif phase["mode"] == PHASE_BOTTOM_UP:
@@ -2435,6 +2748,8 @@ class StackPipeline:
                         phase["phase"], pass_number, selected
                     )
                 phases.append(outcome)
+                self.completed_phases.append(outcome)
+                self.check_cancellation()
                 if outcome.get("stopped") is not None:
                     return self.finish(
                         "stopped",
@@ -2456,6 +2771,7 @@ class StackPipeline:
                     )
 
             completed_passes = pass_number
+            self.completed_passes = pass_number
             snapshot = self.final_snapshot()
             self.emit(
                 "snapshot_taken",
@@ -2630,6 +2946,133 @@ def command_watch(args: argparse.Namespace) -> None:
     )
 
 
+def command_cancel(args: argparse.Namespace) -> None:
+    kickoff = load_kickoff(args)
+    run_id = validate_run_id(args.run_id)
+    launch = common.read_json(launch_state_path(kickoff, run_id))
+    identity = {"kind": RUN_KIND, "run_id": run_id, "kickoff": kickoff}
+    if not isinstance(launch, dict):
+        common.emit(
+            {
+                "event": "stack_pipeline_cancel",
+                "result": "unknown_run",
+                "run_id": run_id,
+            }
+        )
+        return
+    if any(launch.get(key) != value for key, value in identity.items()):
+        common.emit(
+            {
+                "event": "stack_pipeline_cancel",
+                "result": "run_identity_mismatch",
+                "run_id": run_id,
+            }
+        )
+        return
+
+    result_path = run_result_path(kickoff, run_id)
+    durable_result = common.read_json(result_path)
+    if (
+        isinstance(durable_result, dict)
+        and all(durable_result.get(key) == value for key, value in identity.items())
+    ):
+        common.emit(
+            {
+                "event": "stack_pipeline_cancel",
+                "result": "already_finished",
+                "run_id": run_id,
+                "pipeline_result": durable_result.get("pipeline_result"),
+            }
+        )
+        return
+
+    request_path = cancellation_request_path(kickoff, run_id)
+    request = common.read_json(request_path)
+    if request is not None and (
+        not isinstance(request, dict)
+        or any(request.get(key) != value for key, value in identity.items())
+    ):
+        common.emit(
+            {
+                "event": "stack_pipeline_cancel",
+                "result": "cancellation_record_malformed",
+                "run_id": run_id,
+            }
+        )
+        return
+    repeated = isinstance(request, dict)
+    if not repeated:
+        request = {
+            **identity,
+            "status": "requested",
+            "requested_at": utc_now(),
+            "requesting_pid": os.getpid(),
+        }
+        common.write_json_atomically(request_path, request)
+
+    deadline = time.monotonic() + args.wait_seconds
+    while True:
+        durable_result = common.read_json(result_path)
+        if (
+            isinstance(durable_result, dict)
+            and all(durable_result.get(key) == value for key, value in identity.items())
+        ):
+            common.write_json_atomically(
+                request_path,
+                {
+                    **request,
+                    "status": "completed",
+                    "completed_at": utc_now(),
+                    "pipeline_result": durable_result.get("pipeline_result", {}).get(
+                        "result"
+                    ),
+                },
+            )
+            common.emit(
+                {
+                    "event": "stack_pipeline_cancel",
+                    "result": (
+                        "cancelled"
+                        if durable_result.get("pipeline_result", {}).get("result")
+                        == "cancelled"
+                        else "already_finished"
+                    ),
+                    "run_id": run_id,
+                    "pipeline_result": durable_result.get("pipeline_result"),
+                }
+            )
+            return
+        pid = launch.get("pid")
+        if not isinstance(pid, int) or not common.process_is_alive(pid):
+            common.write_json_atomically(
+                request_path,
+                {
+                    **request,
+                    "status": "stale",
+                    "completed_at": utc_now(),
+                    "result": "scheduler_not_running",
+                },
+            )
+            common.emit(
+                {
+                    "event": "stack_pipeline_cancel",
+                    "result": "stale_run",
+                    "run_id": run_id,
+                }
+            )
+            return
+        if time.monotonic() >= deadline:
+            common.emit(
+                {
+                    "event": "stack_pipeline_cancel",
+                    "result": "already_requested" if repeated else "requested",
+                    "run_id": run_id,
+                }
+            )
+            return
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+
 def command_run(args: argparse.Namespace) -> None:
     common.require_tools()
     kickoff = load_kickoff(args)
@@ -2713,6 +3156,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=PROGRESS_HEARTBEAT_INTERVAL,
     )
     watch.set_defaults(function=command_watch)
+
+    cancel = subparsers.add_parser(
+        "cancel", help="durably cancel one started stack pipeline run"
+    )
+    cancel.add_argument(
+        "--kickoff",
+        help="the exact structured kickoff JSON used to start the run",
+    )
+    cancel.add_argument(
+        "--kickoff-file", help="read the structured kickoff JSON from this file"
+    )
+    cancel.add_argument("--run-id", required=True)
+    cancel.add_argument("--wait-seconds", type=float, default=30.0)
+    cancel.set_defaults(function=command_cancel)
     return parser
 
 
@@ -2736,6 +3193,15 @@ def main() -> int:
             common.emit(
                 {
                     "event": "stack_pipeline_launch_failed",
+                    "error": str(error),
+                }
+            )
+            return 1
+        if args.command == "cancel":
+            common.emit(
+                {
+                    "event": "stack_pipeline_cancel",
+                    "result": "error",
                     "error": str(error),
                 }
             )
@@ -2766,6 +3232,14 @@ def main() -> int:
                 {
                     "event": "stack_pipeline_launch_failed",
                     "error": "interrupted",
+                }
+            )
+            return 130
+        if args.command == "cancel":
+            common.emit(
+                {
+                    "event": "stack_pipeline_cancel",
+                    "result": "interrupted",
                 }
             )
             return 130

@@ -3253,6 +3253,59 @@ class CleanAtHeadShaTest(unittest.TestCase):
         self.assertNotIn("stage_outcome", payload)
 
 
+class StageProgressTest(unittest.TestCase):
+    def test_progress_command_records_each_supported_live_substate(self):
+        for phase in sorted(MODULE.STAGE_PROGRESS_PHASES):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "state.json"
+                MODULE.save_state(
+                    path,
+                    {"version": MODULE.STATE_VERSION, "pr": {"number": 42}},
+                )
+                args = SimpleNamespace(
+                    state=str(path), phase=phase, detail=f"detail for {phase}"
+                )
+                with mock.patch.object(MODULE, "emit") as emit:
+                    MODULE.command_progress(args)
+
+                saved = MODULE.load_state(path)
+                self.assertEqual(phase, saved["stage_progress"]["phase"])
+                self.assertEqual(
+                    f"detail for {phase}", saved["stage_progress"]["detail"]
+                )
+                self.assertEqual(
+                    phase, emit.call_args.args[0]["stage_progress"]["phase"]
+                )
+
+    def test_status_exposes_structured_stage_progress(self):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "pr": {"number": 42},
+            "stage_progress": {
+                "phase": "validating",
+                "observed_at": "2026-08-31T12:00:00Z",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(path, state)
+            with mock.patch.object(MODULE, "emit") as emit:
+                MODULE.command_status(
+                    SimpleNamespace(current=False, state=str(path), repo_root=None)
+                )
+
+        self.assertEqual(
+            "validating", emit.call_args.args[0]["stage_progress"]["phase"]
+        )
+
+    def test_agent_marks_validation_with_structured_progress(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+        self.assertIn("progress --state <path> --phase validating", instructions)
+        self.assertIn(
+            "progress --state <path> --phase addressing_comments", instructions
+        )
+
+
 class StageOutcomeTest(unittest.TestCase):
     """The vocabulary an external orchestrator reads instead of the prose report."""
 
