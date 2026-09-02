@@ -1727,6 +1727,36 @@ def pipeline_scope(
     }
 
 
+def invocation_scope(
+    state: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any] | None:
+    """Scope a standalone budget to one explicit user invocation."""
+    if getattr(args, "new_invocation", False):
+        spent = int(state.get("iterations", 0))
+        return {
+            "run": uuid.uuid4().hex,
+            "iteration": None,
+            "baseline": spent,
+            "run_baseline": spent,
+        }
+    run = getattr(args, "invocation_run", None)
+    if not isinstance(run, str) or not run:
+        return None
+    recorded = state.get("invocation_budget")
+    if not isinstance(recorded, dict) or recorded.get("run") != run:
+        raise WorkflowError(
+            "invocation run does not match the active invocation; start a new "
+            "explicit invocation with --new-invocation"
+        )
+    spent = int(state.get("iterations", 0))
+    return {
+        "run": run,
+        "iteration": None,
+        "baseline": whole_number(recorded.get("baseline"), spent),
+        "run_baseline": whole_number(recorded.get("run_baseline"), spent),
+    }
+
+
 def absolute_iteration_cap(
     scope: dict[str, Any] | None, max_iterations: int, pipeline_max_iterations: Any
 ) -> int | None:
@@ -1757,16 +1787,111 @@ def budget_spent(
 ) -> tuple[int, int]:
     """How much of the per-iteration budget and of the whole run this PR has used.
 
-    Without an outer loop both are the durable count itself, which is the flat
-    per-pull-request cap this loop has always applied.
+    Scoped counters keep overlapping pipeline and standalone runs independent.
+    A state written before those counters existed falls back to its durable-count
+    baselines. Without a scope, both values remain the lifetime count.
     """
     spent = int(state.get("iterations", 0))
     if scope is None:
         return spent, spent
+    charge_key = scope.get("_charge_key")
+    run_charge_key = scope.get("_run_charge_key")
+    charges = state.get("budget_charges")
+    if (
+        isinstance(charge_key, str)
+        and isinstance(run_charge_key, str)
+        and isinstance(charges, dict)
+    ):
+        return (
+            whole_number(charges.get(charge_key), 0),
+            whole_number(charges.get(run_charge_key), 0),
+        )
     return (
         max(0, spent - whole_number(scope.get("baseline"), spent)),
         max(0, spent - whole_number(scope.get("run_baseline"), spent)),
     )
+
+
+def budget_charge_keys(kind: str, scope: dict[str, Any]) -> tuple[str, str]:
+    run = scope["run"]
+    iteration = scope.get("iteration")
+    return (
+        json.dumps([kind, run, iteration], separators=(",", ":")),
+        json.dumps([kind, run], separators=(",", ":")),
+    )
+
+
+def stored_budget_scope(state: dict[str, Any]) -> str:
+    kind = state.get("budget_scope")
+    if kind in {"pipeline", "invocation", "lifetime"}:
+        return kind
+    if isinstance(state.get("pipeline_budget"), dict):
+        return "pipeline"
+    if isinstance(state.get("invocation_budget"), dict):
+        return "invocation"
+    return "lifetime"
+
+
+def migrate_budget_counters(state: dict[str, Any]) -> None:
+    """Materialize counters and charged-head records from baseline-based state."""
+    spent = int(state.get("iterations", 0))
+    charges = state.setdefault("budget_charges", {})
+    for kind, field in (
+        ("pipeline", "pipeline_budget"),
+        ("invocation", "invocation_budget"),
+    ):
+        scope = state.get(field)
+        if not isinstance(scope, dict) or not isinstance(scope.get("run"), str):
+            continue
+        charge_key, run_charge_key = budget_charge_keys(kind, scope)
+        charges.setdefault(
+            charge_key,
+            max(0, spent - whole_number(scope.get("baseline"), spent)),
+        )
+        charges.setdefault(
+            run_charge_key,
+            max(0, spent - whole_number(scope.get("run_baseline"), spent)),
+        )
+
+    charged_head = state.get("charged_head_sha")
+    if charged_head:
+        entry = {
+            "head_sha": charged_head,
+            "iteration": (state.get("run") or {}).get("iteration"),
+        }
+        charged_heads = state.setdefault("budget_charged_heads", {})
+        charged_heads.setdefault("lifetime", entry)
+        for kind, field in (
+            ("pipeline", "pipeline_budget"),
+            ("invocation", "invocation_budget"),
+        ):
+            scope = state.get(field)
+            if isinstance(scope, dict) and isinstance(scope.get("run"), str):
+                charge_key, _ = budget_charge_keys(kind, scope)
+                charged_heads.setdefault(charge_key, entry)
+        state.pop("charged_head_sha", None)
+
+
+def scoped_budget(
+    state: dict[str, Any],
+    kind: str,
+    scope: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Attach persistent charge counters to one active budget."""
+    if scope is None:
+        return None
+    previous_iteration_spent, previous_run_spent = budget_spent(state, scope)
+    charge_key, run_charge_key = budget_charge_keys(kind, scope)
+    charges = state.setdefault("budget_charges", {})
+    if charge_key not in charges:
+        charges[charge_key] = previous_iteration_spent
+    if run_charge_key not in charges:
+        charges[run_charge_key] = previous_run_spent
+    return {
+        **scope,
+        "_charge_key": charge_key,
+        "_run_charge_key": run_charge_key,
+    }
 
 
 def exhausted_budget(
@@ -1815,18 +1940,36 @@ def charge_iteration(state: dict[str, Any], run_state: dict[str, Any]) -> bool:
     reached that head. A run carrying no head is charged, because a dedupe with no
     head to key on would be a guess.
 
-    The count is durable and only ever rises. Both budgets read it through a
-    baseline recorded in ``pipeline_budget``, so an outer iteration widens what
-    this loop may spend without rewriting what it already spent.
+    The lifetime count is durable and only ever rises. Scoped counters enforce
+    each active budget without letting another run's work consume it.
     """
     if run_state.get("charged"):
         return False
     head_sha = run_state.get("head_sha")
-    if head_sha and state.get("charged_head_sha") == head_sha:
+    charge_key = run_state.get("budget_charge_key")
+    head_key = run_state.get("budget_head_key")
+    if isinstance(head_key, str):
+        charged_heads = state.setdefault("budget_charged_heads", {})
+        charged = charged_heads.get(head_key)
+        charged_head = charged.get("head_sha") if isinstance(charged, dict) else charged
+        if head_sha and charged_head == head_sha:
+            return False
+    elif head_sha and state.get("charged_head_sha") == head_sha:
         return False
     run_state["charged"] = True
     state["iterations"] = int(state.get("iterations", 0)) + 1
-    if head_sha:
+    if isinstance(charge_key, str):
+        charges = state.setdefault("budget_charges", {})
+        charges[charge_key] = whole_number(charges.get(charge_key), 0) + 1
+        run_charge_key = run_state.get("budget_run_charge_key")
+        if isinstance(run_charge_key, str) and run_charge_key != charge_key:
+            charges[run_charge_key] = whole_number(charges.get(run_charge_key), 0) + 1
+    if isinstance(head_key, str) and head_sha:
+        charged_heads[head_key] = {
+            "head_sha": head_sha,
+            "iteration": run_state.get("iteration"),
+        }
+    elif not isinstance(charge_key, str) and head_sha:
         state["charged_head_sha"] = head_sha
     return True
 
@@ -1967,6 +2110,7 @@ def command_preflight(args: argparse.Namespace) -> None:
     target = resolve_target(args.target, repo_root)
     state_path = cli_path(args.state) if args.state else default_state_path(target)
     state = load_state(state_path) if state_path.is_file() else None
+    state_origin = "reused" if state is not None else "fresh"
 
     dirty = git(repo_root, "status", "--porcelain=v1")
     if dirty:
@@ -2000,26 +2144,46 @@ def command_preflight(args: argparse.Namespace) -> None:
             "reruns": {},
             "escalation": None,
         }
-    archive_run(state)
     state["iterations"] = int(state.get("iterations", 0))
+    migrate_budget_counters(state)
+    archive_run(state)
     previous_run = state.get("run") or {}
     previous_head = previous_run.get("head_sha")
     if previous_head and previous_head != metadata["head_sha"]:
         # A new head invalidates every re-run this loop spent on the old one.
         state["reruns"] = {}
     max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
-    scope = pipeline_scope(state, args)
-    if budget_advanced(state.get("pipeline_budget"), scope):
-        # The per-head charge protects one budget, so it lives exactly as long as
-        # that budget does. An outer iteration that widens what this loop may
-        # spend is entitled to a fresh attempt at the head it is looking at.
-        state.pop("charged_head_sha", None)
-    if scope is not None:
-        state["pipeline_budget"] = scope
-    absolute_cap = absolute_iteration_cap(
-        scope, max_iterations, getattr(args, "pipeline_max_iterations", None)
+    pipeline = pipeline_scope(state, args)
+    invocation = invocation_scope(state, args)
+    if pipeline is not None and invocation is not None:
+        raise WorkflowError(
+            "standalone invocation arguments cannot be combined with pipeline arguments"
+        )
+    scope = pipeline or invocation
+    budget_scope = (
+        "pipeline"
+        if pipeline is not None
+        else "invocation"
+        if invocation is not None
+        else "lifetime"
     )
-    exhausted = exhausted_budget(state, scope, max_iterations, absolute_cap)
+    recorded_scope = (
+        state.get("pipeline_budget")
+        if budget_scope == "pipeline"
+        else state.get("invocation_budget")
+        if budget_scope == "invocation"
+        else None
+    )
+    budget_just_advanced = budget_advanced(recorded_scope, scope)
+    if budget_scope == "pipeline":
+        state["pipeline_budget"] = scope
+    elif budget_scope == "invocation":
+        state["invocation_budget"] = scope
+    state["budget_scope"] = budget_scope
+    scope = scoped_budget(state, budget_scope, scope)
+    absolute_cap = absolute_iteration_cap(
+        pipeline, max_iterations, getattr(args, "pipeline_max_iterations", None)
+    )
     completed_iterations, run_spent = budget_spent(state, scope)
     # Numbered from the durable count rather than from the budget, because this id
     # is what `archive_run` dedupes history on and a duplicate is dropped rather
@@ -2031,12 +2195,22 @@ def command_preflight(args: argparse.Namespace) -> None:
     # verdicts already archived under that id and they are correctly dropped;
     # advancing the number would let the label outrun the budget and make a third
     # read collide with the second's entries instead.
-    already_charged = bool(
-        state.get("charged_head_sha")
-        and state.get("charged_head_sha") == metadata["head_sha"]
+    budget_head_key = scope["_charge_key"] if scope is not None else "lifetime"
+    charged = (state.get("budget_charged_heads") or {}).get(
+        budget_head_key,
+        state.get("charged_head_sha") if scope is None else None,
     )
-    iteration = state["iterations"] + (0 if already_charged else 1)
-    result = "max_iterations_reached" if exhausted else "ready"
+    charged_head = charged.get("head_sha") if isinstance(charged, dict) else charged
+    already_charged = bool(charged_head and charged_head == metadata["head_sha"])
+    charged_iteration = (
+        whole_number(charged.get("iteration"), state["iterations"])
+        if isinstance(charged, dict)
+        else state["iterations"]
+    )
+    iteration = charged_iteration if already_charged else state["iterations"] + 1
+    exhausted = exhausted_budget(state, scope, max_iterations, absolute_cap)
+    blocked_budget = exhausted if not already_charged else None
+    result = "max_iterations_reached" if blocked_budget else "ready"
     diff_path = diff_path_for(state_path)
     diff_path.parent.mkdir(parents=True, exist_ok=True)
     diff_path.write_text(diff_text, encoding="utf-8", newline="")
@@ -2059,6 +2233,12 @@ def command_preflight(args: argparse.Namespace) -> None:
                 "tracking": {},
                 "decision": None,
                 "charged": False,
+                "budget_scope": budget_scope,
+                "budget_head_key": budget_head_key,
+                "budget_charge_key": None if scope is None else scope["_charge_key"],
+                "budget_run_charge_key": (
+                    None if scope is None else scope["_run_charge_key"]
+                ),
             },
         }
     )
@@ -2073,8 +2253,8 @@ def command_preflight(args: argparse.Namespace) -> None:
             f"in this pipeline run, which is its ceiling of {absolute_cap}"
             if exhausted == "absolute"
             else (
-                f"this loop already ran {completed_iterations} iteration(s), which is "
-                f"its cap of {max_iterations}"
+                f"this {budget_scope} budget already spent {completed_iterations} "
+                f"iteration(s), which is its cap of {max_iterations}"
             )
         )
         state["escalation"] = {
@@ -2106,9 +2286,13 @@ def command_preflight(args: argparse.Namespace) -> None:
         "max_iterations": max_iterations,
         "completed_iterations": completed_iterations,
         "absolute_cap": absolute_cap,
-        "budget_exhausted": exhausted,
-        "pipeline_run": None if scope is None else scope["run"],
-        "pipeline_iteration": None if scope is None else scope["iteration"],
+        "budget_exhausted": blocked_budget,
+        "budget_origin": "fresh" if budget_just_advanced else "reused",
+        "budget_scope": budget_scope,
+        "state_origin": state_origin,
+        "invocation_run": None if invocation is None else invocation["run"],
+        "pipeline_run": None if pipeline is None else pipeline["run"],
+        "pipeline_iteration": None if pipeline is None else pipeline["iteration"],
     }
     write_result_file(preflight_path, payload, "preflight")
     emit(
@@ -2138,6 +2322,11 @@ def command_preflight(args: argparse.Namespace) -> None:
             },
             "iteration": iteration,
             "max_iterations": max_iterations,
+            "completed_iterations": completed_iterations,
+            "budget_origin": "fresh" if budget_just_advanced else "reused",
+            "budget_scope": budget_scope,
+            "state_origin": state_origin,
+            "invocation_run": None if invocation is None else invocation["run"],
         }
     )
 
@@ -2711,6 +2900,11 @@ def accepted_push_checkpoint(
     commits: list[str],
     kind: str = "fix",
 ) -> dict[str, Any]:
+    pipeline_budget = (
+        state.get("pipeline_budget")
+        if stored_budget_scope(state) == "pipeline"
+        else None
+    ) or {}
     checkpoint = {
         "id": uuid.uuid4().hex,
         "accepted_at": utc_now(),
@@ -2718,8 +2912,8 @@ def accepted_push_checkpoint(
         "head_sha": head_sha,
         "commits": commits,
         "kind": kind,
-        "pipeline_run": (state.get("pipeline_budget") or {}).get("run"),
-        "pipeline_iteration": (state.get("pipeline_budget") or {}).get("iteration"),
+        "pipeline_run": pipeline_budget.get("run"),
+        "pipeline_iteration": pipeline_budget.get("iteration"),
     }
     state.setdefault("accepted_pushes", []).append(checkpoint)
     return checkpoint
@@ -3161,6 +3355,8 @@ def status_payload(state: dict[str, Any], path: Path) -> dict[str, Any]:
         "skip_note": state.get("skip_note"),
         "iterations": int(state.get("iterations", 0)),
         "pipeline_budget": state.get("pipeline_budget"),
+        "invocation_budget": state.get("invocation_budget"),
+        "budget_scope": state.get("budget_scope", "lifetime"),
         "accepted_pushes": state.get("accepted_pushes") or [],
         "progress": work_progress(state),
         "last_helper_activity": last_helper_activity(state),
@@ -3241,6 +3437,8 @@ def command_status(args: argparse.Namespace) -> None:
                 **class_counts(checks),
             },
             "iterations": int(state.get("iterations", 0)),
+            "budget_scope": state.get("budget_scope", "lifetime"),
+            "invocation_budget": state.get("invocation_budget"),
             "accepted_pushes": state.get("accepted_pushes") or [],
             "progress": work_progress(state),
             "last_helper_activity": last_helper_activity(state),
@@ -3278,6 +3476,16 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--repo-root")
     preflight.add_argument("--state")
     preflight.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS)
+    invocation = preflight.add_mutually_exclusive_group()
+    invocation.add_argument(
+        "--new-invocation",
+        action="store_true",
+        help="start a fresh standalone budget and return its invocation run token",
+    )
+    invocation.add_argument(
+        "--invocation-run",
+        help="reuse the invocation run token returned by its first preflight",
+    )
     preflight.add_argument(
         "--pipeline-run",
         help=(

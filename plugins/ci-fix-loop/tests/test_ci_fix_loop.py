@@ -345,6 +345,18 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("The maximum is 5 iterations", self.instructions)
         self.assertIn("max_iterations_reached", self.instructions)
 
+    def test_starts_each_explicit_invocation_with_a_fresh_budget(self):
+        self.assertIn(
+            "Every explicit user invocation starts with a fresh five-iteration budget.",
+            self.instructions,
+        )
+        self.assertIn("`--new-invocation`", self.instructions)
+        self.assertIn("`--invocation-run <token>`", self.instructions)
+        self.assertIn(
+            "Do not use `--new-invocation` again during the same user invocation",
+            self.instructions,
+        )
+
     def test_says_an_iteration_is_charged_per_head_rather_than_per_launch(self):
         """The prose is what the next reader believes, so it has to say which it is.
 
@@ -3222,6 +3234,70 @@ class ChargeIterationTest(unittest.TestCase):
         self.assertEqual(3, state["iterations"])
         self.assertNotIn("charged_head_sha", state)
 
+    def test_scoped_runs_charge_and_dedupe_independently(self):
+        state = {
+            "iterations": 0,
+            "budget_charges": {
+                "pipeline-position": 0,
+                "pipeline-run": 0,
+                "user-invocation": 0,
+                "user-run": 0,
+            },
+        }
+        pipeline = {
+            "head_sha": "head1",
+            "iteration": 1,
+            "budget_head_key": "pipeline-position",
+            "budget_charge_key": "pipeline-position",
+            "budget_run_charge_key": "pipeline-run",
+        }
+        invocation = {
+            "head_sha": "head1",
+            "iteration": 2,
+            "budget_head_key": "user-invocation",
+            "budget_charge_key": "user-invocation",
+            "budget_run_charge_key": "user-run",
+        }
+
+        self.assertTrue(MODULE.charge_iteration(state, pipeline))
+        self.assertTrue(MODULE.charge_iteration(state, invocation))
+        self.assertFalse(
+            MODULE.charge_iteration(
+                state,
+                {
+                    **pipeline,
+                    "charged": False,
+                },
+            )
+        )
+
+        self.assertEqual(2, state["iterations"])
+        self.assertEqual(1, state["budget_charges"]["pipeline-position"])
+        self.assertEqual(1, state["budget_charges"]["pipeline-run"])
+        self.assertEqual(1, state["budget_charges"]["user-invocation"])
+        self.assertEqual(1, state["budget_charges"]["user-run"])
+
+
+class AcceptedPushCheckpointTest(unittest.TestCase):
+    def test_a_standalone_push_does_not_inherit_saved_pipeline_position(self):
+        state = {
+            "budget_scope": "invocation",
+            "pipeline_budget": {
+                "run": "old-pipeline",
+                "iteration": 2,
+            },
+        }
+
+        checkpoint = MODULE.accepted_push_checkpoint(
+            state,
+            previous_head="head1",
+            head_sha="head2",
+            commits=["head2"],
+        )
+
+        self.assertIsNone(checkpoint["pipeline_run"])
+        self.assertIsNone(checkpoint["pipeline_iteration"])
+
 
 class TestSuppressionTest(unittest.TestCase):
     def test_recognizes_a_test_path_by_directory_or_by_file_name(self):
@@ -3746,6 +3822,59 @@ class PipelineBudgetTest(unittest.TestCase):
         self.assertEqual(3, given.pipeline_max_iterations)
 
 
+class InvocationBudgetTest(unittest.TestCase):
+    def scope(self, state, *arguments):
+        return MODULE.invocation_scope(state, run_arguments("preflight", *arguments))
+
+    def test_a_new_invocation_preserves_the_lifetime_count_and_starts_at_zero(self):
+        state = {"iterations": 5}
+
+        with mock.patch.object(MODULE.uuid, "uuid4") as token:
+            token.return_value.hex = "new-run"
+            scope = self.scope(state, "--new-invocation")
+
+        self.assertEqual(
+            {
+                "run": "new-run",
+                "iteration": None,
+                "baseline": 5,
+                "run_baseline": 5,
+            },
+            scope,
+        )
+        self.assertEqual(5, state["iterations"])
+        self.assertEqual((0, 0), MODULE.budget_spent(state, scope))
+
+    def test_the_returned_token_reuses_only_its_active_invocation_budget(self):
+        state = {
+            "iterations": 7,
+            "invocation_budget": {
+                "run": "active-run",
+                "iteration": None,
+                "baseline": 5,
+                "run_baseline": 5,
+            },
+        }
+
+        scope = self.scope(state, "--invocation-run", "active-run")
+
+        self.assertEqual((2, 2), MODULE.budget_spent(state, scope))
+
+    def test_an_unknown_invocation_token_is_rejected(self):
+        state = {
+            "iterations": 7,
+            "invocation_budget": {
+                "run": "active-run",
+                "iteration": None,
+                "baseline": 5,
+                "run_baseline": 5,
+            },
+        }
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "--new-invocation"):
+            self.scope(state, "--invocation-run", "other-run")
+
+
 class BudgetAdvancedTest(unittest.TestCase):
     """The per-head charge lives exactly as long as the budget it protects."""
 
@@ -3925,6 +4054,212 @@ class PreflightCommandTest(unittest.TestCase):
         self.assertEqual("max_iterations_reached", escalation["reason"])
         self.assertTrue(escalation["next_action"])
 
+    def test_a_second_user_invocation_gets_five_fresh_attempts(self):
+        path = self.root / "state.json"
+        invocation_run = None
+        for index in range(MODULE.DEFAULT_MAX_ITERATIONS):
+            head = f"old-head-{index + 1}"
+            self.metadata["head_sha"] = head
+            arguments = (
+                ["--new-invocation"]
+                if invocation_run is None
+                else ["--invocation-run", invocation_run]
+            )
+            with contextlib.ExitStack() as stack:
+                payload = self.preflight(
+                    stack, head=head, state_path=path, pipeline=arguments
+                )
+            invocation_run = payload["invocation_run"]
+            state = MODULE.load_state(path)
+            MODULE.charge_iteration(state, state["run"])
+            MODULE.save_state(path, state)
+
+        self.metadata["head_sha"] = "new-head-1"
+        with contextlib.ExitStack() as stack:
+            fresh = self.preflight(
+                stack,
+                head="new-head-1",
+                state_path=path,
+                pipeline=["--new-invocation"],
+            )
+
+        self.assertEqual("ready", fresh["result"])
+        self.assertEqual(6, fresh["iteration"])
+        self.assertEqual(0, fresh["completed_iterations"])
+        self.assertEqual("reused", fresh["state_origin"])
+        self.assertEqual("fresh", fresh["budget_origin"])
+        self.assertEqual("invocation", fresh["budget_scope"])
+        self.assertNotEqual(invocation_run, fresh["invocation_run"])
+
+        invocation_run = fresh["invocation_run"]
+        for index in range(MODULE.DEFAULT_MAX_ITERATIONS):
+            head = f"new-head-{index + 1}"
+            self.metadata["head_sha"] = head
+            with contextlib.ExitStack() as stack:
+                attempt = self.preflight(
+                    stack,
+                    head=head,
+                    state_path=path,
+                    pipeline=["--invocation-run", invocation_run],
+                )
+            self.assertEqual("ready", attempt["result"])
+            self.assertEqual(index, attempt["completed_iterations"])
+            self.assertEqual("reused", attempt["budget_origin"])
+            state = MODULE.load_state(path)
+            MODULE.charge_iteration(state, state["run"])
+            MODULE.save_state(path, state)
+
+        with contextlib.ExitStack() as stack:
+            resumed_fifth = self.preflight(
+                stack,
+                head="new-head-5",
+                state_path=path,
+                pipeline=["--invocation-run", invocation_run],
+            )
+        self.assertEqual("ready", resumed_fifth["result"])
+        self.assertEqual(10, resumed_fifth["iteration"])
+        self.assertEqual(5, resumed_fifth["completed_iterations"])
+
+        self.metadata["head_sha"] = "new-head-6"
+        with contextlib.ExitStack() as stack:
+            exhausted = self.preflight(
+                stack,
+                head="new-head-6",
+                state_path=path,
+                pipeline=["--invocation-run", invocation_run],
+            )
+        self.assertEqual("max_iterations_reached", exhausted["result"])
+        self.assertEqual(5, exhausted["completed_iterations"])
+        self.assertEqual(10, MODULE.load_state(path)["iterations"])
+
+    def test_migrates_a_legacy_pipeline_before_a_standalone_run_can_charge(self):
+        path = write_state(
+            self.root,
+            iterations=4,
+            charged_head_sha="head1",
+            pipeline_budget={
+                "run": "pipeline-a",
+                "iteration": 1,
+                "baseline": 2,
+                "run_baseline": 2,
+            },
+            run={"iteration": 4},
+        )
+        self.metadata["head_sha"] = "standalone-head"
+        with contextlib.ExitStack() as stack:
+            standalone = self.preflight(
+                stack,
+                head="standalone-head",
+                state_path=path,
+                pipeline=["--new-invocation"],
+            )
+        state = MODULE.load_state(path)
+        MODULE.charge_iteration(state, state["run"])
+        MODULE.save_state(path, state)
+
+        self.metadata["head_sha"] = "pipeline-head"
+        with contextlib.ExitStack() as stack:
+            pipeline = self.preflight(
+                stack,
+                head="pipeline-head",
+                state_path=path,
+                pipeline=[
+                    "--pipeline-run",
+                    "pipeline-a",
+                    "--pipeline-iteration",
+                    "1",
+                ],
+            )
+
+        self.assertEqual(2, pipeline["completed_iterations"])
+        self.assertEqual("ready", pipeline["result"])
+
+    def test_migrates_a_legacy_charged_head_into_its_pipeline_scope(self):
+        path = write_state(
+            self.root,
+            iterations=4,
+            charged_head_sha="head1",
+            pipeline_budget={
+                "run": "pipeline-a",
+                "iteration": 1,
+                "baseline": 0,
+                "run_baseline": 0,
+            },
+            run={"iteration": 4},
+        )
+        with contextlib.ExitStack() as stack:
+            resumed = self.preflight(
+                stack,
+                state_path=path,
+                pipeline=[
+                    "--pipeline-run",
+                    "pipeline-a",
+                    "--pipeline-iteration",
+                    "1",
+                ],
+            )
+
+        state = MODULE.load_state(path)
+        self.assertEqual(4, resumed["iteration"])
+        self.assertEqual("ready", resumed["result"])
+        self.assertFalse(MODULE.charge_iteration(state, state["run"]))
+        self.assertEqual(4, state["iterations"])
+
+        MODULE.save_state(path, state)
+        with contextlib.ExitStack() as stack:
+            fresh = self.preflight(
+                stack,
+                state_path=path,
+                pipeline=["--new-invocation"],
+            )
+        state = MODULE.load_state(path)
+        self.assertEqual(5, fresh["iteration"])
+        self.assertTrue(MODULE.charge_iteration(state, state["run"]))
+        self.assertEqual(5, state["iterations"])
+
+    def test_a_legacy_lifetime_head_cannot_leak_into_a_fresh_invocation(self):
+        path = write_state(
+            self.root,
+            iterations=5,
+            charged_head_sha="head1",
+            run={"iteration": 5},
+        )
+        with contextlib.ExitStack() as stack:
+            fresh = self.preflight(
+                stack,
+                state_path=path,
+                pipeline=["--new-invocation"],
+            )
+
+        state = MODULE.load_state(path)
+        self.assertEqual(6, fresh["iteration"])
+        self.assertTrue(MODULE.charge_iteration(state, state["run"]))
+        self.assertEqual(6, state["iterations"])
+        self.assertEqual("head1", state["budget_charged_heads"]["lifetime"]["head_sha"])
+
+    def test_a_stale_legacy_pipeline_budget_does_not_hide_a_lifetime_charge(self):
+        path = write_state(
+            self.root,
+            iterations=5,
+            charged_head_sha="head1",
+            pipeline_budget={
+                "run": "old-pipeline",
+                "iteration": 1,
+                "baseline": 0,
+                "run_baseline": 0,
+            },
+            run={"iteration": 5},
+        )
+
+        with contextlib.ExitStack() as stack:
+            resumed = self.preflight(stack, state_path=path)
+
+        self.assertEqual("ready", resumed["result"])
+        self.assertEqual(5, resumed["iteration"])
+        state = MODULE.load_state(path)
+        self.assertFalse(MODULE.charge_iteration(state, state["run"]))
+        self.assertEqual(5, state["iterations"])
+
     def test_a_second_preflight_at_a_charged_head_costs_nothing_and_keeps_its_number(self):
         """One logical attempt, read twice, must be billed once and numbered once.
 
@@ -3974,7 +4309,11 @@ class PreflightCommandTest(unittest.TestCase):
         state = MODULE.load_state(path)
         MODULE.charge_iteration(state, state["run"])
         MODULE.save_state(path, state)
-        self.assertEqual("head1", MODULE.load_state(path)["charged_head_sha"])
+        charged_heads = MODULE.load_state(path)["budget_charged_heads"]
+        self.assertEqual(
+            ["head1"],
+            [entry["head_sha"] for entry in charged_heads.values()],
+        )
 
         with contextlib.ExitStack() as stack:
             advanced = self.preflight(
@@ -3983,12 +4322,49 @@ class PreflightCommandTest(unittest.TestCase):
                 pipeline=["--pipeline-run", "run-a", "--pipeline-iteration", "2"],
             )
 
-        self.assertNotIn("charged_head_sha", MODULE.load_state(path))
+        self.assertEqual(1, len(MODULE.load_state(path)["budget_charged_heads"]))
         self.assertEqual(2, advanced["iteration"])
         complete = json.loads(
             Path(advanced["preflight_path"]).read_text(encoding="utf-8")
         )
         self.assertEqual(0, complete["completed_iterations"])
+
+    def test_standalone_and_pipeline_budgets_do_not_spend_each_other(self):
+        path = self.root / "state.json"
+        pipeline = [
+            "--pipeline-run",
+            "pipeline-a",
+            "--pipeline-iteration",
+            "1",
+            "--pipeline-max-iterations",
+            "2",
+        ]
+        with contextlib.ExitStack() as stack:
+            first_pipeline = self.preflight(
+                stack, state_path=path, pipeline=pipeline
+            )
+        state = MODULE.load_state(path)
+        MODULE.charge_iteration(state, state["run"])
+        MODULE.save_state(path, state)
+
+        with contextlib.ExitStack() as stack:
+            standalone = self.preflight(
+                stack, state_path=path, pipeline=["--new-invocation"]
+            )
+        state = MODULE.load_state(path)
+        MODULE.charge_iteration(state, state["run"])
+        MODULE.save_state(path, state)
+
+        with contextlib.ExitStack() as stack:
+            resumed_pipeline = self.preflight(
+                stack, state_path=path, pipeline=pipeline
+            )
+
+        self.assertEqual(1, first_pipeline["iteration"])
+        self.assertEqual(2, standalone["iteration"])
+        self.assertEqual(1, resumed_pipeline["iteration"])
+        self.assertEqual(1, resumed_pipeline["completed_iterations"])
+        self.assertEqual("reused", resumed_pipeline["budget_origin"])
 
     def test_a_pipeline_iteration_never_rewrites_the_durable_count(self):
         """Zeroing it would restart the numbering and collide with archived ids.
