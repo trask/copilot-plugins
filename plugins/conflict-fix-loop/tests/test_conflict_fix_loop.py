@@ -2197,6 +2197,11 @@ class PreflightTest(unittest.TestCase):
         external=None,
         whole_stack=False,
         whole_stack_mergeable=False,
+        new_invocation=False,
+        invocation_run=None,
+        pipeline_run=None,
+        pipeline_iteration=None,
+        pipeline_max_iterations=None,
     ):
         args = SimpleNamespace(
             target="owner/repo#7",
@@ -2205,6 +2210,11 @@ class PreflightTest(unittest.TestCase):
             strategy=strategy,
             max_iterations=max_iterations,
             whole_stack=whole_stack,
+            new_invocation=new_invocation,
+            invocation_run=invocation_run,
+            pipeline_run=pipeline_run,
+            pipeline_iteration=pipeline_iteration,
+            pipeline_max_iterations=pipeline_max_iterations,
         )
         ad_hoc = ad_hoc or {
             "reason": "the head conflicts with develop in docs/list.yaml",
@@ -2337,6 +2347,48 @@ class PreflightTest(unittest.TestCase):
         payload = self.preflight(max_iterations=6)
         self.assertEqual("ready", payload["result"])
         self.assertEqual(6, payload["iteration"])
+
+    def test_a_new_manual_invocation_does_not_inherit_a_pipeline_cap(self):
+        write_state(
+            self.directory,
+            iterations=6,
+            attempt=None,
+            history=[],
+            pipeline_budget={
+                "run": "old-pipeline",
+                "iteration": 2,
+                "baseline": 0,
+                "run_baseline": 0,
+            },
+        )
+
+        with mock.patch.object(MODULE.uuid, "uuid4") as token:
+            token.return_value.hex = "manual-run"
+            payload = self.preflight(new_invocation=True)
+
+        self.assertEqual("ready", payload["result"])
+        self.assertEqual(0, payload["completed_iterations"])
+        self.assertEqual("invocation", payload["budget_scope"])
+        self.assertEqual("manual-run", payload["invocation_run"])
+        self.assertEqual(7, payload["iteration"])
+
+    def test_an_active_manual_invocation_cannot_silently_fall_back_to_lifetime(self):
+        write_state(
+            self.directory,
+            iterations=6,
+            attempt=None,
+            history=[],
+            budget_scope="invocation",
+            invocation_budget={
+                "run": "manual-run",
+                "iteration": None,
+                "baseline": 6,
+                "run_baseline": 6,
+            },
+        )
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "--invocation-run"):
+            self.preflight()
 
     def test_a_second_preflight_archives_the_finished_attempt(self):
         write_state(
@@ -4799,6 +4851,8 @@ class PipelineBudgetTest(unittest.TestCase):
         parser = MODULE.build_parser()
 
         bare = parser.parse_args(["preflight"])
+        self.assertFalse(bare.new_invocation)
+        self.assertIsNone(bare.invocation_run)
         self.assertIsNone(bare.pipeline_run)
         self.assertIsNone(bare.pipeline_iteration)
         self.assertIsNone(bare.pipeline_max_iterations)
@@ -4818,6 +4872,13 @@ class PipelineBudgetTest(unittest.TestCase):
         self.assertEqual(2, given.pipeline_iteration)
         self.assertEqual(3, given.pipeline_max_iterations)
 
+        fresh = parser.parse_args(["preflight", "--new-invocation"])
+        self.assertTrue(fresh.new_invocation)
+        resumed = parser.parse_args(
+            ["preflight", "--invocation-run", "manual-run"]
+        )
+        self.assertEqual("manual-run", resumed.invocation_run)
+
     def test_the_helper_advertises_the_flag_an_orchestrator_probes_for(self):
         """An orchestrator reads the installed script to decide whether to send it.
 
@@ -4825,6 +4886,89 @@ class PipelineBudgetTest(unittest.TestCase):
         would silently leave this stage unscoped rather than fail.
         """
         self.assertIn("--pipeline-run", SCRIPT.read_text(encoding="utf-8"))
+
+
+class InvocationBudgetTest(unittest.TestCase):
+    def scope(self, state, **arguments):
+        return MODULE.invocation_scope(state, SimpleNamespace(**arguments))
+
+    def test_a_new_invocation_preserves_the_lifetime_count_and_starts_at_zero(self):
+        state = {"iterations": 6}
+
+        with mock.patch.object(MODULE.uuid, "uuid4") as token:
+            token.return_value.hex = "manual-run"
+            scope = self.scope(state, new_invocation=True)
+
+        self.assertEqual(
+            {
+                "run": "manual-run",
+                "iteration": None,
+                "baseline": 6,
+                "run_baseline": 6,
+            },
+            scope,
+        )
+        self.assertEqual((0, 0), MODULE.budget_spent(state, scope))
+        self.assertEqual(6, state["iterations"])
+
+    def test_the_returned_token_reuses_only_its_active_invocation_budget(self):
+        state = {
+            "iterations": 8,
+            "invocation_budget": {
+                "run": "manual-run",
+                "iteration": None,
+                "baseline": 6,
+                "run_baseline": 6,
+            },
+        }
+
+        scope = self.scope(state, invocation_run="manual-run")
+
+        self.assertEqual((2, 2), MODULE.budget_spent(state, scope))
+
+    def test_an_unknown_invocation_token_is_rejected(self):
+        state = {
+            "iterations": 8,
+            "invocation_budget": {
+                "run": "manual-run",
+                "iteration": None,
+                "baseline": 6,
+                "run_baseline": 6,
+            },
+        }
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "--new-invocation"):
+            self.scope(state, invocation_run="other-run")
+
+    def test_pipeline_and_manual_charges_do_not_spend_each_others_budget(self):
+        state = {"iterations": 6}
+        pipeline = {
+            "run": "pipeline-run",
+            "iteration": 2,
+            "baseline": 0,
+            "run_baseline": 0,
+        }
+        invocation = {
+            "run": "manual-run",
+            "iteration": None,
+            "baseline": 6,
+            "run_baseline": 6,
+        }
+        pipeline = MODULE.scoped_budget(state, "pipeline", pipeline)
+        invocation = MODULE.scoped_budget(state, "invocation", invocation)
+        state["pipeline_budget"] = {
+            key: value for key, value in pipeline.items() if not key.startswith("_")
+        }
+        state["budget_scope"] = "pipeline"
+        MODULE.charge_iteration(state)
+        state["invocation_budget"] = {
+            key: value for key, value in invocation.items() if not key.startswith("_")
+        }
+        state["budget_scope"] = "invocation"
+        MODULE.charge_iteration(state)
+
+        self.assertEqual((7, 7), MODULE.budget_spent(state, pipeline))
+        self.assertEqual((1, 1), MODULE.budget_spent(state, invocation))
 
 
 class LauncherPositionInstructionsTest(unittest.TestCase):
@@ -5514,6 +5658,19 @@ class CleanupReplacedStackAttemptTest(unittest.TestCase):
             )
         }
         MODULE.cleanup_replaced_stack_attempt(state)
+        self.assertFalse(workspace.exists())
+        self.assertIsNone(state["attempt"]["stack"]["workspace"])
+
+    def test_a_published_attempt_never_leaves_its_workspace_owning_preflight(self):
+        workspace = self.workspace()
+        state = {
+            "attempt": stack_attempt_record(
+                status="published", stack={"workspace": str(workspace)}
+            )
+        }
+
+        MODULE.cleanup_replaced_stack_attempt(state)
+
         self.assertFalse(workspace.exists())
         self.assertIsNone(state["attempt"]["stack"]["workspace"])
 

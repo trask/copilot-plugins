@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Iterable
+import uuid
 
 
 STATE_VERSION = 1
@@ -1960,6 +1961,36 @@ def pipeline_scope(
     }
 
 
+def invocation_scope(
+    state: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any] | None:
+    """Scope a standalone budget to one explicit user invocation."""
+    if getattr(args, "new_invocation", False):
+        spent = int(state.get("iterations", 0))
+        return {
+            "run": uuid.uuid4().hex,
+            "iteration": None,
+            "baseline": spent,
+            "run_baseline": spent,
+        }
+    run = getattr(args, "invocation_run", None)
+    if not isinstance(run, str) or not run:
+        return None
+    recorded = state.get("invocation_budget")
+    if not isinstance(recorded, dict) or recorded.get("run") != run:
+        raise WorkflowError(
+            "invocation run does not match the active invocation; start a new "
+            "explicit invocation with --new-invocation"
+        )
+    spent = int(state.get("iterations", 0))
+    return {
+        "run": run,
+        "iteration": None,
+        "baseline": whole_number(recorded.get("baseline"), spent),
+        "run_baseline": whole_number(recorded.get("run_baseline"), spent),
+    }
+
+
 def absolute_iteration_cap(
     scope: dict[str, Any] | None, max_iterations: int, pipeline_max_iterations: Any
 ) -> int | None:
@@ -1990,16 +2021,80 @@ def budget_spent(
 ) -> tuple[int, int]:
     """How much of the per-iteration budget and of the whole run this PR has used.
 
-    Without an outer loop both are the durable count itself, which is the flat
-    per-pull-request cap this loop has always applied.
+    Scoped counters keep pipeline and standalone runs independent. Without a
+    scope, both values are the durable lifetime count.
     """
     spent = int(state.get("iterations", 0))
     if scope is None:
         return spent, spent
+    charge_key = scope.get("_charge_key")
+    run_charge_key = scope.get("_run_charge_key")
+    charges = state.get("budget_charges")
+    if (
+        isinstance(charge_key, str)
+        and isinstance(run_charge_key, str)
+        and isinstance(charges, dict)
+    ):
+        return (
+            whole_number(charges.get(charge_key), 0),
+            whole_number(charges.get(run_charge_key), 0),
+        )
     return (
         max(0, spent - whole_number(scope.get("baseline"), spent)),
         max(0, spent - whole_number(scope.get("run_baseline"), spent)),
     )
+
+
+def budget_charge_keys(kind: str, scope: dict[str, Any]) -> tuple[str, str]:
+    run = scope["run"]
+    iteration = scope.get("iteration")
+    return (
+        json.dumps([kind, run, iteration], separators=(",", ":")),
+        json.dumps([kind, run], separators=(",", ":")),
+    )
+
+
+def scoped_budget(
+    state: dict[str, Any],
+    kind: str,
+    scope: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Attach persistent charge counters to one active budget."""
+    if scope is None:
+        return None
+    previous_iteration_spent, previous_run_spent = budget_spent(state, scope)
+    charge_key, run_charge_key = budget_charge_keys(kind, scope)
+    charges = state.setdefault("budget_charges", {})
+    if charge_key not in charges:
+        charges[charge_key] = previous_iteration_spent
+    if run_charge_key not in charges:
+        charges[run_charge_key] = previous_run_spent
+    return {
+        **scope,
+        "_charge_key": charge_key,
+        "_run_charge_key": run_charge_key,
+    }
+
+
+def charge_iteration(state: dict[str, Any]) -> None:
+    """Spend one iteration against the lifetime and active scoped budgets."""
+    state["iterations"] = int(state.get("iterations", 0)) + 1
+    kind = state.get("budget_scope")
+    field = (
+        "pipeline_budget"
+        if kind == "pipeline"
+        else "invocation_budget"
+        if kind == "invocation"
+        else None
+    )
+    scope = state.get(field) if field is not None else None
+    if not isinstance(scope, dict) or not isinstance(scope.get("run"), str):
+        return
+    charge_key, run_charge_key = budget_charge_keys(kind, scope)
+    charges = state.setdefault("budget_charges", {})
+    charges[charge_key] = whole_number(charges.get(charge_key), 0) + 1
+    if run_charge_key != charge_key:
+        charges[run_charge_key] = whole_number(charges.get(run_charge_key), 0) + 1
 
 
 def exhausted_budget(
@@ -2147,11 +2242,38 @@ def command_preflight(args: argparse.Namespace) -> None:
     state["stack"] = stack
 
     max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
-    scope = pipeline_scope(state, args)
-    if scope is not None:
+    pipeline = pipeline_scope(state, args)
+    invocation = invocation_scope(state, args)
+    if pipeline is not None and invocation is not None:
+        raise WorkflowError(
+            "standalone invocation arguments cannot be combined with pipeline arguments"
+        )
+    if (
+        pipeline is None
+        and invocation is None
+        and state.get("budget_scope") == "invocation"
+        and isinstance(state.get("invocation_budget"), dict)
+    ):
+        raise WorkflowError(
+            "an explicit standalone invocation is active; pass its --invocation-run "
+            "token to continue it, or use --new-invocation for a new user invocation"
+        )
+    scope = pipeline or invocation
+    budget_scope = (
+        "pipeline"
+        if pipeline is not None
+        else "invocation"
+        if invocation is not None
+        else "lifetime"
+    )
+    if budget_scope == "pipeline":
         state["pipeline_budget"] = scope
+    elif budget_scope == "invocation":
+        state["invocation_budget"] = scope
+    state["budget_scope"] = budget_scope
+    scope = scoped_budget(state, budget_scope, scope)
     absolute_cap = absolute_iteration_cap(
-        scope, max_iterations, getattr(args, "pipeline_max_iterations", None)
+        pipeline, max_iterations, getattr(args, "pipeline_max_iterations", None)
     )
     exhausted = exhausted_budget(state, scope, max_iterations, absolute_cap)
     completed_iterations = budget_spent(state, scope)[0]
@@ -2325,8 +2447,10 @@ def command_preflight(args: argparse.Namespace) -> None:
         "completed_iterations": completed_iterations,
         "absolute_cap": absolute_cap,
         "budget_exhausted": exhausted,
-        "pipeline_run": None if scope is None else scope["run"],
-        "pipeline_iteration": None if scope is None else scope["iteration"],
+        "budget_scope": budget_scope,
+        "pipeline_run": None if pipeline is None else pipeline["run"],
+        "pipeline_iteration": None if pipeline is None else pipeline["iteration"],
+        "invocation_run": None if invocation is None else invocation["run"],
     }
     write_result_file(preflight_path, payload, "preflight")
     emit(
@@ -2376,8 +2500,10 @@ def command_preflight(args: argparse.Namespace) -> None:
             "completed_iterations": completed_iterations,
             "absolute_cap": absolute_cap,
             "budget_exhausted": exhausted,
-            "pipeline_run": None if scope is None else scope["run"],
-            "pipeline_iteration": None if scope is None else scope["iteration"],
+            "budget_scope": budget_scope,
+            "pipeline_run": None if pipeline is None else pipeline["run"],
+            "pipeline_iteration": None if pipeline is None else pipeline["iteration"],
+            "invocation_run": None if invocation is None else invocation["run"],
         }
     )
 
@@ -3085,7 +3211,7 @@ def command_publish(args: argparse.Namespace) -> None:
     attempt["mergeable_at_head_sha"] = (
         local_head if mergeability == "mergeable" else None
     )
-    state["iterations"] = int(state.get("iterations", 0)) + 1
+    charge_iteration(state)
     state["pr"] = final
     archive_attempt(state)
     save_state(state_path, state)
@@ -3238,6 +3364,10 @@ def cleanup_replaced_stack_attempt(state: dict[str, Any]) -> None:
             "the stack refs are already published; re-run stack-publish before "
             "starting a new preflight"
         )
+    if status == "published":
+        if workspace and Path(workspace).exists():
+            remove_stack_workspace(attempt)
+        return
     if status != "resolved":
         raise WorkflowError(
             f"the previous stack cascade is still {status}; run stack-abort before "
@@ -4666,7 +4796,7 @@ def command_stack_publish(args: argparse.Namespace) -> None:
         attempt["published_head_sha"] if mergeability == "mergeable" else None
     )
     state["pr"] = final
-    state["iterations"] = int(state.get("iterations", 0)) + 1
+    charge_iteration(state)
     archive_attempt(state)
     save_state(state_path, state)
     emit(
@@ -4850,6 +4980,9 @@ def command_status(args: argparse.Namespace) -> None:
             "escalation": state.get("escalation"),
             "history": history,
             "iterations": int(state.get("iterations", 0)),
+            "pipeline_budget": state.get("pipeline_budget"),
+            "invocation_budget": state.get("invocation_budget"),
+            "budget_scope": state.get("budget_scope", "lifetime"),
             "last_helper_activity": last_helper_activity(state),
         },
         state,
@@ -4881,6 +5014,7 @@ def command_status(args: argparse.Namespace) -> None:
                     "history": len(history),
                 },
                 "iterations": int(state.get("iterations", 0)),
+                "budget_scope": state.get("budget_scope", "lifetime"),
                 "last_helper_activity": last_helper_activity(state),
             },
             state,
@@ -4926,6 +5060,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     preflight.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS)
+    invocation = preflight.add_mutually_exclusive_group()
+    invocation.add_argument(
+        "--new-invocation",
+        action="store_true",
+        help="start a fresh standalone budget and return its invocation run token",
+    )
+    invocation.add_argument(
+        "--invocation-run",
+        help="reuse the invocation run token returned by its first preflight",
+    )
     preflight.add_argument(
         "--pipeline-run",
         help=(

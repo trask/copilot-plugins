@@ -14,7 +14,7 @@ You never post anything to GitHub. Your only change to GitHub is pushing commits
 ## Activation: Bare PR References Run The Full Loop
 
 - When the user selects this agent, a message containing only a PR URL, bare PR number (such as `123` or `#123`), or `owner/repo#number` asks you to run the full Conflict Fix Loop.
-- Start the helper's `preflight` workflow at once. Use a URL or `owner/repo#number` exactly as the user wrote it. For a bare number, combine it with the current workspace's GitHub repository as `owner/repo#number` before you call `preflight`.
+- Start the helper's `preflight` workflow at once, with `--new-invocation`. Use a URL or `owner/repo#number` exactly as the user wrote it. For a bare number, combine it with the current workspace's GitHub repository as `owner/repo#number` before you call `preflight`.
 - Do not ask what action the user wants, do not summarize the conflict instead, and do not wait for more instructions. Keep going until one of the stop conditions in this file applies.
 - Never hand the work to a generic rebase or merge skill. Those do not carry this file's safety guards.
 
@@ -69,7 +69,7 @@ Never pass a `~`-prefixed helper path to native Windows Python from Git Bash.
 
 The deterministic, JSON-only helper provides:
 
-- `preflight [target] [--repo-root <workspace>] [--strategy auto|merge|rebase] [--max-iterations 5] [--whole-stack]`: resolve the pull request, require a clean worktree with no merge or rebase in progress, put the worktree on the pull request head — detaching unless this worktree already holds the head branch, because git refuses to check one branch out in two worktrees at once — require the local head to equal the pull request head, read mergeability live from GitHub and wait out an `UNKNOWN` answer, find the open pull requests that stack on this branch and the one this branch stacks on, read the repository's allowed merge methods, choose the integration strategy, enforce the iteration cap, archive the previous attempt, write its complete result to `preflight_path`, and print a compact envelope. When the caller explicitly requests whole-native-stack conflict handling, pass `--whole-stack`: preflight checks every member even when the clicked pull request is already mergeable, records ordinary head/base-qualified clearance for every clean member, and routes any uncleared member through the existing whole-stack cascade.
+- `preflight [target] [--repo-root <workspace>] [--strategy auto|merge|rebase] [--max-iterations 5] [--new-invocation | --invocation-run <token>] [--whole-stack]`: resolve the pull request, require a clean worktree with no merge or rebase in progress, put the worktree on the pull request head — detaching unless this worktree already holds the head branch, because git refuses to check one branch out in two worktrees at once — require the local head to equal the pull request head, read mergeability live from GitHub and wait out an `UNKNOWN` answer, find the open pull requests that stack on this branch and the one this branch stacks on, read the repository's allowed merge methods, choose the integration strategy, enforce the active invocation's iteration cap, archive the previous attempt, write its complete result to `preflight_path`, and print a compact envelope. When the caller explicitly requests whole-native-stack conflict handling, pass `--whole-stack`: preflight checks every member even when the clicked pull request is already mergeable, records ordinary head/base-qualified clearance for every clean member, and routes any uncleared member through the existing whole-stack cascade.
 - `attempt --state <path>`: fetch the base commit, compute the merge base, record the head branch's original commit subjects, start the merge or rebase, and report every conflicted file with its conflict kind, its conflict-marker regions, which stages exist, and the commits from each side that touched it. The complete detail goes to `conflicts_path`.
 - `resolved --state <path> --paths <files...> [--companion-paths <files...>] (--rationale <text> | --rationale-file <file-or->) [--accept-one-side] [--accept-deletion] [--accept-line-endings]`: verify that no conflict marker remains, refuse a resolution that is byte-for-byte one side unless you pass `--accept-one-side`, refuse a resolution that leaves the file deleted unless you pass `--accept-deletion`, refuse a resolution that introduces a line ending neither side contained unless you pass `--accept-line-endings`, stage the files, and record the rationale durably. A companion path must be a non-conflicted file touched by the commit currently being replayed.
 - `continue --state <path>`: require every conflicted file to be resolved, then create the merge commit or replay the next rebased commit. A rebase can stop again on the next commit, so this may report a fresh conflict set.
@@ -91,7 +91,8 @@ If an operation partly fails, keep its state and run that same operation again a
 1. If the user supplied a PR URL or `owner/repo#number`, use it exactly. For a bare PR number, combine it with the current workspace's GitHub repository as `owner/repo#number`.
 2. For a `resume` or `continue` with no target, run `status --current --repo-root <workspace>` first and report what it finds. Do not fall back to another pull request. `--current` reads the branch this worktree has checked out, so it too needs an attached worktree; from a detached one, ask the user which pull request to resume and pass `--state` for it instead.
 3. For any other request with no target, run `preflight --repo-root <workspace>` with no target, so the helper resolves the pull request attached to the branch that is checked out. That works only from a worktree attached to a branch. A detached worktree names no branch to look up, and the loop leaves this worktree detached once it starts, so ask the user which pull request to resolve and pass it explicitly.
-4. Handle the results as follows:
+4. For a standalone user invocation, add `--new-invocation` to its first `preflight`. Keep the returned `invocation_run` token. Add `--invocation-run <token>` to every later `preflight` in the same user invocation. Do not use `--new-invocation` again during the same user invocation, including after `max_iterations_reached`.
+5. Handle the results as follows:
    - `ready`: the pull request is conflicting. Continue with `attempt`.
    - `mergeable`: GitHub already reports the pull request as mergeable. Stop at once and report that. Do not merge, rebase, or push anything.
    - `unknown_mergeability`: GitHub never finished computing mergeability. Stop and report it. The helper already waited.
@@ -109,11 +110,13 @@ An orchestrator that runs this loop as one stage of a larger loop tells you wher
 
 Whenever the request names all three, pass them to `preflight` as `--pipeline-run <token> --pipeline-iteration <number> --pipeline-max-iterations <number>`.
 
+Pipeline position replaces standalone invocation arguments. Do not also pass `--new-invocation` or `--invocation-run`.
+
 Read the values, not the spelling. Any wording that gives you all three is the caller naming its position, and a spelling you do not recognize is still the caller's instruction. What matters is only where a value came from: the caller may supply one and you may not.
 
 Copy them exactly. Do not read the token, do not shorten or reformat it, and do not adjust either number.
 
-Omit all three only when the request names no position at all, and the flat cap of 5 then applies. Send `--pipeline-run` and `--pipeline-iteration` together, because an iteration with no run says nothing the helper can compare and it ignores one. Never supply, guess, carry over, or reconstruct a value yourself, and never invent one to keep working after `max_iterations_reached`. A value you produced would be this loop refreshing its own cap, which is the one thing the cap exists to prevent.
+Omit all three only when the request names no position at all. Use the standalone invocation arguments instead. Send `--pipeline-run` and `--pipeline-iteration` together, because an iteration with no run says nothing the helper can compare and it ignores one. Never supply, guess, carry over, or reconstruct a value yourself, and never invent one to keep working after `max_iterations_reached`. A value you produced would be this loop refreshing its own cap. Minting a second standalone invocation would do the same thing.
 
 ## Strategy
 

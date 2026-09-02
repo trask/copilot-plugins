@@ -1,7 +1,7 @@
 {
   "name": "conflict-fix-loop",
   "description": "Resolve merge conflicts on a pull request by keeping both sides' intent, then push and repeat until GitHub reports it mergeable.",
-  "version": "1.0.21",
+  "version": "1.0.22",
   "author": {
     "name": "Trask Stalnaker"
   },
