@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Iterable
+import uuid
 
 
 STATE_VERSION = 1
@@ -1230,6 +1231,47 @@ def stored_audit_summary(state: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def whole_number(value: Any, fallback: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return fallback
+    return value
+
+
+def invocation_scope(
+    state: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any] | None:
+    """Scope a standalone budget to one explicit user invocation."""
+    if getattr(args, "new_invocation", False):
+        spent = int(state.get("iterations", 0))
+        return {
+            "run": uuid.uuid4().hex,
+            "baseline": spent,
+        }
+    run = getattr(args, "invocation_run", None)
+    if not isinstance(run, str) or not run:
+        return None
+    recorded = state.get("invocation_budget")
+    if not isinstance(recorded, dict) or recorded.get("run") != run:
+        raise WorkflowError(
+            "invocation run does not match the active invocation; start a new "
+            "explicit invocation with --new-invocation"
+        )
+    spent = int(state.get("iterations", 0))
+    return {
+        "run": run,
+        "baseline": whole_number(recorded.get("baseline"), spent),
+    }
+
+
+def invocation_iterations(
+    state: dict[str, Any], scope: dict[str, Any] | None
+) -> int:
+    spent = int(state.get("iterations", 0))
+    if scope is None:
+        return spent
+    return max(0, spent - whole_number(scope.get("baseline"), spent))
+
+
 def stored_stop_envelope(
     result: str, state_path: Path, state: dict[str, Any], max_iterations: int
 ) -> dict[str, Any]:
@@ -1241,6 +1283,11 @@ def stored_stop_envelope(
     """
     pr = state.get("pr") or {}
     iterations = int(state.get("iterations", 0))
+    invocation = (
+        state.get("invocation_budget")
+        if state.get("budget_scope") == "invocation"
+        else None
+    )
     return {
         "result": result,
         "state": str(state_path),
@@ -1263,7 +1310,12 @@ def stored_stop_envelope(
         "local_validation": state.get("local_validation") or [],
         **stage_outcome_fields(state),
         "iterations": iterations,
+        "completed_iterations": invocation_iterations(state, invocation),
         "max_iterations": max_iterations,
+        "budget_scope": state.get("budget_scope", "lifetime"),
+        "invocation_run": (
+            invocation.get("run") if isinstance(invocation, dict) else None
+        ),
         "pushed": False,
     }
 
@@ -1277,6 +1329,21 @@ def command_preflight(args: argparse.Namespace) -> None:
     audit_branch = audit_branch_name(target["number"])
     context_path = context_path_for(state_path)
     max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
+    budget_state = state if state is not None else {"iterations": 0}
+    invocation = invocation_scope(budget_state, args)
+    if (
+        state is not None
+        and invocation is None
+        and state.get("budget_scope") == "invocation"
+        and isinstance(state.get("invocation_budget"), dict)
+    ):
+        raise WorkflowError(
+            "an explicit standalone invocation is active; pass its --invocation-run "
+            "token to continue it, or use --new-invocation for a new user invocation"
+        )
+    if invocation is not None:
+        budget_state["invocation_budget"] = invocation
+        budget_state["budget_scope"] = "invocation"
 
     # Both stops read stored state and answer from it alone. Anything below this
     # point reads GitHub, moves the audit branch, archives the previous
@@ -1294,7 +1361,7 @@ def command_preflight(args: argparse.Namespace) -> None:
                 }
             )
             return
-        if int(state.get("iterations", 0)) >= max_iterations:
+        if invocation_iterations(state, invocation) >= max_iterations:
             emit(
                 stored_stop_envelope(
                     "max_iterations_reached", state_path, state, max_iterations
@@ -1375,6 +1442,11 @@ def command_preflight(args: argparse.Namespace) -> None:
             "next_candidate_id": 1,
             "history": [],
         }
+    if invocation is not None:
+        state["invocation_budget"] = invocation
+        state["budget_scope"] = "invocation"
+    elif "budget_scope" not in state:
+        state["budget_scope"] = "lifetime"
     if not resuming:
         state["context_counts"] = {
             "issue_comments": len(context["issue_comments"]),
@@ -1389,6 +1461,7 @@ def command_preflight(args: argparse.Namespace) -> None:
         not entry["in_audit_commits"] for entry in history_commit_presence
     )
     iteration = state["iterations"] + 1
+    completed_iterations = invocation_iterations(state, invocation)
     result = "ready"
 
     diff_path = diff_path_for(state_path)
@@ -1457,7 +1530,10 @@ def command_preflight(args: argparse.Namespace) -> None:
         "history": state["history"],
         "history_commit_presence": history_commit_presence,
         "iteration": iteration,
+        "completed_iterations": completed_iterations,
         "max_iterations": max_iterations,
+        "budget_scope": state["budget_scope"],
+        "invocation_run": None if invocation is None else invocation["run"],
     }
     write_result_file(preflight_path, payload, "preflight")
     emit(
@@ -1483,7 +1559,10 @@ def command_preflight(args: argparse.Namespace) -> None:
             "diff_bytes": len(diff_text.encode("utf-8")),
             "counts": counts,
             "iteration": iteration,
+            "completed_iterations": completed_iterations,
             "max_iterations": max_iterations,
+            "budget_scope": state["budget_scope"],
+            "invocation_run": None if invocation is None else invocation["run"],
         }
     )
 
@@ -2113,6 +2192,16 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--repo-root")
     preflight.add_argument("--state")
     preflight.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS)
+    invocation = preflight.add_mutually_exclusive_group()
+    invocation.add_argument(
+        "--new-invocation",
+        action="store_true",
+        help="start a fresh audit budget and return its invocation run token",
+    )
+    invocation.add_argument(
+        "--invocation-run",
+        help="reuse the invocation run token returned by its first preflight",
+    )
     preflight.set_defaults(function=command_preflight)
 
     candidates = subparsers.add_parser(

@@ -17,13 +17,13 @@
     {
       "name": "copilot-review-loop",
       "description": "Address Copilot pull request review comments, publish fixes, and repeat until the review is clean.",
-      "version": "1.0.45",
+      "version": "1.0.46",
       "source": "./plugins/copilot-review-loop"
     },
     {
       "name": "self-review-loop",
       "description": "Review a GitHub pull request, verify each finding independently, and commit the fixes without posting review comments.",
-      "version": "1.1.17",
+      "version": "1.1.18",
       "source": "./plugins/self-review-loop"
     },
     {
@@ -41,7 +41,7 @@
     {
       "name": "conflict-fix-loop",
       "description": "Resolve merge conflicts on a pull request by keeping both sides' intent, then push and repeat until GitHub reports it mergeable.",
-      "version": "1.0.22",
+      "version": "1.0.23",
       "source": "./plugins/conflict-fix-loop"
     },
     {
@@ -53,7 +53,7 @@
     {
       "name": "historical-pr-audit",
       "description": "Audit an already-merged GitHub pull request against its own historical snapshot, verify each finding independently, and commit the fixes on a separate audit branch.",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "source": "./plugins/historical-pr-audit"
     }
   ]

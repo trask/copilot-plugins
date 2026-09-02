@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Iterable
+import uuid
 
 
 STATE_VERSION = 1
@@ -1198,6 +1199,36 @@ def pipeline_scope(
     }
 
 
+def invocation_scope(
+    state: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any] | None:
+    """Scope a standalone budget to one explicit user invocation."""
+    if getattr(args, "new_invocation", False):
+        spent = int(state.get("iterations", 0))
+        return {
+            "run": uuid.uuid4().hex,
+            "iteration": None,
+            "baseline": spent,
+            "run_baseline": spent,
+        }
+    run = getattr(args, "invocation_run", None)
+    if not isinstance(run, str) or not run:
+        return None
+    recorded = state.get("invocation_budget")
+    if not isinstance(recorded, dict) or recorded.get("run") != run:
+        raise WorkflowError(
+            "invocation run does not match the active invocation; start a new "
+            "explicit invocation with --new-invocation"
+        )
+    spent = int(state.get("iterations", 0))
+    return {
+        "run": run,
+        "iteration": None,
+        "baseline": whole_number(recorded.get("baseline"), spent),
+        "run_baseline": whole_number(recorded.get("run_baseline"), spent),
+    }
+
+
 def absolute_iteration_cap(
     scope: dict[str, Any] | None, max_iterations: int, pipeline_max_iterations: Any
 ) -> int | None:
@@ -1228,16 +1259,114 @@ def budget_spent(
 ) -> tuple[int, int]:
     """How much of the per-iteration budget and of the whole run this PR has used.
 
-    Without an outer loop both are the durable count itself, which is the flat
-    per-pull-request cap this loop has always applied.
+    Scoped counters keep pipeline and standalone runs independent. Without a
+    scope, both values are the durable lifetime count.
     """
     spent = int(state.get("iterations", 0))
     if scope is None:
         return spent, spent
+    charge_key = scope.get("_charge_key")
+    run_charge_key = scope.get("_run_charge_key")
+    charges = state.get("budget_charges")
+    if (
+        isinstance(charge_key, str)
+        and isinstance(run_charge_key, str)
+        and isinstance(charges, dict)
+    ):
+        return (
+            whole_number(charges.get(charge_key), 0),
+            whole_number(charges.get(run_charge_key), 0),
+        )
     return (
         max(0, spent - whole_number(scope.get("baseline"), spent)),
         max(0, spent - whole_number(scope.get("run_baseline"), spent)),
     )
+
+
+def budget_charge_keys(kind: str, scope: dict[str, Any]) -> tuple[str, str]:
+    run = scope["run"]
+    iteration = scope.get("iteration")
+    return (
+        json.dumps([kind, run, iteration], separators=(",", ":")),
+        json.dumps([kind, run], separators=(",", ":")),
+    )
+
+
+def migrate_budget_counters(state: dict[str, Any]) -> None:
+    """Materialize counters from state written before scoped counters existed."""
+    spent = int(state.get("iterations", 0))
+    charges = state.setdefault("budget_charges", {})
+    for kind, field in (
+        ("pipeline", "pipeline_budget"),
+        ("invocation", "invocation_budget"),
+    ):
+        scope = state.get(field)
+        if not isinstance(scope, dict) or not isinstance(scope.get("run"), str):
+            continue
+        charge_key, run_charge_key = budget_charge_keys(kind, scope)
+        charges.setdefault(
+            charge_key,
+            max(0, spent - whole_number(scope.get("baseline"), spent)),
+        )
+        charges.setdefault(
+            run_charge_key,
+            max(0, spent - whole_number(scope.get("run_baseline"), spent)),
+        )
+
+
+def stored_budget_scope(state: dict[str, Any]) -> str:
+    kind = state.get("budget_scope")
+    if kind in {"pipeline", "invocation", "lifetime"}:
+        return kind
+    if isinstance(state.get("pipeline_budget"), dict):
+        return "pipeline"
+    if isinstance(state.get("invocation_budget"), dict):
+        return "invocation"
+    return "lifetime"
+
+
+def scoped_budget(
+    state: dict[str, Any],
+    kind: str,
+    scope: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Attach persistent charge counters to one active budget."""
+    if scope is None:
+        return None
+    previous_iteration_spent, previous_run_spent = budget_spent(state, scope)
+    charge_key, run_charge_key = budget_charge_keys(kind, scope)
+    charges = state.setdefault("budget_charges", {})
+    if charge_key not in charges:
+        charges[charge_key] = previous_iteration_spent
+    if run_charge_key not in charges:
+        charges[run_charge_key] = previous_run_spent
+    return {
+        **scope,
+        "_charge_key": charge_key,
+        "_run_charge_key": run_charge_key,
+    }
+
+
+def charge_iteration(state: dict[str, Any]) -> None:
+    """Spend one iteration against the lifetime and active scoped budgets."""
+    migrate_budget_counters(state)
+    state["iterations"] = int(state.get("iterations", 0)) + 1
+    kind = stored_budget_scope(state)
+    field = (
+        "pipeline_budget"
+        if kind == "pipeline"
+        else "invocation_budget"
+        if kind == "invocation"
+        else None
+    )
+    scope = state.get(field) if field is not None else None
+    if not isinstance(scope, dict) or not isinstance(scope.get("run"), str):
+        return
+    charge_key, run_charge_key = budget_charge_keys(kind, scope)
+    charges = state.setdefault("budget_charges", {})
+    charges[charge_key] = whole_number(charges.get(charge_key), 0) + 1
+    if run_charge_key != charge_key:
+        charges[run_charge_key] = whole_number(charges.get(run_charge_key), 0) + 1
 
 
 def exhausted_budget(
@@ -1303,16 +1432,44 @@ def command_preflight(args: argparse.Namespace) -> None:
         }
     archive_review(state)
     state["iterations"] = int(state.get("iterations", 0))
+    migrate_budget_counters(state)
     history_commit_presence = compare_history_commits(state["history"], pr_commits)
     history_commits_missing = sum(
         not entry["in_pr_commits"] for entry in history_commit_presence
     )
     max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
-    scope = pipeline_scope(state, args)
-    if scope is not None:
+    pipeline = pipeline_scope(state, args)
+    invocation = invocation_scope(state, args)
+    if pipeline is not None and invocation is not None:
+        raise WorkflowError(
+            "standalone invocation arguments cannot be combined with pipeline arguments"
+        )
+    if (
+        pipeline is None
+        and invocation is None
+        and state.get("budget_scope") == "invocation"
+        and isinstance(state.get("invocation_budget"), dict)
+    ):
+        raise WorkflowError(
+            "an explicit standalone invocation is active; pass its --invocation-run "
+            "token to continue it, or use --new-invocation for a new user invocation"
+        )
+    scope = pipeline or invocation
+    budget_scope = (
+        "pipeline"
+        if pipeline is not None
+        else "invocation"
+        if invocation is not None
+        else "lifetime"
+    )
+    if budget_scope == "pipeline":
         state["pipeline_budget"] = scope
+    elif budget_scope == "invocation":
+        state["invocation_budget"] = scope
+    state["budget_scope"] = budget_scope
+    scope = scoped_budget(state, budget_scope, scope)
     absolute_cap = absolute_iteration_cap(
-        scope, max_iterations, getattr(args, "pipeline_max_iterations", None)
+        pipeline, max_iterations, getattr(args, "pipeline_max_iterations", None)
     )
     exhausted = exhausted_budget(state, scope, max_iterations, absolute_cap)
     completed_iterations = budget_spent(state, scope)[0]
@@ -1374,8 +1531,10 @@ def command_preflight(args: argparse.Namespace) -> None:
         "completed_iterations": completed_iterations,
         "absolute_cap": absolute_cap,
         "budget_exhausted": exhausted,
-        "pipeline_run": None if scope is None else scope["run"],
-        "pipeline_iteration": None if scope is None else scope["iteration"],
+        "budget_scope": budget_scope,
+        "pipeline_run": None if pipeline is None else pipeline["run"],
+        "pipeline_iteration": None if pipeline is None else pipeline["iteration"],
+        "invocation_run": None if invocation is None else invocation["run"],
     }
     write_result_file(preflight_path, payload, "preflight")
     emit(
@@ -1408,8 +1567,10 @@ def command_preflight(args: argparse.Namespace) -> None:
             "completed_iterations": completed_iterations,
             "absolute_cap": absolute_cap,
             "budget_exhausted": exhausted,
-            "pipeline_run": None if scope is None else scope["run"],
-            "pipeline_iteration": None if scope is None else scope["iteration"],
+            "budget_scope": budget_scope,
+            "pipeline_run": None if pipeline is None else pipeline["run"],
+            "pipeline_iteration": None if pipeline is None else pipeline["iteration"],
+            "invocation_run": None if invocation is None else invocation["run"],
         }
     )
 
@@ -1777,7 +1938,7 @@ def command_publish(args: argparse.Namespace) -> None:
     review["published_head_sha"] = local_head
     validation = local_validation_entry(args, local_head)
     state.setdefault("local_validation", []).append(validation)
-    state["iterations"] = int(state.get("iterations", 0)) + 1
+    charge_iteration(state)
     archive_review(state)
     save_state(path, state)
     emit(
@@ -1953,6 +2114,16 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--repo-root")
     preflight.add_argument("--state")
     preflight.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS)
+    invocation = preflight.add_mutually_exclusive_group()
+    invocation.add_argument(
+        "--new-invocation",
+        action="store_true",
+        help="start a fresh standalone budget and return its invocation run token",
+    )
+    invocation.add_argument(
+        "--invocation-run",
+        help="reuse the invocation run token returned by its first preflight",
+    )
     preflight.add_argument(
         "--pipeline-run",
         help=(

@@ -1012,10 +1012,88 @@ def budget_spent(
     if scope is None:
         return completed_run_iterations, completed_run_iterations
     published = int(state.get("iterations", 0))
+    charge_key = scope.get("_charge_key")
+    run_charge_key = scope.get("_run_charge_key")
+    charges = state.get("budget_charges")
+    if (
+        isinstance(charge_key, str)
+        and isinstance(run_charge_key, str)
+        and isinstance(charges, dict)
+    ):
+        return (
+            whole_number(charges.get(charge_key), 0),
+            whole_number(charges.get(run_charge_key), 0),
+        )
     return (
         max(0, published - whole_number(scope.get("baseline"), published)),
         max(0, published - whole_number(scope.get("run_baseline"), published)),
     )
+
+
+def budget_charge_keys(scope: dict[str, Any]) -> tuple[str, str]:
+    run = scope["run"]
+    iteration = scope.get("iteration")
+    return (
+        json.dumps(["pipeline", run, iteration], separators=(",", ":")),
+        json.dumps(["pipeline", run], separators=(",", ":")),
+    )
+
+
+def migrate_budget_counters(state: dict[str, Any]) -> None:
+    """Materialize counters from state written before scoped counters existed."""
+    scope = state.get("pipeline_budget")
+    if not isinstance(scope, dict) or not isinstance(scope.get("run"), str):
+        return
+    spent = int(state.get("iterations", 0))
+    charge_key, run_charge_key = budget_charge_keys(scope)
+    charges = state.setdefault("budget_charges", {})
+    charges.setdefault(
+        charge_key,
+        max(0, spent - whole_number(scope.get("baseline"), spent)),
+    )
+    charges.setdefault(
+        run_charge_key,
+        max(0, spent - whole_number(scope.get("run_baseline"), spent)),
+    )
+
+
+def scoped_pipeline_budget(
+    state: dict[str, Any], scope: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Attach persistent charge counters to one pipeline budget."""
+    if scope is None:
+        return None
+    previous_iteration_spent, previous_run_spent = budget_spent(state, scope, 0)
+    charge_key, run_charge_key = budget_charge_keys(scope)
+    charges = state.setdefault("budget_charges", {})
+    if charge_key not in charges:
+        charges[charge_key] = previous_iteration_spent
+    if run_charge_key not in charges:
+        charges[run_charge_key] = previous_run_spent
+    return {
+        **scope,
+        "_charge_key": charge_key,
+        "_run_charge_key": run_charge_key,
+    }
+
+
+def charge_iteration(state: dict[str, Any]) -> None:
+    """Spend one publication against the lifetime and active pipeline budgets."""
+    migrate_budget_counters(state)
+    state["iterations"] = int(state.get("iterations", 0)) + 1
+    kind = state.get("budget_scope")
+    if kind is None and isinstance(state.get("pipeline_budget"), dict):
+        kind = "pipeline"
+    if kind != "pipeline":
+        return
+    scope = state.get("pipeline_budget")
+    if not isinstance(scope, dict) or not isinstance(scope.get("run"), str):
+        return
+    charge_key, run_charge_key = budget_charge_keys(scope)
+    charges = state.setdefault("budget_charges", {})
+    charges[charge_key] = whole_number(charges.get(charge_key), 0) + 1
+    if run_charge_key != charge_key:
+        charges[run_charge_key] = whole_number(charges.get(run_charge_key), 0) + 1
 
 
 def exhausted_budget(
@@ -1158,6 +1236,7 @@ def command_preflight(args: argparse.Namespace) -> None:
     )
     state = prior_state or {"version": STATE_VERSION, "created_at": utc_now()}
     state["iterations"] = int(state.get("iterations", 0))
+    migrate_budget_counters(state)
     previous_queue = state.get("queue") or {}
     carry_over_progress(previous_queue.get("comments") or [], comments)
     state.update(
@@ -1189,6 +1268,10 @@ def command_preflight(args: argparse.Namespace) -> None:
     scope = pipeline_scope(state, args)
     if scope is not None:
         state["pipeline_budget"] = scope
+        state["budget_scope"] = "pipeline"
+    else:
+        state["budget_scope"] = "standalone"
+    scope = scoped_pipeline_budget(state, scope)
     absolute_cap = absolute_iteration_cap(
         scope, max_iterations, getattr(args, "pipeline_max_iterations", None)
     )
@@ -2003,7 +2086,7 @@ def command_publish(args: argparse.Namespace) -> None:
     )
     if validation:
         state.setdefault("local_validation", []).append(validation)
-    state["iterations"] = int(state.get("iterations", 0)) + 1
+    charge_iteration(state)
     state["clean_at_head_sha"] = None
     set_stage_progress(state, "waiting_for_review")
     save_state(path, state)

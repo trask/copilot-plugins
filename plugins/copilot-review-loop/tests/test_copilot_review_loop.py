@@ -4555,6 +4555,77 @@ class PipelineBudgetTest(unittest.TestCase):
         self.assertEqual(self.scope(state, pipeline_run="run-a")["baseline"], 7)
         self.assertEqual(self.scope(state, pipeline_run="run-b")["baseline"], 9)
 
+    def test_a_standalone_publication_does_not_spend_a_pipeline_budget(self):
+        state = {"iterations": 5}
+        scope = MODULE.scoped_pipeline_budget(
+            state,
+            {
+                "run": "pipeline-run",
+                "iteration": 1,
+                "baseline": 5,
+                "run_baseline": 5,
+            },
+        )
+        state["pipeline_budget"] = {
+            key: value for key, value in scope.items() if not key.startswith("_")
+        }
+        state["budget_scope"] = "standalone"
+
+        MODULE.charge_iteration(state)
+
+        self.assertEqual((0, 0), MODULE.budget_spent(state, scope, 0))
+        state["budget_scope"] = "pipeline"
+        MODULE.charge_iteration(state)
+        self.assertEqual((1, 1), MODULE.budget_spent(state, scope, 0))
+
+    def test_migration_seals_a_paused_pipeline_budget_before_standalone_work(self):
+        state = {
+            "iterations": 7,
+            "pipeline_budget": {
+                "run": "pipeline-run",
+                "iteration": 1,
+                "baseline": 5,
+                "run_baseline": 5,
+            },
+        }
+        state["budget_scope"] = "standalone"
+        MODULE.charge_iteration(state)
+        scope = MODULE.scoped_pipeline_budget(
+            state,
+            MODULE.pipeline_scope(
+                state,
+                SimpleNamespace(
+                    pipeline_run="pipeline-run", pipeline_iteration=1
+                ),
+            ),
+        )
+
+        self.assertEqual((2, 2), MODULE.budget_spent(state, scope, 0))
+
+    def test_direct_legacy_pipeline_publish_is_charged_after_migration(self):
+        state = {
+            "iterations": 7,
+            "pipeline_budget": {
+                "run": "pipeline-run",
+                "iteration": 1,
+                "baseline": 5,
+                "run_baseline": 5,
+            },
+        }
+
+        MODULE.charge_iteration(state)
+        scope = MODULE.scoped_pipeline_budget(
+            state,
+            MODULE.pipeline_scope(
+                state,
+                SimpleNamespace(
+                    pipeline_run="pipeline-run", pipeline_iteration=1
+                ),
+            ),
+        )
+
+        self.assertEqual((3, 3), MODULE.budget_spent(state, scope, 0))
+
 
 class DerivedCeilingTest(unittest.TestCase):
     """The outer cap bounds the run; it does not replace the stage's own budget."""

@@ -166,6 +166,8 @@ class AgentInstructionsTest(unittest.TestCase):
             "inputs, and never call it or pass the work to it",
             self.instructions,
         )
+        self.assertIn("with `--new-invocation`", self.instructions)
+        self.assertIn("`--invocation-run <token>`", self.instructions)
 
     def test_changes_nothing_on_github_except_the_audit_branch(self):
         section = _agent_section(
@@ -1378,12 +1380,16 @@ class PreflightTest(unittest.TestCase):
         target="owner/repo#7",
         diff=DIFF,
         cumulative=CUMULATIVE_DIFF,
+        new_invocation=False,
+        invocation_run=None,
     ):
         arguments = SimpleNamespace(
             target=target,
             repo_root=str(self.directory),
             state=str(state_path),
             max_iterations=max_iterations,
+            new_invocation=new_invocation,
+            invocation_run=invocation_run,
         )
         metadata_sequence = metadata_sequence or [self.metadata, self.metadata]
         with (
@@ -1712,6 +1718,39 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(state_path.read_bytes(), before)
         self.assertEqual(diff_path.read_text(encoding="utf-8"), "earlier diff")
         self.assertEqual(preflight_path.read_text(encoding="utf-8"), "{}")
+
+    def test_a_new_invocation_does_not_inherit_the_lifetime_cap(self):
+        state_path = write_state(
+            self.directory, iterations=5, published_head="audit5"
+        )
+        self.branch_state = dict(
+            self.branch_state, branch_action="resumed", local_head="audit5"
+        )
+
+        with mock.patch.object(MODULE.uuid, "uuid4") as token:
+            token.return_value.hex = "manual-run"
+            envelope = self.preflight(
+                state_path,
+                metadata_sequence=[self.metadata],
+                new_invocation=True,
+            )
+
+        self.assertEqual("ready", envelope["result"])
+        self.assertEqual(0, envelope["completed_iterations"])
+        self.assertEqual("invocation", envelope["budget_scope"])
+        self.assertEqual("manual-run", envelope["invocation_run"])
+
+    def test_an_active_invocation_requires_its_token(self):
+        state_path = write_state(
+            self.directory, iterations=5, published_head="audit5"
+        )
+        state = MODULE.load_state(state_path)
+        state["budget_scope"] = "invocation"
+        state["invocation_budget"] = {"run": "manual-run", "baseline": 5}
+        MODULE.save_state(state_path, state)
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "--invocation-run"):
+            self.preflight(state_path, metadata_sequence=[])
 
     def test_a_terminal_clean_audit_is_already_complete(self):
         state_path = write_state(self.directory, iterations=1, published_head="audit1")
@@ -2777,6 +2816,22 @@ class ParserTest(unittest.TestCase):
 
         self.assertEqual(arguments.max_iterations, MODULE.DEFAULT_MAX_ITERATIONS)
         self.assertEqual(MODULE.DEFAULT_MAX_ITERATIONS, 5)
+        self.assertFalse(arguments.new_invocation)
+        self.assertIsNone(arguments.invocation_run)
+
+        fresh = parser.parse_args(
+            ["preflight", "owner/repo#7", "--new-invocation"]
+        )
+        self.assertTrue(fresh.new_invocation)
+        resumed = parser.parse_args(
+            [
+                "preflight",
+                "owner/repo#7",
+                "--invocation-run",
+                "manual-run",
+            ]
+        )
+        self.assertEqual("manual-run", resumed.invocation_run)
 
 
 if __name__ == "__main__":

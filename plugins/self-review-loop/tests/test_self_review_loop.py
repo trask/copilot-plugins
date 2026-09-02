@@ -496,6 +496,8 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn("The maximum is 5 iterations,", self.instructions)
         self.assertIn("`max_iterations_reached`", self.instructions)
+        self.assertIn("with `--new-invocation`", self.instructions)
+        self.assertIn("`--invocation-run <token>`", self.instructions)
         self.assertIn("`nothing_to_publish`", self.instructions)
         self.assertIn(
             "A missing history commit is not enough to raise the finding again",
@@ -2538,12 +2540,22 @@ class PreflightTest(unittest.TestCase):
         max_iterations=5,
         checked_out_branch=True,
         provenance=None,
+        new_invocation=False,
+        invocation_run=None,
+        pipeline_run=None,
+        pipeline_iteration=None,
+        pipeline_max_iterations=None,
     ):
         arguments = SimpleNamespace(
             target="owner/repo#7",
             repo_root=str(self.directory),
             state=str(state_path),
             max_iterations=max_iterations,
+            new_invocation=new_invocation,
+            invocation_run=invocation_run,
+            pipeline_run=pipeline_run,
+            pipeline_iteration=pipeline_iteration,
+            pipeline_max_iterations=pipeline_max_iterations,
         )
         metadata_sequence = metadata_sequence or [self.metadata, self.metadata]
         provenance = provenance or [
@@ -2808,6 +2820,34 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(result["result"], "max_iterations_reached")
         self.assertEqual(result["iteration"], 6)
         self.assertEqual(result["max_iterations"], 5)
+
+    def test_a_new_manual_invocation_does_not_inherit_the_lifetime_cap(self):
+        state_path = write_state(self.directory, iterations=5)
+
+        with mock.patch.object(MODULE.uuid, "uuid4") as token:
+            token.return_value.hex = "manual-run"
+            result = self.preflight(state_path, new_invocation=True)
+
+        self.assertEqual("ready", result["result"])
+        self.assertEqual(0, result["completed_iterations"])
+        self.assertEqual("invocation", result["budget_scope"])
+        self.assertEqual("manual-run", result["invocation_run"])
+
+    def test_an_active_manual_invocation_requires_its_token(self):
+        state_path = write_state(
+            self.directory,
+            iterations=5,
+            budget_scope="invocation",
+            invocation_budget={
+                "run": "manual-run",
+                "iteration": None,
+                "baseline": 5,
+                "run_baseline": 5,
+            },
+        )
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "--invocation-run"):
+            self.preflight(state_path)
 
 
 class StatusTest(unittest.TestCase):
@@ -3132,6 +3172,46 @@ class PipelineBudgetTest(unittest.TestCase):
     def scope(self, state, **pipeline):
         return MODULE.pipeline_scope(state, SimpleNamespace(**pipeline))
 
+    def test_migration_seals_a_paused_pipeline_budget_before_standalone_work(self):
+        state = {
+            "iterations": 7,
+            "pipeline_budget": {
+                "run": "run-a",
+                "iteration": 2,
+                "baseline": 5,
+                "run_baseline": 5,
+            },
+        }
+        state["budget_scope"] = "lifetime"
+        MODULE.charge_iteration(state)
+        scope = MODULE.scoped_budget(
+            state,
+            "pipeline",
+            self.scope(state, pipeline_run="run-a", pipeline_iteration=2),
+        )
+
+        self.assertEqual((2, 2), MODULE.budget_spent(state, scope))
+
+    def test_direct_legacy_pipeline_publish_is_charged_after_migration(self):
+        state = {
+            "iterations": 7,
+            "pipeline_budget": {
+                "run": "run-a",
+                "iteration": 2,
+                "baseline": 5,
+                "run_baseline": 5,
+            },
+        }
+
+        MODULE.charge_iteration(state)
+        scope = MODULE.scoped_budget(
+            state,
+            "pipeline",
+            self.scope(state, pipeline_run="run-a", pipeline_iteration=2),
+        )
+
+        self.assertEqual((3, 3), MODULE.budget_spent(state, scope))
+
     def test_a_standalone_invocation_is_left_exactly_as_it_was(self):
         """Absent, empty, and unusable run tokens must never read as a new run."""
         for pipeline in (
@@ -3419,6 +3499,8 @@ class PipelineBudgetTest(unittest.TestCase):
         parser = MODULE.build_parser()
 
         bare = parser.parse_args(["preflight"])
+        self.assertFalse(bare.new_invocation)
+        self.assertIsNone(bare.invocation_run)
         self.assertIsNone(bare.pipeline_run)
         self.assertIsNone(bare.pipeline_iteration)
         self.assertIsNone(bare.pipeline_max_iterations)
@@ -3437,6 +3519,51 @@ class PipelineBudgetTest(unittest.TestCase):
         self.assertEqual("run-a", given.pipeline_run)
         self.assertEqual(2, given.pipeline_iteration)
         self.assertEqual(3, given.pipeline_max_iterations)
+
+        fresh = parser.parse_args(["preflight", "--new-invocation"])
+        self.assertTrue(fresh.new_invocation)
+        resumed = parser.parse_args(
+            ["preflight", "--invocation-run", "manual-run"]
+        )
+        self.assertEqual("manual-run", resumed.invocation_run)
+
+
+class InvocationBudgetTest(unittest.TestCase):
+    def test_manual_and_pipeline_charges_are_independent(self):
+        state = {"iterations": 5}
+        pipeline = MODULE.scoped_budget(
+            state,
+            "pipeline",
+            {
+                "run": "pipeline-run",
+                "iteration": 2,
+                "baseline": 0,
+                "run_baseline": 0,
+            },
+        )
+        invocation = MODULE.scoped_budget(
+            state,
+            "invocation",
+            {
+                "run": "manual-run",
+                "iteration": None,
+                "baseline": 5,
+                "run_baseline": 5,
+            },
+        )
+        state["pipeline_budget"] = {
+            key: value for key, value in pipeline.items() if not key.startswith("_")
+        }
+        state["budget_scope"] = "pipeline"
+        MODULE.charge_iteration(state)
+        state["invocation_budget"] = {
+            key: value for key, value in invocation.items() if not key.startswith("_")
+        }
+        state["budget_scope"] = "invocation"
+        MODULE.charge_iteration(state)
+
+        self.assertEqual((6, 6), MODULE.budget_spent(state, pipeline))
+        self.assertEqual((1, 1), MODULE.budget_spent(state, invocation))
 
     def test_the_helper_advertises_the_flag_an_orchestrator_probes_for(self):
         """An orchestrator reads the installed script to decide whether to send it.

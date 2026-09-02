@@ -4564,6 +4564,91 @@ class PipelineBudgetTest(unittest.TestCase):
     def scope(self, state, **pipeline):
         return MODULE.pipeline_scope(state, SimpleNamespace(**pipeline))
 
+    def test_migration_seals_a_paused_pipeline_budget_before_standalone_work(self):
+        state = {
+            "iterations": 7,
+            "pipeline_budget": {
+                "run": "run-a",
+                "iteration": 2,
+                "baseline": 5,
+                "run_baseline": 5,
+            },
+        }
+        state["budget_scope"] = "lifetime"
+        MODULE.charge_iteration(state)
+        scope = MODULE.scoped_budget(
+            state,
+            "pipeline",
+            MODULE.pipeline_scope(
+                state,
+                SimpleNamespace(pipeline_run="run-a", pipeline_iteration=2),
+            ),
+        )
+
+        self.assertEqual((2, 2), MODULE.budget_spent(state, scope))
+
+    def test_direct_legacy_pipeline_publish_is_charged_after_migration(self):
+        state = {
+            "iterations": 7,
+            "pipeline_budget": {
+                "run": "run-a",
+                "iteration": 2,
+                "baseline": 5,
+                "run_baseline": 5,
+            },
+        }
+
+        MODULE.charge_iteration(state)
+        scope = MODULE.scoped_budget(
+            state,
+            "pipeline",
+            self.scope(state, pipeline_run="run-a", pipeline_iteration=2),
+        )
+
+        self.assertEqual((3, 3), MODULE.budget_spent(state, scope))
+
+    def test_stack_descendant_clearance_does_not_charge_its_paused_pipeline(self):
+        prior = {
+            "version": MODULE.STATE_VERSION,
+            "iterations": 7,
+            "pipeline_budget": {
+                "run": "run-a",
+                "iteration": 2,
+                "baseline": 5,
+                "run_baseline": 5,
+            },
+            "history": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            MODULE.save_state(state_path, prior)
+            with mock.patch.object(
+                MODULE, "default_state_path", return_value=state_path
+            ), mock.patch.object(
+                MODULE, "stack_member_target", return_value={"number": 2}
+            ), mock.patch.object(
+                MODULE,
+                "live_mergeability",
+                return_value={"head_sha": "member-head", "base_sha": "base"},
+            ), mock.patch.object(
+                MODULE, "classify_mergeability", return_value="mergeable"
+            ):
+                MODULE.record_stack_member_clearances(
+                    {"pr": {"number": 1}},
+                    [{"number": 2, "head_sha": "member-head"}],
+                    invoked_number=1,
+                )
+
+            saved = MODULE.load_state(state_path)
+
+        scope = MODULE.scoped_budget(
+            saved,
+            "pipeline",
+            self.scope(saved, pipeline_run="run-a", pipeline_iteration=2),
+        )
+        self.assertEqual(8, saved["iterations"])
+        self.assertEqual((2, 2), MODULE.budget_spent(saved, scope))
+
     def test_a_standalone_invocation_is_left_exactly_as_it_was(self):
         """Absent, empty, and unusable run tokens must never read as a new run."""
         for pipeline in (

@@ -2054,6 +2054,39 @@ def budget_charge_keys(kind: str, scope: dict[str, Any]) -> tuple[str, str]:
     )
 
 
+def migrate_budget_counters(state: dict[str, Any]) -> None:
+    """Materialize counters from state written before scoped counters existed."""
+    spent = int(state.get("iterations", 0))
+    charges = state.setdefault("budget_charges", {})
+    for kind, field in (
+        ("pipeline", "pipeline_budget"),
+        ("invocation", "invocation_budget"),
+    ):
+        scope = state.get(field)
+        if not isinstance(scope, dict) or not isinstance(scope.get("run"), str):
+            continue
+        charge_key, run_charge_key = budget_charge_keys(kind, scope)
+        charges.setdefault(
+            charge_key,
+            max(0, spent - whole_number(scope.get("baseline"), spent)),
+        )
+        charges.setdefault(
+            run_charge_key,
+            max(0, spent - whole_number(scope.get("run_baseline"), spent)),
+        )
+
+
+def stored_budget_scope(state: dict[str, Any]) -> str:
+    kind = state.get("budget_scope")
+    if kind in {"pipeline", "invocation", "lifetime"}:
+        return kind
+    if isinstance(state.get("pipeline_budget"), dict):
+        return "pipeline"
+    if isinstance(state.get("invocation_budget"), dict):
+        return "invocation"
+    return "lifetime"
+
+
 def scoped_budget(
     state: dict[str, Any],
     kind: str,
@@ -2078,8 +2111,9 @@ def scoped_budget(
 
 def charge_iteration(state: dict[str, Any]) -> None:
     """Spend one iteration against the lifetime and active scoped budgets."""
+    migrate_budget_counters(state)
     state["iterations"] = int(state.get("iterations", 0)) + 1
-    kind = state.get("budget_scope")
+    kind = stored_budget_scope(state)
     field = (
         "pipeline_budget"
         if kind == "pipeline"
@@ -2234,6 +2268,7 @@ def command_preflight(args: argparse.Namespace) -> None:
         }
     archive_attempt(state)
     state["iterations"] = int(state.get("iterations", 0))
+    migrate_budget_counters(state)
     state["repo_root"] = str(repo_root)
     state["pr"] = metadata
     state["relations"] = relations
@@ -4840,6 +4875,7 @@ def record_stack_member_clearances(
             "history": [],
         }
         archive_attempt(projected)
+        migrate_budget_counters(projected)
         projected["pr"] = metadata
         projected["escalation"] = None
         projected["iterations"] = int(projected.get("iterations", 0)) + 1
