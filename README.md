@@ -18,7 +18,7 @@ copilot plugin install copilot-review-loop@trask-plugins
 copilot plugin install self-review-loop@trask-plugins
 copilot plugin install pr-description@trask-plugins
 copilot plugin install pr-pipeline@trask-plugins
-copilot plugin install conflict-fix-loop@trask-plugins
+copilot plugin install pr-conflict-resolver@trask-plugins
 copilot plugin install ci-fix-loop@trask-plugins
 copilot plugin install historical-pr-audit@trask-plugins
 ```
@@ -90,18 +90,19 @@ Stack state lives under `~/.copilot/run/pr-stack-pipeline/` and exposes the run
 ID, topology fingerprint, selected suffix, expected heads and bases, current
 pass and phase, per-PR stage state, dispatch nonces, result, and timestamps.
 
-### Conflict Fix Loop
+### PR Conflict Resolver
 
-Resolves the merge conflicts on a pull request and repeats until GitHub reports
-it mergeable. It reads the history behind each conflicted file first, then keeps
-what both sides meant to do rather than picking a side, and records why in the
-merge commit. It stops and reports when the two sides genuinely contradict each
-other. It refuses to rewrite an ordinary branch with dependents. For a native
-GitHub stack, it rebases every descendant in a throwaway clone and publishes the
-complete stack with one atomic, exact-lease push. It never posts anything to
-GitHub. Its machine-facing descendant propagation operation uses the same
-topology checks and atomic publisher after a lower stack member receives a CI
-fix.
+Resolves the merge conflicts on a pull request in one pass. It reads the history
+behind each conflicted file first, then keeps what both sides meant to do rather
+than picking a side, and records why in the merge commit. It stops and reports
+when the two sides genuinely contradict each other. It refuses to rewrite an
+ordinary branch with dependents. For a native GitHub stack, it rebases every
+descendant in a throwaway clone and publishes the complete stack with one
+atomic, exact-lease push. A run that publishes and then still reads as
+conflicting is finished rather than failed, and a caller that wants another
+integration starts another run. It never posts anything to GitHub. Its
+machine-facing descendant propagation operation uses the same topology checks and
+atomic publisher after a lower stack member receives a CI fix.
 
 ### CI Fix Loop
 
@@ -159,7 +160,7 @@ copilot plugin update copilot-review-loop
 copilot plugin update self-review-loop
 copilot plugin update pr-description
 copilot plugin update pr-pipeline
-copilot plugin update conflict-fix-loop
+copilot plugin update pr-conflict-resolver
 copilot plugin update ci-fix-loop
 copilot plugin update historical-pr-audit
 ```

@@ -514,6 +514,7 @@ def run_pipeline(
     runs: list[dict[str, Any]] = []
     known_safe_head: str | None = None
     completed_sweeps = 0
+    completed_conflict_resolution = False
     report_event(report, "pipeline_started", run_id=run_id, target=target["pr_url"])
 
     for sweep in range(1, MAX_SWEEPS + 1):
@@ -589,6 +590,11 @@ def run_pipeline(
             known_safe_head = current_head
 
             before = inspect_stage(entry, target, current_head, pr["base_sha"])
+            before_attempt_id = (
+                ((before.get("status") or {}).get("attempt") or {}).get("id")
+                if entry["stage"] == STAGE_CONFLICT
+                else None
+            )
             if before["clear"]:
                 record = {
                     "stage": entry["stage"],
@@ -598,6 +604,22 @@ def run_pipeline(
                     "ended_head_sha": current_head,
                     "outcome": before["outcome"],
                     "clear": True,
+                    "stage_reason": before["reason"],
+                    "status": before["status"],
+                    "published_commits": [],
+                }
+                runs.append(record)
+                report_event(report, "stage_finished", run_id=run_id, **record)
+                continue
+            if entry["stage"] == STAGE_CONFLICT and completed_conflict_resolution:
+                record = {
+                    "stage": entry["stage"],
+                    "sweep": sweep,
+                    "action": "completed_this_run",
+                    "started_head_sha": current_head,
+                    "ended_head_sha": current_head,
+                    "outcome": before["outcome"],
+                    "clear": False,
                     "stage_reason": before["reason"],
                     "status": before["status"],
                     "published_commits": [],
@@ -729,6 +751,13 @@ def run_pipeline(
             )
             runs.append(record)
             report_event(report, "stage_finished", run_id=run_id, **record)
+            if entry["stage"] == STAGE_CONFLICT and after["outcome"] == "completed":
+                after_attempt_id = (
+                    ((after.get("status") or {}).get("attempt") or {}).get("id")
+                )
+                completed_conflict_resolution = (
+                    bool(after_attempt_id) and after_attempt_id != before_attempt_id
+                )
 
         completed_sweeps = sweep
         pr = read_pull_request(target)

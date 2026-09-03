@@ -35,14 +35,14 @@
     {
       "name": "pr-pipeline",
       "description": "Drive one pull request or a selected native-stack suffix through conflict resolution, review, CI fixing, and description validation.",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "source": "./plugins/pr-pipeline"
     },
     {
-      "name": "conflict-fix-loop",
-      "description": "Resolve merge conflicts on a pull request by keeping both sides' intent, then push and repeat until GitHub reports it mergeable.",
-      "version": "1.0.23",
-      "source": "./plugins/conflict-fix-loop"
+      "name": "pr-conflict-resolver",
+      "description": "Resolve the merge conflicts on a pull request in one pass by keeping both sides' intent, then push the resolution.",
+      "version": "1.0.0",
+      "source": "./plugins/pr-conflict-resolver"
     },
     {
       "name": "ci-fix-loop",

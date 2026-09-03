@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic mechanics for the Conflict Fix Loop custom agent."""
+"""Deterministic mechanics for the PR Conflict Resolver custom agent."""
 
 from __future__ import annotations
 
@@ -17,13 +17,9 @@ import sys
 import tempfile
 import time
 from typing import Any, Iterable
-import uuid
 
 
 STATE_VERSION = 1
-DEFAULT_MAX_ITERATIONS = 5
-DEFAULT_PIPELINE_MAX_ITERATIONS = 2
-NO_PROGRESS_LIMIT = 2
 MERGEABILITY_RETRY_DELAYS = (2, 4, 8, 16)
 PR_HEAD_LAG_RETRY_DELAY = 1
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
@@ -58,8 +54,6 @@ STACK_ENTRIES_PAGE = 100
 STACK_CONFLICT_EXIT = 3
 ESCALATION_KINDS = (
     "contradiction",
-    "max_iterations",
-    "no_progress",
     "unsafe_push",
     "unknown_mergeability",
     "ad_hoc_base",
@@ -67,7 +61,7 @@ ESCALATION_KINDS = (
     "validation",
     "other",
 )
-STAGE_OUTCOMES = ("cleared", "skipped", "no_progress", "escalated", "carried")
+STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 
@@ -552,7 +546,7 @@ def parse_target(target: str) -> dict[str, Any]:
 
 def default_state_path(target: dict[str, Any]) -> Path:
     name = f"{target['owner']}--{target['repo']}--{target['number']}.json"
-    return Path.home() / ".copilot" / "run" / "conflict-fix-loop" / name
+    return Path.home() / ".copilot" / "run" / "pr-conflict-resolver" / name
 
 
 def preflight_path_for(state_path: Path) -> Path:
@@ -574,7 +568,7 @@ def default_propagation_state_path(
         f"{target['owner']}--{target['repo']}--stack-{stack_number}"
         f"--after-{fixed_number}.json"
     )
-    return Path.home() / ".copilot" / "run" / "conflict-fix-loop" / "propagation" / name
+    return Path.home() / ".copilot" / "run" / "pr-conflict-resolver" / "propagation" / name
 
 
 def write_result_file(path: Path, payload: dict[str, Any], label: str) -> None:
@@ -924,7 +918,7 @@ def require_open_pull_request(metadata: dict[str, Any]) -> None:
     if state != "OPEN":
         raise WorkflowError(
             f"pull request {metadata['pr_url']} is {str(state).lower()}; "
-            "this loop only operates on an open pull request"
+            "this resolver only operates on an open pull request"
         )
 
 
@@ -1384,16 +1378,6 @@ def conflict_signature(paths: Iterable[str]) -> str:
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
-def detect_no_progress(history: list[dict[str, Any]], signature: str) -> int:
-    """Count how many finished attempts in a row ended on this same conflict set."""
-    repeats = 0
-    for entry in reversed(history):
-        if entry.get("conflict_signature") != signature:
-            break
-        repeats += 1
-    return repeats
-
-
 def collect_conflicts(
     repo_root: Path, *, head_sha: str, base_sha: str, merge_base: str
 ) -> list[dict[str, Any]]:
@@ -1730,7 +1714,7 @@ def path_has_unstaged_changes(repo_root: Path, path: str) -> bool:
 def archive_attempt(state: dict[str, Any]) -> None:
     """Fold a finished attempt into the durable history."""
     attempt = state.get("attempt")
-    if not attempt or attempt.get("status") not in {"published", "aborted", "escalated"}:
+    if not attempt or attempt.get("status") not in RECORDED_ENDINGS:
         return
     history = state.setdefault("history", [])
     if any(entry.get("id") == attempt.get("id") for entry in history):
@@ -1738,7 +1722,7 @@ def archive_attempt(state: dict[str, Any]) -> None:
     history.append(
         {
             "id": attempt.get("id"),
-            "iteration": attempt.get("iteration"),
+            "attempt_number": attempt.get("attempt_number"),
             "strategy": attempt.get("strategy"),
             "status": attempt.get("status"),
             "head_sha": attempt.get("head_sha"),
@@ -1771,13 +1755,13 @@ def record_escalation(
     kind: str,
     reason: str,
     recommended_action: str | None,
-    iteration: int | None,
+    attempt_number: int | None,
 ) -> dict[str, Any]:
     escalation = {
         "kind": kind,
         "reason": reason,
         "recommended_action": recommended_action,
-        "iteration": iteration,
+        "attempt_number": attempt_number,
         "recorded_at": utc_now(),
     }
     state["escalation"] = escalation
@@ -1790,7 +1774,7 @@ def attempt_summary(attempt: dict[str, Any] | None) -> dict[str, Any] | None:
     return {
         "id": attempt.get("id"),
         "status": attempt.get("status"),
-        "iteration": attempt.get("iteration"),
+        "attempt_number": attempt.get("attempt_number"),
         "strategy": attempt.get("strategy"),
         "head_sha": attempt.get("head_sha"),
         "base_sha": attempt.get("base_sha"),
@@ -1838,7 +1822,7 @@ def checkout_pr_branch(
 
     Resolving a conflict commits onto the head branch through the push refspec,
     not through the branch name this worktree carries, so a detached head serves
-    the whole loop. It also serves the one arrangement that claiming the branch
+    the whole run. It also serves the one arrangement that claiming the branch
     cannot: git refuses to check a branch out in two worktrees of one repository,
     and the session worktree that opened the pull request is usually still
     holding it, so attaching would fail exactly when a conflict needs resolving.
@@ -1861,293 +1845,14 @@ def checkout_pr_branch(
     if local_head != metadata["head_sha"]:
         raise WorkflowError(
             f"HEAD mismatch: local {local_head}, PR head {metadata['head_sha']}; "
-            "this loop resolves the authoritative remote branch, so publish or "
+            "this resolver resolves the authoritative remote branch, so publish or "
             "reconcile local work before preflight"
         )
     return on_pr_branch
 
 
-def pipeline_iteration_value(pipeline_iteration: Any) -> int | None:
-    """Read the caller's loop counter, or nothing when it named no usable one.
-
-    An iteration this loop cannot compare is treated as absent rather than
-    guessed at, which leaves the run token to scope the budget on its own.
-    """
-    if isinstance(pipeline_iteration, bool) or not isinstance(pipeline_iteration, int):
-        return None
-    if pipeline_iteration < 1:
-        return None
-    return pipeline_iteration
-
-
-def whole_number(value: Any, fallback: int) -> int:
-    """Read a counter out of stored state, falling back when it holds anything else."""
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return fallback
-    return value
-
-
-def pipeline_scope(
-    state: dict[str, Any], args: argparse.Namespace
-) -> dict[str, Any] | None:
-    """Scope the iteration budget to an outer loop's position rather than a launch.
-
-    An invocation is not a sound unit of budget. An outer loop relaunches a stage
-    within one of its iterations as a matter of course, so a budget that resets on
-    launch is reset by the one event it must ignore, and nothing bounds the total.
-
-    The caller supplies the whole position and this loop never constructs any part
-    of it. Nothing this loop can observe about itself, such as a new head, a
-    relaunch, a re-run, or a commit it just pushed, reaches this function, so a
-    reset cannot be self-triggered. That is the whole point of the budget.
-
-    The run identity is opaque and compared only for equality, never parsed and
-    never ordered. The iteration is ordered, but only against an iteration of the
-    same run. An outer loop numbers its iterations from one, so a second run on the
-    same pull request legitimately presents a lower number than one already
-    recorded here; comparing across runs would refuse to reset again for the rest
-    of the pull request's life, and this state outlives any one run.
-
-    Within a run the comparison stays strict, so a relaunch replaying an earlier
-    iteration, or repeating the current one, buys nothing.
-
-    The two halves are not symmetric for a reader. An iteration with no run asks
-    which run it belongs to and nothing can answer, so it is ignored. A run with
-    no iteration still answers the question the run token exists for, whether this
-    loop has seen the run before, so it scopes the budget on equality alone. The
-    caller mints one token per run and repeats it on every relaunch, so that
-    degrades to a coarser run-scoped budget rather than to a launch-scoped one.
-    Ignoring it instead would leave the durable count untouched and refuse a pull
-    request that already reached the cap for the rest of its life.
-
-    Both budgets are expressed as baselines against the durable per-pull-request
-    count, so a reset never rewrites that count. ``baseline`` moves on every
-    advance and bounds one outer iteration. ``run_baseline`` moves only on a new
-    run and bounds the whole run, so an advance cannot refresh the ceiling.
-
-    Returns ``None`` when no outer loop is driving this stage, which leaves a
-    standalone invocation exactly as it was. Absent arguments never read as a new
-    run.
-    """
-    run = getattr(args, "pipeline_run", None)
-    if not isinstance(run, str) or not run:
-        return None
-    iteration = pipeline_iteration_value(getattr(args, "pipeline_iteration", None))
-    spent = int(state.get("iterations", 0))
-    recorded = state.get("pipeline_budget") or {}
-    if recorded.get("run") != run:
-        return {
-            "run": run,
-            "iteration": iteration,
-            "baseline": spent,
-            "run_baseline": spent,
-        }
-    run_baseline = whole_number(recorded.get("run_baseline"), spent)
-    seen = pipeline_iteration_value(recorded.get("iteration"))
-    if iteration is not None and seen is not None and iteration > seen:
-        return {
-            "run": run,
-            "iteration": iteration,
-            "baseline": spent,
-            "run_baseline": run_baseline,
-        }
-    return {
-        "run": run,
-        "iteration": max(
-            (value for value in (seen, iteration) if value is not None), default=None
-        ),
-        "baseline": whole_number(recorded.get("baseline"), spent),
-        "run_baseline": run_baseline,
-    }
-
-
-def invocation_scope(
-    state: dict[str, Any], args: argparse.Namespace
-) -> dict[str, Any] | None:
-    """Scope a standalone budget to one explicit user invocation."""
-    if getattr(args, "new_invocation", False):
-        spent = int(state.get("iterations", 0))
-        return {
-            "run": uuid.uuid4().hex,
-            "iteration": None,
-            "baseline": spent,
-            "run_baseline": spent,
-        }
-    run = getattr(args, "invocation_run", None)
-    if not isinstance(run, str) or not run:
-        return None
-    recorded = state.get("invocation_budget")
-    if not isinstance(recorded, dict) or recorded.get("run") != run:
-        raise WorkflowError(
-            "invocation run does not match the active invocation; start a new "
-            "explicit invocation with --new-invocation"
-        )
-    spent = int(state.get("iterations", 0))
-    return {
-        "run": run,
-        "iteration": None,
-        "baseline": whole_number(recorded.get("baseline"), spent),
-        "run_baseline": whole_number(recorded.get("run_baseline"), spent),
-    }
-
-
-def absolute_iteration_cap(
-    scope: dict[str, Any] | None, max_iterations: int, pipeline_max_iterations: Any
-) -> int | None:
-    """Bound the total work one outer run may spend on a pull request.
-
-    Derived from the caller's own cap rather than hardcoded, so raising the outer
-    iteration limit raises this with it. It is enforced even though the caller
-    advancing its own loop at most that many times already implies it, because a
-    bound that depends on a peer behaving is not a bound.
-
-    Only the outer cap is optional. Omitting it falls back rather than removing the
-    ceiling, so a caller cannot lift the bound by leaving the value out.
-    """
-    if scope is None:
-        return None
-    outer = (
-        pipeline_max_iterations
-        if isinstance(pipeline_max_iterations, int)
-        and not isinstance(pipeline_max_iterations, bool)
-        and pipeline_max_iterations > 0
-        else DEFAULT_PIPELINE_MAX_ITERATIONS
-    )
-    return max_iterations * outer
-
-
-def budget_spent(
-    state: dict[str, Any], scope: dict[str, Any] | None
-) -> tuple[int, int]:
-    """How much of the per-iteration budget and of the whole run this PR has used.
-
-    Scoped counters keep pipeline and standalone runs independent. Without a
-    scope, both values are the durable lifetime count.
-    """
-    spent = int(state.get("iterations", 0))
-    if scope is None:
-        return spent, spent
-    charge_key = scope.get("_charge_key")
-    run_charge_key = scope.get("_run_charge_key")
-    charges = state.get("budget_charges")
-    if (
-        isinstance(charge_key, str)
-        and isinstance(run_charge_key, str)
-        and isinstance(charges, dict)
-    ):
-        return (
-            whole_number(charges.get(charge_key), 0),
-            whole_number(charges.get(run_charge_key), 0),
-        )
-    return (
-        max(0, spent - whole_number(scope.get("baseline"), spent)),
-        max(0, spent - whole_number(scope.get("run_baseline"), spent)),
-    )
-
-
-def budget_charge_keys(kind: str, scope: dict[str, Any]) -> tuple[str, str]:
-    run = scope["run"]
-    iteration = scope.get("iteration")
-    return (
-        json.dumps([kind, run, iteration], separators=(",", ":")),
-        json.dumps([kind, run], separators=(",", ":")),
-    )
-
-
-def migrate_budget_counters(state: dict[str, Any]) -> None:
-    """Materialize counters from state written before scoped counters existed."""
-    spent = int(state.get("iterations", 0))
-    charges = state.setdefault("budget_charges", {})
-    for kind, field in (
-        ("pipeline", "pipeline_budget"),
-        ("invocation", "invocation_budget"),
-    ):
-        scope = state.get(field)
-        if not isinstance(scope, dict) or not isinstance(scope.get("run"), str):
-            continue
-        charge_key, run_charge_key = budget_charge_keys(kind, scope)
-        charges.setdefault(
-            charge_key,
-            max(0, spent - whole_number(scope.get("baseline"), spent)),
-        )
-        charges.setdefault(
-            run_charge_key,
-            max(0, spent - whole_number(scope.get("run_baseline"), spent)),
-        )
-
-
-def stored_budget_scope(state: dict[str, Any]) -> str:
-    kind = state.get("budget_scope")
-    if kind in {"pipeline", "invocation", "lifetime"}:
-        return kind
-    if isinstance(state.get("pipeline_budget"), dict):
-        return "pipeline"
-    if isinstance(state.get("invocation_budget"), dict):
-        return "invocation"
-    return "lifetime"
-
-
-def scoped_budget(
-    state: dict[str, Any],
-    kind: str,
-    scope: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    """Attach persistent charge counters to one active budget."""
-    if scope is None:
-        return None
-    previous_iteration_spent, previous_run_spent = budget_spent(state, scope)
-    charge_key, run_charge_key = budget_charge_keys(kind, scope)
-    charges = state.setdefault("budget_charges", {})
-    if charge_key not in charges:
-        charges[charge_key] = previous_iteration_spent
-    if run_charge_key not in charges:
-        charges[run_charge_key] = previous_run_spent
-    return {
-        **scope,
-        "_charge_key": charge_key,
-        "_run_charge_key": run_charge_key,
-    }
-
-
-def charge_iteration(state: dict[str, Any]) -> None:
-    """Spend one iteration against the lifetime and active scoped budgets."""
-    migrate_budget_counters(state)
-    state["iterations"] = int(state.get("iterations", 0)) + 1
-    kind = stored_budget_scope(state)
-    field = (
-        "pipeline_budget"
-        if kind == "pipeline"
-        else "invocation_budget"
-        if kind == "invocation"
-        else None
-    )
-    scope = state.get(field) if field is not None else None
-    if not isinstance(scope, dict) or not isinstance(scope.get("run"), str):
-        return
-    charge_key, run_charge_key = budget_charge_keys(kind, scope)
-    charges = state.setdefault("budget_charges", {})
-    charges[charge_key] = whole_number(charges.get(charge_key), 0) + 1
-    if run_charge_key != charge_key:
-        charges[run_charge_key] = whole_number(charges.get(run_charge_key), 0) + 1
-
-
-def exhausted_budget(
-    state: dict[str, Any],
-    scope: dict[str, Any] | None,
-    max_iterations: int,
-    absolute_cap: int | None,
-) -> str | None:
-    """Name the budget this pull request has used up, if it has used one up."""
-    iteration_spent, run_spent = budget_spent(state, scope)
-    if absolute_cap is not None and run_spent >= absolute_cap:
-        return "absolute"
-    if iteration_spent >= max_iterations:
-        return "iteration"
-    return None
-
-
 def planned_stack_attempt(
-    metadata: dict[str, Any], stack: dict[str, Any], iteration: int
+    metadata: dict[str, Any], stack: dict[str, Any], attempt_number: int
 ) -> dict[str, Any]:
     """Build the planned attempt for a native-stack cascade.
 
@@ -2168,9 +1873,9 @@ def planned_stack_attempt(
         for member in stack["members"]
     ]
     return {
-        "id": f"pr-{metadata['number']}-iteration-{iteration}",
+        "id": f"pr-{metadata['number']}-attempt-{attempt_number}",
         "status": "planned",
-        "iteration": iteration,
+        "attempt_number": attempt_number,
         "strategy": "stack",
         "strategy_reason": (
             "the pull request is part of a native GitHub stack; the conflict is "
@@ -2262,13 +1967,11 @@ def command_preflight(args: argparse.Namespace) -> None:
         state = {
             "version": STATE_VERSION,
             "created_at": utc_now(),
-            "iterations": 0,
+            "attempts": 0,
             "history": [],
             "escalation": None,
         }
     archive_attempt(state)
-    state["iterations"] = int(state.get("iterations", 0))
-    migrate_budget_counters(state)
     state["repo_root"] = str(repo_root)
     state["pr"] = metadata
     state["relations"] = relations
@@ -2276,47 +1979,11 @@ def command_preflight(args: argparse.Namespace) -> None:
     state["default_branch"] = default_branch
     state["stack"] = stack
 
-    max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
-    pipeline = pipeline_scope(state, args)
-    invocation = invocation_scope(state, args)
-    if pipeline is not None and invocation is not None:
-        raise WorkflowError(
-            "standalone invocation arguments cannot be combined with pipeline arguments"
-        )
-    if (
-        pipeline is None
-        and invocation is None
-        and state.get("budget_scope") == "invocation"
-        and isinstance(state.get("invocation_budget"), dict)
-    ):
-        raise WorkflowError(
-            "an explicit standalone invocation is active; pass its --invocation-run "
-            "token to continue it, or use --new-invocation for a new user invocation"
-        )
-    scope = pipeline or invocation
-    budget_scope = (
-        "pipeline"
-        if pipeline is not None
-        else "invocation"
-        if invocation is not None
-        else "lifetime"
-    )
-    if budget_scope == "pipeline":
-        state["pipeline_budget"] = scope
-    elif budget_scope == "invocation":
-        state["invocation_budget"] = scope
-    state["budget_scope"] = budget_scope
-    scope = scoped_budget(state, budget_scope, scope)
-    absolute_cap = absolute_iteration_cap(
-        pipeline, max_iterations, getattr(args, "pipeline_max_iterations", None)
-    )
-    exhausted = exhausted_budget(state, scope, max_iterations, absolute_cap)
-    completed_iterations = budget_spent(state, scope)[0]
-    # Numbered from the durable count rather than from the budget, because this id
-    # is what `archive_attempt` dedupes history on and a duplicate is dropped
-    # rather than recorded. Any budget that rewrote that count instead of taking a
-    # baseline against it would restart the numbering and lose an entry.
-    iteration = state["iterations"] + 1
+    # Every preflight opens a new attempt and numbers it one higher than the last,
+    # so an explicit re-invocation always starts a fresh one. The number is what
+    # `archive_attempt` dedupes history on, so it never repeats and never resets.
+    attempt_number = int(state.get("attempts", 0)) + 1
+    state["attempts"] = attempt_number
     mergeability = classify_mergeability(metadata)
     whole_stack = bool(getattr(args, "whole_stack", False))
     whole_stack_mergeable = (
@@ -2336,8 +2003,6 @@ def command_preflight(args: argparse.Namespace) -> None:
 
     if push_blockers:
         result = "unsafe_push"
-    elif exhausted:
-        result = "max_iterations_reached"
     elif whole_stack_mergeable:
         result = "stack_mergeable"
     elif mergeability == "mergeable" and not (whole_stack and stack is not None):
@@ -2357,7 +2022,7 @@ def command_preflight(args: argparse.Namespace) -> None:
     elif metadata["base_branch"] != default_branch:
         # The declared base is neither the default branch nor a native stack
         # trunk, so GitHub measures mergeability against a different branch than
-        # the one this loop would merge in. Naming the real conflict beats
+        # the one this resolver would merge in. Naming the real conflict beats
         # rebasing onto the declared base and reporting a false clearance.
         result = "ad_hoc_base"
     elif strategy_error is not None:
@@ -2367,13 +2032,13 @@ def command_preflight(args: argparse.Namespace) -> None:
 
     if result in {"mergeable", "stack_mergeable", "ready"}:
         attempt = {
-            "id": f"pr-{metadata['number']}-iteration-{iteration}",
+            "id": f"pr-{metadata['number']}-attempt-{attempt_number}",
             "status": (
                 "mergeable"
                 if result in {"mergeable", "stack_mergeable"}
                 else "planned"
             ),
-            "iteration": iteration,
+            "attempt_number": attempt_number,
             "strategy": None if strategy_choice is None else strategy_choice["strategy"],
             "strategy_reason": None
             if strategy_choice is None
@@ -2398,9 +2063,20 @@ def command_preflight(args: argparse.Namespace) -> None:
         }
         state["attempt"] = attempt
     elif result == "stack_rebase":
-        state["attempt"] = planned_stack_attempt(metadata, stack, iteration)
+        state["attempt"] = planned_stack_attempt(metadata, stack, attempt_number)
     else:
-        state["attempt"] = None
+        state["attempt"] = {
+            "id": f"pr-{metadata['number']}-attempt-{attempt_number}",
+            "status": "planned",
+            "attempt_number": attempt_number,
+            "strategy": None if strategy_choice is None else strategy_choice["strategy"],
+            "head_sha": metadata["head_sha"],
+            "base_sha": metadata["base_sha"],
+            "started_at": utc_now(),
+            "conflicts": [],
+            "mergeable_at_head_sha": None,
+            "published_head_sha": None,
+        }
 
     ad_hoc: dict[str, Any] | None = None
     if result == "ad_hoc_base":
@@ -2410,19 +2086,18 @@ def command_preflight(args: argparse.Namespace) -> None:
             repo_root, remote, metadata, default_branch, default_sha
         )
 
-    if result in {"unsafe_push", "max_iterations_reached", "no_safe_strategy", "unknown_mergeability"}:
+    if result in {"unsafe_push", "no_safe_strategy", "unknown_mergeability"}:
         record_escalation(
             state,
             kind={
                 "unsafe_push": "unsafe_push",
-                "max_iterations_reached": "max_iterations",
                 "no_safe_strategy": "unsafe_push",
                 "unknown_mergeability": "unknown_mergeability",
             }[result],
             reason=strategy_error
             or ("; ".join(push_blockers) if push_blockers else result),
             recommended_action="a person must decide how to proceed on this pull request",
-            iteration=iteration,
+            attempt_number=attempt_number,
         )
     elif result == "ad_hoc_base":
         record_escalation(
@@ -2430,7 +2105,7 @@ def command_preflight(args: argparse.Namespace) -> None:
             kind="ad_hoc_base",
             reason=ad_hoc["reason"],
             recommended_action=ad_hoc["recommended_action"],
-            iteration=iteration,
+            attempt_number=attempt_number,
         )
     elif result == "stack_external_dependents":
         listed = "; ".join(
@@ -2448,10 +2123,14 @@ def command_preflight(args: argparse.Namespace) -> None:
                 "a person must retarget or close these dependent pull requests "
                 "before the stack can be cascaded"
             ),
-            iteration=iteration,
+            attempt_number=attempt_number,
         )
     elif result in {"mergeable", "stack_mergeable", "ready", "stack_rebase"}:
         state["escalation"] = None
+
+    if state.get("escalation") is not None:
+        state["attempt"]["status"] = "escalated"
+        archive_attempt(state)
 
     save_state(state_path, state)
     if result == "stack_mergeable":
@@ -2477,15 +2156,7 @@ def command_preflight(args: argparse.Namespace) -> None:
         "strategy_error": strategy_error,
         "escalation": state.get("escalation"),
         "history": state["history"],
-        "iteration": iteration,
-        "max_iterations": max_iterations,
-        "completed_iterations": completed_iterations,
-        "absolute_cap": absolute_cap,
-        "budget_exhausted": exhausted,
-        "budget_scope": budget_scope,
-        "pipeline_run": None if pipeline is None else pipeline["run"],
-        "pipeline_iteration": None if pipeline is None else pipeline["iteration"],
-        "invocation_run": None if invocation is None else invocation["run"],
+        "attempt_number": attempt_number,
     }
     write_result_file(preflight_path, payload, "preflight")
     emit(
@@ -2530,15 +2201,7 @@ def command_preflight(args: argparse.Namespace) -> None:
             "ad_hoc": ad_hoc,
             "external_dependents": external_dependents,
             "escalation": state.get("escalation"),
-            "iteration": iteration,
-            "max_iterations": max_iterations,
-            "completed_iterations": completed_iterations,
-            "absolute_cap": absolute_cap,
-            "budget_exhausted": exhausted,
-            "budget_scope": budget_scope,
-            "pipeline_run": None if pipeline is None else pipeline["run"],
-            "pipeline_iteration": None if pipeline is None else pipeline["iteration"],
-            "invocation_run": None if invocation is None else invocation["run"],
+            "attempt_number": attempt_number,
         }
     )
 
@@ -2647,7 +2310,7 @@ def command_attempt(args: argparse.Namespace) -> None:
         # infer it from the merge changing nothing; asking git directly lets the
         # escalation state the fact and name the two commits it compared. GitHub
         # can report CONFLICTING against a base tip that is already an ancestor,
-        # and that stale flag is exactly what leaves this loop with no work.
+        # and that stale flag is exactly what leaves this resolver with no work.
         attempt["status"] = "escalated"
         escalation = record_escalation(
             state,
@@ -2659,7 +2322,7 @@ def command_attempt(args: argparse.Namespace) -> None:
                 f"{pr['base_branch']}"
             ),
             recommended_action="a person must work out why GitHub still reports a conflict",
-            iteration=attempt["iteration"],
+            attempt_number=attempt["attempt_number"],
         )
         archive_attempt(state)
         save_state(state_path, state)
@@ -2688,28 +2351,14 @@ def command_attempt(args: argparse.Namespace) -> None:
 
     if conflicts:
         attempt["status"] = "conflicted"
-        repeats = detect_no_progress(state["history"], attempt["conflict_signature"])
-        result = "no_progress" if repeats >= NO_PROGRESS_LIMIT else "conflicted"
-        if result == "no_progress":
-            attempt["status"] = "escalated"
-            record_escalation(
-                state,
-                kind="no_progress",
-                reason=(
-                    f"the last {repeats} finished attempts ended on this same set of "
-                    f"conflicted files: {', '.join(conflict['path'] for conflict in conflicts)}"
-                ),
-                recommended_action="a person must resolve this conflict by hand",
-                iteration=attempt["iteration"],
-            )
         save_state(state_path, state)
-        conflicts_path = write_conflicts_result(state_path, state, attempt, result)
+        conflicts_path = write_conflicts_result(state_path, state, attempt, "conflicted")
         emit_conflicts(
             state_path,
             conflicts_path,
             state,
             attempt,
-            result,
+            "conflicted",
             {"escalation": state.get("escalation")},
         )
         return
@@ -2967,7 +2616,7 @@ def command_continue(args: argparse.Namespace) -> None:
             )
         if not merge_in_progress(repo_root):
             raise WorkflowError("no merge is in progress; run attempt again")
-        handle, message_name = tempfile.mkstemp(prefix="conflict-fix-loop.", suffix=".txt")
+        handle, message_name = tempfile.mkstemp(prefix="pr-conflict-resolver.", suffix=".txt")
         os.close(handle)
         message_path = Path(message_name)
         try:
@@ -3084,7 +2733,7 @@ def command_escalate(args: argparse.Namespace) -> None:
         kind=args.kind,
         reason=reason,
         recommended_action=args.recommended_action,
-        iteration=None if attempt is None else attempt.get("iteration"),
+        attempt_number=None if attempt is None else attempt.get("attempt_number"),
     )
     if attempt is not None and attempt.get("status") not in {"published", "aborted"}:
         attempt["status"] = "escalated"
@@ -3137,7 +2786,7 @@ def command_publish(args: argparse.Namespace) -> None:
             kind="unsafe_push",
             reason="; ".join(blockers),
             recommended_action="a person must decide how to publish this resolution",
-            iteration=attempt.get("iteration"),
+            attempt_number=attempt.get("attempt_number"),
         )
         attempt["status"] = "escalated"
         archive_attempt(state)
@@ -3246,7 +2895,6 @@ def command_publish(args: argparse.Namespace) -> None:
     attempt["mergeable_at_head_sha"] = (
         local_head if mergeability == "mergeable" else None
     )
-    charge_iteration(state)
     state["pr"] = final
     archive_attempt(state)
     save_state(state_path, state)
@@ -3259,7 +2907,7 @@ def command_publish(args: argparse.Namespace) -> None:
             "mergeability": mergeability,
             "mergeable_at_head_sha": attempt["mergeable_at_head_sha"],
             "push_verification": verification,
-            "iterations": state["iterations"],
+            "attempts": int(state.get("attempts", 0)),
         }
     )
 
@@ -3294,7 +2942,7 @@ def create_stack_workspace(pr: dict[str, Any], reference: Path | None = None) ->
     must be dissociated before it is preserved past the cascade; see
     ``dissociate_workspace``.
     """
-    workspace = Path(tempfile.mkdtemp(prefix="conflict-fix-loop-stack."))
+    workspace = Path(tempfile.mkdtemp(prefix="pr-conflict-resolver-stack."))
     upstream = f"{pr['upstream_owner']}/{pr['upstream_repo']}"
     git_flags = ["--no-single-branch"]
     if reference is not None:
@@ -4179,29 +3827,14 @@ def finish_stack_rebase(
         )
         attempt["status"] = "conflicted"
         attempt["command_output"] = output
-        repeats = detect_no_progress(state["history"], attempt["conflict_signature"])
-        result = "no_progress" if repeats >= NO_PROGRESS_LIMIT else "conflicted"
-        if result == "no_progress":
-            attempt["status"] = "escalated"
-            record_escalation(
-                state,
-                kind="no_progress",
-                reason=(
-                    f"the last {repeats} finished attempts ended on this same set of "
-                    f"conflicted files: "
-                    f"{', '.join(conflict['path'] for conflict in conflicts)}"
-                ),
-                recommended_action="a person must resolve this conflict by hand",
-                iteration=attempt["iteration"],
-            )
         save_state(state_path, state)
-        conflicts_path = write_conflicts_result(state_path, state, attempt, result)
+        conflicts_path = write_conflicts_result(state_path, state, attempt, "conflicted")
         emit_conflicts(
             state_path,
             conflicts_path,
             state,
             attempt,
-            result,
+            "conflicted",
             {"escalation": state.get("escalation"), "next": "resolved"},
         )
         return
@@ -4831,7 +4464,6 @@ def command_stack_publish(args: argparse.Namespace) -> None:
         attempt["published_head_sha"] if mergeability == "mergeable" else None
     )
     state["pr"] = final
-    charge_iteration(state)
     archive_attempt(state)
     save_state(state_path, state)
     emit(
@@ -4842,7 +4474,7 @@ def command_stack_publish(args: argparse.Namespace) -> None:
             "invoked_head_sha": attempt["published_head_sha"],
             "mergeability": mergeability,
             "mergeable_at_head_sha": attempt["mergeable_at_head_sha"],
-            "iterations": state["iterations"],
+            "attempts": int(state.get("attempts", 0)),
             **(
                 {"push_detail": attempt["stack_push_detail"]}
                 if attempt.get("stack_push_detail")
@@ -4871,17 +4503,18 @@ def record_stack_member_clearances(
         projected = prior or {
             "version": STATE_VERSION,
             "created_at": utc_now(),
-            "iterations": 0,
+            "attempts": 0,
             "history": [],
         }
         archive_attempt(projected)
-        migrate_budget_counters(projected)
         projected["pr"] = metadata
         projected["escalation"] = None
-        projected["iterations"] = int(projected.get("iterations", 0)) + 1
+        projected["attempts"] = int(projected.get("attempts", 0)) + 1
+        attempt_number = projected["attempts"]
         projected["attempt"] = {
-            "iteration": projected["iterations"],
-            "status": "mergeable" if mergeability == "mergeable" else "escalated",
+            "id": f"pr-{member['number']}-attempt-{attempt_number}",
+            "attempt_number": attempt_number,
+            "status": "mergeable" if mergeability == "mergeable" else "published",
             "base_sha": metadata.get("base_sha"),
             "mergeable_at_head_sha": (
                 member["head_sha"] if mergeability == "mergeable" else None
@@ -4935,32 +4568,30 @@ def stage_outcome(state: dict[str, Any] | None) -> str | None:
     record and inverts for a guess: a guess made from a state file would outrank the
     live agent that actually watched the run, so a guess must be absence instead.
 
+    A run that published a resolution and then read a conflicting or unknown
+    mergeability reports completed. It did everything this agent does in one pass,
+    so it is finished rather than blocked; the pull request is simply still not
+    mergeable, which the absent clearance marker already says.
+
     An ending that was recorded but is not one of the recognized ones still reports
     escalated. That is evidence of an ending nobody can describe, which is worth a
     person's attention, and not the same as having no evidence at all.
 
-    A run that spent its own iteration cap reports carried. The cap bounds one pass
-    of the orchestrator, and the orchestrator gives the stage the rest of its
-    budget on the next pass rather than ending the run there.
-
     With no state at all there is likewise no run to describe. A stage that was never
-    launched and one that finished and cleaned up after itself both look like this,
-    and neither of them made no progress.
+    launched and one that finished and cleaned up after itself both look like this.
     """
     if not state:
         return None
-    escalation = state.get("escalation")
-    if escalation:
-        kind = escalation.get("kind")
-        if kind == "no_progress":
-            return "no_progress"
-        if kind == "max_iterations":
-            return "carried"
+    if state.get("escalation"):
         return "escalated"
     status = (state.get("attempt") or {}).get("status")
     if status not in RECORDED_ENDINGS:
         return None
-    return "cleared" if cleared_head_sha(state) else "escalated"
+    if cleared_head_sha(state):
+        return "cleared"
+    if status == "published":
+        return "completed"
+    return "escalated"
 
 
 def with_stage_outcome(payload: dict[str, Any], state: dict[str, Any] | None) -> dict[str, Any]:
@@ -5015,10 +4646,7 @@ def command_status(args: argparse.Namespace) -> None:
             "merge_methods": state.get("merge_methods"),
             "escalation": state.get("escalation"),
             "history": history,
-            "iterations": int(state.get("iterations", 0)),
-            "pipeline_budget": state.get("pipeline_budget"),
-            "invocation_budget": state.get("invocation_budget"),
-            "budget_scope": state.get("budget_scope", "lifetime"),
+            "attempts": int(state.get("attempts", 0)),
             "last_helper_activity": last_helper_activity(state),
         },
         state,
@@ -5049,8 +4677,7 @@ def command_status(args: argparse.Namespace) -> None:
                     ),
                     "history": len(history),
                 },
-                "iterations": int(state.get("iterations", 0)),
-                "budget_scope": state.get("budget_scope", "lifetime"),
+                "attempts": int(state.get("attempts", 0)),
                 "last_helper_activity": last_helper_activity(state),
             },
             state,
@@ -5094,37 +4721,6 @@ def build_parser() -> argparse.ArgumentParser:
             "inspect every native-stack member even when the invoked pull request "
             "is already mergeable"
         ),
-    )
-    preflight.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS)
-    invocation = preflight.add_mutually_exclusive_group()
-    invocation.add_argument(
-        "--new-invocation",
-        action="store_true",
-        help="start a fresh standalone budget and return its invocation run token",
-    )
-    invocation.add_argument(
-        "--invocation-run",
-        help="reuse the invocation run token returned by its first preflight",
-    )
-    preflight.add_argument(
-        "--pipeline-run",
-        help=(
-            "opaque identifier for one outer run, compared only for equality; "
-            "a different one starts both budgets over"
-        ),
-    )
-    preflight.add_argument(
-        "--pipeline-iteration",
-        type=int,
-        help=(
-            "the orchestrator's own loop counter; a higher one within the same run "
-            "refreshes the per-iteration budget"
-        ),
-    )
-    preflight.add_argument(
-        "--pipeline-max-iterations",
-        type=int,
-        help="the orchestrator's own iteration cap, which derives the ceiling",
     )
     preflight.set_defaults(function=command_preflight)
 

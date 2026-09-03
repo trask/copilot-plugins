@@ -55,13 +55,15 @@ After monitoring finishes, rename the session to the final event's `session_titl
 
 The helper runs at most two passes. Each pass delegates to the plugin-qualified agent that owns the stage:
 
-1. `conflict-fix-loop:conflict-fix-loop`, dispatched once for the clicked pull request and covering the whole stack
+1. `pr-conflict-resolver:pr-conflict-resolver`, dispatched once for the clicked pull request and covering the whole stack
 2. `copilot-review-loop:copilot-review-loop`, one worker per selected pull request
 3. `self-review-loop:self-review-loop`, one worker per selected pull request
 4. `ci-fix-loop:ci-fix-loop`, bottom-up, where a higher member starts only after the member below it is green at its current head; when containment is missing, the helper first asks the conflict plugin to atomically align descendants to that live head
 5. `pr-description:pr-description`, one worker per selected pull request
 
 Workers are `copilot` subprocesses in isolated worktrees, not app sessions, and this is the only visible session. The helper starts them one at a time and only continues after the previous one is verified and active; once active they run concurrently. Failed propagation checkpoints remain retryable while their source head is current and are retired when that pull request has moved. Success needs all five markers current for every selected pull request at a single final snapshot of the stack, its heads, and its bases. Otherwise the run reports the partial state it reached.
+
+A PR Conflict Resolver run that publishes but leaves the stack conflicting is completed and is not launched again during that stack-pipeline run.
 
 Never mark a pull request ready for review, approve one, create one, or post a comment.
 

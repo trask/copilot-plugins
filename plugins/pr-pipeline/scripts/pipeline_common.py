@@ -40,7 +40,7 @@ SHORT_TARGET_PATTERN = re.compile(
 BARE_NUMBER_PATTERN = re.compile(r"^#?(?P<number>\d+)$")
 REPO_NAME_PATTERN = re.compile(r"^(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)$")
 
-STAGE_CONFLICT = "conflict-fix-loop"
+STAGE_CONFLICT = "pr-conflict-resolver"
 STAGE_SELF_REVIEW = "self-review-loop"
 STAGE_COPILOT_REVIEW = "copilot-review-loop"
 STAGE_CI = "ci-fix-loop"
@@ -51,7 +51,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "stage": STAGE_CONFLICT,
         "plugin": STAGE_CONFLICT,
         "agent": f"{STAGE_CONFLICT}:{STAGE_CONFLICT}",
-        "module": "conflict_fix_loop",
+        "module": "pr_conflict_resolver",
         "marker": ("mergeable_at_head_sha",),
         "base_marker": ("attempt", "base_sha"),
         "model": DEFAULT_STAGE_MODEL,

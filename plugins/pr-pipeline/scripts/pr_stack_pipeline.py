@@ -486,7 +486,11 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
     elif event == "phase_finished":
         stopped = payload.get("stopped")
         blocked = payload.get("blocked")
-        if stopped:
+        action = payload.get("action")
+        if action == "completed_this_run":
+            outcome = "not run again because it already completed in this pipeline"
+            next_action = "Continue with the next stage."
+        elif stopped:
             outcome = "failed"
             next_action = "Stop the pipeline and report the launch failure."
         elif blocked:
@@ -1912,10 +1916,19 @@ class StackPipeline:
             for member in selected
             if member["number"] == self.kickoff["startPullRequest"]
         )
+        before = self.clearance(
+            clicked["number"],
+            STAGE_CONFLICT,
+            clicked["head_sha"],
+            self.base_sha_for(clicked),
+        )
+        before_attempt_id = (
+            ((before.get("status") or {}).get("attempt") or {}).get("id")
+        )
         scope = (
             f"This pull request is the clicked member of native stack "
             f"{self.kickoff['stackNumber']}. Resolve the stack as a whole; the "
-            "cascade may move members below it. Run Conflict Fix Loop preflight "
+            "cascade may move members below it. Run PR Conflict Resolver preflight "
             "with --whole-stack."
         )
         request = self.request_for(clicked, STAGE_CONFLICT, pass_number, scope=scope)
@@ -1941,12 +1954,27 @@ class StackPipeline:
                     "dispatched_head_sha": completion["head_sha"],
                 },
             )
+        after = self.clearance(
+            clicked["number"],
+            STAGE_CONFLICT,
+            clicked["head_sha"],
+            self.base_sha_for(clicked),
+        )
+        after_attempt_id = (
+            ((after.get("status") or {}).get("attempt") or {}).get("id")
+        )
         result = {
             "phase": STAGE_CONFLICT,
             "mode": PHASE_STACK_DISPATCH,
             "dispatches": 1,
             "completions": completions,
             "stopped": launched["stopped"],
+            "completed": (
+                any(completion.get("accepted") for completion in completions)
+                and after.get("outcome") == "completed"
+                and bool(after_attempt_id)
+                and after_attempt_id != before_attempt_id
+            ),
         }
         self.emit(
             "phase_finished",
@@ -2711,6 +2739,7 @@ class StackPipeline:
         phases: list[dict[str, Any]] = []
         snapshot: dict[str, Any] | None = None
         completed_passes = 0
+        completed_conflict_resolution = False
         for pass_number in range(1, MAX_PASSES + 1):
             self.check_cancellation()
             current = self.revalidate()
@@ -2740,7 +2769,28 @@ class StackPipeline:
             for phase in PHASES:
                 self.check_cancellation()
                 if phase["mode"] == PHASE_STACK_DISPATCH:
-                    outcome = self.run_conflict_phase(pass_number, selected)
+                    if completed_conflict_resolution:
+                        clicked_number = self.kickoff["startPullRequest"]
+                        outcome = {
+                            "phase": STAGE_CONFLICT,
+                            "mode": PHASE_STACK_DISPATCH,
+                            "dispatches": 0,
+                            "completions": [],
+                            "stopped": None,
+                            "action": "completed_this_run",
+                        }
+                        self.emit(
+                            "phase_finished",
+                            pull_request_pass=pass_number,
+                            numbers=[clicked_number],
+                            **summarize_phase(outcome),
+                        )
+                    else:
+                        outcome = self.run_conflict_phase(pass_number, selected)
+                        completed_conflict_resolution = (
+                            completed_conflict_resolution
+                            or bool(outcome.get("completed"))
+                        )
                 elif phase["mode"] == PHASE_BOTTOM_UP:
                     outcome = self.run_ci_phase(pass_number, selected)
                 else:
@@ -2824,6 +2874,8 @@ def summarize_phase(phase: dict[str, Any]) -> dict[str, Any]:
     }
     if phase.get("blocked") is not None:
         summary["blocked"] = phase["blocked"]
+    if phase.get("action") is not None:
+        summary["action"] = phase["action"]
     return summary
 
 

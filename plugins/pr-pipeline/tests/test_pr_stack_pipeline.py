@@ -189,7 +189,7 @@ class DelegationTest(unittest.TestCase):
     def test_every_phase_delegates_to_a_plugin_qualified_agent(self):
         self.assertEqual(
             {
-                "conflict-fix-loop": "conflict-fix-loop:conflict-fix-loop",
+                "pr-conflict-resolver": "pr-conflict-resolver:pr-conflict-resolver",
                 "copilot-review-loop": "copilot-review-loop:copilot-review-loop",
                 "self-review-loop": "self-review-loop:self-review-loop",
                 "ci-fix-loop": "ci-fix-loop:ci-fix-loop",
@@ -201,7 +201,7 @@ class DelegationTest(unittest.TestCase):
     def test_phase_order_and_modes_are_fixed(self):
         self.assertEqual(
             (
-                "conflict-fix-loop",
+                "pr-conflict-resolver",
                 "copilot-review-loop",
                 "self-review-loop",
                 "ci-fix-loop",
@@ -379,6 +379,8 @@ class StackFixture(unittest.TestCase):
         self.launcher = FakeLauncher()
         self.stack = stack()
         self.clear: set[tuple[int, str]] = set()
+        self.completed: set[tuple[int, str]] = set()
+        self.attempt_ids: dict[tuple[int, str], str] = {}
         self.nonce_count = 0
         self.checkpoint_map: dict[int, list[dict]] = {}
         self.worker_progress_map: dict[int, dict] = {}
@@ -394,16 +396,23 @@ class StackFixture(unittest.TestCase):
 
     def inspect(self, entry, target, head_sha, base_sha=None):
         clear = (target["number"], entry["stage"]) in self.clear
+        completed = (target["number"], entry["stage"]) in self.completed
         return {
             "stage": entry["stage"],
             "clear": clear,
             "clear_at_head_sha": head_sha if clear else None,
             "clear_at_base_sha": None,
-            "outcome": "cleared" if clear else "carried",
-            "reason": None if clear else "carried",
+            "outcome": "cleared" if clear else "completed" if completed else "carried",
+            "reason": None if clear else "completed" if completed else "carried",
             "installed": True,
             "status_state": "state.json",
-            "status": {},
+            "status": {
+                "attempt": {
+                    "id": self.attempt_ids.get(
+                        (target["number"], entry["stage"]), "old-attempt"
+                    )
+                }
+            },
         }
 
     def checkpoints(self, repository, number):
@@ -479,7 +488,7 @@ class StackRunTest(StackFixture):
         self.assertEqual([("create", 11)], self.launcher.calls[:1])
         self.assertEqual([11], [request["number"] for request in self.launcher.started])
         request = self.launcher.started[0]
-        self.assertEqual("conflict-fix-loop:conflict-fix-loop", request["agent"])
+        self.assertEqual("pr-conflict-resolver:pr-conflict-resolver", request["agent"])
         self.assertIn("stack 77", request["prompt"])
         self.assertIn("as a whole", request["prompt"])
 
@@ -886,6 +895,17 @@ class StackRunTest(StackFixture):
             request["arguments"],
         )
 
+    def test_the_conflict_stage_carries_no_pipeline_position(self):
+        """PR Conflict Resolver integrates once per launch and takes no budget.
+
+        Its helper rejects the flags outright, so sending them would kill every
+        conflict worker at preflight.
+        """
+        pipeline = self.pipeline()
+        member = self.stack["members"][0]
+        request = pipeline.request_for(member, MODULE.STAGE_CONFLICT, 2)
+        self.assertEqual([], request["arguments"])
+
     # Push propagation ---------------------------------------------------
 
     def test_an_accepted_push_is_propagated_while_the_worker_runs(self):
@@ -1241,7 +1261,7 @@ class StackRunTest(StackFixture):
         self.assertEqual("complete", result["result"])
         self.assertEqual(1, result["passes"])
         self.assertEqual(
-            ["conflict-fix-loop", "copilot-review-loop", "self-review-loop", "ci-fix-loop", "pr-description"],
+            ["pr-conflict-resolver", "copilot-review-loop", "self-review-loop", "ci-fix-loop", "pr-description"],
             [phase["phase"] for phase in result["phases"]],
         )
 
@@ -1257,6 +1277,42 @@ class StackRunTest(StackFixture):
             2, len([phase for phase in result["phases"] if phase["phase"] == "ci-fix-loop"])
         )
         self.assertEqual("incomplete", result["snapshot"]["result"])
+
+    def test_second_pass_does_not_relaunch_a_completed_conflict_resolution(self):
+        self.completed.add((11, MODULE.STAGE_CONFLICT))
+        self.launcher.on_start = lambda request: self.attempt_ids.__setitem__(
+            (request["number"], request["stage"]), "current-attempt"
+        )
+        pipeline = self.pipeline()
+
+        result = pipeline.execute()
+
+        conflict_phases = [
+            phase for phase in result["phases"] if phase["phase"] == MODULE.STAGE_CONFLICT
+        ]
+        self.assertEqual(2, len(conflict_phases))
+        self.assertEqual(1, conflict_phases[0]["dispatches"])
+        self.assertEqual(0, conflict_phases[1]["dispatches"])
+        self.assertEqual("completed_this_run", conflict_phases[1]["action"])
+        skipped = [
+            event
+            for event in self.events
+            if event["event"] == "phase_finished"
+            and event["pull_request_pass"] == 2
+            and event.get("action") == "completed_this_run"
+        ]
+        self.assertEqual([11], skipped[0]["numbers"])
+
+    def test_stale_completed_state_does_not_suppress_the_second_pass(self):
+        self.completed.add((11, MODULE.STAGE_CONFLICT))
+        pipeline = self.pipeline()
+
+        result = pipeline.execute()
+
+        conflict_phases = [
+            phase for phase in result["phases"] if phase["phase"] == MODULE.STAGE_CONFLICT
+        ]
+        self.assertEqual([1, 1], [phase["dispatches"] for phase in conflict_phases])
 
     def test_a_changed_topology_stops_the_run(self):
         pipeline = self.pipeline()
@@ -1704,6 +1760,23 @@ class ProgressProtocolTest(StackFixture):
         self.assertTrue(updates[0]["next_action"])
         self.assertIn("failed for #11", updates[1]["message"])
 
+    def test_a_completed_resolver_skip_is_reported_without_a_start_event(self):
+        reporter, _ = self.reporter()
+        reporter(
+            {
+                "event": "phase_finished",
+                "phase": MODULE.STAGE_CONFLICT,
+                "pull_request_pass": 2,
+                "numbers": [11],
+                "action": "completed_this_run",
+            }
+        )
+
+        update = MODULE.read_progress_log(self.event_log)[0]
+        self.assertIn("not run again", update["message"])
+        self.assertEqual("phase_finished", update["source_event"])
+        self.assertEqual([11], update["pull_requests"])
+
     def test_worker_progress_names_known_failure_diagnostics(self):
         reporter, _ = self.reporter()
         reporter(
@@ -1974,7 +2047,7 @@ class DependencyTest(unittest.TestCase):
         self.assertEqual(list(MODULE.STAGE_NAMES), missing)
 
     def test_propagation_calls_the_conflict_plugin(self):
-        script = self.root / "conflict_fix_loop.py"
+        script = self.root / "pr_conflict_resolver.py"
         script.write_text("", encoding="utf-8")
         seen: list[list[str]] = []
 

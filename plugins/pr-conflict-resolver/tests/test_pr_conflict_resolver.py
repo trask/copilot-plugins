@@ -12,9 +12,9 @@ from types import SimpleNamespace
 from unittest import mock
 
 
-SCRIPT = Path(__file__).parents[1] / "scripts" / "conflict_fix_loop.py"
-AGENT = Path(__file__).parents[1] / "agents" / "conflict-fix-loop.agent.md"
-SPEC = importlib.util.spec_from_file_location("conflict_fix_loop", SCRIPT)
+SCRIPT = Path(__file__).parents[1] / "scripts" / "pr_conflict_resolver.py"
+AGENT = Path(__file__).parents[1] / "agents" / "pr-conflict-resolver.agent.md"
+SPEC = importlib.util.spec_from_file_location("pr_conflict_resolver", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -171,9 +171,9 @@ def conflict_record(path="app.py", **overrides):
 
 def attempt_record(**overrides):
     attempt = {
-        "id": "pr-7-iteration-1",
+        "id": "pr-7-attempt-1",
         "status": "conflicted",
-        "iteration": 1,
+        "attempt_number": 1,
         "strategy": "merge",
         "strategy_reason": "a merge resolves the conflict without rewriting the branch",
         "strategy_warnings": [],
@@ -198,7 +198,7 @@ def write_state(directory: Path, **overrides) -> Path:
         "version": MODULE.STATE_VERSION,
         "created_at": "2026-01-01T00:00:00Z",
         "updated_at": "2026-01-01T00:00:00Z",
-        "iterations": 0,
+        "attempts": 0,
         "history": [],
         "escalation": None,
         "repo_root": str(directory),
@@ -244,7 +244,7 @@ class AgentInstructionsTest(unittest.TestCase):
         )
 
     def test_the_no_target_path_is_not_offered_to_a_detached_worktree(self):
-        """The loop detaches, so a step telling a caller to omit the target traps them.
+        """The run detaches, so a step telling a caller to omit the target traps them.
 
         `preflight` and `status --current` both resolve the pull request from the
         checked-out branch, and a detached worktree names none.
@@ -259,7 +259,7 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("`--current` reads the branch this worktree has checked out", self.instructions)
 
     def test_declares_the_frontmatter_keys_the_sibling_loops_use(self):
-        self.assertIn("name: Conflict Fix Loop", self.instructions)
+        self.assertIn("name: PR Conflict Resolver", self.instructions)
         self.assertIn(
             'description: "Use when selected with only a PR URL, PR number, '
             'or owner/repo#number',
@@ -323,27 +323,36 @@ class AgentInstructionsTest(unittest.TestCase):
         frontmatter = self.instructions.split("---")[1]
         self.assertNotIn("model:", frontmatter)
 
-    def test_bare_pr_reference_runs_the_full_loop(self):
+    def test_bare_pr_reference_starts_the_run(self):
         self.assertIn(
-            "## Activation: Bare PR References Run The Full Loop", self.instructions
+            "## Activation: Bare PR References Start The Run", self.instructions
         )
-        self.assertIn(
-            "asks you to run the full Conflict Fix Loop", self.instructions
-        )
+        self.assertIn("asks you to run PR Conflict Resolver on it", self.instructions)
         self.assertIn("Start the helper's `preflight` workflow at once", self.instructions)
         self.assertIn(
             "Never hand the work to a generic rebase or merge skill", self.instructions
         )
 
+    def test_every_invocation_starts_a_fresh_attempt_without_a_token_or_a_cap(self):
+        """Without this a repeat selection looks spent rather than fresh.
+
+        The one-shot contract only holds when the user can select the agent
+        again and get a whole new run.
+        """
+        self.assertIn("Every explicit invocation starts a fresh attempt", self.instructions)
+        self.assertIn(
+            "There is no token to carry and no cap to spend", self.instructions
+        )
+
     def test_names_the_session_from_preflight_metadata_idempotently(self):
         self.assertIn("## Session Naming", self.instructions)
         self.assertIn(
-            "ensure the session name is `Conflict Fix Loop: <PR number> - <PR title>`",
+            "ensure the session name is `PR Conflict Resolver: <PR number> - <PR title>`",
             self.instructions,
         )
         self.assertIn(
             "If the harness has already supplied a name beginning "
-            "`Conflict Fix Loop: <PR number> - `",
+            "`PR Conflict Resolver: <PR number> - `",
             self.instructions,
         )
         self.assertIn("do not call `rename_session`", self.instructions)
@@ -398,13 +407,22 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
 
-    def test_states_the_iteration_cap_and_treats_it_as_an_escalation(self):
-        self.assertIn("The maximum is 5 iterations", self.instructions)
+    def test_states_that_one_run_integrates_once(self):
+        """A cap would only matter to an outer loop, and there is none.
+
+        The run has to end after a single integration whatever the last
+        mergeability answer says.
+        """
+        self.assertIn("One run integrates once", self.instructions)
         self.assertIn(
-            "Hitting the cap is an escalation, not a normal completion",
+            "you are finished, even when the pull request is still conflicting",
             self.instructions,
         )
-        self.assertIn("--max-iterations 5", self.instructions)
+        self.assertIn(
+            "Never start a second `preflight` in the same run", self.instructions
+        )
+        self.assertNotIn("--max-iterations", self.instructions)
+        self.assertNotIn("iteration", self.instructions.lower())
 
     def test_guards_the_push_and_the_stack(self):
         self.assertIn("Never push to the base branch", self.instructions)
@@ -456,7 +474,6 @@ class AgentInstructionsTest(unittest.TestCase):
             "ready",
             "mergeable",
             "unknown_mergeability",
-            "max_iterations_reached",
             "unsafe_push",
             "no_safe_strategy",
             "stack_rebase",
@@ -578,21 +595,61 @@ class AgentInstructionsTest(unittest.TestCase):
 
     def test_the_report_agrees_with_the_machine_readable_outcome(self):
         self.assertIn("run `status` and read its `stage_outcome`", self.instructions)
-        for word in ("`cleared`", "`skipped`", "`no_progress`", "`escalated`"):
+        for word in ("`cleared`", "`skipped`", "`completed`", "`escalated`"):
             self.assertIn(word, self.instructions)
         self.assertIn("it never says the stage is green", self.instructions)
+
+    def test_a_published_run_that_is_still_conflicting_is_completed(self):
+        """Calling that outcome a failure invites a retry the contract forbids.
+
+        The run pushed its resolution, so it did its whole job even when
+        GitHub still reads the pull request as conflicting.
+        """
+        self.assertIn(
+            "this run published its resolution and GitHub then read the pull request "
+            "as conflicting or would not say",
+            self.instructions,
+        )
+        self.assertIn("The run did its whole job", self.instructions)
+        self.assertIn(
+            "Do not run `preflight` again, do not escalate, and do not claim the pull "
+            "request is mergeable",
+            self.instructions,
+        )
+        self.assertIn(
+            "A conflicting or unknown answer after a successful publish is a completed "
+            "run, not a failure",
+            self.instructions,
+        )
+
+    def test_a_single_integration_may_still_take_many_continue_steps(self):
+        """One pass means one integration, not one helper call.
+
+        A run that read the cascade as spent after its first `stack-continue`
+        would abandon the members above it.
+        """
+        self.assertIn(
+            "a cascade that climbs from one stack member to the next, is still one "
+            "integration",
+            self.instructions,
+        )
+        self.assertIn(
+            "Run `continue` or `stack-continue` as many times as that single "
+            "integration needs",
+            self.instructions,
+        )
 
     def test_an_absent_outcome_is_not_read_as_a_failed_run(self):
         self.assertIn("the field is absent", self.instructions)
         self.assertIn("there is no run to describe", self.instructions)
-        self.assertIn("it is not `no_progress`", self.instructions)
+        self.assertIn("reaching for one of the four words", self.instructions)
 
     def test_an_unfinished_run_is_finished_rather_than_guessed_at(self):
         self.assertIn("absent while a run is still going", self.instructions)
         self.assertIn("no command recorded an ending", self.instructions)
 
     def test_closes_every_run_with_a_tagged_retrospective(self):
-        self.assertIn("## Conflict Fix Loop Agent Retrospective", self.instructions)
+        self.assertIn("## PR Conflict Resolver Agent Retrospective", self.instructions)
         for category in (
             "**Agent**",
             "**Helper**",
@@ -647,7 +704,7 @@ class TargetParsingTest(unittest.TestCase):
     def test_state_path_encodes_the_target(self):
         path = MODULE.default_state_path(MODULE.parse_target("owner/repo#9"))
         self.assertEqual("owner--repo--9.json", path.name)
-        self.assertEqual("conflict-fix-loop", path.parent.name)
+        self.assertEqual("pr-conflict-resolver", path.parent.name)
         self.assertEqual("run", path.parent.parent.name)
 
     def test_sidecar_paths_sit_beside_the_state_file(self):
@@ -948,7 +1005,7 @@ class PullRequestMetadataTest(unittest.TestCase):
         ), mock.patch.object(MODULE, "base_ref_tip", return_value=base_tip):
             return MODULE.metadata_for(target)
 
-    def test_normalizes_the_fields_the_loop_uses(self):
+    def test_normalizes_the_fields_the_resolver_uses(self):
         metadata = self.metadata()
         self.assertEqual("owner/repo", metadata["repo_name"])
         self.assertEqual("owner", metadata["upstream_owner"])
@@ -1584,17 +1641,6 @@ class ConflictEvidenceTest(unittest.TestCase):
             MODULE.conflict_signature(["a.py"]), MODULE.conflict_signature(["a.py", "b.py"])
         )
 
-    def test_no_progress_counts_only_the_trailing_run(self):
-        history = [
-            {"conflict_signature": "x"},
-            {"conflict_signature": "y"},
-            {"conflict_signature": "x"},
-            {"conflict_signature": "x"},
-        ]
-        self.assertEqual(2, MODULE.detect_no_progress(history, "x"))
-        self.assertEqual(0, MODULE.detect_no_progress(history, "y"))
-        self.assertEqual(0, MODULE.detect_no_progress([], "x"))
-
     def test_normalizing_content_folds_windows_line_endings(self):
         self.assertEqual(b"a\nb\n", MODULE.normalize_content(b"a\r\nb\r\n"))
         self.assertIsNone(MODULE.normalize_content(None))
@@ -1901,10 +1947,10 @@ class StateFileTest(unittest.TestCase):
     def test_a_saved_state_round_trips_and_gains_a_timestamp(self):
         directory = temporary_directory(self)
         path = directory / "nested" / "state.json"
-        state = {"version": MODULE.STATE_VERSION, "iterations": 1}
+        state = {"version": MODULE.STATE_VERSION, "attempts": 1}
         MODULE.save_state(path, state)
         loaded = MODULE.load_state(path)
-        self.assertEqual(1, loaded["iterations"])
+        self.assertEqual(1, loaded["attempts"])
         self.assertTrue(loaded["updated_at"].endswith("Z"))
         self.assertEqual([path.name], [item.name for item in path.parent.iterdir()])
 
@@ -2025,7 +2071,7 @@ class StateHelpersTest(unittest.TestCase):
         self.assertEqual([], empty["history"])
 
     def test_archiving_accepts_every_finished_status(self):
-        for status in ("published", "aborted", "escalated"):
+        for status in MODULE.RECORDED_ENDINGS:
             with self.subTest(status=status):
                 state = {"history": [], "attempt": attempt_record(status=status)}
                 MODULE.archive_attempt(state)
@@ -2038,19 +2084,17 @@ class StateHelpersTest(unittest.TestCase):
             kind="contradiction",
             reason="the two sides contradict each other",
             recommended_action="a person must decide",
-            iteration=2,
+            attempt_number=2,
         )
         self.assertEqual(escalation, state["escalation"])
         self.assertEqual("contradiction", escalation["kind"])
-        self.assertEqual(2, escalation["iteration"])
+        self.assertEqual(2, escalation["attempt_number"])
         self.assertTrue(escalation["recorded_at"].endswith("Z"))
 
     def test_every_escalation_kind_is_declared(self):
         self.assertEqual(
             (
                 "contradiction",
-                "max_iterations",
-                "no_progress",
                 "unsafe_push",
                 "unknown_mergeability",
                 "ad_hoc_base",
@@ -2070,7 +2114,7 @@ class StateHelpersTest(unittest.TestCase):
         )
         summary = MODULE.attempt_summary(attempt)
         self.assertEqual({"resolved": 1, "conflicted": 1}, summary["conflict_statuses"])
-        self.assertEqual("pr-7-iteration-1", summary["id"])
+        self.assertEqual("pr-7-attempt-1", summary["id"])
         self.assertNotIn("conflicts", summary)
         self.assertIsNone(MODULE.attempt_summary(None))
 
@@ -2190,31 +2234,19 @@ class PreflightTest(unittest.TestCase):
         relations=None,
         merge_methods=None,
         strategy="auto",
-        max_iterations=MODULE.DEFAULT_MAX_ITERATIONS,
         state=None,
         detection=None,
         ad_hoc=None,
         external=None,
         whole_stack=False,
         whole_stack_mergeable=False,
-        new_invocation=False,
-        invocation_run=None,
-        pipeline_run=None,
-        pipeline_iteration=None,
-        pipeline_max_iterations=None,
     ):
         args = SimpleNamespace(
             target="owner/repo#7",
             repo_root=str(self.directory),
             state=str(state or self.state_path),
             strategy=strategy,
-            max_iterations=max_iterations,
             whole_stack=whole_stack,
-            new_invocation=new_invocation,
-            invocation_run=invocation_run,
-            pipeline_run=pipeline_run,
-            pipeline_iteration=pipeline_iteration,
-            pipeline_max_iterations=pipeline_max_iterations,
         )
         ad_hoc = ad_hoc or {
             "reason": "the head conflicts with develop in docs/list.yaml",
@@ -2272,12 +2304,12 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual("ready", payload["result"])
         self.assertEqual("conflicting", payload["mergeability"])
         self.assertEqual("merge", payload["strategy"])
-        self.assertEqual(1, payload["iteration"])
-        self.assertEqual(MODULE.DEFAULT_MAX_ITERATIONS, payload["max_iterations"])
+        self.assertEqual(1, payload["attempt_number"])
+        self.assertNotIn("max_iterations", payload)
         self.assertIsNone(payload["escalation"])
         state = self.saved()
         self.assertEqual("planned", state["attempt"]["status"])
-        self.assertEqual("pr-7-iteration-1", state["attempt"]["id"])
+        self.assertEqual("pr-7-attempt-1", state["attempt"]["id"])
         self.assertEqual("head1", state["attempt"]["head_sha"])
         self.assertIsNone(state["attempt"]["mergeable_at_head_sha"])
         self.checkout.assert_called_once()
@@ -2304,7 +2336,9 @@ class PreflightTest(unittest.TestCase):
         payload = self.preflight(metadata=pr_metadata(mergeable="UNKNOWN"))
         self.assertEqual("unknown_mergeability", payload["result"])
         self.assertEqual("unknown_mergeability", payload["escalation"]["kind"])
-        self.assertIsNone(self.saved()["attempt"])
+        state = self.saved()
+        self.assertEqual("escalated", state["attempt"]["status"])
+        self.assertEqual("pr-7-attempt-1", state["history"][0]["id"])
 
     def test_a_closed_pull_request_is_refused(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "is closed"):
@@ -2318,7 +2352,7 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual("unsafe_push", payload["result"])
         self.assertEqual("unsafe_push", payload["escalation"]["kind"])
         self.assertIn("#3", payload["push_blockers"][0])
-        self.assertIsNone(self.saved()["attempt"])
+        self.assertEqual("escalated", self.saved()["attempt"]["status"])
 
     def test_no_safe_strategy_escalates_instead_of_guessing(self):
         relations = {"dependents": [dependent()], "stacked_on": None}
@@ -2330,70 +2364,23 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual("unsafe_push", payload["escalation"]["kind"])
         self.assertIsNone(payload["strategy"])
 
-    def test_the_iteration_cap_escalates(self):
-        write_state(
-            self.directory,
-            iterations=MODULE.DEFAULT_MAX_ITERATIONS,
-            attempt=None,
-            history=[],
-        )
+    def test_every_preflight_opens_the_next_attempt_without_a_cap(self):
+        """A cap would strand a pull request the user asked about again.
+
+        Numbering only has to keep climbing so two runs never share an
+        attempt id.
+        """
+        write_state(self.directory, attempts=40, attempt=None, history=[])
         payload = self.preflight()
-        self.assertEqual("max_iterations_reached", payload["result"])
-        self.assertEqual("max_iterations", payload["escalation"]["kind"])
-        self.assertEqual(MODULE.DEFAULT_MAX_ITERATIONS + 1, payload["iteration"])
-
-    def test_the_cap_can_be_raised_for_a_single_run(self):
-        write_state(self.directory, iterations=5, attempt=None, history=[])
-        payload = self.preflight(max_iterations=6)
         self.assertEqual("ready", payload["result"])
-        self.assertEqual(6, payload["iteration"])
-
-    def test_a_new_manual_invocation_does_not_inherit_a_pipeline_cap(self):
-        write_state(
-            self.directory,
-            iterations=6,
-            attempt=None,
-            history=[],
-            pipeline_budget={
-                "run": "old-pipeline",
-                "iteration": 2,
-                "baseline": 0,
-                "run_baseline": 0,
-            },
-        )
-
-        with mock.patch.object(MODULE.uuid, "uuid4") as token:
-            token.return_value.hex = "manual-run"
-            payload = self.preflight(new_invocation=True)
-
-        self.assertEqual("ready", payload["result"])
-        self.assertEqual(0, payload["completed_iterations"])
-        self.assertEqual("invocation", payload["budget_scope"])
-        self.assertEqual("manual-run", payload["invocation_run"])
-        self.assertEqual(7, payload["iteration"])
-
-    def test_an_active_manual_invocation_cannot_silently_fall_back_to_lifetime(self):
-        write_state(
-            self.directory,
-            iterations=6,
-            attempt=None,
-            history=[],
-            budget_scope="invocation",
-            invocation_budget={
-                "run": "manual-run",
-                "iteration": None,
-                "baseline": 6,
-                "run_baseline": 6,
-            },
-        )
-
-        with self.assertRaisesRegex(MODULE.WorkflowError, "--invocation-run"):
-            self.preflight()
+        self.assertEqual(41, payload["attempt_number"])
+        self.assertEqual(41, self.saved()["attempts"])
+        self.assertIsNone(payload["escalation"])
 
     def test_a_second_preflight_archives_the_finished_attempt(self):
         write_state(
             self.directory,
-            iterations=1,
+            attempts=1,
             attempt=attempt_record(status="published", published_head_sha="head2"),
             history=[],
         )
@@ -2401,13 +2388,13 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(1, payload["counts"]["history"])
         state = self.saved()
         self.assertEqual("published", state["history"][0]["status"])
-        self.assertEqual("pr-7-iteration-2", state["attempt"]["id"])
+        self.assertEqual("pr-7-attempt-2", state["attempt"]["id"])
 
     def test_a_new_run_clears_a_stale_escalation(self):
         write_state(
             self.directory,
             attempt=None,
-            escalation={"kind": "no_progress", "reason": "stuck"},
+            escalation={"kind": "contradiction", "reason": "stuck"},
         )
         payload = self.preflight()
         self.assertIsNone(payload["escalation"])
@@ -2547,7 +2534,7 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual("unsafe_push", payload["result"])
         self.assertEqual("unsafe_push", payload["escalation"]["kind"])
         self.assertIn("no head branch", payload["push_blockers"][0])
-        self.assertIsNone(self.saved()["attempt"])
+        self.assertEqual("escalated", self.saved()["attempt"]["status"])
 
     def test_a_native_stack_whose_head_is_its_base_still_escalates(self):
         # The head branch and base branch are the same ref in the upstream
@@ -2560,7 +2547,7 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual("unsafe_push", payload["result"])
         self.assertEqual("unsafe_push", payload["escalation"]["kind"])
         self.assertIn("write to the base branch", payload["push_blockers"][0])
-        self.assertIsNone(self.saved()["attempt"])
+        self.assertEqual("escalated", self.saved()["attempt"]["status"])
 
     def test_a_native_stack_stacked_on_its_own_head_still_escalates(self):
         # The declared base resolves to this same head branch through an open
@@ -2575,7 +2562,7 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual("unsafe_push", payload["result"])
         self.assertEqual("unsafe_push", payload["escalation"]["kind"])
         self.assertIn("#3", payload["push_blockers"][0])
-        self.assertIsNone(self.saved()["attempt"])
+        self.assertEqual("escalated", self.saved()["attempt"]["status"])
 
     def test_a_native_stack_with_an_external_dependent_escalates(self):
         # An open pull request based on a branch the cascade will force-push,
@@ -2600,11 +2587,11 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("#42", payload["escalation"]["reason"])
         self.assertIn("v143", payload["escalation"]["reason"])
         self.assertEqual(external, payload["external_dependents"])
-        self.assertIsNone(self.saved()["attempt"])
+        self.assertEqual("escalated", self.saved()["attempt"]["status"])
 
     def test_an_ad_hoc_base_escalates_and_names_the_conflict(self):
         # base_branch differs from the default branch and there is no native
-        # stack, so GitHub measures mergeability against a branch this loop would
+        # stack, so GitHub measures mergeability against a branch this resolver would
         # not merge in. The escalation names the real conflict.
         detection = {"default_branch": "develop", "stack": None}
         payload = self.preflight(
@@ -2613,7 +2600,7 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual("ad_hoc_base", payload["result"])
         self.assertEqual("ad_hoc_base", payload["escalation"]["kind"])
         self.assertIn("docs/list.yaml", payload["escalation"]["reason"])
-        self.assertIsNone(self.saved()["attempt"])
+        self.assertEqual("escalated", self.saved()["attempt"]["status"])
 
     def test_a_default_branch_base_still_merges_even_when_not_main(self):
         # The declared base is the repository default branch, so the existing
@@ -2631,7 +2618,7 @@ class PreflightTest(unittest.TestCase):
             repo_root=None,
             state=None,
             strategy="auto",
-            max_iterations=5,
+            max_attempts=5,
         )
         with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
             MODULE, "resolve_repo_root", return_value=self.directory
@@ -2754,31 +2741,25 @@ class AttemptTest(unittest.TestCase):
         self.assertEqual("a.py", detail["conflicts"][0]["path"])
         self.assertEqual(pr_metadata(), detail["pr"])
 
-    def test_the_same_conflict_set_twice_running_escalates(self):
+    def test_a_repeated_conflict_set_still_reports_the_conflict(self):
+        """A run only integrates once, so a repeat is a first attempt here.
+
+        Reading the history as exhaustion would escalate a run that has not
+        tried anything yet.
+        """
         signature = MODULE.conflict_signature(["a.py"])
         history = [
-            {"id": "pr-7-iteration-1", "conflict_signature": signature},
-            {"id": "pr-7-iteration-2", "conflict_signature": signature},
+            {"id": "pr-7-attempt-1", "conflict_signature": signature},
+            {"id": "pr-7-attempt-2", "conflict_signature": signature},
         ]
         payload = self.attempt(
             conflicts=[conflict_record("a.py")],
-            attempt=self.planned(iteration=3),
+            attempt=self.planned(attempt_number=3),
             history=history,
         )
-        self.assertEqual("no_progress", payload["result"])
-        self.assertEqual("no_progress", payload["escalation"]["kind"])
-        self.assertIn("a.py", payload["escalation"]["reason"])
-        self.assertEqual("escalated", self.saved()["attempt"]["status"])
-
-    def test_a_different_conflict_set_is_progress(self):
-        history = [
-            {"conflict_signature": MODULE.conflict_signature(["b.py"])},
-            {"conflict_signature": MODULE.conflict_signature(["b.py"])},
-        ]
-        payload = self.attempt(
-            conflicts=[conflict_record("a.py")], attempt=self.planned(), history=history
-        )
         self.assertEqual("conflicted", payload["result"])
+        self.assertIsNone(payload["escalation"])
+        self.assertEqual("conflicted", self.saved()["attempt"]["status"])
 
     def test_a_clean_merge_moves_on_to_continue(self):
         payload = self.attempt(
@@ -2946,7 +2927,7 @@ class ResolvedTest(unittest.TestCase):
             self.git_try.call_args[0][1:],
         )
 
-    def test_remaining_conflicts_keep_the_loop_on_resolved(self):
+    def test_remaining_conflicts_keep_the_run_on_resolved(self):
         self.write("app.py", b"ours\ntheirs\n")
         payload = self.resolve(
             attempt=attempt_record(
@@ -3437,7 +3418,7 @@ class PublishTest(unittest.TestCase):
         pushed_head=None,
         **state_overrides,
     ):
-        overrides = {"attempt": attempt_record(status="resolved")}
+        overrides = {"attempts": 1, "attempt": attempt_record(status="resolved")}
         overrides.update(state_overrides)
         state_path = write_state(self.directory, **overrides)
         args = SimpleNamespace(state=str(state_path))
@@ -3493,7 +3474,7 @@ class PublishTest(unittest.TestCase):
         self.assertEqual("head1", payload["previous_head_sha"])
         self.assertEqual("mergeable", payload["mergeability"])
         self.assertEqual("head2", payload["mergeable_at_head_sha"])
-        self.assertEqual(1, payload["iterations"])
+        self.assertEqual(1, payload["attempts"])
         self.assertIn("no other branch moved during the push", payload["push_verification"]["checks"])
         state = self.saved()
         self.assertEqual("published", state["attempt"]["status"])
@@ -3577,7 +3558,7 @@ class PublishTest(unittest.TestCase):
         payload = self.publish(final=pr_metadata(head_sha="head2", mergeable="CONFLICTING"))
         self.assertEqual("conflicting", payload["mergeability"])
         self.assertIsNone(payload["mergeable_at_head_sha"])
-        self.assertEqual(1, payload["iterations"])
+        self.assertEqual(1, payload["attempts"])
 
     def test_only_a_resolved_attempt_can_be_published(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "only a resolved attempt"):
@@ -3702,7 +3683,7 @@ class EscalateTest(unittest.TestCase):
         payload = self.escalate()
         self.assertEqual("escalated", payload["result"])
         self.assertEqual("contradiction", payload["escalation"]["kind"])
-        self.assertEqual(1, payload["escalation"]["iteration"])
+        self.assertEqual(1, payload["escalation"]["attempt_number"])
         state = self.saved()
         self.assertEqual("escalated", state["attempt"]["status"])
         self.assertEqual(1, len(state["history"]))
@@ -3720,7 +3701,7 @@ class EscalateTest(unittest.TestCase):
     def test_escalating_with_no_attempt_still_records_the_reason(self):
         payload = self.escalate(attempt=None)
         self.assertIsNone(payload["attempt"])
-        self.assertIsNone(payload["escalation"]["iteration"])
+        self.assertIsNone(payload["escalation"]["attempt_number"])
         self.assertEqual("contradiction", self.saved()["escalation"]["kind"])
 
 
@@ -3732,7 +3713,7 @@ class StageOutcomeTest(unittest.TestCase):
 
     def test_every_outcome_is_in_the_agreed_vocabulary(self):
         self.assertEqual(
-            ("cleared", "skipped", "no_progress", "escalated", "carried"),
+            ("cleared", "skipped", "completed", "escalated"),
             MODULE.STAGE_OUTCOMES,
         )
 
@@ -3758,7 +3739,12 @@ class StageOutcomeTest(unittest.TestCase):
         )
         self.assertEqual("cleared", outcome)
 
-    def test_a_published_run_that_did_not_reach_mergeable_escalates(self):
+    def test_a_published_run_that_did_not_reach_mergeable_is_completed(self):
+        """Calling this escalated would send a person after a run that worked.
+
+        The run pushed its resolution and read the answer GitHub gave, which
+        is the whole job even when that answer is still conflicting.
+        """
         outcome = MODULE.stage_outcome(
             self.state(
                 attempt=attempt_record(
@@ -3768,7 +3754,18 @@ class StageOutcomeTest(unittest.TestCase):
                 )
             )
         )
-        self.assertEqual("escalated", outcome)
+        self.assertEqual("completed", outcome)
+
+    def test_a_completed_run_does_not_clear_the_stage(self):
+        state = self.state(
+            attempt=attempt_record(
+                status="published",
+                published_head_sha="head2",
+                mergeable_at_head_sha=None,
+            )
+        )
+        self.assertEqual("completed", MODULE.stage_outcome(state))
+        self.assertIsNone(MODULE.cleared_head_sha(state))
 
     def test_a_clearance_recorded_for_another_commit_is_not_believed(self):
         outcome = MODULE.stage_outcome(
@@ -3780,7 +3777,7 @@ class StageOutcomeTest(unittest.TestCase):
                 )
             )
         )
-        self.assertEqual("escalated", outcome)
+        self.assertEqual("completed", outcome)
 
     def test_a_clearance_that_names_no_commit_is_not_a_clearance(self):
         outcome = MODULE.stage_outcome(
@@ -3790,22 +3787,8 @@ class StageOutcomeTest(unittest.TestCase):
         )
         self.assertEqual("escalated", outcome)
 
-    def test_a_repeating_run_reports_no_progress(self):
-        outcome = MODULE.stage_outcome(
-            self.state(escalation={"kind": "no_progress", "reason": "same files twice"})
-        )
-        self.assertEqual("no_progress", outcome)
-
-    def test_a_spent_iteration_cap_reports_carried(self):
-        outcome = MODULE.stage_outcome(
-            self.state(escalation={"kind": "max_iterations", "reason": "r"})
-        )
-        self.assertEqual("carried", outcome)
-
-    def test_every_other_escalation_kind_reports_escalated(self):
+    def test_every_escalation_kind_reports_escalated(self):
         for kind in MODULE.ESCALATION_KINDS:
-            if kind in ("no_progress", "max_iterations"):
-                continue
             with self.subTest(kind=kind):
                 outcome = MODULE.stage_outcome(
                     self.state(escalation={"kind": kind, "reason": "r"})
@@ -3947,15 +3930,15 @@ class StatusCommandTest(unittest.TestCase):
         self.state_path = Path(path) if path else None
         return emitted(emit)
 
-    def test_the_machine_readable_answer_carries_the_loop_outcome(self):
+    def test_the_machine_readable_answer_carries_the_run_outcome(self):
         payload = self.status(
-            iterations=2,
+            attempts=2,
             attempt=attempt_record(
                 status="published",
                 published_head_sha="head2",
                 mergeable_at_head_sha="head2",
             ),
-            history=[{"id": "pr-7-iteration-1", "status": "published"}],
+            history=[{"id": "pr-7-attempt-1", "status": "published"}],
             relations={"dependents": [dependent()], "stacked_on": None},
         )
         self.assertEqual("ready", payload["result"])
@@ -3963,7 +3946,7 @@ class StatusCommandTest(unittest.TestCase):
         self.assertEqual(7, payload["pr"]["number"])
         self.assertEqual("published", payload["attempt"]["status"])
         self.assertEqual("head2", payload["mergeable_at_head_sha"])
-        self.assertEqual(2, payload["iterations"])
+        self.assertEqual(2, payload["attempts"])
         self.assertEqual(
             {"conflicts": 1, "dependents": 1, "history": 1}, payload["counts"]
         )
@@ -3986,7 +3969,7 @@ class StatusCommandTest(unittest.TestCase):
             "kind": "contradiction",
             "reason": "both sides changed the same guard",
             "recommended_action": "a person must choose",
-            "iteration": 1,
+            "attempt_number": 1,
             "recorded_at": "2026-01-01T00:00:00Z",
         }
         payload = self.status(escalation=escalation)
@@ -4064,7 +4047,7 @@ class StatusCommandTest(unittest.TestCase):
             MODULE.command_status(args)
         self.assertEqual("ready", emitted(emit)["result"])
 
-    def test_a_pull_request_this_loop_never_touched_reports_no_state(self):
+    def test_a_pull_request_this_resolver_never_touched_reports_no_state(self):
         args = SimpleNamespace(state=None, current=True, repo_root=None)
         with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
             MODULE, "resolve_repo_root", return_value=self.directory
@@ -4142,12 +4125,30 @@ class ParserTest(unittest.TestCase):
                 args = self.parser.parse_args(arguments)
                 self.assertTrue(callable(args.function))
 
-    def test_preflight_defaults_match_the_documented_loop(self):
+    def test_preflight_defaults_match_the_documented_run(self):
         args = self.parser.parse_args(["preflight"])
         self.assertIsNone(args.target)
         self.assertEqual("auto", args.strategy)
-        self.assertEqual(MODULE.DEFAULT_MAX_ITERATIONS, args.max_iterations)
-        self.assertEqual(5, MODULE.DEFAULT_MAX_ITERATIONS)
+        self.assertFalse(args.whole_stack)
+        self.assertFalse(hasattr(args, "max_iterations"))
+
+    def test_preflight_rejects_the_arguments_an_outer_loop_used_to_pass(self):
+        """A caller that still passes them would otherwise run unbounded.
+
+        Failing loudly beats silently accepting a cap this resolver no longer
+        honours.
+        """
+        for argument in (
+            "--max-iterations",
+            "--new-invocation",
+            "--invocation-run",
+            "--pipeline-run",
+            "--pipeline-iteration",
+            "--pipeline-max-iterations",
+        ):
+            with self.subTest(argument=argument):
+                with self.assertRaises(SystemExit):
+                    self.parser.parse_args(["preflight", argument, "1"])
 
     def test_preflight_accepts_every_argument_shape(self):
         for target in (
@@ -4235,14 +4236,14 @@ class ParserTest(unittest.TestCase):
 class MainTest(unittest.TestCase):
     def test_a_successful_command_exits_zero(self):
         with mock.patch.object(
-            MODULE.sys, "argv", ["conflict_fix_loop.py", "status", "--state", "s.json"]
+            MODULE.sys, "argv", ["pr_conflict_resolver.py", "status", "--state", "s.json"]
         ), mock.patch.object(MODULE, "command_status") as command:
             self.assertEqual(0, MODULE.main())
         command.assert_called_once()
 
     def test_a_workflow_error_is_reported_as_json_and_exits_one(self):
         with mock.patch.object(
-            MODULE.sys, "argv", ["conflict_fix_loop.py", "status", "--state", "s.json"]
+            MODULE.sys, "argv", ["pr_conflict_resolver.py", "status", "--state", "s.json"]
         ), mock.patch.object(
             MODULE, "command_status", side_effect=MODULE.WorkflowError("boom")
         ), mock.patch.object(MODULE, "emit") as emit:
@@ -4258,7 +4259,7 @@ class MainTest(unittest.TestCase):
                 with mock.patch.object(
                     MODULE.sys,
                     "argv",
-                    ["conflict_fix_loop.py", "status", "--state", "s.json"],
+                    ["pr_conflict_resolver.py", "status", "--state", "s.json"],
                 ), mock.patch.object(
                     MODULE, "command_status", side_effect=error
                 ), mock.patch.object(MODULE, "emit") as emit:
@@ -4267,7 +4268,7 @@ class MainTest(unittest.TestCase):
 
     def test_an_unexpected_error_is_not_swallowed(self):
         with mock.patch.object(
-            MODULE.sys, "argv", ["conflict_fix_loop.py", "status", "--state", "s.json"]
+            MODULE.sys, "argv", ["pr_conflict_resolver.py", "status", "--state", "s.json"]
         ), mock.patch.object(
             MODULE, "command_status", side_effect=ValueError("unexpected")
         ):
@@ -4290,12 +4291,12 @@ class RealGitConflictTest(GitTestCase):
         cls.template_repo = Path(cls.template.name).resolve() / "repo"
         cls.template_repo.mkdir()
         cls.git_in(cls.template_repo, "init", "--initial-branch", "main")
-        cls.git_in(cls.template_repo, "config", "user.name", "Conflict Fix Loop")
+        cls.git_in(cls.template_repo, "config", "user.name", "PR Conflict Resolver")
         cls.git_in(
             cls.template_repo,
             "config",
             "user.email",
-            "conflict-fix-loop@example.invalid",
+            "pr-conflict-resolver@example.invalid",
         )
         cls.git_in(cls.template_repo, "config", "core.autocrlf", "false")
         cls.git_in(cls.template_repo, "config", "commit.gpgsign", "false")
@@ -4409,7 +4410,7 @@ class RealGitConflictTest(GitTestCase):
             [item["subject"] for item in conflict["base_commits"]],
         )
 
-    def test_commit_subjects_read_the_branch_the_loop_would_republish(self):
+    def test_commit_subjects_read_the_branch_the_run_would_republish(self):
         self.assertEqual(
             ["Take a name"],
             MODULE.commit_subjects(self.repo, f"{self.merge_base}..{self.head_sha}"),
@@ -4538,7 +4539,7 @@ class RealGitConflictTest(GitTestCase):
         self.assertIsNone(MODULE.integration_in_progress(self.repo))
         MODULE.require_clean_worktree(self.repo)
 
-    def test_a_dirty_worktree_stops_the_loop(self):
+    def test_a_dirty_worktree_stops_the_run(self):
         self.write("notes.md", "edited\n")
         with self.assertRaisesRegex(MODULE.WorkflowError, "worktree is not clean"):
             MODULE.require_clean_worktree(self.repo)
@@ -4556,571 +4557,6 @@ class RealGitConflictTest(GitTestCase):
 
 
 
-class PipelineBudgetTest(unittest.TestCase):
-    """A stage budget belongs to an outer loop's iteration, not to a launch."""
-
-    RECORDED = {"run": "run-a", "iteration": 2, "baseline": 3, "run_baseline": 1}
-
-    def scope(self, state, **pipeline):
-        return MODULE.pipeline_scope(state, SimpleNamespace(**pipeline))
-
-    def test_migration_seals_a_paused_pipeline_budget_before_standalone_work(self):
-        state = {
-            "iterations": 7,
-            "pipeline_budget": {
-                "run": "run-a",
-                "iteration": 2,
-                "baseline": 5,
-                "run_baseline": 5,
-            },
-        }
-        state["budget_scope"] = "lifetime"
-        MODULE.charge_iteration(state)
-        scope = MODULE.scoped_budget(
-            state,
-            "pipeline",
-            MODULE.pipeline_scope(
-                state,
-                SimpleNamespace(pipeline_run="run-a", pipeline_iteration=2),
-            ),
-        )
-
-        self.assertEqual((2, 2), MODULE.budget_spent(state, scope))
-
-    def test_direct_legacy_pipeline_publish_is_charged_after_migration(self):
-        state = {
-            "iterations": 7,
-            "pipeline_budget": {
-                "run": "run-a",
-                "iteration": 2,
-                "baseline": 5,
-                "run_baseline": 5,
-            },
-        }
-
-        MODULE.charge_iteration(state)
-        scope = MODULE.scoped_budget(
-            state,
-            "pipeline",
-            self.scope(state, pipeline_run="run-a", pipeline_iteration=2),
-        )
-
-        self.assertEqual((3, 3), MODULE.budget_spent(state, scope))
-
-    def test_stack_descendant_clearance_does_not_charge_its_paused_pipeline(self):
-        prior = {
-            "version": MODULE.STATE_VERSION,
-            "iterations": 7,
-            "pipeline_budget": {
-                "run": "run-a",
-                "iteration": 2,
-                "baseline": 5,
-                "run_baseline": 5,
-            },
-            "history": [],
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            state_path = Path(directory) / "state.json"
-            MODULE.save_state(state_path, prior)
-            with mock.patch.object(
-                MODULE, "default_state_path", return_value=state_path
-            ), mock.patch.object(
-                MODULE, "stack_member_target", return_value={"number": 2}
-            ), mock.patch.object(
-                MODULE,
-                "live_mergeability",
-                return_value={"head_sha": "member-head", "base_sha": "base"},
-            ), mock.patch.object(
-                MODULE, "classify_mergeability", return_value="mergeable"
-            ):
-                MODULE.record_stack_member_clearances(
-                    {"pr": {"number": 1}},
-                    [{"number": 2, "head_sha": "member-head"}],
-                    invoked_number=1,
-                )
-
-            saved = MODULE.load_state(state_path)
-
-        scope = MODULE.scoped_budget(
-            saved,
-            "pipeline",
-            self.scope(saved, pipeline_run="run-a", pipeline_iteration=2),
-        )
-        self.assertEqual(8, saved["iterations"])
-        self.assertEqual((2, 2), MODULE.budget_spent(saved, scope))
-
-    def test_a_standalone_invocation_is_left_exactly_as_it_was(self):
-        """Absent, empty, and unusable run tokens must never read as a new run."""
-        for pipeline in (
-            {},
-            {"pipeline_run": None, "pipeline_iteration": None},
-            {"pipeline_run": "", "pipeline_iteration": 2},
-            {"pipeline_run": 7, "pipeline_iteration": 2},
-            {"pipeline_iteration": 2},
-            {"pipeline_iteration": 2, "pipeline_max_iterations": 3},
-        ):
-            with self.subTest(pipeline=pipeline):
-                self.assertIsNone(self.scope({"iterations": 3}, **pipeline))
-
-    def test_the_run_token_alone_decides_whether_the_budget_is_scoped(self):
-        """Enumerate every subset of the three arguments rather than assert it in prose.
-
-        The two halves are not symmetric for a reader. An iteration with no run
-        asks which run it belongs to and nothing can answer it. A run with no
-        iteration still answers what the token is for, whether this loop has seen
-        the run before, so it scopes on equality alone. Only the outer cap is
-        optional in the other sense: leaving it out falls back rather than lifting
-        the ceiling.
-        """
-        parts = {
-            "run": {"pipeline_run": "run-a"},
-            "iteration": {"pipeline_iteration": 2},
-            "cap": {"pipeline_max_iterations": 3},
-        }
-        scoped_by_names = {
-            (): False,
-            ("run",): True,
-            ("iteration",): False,
-            ("cap",): False,
-            ("run", "cap"): True,
-            ("iteration", "cap"): False,
-            ("run", "iteration"): True,
-            ("run", "iteration", "cap"): True,
-        }
-        for names, scoped in scoped_by_names.items():
-            with self.subTest(names=names):
-                pipeline = {}
-                for name in names:
-                    pipeline.update(parts[name])
-                scope = self.scope({"iterations": 9}, **pipeline)
-                self.assertEqual(scoped, scope is not None)
-                self.assertEqual(
-                    scoped,
-                    MODULE.absolute_iteration_cap(
-                        scope, 5, pipeline.get("pipeline_max_iterations")
-                    )
-                    is not None,
-                )
-
-    def test_a_lone_run_token_resets_once_and_is_inert_on_every_relaunch(self):
-        """This is what makes the degraded case coarser rather than launch-scoped.
-
-        The caller mints one token per run and repeats it on every relaunch inside
-        that run, so equality alone still tells a first sighting from a repeat. The
-        budget therefore refreshes once when the run arrives and never again while
-        it lasts, which is the stricter direction, not the unbounded one.
-        """
-        state = {"iterations": 5}
-
-        first = self.scope(state, pipeline_run="run-a")
-        self.assertEqual(5, first["baseline"])
-        self.assertEqual(5, first["run_baseline"])
-
-        state["pipeline_budget"] = first
-        for spent in (5, 7, 40):
-            with self.subTest(spent=spent):
-                state["iterations"] = spent
-                relaunch = self.scope(state, pipeline_run="run-a")
-                self.assertEqual(5, relaunch["baseline"])
-                self.assertEqual(5, relaunch["run_baseline"])
-
-        state["iterations"] = 40
-        next_run = self.scope(state, pipeline_run="run-b")
-        self.assertEqual(40, next_run["baseline"])
-        self.assertEqual(40, next_run["run_baseline"])
-
-    def test_an_unusable_iteration_degrades_rather_than_refusing_the_pull_request(self):
-        """Ignoring the run outright is the permanent refusal this contract removes.
-
-        The durable count only ever climbs, so a position this loop discarded would
-        leave a pull request that already reached the cap refusing every later run
-        for the rest of its life. The usable half is used instead.
-        """
-        for iteration in (None, 0, -1, True, "2", 1.5):
-            with self.subTest(iteration=iteration):
-                scope = self.scope(
-                    {"iterations": 5}, pipeline_run="run-a", pipeline_iteration=iteration
-                )
-                self.assertIsNotNone(scope)
-                self.assertIsNone(
-                    MODULE.exhausted_budget({"iterations": 5}, scope, 5, 10)
-                )
-
-    def test_an_iteration_with_no_run_cannot_be_completed_by_this_loops_own_state(self):
-        """A run token must come from the caller, never from what this loop recorded.
-
-        Reading it back out of an earlier budget, a head it pushed, or an
-        escalation it wrote would be this loop naming its own position.
-        """
-        states = (
-            {},
-            {"iterations": 4},
-            {"iterations": 4, "pipeline_budget": dict(self.RECORDED)},
-            {"iterations": 4, "pr": {"head_sha": "aaaa"}, "history": [{"id": "one"}]},
-            {"iterations": 4, "escalation": {"kind": "max_iterations"}},
-            {"iterations": 4, "clean_at_head_sha": "aaaa"},
-        )
-        for state in states:
-            with self.subTest(state=state):
-                self.assertIsNone(
-                    self.scope(dict(state), pipeline_iteration=2, pipeline_max_iterations=3)
-                )
-
-    def test_only_the_position_the_caller_passes_can_reset_the_budget(self):
-        """Enumerate the inputs to a reset instead of claiming the property in prose.
-
-        A repeat of one position stays inert no matter what this loop did in
-        between: a new head, a commit it pushed, an escalation it recorded, a
-        clearance, or more iterations it spent. Every one of those varies here
-        while the caller's values stay the same, and neither baseline moves.
-        """
-        observable = (
-            {},
-            {"pr": {"head_sha": "new-head"}},
-            {"pr": {"head_sha": "another-head"}, "attempt": {"status": "published"}},
-            {"escalation": {"kind": "max_iterations"}},
-            {"history": [{"id": "one"}, {"id": "two"}]},
-            {"clean_at_head_sha": "new-head"},
-            {"last_result": "published"},
-        )
-        for spent in (0, 3, 5, 40):
-            for extra in observable:
-                with self.subTest(spent=spent, extra=extra):
-                    state = {
-                        "iterations": spent,
-                        "pipeline_budget": dict(self.RECORDED),
-                        **extra,
-                    }
-                    scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=2)
-                    self.assertEqual(self.RECORDED, scope)
-
-    def test_a_stale_or_replayed_iteration_is_inert(self):
-        """Strictly greater, so a repeat and a replay both buy nothing."""
-        for iteration in (1, 2):
-            with self.subTest(iteration=iteration):
-                state = {"iterations": 9, "pipeline_budget": dict(self.RECORDED)}
-                scope = self.scope(
-                    state, pipeline_run="run-a", pipeline_iteration=iteration
-                )
-                self.assertEqual(self.RECORDED, scope)
-
-    def test_a_genuine_advance_refreshes_only_the_per_iteration_budget(self):
-        """The whole-run ceiling must survive an advance, or it bounds nothing."""
-        state = {"iterations": 9, "pipeline_budget": dict(self.RECORDED)}
-
-        scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
-
-        self.assertEqual(
-            {"run": "run-a", "iteration": 3, "baseline": 9, "run_baseline": 1}, scope
-        )
-
-    def test_a_first_iteration_inside_a_run_scoped_budget_is_not_an_advance(self):
-        """Nothing was recorded to advance past, so the run's own reset still stands."""
-        state = {
-            "iterations": 9,
-            "pipeline_budget": {
-                "run": "run-a",
-                "iteration": None,
-                "baseline": 5,
-                "run_baseline": 5,
-            },
-        }
-
-        scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
-
-        self.assertEqual(
-            {"run": "run-a", "iteration": 3, "baseline": 5, "run_baseline": 5}, scope
-        )
-
-    def test_a_new_run_resets_both_budgets_even_when_its_iteration_went_backwards(self):
-        """An outer run restarts at 1 while this state is durable per pull request.
-
-        Comparing order alone would see the count go backwards on every later run
-        and never reset again, refusing the pull request for the rest of its life.
-        """
-        state = {
-            "iterations": 9,
-            "pipeline_budget": {
-                "run": "run-a",
-                "iteration": 6,
-                "baseline": 7,
-                "run_baseline": 2,
-            },
-        }
-
-        scope = self.scope(state, pipeline_run="run-b", pipeline_iteration=1)
-
-        self.assertEqual(
-            {"run": "run-b", "iteration": 1, "baseline": 9, "run_baseline": 9}, scope
-        )
-
-    def test_the_run_is_opaque_and_only_ever_compared_for_equality(self):
-        """Tokens that would sort or parse are still just tokens."""
-        state = {
-            "iterations": 4,
-            "pipeline_budget": {
-                "run": "2026-05-01/7",
-                "iteration": 3,
-                "baseline": 2,
-                "run_baseline": 0,
-            },
-        }
-
-        same = self.scope(state, pipeline_run="2026-05-01/7", pipeline_iteration=3)
-        self.assertEqual(2, same["baseline"])
-        for other in ("2026-05-01/8", "2026-04-01/7", "7", "run", " 2026-05-01/7"):
-            with self.subTest(other=other):
-                scope = self.scope(state, pipeline_run=other, pipeline_iteration=3)
-                self.assertEqual(4, scope["baseline"])
-                self.assertEqual(4, scope["run_baseline"])
-
-    def test_a_reset_never_rewrites_the_durable_count_itself(self):
-        """Both budgets are baselines, so the per-PR iteration numbering stays monotone.
-
-        Zeroing the count instead would restart the numbering, and an attempt id
-        built from it would collide with one already folded into history, where a
-        duplicate is dropped rather than recorded.
-        """
-        state = {"iterations": 9, "pipeline_budget": dict(self.RECORDED)}
-
-        self.scope(state, pipeline_run="run-b", pipeline_iteration=1)
-
-        self.assertEqual(9, state["iterations"])
-
-    def test_the_ceiling_is_derived_from_the_callers_own_cap(self):
-        scope = {"run": "run-a", "iteration": 1, "baseline": 0, "run_baseline": 0}
-        self.assertEqual(15, MODULE.absolute_iteration_cap(scope, 5, 3))
-        self.assertEqual(20, MODULE.absolute_iteration_cap(scope, 10, 2))
-
-    def test_an_omitted_outer_cap_falls_back_rather_than_disabling_the_ceiling(self):
-        """Only the outer cap is optional, and omitting it must not remove the bound."""
-        scope = {"run": "run-a", "iteration": 1, "baseline": 0, "run_baseline": 0}
-        for value in (None, 0, -1, True, "3"):
-            with self.subTest(value=value):
-                self.assertEqual(
-                    5 * MODULE.DEFAULT_PIPELINE_MAX_ITERATIONS,
-                    MODULE.absolute_iteration_cap(scope, 5, value),
-                )
-
-    def test_a_standalone_run_keeps_the_flat_per_pull_request_cap(self):
-        """No arguments means the behavior this loop has always had."""
-        for spent, expected in ((0, None), (4, None), (5, "iteration"), (9, "iteration")):
-            with self.subTest(spent=spent):
-                self.assertEqual(
-                    expected,
-                    MODULE.exhausted_budget({"iterations": spent}, None, 5, None),
-                )
-
-    def test_a_scoped_run_spends_against_its_baseline_and_not_the_lifetime_count(self):
-        """A spent brake must not read as a permanent refusal.
-
-        Ninety iterations over the pull request's life say nothing about the run
-        that just started, which has spent none of its own budget.
-        """
-        scope = {"run": "run-a", "iteration": 1, "baseline": 90, "run_baseline": 90}
-        self.assertIsNone(MODULE.exhausted_budget({"iterations": 90}, scope, 5, 10))
-        self.assertIsNone(MODULE.exhausted_budget({"iterations": 94}, scope, 5, 10))
-        self.assertEqual(
-            "iteration", MODULE.exhausted_budget({"iterations": 95}, scope, 5, 10)
-        )
-
-    def test_the_whole_run_ceiling_holds_even_when_every_iteration_looks_fresh(self):
-        """A caller that keeps advancing must still not spend without end."""
-        scope = {"run": "run-a", "iteration": 4, "baseline": 10, "run_baseline": 0}
-        self.assertEqual(
-            "absolute", MODULE.exhausted_budget({"iterations": 10}, scope, 5, 10)
-        )
-        self.assertIsNone(MODULE.exhausted_budget({"iterations": 9}, scope, 5, 10))
-
-    def test_preflight_takes_the_position_and_defaults_it_to_absent(self):
-        parser = MODULE.build_parser()
-
-        bare = parser.parse_args(["preflight"])
-        self.assertFalse(bare.new_invocation)
-        self.assertIsNone(bare.invocation_run)
-        self.assertIsNone(bare.pipeline_run)
-        self.assertIsNone(bare.pipeline_iteration)
-        self.assertIsNone(bare.pipeline_max_iterations)
-
-        given = parser.parse_args(
-            [
-                "preflight",
-                "--pipeline-run",
-                "run-a",
-                "--pipeline-iteration",
-                "2",
-                "--pipeline-max-iterations",
-                "3",
-            ]
-        )
-        self.assertEqual("run-a", given.pipeline_run)
-        self.assertEqual(2, given.pipeline_iteration)
-        self.assertEqual(3, given.pipeline_max_iterations)
-
-        fresh = parser.parse_args(["preflight", "--new-invocation"])
-        self.assertTrue(fresh.new_invocation)
-        resumed = parser.parse_args(
-            ["preflight", "--invocation-run", "manual-run"]
-        )
-        self.assertEqual("manual-run", resumed.invocation_run)
-
-    def test_the_helper_advertises_the_flag_an_orchestrator_probes_for(self):
-        """An orchestrator reads the installed script to decide whether to send it.
-
-        It omits the position entirely when the flag is missing, so renaming it
-        would silently leave this stage unscoped rather than fail.
-        """
-        self.assertIn("--pipeline-run", SCRIPT.read_text(encoding="utf-8"))
-
-
-class InvocationBudgetTest(unittest.TestCase):
-    def scope(self, state, **arguments):
-        return MODULE.invocation_scope(state, SimpleNamespace(**arguments))
-
-    def test_a_new_invocation_preserves_the_lifetime_count_and_starts_at_zero(self):
-        state = {"iterations": 6}
-
-        with mock.patch.object(MODULE.uuid, "uuid4") as token:
-            token.return_value.hex = "manual-run"
-            scope = self.scope(state, new_invocation=True)
-
-        self.assertEqual(
-            {
-                "run": "manual-run",
-                "iteration": None,
-                "baseline": 6,
-                "run_baseline": 6,
-            },
-            scope,
-        )
-        self.assertEqual((0, 0), MODULE.budget_spent(state, scope))
-        self.assertEqual(6, state["iterations"])
-
-    def test_the_returned_token_reuses_only_its_active_invocation_budget(self):
-        state = {
-            "iterations": 8,
-            "invocation_budget": {
-                "run": "manual-run",
-                "iteration": None,
-                "baseline": 6,
-                "run_baseline": 6,
-            },
-        }
-
-        scope = self.scope(state, invocation_run="manual-run")
-
-        self.assertEqual((2, 2), MODULE.budget_spent(state, scope))
-
-    def test_an_unknown_invocation_token_is_rejected(self):
-        state = {
-            "iterations": 8,
-            "invocation_budget": {
-                "run": "manual-run",
-                "iteration": None,
-                "baseline": 6,
-                "run_baseline": 6,
-            },
-        }
-
-        with self.assertRaisesRegex(MODULE.WorkflowError, "--new-invocation"):
-            self.scope(state, invocation_run="other-run")
-
-    def test_pipeline_and_manual_charges_do_not_spend_each_others_budget(self):
-        state = {"iterations": 6}
-        pipeline = {
-            "run": "pipeline-run",
-            "iteration": 2,
-            "baseline": 0,
-            "run_baseline": 0,
-        }
-        invocation = {
-            "run": "manual-run",
-            "iteration": None,
-            "baseline": 6,
-            "run_baseline": 6,
-        }
-        pipeline = MODULE.scoped_budget(state, "pipeline", pipeline)
-        invocation = MODULE.scoped_budget(state, "invocation", invocation)
-        state["pipeline_budget"] = {
-            key: value for key, value in pipeline.items() if not key.startswith("_")
-        }
-        state["budget_scope"] = "pipeline"
-        MODULE.charge_iteration(state)
-        state["invocation_budget"] = {
-            key: value for key, value in invocation.items() if not key.startswith("_")
-        }
-        state["budget_scope"] = "invocation"
-        MODULE.charge_iteration(state)
-
-        self.assertEqual((7, 7), MODULE.budget_spent(state, pipeline))
-        self.assertEqual((1, 1), MODULE.budget_spent(state, invocation))
-
-
-class LauncherPositionInstructionsTest(unittest.TestCase):
-    """The agent file has to take a position however the caller words it."""
-
-    def setUp(self):
-        self.instructions = AGENT.read_text(encoding="utf-8")
-
-    def test_the_position_reaches_preflight_as_the_three_arguments(self):
-        self.assertIn("### A Launcher's Loop Position", self.instructions)
-        self.assertIn(
-            "--pipeline-run <token> --pipeline-iteration <number> "
-            "--pipeline-max-iterations <number>",
-            self.instructions,
-        )
-        self.assertIn("Copy them exactly. Do not read the token", self.instructions)
-
-    def test_keys_the_position_on_the_values_rather_than_one_spelling(self):
-        """A launcher that words it differently still gets its budget scoped.
-
-        Making one phrasing the trigger drops a position supplied any other way,
-        and it drops it silently: the run reports cleanly and the budget was
-        simply never scoped. What makes the widening safe is where a value came
-        from, not how it was written.
-        """
-        self.assertIn("Read the values, not the spelling.", self.instructions)
-        self.assertIn(
-            "a spelling you do not recognize is still the caller's instruction",
-            self.instructions,
-        )
-        self.assertIn("the caller may supply one and you may not", self.instructions)
-
-    def test_the_two_halves_go_out_together_as_a_rule_on_the_sender(self):
-        """The pairing binds what a launcher emits, never what this loop accepts.
-
-        Reading it as a receiver rule would have this loop discard a position that
-        arrived with a half missing, and its durable count would then refuse the
-        pull request for good.
-        """
-        self.assertIn(
-            "Omit all three only when the request names no position at all",
-            self.instructions,
-        )
-        self.assertIn(
-            "Send `--pipeline-run` and `--pipeline-iteration` together",
-            self.instructions,
-        )
-        self.assertNotIn("the helper ignores a lone one", self.instructions)
-
-    def test_the_loop_may_never_supply_a_value_itself(self):
-        self.assertIn(
-            "Never supply, guess, carry over, or reconstruct a value yourself",
-            self.instructions,
-        )
-        self.assertIn(
-            "never invent one to keep working after `max_iterations_reached`",
-            self.instructions,
-        )
-        self.assertIn(
-            "A value you produced would be this loop refreshing its own cap",
-            self.instructions,
-        )
-
-    def test_the_flat_cap_is_stated_as_a_default_an_outer_loop_may_replace(self):
-        self.assertIn("unless an outer loop sets its own", self.instructions)
-
-
 @unittest.skipUnless(shutil.which("git"), "git is not installed")
 class HeadBranchHeldElsewhereTest(unittest.TestCase):
     """The head branch is checked out in a sibling worktree, as in a live run."""
@@ -5132,8 +4568,8 @@ class HeadBranchHeldElsewhereTest(unittest.TestCase):
         self.repo.mkdir()
         self.session = root / "session"
         self.git("init", "--initial-branch", "main")
-        self.git("config", "user.name", "Conflict Fix Loop")
-        self.git("config", "user.email", "conflict-fix-loop@example.invalid")
+        self.git("config", "user.name", "PR Conflict Resolver")
+        self.git("config", "user.email", "pr-conflict-resolver@example.invalid")
         self.git("config", "commit.gpgsign", "false")
         self.write("app.py", "start\n")
         self.commit("Start the app")
@@ -5216,9 +4652,9 @@ class HeadBranchHeldElsewhereTest(unittest.TestCase):
 
 def stack_attempt_record(**overrides):
     attempt = {
-        "id": "pr-7-iteration-1",
+        "id": "pr-7-attempt-1",
         "status": "planned",
-        "iteration": 1,
+        "attempt_number": 1,
         "strategy": "stack",
         "strategy_reason": "cascade",
         "strategy_warnings": [],
@@ -7103,6 +6539,24 @@ class StackPublishCommandTest(unittest.TestCase):
         self.assertEqual("newa", projected["attempt"]["mergeable_at_head_sha"])
         self.assertEqual("base1", projected["attempt"]["base_sha"])
         self.assertEqual(7, projected["attempt"]["stack_source_pr"])
+
+    def test_publishing_records_a_completed_nonclearing_stack_member(self):
+        def final(target, *, expected_head=None):
+            return pr_metadata(
+                number=target["number"],
+                head_sha=expected_head,
+                base_sha="base1",
+                mergeable="MERGEABLE" if target["number"] == 7 else "CONFLICTING",
+            )
+
+        self.publish(final=final)
+
+        projected = json.loads(self.projected_path.read_text(encoding="utf-8"))
+        attempt = projected["attempt"]
+        self.assertEqual("pr-19483-attempt-1", attempt["id"])
+        self.assertEqual("published", attempt["status"])
+        self.assertIsNone(attempt["mergeable_at_head_sha"])
+        self.assertEqual("completed", MODULE.stage_outcome(projected))
 
     def test_a_rejected_atomic_push_preserves_the_workspace_and_publishes_nothing(self):
         self.publish(

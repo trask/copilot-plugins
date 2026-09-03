@@ -354,7 +354,7 @@ class StageContractTest(unittest.TestCase):
     def test_stage_order_is_fixed(self):
         self.assertEqual(
             (
-                "conflict-fix-loop",
+                "pr-conflict-resolver",
                 "copilot-review-loop",
                 "self-review-loop",
                 "ci-fix-loop",
@@ -400,6 +400,16 @@ class StageContractTest(unittest.TestCase):
             ],
             arguments,
         )
+
+    def test_the_conflict_stage_no_longer_takes_a_pipeline_position(self):
+        """PR Conflict Resolver runs once per launch and has no budget to shrink.
+
+        Passing the flags to a helper that rejects them would make every
+        conflict launch die on its own preflight.
+        """
+        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT]
+        self.assertFalse(MODULE.stage_accepts_pipeline_position(entry))
+        self.assertEqual([], MODULE.pipeline_arguments(entry, "run-1", 2))
 
     def test_ci_live_progress_reads_the_action_and_pending_checks(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -540,6 +550,8 @@ class SweepTest(unittest.TestCase):
         self.base_sha = BASE
         self.clear_at = {stage: None for stage in MODULE.STAGE_NAMES}
         self.clear_base_at = None
+        self.completed: set[str] = set()
+        self.attempt_ids = {MODULE.STAGE_CONFLICT: "old-attempt"}
         self.launched: list[tuple[str, int]] = []
         self.events: list[dict] = []
 
@@ -602,6 +614,15 @@ class SweepTest(unittest.TestCase):
         }
 
     def inspect(self, entry, _target, head, base_sha):
+        if entry["stage"] in self.completed:
+            return {
+                **uncleared_stage(entry["stage"]),
+                "outcome": "completed",
+                "reason": "completed",
+                "status": {
+                    "attempt": {"id": self.attempt_ids[MODULE.STAGE_CONFLICT]}
+                },
+            }
         if self.clear_at[entry["stage"]] == head and (
             entry["stage"] != MODULE.STAGE_CONFLICT
             or self.clear_base_at == base_sha
@@ -757,6 +778,63 @@ class SweepTest(unittest.TestCase):
             launches,
         )
         self.assertEqual("incomplete", result["result"])
+
+    def test_second_sweep_does_not_relaunch_a_completed_conflict_resolution(self):
+        original = self.run_stage
+
+        def complete_conflict_and_move_head(entry, *args, **kwargs):
+            result = original(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_CONFLICT:
+                self.clear_at[entry["stage"]] = None
+                self.completed.add(entry["stage"])
+                self.attempt_ids[entry["stage"]] = "current-attempt"
+                if kwargs["sweep"] == 1:
+                    self.sync_heads.append(NEXT_HEAD)
+            return result
+
+        MODULE.run_stage.side_effect = complete_conflict_and_move_head
+        result = self.execute()
+
+        self.assertEqual("incomplete", result["result"])
+        self.assertEqual(
+            [(MODULE.STAGE_CONFLICT, 1)],
+            [
+                launch
+                for launch in self.launched
+                if launch[0] == MODULE.STAGE_CONFLICT
+            ],
+        )
+        skipped = [
+            run
+            for run in result["runs"]
+            if run["stage"] == MODULE.STAGE_CONFLICT and run["sweep"] == 2
+        ]
+        self.assertEqual("completed_this_run", skipped[0]["action"])
+
+    def test_stale_completed_state_does_not_suppress_a_second_sweep(self):
+        self.completed.add(MODULE.STAGE_CONFLICT)
+        original = self.run_stage
+
+        def move_head_without_new_resolver_state(entry, *args, **kwargs):
+            result = original(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_DESCRIPTION and kwargs["sweep"] == 1:
+                self.sync_heads.append(NEXT_HEAD)
+            if entry["stage"] == MODULE.STAGE_CONFLICT:
+                self.completed.add(entry["stage"])
+                self.clear_at[entry["stage"]] = None
+            return result
+
+        MODULE.run_stage.side_effect = move_head_without_new_resolver_state
+        self.execute()
+
+        self.assertEqual(
+            [(MODULE.STAGE_CONFLICT, 1), (MODULE.STAGE_CONFLICT, 2)],
+            [
+                launch
+                for launch in self.launched
+                if launch[0] == MODULE.STAGE_CONFLICT
+            ],
+        )
 
     def test_two_sweeps_bound_the_run_at_ten_stage_launches(self):
         def never_clear(entry, *args, **kwargs):
