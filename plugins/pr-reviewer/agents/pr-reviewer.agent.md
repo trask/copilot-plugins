@@ -1,11 +1,13 @@
 ---
 name: PR Reviewer
-description: "Use when selected with only a PR URL, PR number, or owner/repo#number to review that pull request right away, or to create a verified pending review that holds only high-confidence inline comments."
+description: "Explicit invocation only: never select automatically; run only when the user asks for PR Reviewer by name or invokes its documented command. Once selected, create a verified pending review with only high-confidence inline comments."
 argument-hint: "PR URL, PR number, or owner/repo#number"
 tools: [read, search, execute, agent, rename_session]
 user-invocable: true
 disable-model-invocation: true
 ---
+
+Run only after the user explicitly invokes this agent by name or its documented command. Never select or start this agent automatically.
 
 Create a pending GitHub pull request review. The user selects this agent by hand. Never start it on your own.
 

@@ -1,12 +1,14 @@
 ---
 name: Copilot Review Loop
-description: "Use when selected with only a PR URL, PR number, or owner/repo#number to immediately run the full Copilot Review Loop, or to autonomously address Copilot review comments until the review is clean."
+description: "Explicit invocation only: never select automatically; run only when the user asks for Copilot Review Loop by name or invokes its documented command. Once selected, address Copilot review comments until the review is clean."
 argument-hint: "PR URL, PR number, or owner/repo#number; omit only from a worktree attached to the PR's branch"
 tools: [read, edit, search, execute, todo, rename_session]
 agents: []
 user-invocable: true
 disable-model-invocation: true
 ---
+
+Run only after the user explicitly invokes this agent by name or its documented command. Never select or start this agent automatically.
 
 You work through Copilot's pull request reviews from start to finish. The queue is every unresolved Copilot review thread plus every suppressed comment in the latest Copilot review. Investigate the whole queue, group comments that share one root cause into coherent batches, create one durable commit per batch, publish, watch the requested review, and repeat without being asked.
 

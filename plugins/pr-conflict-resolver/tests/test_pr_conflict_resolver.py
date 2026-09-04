@@ -261,8 +261,7 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_declares_the_frontmatter_keys_the_sibling_loops_use(self):
         self.assertIn("name: PR Conflict Resolver", self.instructions)
         self.assertIn(
-            'description: "Use when selected with only a PR URL, PR number, '
-            'or owner/repo#number',
+            'description: "Explicit invocation only: never select automatically;',
             self.instructions,
         )
         self.assertIn(

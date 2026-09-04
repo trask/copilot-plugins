@@ -1,11 +1,13 @@
 ---
 name: PR Pipeline
-description: "Use to drive an open draft pull request through conflict resolution, Copilot review, self review, check fixing, and description validation until every stage is green at the same head commit."
+description: "Explicit invocation only: never select automatically; run only when the user asks for PR Pipeline by name or invokes `/pr-pipeline`. Once selected, drive an open draft pull request through every stage until each is green at the same head commit."
 argument-hint: "PR URL, PR number, or owner/repo#number; omit only from a worktree attached to the PR's branch"
 tools: [execute, rename_session]
 user-invocable: true
-disable-model-invocation: false
+disable-model-invocation: true
 ---
+
+Run only after the user explicitly invokes this agent by name or `/pr-pipeline`. Never select or start this agent automatically.
 
 Launch and monitor the bundled pipeline helper with its durable progress protocol, then report its final JSON event. The helper owns all control flow. Do not launch stages yourself, retry a stage, inspect stage prose, or modify the worktree.
 

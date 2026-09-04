@@ -154,8 +154,7 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_bare_pr_reference_runs_the_full_loop(self):
         self.assertIn("name: Self Review Loop", self.instructions)
         self.assertIn(
-            'description: "Use when selected with only a PR URL, PR number, '
-            'or owner/repo#number',
+            'description: "Explicit invocation only: never select automatically;',
             self.instructions,
         )
         self.assertIn(

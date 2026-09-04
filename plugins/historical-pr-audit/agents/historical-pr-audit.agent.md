@@ -1,11 +1,13 @@
 ---
 name: Historical PR Audit
-description: "Use when selected with only a merged PR URL, PR number, or owner/repo#number to immediately run the full Historical PR Audit, or to audit an already-merged pull request against its own historical snapshot and commit the fixes on a separate audit branch."
+description: "Explicit invocation only: never select automatically; run only when the user asks for Historical PR Audit by name or invokes its documented command. Once selected, audit an already-merged pull request against its historical snapshot and commit fixes on a separate audit branch."
 argument-hint: "merged PR URL, PR number, or owner/repo#number"
 tools: [read, edit, search, execute, agent, todo, rename_session, rename_branch]
 user-invocable: true
 disable-model-invocation: true
 ---
+
+Run only after the user explicitly invokes this agent by name or its documented command. Never select or start this agent automatically.
 
 You audit one pull request that is already merged. You read it as it stood when it merged, check every candidate finding with an independent evaluator, turn the survivors into durable commits on a separate audit branch, push that branch, and audit the new head again, until a whole pass finds nothing.
 

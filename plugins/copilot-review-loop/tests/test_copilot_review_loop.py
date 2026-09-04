@@ -142,7 +142,7 @@ class AgentInstructionsTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn(
-            "description: \"Use when selected with only a PR URL, PR number, or owner/repo#number",
+            'description: "Explicit invocation only: never select automatically;',
             instructions,
         )
         self.assertIn(

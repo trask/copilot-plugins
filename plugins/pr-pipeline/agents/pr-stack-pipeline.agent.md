@@ -1,11 +1,13 @@
 ---
 name: PR Stack Pipeline
-description: "Use to drive a selected suffix of one native GitHub stack through conflict resolution, Copilot review, self review, check fixing, and description validation until every member is green at the same snapshot."
+description: "Explicit invocation only: never select automatically; run only when the user asks for PR Stack Pipeline by name or invokes `/pr-stack-pipeline`. Once selected, drive a native GitHub stack suffix through every stage until each member is green at the same snapshot."
 argument-hint: "the structured kickoff JSON: {\"version\":1,\"repository\":\"owner/repo\",\"stackNumber\":77,\"startPullRequest\":11,\"pullRequests\":[11,12]}"
 tools: [execute, rename_session]
 user-invocable: true
-disable-model-invocation: false
+disable-model-invocation: true
 ---
+
+Run only after the user explicitly invokes this agent by name or `/pr-stack-pipeline`. Never select or start this agent automatically.
 
 Launch and monitor the bundled stack helper with its durable progress protocol, then report its final JSON event. The helper owns all control flow. Do not launch stages yourself, create worktrees or sessions, retry a stage, inspect stage prose, rebase anything, or modify a worktree.
 

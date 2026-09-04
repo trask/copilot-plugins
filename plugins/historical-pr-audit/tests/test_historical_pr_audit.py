@@ -149,8 +149,7 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_declares_the_agent_and_its_activation(self):
         self.assertIn("name: Historical PR Audit", self.instructions)
         self.assertIn(
-            'description: "Use when selected with only a merged PR URL, PR number, '
-            'or owner/repo#number',
+            'description: "Explicit invocation only: never select automatically;',
             self.instructions,
         )
         self.assertIn(
