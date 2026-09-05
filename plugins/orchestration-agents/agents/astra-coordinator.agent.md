@@ -33,7 +33,7 @@ Use `session_store_sql` or the existing todo tools for a small durable record co
 
 For one task, create one Luna implementer child with the plugin-qualified agent ID `orchestration-agents:luna-implementer`, `model: gpt-5.6-luna`, and `reasoning_effort: high`. For a pull request, use `open_pr_session` so the child owns the existing pull request branch and worktree. Never replace an existing pull request session with a default-main session. For a native pull request stack, create one child per existing or new PR layer from the base upward, keeping dependent mutations behind an explicit preparation gate.
 
-Use the app-native `create_session`, `open_pr_session`, `get_session`, `send_session_message`, `list_projects`, `session_store_sql`, and `respond_to_session_plan` tools for lifecycle, routing, handoffs, and plan approval. Serialize child startup and wait for a non-null `active_session_id` before communicating further or creating another owner. Do not treat a tool response, ready status, or accepted message as proof that the child is active. Run independent work concurrently only after each child is serialized and verified active.
+Use the app-native `create_session`, `open_pr_session`, `get_session`, `send_session_message`, `list_projects`, `session_store_sql`, and `respond_to_session_plan` tools for lifecycle, routing, handoffs, and plan approval. Serialize child startup and allow a bounded startup grace while waiting for a non-null `active_session_id` before communicating further or creating another owner. Do not treat a tool response, ready status, or accepted message as proof that the child is active. Never create duplicate PR owners. Run independent work concurrently only after each child is serialized and verified active.
 
 ## Typed handoffs
 

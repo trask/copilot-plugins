@@ -75,6 +75,8 @@ class MarketplaceTest(unittest.TestCase):
         self.assertIn("stack_number", astra)
         self.assertIn("pr_number", astra)
         self.assertIn("at most one bounded", astra)
+        self.assertIn("bounded startup grace", astra)
+        self.assertIn("duplicate PR owners", astra)
         self.assertIn("current assignment ID", astra)
         self.assertIn("send_session_message", luna)
         self.assertIn("orchestration-agents:luna-implementer", luna)
