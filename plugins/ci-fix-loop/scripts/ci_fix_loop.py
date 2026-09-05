@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import fnmatch
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,8 @@ import uuid
 
 
 STATE_VERSION = 1
+STACK_STATE_KIND = "native_stack"
+STACK_ENTRIES_PAGE = 100
 DEFAULT_MAX_ITERATIONS = 5
 DEFAULT_PIPELINE_MAX_ITERATIONS = 2
 DEFAULT_POLL_INTERVAL = 60
@@ -28,6 +31,7 @@ DEFAULT_NOT_STARTED_GRACE = 900
 MAX_RERUNS_PER_CHECK = 1
 PR_HEAD_LAG_RETRY_DELAY = 1
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
+PROPAGATION_CONTAINMENT_RETRY_DELAYS = (1, 2, 4)
 EMPTY_RERUN_COMMIT_MESSAGE = "ci: rerun checks"
 IS_WINDOWS = os.name == "nt"
 PR_URL_PATTERN = re.compile(
@@ -104,6 +108,27 @@ PASSED_BASELINE_CONCLUSIONS = {"SUCCESS"}
 APPROVAL_RUN_STATES = {"ACTION_REQUIRED", "WAITING"}
 VERDICTS = ("pr_caused", "pre_existing", "flake")
 WORKING_ACTIONS = ("attribute", "rerun", "fix")
+STACK_CLEAR_OUTCOMES = {"cleared", "skipped"}
+
+STACK_QUERY = (
+    "query($owner: String!, $name: String!, $number: Int!, $first: Int!) {"
+    "  repository(owner: $owner, name: $name) {"
+    "    pullRequest(number: $number) {"
+    "      stack {"
+    "        id number size baseRefName"
+    "        entries(first: $first) {"
+    "          nodes {"
+    "            position"
+    "            pullRequest {"
+    "              number title headRefName baseRefName headRefOid isDraft state"
+    "            }"
+    "          }"
+    "        }"
+    "      }"
+    "    }"
+    "  }"
+    "}"
+)
 
 # A path this matches holds tests. The loop refuses to make a check pass by
 # stopping one of them from running, so it needs to recognize one by name.
@@ -387,6 +412,29 @@ def parse_target(target: str) -> dict[str, Any]:
 def default_state_path(target: dict[str, Any]) -> Path:
     name = f"{target['owner']}--{target['repo']}--{target['number']}.json"
     return Path.home() / ".copilot" / "run" / "ci-fix-loop" / name
+
+
+def default_stack_state_path(
+    target: dict[str, Any], stack_number: int, run_id: str
+) -> Path:
+    name = (
+        f"{target['owner']}--{target['repo']}--stack-{stack_number}--{run_id}.json"
+    )
+    return Path.home() / ".copilot" / "run" / "ci-fix-loop" / "stacks" / name
+
+
+def stack_member_state_path(stack_state_path: Path, member_number: int) -> Path:
+    return stack_state_path.with_name(
+        f"{stack_state_path.stem}--pr-{member_number}.json"
+    )
+
+
+def stack_propagation_state_path(
+    stack_state_path: Path, fixed_number: int, expected_head: str
+) -> Path:
+    return stack_state_path.with_name(
+        f"{stack_state_path.stem}--propagate-pr-{fixed_number}-{expected_head}.json"
+    )
 
 
 def diff_path_for(state_path: Path) -> Path:
@@ -768,6 +816,136 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
         "is_draft": bool(metadata.get("isDraft")),
         "commits": commits,
     }
+
+
+def parse_native_stack(raw: Any) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise WorkflowError("the native stack is not an object")
+    trunk = raw.get("baseRefName")
+    if not isinstance(trunk, str) or not trunk:
+        raise WorkflowError("the native stack has no trunk branch")
+    entries = raw.get("entries")
+    nodes = entries.get("nodes") if isinstance(entries, dict) else None
+    if not isinstance(nodes, list):
+        raise WorkflowError("the native stack has no readable member list")
+    members: list[dict[str, Any]] = []
+    for node in nodes:
+        member = node.get("pullRequest") if isinstance(node, dict) else None
+        if not isinstance(member, dict):
+            raise WorkflowError("the native stack has an unreadable member")
+        number = member.get("number")
+        title = member.get("title")
+        head_branch = member.get("headRefName")
+        base_branch = member.get("baseRefName")
+        head_sha = member.get("headRefOid")
+        if (
+            not isinstance(number, int)
+            or not isinstance(title, str)
+            or not title.strip()
+            or not isinstance(head_branch, str)
+            or not head_branch
+            or not isinstance(base_branch, str)
+            or not base_branch
+            or not isinstance(head_sha, str)
+            or not head_sha
+        ):
+            raise WorkflowError(
+                f"native stack member {number!r} is missing a required field"
+            )
+        members.append(
+            {
+                "position": node.get("position"),
+                "number": number,
+                "title": title.strip(),
+                "head_branch": head_branch,
+                "base_branch": base_branch,
+                "head_sha": head_sha,
+                "is_draft": bool(member.get("isDraft")),
+                "state": member.get("state"),
+            }
+        )
+    members.sort(
+        key=lambda item: (item["position"] is None, item["position"], item["number"])
+    )
+    size = raw.get("size")
+    if not isinstance(size, int) or size != len(members):
+        raise WorkflowError(
+            f"the native stack reports {size!r} members but exposes {len(members)}"
+        )
+    number = raw.get("number")
+    if not isinstance(number, int):
+        raise WorkflowError("the native stack has no number")
+    return {
+        "id": raw.get("id"),
+        "number": number,
+        "size": size,
+        "trunk": trunk,
+        "members": members,
+    }
+
+
+def read_native_stack(target: dict[str, Any]) -> dict[str, Any] | None:
+    payload = graphql(
+        STACK_QUERY,
+        {
+            "owner": target["owner"],
+            "name": target["repo"],
+            "number": target["number"],
+            "first": STACK_ENTRIES_PAGE,
+        },
+    )
+    data = payload.get("data") if isinstance(payload, dict) else None
+    repository = data.get("repository") if isinstance(data, dict) else None
+    if not isinstance(repository, dict):
+        raise WorkflowError("the stack query returned no repository")
+    pull = repository.get("pullRequest")
+    if not isinstance(pull, dict):
+        raise WorkflowError("the stack query returned no pull request")
+    return parse_native_stack(pull.get("stack"))
+
+
+def stack_topology_fingerprint(stack: dict[str, Any]) -> str:
+    material = json.dumps(
+        {
+            "id": stack.get("id"),
+            "number": stack.get("number"),
+            "trunk": stack.get("trunk"),
+            "members": [
+                [member["number"], member["head_branch"], member["base_branch"]]
+                for member in stack["members"]
+            ],
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def commit_contains(repository: str, ancestor: str, descendant: str) -> bool:
+    payload = gh_json(
+        ["api", f"repos/{repository}/compare/{ancestor}...{descendant}"]
+    )
+    return isinstance(payload, dict) and payload.get("status") in {
+        "ahead",
+        "identical",
+    }
+
+
+def copilot_home() -> Path:
+    value = os.environ.get("COPILOT_HOME", "").strip()
+    return cli_path(value) if value else Path.home() / ".copilot"
+
+
+def conflict_resolver_script() -> Path:
+    return (
+        copilot_home()
+        / "installed-plugins"
+        / "trask-plugins"
+        / "pr-conflict-resolver"
+        / "scripts"
+        / "pr_conflict_resolver.py"
+    )
 
 
 def changed_files_for(pr: dict[str, Any]) -> list[str]:
@@ -2117,6 +2295,13 @@ def command_preflight(args: argparse.Namespace) -> None:
         raise WorkflowError(f"worktree is not clean:\n{dirty}")
 
     metadata = metadata_for(target)
+    stack_guard = (
+        verify_stack_member_guard(
+            cli_path(args.stack_state), target, metadata["head_sha"]
+        )
+        if getattr(args, "stack_state", None)
+        else None
+    )
     checked_out_branch = checkout_pr(repo_root, target, metadata)
     branch = git(repo_root, "branch", "--show-current")
     if checked_out_branch and branch != metadata["head_branch"]:
@@ -2232,6 +2417,7 @@ def command_preflight(args: argparse.Namespace) -> None:
                 "batches": [],
                 "tracking": {},
                 "decision": None,
+                "stack_guard": stack_guard,
                 "charged": False,
                 "budget_scope": budget_scope,
                 "budget_head_key": budget_head_key,
@@ -2576,6 +2762,25 @@ def command_rerun(args: argparse.Namespace) -> None:
     require_tools()
     path = cli_path(args.state)
     state = load_state(path)
+    completed = finalized_stack_push(state, "rerun", check_key=args.check)
+    if completed is not None:
+        pushed, checkpoint = completed
+        resume = pushed.get("resume") or {}
+        emit(
+            {
+                "result": "empty_commit_published",
+                "state": str(path),
+                "check": args.check,
+                "name": resume.get("name"),
+                "run_id": resume.get("run_id"),
+                "head_sha": pushed["head_sha"],
+                "reruns": 1,
+                "max_reruns": MAX_RERUNS_PER_CHECK,
+                "accepted_push": checkpoint,
+                "recovered": True,
+            }
+        )
+        return
     run_state = active_run(state)
     attributions = run_state.get("attributions") or {}
     entry = attributions.get(args.check)
@@ -2681,6 +2886,7 @@ def command_rerun(args: argparse.Namespace) -> None:
 def command_plan(args: argparse.Namespace) -> None:
     path = cli_path(args.state)
     state = load_state(path)
+    require_stack_guard(state)
     run_state = active_run(state)
     require_known_checks(run_state, args.checks)
     attributions = run_state.get("attributions") or {}
@@ -2899,6 +3105,7 @@ def accepted_push_checkpoint(
     head_sha: str,
     commits: list[str],
     kind: str = "fix",
+    checkpoint_id: str | None = None,
 ) -> dict[str, Any]:
     pipeline_budget = (
         state.get("pipeline_budget")
@@ -2906,7 +3113,7 @@ def accepted_push_checkpoint(
         else None
     ) or {}
     checkpoint = {
-        "id": uuid.uuid4().hex,
+        "id": checkpoint_id or uuid.uuid4().hex,
         "accepted_at": utc_now(),
         "previous_head_sha": previous_head,
         "head_sha": head_sha,
@@ -2917,6 +3124,142 @@ def accepted_push_checkpoint(
     }
     state.setdefault("accepted_pushes", []).append(checkpoint)
     return checkpoint
+
+
+def prepare_pending_stack_push(
+    path: Path,
+    state: dict[str, Any],
+    *,
+    previous_head: str,
+    head_sha: str,
+    commits: list[str],
+    kind: str,
+    validation: dict[str, Any] | None = None,
+    resume: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    guard = (active_run(state).get("stack_guard") or {})
+    if not guard:
+        return None
+    pending = state.get("pending_stack_push")
+    expected = {
+        "previous_head_sha": previous_head,
+        "head_sha": head_sha,
+        "commits": commits,
+        "kind": kind,
+        "pipeline_run": guard.get("run_id"),
+        "member": guard.get("member"),
+    }
+    if isinstance(pending, dict):
+        if any(pending.get(key) != value for key, value in expected.items()):
+            raise WorkflowError(
+                "another native stack push intent is already pending in this PR state"
+            )
+        return pending
+    pending = {
+        "id": uuid.uuid4().hex,
+        "prepared_at": utc_now(),
+        **expected,
+        "validation": validation,
+        "resume": resume,
+    }
+    state["pending_stack_push"] = pending
+    save_state(path, state)
+    return pending
+
+
+def finalize_pending_stack_push(
+    path: Path, state: dict[str, Any], pending: dict[str, Any]
+) -> dict[str, Any]:
+    checkpoint = next(
+        (
+            entry
+            for entry in state.get("accepted_pushes") or []
+            if entry.get("id") == pending["id"]
+        ),
+        None,
+    )
+    if checkpoint is None:
+        checkpoint = accepted_push_checkpoint(
+            state,
+            previous_head=pending["previous_head_sha"],
+            head_sha=pending["head_sha"],
+            commits=list(pending["commits"]),
+            kind=pending["kind"],
+            checkpoint_id=pending["id"],
+        )
+    validation = pending.get("validation")
+    if isinstance(validation, dict) and not any(
+        entry.get("pending_push_id") == pending["id"]
+        for entry in state.get("local_validation") or []
+    ):
+        state.setdefault("local_validation", []).append(
+            {**validation, "pending_push_id": pending["id"]}
+        )
+    run_state = active_run(state)
+    run_state["status"] = "published"
+    run_state["published_head_sha"] = pending["head_sha"]
+    state["reruns"] = {}
+    state["clean_at_head_sha"] = None
+    archive_run(state)
+    state["last_stack_push"] = {
+        **pending,
+        "checkpoint_id": checkpoint["id"],
+        "completed_at": utc_now(),
+    }
+    state.pop("pending_stack_push", None)
+    save_state(path, state)
+    return checkpoint
+
+
+def finalized_stack_push(
+    state: dict[str, Any], command: str, *, check_key: str | None = None
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    run_state = state.get("run") or {}
+    completed = state.get("last_stack_push")
+    guard = run_state.get("stack_guard") or {}
+    if (
+        run_state.get("status") != "published"
+        or not isinstance(completed, dict)
+        or (completed.get("resume") or {}).get("command") != command
+        or completed.get("head_sha") != run_state.get("published_head_sha")
+        or completed.get("pipeline_run") != guard.get("run_id")
+        or completed.get("member") != guard.get("member")
+    ):
+        return None
+    if check_key is not None and (completed.get("resume") or {}).get("check") != check_key:
+        return None
+    checkpoint = next(
+        (
+            entry
+            for entry in state.get("accepted_pushes") or []
+            if entry.get("id") == completed.get("checkpoint_id")
+        ),
+        None,
+    )
+    if checkpoint is None:
+        return None
+    return completed, checkpoint
+
+
+def recover_landed_pending_stack_push(
+    path: Path, state: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    pending = state.get("pending_stack_push")
+    if not isinstance(pending, dict):
+        return None
+    run_state = active_run(state)
+    guard = run_state.get("stack_guard") or {}
+    if (
+        pending.get("pipeline_run") != guard.get("run_id")
+        or pending.get("member") != guard.get("member")
+        or pending.get("previous_head_sha") != run_state.get("head_sha")
+    ):
+        raise WorkflowError("the pending native stack push does not match this run")
+    live_head = metadata_for(parse_target(state["pr"]["pr_url"]))["head_sha"]
+    if live_head != pending.get("head_sha"):
+        return None
+    checkpoint = finalize_pending_stack_push(path, state, pending)
+    return pending, checkpoint
 
 
 def require_empty_child(repo_root: Path, commit_sha: str, pinned: str) -> None:
@@ -2942,6 +3285,27 @@ def publish_empty_rerun_commit(
 ) -> None:
     """Publish one empty commit when GitHub explicitly denies a workflow re-run."""
     run_state = active_run(state)
+    recovered = recover_landed_pending_stack_push(path, state)
+    if recovered is not None:
+        pending, checkpoint = recovered
+        if pending.get("kind") != "ci_rerun":
+            raise WorkflowError("the recovered native stack push is not a CI re-run")
+        emit(
+            {
+                "result": "empty_commit_published",
+                "state": str(path),
+                "check": check_key,
+                "name": attribution["name"],
+                "run_id": run_id,
+                "head_sha": pending["head_sha"],
+                "reruns": 1,
+                "max_reruns": MAX_RERUNS_PER_CHECK,
+                "accepted_push": checkpoint,
+                "recovered": True,
+            }
+        )
+        return
+    require_stack_guard(state)
     reruns = state.setdefault("reruns", {})
     fallback = reruns.get(check_key)
     if fallback is not None and (
@@ -3042,6 +3406,20 @@ def publish_empty_rerun_commit(
         fallback["status"] = "prepared"
         save_state(path, state)
 
+    pending = prepare_pending_stack_push(
+        path,
+        state,
+        previous_head=pinned,
+        head_sha=commit_sha,
+        commits=[commit_sha],
+        kind="ci_rerun",
+        resume={
+            "command": "rerun",
+            "check": check_key,
+            "name": attribution["name"],
+            "run_id": run_id,
+        },
+    )
     if remote_current == pinned:
         if pr_head != pinned:
             raise WorkflowError(
@@ -3080,29 +3458,32 @@ def publish_empty_rerun_commit(
 
     fallback["status"] = "published"
     fallback["published_head_sha"] = commit_sha
-    run_state["status"] = "published"
-    run_state["published_head_sha"] = commit_sha
-    accepted_push = next(
-        (
-            checkpoint
-            for checkpoint in state.get("accepted_pushes") or []
-            if checkpoint.get("kind") == "ci_rerun"
-            and checkpoint.get("previous_head_sha") == pinned
-            and checkpoint.get("head_sha") == commit_sha
-        ),
-        None,
-    )
-    if accepted_push is None:
-        accepted_push = accepted_push_checkpoint(
-            state,
-            previous_head=pinned,
-            head_sha=commit_sha,
-            commits=[commit_sha],
-            kind="ci_rerun",
+    if pending is not None:
+        accepted_push = finalize_pending_stack_push(path, state, pending)
+    else:
+        run_state["status"] = "published"
+        run_state["published_head_sha"] = commit_sha
+        accepted_push = next(
+            (
+                checkpoint
+                for checkpoint in state.get("accepted_pushes") or []
+                if checkpoint.get("kind") == "ci_rerun"
+                and checkpoint.get("previous_head_sha") == pinned
+                and checkpoint.get("head_sha") == commit_sha
+            ),
+            None,
         )
-    state["clean_at_head_sha"] = None
-    archive_run(state)
-    save_state(path, state)
+        if accepted_push is None:
+            accepted_push = accepted_push_checkpoint(
+                state,
+                previous_head=pinned,
+                head_sha=commit_sha,
+                commits=[commit_sha],
+                kind="ci_rerun",
+            )
+        state["clean_at_head_sha"] = None
+        archive_run(state)
+        save_state(path, state)
     emit(
         {
             "result": "empty_commit_published",
@@ -3160,6 +3541,39 @@ def command_publish(args: argparse.Namespace) -> None:
     require_tools()
     path = cli_path(args.state)
     state = load_state(path)
+    completed = finalized_stack_push(state, "publish")
+    if completed is not None:
+        pushed, checkpoint = completed
+        emit(
+            {
+                "result": "published",
+                "state": str(path),
+                "head_sha": pushed["head_sha"],
+                "commits": pushed["commits"],
+                "accepted_push": checkpoint,
+                "iterations": state["iterations"],
+                "local_validation": pushed.get("validation"),
+                "recovered": True,
+            }
+        )
+        return
+    recovered = recover_landed_pending_stack_push(path, state)
+    if recovered is not None:
+        pending, checkpoint = recovered
+        emit(
+            {
+                "result": "published",
+                "state": str(path),
+                "head_sha": pending["head_sha"],
+                "commits": pending["commits"],
+                "accepted_push": checkpoint,
+                "iterations": state["iterations"],
+                "local_validation": pending.get("validation"),
+                "recovered": True,
+            }
+        )
+        return
+    require_stack_guard(state)
     run_state = active_run(state)
     repo_root = Path(state["repo_root"])
     dirty = git(repo_root, "status", "--porcelain=v1")
@@ -3223,7 +3637,23 @@ def command_publish(args: argparse.Namespace) -> None:
     pr = state["pr"]
     require_fork_head(pr)
     remote = find_push_remote(repo_root, pr["head_owner"], pr["head_repo"])
-    if remote_head(pr["head_owner"], pr["head_repo"], pr["head_branch"]) != local_head:
+    remote_before = remote_head(pr["head_owner"], pr["head_repo"], pr["head_branch"])
+    if remote_before not in {pinned, local_head}:
+        raise WorkflowError(
+            f"head ref moved from {pinned} to {remote_before}; refusing to push"
+        )
+    validation = local_validation_entry(args, local_head)
+    pending = prepare_pending_stack_push(
+        path,
+        state,
+        previous_head=pinned,
+        head_sha=local_head,
+        commits=commits,
+        kind="fix",
+        validation=validation,
+        resume={"command": "publish"},
+    )
+    if remote_before != local_head:
         run(["git", "-C", str(repo_root), "push", remote, f"HEAD:{pr['head_branch']}"])
     pushed_head = wait_for_remote_head(
         pr["head_owner"], pr["head_repo"], pr["head_branch"], local_head
@@ -3239,22 +3669,24 @@ def command_publish(args: argparse.Namespace) -> None:
     if pr_head != local_head:
         raise WorkflowError(f"PR head mismatch: local {local_head}, PR head {pr_head}")
 
-    run_state["status"] = "published"
-    run_state["published_head_sha"] = local_head
-    accepted_push = accepted_push_checkpoint(
-        state,
-        previous_head=pinned,
-        head_sha=local_head,
-        commits=commits,
-    )
-    validation = local_validation_entry(args, local_head)
-    state.setdefault("local_validation", []).append(validation)
-    # The published head is new, so nothing this loop learned about the old head's
-    # checks still applies.
-    state["reruns"] = {}
-    state["clean_at_head_sha"] = None
-    archive_run(state)
-    save_state(path, state)
+    if pending is not None:
+        accepted_push = finalize_pending_stack_push(path, state, pending)
+    else:
+        run_state["status"] = "published"
+        run_state["published_head_sha"] = local_head
+        accepted_push = accepted_push_checkpoint(
+            state,
+            previous_head=pinned,
+            head_sha=local_head,
+            commits=commits,
+        )
+        state.setdefault("local_validation", []).append(validation)
+        # The published head is new, so nothing this loop learned about the old
+        # head's checks still applies.
+        state["reruns"] = {}
+        state["clean_at_head_sha"] = None
+        archive_run(state)
+        save_state(path, state)
     emit(
         {
             "result": "published",
@@ -3266,6 +3698,913 @@ def command_publish(args: argparse.Namespace) -> None:
             "local_validation": validation,
         }
     )
+
+
+def load_stack_state(path: Path) -> dict[str, Any]:
+    state = load_state(path)
+    if state.get("kind") != STACK_STATE_KIND:
+        raise WorkflowError(f"state file is not a native stack run: {path}")
+    return state
+
+
+def stack_target(state: dict[str, Any]) -> dict[str, Any]:
+    target = state.get("target")
+    if not isinstance(target, dict):
+        raise WorkflowError("native stack state has no target")
+    return parse_target(str(target.get("pr_url") or ""))
+
+
+def stack_stop(
+    path: Path,
+    state: dict[str, Any],
+    reason: str,
+    detail: str,
+    *,
+    member: int | None = None,
+) -> None:
+    state["status"] = "stopped"
+    state["outcome"] = None
+    state["reason"] = reason
+    state["detail"] = detail
+    if member is not None:
+        state["blocked_member"] = member
+    save_state(path, state)
+    emit(
+        {
+            "result": "stopped",
+            "state": str(path),
+            "reason": reason,
+            "detail": detail,
+            "blocked_member": member,
+        }
+    )
+
+
+def refresh_stack_state(state: dict[str, Any]) -> dict[str, Any]:
+    stack = read_native_stack(stack_target(state))
+    if stack is None:
+        raise WorkflowError("the selected pull request is no longer in a native stack")
+    if stack["number"] != state.get("stack_number"):
+        raise WorkflowError(
+            f"the selected pull request moved from native stack "
+            f"{state.get('stack_number')} to {stack['number']}"
+        )
+    fingerprint = stack_topology_fingerprint(stack)
+    if fingerprint != state.get("topology_fingerprint"):
+        raise WorkflowError("the native stack topology changed during the CI run")
+    live_by_number = {member["number"]: member for member in stack["members"]}
+    recorded_numbers = [member["number"] for member in state.get("members") or []]
+    if recorded_numbers != [member["number"] for member in stack["members"]]:
+        raise WorkflowError("the native stack member order changed during the CI run")
+    for recorded in state["members"]:
+        live = live_by_number[recorded["number"]]
+        recorded.update(
+            {
+                "title": live["title"],
+                "head_branch": live["head_branch"],
+                "base_branch": live["base_branch"],
+                "head_sha": live["head_sha"],
+                "is_draft": live["is_draft"],
+                "state": live["state"],
+            }
+        )
+        if live["state"] != "OPEN":
+            raise WorkflowError(
+                f"native stack member #{live['number']} is no longer open"
+            )
+    return stack
+
+
+def stale_cleared_member(state: dict[str, Any]) -> dict[str, Any] | None:
+    for member in state.get("members") or []:
+        if (
+            member.get("ci_status") == "clear"
+            and member.get("clean_at_head_sha") != member.get("head_sha")
+        ):
+            return member
+    return None
+
+
+def verify_stack_member_guard(
+    path: Path, target: dict[str, Any], head_sha: str
+) -> dict[str, Any]:
+    state = load_stack_state(path)
+    if state.get("status") != "active":
+        raise WorkflowError(
+            f"native stack run {state.get('run_id')} is {state.get('status')}, not active"
+        )
+    refresh_stack_state(state)
+    stale = stale_cleared_member(state)
+    if stale is not None:
+        raise WorkflowError(
+            f"native stack member #{stale['number']} moved from "
+            f"{stale.get('clean_at_head_sha')} to {stale.get('head_sha')} after "
+            "its CI result was recorded"
+        )
+    cursor = int(state.get("cursor", 0))
+    members = state.get("members") or []
+    if cursor >= len(members):
+        raise WorkflowError("native stack run has no current member")
+    member = members[cursor]
+    if member["number"] != target["number"]:
+        raise WorkflowError(
+            f"native stack run expects pull request #{member['number']}, not "
+            f"#{target['number']}"
+        )
+    if member["head_sha"] != head_sha:
+        raise WorkflowError(
+            f"native stack member #{member['number']} moved from {head_sha} to "
+            f"{member['head_sha']}"
+        )
+    predecessor = members[cursor - 1] if cursor else None
+    if predecessor is not None:
+        if (
+            predecessor.get("ci_status") != "clear"
+            or predecessor.get("clean_at_head_sha") != predecessor.get("head_sha")
+        ):
+            raise WorkflowError(
+                f"native stack predecessor #{predecessor['number']} is not clear at "
+                "its current head"
+            )
+        if not commit_contains(
+            state["repository"], predecessor["head_sha"], member["head_sha"]
+        ):
+            raise WorkflowError(
+                f"native stack member #{member['number']} does not contain clear "
+                f"predecessor #{predecessor['number']} at {predecessor['head_sha']}"
+            )
+    return {
+        "state": str(path),
+        "run_id": state["run_id"],
+        "stack_number": state["stack_number"],
+        "member": member["number"],
+        "member_head_sha": member["head_sha"],
+        "predecessor": None if predecessor is None else predecessor["number"],
+        "predecessor_head_sha": (
+            None if predecessor is None else predecessor["head_sha"]
+        ),
+    }
+
+
+def require_stack_guard(state: dict[str, Any]) -> None:
+    run_state = active_run(state)
+    guard = run_state.get("stack_guard")
+    if not isinstance(guard, dict):
+        return
+    path_value = guard.get("state")
+    if not isinstance(path_value, str) or not path_value:
+        raise WorkflowError("native stack guard has no coordinator state path")
+    refreshed = verify_stack_member_guard(
+        cli_path(path_value),
+        parse_target(state["pr"]["pr_url"]),
+        run_state["head_sha"],
+    )
+    if refreshed["run_id"] != guard.get("run_id"):
+        raise WorkflowError(
+            "a different native stack run now owns this member; refusing to edit or push"
+        )
+
+
+def stop_for_stale_cleared_member(
+    path: Path, state: dict[str, Any]
+) -> bool:
+    member = stale_cleared_member(state)
+    if member is None:
+        return False
+    stack_stop(
+        path,
+        state,
+        "cleared_member_head_changed",
+        f"pull request #{member['number']} moved from "
+        f"{member.get('clean_at_head_sha')} to {member.get('head_sha')} after "
+        "its CI result was recorded",
+        member=member["number"],
+    )
+    return True
+
+
+def command_stack_start(args: argparse.Namespace) -> None:
+    require_tools()
+    repo_root = resolve_repo_root(args.repo_root)
+    target = resolve_target(args.target, repo_root)
+    if args.pipeline_run:
+        emit(
+            {
+                "result": "single",
+                "target": target["pr_url"],
+                "reason": "orchestrated_invocation",
+                "pr": {
+                    "number": target["number"],
+                    "pr_url": target["pr_url"],
+                    "repo_name": target["repo_name"],
+                },
+            }
+        )
+        return
+    stack = read_native_stack(target)
+    if stack is None:
+        emit(
+            {
+                "result": "single",
+                "target": target["pr_url"],
+                "pr": {
+                    "number": target["number"],
+                    "pr_url": target["pr_url"],
+                    "repo_name": target["repo_name"],
+                },
+            }
+        )
+        return
+    selected = next(
+        (member for member in stack["members"] if member["number"] == target["number"]),
+        None,
+    )
+    if selected is None:
+        raise WorkflowError(
+            f"pull request #{target['number']} is not present in its native stack"
+        )
+    not_open = [
+        member["number"] for member in stack["members"] if member["state"] != "OPEN"
+    ]
+    if not_open:
+        raise WorkflowError(
+            f"native stack members are no longer open: "
+            f"{', '.join(f'#{number}' for number in not_open)}"
+        )
+    resolver = conflict_resolver_script()
+    if not resolver.is_file():
+        raise WorkflowError(
+            "native stack CI requires PR Conflict Resolver before any repair starts; "
+            "install pr-conflict-resolver@trask-plugins"
+        )
+    run_id = uuid.uuid4().hex
+    path = (
+        cli_path(args.state)
+        if args.state
+        else default_stack_state_path(target, stack["number"], run_id)
+    )
+    if path.exists():
+        raise WorkflowError(f"native stack state already exists: {path}")
+    state = {
+        "version": STATE_VERSION,
+        "kind": STACK_STATE_KIND,
+        "created_at": utc_now(),
+        "status": "active",
+        "run_id": run_id,
+        "repo_root": str(repo_root),
+        "repository": target["repo_name"],
+        "target": {
+            "number": selected["number"],
+            "title": selected["title"],
+            "pr_url": target["pr_url"],
+        },
+        "stack_number": stack["number"],
+        "stack_id": stack.get("id"),
+        "trunk": stack["trunk"],
+        "topology_fingerprint": stack_topology_fingerprint(stack),
+        "cursor": 0,
+        "members": [
+            {
+                **member,
+                "ci_status": "pending",
+                "stage_outcome": None,
+                "clean_at_head_sha": None,
+                "dispatched_head_sha": None,
+                "iterations": 0,
+                "accepted_pushes": [],
+            }
+            for member in stack["members"]
+        ],
+        "propagations": [],
+        "propagation_attempts": [],
+        "propagated_pushes": [],
+        "superseded_pushes": [],
+        "reason": None,
+        "detail": None,
+    }
+    save_state(path, state)
+    emit(
+        {
+            "result": "stack",
+            "state": str(path),
+            "run_id": run_id,
+            "repository": target["repo_name"],
+            "stack_number": stack["number"],
+            "selected_pr": selected["number"],
+            "selected_title": selected["title"],
+            "members": [member["number"] for member in stack["members"]],
+        }
+    )
+
+
+def command_stack_next(args: argparse.Namespace) -> None:
+    require_tools()
+    path = cli_path(args.state)
+    state = load_stack_state(path)
+    if state.get("status") != "active":
+        emit(
+            {
+                "result": state.get("status"),
+                "state": str(path),
+                "reason": state.get("reason"),
+                "detail": state.get("detail"),
+                "blocked_member": state.get("blocked_member"),
+            }
+        )
+        return
+    try:
+        refresh_stack_state(state)
+    except WorkflowError as error:
+        stack_stop(path, state, "topology_changed", str(error))
+        return
+    if stop_for_stale_cleared_member(path, state):
+        return
+    cursor = int(state.get("cursor", 0))
+    members = state["members"]
+    if cursor >= len(members):
+        skipped = [
+            member["number"]
+            for member in members
+            if member.get("stage_outcome") == "skipped"
+        ]
+        state["status"] = "complete"
+        state["outcome"] = "skipped" if skipped else "green"
+        state["reason"] = "members_without_checks" if skipped else "all_members_green"
+        state["detail"] = (
+            "these native stack members report no applicable checks: "
+            + ", ".join(f"#{number}" for number in skipped)
+            if skipped
+            else (
+                f"all {len(members)} native stack members are green at their "
+                "current heads"
+            )
+        )
+        save_state(path, state)
+        emit(
+            {
+                "result": "complete",
+                "state": str(path),
+                "stack_number": state["stack_number"],
+                "members": [member["number"] for member in members],
+                "outcome": state["outcome"],
+                "skipped_members": skipped,
+                "propagations": len(state.get("propagations") or []),
+            }
+        )
+        return
+
+    member = members[cursor]
+    member_target = parse_target(f"{state['repository']}#{member['number']}")
+    member_state_path = stack_member_state_path(path, member["number"])
+    if member.get("ci_status") == "active":
+        if member_state_path.is_file():
+            member_state = load_state(member_state_path)
+            pending = member_state.get("pending_stack_push")
+            member_guard = ((member_state.get("run") or {}).get("stack_guard") or {})
+            member_owned_by_run = (
+                member_guard.get("run_id") == state["run_id"]
+                and member_guard.get("member") == member["number"]
+            )
+            member_guard_matches_head = (
+                member_owned_by_run
+                and member_guard.get("member_head_sha") == member["head_sha"]
+            )
+            pending_matches_run = (
+                isinstance(pending, dict)
+                and pending.get("pipeline_run") == state["run_id"]
+                and pending.get("member") == member["number"]
+                and member_owned_by_run
+            )
+            if pending_matches_run and pending.get("head_sha") == member["head_sha"]:
+                finalize_pending_stack_push(
+                    member_state_path, member_state, pending
+                )
+            elif (
+                pending_matches_run
+                and pending.get("previous_head_sha") == member["head_sha"]
+            ):
+                resume = pending.get("resume") or {}
+                command = resume.get("command")
+                if command not in {"publish", "rerun"}:
+                    stack_stop(
+                        path,
+                        state,
+                        "pending_push_unrecoverable",
+                        f"pull request #{member['number']} has a pending push with "
+                        "no supported resume command",
+                        member=member["number"],
+                    )
+                    return
+                emit(
+                    {
+                        "result": f"resume_{command}",
+                        "state": str(path),
+                        "member": member["number"],
+                        "member_state": str(member_state_path),
+                        "check": resume.get("check"),
+                        "validation": pending.get("validation"),
+                        "reason": "prepared_push_not_published",
+                    }
+                )
+                return
+            if member_guard_matches_head and not isinstance(pending, dict):
+                unfinished_reruns = [
+                    (check_key, rerun)
+                    for check_key, rerun in (member_state.get("reruns") or {}).items()
+                    if isinstance(rerun, dict)
+                    and rerun.get("method") == "empty_commit"
+                    and rerun.get("head_sha") == member["head_sha"]
+                    and rerun.get("status") in {"creating", "prepared", "pushed"}
+                ]
+                if len(unfinished_reruns) > 1:
+                    stack_stop(
+                        path,
+                        state,
+                        "pending_push_unrecoverable",
+                        f"pull request #{member['number']} has multiple unfinished "
+                        "empty-commit retries",
+                        member=member["number"],
+                    )
+                    return
+                if unfinished_reruns:
+                    check_key, rerun = unfinished_reruns[0]
+                    emit(
+                        {
+                            "result": "resume_rerun",
+                            "state": str(path),
+                            "member": member["number"],
+                            "member_state": str(member_state_path),
+                            "check": check_key,
+                            "validation": None,
+                            "reason": f"empty_commit_{rerun['status']}",
+                        }
+                    )
+                    return
+            propagated = set(state.get("propagated_pushes") or [])
+            pending_pushes = [
+                checkpoint
+                for checkpoint in member_state.get("accepted_pushes") or []
+                if checkpoint.get("pipeline_run") == state["run_id"]
+                and checkpoint.get("id")
+                and checkpoint["id"] not in propagated
+            ]
+            current_pushes = [
+                checkpoint
+                for checkpoint in pending_pushes
+                if checkpoint.get("head_sha") == member["head_sha"]
+            ]
+            superseded = [
+                checkpoint["id"]
+                for checkpoint in pending_pushes
+                if checkpoint.get("head_sha") != member["head_sha"]
+            ]
+            if superseded:
+                state.setdefault("superseded_pushes", []).extend(superseded)
+                state["superseded_pushes"] = sorted(
+                    set(state["superseded_pushes"])
+                )
+                state.setdefault("propagated_pushes", []).extend(superseded)
+                state["propagated_pushes"] = sorted(
+                    set(state["propagated_pushes"])
+                )
+            if current_pushes:
+                checkpoint = current_pushes[-1]
+                save_state(path, state)
+                emit(
+                    {
+                        "result": "propagate",
+                        "state": str(path),
+                        "stack_number": state["stack_number"],
+                        "fixed_pr": member["number"],
+                        "expected_head": member["head_sha"],
+                        "checkpoint_id": checkpoint["id"],
+                        "reason": "accepted_push_not_propagated",
+                    }
+                )
+                return
+        dispatched_head = member.get("dispatched_head_sha")
+        if dispatched_head and dispatched_head != member["head_sha"]:
+            stack_stop(
+                path,
+                state,
+                "active_member_head_changed",
+                f"pull request #{member['number']} moved from {dispatched_head} to "
+                f"{member['head_sha']} while its CI repair was active",
+                member=member["number"],
+            )
+            return
+    if cursor:
+        predecessor = members[cursor - 1]
+        if predecessor.get("ci_status") != "clear":
+            stack_stop(
+                path,
+                state,
+                "predecessor_not_clear",
+                f"pull request #{predecessor['number']} is not clear at its current head",
+                member=member["number"],
+            )
+            return
+        if predecessor.get("clean_at_head_sha") != predecessor["head_sha"]:
+            stack_stop(
+                path,
+                state,
+                "predecessor_head_changed",
+                f"pull request #{predecessor['number']} moved after it was cleared",
+                member=member["number"],
+            )
+            return
+        if not commit_contains(
+            state["repository"], predecessor["head_sha"], member["head_sha"]
+        ):
+            attempt = f"{predecessor['number']}:{predecessor['head_sha']}"
+            if attempt in set(state.get("propagation_attempts") or []):
+                stack_stop(
+                    path,
+                    state,
+                    "propagation_did_not_contain",
+                    f"propagating pull request #{predecessor['number']} at "
+                    f"{predecessor['head_sha']} did not make pull request "
+                    f"#{member['number']} contain that head",
+                    member=member["number"],
+                )
+                return
+            save_state(path, state)
+            emit(
+                {
+                    "result": "propagate",
+                    "state": str(path),
+                    "stack_number": state["stack_number"],
+                    "fixed_pr": predecessor["number"],
+                    "expected_head": predecessor["head_sha"],
+                    "next_member": member["number"],
+                    "reason": "predecessor_head_is_not_contained",
+                }
+            )
+            return
+
+    member["ci_status"] = "active"
+    member["dispatched_head_sha"] = member["head_sha"]
+    save_state(path, state)
+    emit(
+        {
+            "result": "run_member",
+            "state": str(path),
+            "run_id": state["run_id"],
+            "stack_number": state["stack_number"],
+            "member": member["number"],
+            "title": member["title"],
+            "target": member_target["pr_url"],
+            "head_sha": member["head_sha"],
+            "base_branch": member["base_branch"],
+            "member_state": str(member_state_path),
+            "stack_state": str(path),
+            "pipeline_run": state["run_id"],
+            "pipeline_iteration": 1,
+            "pipeline_max_iterations": 1,
+        }
+    )
+
+
+def command_stack_record(args: argparse.Namespace) -> None:
+    require_tools()
+    path = cli_path(args.state)
+    state = load_stack_state(path)
+    if state.get("status") != "active":
+        raise WorkflowError("cannot record a member on a finished native stack run")
+    try:
+        refresh_stack_state(state)
+    except WorkflowError as error:
+        stack_stop(path, state, "topology_changed", str(error))
+        return
+    if stop_for_stale_cleared_member(path, state):
+        return
+    cursor = int(state.get("cursor", 0))
+    members = state["members"]
+    if cursor >= len(members):
+        raise WorkflowError("the native stack run has no current member")
+    member = members[cursor]
+    member_state_path = cli_path(args.member_state)
+    member_state = load_state(member_state_path)
+    pr = member_state.get("pr") or {}
+    if (
+        pr.get("number") != member["number"]
+        or str(pr.get("repo_name") or "").casefold()
+        != str(state["repository"]).casefold()
+    ):
+        raise WorkflowError(
+            f"{member_state_path} does not belong to "
+            f"{state['repository']}#{member['number']}"
+        )
+    member_run = member_state.get("run") or {}
+    guard = member_run.get("stack_guard") or {}
+    if (
+        member_state.get("budget_scope") != "pipeline"
+        or member_run.get("budget_scope") != "pipeline"
+        or guard.get("run_id") != state["run_id"]
+        or guard.get("member") != member["number"]
+        or guard.get("member_head_sha") != member["head_sha"]
+        or cli_path(str(guard.get("state") or "")) != path
+    ):
+        raise WorkflowError(
+            f"{member_state_path} was not produced by native stack run "
+            f"{state['run_id']}"
+        )
+    outcome = stage_outcome(member_state)
+    clean_head = member_state.get("clean_at_head_sha")
+    if outcome not in STACK_CLEAR_OUTCOMES or clean_head != member["head_sha"]:
+        escalation = member_state.get("escalation") or {}
+        detail = (
+            escalation.get("detail")
+            or (
+                f"CI Fix Loop ended as {outcome!r} at {clean_head!r}, not clear at "
+                f"the live head {member['head_sha']}"
+            )
+        )
+        stack_stop(
+            path,
+            state,
+            "member_not_clear",
+            str(detail),
+            member=member["number"],
+        )
+        return
+    accepted = [
+        checkpoint
+        for checkpoint in member_state.get("accepted_pushes") or []
+        if checkpoint.get("pipeline_run") == state["run_id"]
+    ]
+    member.update(
+        {
+            "ci_status": "clear",
+            "stage_outcome": outcome,
+            "clean_at_head_sha": clean_head,
+            "iterations": int(member_state.get("iterations", 0)),
+            "accepted_pushes": accepted,
+            "skip_note": member_state.get("skip_note"),
+        }
+    )
+    state["cursor"] = cursor + 1
+    save_state(path, state)
+    emit(
+        {
+            "result": "recorded",
+            "state": str(path),
+            "member": member["number"],
+            "stage_outcome": outcome,
+            "head_sha": clean_head,
+            "accepted_pushes": accepted,
+            "remaining": len(members) - state["cursor"],
+        }
+    )
+
+
+def command_stack_propagate(args: argparse.Namespace) -> None:
+    require_tools()
+    path = cli_path(args.state)
+    state = load_stack_state(path)
+    if state.get("status") != "active":
+        raise WorkflowError("cannot propagate a finished native stack run")
+    try:
+        refresh_stack_state(state)
+    except WorkflowError as error:
+        stack_stop(path, state, "topology_changed", str(error))
+        return
+    if stop_for_stale_cleared_member(path, state):
+        return
+    fixed = next(
+        (
+            member
+            for member in state["members"]
+            if member["number"] == args.fixed_pr
+        ),
+        None,
+    )
+    if fixed is None:
+        raise WorkflowError(
+            f"pull request #{args.fixed_pr} is not in native stack "
+            f"{state['stack_number']}"
+        )
+    if fixed["head_sha"] != args.expected_head:
+        stack_stop(
+            path,
+            state,
+            "source_head_changed",
+            f"pull request #{args.fixed_pr} is at {fixed['head_sha']}, not "
+            f"{args.expected_head}",
+            member=args.fixed_pr,
+        )
+        return
+    attempt = f"{args.fixed_pr}:{args.expected_head}"
+    script = conflict_resolver_script()
+    if not script.is_file():
+        stack_stop(
+            path,
+            state,
+            "propagation_unavailable",
+            f"PR Conflict Resolver is not installed at {script}",
+            member=args.fixed_pr,
+        )
+        return
+    resolver_state_path = stack_propagation_state_path(
+        path, args.fixed_pr, args.expected_head
+    )
+    if resolver_state_path.is_file():
+        resolver_state = json.loads(resolver_state_path.read_text(encoding="utf-8"))
+        if resolver_state.get("status") == "resolved":
+            fixed_index = state["members"].index(fixed)
+            current_descendants = state["members"][fixed_index + 1 :]
+            recorded_descendants = resolver_state.get("members_before") or []
+            keys = ("number", "head_sha", "head_branch", "base_branch")
+            current_snapshot = [
+                tuple(member.get(key) for key in keys)
+                for member in current_descendants
+            ]
+            recorded_snapshot = [
+                tuple(member.get(key) for key in keys)
+                for member in recorded_descendants
+            ]
+            if current_snapshot != recorded_snapshot:
+                stack_stop(
+                    path,
+                    state,
+                    "propagation_snapshot_changed",
+                    "a descendant moved after PR Conflict Resolver prepared the "
+                    "propagation; refusing to publish its preserved workspace",
+                    member=args.fixed_pr,
+                )
+                return
+    process = run(
+        [
+            sys.executable,
+            str(script),
+            "descendant-propagate",
+            f"{state['repository']}#{args.fixed_pr}",
+            "--stack-number",
+            str(state["stack_number"]),
+            "--fixed-pr",
+            str(args.fixed_pr),
+            "--expected-head",
+            args.expected_head,
+            "--repo-root",
+            state["repo_root"],
+            "--state",
+            str(resolver_state_path),
+        ],
+        check=False,
+    )
+    if process.returncode != 0:
+        detail = process.stderr.strip() or process.stdout.strip() or "no output"
+        stack_stop(
+            path,
+            state,
+            "propagation_failed",
+            detail,
+            member=args.fixed_pr,
+        )
+        return
+    try:
+        result = json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        stack_stop(
+            path,
+            state,
+            "propagation_failed",
+            f"PR Conflict Resolver returned invalid JSON: {error}",
+            member=args.fixed_pr,
+        )
+        return
+    if not isinstance(result, dict) or result.get("result") not in {
+        "published",
+        "no_descendants",
+    }:
+        detail = (
+            result.get("detail")
+            if isinstance(result, dict)
+            else "PR Conflict Resolver returned no result object"
+        )
+        stack_stop(
+            path,
+            state,
+            "propagation_conflicted"
+            if isinstance(result, dict) and result.get("result") == "conflicted"
+            else "propagation_failed",
+            str(detail or result),
+            member=args.fixed_pr,
+        )
+        return
+    contained = False
+    for delay in (0, *PROPAGATION_CONTAINMENT_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            refresh_stack_state(state)
+        except WorkflowError as error:
+            stack_stop(path, state, "topology_changed", str(error))
+            return
+        fixed_index = next(
+            index
+            for index, member in enumerate(state["members"])
+            if member["number"] == args.fixed_pr
+        )
+        descendants = state["members"][fixed_index + 1 :]
+        if all(
+            commit_contains(
+                state["repository"], args.expected_head, member["head_sha"]
+            )
+            for member in descendants
+        ):
+            contained = True
+            break
+    if not contained:
+        stack_stop(
+            path,
+            state,
+            "propagation_did_not_contain",
+            f"PR Conflict Resolver reported {result['result']}, but the descendants "
+            f"do not contain pull request #{args.fixed_pr} at {args.expected_head}",
+            member=args.fixed_pr,
+        )
+        return
+    propagation = {
+        "fixed_pr": args.fixed_pr,
+        "fixed_head_sha": args.expected_head,
+        "result": result["result"],
+        "members_published": result.get("members_published") or [],
+        "recorded_at": utc_now(),
+    }
+    state.setdefault("propagations", []).append(propagation)
+    state.setdefault("propagation_attempts", []).append(attempt)
+    state["propagation_attempts"] = sorted(set(state["propagation_attempts"]))
+    if args.checkpoint_id:
+        state.setdefault("propagated_pushes", []).append(args.checkpoint_id)
+        state["propagated_pushes"] = sorted(set(state["propagated_pushes"]))
+    cursor = int(state.get("cursor", 0))
+    if (
+        cursor < len(state["members"])
+        and state["members"][cursor]["number"] == args.fixed_pr
+    ):
+        state["members"][cursor]["dispatched_head_sha"] = args.expected_head
+    save_state(path, state)
+    emit(
+        {
+            "state": str(path),
+            "stack_number": state["stack_number"],
+            **propagation,
+            "propagation_result": propagation["result"],
+            "result": "propagated",
+        }
+    )
+
+
+def command_stack_status(args: argparse.Namespace) -> None:
+    path = cli_path(args.state)
+    state = load_stack_state(path)
+    if state.get("status") in {"active", "complete"}:
+        require_tools()
+        try:
+            refresh_stack_state(state)
+        except WorkflowError as error:
+            stack_stop(path, state, "topology_changed", str(error))
+            return
+        if stop_for_stale_cleared_member(path, state):
+            return
+    emit(
+        {
+            "result": "ready",
+            "state": str(path),
+            "status": state.get("status"),
+            "run_id": state.get("run_id"),
+            "repository": state.get("repository"),
+            "stack_number": state.get("stack_number"),
+            "selected_pr": (state.get("target") or {}).get("number"),
+            "cursor": state.get("cursor"),
+            "outcome": state.get("outcome"),
+            "members": [
+                {
+                    "number": member["number"],
+                    "head_sha": member["head_sha"],
+                    "ci_status": member.get("ci_status"),
+                    "stage_outcome": member.get("stage_outcome"),
+                    "clean_at_head_sha": member.get("clean_at_head_sha"),
+                    "accepted_pushes": member.get("accepted_pushes") or [],
+                    "skip_note": member.get("skip_note"),
+                }
+                for member in state.get("members") or []
+            ],
+            "propagations": state.get("propagations") or [],
+            "reason": state.get("reason"),
+            "detail": state.get("detail"),
+            "blocked_member": state.get("blocked_member"),
+            "last_helper_activity": last_helper_activity(state),
+        }
+    )
+
+
+def command_stack_cleanup(args: argparse.Namespace) -> None:
+    path = cli_path(args.state)
+    load_stack_state(path)
+    path.unlink()
+    emit({"result": "cleaned_up", "state": str(path)})
 
 
 def stage_outcome(state: dict[str, Any]) -> str | None:
@@ -3461,6 +4800,63 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    stack_start = subparsers.add_parser(
+        "stack-start",
+        help="detect a native stack and start its bottom-up CI-only run",
+    )
+    stack_start.add_argument(
+        "target",
+        nargs="?",
+        help=(
+            "PR URL or owner/repo#number; omit only from a worktree "
+            "attached to the PR's branch"
+        ),
+    )
+    stack_start.add_argument("--repo-root")
+    stack_start.add_argument("--state")
+    stack_start.add_argument(
+        "--pipeline-run",
+        help="return the single-PR path when another orchestrator owns stack scope",
+    )
+    stack_start.set_defaults(function=command_stack_start)
+
+    stack_next = subparsers.add_parser(
+        "stack-next",
+        help="return the next member repair or descendant propagation action",
+    )
+    stack_next.add_argument("--state", required=True)
+    stack_next.set_defaults(function=command_stack_next)
+
+    stack_record = subparsers.add_parser(
+        "stack-record",
+        help="record the current member's verified CI Fix Loop outcome",
+    )
+    stack_record.add_argument("--state", required=True)
+    stack_record.add_argument("--member-state", required=True)
+    stack_record.set_defaults(function=command_stack_record)
+
+    stack_propagate = subparsers.add_parser(
+        "stack-propagate",
+        help="atomically carry one current member head through its descendants",
+    )
+    stack_propagate.add_argument("--state", required=True)
+    stack_propagate.add_argument("--fixed-pr", type=int, required=True)
+    stack_propagate.add_argument("--expected-head", required=True)
+    stack_propagate.add_argument("--checkpoint-id")
+    stack_propagate.set_defaults(function=command_stack_propagate)
+
+    stack_status = subparsers.add_parser(
+        "stack-status", help="print compact native stack CI state"
+    )
+    stack_status.add_argument("--state", required=True)
+    stack_status.set_defaults(function=command_stack_status)
+
+    stack_cleanup = subparsers.add_parser(
+        "stack-cleanup", help="delete completed native stack coordination state"
+    )
+    stack_cleanup.add_argument("--state", required=True)
+    stack_cleanup.set_defaults(function=command_stack_cleanup)
+
     preflight = subparsers.add_parser(
         "preflight",
         help="verify and check out a PR, then pin the head its checks ran on",
@@ -3475,6 +4871,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preflight.add_argument("--repo-root")
     preflight.add_argument("--state")
+    preflight.add_argument(
+        "--stack-state",
+        help="native stack coordinator state that must still authorize this member",
+    )
     preflight.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS)
     invocation = preflight.add_mutually_exclusive_group()
     invocation.add_argument(

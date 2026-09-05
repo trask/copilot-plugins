@@ -106,10 +106,18 @@ atomic publisher after a lower stack member receives a CI fix.
 
 ### CI Fix Loop
 
-Fixes only failures attributable to the pull request, with five charged
-iterations per outer pipeline pass and an absolute ten across a two-pass run.
-Each accepted push records a durable machine-readable checkpoint so a stack
-orchestrator can propagate the new parent immediately.
+Fixes only failures attributable to the pull request. A standalone run on a
+native GitHub stack checks CI from the bottom member through the top, starts real
+repair work at the lowest failure, and uses PR Conflict Resolver to propagate
+each fixed head through its descendants before their checks run. It does not run
+the review, description, or other PR Pipeline stages. A pull request outside a
+native stack keeps the single-PR behavior.
+
+Each member gets five charged iterations. A PR Pipeline run keeps its existing
+five charged iterations per outer pass and absolute ten across two passes. Every
+accepted push records a durable machine-readable checkpoint. Install
+`pr-conflict-resolver@trask-plugins` to use native-stack mode; the loop checks
+for it before it edits or pushes any stack member.
 
 ### Historical PR Audit
 

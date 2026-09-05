@@ -6795,3 +6795,65 @@ class DescendantPropagationTest(unittest.TestCase):
 
         self.assertEqual("no_descendants", emitted(emit_mock)["result"])
         create_workspace.assert_not_called()
+
+    def test_resolved_propagation_rejects_a_changed_source_snapshot(self):
+        original = self.stack()
+        moved = self.stack()
+        moved["members"][-1]["head_sha"] = "tip-moved"
+        args = SimpleNamespace(
+            target="owner/repo#11",
+            repo=None,
+            pull_request=None,
+            head_sha=None,
+            stack_number=77,
+            fixed_pr=11,
+            expected_head="fixed-head",
+            repo_root=None,
+            state=None,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            state_path = root / "propagation.json"
+            args.state = str(state_path)
+            MODULE.save_state(
+                state_path,
+                {
+                    "version": MODULE.STATE_VERSION,
+                    "operation": "descendant_propagation",
+                    "status": "resolved",
+                    "stack_number": 77,
+                    "fixed_pr": 11,
+                    "fixed_head_sha": "fixed-head",
+                    "source_snapshot": MODULE.stack_snapshot_fingerprint(original),
+                    "members_before": original["members"][2:],
+                    "members_after": [
+                        {
+                            "number": 12,
+                            "head_branch": "tip",
+                            "head_sha": "rebased-tip",
+                        }
+                    ],
+                    "expected_post_fingerprint": None,
+                    "workspace": str(workspace),
+                },
+            )
+            with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=root
+            ), mock.patch.object(
+                MODULE, "metadata_for", return_value=pr_metadata(number=11)
+            ), mock.patch.object(
+                MODULE,
+                "stack_membership",
+                return_value={"default_branch": "main", "stack": moved},
+            ), mock.patch.object(
+                MODULE, "external_stack_dependents", return_value=[]
+            ), mock.patch.object(
+                MODULE, "create_stack_workspace"
+            ) as create_workspace:
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError, "earlier descendant propagation"
+                ):
+                    MODULE.command_descendant_propagate(args)
+            create_workspace.assert_not_called()

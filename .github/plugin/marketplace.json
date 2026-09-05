@@ -41,13 +41,13 @@
     {
       "name": "pr-conflict-resolver",
       "description": "Resolve the merge conflicts on a pull request in one pass by keeping both sides' intent, then push the resolution.",
-      "version": "1.0.1",
+      "version": "1.0.2",
       "source": "./plugins/pr-conflict-resolver"
     },
     {
       "name": "ci-fix-loop",
-      "description": "Fix the failing continuous integration checks a pull request caused, re-run a suspected flake once, and push the fixes until the checks are green.",
-      "version": "1.0.15",
+      "description": "Fix continuous integration failures on one pull request or bottom-up through a native stack, propagating each fix through its descendants.",
+      "version": "1.1.0",
       "source": "./plugins/ci-fix-loop"
     },
     {

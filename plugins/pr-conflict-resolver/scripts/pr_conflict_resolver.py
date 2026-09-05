@@ -4199,6 +4199,7 @@ def command_descendant_propagate(args: argparse.Namespace) -> None:
             and prior.get("stack_number") == stack["number"]
             and prior.get("fixed_pr") == fixed_pr
             and prior.get("fixed_head_sha") == expected_head
+            and prior.get("source_snapshot") == stack_snapshot_fingerprint(stack)
             and isinstance(prior_workspace, str)
             and Path(prior_workspace).exists()
         ):

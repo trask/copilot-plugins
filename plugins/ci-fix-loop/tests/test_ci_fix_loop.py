@@ -141,6 +141,37 @@ def attribution(key, verdict, *, source="baseline", baseline=None, conclusion=No
     }
 
 
+def native_stack(heads=None, *, branches=None):
+    heads = heads or {5: "lower1", 7: "middle1", 9: "upper1"}
+    branches = branches or {
+        5: ("lower", "main"),
+        7: ("middle", "lower"),
+        9: ("upper", "middle"),
+    }
+    members = []
+    for position, number in enumerate((5, 7, 9)):
+        head_branch, base_branch = branches[number]
+        members.append(
+            {
+                "position": position,
+                "number": number,
+                "title": f"PR {number}",
+                "head_branch": head_branch,
+                "base_branch": base_branch,
+                "head_sha": heads[number],
+                "is_draft": True,
+                "state": "OPEN",
+            }
+        )
+    return {
+        "id": "stack-id",
+        "number": 77,
+        "size": len(members),
+        "trunk": "main",
+        "members": members,
+    }
+
+
 LOCAL_VALIDATION_HEADING = "## Local Validation Before A Push"
 def _agent_section(text, heading):
     """Return the body of one Markdown section, stopping at the next peer heading."""
@@ -269,9 +300,26 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_runs_the_whole_loop_from_a_bare_reference(self):
         self.assertIn("## Activation: Bare PR References Run The Full Loop", self.instructions)
         self.assertIn(
-            "Start the helper's `preflight` workflow at once", self.instructions
+            "For a standalone user invocation, start with `stack-start`",
+            self.instructions,
+        )
+        self.assertIn(
+            "skip `stack-start` and begin with `preflight`", self.instructions
         )
         self.assertIn("Do not ask what action the user wants", self.instructions)
+
+    def test_native_stack_protocol_is_ci_only_and_propagates_every_push(self):
+        section = _agent_section(self.instructions, "## Native Stack Coordination")
+        self.assertIn("Do not invoke PR Stack Pipeline", section)
+        self.assertIn("Pass `--state <member_state>", section)
+        self.assertIn(
+            "After every `published` or `empty_commit_published` result", section
+        )
+        self.assertIn("immediately run `stack-propagate`", section)
+        self.assertIn(
+            "A higher member never starts until its direct predecessor is clear",
+            section,
+        )
 
     def test_never_posts_anything_to_github(self):
         self.assertIn(
@@ -830,6 +878,21 @@ class PathHelperTest(unittest.TestCase):
         self.assertEqual("owner--repo--7.json", path.name)
         self.assertEqual("ci-fix-loop", path.parent.name)
         self.assertEqual("run", path.parent.parent.name)
+
+    def test_stack_member_state_is_scoped_to_the_coordinator_run(self):
+        coordinator = Path("stacks/owner--repo--stack-3--run-1.json")
+        path = MODULE.stack_member_state_path(coordinator, 7)
+        self.assertEqual("owner--repo--stack-3--run-1--pr-7.json", path.name)
+        self.assertEqual(coordinator.parent, path.parent)
+
+    def test_stack_propagation_state_is_scoped_to_the_coordinator_run(self):
+        coordinator = Path("stacks/owner--repo--stack-3--run-1.json")
+        path = MODULE.stack_propagation_state_path(coordinator, 5, "abc123")
+        self.assertEqual(
+            "owner--repo--stack-3--run-1--propagate-pr-5-abc123.json",
+            path.name,
+        )
+        self.assertEqual(coordinator.parent, path.parent)
 
     def test_side_files_hang_off_the_state_path(self):
         path = Path("/tmp/state.json")
@@ -4449,6 +4512,703 @@ class MainTest(unittest.TestCase):
                     code = MODULE.main()
             self.assertEqual(0, code)
             self.assertEqual("cleaned_up", json.loads(stream.getvalue())["result"])
+
+
+class NativeStackCoordinatorTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.stack_state = self.root / "stack.json"
+        self.resolver = self.root / "pr_conflict_resolver.py"
+        self.resolver.write_text("# test", encoding="utf-8")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def start(self, stack):
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "resolve_repo_root", return_value=self.root
+        ), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ), mock.patch.object(
+            MODULE, "conflict_resolver_script", return_value=self.resolver
+        ):
+            return call(
+                "stack-start",
+                "owner/repo#7",
+                "--repo-root",
+                str(self.root),
+                "--state",
+                str(self.stack_state),
+            )
+
+    def member_state(self, number, head, run_id, *, outcome="green"):
+        directory = self.root / f"member-{number}"
+        directory.mkdir()
+        checkpoint = {
+            "id": f"push-{number}",
+            "head_sha": head,
+            "pipeline_run": run_id,
+            "pipeline_iteration": 1,
+            "commits": [f"commit-{number}"],
+        }
+        return write_state(
+            directory,
+            pr={
+                "number": number,
+                "title": f"PR {number}",
+                "pr_url": f"https://github.com/owner/repo/pull/{number}",
+                "repo_name": "owner/repo",
+                "head_sha": head,
+            },
+            outcome=outcome,
+            clean_at_head_sha=head,
+            budget_scope="pipeline",
+            pipeline_budget={"run": run_id, "iteration": 1},
+            accepted_pushes=[checkpoint],
+            run={
+                "budget_scope": "pipeline",
+                "stack_guard": {
+                    "state": str(self.stack_state),
+                    "run_id": run_id,
+                    "member": number,
+                    "member_head_sha": head,
+                },
+            },
+        )
+
+    def pending_member_state(self, run_id, *, kind="fix", check_key=None):
+        directory = self.root / f"pending-{kind}"
+        directory.mkdir()
+        pending = {
+            "id": f"pending-{kind}",
+            "previous_head_sha": "lower1",
+            "head_sha": "lower2",
+            "commits": ["fix"],
+            "kind": kind,
+            "pipeline_run": run_id,
+            "member": 5,
+            "validation": {"status": "passed", "commands": ["test"]},
+            "resume": {
+                "command": "rerun" if kind == "ci_rerun" else "publish",
+            },
+        }
+        if check_key:
+            pending["check_key"] = check_key
+            pending["resume"]["check"] = check_key
+            pending["resume"]["name"] = "build"
+            pending["resume"]["run_id"] = 123
+        return write_state(
+            directory,
+            pr={
+                "number": 5,
+                "title": "PR 5",
+                "pr_url": "https://github.com/owner/repo/pull/5",
+                "repo_name": "owner/repo",
+                "head_sha": "lower1",
+            },
+            budget_scope="pipeline",
+            pipeline_budget={"run": run_id, "iteration": 1},
+            run={
+                "budget_scope": "pipeline",
+                "stack_guard": {
+                    "state": str(self.stack_state),
+                    "run_id": run_id,
+                    "member": 5,
+                    "member_head_sha": "lower1",
+                },
+            },
+            pending_stack_push=pending,
+        )
+
+    def unfinished_rerun_member_state(self, run_id, status):
+        directory = self.root / f"unfinished-rerun-{status}"
+        directory.mkdir()
+        return write_state(
+            directory,
+            pr={
+                "number": 5,
+                "title": "PR 5",
+                "pr_url": "https://github.com/owner/repo/pull/5",
+                "repo_name": "owner/repo",
+                "head_sha": "lower1",
+            },
+            budget_scope="pipeline",
+            pipeline_budget={"run": run_id, "iteration": 1},
+            run={
+                "budget_scope": "pipeline",
+                "stack_guard": {
+                    "state": str(self.stack_state),
+                    "run_id": run_id,
+                    "member": 5,
+                    "member_head_sha": "lower1",
+                },
+            },
+            reruns={
+                "build (linux)": {
+                    "count": 1,
+                    "name": "build",
+                    "run_id": 123,
+                    "head_sha": "lower1",
+                    "method": "empty_commit",
+                    "status": status,
+                    "commit_sha": "lower2" if status != "creating" else None,
+                }
+            },
+        )
+
+    def next(self, stack, *, contains=True):
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ), mock.patch.object(MODULE, "commit_contains", return_value=contains):
+            return call("stack-next", "--state", str(self.stack_state))
+
+    def record(self, stack, member_state):
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ):
+            return call(
+                "stack-record",
+                "--state",
+                str(self.stack_state),
+                "--member-state",
+                str(member_state),
+            )
+
+    def test_non_stack_target_keeps_the_single_pr_path(self):
+        result = self.start(None)
+        self.assertEqual("single", result["result"])
+        self.assertEqual("https://github.com/owner/repo/pull/7", result["target"])
+        self.assertFalse(self.stack_state.exists())
+
+    def test_orchestrated_invocation_cannot_start_a_recursive_stack_run(self):
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "resolve_repo_root", return_value=self.root
+        ), mock.patch.object(MODULE, "read_native_stack") as read_stack:
+            result = call(
+                "stack-start",
+                "owner/repo#7",
+                "--repo-root",
+                str(self.root),
+                "--pipeline-run",
+                "outer-run",
+            )
+        self.assertEqual("single", result["result"])
+        self.assertEqual("orchestrated_invocation", result["reason"])
+        read_stack.assert_not_called()
+
+    def test_missing_resolver_stops_before_stack_state_is_created(self):
+        missing = self.root / "missing-resolver.py"
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "resolve_repo_root", return_value=self.root
+        ), mock.patch.object(
+            MODULE, "read_native_stack", return_value=native_stack()
+        ), mock.patch.object(
+            MODULE, "conflict_resolver_script", return_value=missing
+        ):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "before any repair starts"
+            ):
+                call(
+                    "stack-start",
+                    "owner/repo#7",
+                    "--repo-root",
+                    str(self.root),
+                    "--state",
+                    str(self.stack_state),
+                )
+        self.assertFalse(self.stack_state.exists())
+
+    def test_middle_target_starts_at_the_bottom_and_continues_upward(self):
+        stack = native_stack()
+        started = self.start(stack)
+        self.assertEqual("stack", started["result"])
+        self.assertEqual([5, 7, 9], started["members"])
+        first = self.next(stack)
+        self.assertEqual("run_member", first["result"])
+        self.assertEqual(5, first["member"])
+        lower_state = self.member_state(5, "lower1", started["run_id"])
+        recorded = self.record(stack, lower_state)
+        self.assertEqual("recorded", recorded["result"])
+        second = self.next(stack)
+        self.assertEqual(7, second["member"])
+        self.assertEqual(started["run_id"], second["pipeline_run"])
+
+    def test_child_waits_for_propagation_when_parent_head_is_not_contained(self):
+        stack = native_stack()
+        started = self.start(stack)
+        lower_state = self.member_state(5, "lower1", started["run_id"])
+        self.record(stack, lower_state)
+        action = self.next(stack, contains=False)
+        self.assertEqual("propagate", action["result"])
+        self.assertEqual(5, action["fixed_pr"])
+        self.assertEqual("lower1", action["expected_head"])
+        self.assertEqual(7, action["next_member"])
+
+    def test_parent_movement_after_clearance_stops_the_stack(self):
+        stack = native_stack()
+        started = self.start(stack)
+        lower_state = self.member_state(5, "lower1", started["run_id"])
+        self.record(stack, lower_state)
+        moved = native_stack(heads={5: "lower2", 7: "middle1", 9: "upper1"})
+        result = self.next(moved)
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual("cleared_member_head_changed", result["reason"])
+        self.assertEqual(5, result["blocked_member"])
+
+    def test_member_guard_rechecks_parent_after_the_child_is_released(self):
+        stack = native_stack()
+        started = self.start(stack)
+        lower_state = self.member_state(5, "lower1", started["run_id"])
+        self.record(stack, lower_state)
+        self.next(stack)
+        moved = native_stack(heads={5: "lower2", 7: "middle1", 9: "upper1"})
+        with mock.patch.object(
+            MODULE, "read_native_stack", return_value=moved
+        ), self.assertRaisesRegex(
+            MODULE.WorkflowError, "moved from lower1 to lower2"
+        ):
+            MODULE.verify_stack_member_guard(
+                self.stack_state, MODULE.parse_target("owner/repo#7"), "middle1"
+            )
+
+    def test_unexplained_active_member_movement_stops_before_more_work(self):
+        stack = native_stack()
+        self.start(stack)
+        self.next(stack)
+        moved = native_stack(heads={5: "lower2", 7: "middle1", 9: "upper1"})
+        missing_state = self.root / "missing-member-state.json"
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=moved
+        ), mock.patch.object(
+            MODULE, "stack_member_state_path", return_value=missing_state
+        ):
+            result = call("stack-next", "--state", str(self.stack_state))
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual("active_member_head_changed", result["reason"])
+
+    def test_record_requires_a_clear_marker_at_the_live_head(self):
+        stack = native_stack()
+        started = self.start(stack)
+        stale = self.member_state(5, "lower1", started["run_id"])
+        state = MODULE.load_state(stale)
+        state["clean_at_head_sha"] = "old-lower"
+        MODULE.save_state(stale, state)
+        result = self.record(stack, stale)
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual("member_not_clear", result["reason"])
+        self.assertEqual(5, result["blocked_member"])
+
+    def test_record_rejects_a_clear_marker_from_another_stack_run(self):
+        stack = native_stack()
+        self.start(stack)
+        other = self.member_state(5, "lower1", "other-run")
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ), self.assertRaisesRegex(MODULE.WorkflowError, "was not produced"):
+            call(
+                "stack-record",
+                "--state",
+                str(self.stack_state),
+                "--member-state",
+                str(other),
+            )
+
+    def test_stale_pipeline_budget_cannot_authorize_a_standalone_result(self):
+        stack = native_stack()
+        started = self.start(stack)
+        standalone = self.member_state(5, "lower1", started["run_id"])
+        state = MODULE.load_state(standalone)
+        state["budget_scope"] = "invocation"
+        state["run"]["budget_scope"] = "invocation"
+        state["run"]["stack_guard"] = None
+        MODULE.save_state(standalone, state)
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ), self.assertRaisesRegex(MODULE.WorkflowError, "was not produced"):
+            call(
+                "stack-record",
+                "--state",
+                str(self.stack_state),
+                "--member-state",
+                str(standalone),
+            )
+
+    def test_interrupted_member_surfaces_its_unpropagated_push(self):
+        stack = native_stack()
+        started = self.start(stack)
+        self.next(stack)
+        updated = native_stack(heads={5: "lower2", 7: "middle1", 9: "upper1"})
+        directory = self.root / "resume-member"
+        directory.mkdir()
+        member_state = write_state(
+            directory,
+            pr={
+                "number": 5,
+                "title": "PR 5",
+                "pr_url": "https://github.com/owner/repo/pull/5",
+                "repo_name": "owner/repo",
+                "head_sha": "lower2",
+            },
+            pipeline_budget={"run": started["run_id"], "iteration": 1},
+            accepted_pushes=[
+                {
+                    "id": "pending-push",
+                    "head_sha": "lower2",
+                    "pipeline_run": started["run_id"],
+                    "pipeline_iteration": 1,
+                    "commits": ["fix"],
+                }
+            ],
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=updated
+        ), mock.patch.object(
+            MODULE, "stack_member_state_path", return_value=member_state
+        ):
+            action = call("stack-next", "--state", str(self.stack_state))
+        self.assertEqual("propagate", action["result"])
+        self.assertEqual("accepted_push_not_propagated", action["reason"])
+        self.assertEqual("pending-push", action["checkpoint_id"])
+        self.assertEqual("lower2", action["expected_head"])
+
+    def test_landed_pending_push_is_finalized_and_propagated_after_a_crash(self):
+        stack = native_stack()
+        started = self.start(stack)
+        self.next(stack)
+        updated = native_stack(heads={5: "lower2", 7: "middle1", 9: "upper1"})
+        member_state = self.pending_member_state(started["run_id"])
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=updated
+        ), mock.patch.object(
+            MODULE, "stack_member_state_path", return_value=member_state
+        ):
+            action = call("stack-next", "--state", str(self.stack_state))
+        self.assertEqual("propagate", action["result"])
+        self.assertEqual("pending-fix", action["checkpoint_id"])
+        recovered = MODULE.load_state(member_state)
+        self.assertNotIn("pending_stack_push", recovered)
+        self.assertEqual(
+            ["pending-fix"],
+            [checkpoint["id"] for checkpoint in recovered["accepted_pushes"]],
+        )
+        retried = call("publish", "--state", str(member_state))
+        self.assertEqual("published", retried["result"])
+        self.assertTrue(retried["recovered"])
+        self.assertEqual("pending-fix", retried["accepted_push"]["id"])
+
+    def test_unlanded_pending_fix_resumes_the_prepared_publish(self):
+        stack = native_stack()
+        started = self.start(stack)
+        self.next(stack)
+        member_state = self.pending_member_state(started["run_id"])
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ), mock.patch.object(
+            MODULE, "stack_member_state_path", return_value=member_state
+        ):
+            action = call("stack-next", "--state", str(self.stack_state))
+        self.assertEqual("resume_publish", action["result"])
+        self.assertEqual(5, action["member"])
+        self.assertEqual(str(member_state), action["member_state"])
+        pending = MODULE.load_state(member_state)["pending_stack_push"]
+        self.assertEqual("pending-fix", pending["id"])
+        self.assertEqual("lower1", pending["previous_head_sha"])
+        self.assertEqual("lower2", pending["head_sha"])
+        self.assertEqual({"command": "publish"}, pending["resume"])
+
+    def test_unlanded_empty_rerun_resumes_the_prepared_check(self):
+        stack = native_stack()
+        started = self.start(stack)
+        self.next(stack)
+        member_state = self.pending_member_state(
+            started["run_id"], kind="ci_rerun", check_key="build (linux)"
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ), mock.patch.object(
+            MODULE, "stack_member_state_path", return_value=member_state
+        ):
+            action = call("stack-next", "--state", str(self.stack_state))
+        self.assertEqual("resume_rerun", action["result"])
+        self.assertEqual(5, action["member"])
+        self.assertEqual(str(member_state), action["member_state"])
+        self.assertEqual("build (linux)", action["check"])
+        pending = MODULE.load_state(member_state)["pending_stack_push"]
+        self.assertEqual("pending-ci_rerun", pending["id"])
+        self.assertEqual("lower1", pending["previous_head_sha"])
+        self.assertEqual("lower2", pending["head_sha"])
+        self.assertEqual(
+            {
+                "command": "rerun",
+                "check": "build (linux)",
+                "name": "build",
+                "run_id": 123,
+            },
+            pending["resume"],
+        )
+
+    def test_landed_empty_rerun_can_repeat_after_finalization(self):
+        stack = native_stack()
+        started = self.start(stack)
+        self.next(stack)
+        updated = native_stack(heads={5: "lower2", 7: "middle1", 9: "upper1"})
+        member_state = self.pending_member_state(
+            started["run_id"], kind="ci_rerun", check_key="build (linux)"
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=updated
+        ), mock.patch.object(
+            MODULE, "stack_member_state_path", return_value=member_state
+        ):
+            action = call("stack-next", "--state", str(self.stack_state))
+        self.assertEqual("propagate", action["result"])
+
+        retried = call(
+            "rerun",
+            "--state",
+            str(member_state),
+            "--check",
+            "build (linux)",
+        )
+        self.assertEqual("empty_commit_published", retried["result"])
+        self.assertTrue(retried["recovered"])
+        self.assertEqual("build", retried["name"])
+        self.assertEqual(123, retried["run_id"])
+        self.assertEqual("pending-ci_rerun", retried["accepted_push"]["id"])
+
+    def test_unfinished_empty_rerun_without_a_push_intent_is_resumed(self):
+        stack = native_stack()
+        started = self.start(stack)
+        self.next(stack)
+        for status in ("creating", "prepared"):
+            with self.subTest(status=status):
+                member_state = self.unfinished_rerun_member_state(
+                    started["run_id"], status
+                )
+                with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+                    MODULE, "read_native_stack", return_value=stack
+                ), mock.patch.object(
+                    MODULE, "stack_member_state_path", return_value=member_state
+                ):
+                    action = call("stack-next", "--state", str(self.stack_state))
+                self.assertEqual("resume_rerun", action["result"])
+                self.assertEqual("build (linux)", action["check"])
+                self.assertEqual(f"empty_commit_{status}", action["reason"])
+
+    def test_propagation_refreshes_every_rewritten_descendant(self):
+        stack = native_stack()
+        self.start(stack)
+        updated = native_stack(heads={5: "lower1", 7: "middle2", 9: "upper2"})
+        script = self.root / "pr_conflict_resolver.py"
+        script.write_text("# test", encoding="utf-8")
+        process = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "result": "published",
+                    "members_published": [
+                        {"number": 7, "head_sha": "middle2"},
+                        {"number": 9, "head_sha": "upper2"},
+                    ],
+                }
+            ),
+            stderr="",
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", side_effect=[stack, updated]
+        ), mock.patch.object(
+            MODULE, "conflict_resolver_script", return_value=script
+        ), mock.patch.object(
+            MODULE, "commit_contains", return_value=True
+        ), mock.patch.object(MODULE, "run", return_value=process) as run:
+            result = call(
+                "stack-propagate",
+                "--state",
+                str(self.stack_state),
+                "--fixed-pr",
+                "5",
+                "--expected-head",
+                "lower1",
+            )
+        self.assertEqual("propagated", result["result"])
+        saved = MODULE.load_stack_state(self.stack_state)
+        self.assertEqual(
+            ["lower1", "middle2", "upper2"],
+            [member["head_sha"] for member in saved["members"]],
+        )
+        command = run.call_args.args[0]
+        self.assertIn("descendant-propagate", command)
+        self.assertIn("--stack-number", command)
+        self.assertIn("77", command)
+        self.assertIn("--expected-head", command)
+        self.assertIn("lower1", command)
+        state_index = command.index("--state")
+        self.assertEqual(
+            str(MODULE.stack_propagation_state_path(self.stack_state, 5, "lower1")),
+            command[state_index + 1],
+        )
+
+    def test_resolved_propagation_refuses_changed_descendants(self):
+        stack = native_stack()
+        self.start(stack)
+        resolver_state = MODULE.stack_propagation_state_path(
+            self.stack_state, 5, "lower1"
+        )
+        MODULE.save_state(
+            resolver_state,
+            {
+                "status": "resolved",
+                "members_before": [dict(member) for member in stack["members"][1:]],
+            },
+        )
+        moved = native_stack(
+            heads={5: "lower1", 7: "middle-external", 9: "upper1"}
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=moved
+        ), mock.patch.object(
+            MODULE, "conflict_resolver_script", return_value=self.resolver
+        ), mock.patch.object(MODULE, "run") as run:
+            result = call(
+                "stack-propagate",
+                "--state",
+                str(self.stack_state),
+                "--fixed-pr",
+                "5",
+                "--expected-head",
+                "lower1",
+            )
+        run.assert_not_called()
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual("propagation_snapshot_changed", result["reason"])
+
+    def test_conflicted_propagation_stops_before_a_descendant_runs(self):
+        stack = native_stack()
+        self.start(stack)
+        script = self.root / "pr_conflict_resolver.py"
+        script.write_text("# test", encoding="utf-8")
+        process = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"result": "conflicted", "detail": "app.py conflicts"}),
+            stderr="",
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ), mock.patch.object(
+            MODULE, "conflict_resolver_script", return_value=script
+        ), mock.patch.object(MODULE, "run", return_value=process):
+            result = call(
+                "stack-propagate",
+                "--state",
+                str(self.stack_state),
+                "--fixed-pr",
+                "5",
+                "--expected-head",
+                "lower1",
+            )
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual("propagation_conflicted", result["reason"])
+        self.assertEqual("app.py conflicts", result["detail"])
+
+    def test_success_without_containment_stops_instead_of_retrying_forever(self):
+        stack = native_stack()
+        self.start(stack)
+        process = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {"result": "published", "members_published": [{"number": 7}]}
+            ),
+            stderr="",
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ), mock.patch.object(
+            MODULE, "conflict_resolver_script", return_value=self.resolver
+        ), mock.patch.object(
+            MODULE, "commit_contains", return_value=False
+        ), mock.patch.object(
+            MODULE, "PROPAGATION_CONTAINMENT_RETRY_DELAYS", ()
+        ), mock.patch.object(MODULE, "run", return_value=process):
+            result = call(
+                "stack-propagate",
+                "--state",
+                str(self.stack_state),
+                "--fixed-pr",
+                "5",
+                "--expected-head",
+                "lower1",
+            )
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual("propagation_did_not_contain", result["reason"])
+
+    def test_topology_change_is_recorded_as_a_safe_stop(self):
+        stack = native_stack()
+        self.start(stack)
+        changed = native_stack(
+            branches={
+                5: ("lower", "main"),
+                7: ("middle", "main"),
+                9: ("upper", "middle"),
+            }
+        )
+        result = self.next(changed)
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual("topology_changed", result["reason"])
+
+    def test_completed_stack_with_no_check_member_is_not_green(self):
+        stack = native_stack()
+        self.start(stack)
+        state = MODULE.load_stack_state(self.stack_state)
+        state["cursor"] = len(state["members"])
+        for member in state["members"]:
+            member["ci_status"] = "clear"
+            member["clean_at_head_sha"] = member["head_sha"]
+            member["stage_outcome"] = (
+                "skipped" if member["number"] == 7 else "cleared"
+            )
+        MODULE.save_state(self.stack_state, state)
+        result = self.next(stack)
+        self.assertEqual("complete", result["result"])
+        self.assertEqual("skipped", result["outcome"])
+        self.assertEqual([7], result["skipped_members"])
+
+    def test_stopping_a_completed_stack_clears_its_outcome(self):
+        stack = native_stack()
+        self.start(stack)
+        state = MODULE.load_stack_state(self.stack_state)
+        state["status"] = "complete"
+        state["outcome"] = "green"
+        MODULE.save_state(self.stack_state, state)
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            MODULE.stack_stop(
+                self.stack_state,
+                state,
+                "topology_changed",
+                "the stack changed",
+            )
+        saved = MODULE.load_stack_state(self.stack_state)
+        self.assertEqual("stopped", saved["status"])
+        self.assertIsNone(saved["outcome"])
+
+    def test_parser_exposes_all_stack_coordination_commands(self):
+        parser = MODULE.build_parser()
+        subparsers = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        self.assertTrue(
+            {
+                "stack-start",
+                "stack-next",
+                "stack-record",
+                "stack-propagate",
+                "stack-status",
+                "stack-cleanup",
+            }.issubset(subparsers.choices)
+        )
 
 
 class LocalValidationRecordTest(unittest.TestCase):
