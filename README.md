@@ -151,9 +151,26 @@ the coordinator worktree.
 When starting a child through an app-native session kickoff, use the
 plugin-qualified agent ID `orchestration-agents:luna-implementer`.
 
-Select **Luna Implementer** directly when a coordinator or user has supplied a
-concrete implementation task. Model configuration requests Luna, but actual
-runtime usage must be verified from execution metadata when available.
+Each child reports its authoritative runtime model and evidence once. Astra
+confirms the effective model from recorded usage before authorizing work, and
+does not repeat the gate for an unchanged authorized runtime. A restart,
+recovery, runtime identity change, or mismatch requires a new gate; unavailable
+reasoning-effort/profile metadata is a disclosed limitation, not another gate.
+
+Every child has one active assignment with a distinguishable ID, repository and
+branch ownership, expected head, acceptance criteria, publication boundary, and
+named dependencies. The coordinator keeps the small durable record with the
+existing session SQL or todo tools. Terminal child reports are exactly `DONE`,
+`BLOCKED`, or `READY`; ordinary implementation ends in `DONE`, while `READY`
+is reserved for an explicit preparation gate. Idle events without a result are
+reconciled against the current assignment, given at most one bounded recovery,
+then surfaced as blocked if the outcome remains unknown.
+
+Handoffs keep `stack_number`, `pr_number`, `repo`, `branch_ref`, and
+`expected_head` separate. A stack number is not a PR number: use the native
+stack endpoint for `stack_number` and the pull request endpoint for
+`pr_number`. The agents do not widen permissions, escalate models
+automatically, or use a restrictive tools allowlist.
 
 ### Optional PR Flight State Sharing
 
