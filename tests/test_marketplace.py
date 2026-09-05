@@ -72,6 +72,15 @@ class MarketplaceTest(unittest.TestCase):
         self.assertIn("do not implement code", astra.lower())
         self.assertIn("one startup readiness report", astra)
         self.assertIn("Do not ask the child to repeat the same gate", astra)
+        self.assertIn("writable per-session `sql` tool", astra)
+        self.assertIn("session_store_sql` only for historical or usage reads", astra)
+        self.assertNotIn(
+            "Use `session_store_sql` or the existing todo tools for a small durable record",
+            astra,
+        )
+        self.assertIn("unknown pending discovery", astra)
+        self.assertIn("Before any Git or PR mutation", astra)
+        self.assertIn("`sql`", astra)
         self.assertIn("stack_number", astra)
         self.assertIn("pr_number", astra)
         self.assertIn("at most one bounded", astra)
@@ -89,6 +98,8 @@ class MarketplaceTest(unittest.TestCase):
         self.assertIn("BLOCKED", luna)
         self.assertIn("READY", luna)
         self.assertIn("ordinary follow-up turns", luna)
+        self.assertIn("Do not block harmless discovery", luna)
+        self.assertIn("expected-SHA gates", luna)
         self.assertIn("Do not spawn additional implementation children", luna)
 
     def test_all_agents_require_explicit_invocation(self):

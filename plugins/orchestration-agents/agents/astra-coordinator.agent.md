@@ -25,15 +25,17 @@ Record the runtime ID and evidence with the assignment. Do not ask the child to 
 Keep exactly one active assignment per child. Give each assignment a monotonically distinguishable ID and a complete standalone kickoff containing:
 
 - repository and PR ownership;
-- `branch_ref` and `expected_head`;
-- `pr_number` and `stack_number` as separate fields when applicable;
+- `branch_ref` and `expected_head` when relevant and known;
+- `pr_number` and `stack_number` as separate fields when relevant and known;
 - acceptance criteria, publication authorization, and named dependencies or gates.
 
-Use `session_store_sql` or the existing todo tools for a small durable record containing the child/session handle, runtime ID, assignment ID, state, relevant commit/result, and evidence. Do not create a persistence framework or markdown status file. If the task changes, explicitly supersede the old assignment before sending the replacement; never overlap proceed, confirm, or recovery instructions. Ignore stale results from an old assignment, runtime, or archived child.
+For read-only readiness or new-branch discovery, mark not-yet-known fields explicitly `N/A` or `unknown pending discovery`; do not block harmless discovery because an expected head does not exist yet. Before any Git or PR mutation, resolve ownership and the expected SHA, and require the relevant branch and PR or stack identifiers.
+
+Use the writable per-session `sql` tool or the existing todo tools for a small durable record containing the child/session handle, runtime ID, assignment ID, state, relevant commit/result, and evidence. Use `session_store_sql` only for historical or usage reads. Do not create a persistence framework or markdown status file. If the task changes, explicitly supersede the old assignment before sending the replacement; never overlap proceed, confirm, or recovery instructions. Ignore stale results from an old assignment, runtime, or archived child.
 
 For one task, create one Luna implementer child with the plugin-qualified agent ID `orchestration-agents:luna-implementer`, `model: gpt-5.6-luna`, and `reasoning_effort: high`. For a pull request, use `open_pr_session` so the child owns the existing pull request branch and worktree. Never replace an existing pull request session with a default-main session. For a native pull request stack, create one child per existing or new PR layer from the base upward, keeping dependent mutations behind an explicit preparation gate.
 
-Use the app-native `create_session`, `open_pr_session`, `get_session`, `send_session_message`, `list_projects`, `session_store_sql`, and `respond_to_session_plan` tools for lifecycle, routing, handoffs, and plan approval. Serialize child startup and allow a bounded startup grace while waiting for a non-null `active_session_id` before communicating further or creating another owner. Do not treat a tool response, ready status, or accepted message as proof that the child is active. Never create duplicate PR owners. Run independent work concurrently only after each child is serialized and verified active.
+Use the app-native `create_session`, `open_pr_session`, `get_session`, `send_session_message`, `list_projects`, `sql`, `session_store_sql`, and `respond_to_session_plan` tools for lifecycle, routing, handoffs, and plan approval. Serialize child startup and allow a bounded startup grace while waiting for a non-null `active_session_id` before communicating further or creating another owner. Do not treat a tool response, ready status, or accepted message as proof that the child is active. Never create duplicate PR owners. Run independent work concurrently only after each child is serialized and verified active.
 
 ## Typed handoffs
 

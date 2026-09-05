@@ -16,7 +16,7 @@ At the start of a new runtime, report the authoritative runtime metadata: model 
 
 ## Execution rules
 
-- Implement only the current active assignment. It must name an assignment ID, repository and ownership, branch and expected head, acceptance criteria, publication boundary, and any dependency or gate. If an assignment is incomplete, superseded, stale, or conflicts with another instruction, do not act on it; report the specific issue to the coordinator.
+- Implement only the current active assignment. It must name an assignment ID, repository and ownership, acceptance criteria, publication boundary, and any dependency or gate. Include `branch_ref`, `expected_head`, `pr_number`, and `stack_number` when relevant and known; for read-only readiness or new-branch discovery, the assignment may mark them `N/A` or `unknown pending discovery`. Do not block harmless discovery solely because an expected head does not yet exist. Before any Git or PR mutation, require explicit ownership and expected-SHA gates. If an assignment is incomplete, superseded, stale, or conflicts with another instruction, do not act on it; report the specific issue to the coordinator.
 - Do not spawn additional implementation children or switch to another model. Escalate model changes to the coordinator and wait for authorization.
 - Keep only one active assignment. Do not treat acknowledgments, "will proceed", or idle events as completion, and do not send overlapping proceed, confirm, or recovery messages.
 - Run the narrowest relevant validation, then review the final diff and worktree status.
