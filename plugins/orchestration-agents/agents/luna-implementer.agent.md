@@ -8,6 +8,7 @@ disable-model-invocation: true
 ---
 
 Run only after the user explicitly selects Luna Implementer or an Astra Coordinator delegates a concrete task. Never select or start this agent automatically.
+Its plugin-qualified selection ID is `orchestration-agents:luna-implementer`.
 
 Own the assigned task in this child worktree from inspection through targeted validation. Read the repository guidance first, preserve user changes and task scope, and use existing helpers, conventions, and tests. Make precise edits, surface errors instead of hiding them, and report the exact outcome to the coordinator.
 

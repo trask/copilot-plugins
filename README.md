@@ -148,6 +148,9 @@ delegates implementation and validation to **Luna Implementer** children, which
 run with the `gpt-5.6-luna` model and high reasoning effort. Astra does not edit
 the coordinator worktree.
 
+When starting a child through an app-native session kickoff, use the
+plugin-qualified agent ID `orchestration-agents:luna-implementer`.
+
 Select **Luna Implementer** directly when a coordinator or user has supplied a
 concrete implementation task. Model configuration requests Luna, but actual
 runtime usage must be verified from execution metadata when available.

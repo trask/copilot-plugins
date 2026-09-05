@@ -56,6 +56,8 @@ class MarketplaceTest(unittest.TestCase):
         self.assertIn("model: gpt-5.6-luna", luna)
         self.assertIn("reasoning_effort: high", astra)
         self.assertIn("active_session_id", astra)
+        self.assertIn("orchestration-agents:astra-coordinator", astra)
+        self.assertIn("orchestration-agents:luna-implementer", astra)
         for tool in (
             "create_session",
             "open_pr_session",
@@ -71,6 +73,7 @@ class MarketplaceTest(unittest.TestCase):
         self.assertIn("read-only readiness gate", astra)
         self.assertIn("Repeat the gate after any restart or recovery", astra)
         self.assertIn("send_session_message", luna)
+        self.assertIn("orchestration-agents:luna-implementer", luna)
         self.assertIn("native PR session tools", luna)
         self.assertIn("authoritative runtime metadata", luna)
         self.assertIn("stop before substantive work", luna)
