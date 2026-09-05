@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "GitHub Copilot plugins by Trask Stalnaker",
-    "version": "2.2.0"
+    "version": "2.2.1"
   },
   "plugins": [
     {
@@ -59,7 +59,7 @@
     {
       "name": "orchestration-agents",
       "description": "Coordinate repository work through an Astra planner and Luna implementation children.",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "source": "./plugins/orchestration-agents"
     }
   ]

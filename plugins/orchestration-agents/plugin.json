@@ -1,7 +1,7 @@
 {
   "name": "orchestration-agents",
   "description": "Coordinate repository work through an Astra planner and Luna implementation children.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": {
     "name": "Trask Stalnaker"
   },
