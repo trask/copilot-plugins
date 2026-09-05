@@ -52,6 +52,7 @@ DELETION_CONFLICT_CODES = {"DD", "UD", "DU"}
 STRATEGIES = ("auto", "merge", "rebase")
 STACK_ENTRIES_PAGE = 100
 STACK_CONFLICT_EXIT = 3
+STACK_FORMAT_EXIT = 4
 ESCALATION_KINDS = (
     "contradiction",
     "unsafe_push",
@@ -1743,6 +1744,9 @@ def archive_attempt(state: dict[str, Any]) -> None:
                 if conflict.get("status") == "resolved"
             ],
             "companion_resolutions": attempt.get("companion_resolutions") or [],
+            "formatting_checkpoints": (
+                (attempt.get("stack") or {}).get("formatting_checkpoints") or []
+            ),
             "started_at": attempt.get("started_at"),
             "ended_at": utc_now(),
         }
@@ -1782,6 +1786,8 @@ def attempt_summary(attempt: dict[str, Any] | None) -> dict[str, Any] | None:
         "published_head_sha": attempt.get("published_head_sha"),
         "mergeable_at_head_sha": attempt.get("mergeable_at_head_sha"),
         "conflict_signature": attempt.get("conflict_signature"),
+        "formatting_member": attempt.get("formatting_member"),
+        "formatting_last_run": attempt.get("formatting_last_run"),
         "conflict_statuses": count_by_status(attempt.get("conflicts")),
     }
 
@@ -3621,15 +3627,27 @@ def record_rebased_member(workspace: Path, member: dict[str, Any]) -> None:
         )
 
 
+def formatting_checkpoint(
+    stack: dict[str, Any], member: dict[str, Any], output: str = ""
+) -> subprocess.CompletedProcess[str]:
+    stack["formatting_index"] = member["index"]
+    return subprocess.CompletedProcess(
+        ["stack-format"],
+        STACK_FORMAT_EXIT,
+        stdout=output,
+        stderr="",
+    )
+
+
 def run_stack_cascade(
     workspace: Path, stack: dict[str, Any], start_index: int = 0
 ) -> subprocess.CompletedProcess[str]:
-    """Rebase each planned layer and stop at the first conflict or hard error."""
+    """Rebase one planned layer and stop for its formatting checkpoint."""
     output = []
     plan = stack.get("plan") or []
     for member in plan[start_index:]:
         if is_ancestor(workspace, member["new_base_ref"], member["branch_ref"]):
-            continue
+            return formatting_checkpoint(stack, member)
         process = run_stack_member_rebase(workspace, member)
         output.extend(part for part in (process.stdout, process.stderr) if part)
         if process.returncode == 0:
@@ -3642,7 +3660,7 @@ def run_stack_cascade(
                     stdout="".join(output),
                     stderr=str(error),
                 )
-            continue
+            return formatting_checkpoint(stack, member, "".join(output))
         if rebase_in_progress(workspace) and unmerged_entries(workspace):
             stack["current_index"] = member["index"]
             return subprocess.CompletedProcess(
@@ -3666,7 +3684,7 @@ def run_stack_cascade(
 def continue_stack_cascade(
     workspace: Path, stack: dict[str, Any]
 ) -> subprocess.CompletedProcess[str]:
-    """Continue the conflicted member, then resume the remaining cascade."""
+    """Continue the conflicted member and stop for its formatting checkpoint."""
     current = stack.get("current_index")
     if not isinstance(current, int):
         raise WorkflowError("the stack cascade has no conflicted member to continue")
@@ -3699,12 +3717,8 @@ def continue_stack_cascade(
                     )
                 return skipped
             record_rebased_member(workspace, stack["plan"][current])
-            remainder = run_stack_cascade(workspace, stack, current + 1)
-            return subprocess.CompletedProcess(
-                remainder.args,
-                remainder.returncode,
-                stdout=output + skipped.stdout + remainder.stdout,
-                stderr=skipped.stderr + remainder.stderr,
+            return formatting_checkpoint(
+                stack, stack["plan"][current], output + skipped.stdout
             )
         if rebase_in_progress(workspace) and unmerged_entries(workspace):
             return subprocess.CompletedProcess(
@@ -3715,13 +3729,7 @@ def continue_stack_cascade(
             )
         return continued
     record_rebased_member(workspace, stack["plan"][current])
-    remainder = run_stack_cascade(workspace, stack, current + 1)
-    return subprocess.CompletedProcess(
-        remainder.args,
-        remainder.returncode,
-        stdout=continued.stdout + remainder.stdout,
-        stderr=continued.stderr + remainder.stderr,
-    )
+    return formatting_checkpoint(stack, stack["plan"][current], continued.stdout)
 
 
 def capture_member_tips(
@@ -3768,6 +3776,241 @@ def validate_rebased_stack(
     return tips
 
 
+def stack_formatting_member(
+    workspace: Path, stack: dict[str, Any]
+) -> tuple[dict[str, Any], int]:
+    index = stack.get("formatting_index")
+    plan = stack.get("plan") or []
+    if not isinstance(index, int) or index < 0 or index >= len(plan):
+        raise WorkflowError(
+            "the stack has no valid formatting checkpoint; run stack-rebase again"
+        )
+    member = plan[index]
+    if member.get("index") != index:
+        raise WorkflowError(
+            f"the formatting checkpoint does not match stack member index {index}"
+        )
+    return member, index
+
+
+def stack_member_paths(
+    workspace: Path, base_ref: str, branch_ref: str
+) -> set[str]:
+    result = git_try(
+        workspace,
+        "diff",
+        "--name-only",
+        "-z",
+        base_ref,
+        branch_ref,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WorkflowError(f"could not identify the current PR's files: {detail}")
+    return {path for path in result.stdout.split("\0") if path}
+
+
+def stack_formatting_checkpoints(stack: dict[str, Any]) -> list[dict[str, Any]]:
+    checkpoints = stack.get("formatting_checkpoints")
+    if not isinstance(checkpoints, list):
+        checkpoints = []
+        stack["formatting_checkpoints"] = checkpoints
+    return checkpoints
+
+
+def previous_formatting_checkpoint(
+    workspace: Path, stack: dict[str, Any], member: dict[str, Any]
+) -> dict[str, Any] | None:
+    for checkpoint in reversed(stack_formatting_checkpoints(stack)):
+        if checkpoint.get("index") != member["index"]:
+            continue
+        current = git_try(workspace, "rev-parse", member["branch_ref"])
+        if current.returncode == 0 and current.stdout.strip() == checkpoint.get(
+            "after_sha"
+        ):
+            require_clean_worktree(workspace)
+            return checkpoint
+        raise WorkflowError(
+            f"the recorded formatting checkpoint for {member['branch']!r} no longer "
+            "matches its local branch"
+        )
+    return None
+
+
+def record_formatting_checkpoint(
+    stack: dict[str, Any],
+    member: dict[str, Any],
+    *,
+    before_sha: str,
+    after_sha: str,
+    changed_paths: list[str],
+    command: list[str] | None,
+) -> dict[str, Any]:
+    checkpoint = {
+        "index": member["index"],
+        "number": member["number"],
+        "branch": member["branch"],
+        "before_sha": before_sha,
+        "after_sha": after_sha,
+        "changed": bool(changed_paths),
+        "paths": changed_paths,
+        "command": command,
+        "recorded_at": utc_now(),
+    }
+    checkpoints = stack_formatting_checkpoints(stack)
+    checkpoints[:] = [
+        existing
+        for existing in checkpoints
+        if existing.get("index") != member["index"]
+    ]
+    checkpoints.append(checkpoint)
+    return checkpoint
+
+
+def format_stack_member(
+    workspace: Path,
+    state_path: Path,
+    state: dict[str, Any],
+    attempt: dict[str, Any],
+    *,
+    format_command: list[str] | None,
+    no_format: bool,
+) -> dict[str, Any]:
+    stack = attempt["stack"]
+    member, _index = stack_formatting_member(workspace, stack)
+    prior = previous_formatting_checkpoint(workspace, stack, member)
+    if prior is not None:
+        return prior
+    if format_command is None and not no_format:
+        raise WorkflowError(
+            "choose --format-command for the repository's formatter or explicitly "
+            "pass --no-format when the repository has no formatting step"
+        )
+    require_no_integration_in_progress(workspace)
+    require_clean_worktree(workspace)
+    branch = git(workspace, "branch", "--show-current")
+    if branch != member["branch"]:
+        checkout = git_try(workspace, "checkout", member["branch"])
+        if checkout.returncode != 0:
+            detail = checkout.stderr.strip() or checkout.stdout.strip() or "no output"
+            raise WorkflowError(
+                f"could not check out formatting branch {member['branch']!r}: {detail}"
+            )
+    before_sha = git(workspace, "rev-parse", member["branch_ref"])
+    allowed_paths = stack_member_paths(
+        workspace, member["new_base_ref"], member["branch_ref"]
+    )
+    output = ""
+    if format_command is not None:
+        process = run(format_command, cwd=workspace, check=False)
+        output = (process.stdout + process.stderr).strip()
+        attempt["formatting_last_run"] = {
+            "index": member["index"],
+            "number": member["number"],
+            "branch": member["branch"],
+            "command": format_command,
+            "returncode": process.returncode,
+            "output": output,
+            "recorded_at": utc_now(),
+        }
+        save_state(state_path, state)
+        if process.returncode != 0:
+            raise WorkflowError(
+                f"the formatter failed for PR #{member['number']} "
+                f"(exit code {process.returncode}): {output or 'no output'}"
+            )
+
+    status = git_try(workspace, "status", "--porcelain=v1", "-z")
+    if status.returncode != 0:
+        detail = status.stderr.strip() or status.stdout.strip() or "no output"
+        raise WorkflowError(f"could not inspect formatter changes: {detail}")
+    entries = parse_status_z(status.stdout)
+    changed_paths = sorted(
+        {
+            path
+            for entry in entries
+            for path in (entry["path"], entry.get("origin"))
+            if path
+        }
+    )
+    outside = [path for path in changed_paths if path not in allowed_paths]
+    if outside:
+        raise WorkflowError(
+            "the formatter changed files outside the current PR layer: "
+            + ", ".join(outside)
+        )
+    if changed_paths:
+        add = git_try(
+            workspace,
+            "add",
+            "--all",
+            "--",
+            *(literal_pathspec(path) for path in changed_paths),
+        )
+        if add.returncode != 0:
+            detail = add.stderr.strip() or add.stdout.strip() or "no output"
+            raise WorkflowError(f"could not stage formatting changes: {detail}")
+    staged = git_try(workspace, "diff", "--cached", "--name-only", "-z")
+    if staged.returncode != 0:
+        detail = staged.stderr.strip() or staged.stdout.strip() or "no output"
+        raise WorkflowError(f"could not inspect staged formatting changes: {detail}")
+    staged_paths = {path for path in staged.stdout.split("\0") if path}
+    staged_outside = sorted(staged_paths - allowed_paths)
+    if staged_outside:
+        raise WorkflowError(
+            "staged formatting changes outside the current PR layer: "
+            + ", ".join(staged_outside)
+        )
+    after_sha = before_sha
+    if staged_paths:
+        commit = git_try(
+            workspace,
+            "commit",
+            "--message",
+            f"Apply repository formatting for PR #{member['number']}",
+        )
+        if commit.returncode != 0:
+            detail = commit.stderr.strip() or commit.stdout.strip() or "no output"
+            raise WorkflowError(f"could not record formatting changes: {detail}")
+        after_sha = git(workspace, "rev-parse", member["branch_ref"])
+        if not is_ancestor(workspace, before_sha, after_sha):
+            raise WorkflowError(
+                f"the formatting commit for PR #{member['number']} is not based on "
+                "the completed PR layer"
+            )
+        committed = git_try(
+            workspace,
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-z",
+            before_sha,
+            after_sha,
+        )
+        if committed.returncode != 0:
+            detail = committed.stderr.strip() or committed.stdout.strip() or "no output"
+            raise WorkflowError(f"could not validate the formatting commit: {detail}")
+        committed_paths = {
+            path for path in committed.stdout.split("\0") if path
+        }
+        committed_outside = sorted(committed_paths - allowed_paths)
+        if committed_outside:
+            raise WorkflowError(
+                "the formatting commit changed files outside the current PR layer: "
+                + ", ".join(committed_outside)
+            )
+    require_clean_worktree(workspace)
+    return record_formatting_checkpoint(
+        stack,
+        member,
+        before_sha=before_sha,
+        after_sha=after_sha,
+        changed_paths=sorted(staged_paths),
+        command=format_command,
+    )
+
+
 def finish_stack_rebase(
     state_path: Path,
     state: dict[str, Any],
@@ -3787,7 +4030,30 @@ def finish_stack_rebase(
     output = (process.stdout + process.stderr).strip()
     stack = attempt["stack"]
 
+    if code == STACK_FORMAT_EXIT:
+        member, _index = stack_formatting_member(workspace, stack)
+        attempt["status"] = "formatting"
+        attempt["formatting_member"] = {
+            "number": member["number"],
+            "branch": member["branch"],
+            "index": member["index"],
+        }
+        attempt["command_output"] = output
+        save_state(state_path, state)
+        emit(
+            {
+                "result": "formatting_required",
+                "state": str(state_path),
+                "attempt": attempt_summary(attempt),
+                "formatting_member": attempt["formatting_member"],
+                "next": "stack-format",
+            }
+        )
+        return
+
     if code == 0:
+        stack["formatting_index"] = None
+        attempt["formatting_member"] = None
         try:
             attempt["stack"]["members_after"] = validate_rebased_stack(
                 workspace, stack
@@ -3811,6 +4077,8 @@ def finish_stack_rebase(
         return
 
     if code == STACK_CONFLICT_EXIT:
+        stack["formatting_index"] = None
+        attempt["formatting_member"] = None
         conflicts = collect_stack_conflicts(workspace, stack)
         if not conflicts:
             if rebase_in_progress(workspace):
@@ -3847,6 +4115,146 @@ def finish_stack_rebase(
     save_state(state_path, state)
     raise WorkflowError(
         f"the stack {verb} failed (exit code {code}): {output or 'no output'}"
+    )
+
+
+def command_stack_format(args: argparse.Namespace) -> None:
+    require_tools()
+    state_path = cli_path(args.state)
+    state = load_state(state_path)
+    if state.get("operation") == "descendant_propagation":
+        command_descendant_format(args, state_path, state)
+        return
+    attempt = active_attempt(state)
+    if attempt.get("strategy") != "stack":
+        raise WorkflowError("this attempt is not a native-stack cascade")
+    if attempt["status"] != "formatting":
+        raise WorkflowError(
+            f"a stack formatting checkpoint is not pending; this attempt is "
+            f"{attempt['status']}"
+        )
+    workspace = attempt_repo_root(state, attempt)
+    stack = attempt["stack"]
+    member, index = stack_formatting_member(workspace, stack)
+    checkpoint = previous_formatting_checkpoint(workspace, stack, member)
+    if checkpoint is None:
+        checkpoint = format_stack_member(
+            workspace,
+            state_path,
+            state,
+            attempt,
+            format_command=args.format_command,
+            no_format=args.no_format,
+        )
+        save_state(state_path, state)
+    stack["formatting_index"] = index
+    process = run_stack_cascade(workspace, stack, index + 1)
+    finish_stack_rebase(state_path, state, attempt, workspace, process, "format")
+
+
+def command_descendant_format(
+    args: argparse.Namespace, state_path: Path, state: dict[str, Any]
+) -> None:
+    if state.get("status") != "formatting":
+        raise WorkflowError(
+            "a descendant propagation formatting checkpoint is not pending; "
+            f"this propagation is {state.get('status')}"
+        )
+    workspace_value = state.get("workspace")
+    stack = state.get("cascade")
+    if not isinstance(workspace_value, str) or not workspace_value:
+        raise WorkflowError("the descendant propagation has no formatting workspace")
+    if not isinstance(stack, dict):
+        raise WorkflowError(
+            "the descendant propagation has no cascade plan for formatting"
+        )
+    workspace = Path(workspace_value)
+    if not workspace.exists():
+        raise WorkflowError(
+            f"the descendant propagation formatting workspace is missing: {workspace}"
+        )
+    attempt = {"status": "formatting", "stack": stack}
+    member, index = stack_formatting_member(workspace, stack)
+    checkpoint = previous_formatting_checkpoint(workspace, stack, member)
+    if checkpoint is None:
+        format_stack_member(
+            workspace,
+            state_path,
+            state,
+            attempt,
+            format_command=args.format_command,
+            no_format=args.no_format,
+        )
+        state["cascade"] = stack
+        save_state(state_path, state)
+    stack["formatting_index"] = index
+    process = run_stack_cascade(workspace, stack, index + 1)
+    output = (process.stdout + process.stderr).strip()
+    if process.returncode == STACK_FORMAT_EXIT:
+        state["status"] = "formatting"
+        state["formatting_index"] = stack["formatting_index"]
+        state["cascade"] = stack
+        save_state(state_path, state)
+        next_member = stack["plan"][stack["formatting_index"]]
+        emit(
+            {
+                "result": "formatting_required",
+                "state": str(state_path),
+                "stack_number": state["stack_number"],
+                "fixed_pr": state["fixed_pr"],
+                "formatting_member": {
+                    "number": next_member["number"],
+                    "branch": next_member["branch"],
+                    "index": next_member["index"],
+                },
+                "next": "stack-format",
+            }
+        )
+        return
+    if process.returncode == STACK_CONFLICT_EXIT:
+        state["status"] = "conflicted"
+        state["detail"] = output
+        remove_stack_workspace({"stack": state})
+        save_state(state_path, state)
+        emit(
+            {
+                "result": "conflicted",
+                "state": str(state_path),
+                "stack_number": state["stack_number"],
+                "fixed_pr": state["fixed_pr"],
+                "members_published": [],
+            }
+        )
+        return
+    if process.returncode != 0:
+        remove_stack_workspace({"stack": state})
+        save_state(state_path, state)
+        raise WorkflowError(
+            f"descendant propagation failed after formatting (exit code "
+            f"{process.returncode}): {output or 'no output'}"
+        )
+    intended = validate_rebased_stack(workspace, stack)
+    state["members_after"] = intended
+    source_stack = state.get("source_stack")
+    if not isinstance(source_stack, dict):
+        raise WorkflowError(
+            "the descendant propagation has no source stack snapshot for validation"
+        )
+    state["expected_post_fingerprint"] = propagated_stack_fingerprint(
+        source_stack, intended
+    )
+    state["status"] = "resolved"
+    state["cascade"] = stack
+    save_state(state_path, state)
+    emit(
+        {
+            "result": "resolved",
+            "state": str(state_path),
+            "stack_number": state["stack_number"],
+            "fixed_pr": state["fixed_pr"],
+            "members_after": intended,
+            "next": "descendant-propagate",
+        }
     )
 
 
@@ -4193,6 +4601,11 @@ def command_descendant_propagate(args: argparse.Namespace) -> None:
                 }
             )
             return
+        if prior.get("status") == "formatting":
+            raise WorkflowError(
+                "this descendant propagation has a formatting checkpoint pending; "
+                "run stack-format before descendant-propagate"
+            )
         prior_workspace = prior.get("workspace")
         if (
             prior.get("status") == "resolved"
@@ -4235,6 +4648,7 @@ def command_descendant_propagate(args: argparse.Namespace) -> None:
             "stack_number": stack["number"],
             "fixed_pr": fixed_pr,
             "fixed_head_sha": expected_head,
+            "source_stack": stack,
             "source_snapshot": stack_snapshot_fingerprint(stack),
             "members_before": partial["members"],
             "members_after": None,
@@ -4246,11 +4660,33 @@ def command_descendant_propagate(args: argparse.Namespace) -> None:
             pr, reference=local_object_source(repo_root)
         )
         state["workspace"] = str(workspace)
+        state["cascade"] = partial
         save_state(state_path, state)
     try:
         if not resume_resolved:
             prepare_stack_cascade(workspace, partial)
+            state["cascade"] = partial
             process = run_stack_cascade(workspace, partial)
+            if process.returncode == STACK_FORMAT_EXIT:
+                state["status"] = "formatting"
+                state["formatting_index"] = partial["formatting_index"]
+                save_state(state_path, state)
+                member = partial["plan"][partial["formatting_index"]]
+                emit(
+                    {
+                        "result": "formatting_required",
+                        "state": str(state_path),
+                        "stack_number": stack["number"],
+                        "fixed_pr": fixed_pr,
+                        "formatting_member": {
+                            "number": member["number"],
+                            "branch": member["branch"],
+                            "index": member["index"],
+                        },
+                        "next": "stack-format",
+                    }
+                )
+                return
             if process.returncode == STACK_CONFLICT_EXIT:
                 state["status"] = "conflicted"
                 state["detail"] = (process.stdout + process.stderr).strip()
@@ -4810,6 +5246,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stack_continue.add_argument("--state", required=True)
     stack_continue.set_defaults(function=command_stack_continue)
+
+    stack_format = subparsers.add_parser(
+        "stack-format",
+        help="run the repository formatter and record the current stack member",
+    )
+    stack_format.add_argument("--state", required=True)
+    format_choice = stack_format.add_mutually_exclusive_group(required=True)
+    format_choice.add_argument(
+        "--format-command",
+        nargs="+",
+        help="formatter executable and arguments, run in the cascade workspace",
+    )
+    format_choice.add_argument(
+        "--no-format",
+        action="store_true",
+        help="record that this repository has no formatting step for this layer",
+    )
+    stack_format.set_defaults(function=command_stack_format)
 
     stack_abort = subparsers.add_parser(
         "stack-abort",

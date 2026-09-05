@@ -5111,6 +5111,39 @@ class NativeStackCoordinatorTest(unittest.TestCase):
         self.assertEqual("propagation_conflicted", result["reason"])
         self.assertEqual("app.py conflicts", result["detail"])
 
+    def test_formatting_checkpoint_stops_propagation_before_publication(self):
+        stack = native_stack()
+        self.start(stack)
+        script = self.root / "pr_conflict_resolver.py"
+        script.write_text("# test", encoding="utf-8")
+        process = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "result": "formatting_required",
+                    "detail": "format PR #7 before continuing",
+                }
+            ),
+            stderr="",
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ), mock.patch.object(
+            MODULE, "conflict_resolver_script", return_value=script
+        ), mock.patch.object(MODULE, "run", return_value=process):
+            result = call(
+                "stack-propagate",
+                "--state",
+                str(self.stack_state),
+                "--fixed-pr",
+                "5",
+                "--expected-head",
+                "lower1",
+            )
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual("propagation_formatting_required", result["reason"])
+        self.assertEqual("format PR #7 before continuing", result["detail"])
+
     def test_success_without_containment_stops_instead_of_retrying_forever(self):
         stack = native_stack()
         self.start(stack)

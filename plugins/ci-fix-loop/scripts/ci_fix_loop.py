@@ -4487,6 +4487,9 @@ def command_stack_propagate(args: argparse.Namespace) -> None:
             state,
             "propagation_conflicted"
             if isinstance(result, dict) and result.get("result") == "conflicted"
+            else "propagation_formatting_required"
+            if isinstance(result, dict)
+            and result.get("result") == "formatting_required"
             else "propagation_failed",
             str(detail or result),
             member=args.fixed_pr,

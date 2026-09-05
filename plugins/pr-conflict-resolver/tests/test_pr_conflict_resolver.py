@@ -462,6 +462,7 @@ class AgentInstructionsTest(unittest.TestCase):
         for command in (
             "stack-rebase",
             "stack-continue",
+            "stack-format",
             "stack-abort",
             "stack-publish",
         ):
@@ -541,6 +542,11 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn(
             "force-pushes every member of the stack, including ones that are "
             "currently mergeable and under review",
+            self.instructions,
+        )
+        self.assertIn(
+            "The helper never runs formatting between individual conflict stops "
+            "in one member",
             self.instructions,
         )
         self.assertIn(
@@ -4693,6 +4699,8 @@ def stack_attempt_record(**overrides):
             "workspace": None,
             "members_after": None,
             "trunk_sha": "base1",
+            "formatting_index": None,
+            "formatting_checkpoints": [],
         },
     }
     stack_overrides = overrides.pop("stack", None)
@@ -6051,6 +6059,25 @@ class StackCascadeTopologyTest(GitTestCase):
     def prepare_and_rebase(self):
         plan = MODULE.prepare_stack_cascade(self.workspace, self.stack)
         process = MODULE.run_stack_cascade(self.workspace, self.stack)
+        while process.returncode == MODULE.STACK_FORMAT_EXIT:
+            index = self.stack["formatting_index"]
+            member = self.stack["plan"][index]
+            tip = self.git(self.workspace, "rev-parse", member["branch_ref"])
+            self.stack.setdefault("formatting_checkpoints", []).append(
+                {
+                    "index": index,
+                    "number": member["number"],
+                    "branch": member["branch"],
+                    "before_sha": tip,
+                    "after_sha": tip,
+                    "changed": False,
+                    "paths": [],
+                    "command": None,
+                }
+            )
+            process = MODULE.run_stack_cascade(
+                self.workspace, self.stack, index + 1
+            )
         if process.returncode == 0:
             self.stack["members_after"] = MODULE.capture_member_tips(
                 self.workspace, self.stack
@@ -6097,6 +6124,41 @@ class StackCascadeTopologyTest(GitTestCase):
         self.assertEqual(tips["child"], self.remote_head("child"))
         self.assertEqual(tips["grandchild"], self.remote_head("grandchild"))
         self.assertEqual(self.unrelated_head, self.remote_head("unrelated"))
+
+    def test_a_formatted_parent_is_the_child_rebase_base(self):
+        MODULE.prepare_stack_cascade(self.workspace, self.stack)
+        first = MODULE.run_stack_cascade(self.workspace, self.stack)
+        self.assertEqual(MODULE.STACK_FORMAT_EXIT, first.returncode)
+        attempt = stack_attempt_record(
+            status="formatting",
+            stack=self.stack,
+        )
+        state_path = write_state(
+            self.root,
+            repo_root=str(self.workspace),
+            attempt=attempt,
+        )
+        MODULE.format_stack_member(
+            self.workspace,
+            state_path,
+            json.loads(state_path.read_text(encoding="utf-8")),
+            attempt,
+            format_command=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('lower.txt').write_text('formatted\\n')",
+            ],
+            no_format=False,
+        )
+        next_process = MODULE.run_stack_cascade(
+            self.workspace, self.stack, self.stack["formatting_index"] + 1
+        )
+        self.assertEqual(MODULE.STACK_FORMAT_EXIT, next_process.returncode)
+        child = self.git(self.workspace, "rev-parse", "refs/heads/child")
+        self.assertEqual(
+            "formatted",
+            self.git(self.workspace, "show", f"{child}:lower.txt"),
+        )
 
     def test_a_fast_forwarded_parent_uses_the_child_merge_base(self):
         self.stack["members"][1]["base_sha"] = self.lower_head
@@ -6250,13 +6312,14 @@ class ContinueStackCascadeTest(unittest.TestCase):
             MODULE, "run_stack_cascade", return_value=completed(0)
         ) as cascade:
             result = MODULE.continue_stack_cascade(self.workspace, self.stack)
-        self.assertEqual(0, result.returncode)
+        self.assertEqual(MODULE.STACK_FORMAT_EXIT, result.returncode)
         self.assertEqual(
             ["git", "-C", str(self.workspace), "rebase", "--skip"],
             runner.call_args_list[1].args[0],
         )
         record.assert_called_once_with(self.workspace, self.stack["plan"][0])
-        cascade.assert_called_once_with(self.workspace, self.stack, 1)
+        cascade.assert_not_called()
+        self.assertEqual(0, self.stack["formatting_index"])
 
     def test_a_skip_that_reaches_another_conflict_reports_that_conflict(self):
         with mock.patch.object(
@@ -6411,6 +6474,25 @@ class StackRebaseCommandTest(unittest.TestCase):
         self.assertEqual("resolved", payload["next"])
         self.assertEqual("conflicted", self.saved()["attempt"]["status"])
 
+    def test_a_completed_member_stops_for_formatting_before_descendants(self):
+        attempt = stack_attempt_record()
+        attempt["stack"]["plan"] = [
+            {
+                "index": 0,
+                "number": 19483,
+                "branch": "v143",
+                "branch_ref": "refs/heads/v143",
+            }
+        ]
+        attempt["stack"]["formatting_index"] = 0
+        payload = self.run_rebase(
+            attempt=attempt,
+            rebase=completed(MODULE.STACK_FORMAT_EXIT),
+        )
+        self.assertEqual("formatting_required", payload["result"])
+        self.assertEqual("stack-format", payload["next"])
+        self.assertEqual("formatting", self.saved()["attempt"]["status"])
+
     def test_a_hard_rebase_failure_removes_the_workspace(self):
         self.run_rebase(rebase=completed(1, stderr="bad lineage"))
         self.assertIsNotNone(self.error)
@@ -6426,6 +6508,160 @@ class StackRebaseCommandTest(unittest.TestCase):
         self.assertIsNotNone(self.error)
         self.assertIn("without any unmerged paths", str(self.error))
         self.remove.assert_called_once()
+
+
+class StackFormatCommandTest(GitTestCase):
+    def setUp(self):
+        self.directory = temporary_directory(self)
+        self.workspace = self.directory / "workspace"
+        self.workspace.mkdir()
+        self.git_in(self.workspace, "init", "--initial-branch", "main")
+        self.git_in(self.workspace, "config", "user.name", "Stack Test")
+        self.git_in(self.workspace, "config", "user.email", "stack@example.invalid")
+        self.write_in(self.workspace, "main.txt", "main\n")
+        self.commit_in(self.workspace, "main")
+        self.main_sha = self.git_in(self.workspace, "rev-parse", "HEAD")
+        self.git_in(self.workspace, "checkout", "-b", "feature")
+        self.write_in(self.workspace, "feature.txt", "before\n")
+        self.commit_in(self.workspace, "feature")
+        self.feature_sha = self.git_in(self.workspace, "rev-parse", "HEAD")
+        self.stack = {
+            "number": 77,
+            "size": 1,
+            "trunk": "main",
+            "members": [
+                {
+                    "number": 7,
+                    "head_branch": "feature",
+                    "base_branch": "main",
+                    "head_sha": self.feature_sha,
+                    "base_sha": self.main_sha,
+                }
+            ],
+            "workspace": str(self.workspace),
+            "plan": [
+                {
+                    "index": 0,
+                    "number": 7,
+                    "branch": "feature",
+                    "branch_ref": "refs/heads/feature",
+                    "head_sha": self.feature_sha,
+                    "new_base_ref": "refs/heads/main",
+                    "old_base": self.main_sha,
+                }
+            ],
+            "formatting_index": 0,
+            "formatting_checkpoints": [],
+        }
+        attempt = stack_attempt_record(
+            status="formatting",
+            stack=self.stack,
+        )
+        self.state_path = write_state(
+            self.directory,
+            repo_root=str(self.workspace),
+            attempt=attempt,
+        )
+
+    def run_format(self, *format_arguments):
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            format_command=list(format_arguments) if format_arguments else None,
+            no_format=not format_arguments,
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "run_stack_cascade", return_value=completed(0)
+        ) as cascade, mock.patch.object(
+            MODULE,
+            "validate_rebased_stack",
+            return_value=[
+                {
+                    "number": 7,
+                    "head_branch": "feature",
+                    "head_sha": self.git_in(
+                        self.workspace, "rev-parse", "refs/heads/feature"
+                    ),
+                }
+            ],
+        ), mock.patch.object(MODULE, "emit") as emit:
+            MODULE.command_stack_format(args)
+        return cascade, emitted(emit)
+
+    def test_formatter_changes_are_committed_to_the_current_member(self):
+        _cascade, payload = self.run_format(
+            sys.executable,
+            "-c",
+            "from pathlib import Path; Path('feature.txt').write_text('after\\n')",
+        )
+        self.assertEqual("resolved", payload["result"])
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        checkpoint = state["attempt"]["stack"]["formatting_checkpoints"][0]
+        self.assertTrue(checkpoint["changed"])
+        self.assertEqual(["feature.txt"], checkpoint["paths"])
+        self.assertEqual("after\n", (self.workspace / "feature.txt").read_text())
+        self.assertEqual(
+            checkpoint["after_sha"],
+            self.git_in(self.workspace, "rev-parse", "refs/heads/feature"),
+        )
+
+    def test_a_successful_formatter_with_no_diff_advances_without_a_commit(self):
+        original = self.git_in(self.workspace, "rev-parse", "refs/heads/feature")
+        _cascade, payload = self.run_format(
+            sys.executable,
+            "-c",
+            "from pathlib import Path; Path('feature.txt').read_text()",
+        )
+        self.assertEqual("resolved", payload["result"])
+        checkpoint = json.loads(
+            self.state_path.read_text(encoding="utf-8")
+        )["attempt"]["stack"]["formatting_checkpoints"][0]
+        self.assertFalse(checkpoint["changed"])
+        self.assertEqual(original, checkpoint["after_sha"])
+
+    def test_formatter_changes_outside_the_current_member_are_refused(self):
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            format_command=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('main.txt').write_text('bad\\n')",
+            ],
+            no_format=False,
+        )
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "outside the current PR layer"
+        ):
+            MODULE.command_stack_format(args)
+        self.assertEqual(
+            self.feature_sha,
+            self.git_in(self.workspace, "rev-parse", "refs/heads/feature"),
+        )
+
+    def test_a_failed_formatter_does_not_advance_and_dirty_retry_is_refused(self):
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            format_command=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('feature.txt').write_text('partial\\n'); raise SystemExit(9)",
+            ],
+            no_format=False,
+        )
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "formatter failed"
+        ):
+            MODULE.command_stack_format(args)
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual("formatting", state["attempt"]["status"])
+        retry = SimpleNamespace(
+            state=str(self.state_path),
+            format_command=[sys.executable, "-c", "pass"],
+            no_format=False,
+        )
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "worktree is not clean"
+        ):
+            MODULE.command_stack_format(retry)
 
 
 class StackPublishCommandTest(unittest.TestCase):
@@ -6766,6 +7002,68 @@ class DescendantPropagationTest(unittest.TestCase):
             ]
         )
         self.assertIs(args.function, MODULE.command_descendant_propagate)
+
+    def test_parser_exposes_the_formatting_checkpoint(self):
+        args = MODULE.build_parser().parse_args(
+            ["stack-format", "--state", "state.json", "--no-format"]
+        )
+        self.assertIs(args.function, MODULE.command_stack_format)
+        self.assertTrue(args.no_format)
+
+    def test_descendant_propagation_stops_for_formatting_before_publishing(self):
+        stack = self.stack()
+        root = temporary_directory(self)
+        args = SimpleNamespace(
+            target="owner/repo#11",
+            repo=None,
+            pull_request=None,
+            head_sha=None,
+            stack_number=77,
+            fixed_pr=11,
+            expected_head="fixed-head",
+            repo_root=None,
+            state=str(root / "propagation.json"),
+        )
+        workspace = root / "workspace"
+        workspace.mkdir()
+
+        def prepare(_workspace, partial):
+            partial["plan"] = [
+                {
+                    "index": 0,
+                    "number": 12,
+                    "branch": "tip",
+                    "branch_ref": "refs/heads/tip",
+                }
+            ]
+            partial["formatting_index"] = 0
+
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "resolve_repo_root", return_value=root
+        ), mock.patch.object(
+            MODULE, "metadata_for", return_value=pr_metadata(number=11)
+        ), mock.patch.object(
+            MODULE,
+            "stack_membership",
+            return_value={"default_branch": "main", "stack": stack},
+        ), mock.patch.object(
+            MODULE, "external_stack_dependents", return_value=[]
+        ), mock.patch.object(
+            MODULE, "create_stack_workspace", return_value=workspace
+        ), mock.patch.object(
+            MODULE, "prepare_stack_cascade", side_effect=prepare
+        ), mock.patch.object(
+            MODULE,
+            "run_stack_cascade",
+            return_value=completed(MODULE.STACK_FORMAT_EXIT),
+        ), mock.patch.object(MODULE, "emit") as emit_mock:
+            MODULE.command_descendant_propagate(args)
+
+        payload = emitted(emit_mock)
+        self.assertEqual("formatting_required", payload["result"])
+        saved = MODULE.load_state(Path(args.state))
+        self.assertEqual("formatting", saved["status"])
+        self.assertTrue(workspace.exists())
 
     def test_tip_propagation_creates_no_workspace_and_rewrites_nothing(self):
         args = SimpleNamespace(
