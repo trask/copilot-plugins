@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "GitHub Copilot plugins by Trask Stalnaker",
-    "version": "2.1.0"
+    "version": "2.2.0"
   },
   "plugins": [
     {
@@ -55,6 +55,12 @@
       "description": "Audit an already-merged GitHub pull request against its own historical snapshot, verify each finding independently, and commit the fixes on a separate audit branch.",
       "version": "1.0.2",
       "source": "./plugins/historical-pr-audit"
+    },
+    {
+      "name": "orchestration-agents",
+      "description": "Coordinate repository work through an Astra planner and Luna implementation children.",
+      "version": "1.0.0",
+      "source": "./plugins/orchestration-agents"
     }
   ]
 }

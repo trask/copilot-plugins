@@ -21,6 +21,7 @@ copilot plugin install pr-pipeline@trask-plugins
 copilot plugin install pr-conflict-resolver@trask-plugins
 copilot plugin install ci-fix-loop@trask-plugins
 copilot plugin install historical-pr-audit@trask-plugins
+copilot plugin install orchestration-agents@trask-plugins
 ```
 
 Restart Copilot after you install or update a plugin.
@@ -139,6 +140,18 @@ agent pushes, and a first pass that finds nothing pushes no branch at all.
 Run this agent on a Claude model. It checks its own findings with GPT-5.6 Sol,
 and that check only works when the evaluator comes from another model family.
 
+### Orchestration Agents
+
+Select **Astra Coordinator** in the agent dropdown and describe the repository
+task, pull request, or stack you want coordinated. Astra plans the work and
+delegates implementation and validation to **Luna Implementer** children, which
+run with the `gpt-5.6-luna` model and high reasoning effort. Astra does not edit
+the coordinator worktree.
+
+Select **Luna Implementer** directly when a coordinator or user has supplied a
+concrete implementation task. Model configuration requests Luna, but actual
+runtime usage must be verified from execution metadata when available.
+
 ### Optional PR Flight State Sharing
 
 Self Review Loop and PR Description can copy the few completion facts that
@@ -171,6 +184,7 @@ copilot plugin update pr-pipeline
 copilot plugin update pr-conflict-resolver
 copilot plugin update ci-fix-loop
 copilot plugin update historical-pr-audit
+copilot plugin update orchestration-agents
 ```
 
 ## Requirements

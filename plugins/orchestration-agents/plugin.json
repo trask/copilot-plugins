@@ -1,0 +1,17 @@
+{
+  "name": "orchestration-agents",
+  "description": "Coordinate repository work through an Astra planner and Luna implementation children.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Trask Stalnaker"
+  },
+  "repository": "https://github.com/trask/copilot-plugins",
+  "license": "MIT",
+  "keywords": [
+    "orchestration",
+    "delegation",
+    "agents",
+    "models"
+  ],
+  "agents": "agents/"
+}
