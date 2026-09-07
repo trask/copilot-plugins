@@ -84,4 +84,26 @@ Add only what changed the stack or needs attention:
 
 For `error`, state the error exactly. Never hide a stopped launch, an escalation, or a required action to make the response shorter.
 
-The terminal response is the run's last message.
+## Retrospective
+
+After every terminal outcome, including a clean pass, blocked run, stopped
+run, and error, look back at the run itself. Report only concrete friction
+encountered during this run; do not invent suggestions because a possible
+improvement exists.
+
+For each suggestion, use exactly one of these categories:
+
+- **Agent** — the PR Stack Pipeline instructions or stack-sweep protocol.
+- **Helper** — the bundled helper's commands, state, or reporting.
+- **General instructions** — the broader Copilot instructions or environment.
+- **Repository** — the reviewed repository's workflows, scripts, or guidance.
+
+Give one concrete suggestion per line and identify the moment that exposed it,
+such as a pass transition, worker launch, topology change, propagation
+checkpoint, monitoring failure, or terminal outcome. Keep this advisory and
+chat-only: never modify code, repository guidance, or GitHub because of the
+retrospective.
+
+Omit this section when the run encountered no friction. When present, render it
+after the complete terminal response as the final block of the response, with
+no recap afterward.

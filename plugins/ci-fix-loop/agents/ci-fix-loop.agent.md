@@ -293,3 +293,26 @@ The helper's `status` subcommand reports the same ending as a `stage_outcome` fi
 No progress is the one ending only you can report. The helper writes state before the run does any work, so a run killed part way through leaves state that looks exactly like a run still going, and the helper refuses to call either one an ending. You are the only thing that knows a run finished, so say `Outcome: no progress.` in your own report and let the missing field mean what it says.
 
 Do not post any of this to GitHub.
+
+## Retrospective
+
+After every terminal outcome, including a clean pass, skipped run, no-progress
+stop, and escalation, look back at the run itself. Report only concrete
+friction encountered during this run; do not invent suggestions because a
+possible improvement exists.
+
+For each suggestion, use exactly one of these categories:
+
+- **Agent** — the CI Fix Loop instructions or decision protocol.
+- **Helper** — the bundled helper's commands, state, or reporting.
+- **General instructions** — the broader Copilot instructions or environment.
+- **Repository** — the reviewed repository's workflows, scripts, or guidance.
+
+Give one concrete suggestion per line and identify the moment that exposed it,
+such as a failed check, attribution decision, propagation checkpoint, retry
+wait, or escalation. Keep this advisory and chat-only: never modify code,
+repository guidance, or GitHub because of the retrospective.
+
+Omit this section when the run encountered no friction. When present, render it
+after the complete `Final Report` as the final block of the response, with no
+recap afterward.

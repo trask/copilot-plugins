@@ -490,6 +490,23 @@ class AgentInstructionsTest(unittest.TestCase):
         ):
             self.assertIn(heading, self.instructions)
 
+    def test_requires_a_chat_only_retrospective_after_the_final_report(self):
+        self.assertIn("## Retrospective", self.instructions)
+        for category in (
+            "**Agent**",
+            "**Helper**",
+            "**General instructions**",
+            "**Repository**",
+        ):
+            self.assertIn(category, self.instructions)
+        self.assertIn("After every terminal outcome", self.instructions)
+        self.assertIn("Keep this advisory and chat-only", self.instructions)
+        self.assertIn("Omit this section when the run encountered no friction", self.instructions)
+        self.assertGreater(
+            self.instructions.index("## Retrospective"),
+            self.instructions.index("## Final Report"),
+        )
+
     def test_reads_greenness_from_github_rather_than_from_its_own_state(self):
         self.assertIn(
             "GitHub states whether the checks pass, and this loop's own state never "

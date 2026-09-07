@@ -1110,6 +1110,21 @@ class WorktreeSafetyTest(unittest.TestCase):
 
 
 class AgentInstructionTest(unittest.TestCase):
+    def test_requires_a_chat_only_retrospective_after_the_terminal_response(self):
+        text = AGENT.read_text(encoding="utf-8")
+        self.assertIn("## Retrospective", text)
+        for category in (
+            "**Agent**",
+            "**Helper**",
+            "**General instructions**",
+            "**Repository**",
+        ):
+            self.assertIn(category, text)
+        self.assertIn("After every terminal outcome", text)
+        self.assertIn("Keep this advisory and chat-only", text)
+        self.assertIn("Omit this section when the run encountered no friction", text)
+        self.assertGreater(text.index("## Retrospective"), text.index("Write a concise final response"))
+
     def test_agent_uses_the_durable_start_and_watch_protocol(self):
         text = AGENT.read_text(encoding="utf-8")
         self.assertIn("pr_pipeline.py\" start", text)

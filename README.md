@@ -21,7 +21,6 @@ copilot plugin install pr-pipeline@trask-plugins
 copilot plugin install pr-conflict-resolver@trask-plugins
 copilot plugin install ci-fix-loop@trask-plugins
 copilot plugin install historical-pr-audit@trask-plugins
-copilot plugin install orchestration-agents@trask-plugins
 ```
 
 Restart Copilot after you install or update a plugin.
@@ -140,38 +139,6 @@ agent pushes, and a first pass that finds nothing pushes no branch at all.
 Run this agent on a Claude model. It checks its own findings with GPT-5.6 Sol,
 and that check only works when the evaluator comes from another model family.
 
-### Orchestration Agents
-
-Select **Astra Coordinator** in the agent dropdown and describe the repository
-task, pull request, or stack you want coordinated. Astra plans the work and
-delegates implementation and validation to **Luna Implementer** children, which
-run with the `gpt-5.6-luna` model and high reasoning effort. Astra does not edit
-the coordinator worktree.
-
-When starting a child through an app-native session kickoff, use the
-plugin-qualified agent ID `orchestration-agents:luna-implementer`.
-
-Each child reports its authoritative runtime model and evidence once. Astra
-confirms the effective model from recorded usage before authorizing work, and
-does not repeat the gate for an unchanged authorized runtime. A restart,
-recovery, runtime identity change, or mismatch requires a new gate; unavailable
-reasoning-effort/profile metadata is a disclosed limitation, not another gate.
-
-Every child has one active assignment with a distinguishable ID, repository and
-branch ownership, expected head, acceptance criteria, publication boundary, and
-named dependencies. The coordinator keeps the small durable record with the
-existing session SQL or todo tools. Terminal child reports are exactly `DONE`,
-`BLOCKED`, or `READY`; ordinary implementation ends in `DONE`, while `READY`
-is reserved for an explicit preparation gate. Idle events without a result are
-reconciled against the current assignment, given at most one bounded recovery,
-then surfaced as blocked if the outcome remains unknown.
-
-Handoffs keep `stack_number`, `pr_number`, `repo`, `branch_ref`, and
-`expected_head` separate. A stack number is not a PR number: use the native
-stack endpoint for `stack_number` and the pull request endpoint for
-`pr_number`. The agents do not widen permissions, escalate models
-automatically, or use a restrictive tools allowlist.
-
 ### Optional PR Flight State Sharing
 
 Self Review Loop and PR Description can copy the few completion facts that
@@ -204,7 +171,6 @@ copilot plugin update pr-pipeline
 copilot plugin update pr-conflict-resolver
 copilot plugin update ci-fix-loop
 copilot plugin update historical-pr-audit
-copilot plugin update orchestration-agents
 ```
 
 ## Requirements

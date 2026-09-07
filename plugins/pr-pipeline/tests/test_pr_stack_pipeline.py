@@ -2268,6 +2268,23 @@ class AgentInstructionTest(unittest.TestCase):
     def setUp(self):
         self.text = AGENT.read_text(encoding="utf-8")
 
+    def test_requires_a_chat_only_retrospective_after_the_terminal_response(self):
+        self.assertIn("## Retrospective", self.text)
+        for category in (
+            "**Agent**",
+            "**Helper**",
+            "**General instructions**",
+            "**Repository**",
+        ):
+            self.assertIn(category, self.text)
+        self.assertIn("After every terminal outcome", self.text)
+        self.assertIn("Keep this advisory and", self.text)
+        self.assertIn("Omit this section when the run encountered no friction", self.text)
+        self.assertGreater(
+            self.text.index("## Retrospective"),
+            self.text.index("Write a concise final response"),
+        )
+
     def test_the_agent_only_runs_and_reports_the_helper(self):
         self.assertIn('pr_stack_pipeline.py" start --kickoff', self.text)
         self.assertIn('pr_stack_pipeline.py" watch --kickoff', self.text)
