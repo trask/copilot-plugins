@@ -28,6 +28,7 @@ DEFAULT_PIPELINE_MAX_ITERATIONS = 2
 DEFAULT_POLL_INTERVAL = 60
 DEFAULT_POLL_TIMEOUT = 300
 DEFAULT_NOT_STARTED_GRACE = 900
+DEFAULT_AUTO_RETRY_TIMEOUT = 600
 MAX_RERUNS_PER_CHECK = 1
 PR_HEAD_LAG_RETRY_DELAY = 1
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
@@ -2208,6 +2209,18 @@ def resolve_run_id(pr: dict[str, Any], reference: dict[str, int]) -> int:
     return run_id
 
 
+def fetch_workflow_run(pr: dict[str, Any], run_id: int) -> dict[str, Any]:
+    payload = gh_json(
+        [
+            "api",
+            f"repos/{pr['upstream_owner']}/{pr['upstream_repo']}/actions/runs/{run_id}",
+        ]
+    )
+    if not isinstance(payload, dict):
+        raise WorkflowError(f"workflow run {run_id} did not return an object")
+    return payload
+
+
 def rerun_failed_jobs(pr: dict[str, Any], run_id: int) -> None:
     process = run(
         [
@@ -2734,6 +2747,110 @@ def command_checks(args: argparse.Namespace) -> None:
             "iteration": run_state["iteration"],
         }
     )
+
+
+def command_wait_for_auto_retry(args: argparse.Namespace) -> None:
+    require_tools()
+    path = cli_path(args.state)
+    state = load_state(path)
+    run_state = active_run(state)
+    check = next(
+        (item for item in run_state.get("checks") or [] if item["key"] == args.check),
+        None,
+    )
+    if check is None:
+        raise WorkflowError(f"check {args.check} is not in this iteration's snapshot")
+    reference = parse_run_reference(check.get("url"))
+    if reference is None:
+        emit(
+            {
+                "result": "retry_not_detected",
+                "state": str(path),
+                "check": args.check,
+                "reason": "no_rerun_support",
+                "detail": (
+                    f"{check.get('name') or args.check} does not identify a GitHub "
+                    "Actions run to watch for an automatic retry"
+                ),
+            }
+        )
+        return
+
+    run_id = resolve_run_id(state["pr"], reference)
+    retries = state.setdefault("auto_retries", {})
+    previous = retries.get(args.check)
+    if (
+        not isinstance(previous, dict)
+        or previous.get("run_id") != run_id
+        or previous.get("head_sha") != run_state["head_sha"]
+    ):
+        previous = None
+
+    deadline = time.monotonic() + max(0, args.timeout)
+    while True:
+        workflow_run = fetch_workflow_run(state["pr"], run_id)
+        attempt = whole_number(
+            workflow_run.get("run_attempt"),
+            whole_number(previous.get("attempt") if previous else None, 1),
+        )
+        baseline_attempt = whole_number(
+            previous.get("attempt") if previous else None, attempt
+        )
+        status = str(workflow_run.get("status") or "").lower()
+        conclusion = str(workflow_run.get("conclusion") or "").lower()
+        observation = {
+            "check": args.check,
+            "run_id": run_id,
+            "head_sha": run_state["head_sha"],
+            "attempt": attempt,
+            "status": status,
+            "conclusion": conclusion or None,
+            "observed_at": utc_now(),
+        }
+        if attempt > baseline_attempt:
+            retries[args.check] = observation
+            save_state(path, state)
+            emit(
+                {
+                    "result": "retry_started",
+                    "state": str(path),
+                    "check": args.check,
+                    "run_id": run_id,
+                    "run_attempt": attempt,
+                    "status": status,
+                    "conclusion": conclusion or None,
+                    "reason": "automatic_retry_started",
+                    "detail": (
+                        f"{check.get('name') or args.check} is running in automatic "
+                        f"retry attempt {attempt}"
+                    ),
+                }
+            )
+            return
+        if time.monotonic() >= deadline:
+            observation["status"] = "not_detected"
+            retries[args.check] = observation
+            save_state(path, state)
+            emit(
+                {
+                    "result": "retry_not_detected",
+                    "state": str(path),
+                    "check": args.check,
+                    "run_id": run_id,
+                    "run_attempt": attempt,
+                    "status": status,
+                    "conclusion": conclusion or None,
+                    "reason": "automatic_retry_not_detected",
+                    "detail": (
+                        f"automatic retry for {check.get('name') or args.check} did "
+                        f"not start within {args.timeout} seconds"
+                    ),
+                }
+            )
+            return
+        retries[args.check] = {**observation, "status": "pending"}
+        save_state(path, state)
+        time.sleep(max(1, args.interval))
 
 
 def command_attribute(args: argparse.Namespace) -> None:
@@ -4922,6 +5039,7 @@ def status_payload(state: dict[str, Any], path: Path) -> dict[str, Any]:
         "run": run_state,
         "history": state.get("history") or [],
         "reruns": state.get("reruns") or {},
+        "auto_retries": state.get("auto_retries") or {},
         "local_validation": state.get("local_validation") or [],
         "escalation": state.get("escalation"),
         "outcome": state.get("outcome"),
@@ -4998,6 +5116,7 @@ def command_status(args: argparse.Namespace) -> None:
             "clean_at_head_sha": state.get("clean_at_head_sha"),
             "skip_note": state.get("skip_note"),
             "escalation": state.get("escalation"),
+            "auto_retries": state.get("auto_retries") or {},
             "local_validation": state.get("local_validation") or [],
             "verdicts": {
                 key: entry.get("verdict")
@@ -5177,6 +5296,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--not-started-grace", type=int, default=DEFAULT_NOT_STARTED_GRACE
     )
     checks.set_defaults(function=command_checks)
+
+    wait_for_auto_retry = subparsers.add_parser(
+        "wait-for-auto-retry",
+        help="wait for a repository workflow to start its automatic retry",
+    )
+    wait_for_auto_retry.add_argument("--state", required=True)
+    wait_for_auto_retry.add_argument("--check", required=True)
+    wait_for_auto_retry.add_argument("--interval", type=int, default=DEFAULT_POLL_INTERVAL)
+    wait_for_auto_retry.add_argument(
+        "--timeout", type=int, default=DEFAULT_AUTO_RETRY_TIMEOUT
+    )
+    wait_for_auto_retry.set_defaults(function=command_wait_for_auto_retry)
 
     attribute = subparsers.add_parser(
         "attribute", help="record one failing check's verdict"

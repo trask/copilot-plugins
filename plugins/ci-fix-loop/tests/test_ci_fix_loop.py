@@ -226,6 +226,11 @@ class AgentInstructionsTest(unittest.TestCase):
         frontmatter = self.instructions.split("---")[1]
         self.assertNotIn("\nmodel:", frontmatter)
 
+    def test_documents_waiting_for_repository_automatic_retries(self):
+        self.assertIn("wait-for-auto-retry", self.instructions)
+        self.assertIn("retry_started", self.instructions)
+        self.assertIn("retry_not_detected", self.instructions)
+
     def test_tells_the_agent_that_no_progress_is_its_claim_to_make(self):
         self.assertIn(
             "It reports `cleared`, `skipped`, `escalated`, and `carried`, and it "
@@ -2114,6 +2119,104 @@ class RerunCommandTest(unittest.TestCase):
         saved = MODULE.load_state(path)
         self.assertEqual("published", saved["reruns"]["check:a"]["status"])
         self.assertEqual(1, len(saved["accepted_pushes"]))
+
+class AutoRetryCommandTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        patcher = mock.patch.object(MODULE, "require_tools")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def state_with(self, auto_retries=None, url=None):
+        return write_state(
+            self.root,
+            auto_retries=auto_retries or {},
+            run={
+                "checks": [
+                    check(
+                        "check:a",
+                        name="Build pull request",
+                        url=url or "https://github.com/o/r/actions/runs/5/job/6",
+                    )
+                ],
+            },
+        )
+
+    def test_records_and_reports_the_new_workflow_attempt(self):
+        path = self.state_with(
+            auto_retries={
+                "check:a": {
+                    "run_id": 5,
+                    "head_sha": "head1",
+                    "attempt": 1,
+                }
+            }
+        )
+        with mock.patch.object(
+            MODULE,
+            "fetch_workflow_run",
+            return_value={
+                "id": 5,
+                "run_attempt": 2,
+                "status": "in_progress",
+                "conclusion": None,
+            },
+        ):
+            payload = call(
+                "wait-for-auto-retry",
+                "--state",
+                str(path),
+                "--check",
+                "check:a",
+                "--timeout",
+                "0",
+            )
+        self.assertEqual("retry_started", payload["result"])
+        self.assertEqual(2, payload["run_attempt"])
+        self.assertEqual(
+            2, MODULE.load_state(path)["auto_retries"]["check:a"]["attempt"]
+        )
+
+    def test_records_a_retry_that_has_not_started(self):
+        path = self.state_with()
+        with mock.patch.object(
+            MODULE,
+            "fetch_workflow_run",
+            return_value={
+                "id": 5,
+                "run_attempt": 1,
+                "status": "completed",
+                "conclusion": "failure",
+            },
+        ):
+            payload = call(
+                "wait-for-auto-retry",
+                "--state",
+                str(path),
+                "--check",
+                "check:a",
+                "--timeout",
+                "0",
+            )
+        self.assertEqual("retry_not_detected", payload["result"])
+        self.assertEqual(
+            "not_detected",
+            MODULE.load_state(path)["auto_retries"]["check:a"]["status"],
+        )
+
+    def test_reports_when_a_failure_has_no_actions_run(self):
+        path = self.state_with(url="https://ci.example.com/build/1")
+        payload = call(
+            "wait-for-auto-retry",
+            "--state",
+            str(path),
+            "--check",
+            "check:a",
+        )
+        self.assertEqual("retry_not_detected", payload["result"])
+        self.assertEqual("no_rerun_support", payload["reason"])
 
 
 class RerunWatermarkTest(unittest.TestCase):
