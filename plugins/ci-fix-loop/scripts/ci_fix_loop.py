@@ -4117,6 +4117,7 @@ def command_stack_start(args: argparse.Namespace) -> None:
         "propagated_pushes": [],
         "superseded_pushes": [],
         "pending_format": None,
+        "pending_conflict": None,
         "reason": None,
         "detail": None,
     }
@@ -4199,6 +4200,22 @@ def command_stack_next(args: argparse.Namespace) -> None:
                 "resolver_state": pending_format.get("resolver_state"),
                 "formatting_member": pending_format.get("formatting_member"),
                 "next": "stack-format",
+            }
+        )
+        return
+    pending_conflict = state.get("pending_conflict")
+    if isinstance(pending_conflict, dict):
+        emit(
+            {
+                "result": "resolve_conflict",
+                "state": str(path),
+                "stack_number": state["stack_number"],
+                "fixed_pr": pending_conflict.get("fixed_pr"),
+                "expected_head": pending_conflict.get("expected_head"),
+                "resolver_state": pending_conflict.get("resolver_state"),
+                "blocked_member": pending_conflict.get("blocked_member"),
+                "detail": pending_conflict.get("detail"),
+                "next": "conflict-resolver",
             }
         )
         return
@@ -4686,12 +4703,57 @@ def command_stack_propagate(args: argparse.Namespace) -> None:
                 }
             )
             return
+        if isinstance(result, dict) and result.get("result") == "conflicted":
+            resolver_snapshot = json.loads(
+                resolver_state_path.read_text(encoding="utf-8")
+            )
+            cascade = resolver_snapshot.get("cascade") or {}
+            plan = cascade.get("plan") or []
+            current_index = cascade.get("current_index")
+            blocked_member = None
+            if isinstance(current_index, int) and 0 <= current_index < len(plan):
+                blocked_member = plan[current_index].get("number")
+            if blocked_member is None:
+                fixed_index = state["members"].index(
+                    next(
+                        member
+                        for member in state["members"]
+                        if member["number"] == args.fixed_pr
+                    )
+                )
+                if fixed_index + 1 < len(state["members"]):
+                    blocked_member = state["members"][fixed_index + 1]["number"]
+            conflict_detail = (
+                resolver_snapshot.get("detail")
+                or detail
+                or "PR Conflict Resolver reported a propagation conflict"
+            )
+            state["pending_conflict"] = {
+                "fixed_pr": args.fixed_pr,
+                "expected_head": args.expected_head,
+                "resolver_state": str(resolver_state_path),
+                "blocked_member": blocked_member,
+                "detail": str(conflict_detail),
+            }
+            save_state(path, state)
+            emit(
+                {
+                    "result": "resolve_conflict",
+                    "state": str(path),
+                    "stack_number": state["stack_number"],
+                    "fixed_pr": args.fixed_pr,
+                    "expected_head": args.expected_head,
+                    "resolver_state": str(resolver_state_path),
+                    "blocked_member": blocked_member,
+                    "detail": str(conflict_detail),
+                    "next": "conflict-resolver",
+                }
+            )
+            return
         stack_stop(
             path,
             state,
-            "propagation_conflicted"
-            if isinstance(result, dict) and result.get("result") == "conflicted"
-            else "propagation_failed",
+            "propagation_failed",
             str(detail or result),
             member=args.fixed_pr,
         )
@@ -4743,6 +4805,7 @@ def command_stack_propagate(args: argparse.Namespace) -> None:
         state.setdefault("propagated_pushes", []).append(args.checkpoint_id)
         state["propagated_pushes"] = sorted(set(state["propagated_pushes"]))
     state.pop("pending_format", None)
+    state.pop("pending_conflict", None)
     cursor = int(state.get("cursor", 0))
     if (
         cursor < len(state["members"])
@@ -4945,6 +5008,7 @@ def command_stack_status(args: argparse.Namespace) -> None:
             ],
             "propagations": state.get("propagations") or [],
             "pending_format": state.get("pending_format"),
+            "pending_conflict": state.get("pending_conflict"),
             "reason": state.get("reason"),
             "detail": state.get("detail"),
             "blocked_member": state.get("blocked_member"),

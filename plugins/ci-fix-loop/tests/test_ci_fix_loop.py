@@ -324,6 +324,9 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("If it returns `format`, run `stack-format`", section)
         self.assertIn("repeat that command for each returned checkpoint", section)
         self.assertIn("reason: formatter_failed", section)
+        self.assertIn("If it returns `resolve_conflict`", section)
+        self.assertIn("pr-conflict-resolver:pr-conflict-resolver", section)
+        self.assertIn("rerun the exact `stack-propagate` action", section)
         self.assertIn(
             "A higher member never starts until its direct predecessor is clear",
             section,
@@ -5206,11 +5209,25 @@ class NativeStackCoordinatorTest(unittest.TestCase):
         self.assertEqual("stopped", result["result"])
         self.assertEqual("propagation_snapshot_changed", result["reason"])
 
-    def test_conflicted_propagation_stops_before_a_descendant_runs(self):
+    def test_conflicted_propagation_waits_for_conflict_resolution(self):
         stack = native_stack()
         self.start(stack)
         script = self.root / "pr_conflict_resolver.py"
         script.write_text("# test", encoding="utf-8")
+        resolver_state = MODULE.stack_propagation_state_path(
+            self.stack_state, 5, "lower1"
+        )
+        MODULE.save_state(
+            resolver_state,
+            {
+                "status": "conflicted",
+                "detail": "app.py conflicts",
+                "cascade": {
+                    "current_index": 0,
+                    "plan": [{"number": 7}],
+                },
+            },
+        )
         process = SimpleNamespace(
             returncode=0,
             stdout=json.dumps({"result": "conflicted", "detail": "app.py conflicts"}),
@@ -5230,9 +5247,27 @@ class NativeStackCoordinatorTest(unittest.TestCase):
                 "--expected-head",
                 "lower1",
             )
-        self.assertEqual("stopped", result["result"])
-        self.assertEqual("propagation_conflicted", result["reason"])
+        self.assertEqual("resolve_conflict", result["result"])
+        self.assertEqual(7, result["blocked_member"])
+        self.assertEqual(
+            str(resolver_state),
+            result["resolver_state"],
+        )
         self.assertEqual("app.py conflicts", result["detail"])
+        self.assertEqual("active", MODULE.load_stack_state(self.stack_state)["status"])
+        self.assertEqual(
+            7,
+            MODULE.load_stack_state(self.stack_state)["pending_conflict"][
+                "blocked_member"
+            ],
+        )
+
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ):
+            next_action = call("stack-next", "--state", str(self.stack_state))
+        self.assertEqual("resolve_conflict", next_action["result"])
+        self.assertEqual("conflict-resolver", next_action["next"])
 
     def test_formatting_checkpoint_keeps_propagation_resumable(self):
         stack = native_stack()
