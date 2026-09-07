@@ -316,6 +316,8 @@ class AgentInstructionsTest(unittest.TestCase):
             "After every `published` or `empty_commit_published` result", section
         )
         self.assertIn("immediately run `stack-propagate`", section)
+        self.assertIn("If it returns `format`, run `stack-format`", section)
+        self.assertIn("repeat that command for each returned checkpoint", section)
         self.assertIn(
             "A higher member never starts until its direct predecessor is clear",
             section,
@@ -5111,7 +5113,7 @@ class NativeStackCoordinatorTest(unittest.TestCase):
         self.assertEqual("propagation_conflicted", result["reason"])
         self.assertEqual("app.py conflicts", result["detail"])
 
-    def test_formatting_checkpoint_stops_propagation_before_publication(self):
+    def test_formatting_checkpoint_keeps_propagation_resumable(self):
         stack = native_stack()
         self.start(stack)
         script = self.root / "pr_conflict_resolver.py"
@@ -5122,6 +5124,11 @@ class NativeStackCoordinatorTest(unittest.TestCase):
                 {
                     "result": "formatting_required",
                     "detail": "format PR #7 before continuing",
+                    "formatting_member": {
+                        "number": 7,
+                        "branch": "middle",
+                        "index": 0,
+                    },
                 }
             ),
             stderr="",
@@ -5140,9 +5147,130 @@ class NativeStackCoordinatorTest(unittest.TestCase):
                 "--expected-head",
                 "lower1",
             )
-        self.assertEqual("stopped", result["result"])
-        self.assertEqual("propagation_formatting_required", result["reason"])
-        self.assertEqual("format PR #7 before continuing", result["detail"])
+        self.assertEqual("format", result["result"])
+        self.assertEqual(5, result["fixed_pr"])
+        self.assertEqual(7, result["formatting_member"]["number"])
+        saved = MODULE.load_stack_state(self.stack_state)
+        self.assertEqual("active", saved["status"])
+        self.assertEqual(5, saved["pending_format"]["fixed_pr"])
+        self.assertEqual(
+            str(MODULE.stack_propagation_state_path(self.stack_state, 5, "lower1")),
+            saved["pending_format"]["resolver_state"],
+        )
+
+    def test_stack_next_returns_the_pending_formatting_action(self):
+        stack = native_stack()
+        self.start(stack)
+        state = MODULE.load_stack_state(self.stack_state)
+        state["pending_format"] = {
+            "fixed_pr": 5,
+            "expected_head": "lower1",
+            "resolver_state": str(
+                MODULE.stack_propagation_state_path(self.stack_state, 5, "lower1")
+            ),
+            "formatting_member": {"number": 7, "branch": "middle", "index": 0},
+        }
+        MODULE.save_state(self.stack_state, state)
+        result = self.next(stack)
+        self.assertEqual("format", result["result"])
+        self.assertEqual("stack-format", result["next"])
+        self.assertEqual(7, result["formatting_member"]["number"])
+
+    def test_stack_format_resumes_propagation_after_the_last_checkpoint(self):
+        stack = native_stack()
+        self.start(stack)
+        resolver_state = MODULE.stack_propagation_state_path(
+            self.stack_state, 5, "lower1"
+        )
+        MODULE.save_state(
+            resolver_state,
+            {"status": "formatting", "operation": "descendant_propagation"},
+        )
+        state = MODULE.load_stack_state(self.stack_state)
+        state["pending_format"] = {
+            "fixed_pr": 5,
+            "expected_head": "lower1",
+            "resolver_state": str(resolver_state),
+            "formatting_member": {"number": 7, "branch": "middle", "index": 0},
+        }
+        MODULE.save_state(self.stack_state, state)
+        process = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "result": "resolved",
+                    "state": str(resolver_state),
+                    "next": "descendant-propagate",
+                }
+            ),
+            stderr="",
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ), mock.patch.object(
+            MODULE, "conflict_resolver_script", return_value=self.resolver
+        ), mock.patch.object(MODULE, "run", return_value=process) as run:
+            result = call(
+                "stack-format",
+                "--state",
+                str(self.stack_state),
+                "--no-format",
+            )
+        self.assertEqual("formatted", result["result"])
+        self.assertEqual("stack-next", result["next"])
+        self.assertNotIn("pending_format", MODULE.load_stack_state(self.stack_state))
+        command = run.call_args.args[0]
+        self.assertIn("stack-format", command)
+        self.assertIn("--no-format", command)
+        self.assertIn(str(resolver_state), command)
+
+    def test_stack_format_keeps_a_later_checkpoint_active(self):
+        stack = native_stack()
+        self.start(stack)
+        resolver_state = MODULE.stack_propagation_state_path(
+            self.stack_state, 5, "lower1"
+        )
+        MODULE.save_state(
+            resolver_state,
+            {"status": "formatting", "operation": "descendant_propagation"},
+        )
+        state = MODULE.load_stack_state(self.stack_state)
+        state["pending_format"] = {
+            "fixed_pr": 5,
+            "expected_head": "lower1",
+            "resolver_state": str(resolver_state),
+            "formatting_member": {"number": 7, "branch": "middle", "index": 0},
+        }
+        MODULE.save_state(self.stack_state, state)
+        process = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "result": "formatting_required",
+                    "formatting_member": {
+                        "number": 9,
+                        "branch": "upper",
+                        "index": 1,
+                    },
+                    "next": "stack-format",
+                }
+            ),
+            stderr="",
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ), mock.patch.object(
+            MODULE, "conflict_resolver_script", return_value=self.resolver
+        ), mock.patch.object(MODULE, "run", return_value=process):
+            result = call(
+                "stack-format",
+                "--state",
+                str(self.stack_state),
+                "--no-format",
+            )
+        self.assertEqual("format", result["result"])
+        self.assertEqual(9, result["formatting_member"]["number"])
+        self.assertEqual("active", MODULE.load_stack_state(self.stack_state)["status"])
 
     def test_success_without_containment_stops_instead_of_retrying_forever(self):
         stack = native_stack()
@@ -5238,6 +5366,7 @@ class NativeStackCoordinatorTest(unittest.TestCase):
                 "stack-next",
                 "stack-record",
                 "stack-propagate",
+                "stack-format",
                 "stack-status",
                 "stack-cleanup",
             }.issubset(subparsers.choices)

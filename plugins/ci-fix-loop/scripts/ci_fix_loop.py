@@ -3979,6 +3979,7 @@ def command_stack_start(args: argparse.Namespace) -> None:
         "propagation_attempts": [],
         "propagated_pushes": [],
         "superseded_pushes": [],
+        "pending_format": None,
         "reason": None,
         "detail": None,
     }
@@ -4018,6 +4019,51 @@ def command_stack_next(args: argparse.Namespace) -> None:
         stack_stop(path, state, "topology_changed", str(error))
         return
     if stop_for_stale_cleared_member(path, state):
+        return
+    pending_format = state.get("pending_format")
+    if isinstance(pending_format, dict):
+        fixed_pr = pending_format.get("fixed_pr")
+        expected_head = pending_format.get("expected_head")
+        fixed = next(
+            (
+                member
+                for member in state["members"]
+                if member["number"] == fixed_pr
+            ),
+            None,
+        )
+        if fixed is None:
+            stack_stop(
+                path,
+                state,
+                "propagation_formatting_member_missing",
+                f"formatting checkpoint names pull request #{fixed_pr}, which is "
+                "not in the native stack",
+                member=fixed_pr if isinstance(fixed_pr, int) else None,
+            )
+            return
+        if fixed["head_sha"] != expected_head:
+            stack_stop(
+                path,
+                state,
+                "source_head_changed",
+                f"pull request #{fixed_pr} is at {fixed['head_sha']}, not "
+                f"{expected_head}",
+                member=fixed_pr,
+            )
+            return
+        emit(
+            {
+                "result": "format",
+                "state": str(path),
+                "stack_number": state["stack_number"],
+                "fixed_pr": fixed_pr,
+                "expected_head": expected_head,
+                "resolver_state": pending_format.get("resolver_state"),
+                "formatting_member": pending_format.get("formatting_member"),
+                "next": "stack-format",
+            }
+        )
         return
     cursor = int(state.get("cursor", 0))
     members = state["members"]
@@ -4482,14 +4528,32 @@ def command_stack_propagate(args: argparse.Namespace) -> None:
             if isinstance(result, dict)
             else "PR Conflict Resolver returned no result object"
         )
+        if isinstance(result, dict) and result.get("result") == "formatting_required":
+            state["pending_format"] = {
+                "fixed_pr": args.fixed_pr,
+                "expected_head": args.expected_head,
+                "resolver_state": str(resolver_state_path),
+                "formatting_member": result.get("formatting_member"),
+            }
+            save_state(path, state)
+            emit(
+                {
+                    "result": "format",
+                    "state": str(path),
+                    "stack_number": state["stack_number"],
+                    "fixed_pr": args.fixed_pr,
+                    "expected_head": args.expected_head,
+                    "resolver_state": str(resolver_state_path),
+                    "formatting_member": result.get("formatting_member"),
+                    "next": "stack-format",
+                }
+            )
+            return
         stack_stop(
             path,
             state,
             "propagation_conflicted"
             if isinstance(result, dict) and result.get("result") == "conflicted"
-            else "propagation_formatting_required"
-            if isinstance(result, dict)
-            and result.get("result") == "formatting_required"
             else "propagation_failed",
             str(detail or result),
             member=args.fixed_pr,
@@ -4541,6 +4605,7 @@ def command_stack_propagate(args: argparse.Namespace) -> None:
     if args.checkpoint_id:
         state.setdefault("propagated_pushes", []).append(args.checkpoint_id)
         state["propagated_pushes"] = sorted(set(state["propagated_pushes"]))
+    state.pop("pending_format", None)
     cursor = int(state.get("cursor", 0))
     if (
         cursor < len(state["members"])
@@ -4556,6 +4621,147 @@ def command_stack_propagate(args: argparse.Namespace) -> None:
             "propagation_result": propagation["result"],
             "result": "propagated",
         }
+    )
+
+
+def command_stack_format(args: argparse.Namespace) -> None:
+    require_tools()
+    path = cli_path(args.state)
+    state = load_stack_state(path)
+    if state.get("status") != "active":
+        raise WorkflowError("cannot format a finished native stack run")
+    pending = state.get("pending_format")
+    if not isinstance(pending, dict):
+        raise WorkflowError("the native stack run has no pending formatting checkpoint")
+    try:
+        refresh_stack_state(state)
+    except WorkflowError as error:
+        stack_stop(path, state, "topology_changed", str(error))
+        return
+    fixed_pr = pending.get("fixed_pr")
+    expected_head = pending.get("expected_head")
+    fixed = next(
+        (
+            member
+            for member in state["members"]
+            if member["number"] == fixed_pr
+        ),
+        None,
+    )
+    if fixed is None:
+        stack_stop(
+            path,
+            state,
+            "propagation_formatting_member_missing",
+            f"formatting checkpoint names pull request #{fixed_pr}, which is "
+            "not in the native stack",
+        )
+        return
+    if fixed["head_sha"] != expected_head:
+        stack_stop(
+            path,
+            state,
+            "source_head_changed",
+            f"pull request #{fixed_pr} is at {fixed['head_sha']}, not "
+            f"{expected_head}",
+            member=fixed_pr,
+        )
+        return
+    resolver_state = cli_path(str(pending.get("resolver_state") or ""))
+    script = conflict_resolver_script()
+    if not script.is_file():
+        stack_stop(
+            path,
+            state,
+            "propagation_unavailable",
+            f"PR Conflict Resolver is not installed at {script}",
+            member=fixed_pr,
+        )
+        return
+    format_arguments = (
+        ["--no-format"]
+        if args.no_format
+        else ["--format-command", *args.format_command]
+    )
+    process = run(
+        [
+            sys.executable,
+            str(script),
+            "stack-format",
+            "--state",
+            str(resolver_state),
+            *format_arguments,
+        ],
+        check=False,
+    )
+    if process.returncode != 0:
+        detail = process.stderr.strip() or process.stdout.strip() or "no output"
+        stack_stop(
+            path,
+            state,
+            "propagation_formatting_failed",
+            detail,
+            member=fixed_pr,
+        )
+        return
+    try:
+        result = json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        stack_stop(
+            path,
+            state,
+            "propagation_formatting_failed",
+            f"PR Conflict Resolver returned invalid JSON: {error}",
+            member=fixed_pr,
+        )
+        return
+    if not isinstance(result, dict):
+        stack_stop(
+            path,
+            state,
+            "propagation_formatting_failed",
+            "PR Conflict Resolver returned no result object",
+            member=fixed_pr,
+        )
+        return
+    if result.get("result") == "formatting_required":
+        pending["formatting_member"] = result.get("formatting_member")
+        save_state(path, state)
+        emit(
+            {
+                "result": "format",
+                "state": str(path),
+                "stack_number": state["stack_number"],
+                "fixed_pr": fixed_pr,
+                "expected_head": expected_head,
+                "resolver_state": str(resolver_state),
+                "formatting_member": result.get("formatting_member"),
+                "next": "stack-format",
+            }
+        )
+        return
+    if result.get("result") == "resolved":
+        state.pop("pending_format", None)
+        save_state(path, state)
+        emit(
+            {
+                "result": "formatted",
+                "state": str(path),
+                "stack_number": state["stack_number"],
+                "fixed_pr": fixed_pr,
+                "expected_head": expected_head,
+                "next": "stack-next",
+            }
+        )
+        return
+    stack_stop(
+        path,
+        state,
+        "propagation_conflicted"
+        if result.get("result") == "conflicted"
+        else "propagation_formatting_failed",
+        str(result.get("detail") or result),
+        member=fixed_pr,
     )
 
 
@@ -4595,6 +4801,7 @@ def command_stack_status(args: argparse.Namespace) -> None:
                 for member in state.get("members") or []
             ],
             "propagations": state.get("propagations") or [],
+            "pending_format": state.get("pending_format"),
             "reason": state.get("reason"),
             "detail": state.get("detail"),
             "blocked_member": state.get("blocked_member"),
@@ -4847,6 +5054,24 @@ def build_parser() -> argparse.ArgumentParser:
     stack_propagate.add_argument("--expected-head", required=True)
     stack_propagate.add_argument("--checkpoint-id")
     stack_propagate.set_defaults(function=command_stack_propagate)
+
+    stack_format = subparsers.add_parser(
+        "stack-format",
+        help="run the repository formatter for a pending propagated stack layer",
+    )
+    stack_format.add_argument("--state", required=True)
+    format_choice = stack_format.add_mutually_exclusive_group(required=True)
+    format_choice.add_argument(
+        "--format-command",
+        nargs="+",
+        help="formatter executable and arguments, run in the propagation workspace",
+    )
+    format_choice.add_argument(
+        "--no-format",
+        action="store_true",
+        help="record that this repository has no formatting step for this layer",
+    )
+    stack_format.set_defaults(function=command_stack_format)
 
     stack_status = subparsers.add_parser(
         "stack-status", help="print compact native stack CI state"
