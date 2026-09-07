@@ -679,9 +679,43 @@ def start_detached(
     else:
         options["start_new_session"] = True
     try:
-        return subprocess.Popen(command, **options)
+        process, _ = popen_with_windows_breakaway_fallback(
+            command,
+            options,
+            operation="detached scheduler",
+        )
+        return process
     finally:
         log.close()
+
+
+def popen_with_windows_breakaway_fallback(
+    command: list[str],
+    options: dict[str, Any],
+    *,
+    operation: str,
+) -> tuple[subprocess.Popen[Any], bool]:
+    """Start once, retrying only a rejected Windows job breakaway request."""
+    try:
+        return subprocess.Popen(command, **options), True
+    except OSError as error:
+        breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        if (
+            not IS_WINDOWS
+            or getattr(error, "winerror", None) != 5
+            or not options.get("creationflags", 0) & breakaway
+        ):
+            raise
+
+    fallback_options = dict(options)
+    fallback_options["creationflags"] &= ~breakaway
+    try:
+        return subprocess.Popen(command, **fallback_options), False
+    except OSError as error:
+        raise WorkflowError(
+            f"{operation} launch failed for {command[0]} after Windows denied "
+            f"CREATE_BREAKAWAY_FROM_JOB: {error}"
+        ) from error
 
 
 def gh_json(arguments: list[str]) -> Any:
@@ -1596,10 +1630,19 @@ def start_background(
     else:
         options["start_new_session"] = True
     try:
-        process = subprocess.Popen(command, **options)
+        process, used_breakaway = popen_with_windows_breakaway_fallback(
+            command,
+            options,
+            operation="background stage worker",
+        )
         owner = None
         try:
-            owner = create_windows_kill_job(process.pid) if IS_WINDOWS else None
+            if IS_WINDOWS:
+                try:
+                    owner = create_windows_kill_job(process.pid)
+                except OSError as error:
+                    if used_breakaway or getattr(error, "winerror", None) != 5:
+                        raise
             if IS_WINDOWS:
                 resume_windows_process(process.pid)
         except BaseException:

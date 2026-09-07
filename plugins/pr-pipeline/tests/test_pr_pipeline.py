@@ -67,6 +67,12 @@ def uncleared_stage(stage: str, outcome: str | None = "carried") -> dict:
 
 
 class WindowsSubprocessTest(unittest.TestCase):
+    @staticmethod
+    def access_denied() -> OSError:
+        error = OSError("Access is denied")
+        error.winerror = 5
+        return error
+
     def test_run_hides_windows_console_processes(self):
         completed = subprocess.CompletedProcess(["tasklist"], 0, "", "")
         with (
@@ -125,6 +131,75 @@ class WindowsSubprocessTest(unittest.TestCase):
         flags = popen.call_args.kwargs["creationflags"]
         self.assertEqual(0x08000000, flags & 0x08000000)
         self.assertEqual(0, flags & 0x00000008)
+
+    def test_detached_scheduler_retries_without_breakaway_when_access_is_denied(self):
+        process = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                mock.patch.object(MODULE.common, "IS_WINDOWS", True),
+                mock.patch.object(
+                    MODULE.common.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True
+                ),
+                mock.patch.object(
+                    MODULE.common.subprocess,
+                    "CREATE_NEW_PROCESS_GROUP",
+                    0x00000200,
+                    create=True,
+                ),
+                mock.patch.object(
+                    MODULE.common.subprocess,
+                    "CREATE_BREAKAWAY_FROM_JOB",
+                    0x01000000,
+                    create=True,
+                ),
+                mock.patch.object(
+                    MODULE.common.subprocess,
+                    "Popen",
+                    side_effect=[self.access_denied(), process],
+                ) as popen,
+            ):
+                started = MODULE.common.start_detached(
+                    [r"C:\Python\python.exe", "scheduler.py"],
+                    cwd=root,
+                    log_path=root / "scheduler.log",
+                )
+
+        self.assertIs(process, started)
+        self.assertEqual(2, popen.call_count)
+        self.assertEqual(0x09000200, popen.call_args_list[0].kwargs["creationflags"])
+        self.assertEqual(0x08000200, popen.call_args_list[1].kwargs["creationflags"])
+
+    def test_detached_scheduler_fallback_reports_operation_and_program(self):
+        fallback_error = OSError("fallback failed")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                mock.patch.object(MODULE.common, "IS_WINDOWS", True),
+                mock.patch.object(
+                    MODULE.common.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True
+                ),
+                mock.patch.object(
+                    MODULE.common.subprocess,
+                    "CREATE_BREAKAWAY_FROM_JOB",
+                    0x01000000,
+                    create=True,
+                ),
+                mock.patch.object(
+                    MODULE.common.subprocess,
+                    "Popen",
+                    side_effect=[self.access_denied(), fallback_error],
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.common.WorkflowError,
+                    r"detached scheduler launch failed for C:\\Python\\python.exe",
+                ):
+                    MODULE.common.start_detached(
+                        [r"C:\Python\python.exe", "scheduler.py"],
+                        cwd=root,
+                        log_path=root / "scheduler.log",
+                    )
 
     def test_windows_liveness_check_uses_the_windows_api(self):
         with (
@@ -264,6 +339,54 @@ class WindowsSubprocessTest(unittest.TestCase):
         create_job.assert_called_once_with(123)
         resume.assert_called_once_with(123)
         self.assertEqual(0x09000204, popen.call_args.kwargs["creationflags"])
+
+    def test_windows_background_worker_falls_back_inside_the_parent_job(self):
+        process = mock.Mock(pid=123)
+        job_error = self.access_denied()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                mock.patch.object(MODULE.common, "IS_WINDOWS", True),
+                mock.patch.object(
+                    MODULE.common.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True
+                ),
+                mock.patch.object(
+                    MODULE.common.subprocess,
+                    "CREATE_NEW_PROCESS_GROUP",
+                    0x00000200,
+                    create=True,
+                ),
+                mock.patch.object(
+                    MODULE.common.subprocess,
+                    "CREATE_BREAKAWAY_FROM_JOB",
+                    0x01000000,
+                    create=True,
+                ),
+                mock.patch.object(
+                    MODULE.common.subprocess,
+                    "Popen",
+                    side_effect=[self.access_denied(), process],
+                ) as popen,
+                mock.patch.object(
+                    MODULE.common,
+                    "create_windows_kill_job",
+                    side_effect=job_error,
+                ) as create_job,
+                mock.patch.object(MODULE.common, "resume_windows_process") as resume,
+            ):
+                started = MODULE.common.start_background(
+                    [r"C:\Program Files\GitHub Copilot\copilot.exe"],
+                    cwd=root,
+                    log_path=root / "worker.log",
+                )
+
+        self.assertIs(process, started.process)
+        self.assertIsNone(started.owner)
+        self.assertEqual(2, popen.call_count)
+        self.assertEqual(0x09000204, popen.call_args_list[0].kwargs["creationflags"])
+        self.assertEqual(0x08000204, popen.call_args_list[1].kwargs["creationflags"])
+        create_job.assert_called_once_with(123)
+        resume.assert_called_once_with(123)
 
 
 class TargetTest(unittest.TestCase):
