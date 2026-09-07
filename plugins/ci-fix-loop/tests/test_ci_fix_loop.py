@@ -318,6 +318,7 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("immediately run `stack-propagate`", section)
         self.assertIn("If it returns `format`, run `stack-format`", section)
         self.assertIn("repeat that command for each returned checkpoint", section)
+        self.assertIn("reason: formatter_failed", section)
         self.assertIn(
             "A higher member never starts until its direct predecessor is clear",
             section,
@@ -5271,6 +5272,94 @@ class NativeStackCoordinatorTest(unittest.TestCase):
         self.assertEqual("format", result["result"])
         self.assertEqual(9, result["formatting_member"]["number"])
         self.assertEqual("active", MODULE.load_stack_state(self.stack_state)["status"])
+
+    def test_stack_format_resolves_a_repository_local_windows_wrapper(self):
+        stack = native_stack()
+        self.start(stack)
+        wrapper = self.root / "gradlew.bat"
+        wrapper.write_text("@echo off\r\n", encoding="utf-8")
+        resolver_state = MODULE.stack_propagation_state_path(
+            self.stack_state, 5, "lower1"
+        )
+        MODULE.save_state(
+            resolver_state,
+            {"status": "formatting", "operation": "descendant_propagation"},
+        )
+        state = MODULE.load_stack_state(self.stack_state)
+        state["pending_format"] = {
+            "fixed_pr": 5,
+            "expected_head": "lower1",
+            "resolver_state": str(resolver_state),
+            "formatting_member": {"number": 7, "branch": "middle", "index": 0},
+        }
+        MODULE.save_state(self.stack_state, state)
+        process = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"result": "resolved"}),
+            stderr="",
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ), mock.patch.object(
+            MODULE, "conflict_resolver_script", return_value=self.resolver
+        ), mock.patch.object(MODULE, "run", return_value=process) as run:
+            result = call(
+                "stack-format",
+                "--state",
+                str(self.stack_state),
+                "--format-command",
+                "gradlew.bat",
+                "spotlessApply",
+            )
+        self.assertEqual("formatted", result["result"])
+        command = run.call_args.args[0]
+        self.assertEqual(str(wrapper.resolve()), command[command.index("--format-command") + 1])
+
+    def test_stack_format_keeps_a_failed_command_retryable(self):
+        stack = native_stack()
+        self.start(stack)
+        resolver_state = MODULE.stack_propagation_state_path(
+            self.stack_state, 5, "lower1"
+        )
+        MODULE.save_state(
+            resolver_state,
+            {"status": "formatting", "operation": "descendant_propagation"},
+        )
+        state = MODULE.load_stack_state(self.stack_state)
+        state["pending_format"] = {
+            "fixed_pr": 5,
+            "expected_head": "lower1",
+            "resolver_state": str(resolver_state),
+            "formatting_member": {"number": 7, "branch": "middle", "index": 0},
+        }
+        MODULE.save_state(self.stack_state, state)
+        process = SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="[WinError 2] The system cannot find the file specified",
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ), mock.patch.object(
+            MODULE, "conflict_resolver_script", return_value=self.resolver
+        ), mock.patch.object(MODULE, "run", return_value=process):
+            result = call(
+                "stack-format",
+                "--state",
+                str(self.stack_state),
+                "--format-command",
+                "gradlew.bat",
+                "spotlessApply",
+            )
+        self.assertEqual("format", result["result"])
+        self.assertEqual("formatter_failed", result["reason"])
+        self.assertEqual("active", MODULE.load_stack_state(self.stack_state)["status"])
+        self.assertEqual(
+            1,
+            MODULE.load_stack_state(self.stack_state)["pending_format"][
+                "format_attempts"
+            ],
+        )
 
     def test_success_without_containment_stops_instead_of_retrying_forever(self):
         stack = native_stack()

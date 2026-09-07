@@ -948,6 +948,26 @@ def conflict_resolver_script() -> Path:
     )
 
 
+def resolve_formatter_command(
+    repo_root: Path, command: list[str]
+) -> list[str]:
+    if not command:
+        raise WorkflowError("the formatter command is empty")
+    executable = Path(command[0])
+    if executable.is_absolute():
+        return list(command)
+    candidates = [repo_root / executable]
+    if IS_WINDOWS and not executable.suffix:
+        candidates.extend(
+            repo_root / f"{executable}{suffix}"
+            for suffix in (".bat", ".cmd", ".exe")
+        )
+    for candidate in candidates:
+        if candidate.is_file():
+            return [str(candidate.resolve()), *command[1:]]
+    return list(command)
+
+
 def changed_files_for(pr: dict[str, Any]) -> list[str]:
     payload = gh_json(
         ["pr", "view", pr["pr_url"], "--repo", pr["repo_name"], "--json", "files"]
@@ -4678,11 +4698,33 @@ def command_stack_format(args: argparse.Namespace) -> None:
             member=fixed_pr,
         )
         return
-    format_arguments = (
-        ["--no-format"]
-        if args.no_format
-        else ["--format-command", *args.format_command]
-    )
+    if args.no_format:
+        format_arguments = ["--no-format"]
+    else:
+        format_command = resolve_formatter_command(
+            Path(state["repo_root"]), args.format_command or []
+        )
+        format_arguments = ["--format-command", *format_command]
+
+    def retryable_format_failure(detail: str) -> None:
+        pending["last_error"] = detail
+        pending["format_attempts"] = int(pending.get("format_attempts", 0)) + 1
+        save_state(path, state)
+        emit(
+            {
+                "result": "format",
+                "state": str(path),
+                "stack_number": state["stack_number"],
+                "fixed_pr": fixed_pr,
+                "expected_head": expected_head,
+                "resolver_state": str(resolver_state),
+                "formatting_member": pending.get("formatting_member"),
+                "reason": "formatter_failed",
+                "detail": detail,
+                "next": "stack-format",
+            }
+        )
+
     process = run(
         [
             sys.executable,
@@ -4696,33 +4738,17 @@ def command_stack_format(args: argparse.Namespace) -> None:
     )
     if process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip() or "no output"
-        stack_stop(
-            path,
-            state,
-            "propagation_formatting_failed",
-            detail,
-            member=fixed_pr,
-        )
+        retryable_format_failure(detail)
         return
     try:
         result = json.loads(process.stdout)
     except json.JSONDecodeError as error:
-        stack_stop(
-            path,
-            state,
-            "propagation_formatting_failed",
-            f"PR Conflict Resolver returned invalid JSON: {error}",
-            member=fixed_pr,
-        )
+        detail = f"PR Conflict Resolver returned invalid JSON: {error}"
+        retryable_format_failure(detail)
         return
     if not isinstance(result, dict):
-        stack_stop(
-            path,
-            state,
-            "propagation_formatting_failed",
-            "PR Conflict Resolver returned no result object",
-            member=fixed_pr,
-        )
+        detail = "PR Conflict Resolver returned no result object"
+        retryable_format_failure(detail)
         return
     if result.get("result") == "formatting_required":
         pending["formatting_member"] = result.get("formatting_member")
