@@ -4704,50 +4704,13 @@ def command_stack_propagate(args: argparse.Namespace) -> None:
             )
             return
         if isinstance(result, dict) and result.get("result") == "conflicted":
-            resolver_snapshot = json.loads(
-                resolver_state_path.read_text(encoding="utf-8")
-            )
-            cascade = resolver_snapshot.get("cascade") or {}
-            plan = cascade.get("plan") or []
-            current_index = cascade.get("current_index")
-            blocked_member = None
-            if isinstance(current_index, int) and 0 <= current_index < len(plan):
-                blocked_member = plan[current_index].get("number")
-            if blocked_member is None:
-                fixed_index = state["members"].index(
-                    next(
-                        member
-                        for member in state["members"]
-                        if member["number"] == args.fixed_pr
-                    )
-                )
-                if fixed_index + 1 < len(state["members"]):
-                    blocked_member = state["members"][fixed_index + 1]["number"]
-            conflict_detail = (
-                resolver_snapshot.get("detail")
-                or detail
-                or "PR Conflict Resolver reported a propagation conflict"
-            )
-            state["pending_conflict"] = {
-                "fixed_pr": args.fixed_pr,
-                "expected_head": args.expected_head,
-                "resolver_state": str(resolver_state_path),
-                "blocked_member": blocked_member,
-                "detail": str(conflict_detail),
-            }
-            save_state(path, state)
-            emit(
-                {
-                    "result": "resolve_conflict",
-                    "state": str(path),
-                    "stack_number": state["stack_number"],
-                    "fixed_pr": args.fixed_pr,
-                    "expected_head": args.expected_head,
-                    "resolver_state": str(resolver_state_path),
-                    "blocked_member": blocked_member,
-                    "detail": str(conflict_detail),
-                    "next": "conflict-resolver",
-                }
+            record_propagation_conflict(
+                path,
+                state,
+                fixed_pr=args.fixed_pr,
+                expected_head=args.expected_head,
+                resolver_state_path=resolver_state_path,
+                detail=detail,
             )
             return
         stack_stop(
@@ -4820,6 +4783,59 @@ def command_stack_propagate(args: argparse.Namespace) -> None:
             **propagation,
             "propagation_result": propagation["result"],
             "result": "propagated",
+        }
+    )
+
+
+def record_propagation_conflict(
+    path: Path,
+    state: dict[str, Any],
+    *,
+    fixed_pr: int,
+    expected_head: str,
+    resolver_state_path: Path,
+    detail: Any,
+) -> None:
+    resolver_snapshot = json.loads(
+        resolver_state_path.read_text(encoding="utf-8")
+    )
+    cascade = resolver_snapshot.get("cascade") or {}
+    plan = cascade.get("plan") or []
+    current_index = cascade.get("current_index")
+    blocked_member = None
+    if isinstance(current_index, int) and 0 <= current_index < len(plan):
+        blocked_member = plan[current_index].get("number")
+    if blocked_member is None:
+        fixed_index = state["members"].index(
+            next(member for member in state["members"] if member["number"] == fixed_pr)
+        )
+        if fixed_index + 1 < len(state["members"]):
+            blocked_member = state["members"][fixed_index + 1]["number"]
+    conflict_detail = (
+        resolver_snapshot.get("detail")
+        or detail
+        or "PR Conflict Resolver reported a propagation conflict"
+    )
+    state.pop("pending_format", None)
+    state["pending_conflict"] = {
+        "fixed_pr": fixed_pr,
+        "expected_head": expected_head,
+        "resolver_state": str(resolver_state_path),
+        "blocked_member": blocked_member,
+        "detail": str(conflict_detail),
+    }
+    save_state(path, state)
+    emit(
+        {
+            "result": "resolve_conflict",
+            "state": str(path),
+            "stack_number": state["stack_number"],
+            "fixed_pr": fixed_pr,
+            "expected_head": expected_head,
+            "resolver_state": str(resolver_state_path),
+            "blocked_member": blocked_member,
+            "detail": str(conflict_detail),
+            "next": "conflict-resolver",
         }
     )
 
@@ -4960,12 +4976,20 @@ def command_stack_format(args: argparse.Namespace) -> None:
             }
         )
         return
+    if result.get("result") == "conflicted":
+        record_propagation_conflict(
+            path,
+            state,
+            fixed_pr=fixed_pr,
+            expected_head=expected_head,
+            resolver_state_path=resolver_state,
+            detail=result.get("detail"),
+        )
+        return
     stack_stop(
         path,
         state,
-        "propagation_conflicted"
-        if result.get("result") == "conflicted"
-        else "propagation_formatting_failed",
+        "propagation_formatting_failed",
         str(result.get("detail") or result),
         member=fixed_pr,
     )

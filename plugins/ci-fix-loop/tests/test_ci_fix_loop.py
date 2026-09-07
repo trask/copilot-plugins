@@ -5428,6 +5428,64 @@ class NativeStackCoordinatorTest(unittest.TestCase):
         self.assertEqual(9, result["formatting_member"]["number"])
         self.assertEqual("active", MODULE.load_stack_state(self.stack_state)["status"])
 
+    def test_stack_format_routes_a_later_conflict_to_the_resolver(self):
+        stack = native_stack()
+        self.start(stack)
+        resolver_state = MODULE.stack_propagation_state_path(
+            self.stack_state, 5, "lower1"
+        )
+        MODULE.save_state(
+            resolver_state,
+            {
+                "status": "conflicted",
+                "detail": "app.py conflicts after formatting",
+                "cascade": {
+                    "current_index": 0,
+                    "plan": [{"number": 7}],
+                },
+            },
+        )
+        state = MODULE.load_stack_state(self.stack_state)
+        state["pending_format"] = {
+            "fixed_pr": 5,
+            "expected_head": "lower1",
+            "resolver_state": str(resolver_state),
+            "formatting_member": {"number": 7, "branch": "middle", "index": 0},
+        }
+        MODULE.save_state(self.stack_state, state)
+        process = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "result": "conflicted",
+                    "detail": "app.py conflicts after formatting",
+                }
+            ),
+            stderr="",
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ), mock.patch.object(
+            MODULE, "conflict_resolver_script", return_value=self.resolver
+        ), mock.patch.object(MODULE, "run", return_value=process):
+            result = call(
+                "stack-format",
+                "--state",
+                str(self.stack_state),
+                "--no-format",
+            )
+        self.assertEqual("resolve_conflict", result["result"])
+        self.assertEqual(7, result["blocked_member"])
+        self.assertEqual("conflict-resolver", result["next"])
+        saved = MODULE.load_stack_state(self.stack_state)
+        self.assertEqual("active", saved["status"])
+        self.assertNotIn("pending_format", saved)
+        self.assertEqual(7, saved["pending_conflict"]["blocked_member"])
+        self.assertEqual(
+            "app.py conflicts after formatting",
+            saved["pending_conflict"]["detail"],
+        )
+
     def test_stack_format_resolves_a_repository_local_windows_wrapper(self):
         stack = native_stack()
         self.start(stack)
