@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import fnmatch
 import hashlib
@@ -4002,22 +4003,127 @@ def require_stack_guard(state: dict[str, Any]) -> None:
         )
 
 
-def stop_for_stale_cleared_member(
+def retire_member_state_work(
+    member_state_path: Path,
+    *,
+    pipeline_run: str,
+    member: int,
+    retired_at: str,
+) -> dict[str, Any] | None:
+    if not member_state_path.is_file():
+        return None
+    member_state = load_state(member_state_path)
+    pending = member_state.get("pending_stack_push")
+    if not (
+        isinstance(pending, dict)
+        and pending.get("pipeline_run") == pipeline_run
+        and pending.get("member") == member
+    ):
+        pending = None
+    unfinished_reruns = {
+        check_key: copy.deepcopy(rerun)
+        for check_key, rerun in (member_state.get("reruns") or {}).items()
+        if isinstance(rerun, dict)
+        and rerun.get("status") in {"creating", "prepared", "pushed"}
+    }
+    accepted_pushes = [
+        copy.deepcopy(checkpoint)
+        for checkpoint in member_state.get("accepted_pushes") or []
+        if isinstance(checkpoint, dict)
+        and checkpoint.get("pipeline_run") == pipeline_run
+    ]
+    if pending is None and not unfinished_reruns and not accepted_pushes:
+        return None
+
+    retired_work = {
+        "retired_at": retired_at,
+        "reason": "cleared_ancestor_head_changed",
+        "pending_stack_push": copy.deepcopy(pending),
+        "unfinished_reruns": unfinished_reruns,
+        "accepted_pushes": accepted_pushes,
+    }
+    member_state.setdefault("retired_stack_work", []).append(retired_work)
+    if pending is not None:
+        member_state.pop("pending_stack_push", None)
+    for check_key in unfinished_reruns:
+        rerun = member_state["reruns"][check_key]
+        rerun["status"] = "retired"
+        rerun["retired_at"] = retired_at
+        rerun["retired_reason"] = "cleared_ancestor_head_changed"
+    save_state(member_state_path, member_state)
+    return {
+        "member": member,
+        "member_state": str(member_state_path),
+        **retired_work,
+    }
+
+
+def retire_stale_cleared_attempt(
     path: Path, state: dict[str, Any]
-) -> bool:
-    member = stale_cleared_member(state)
-    if member is None:
-        return False
-    stack_stop(
-        path,
-        state,
-        "cleared_member_head_changed",
-        f"pull request #{member['number']} moved from "
-        f"{member.get('clean_at_head_sha')} to {member.get('head_sha')} after "
-        "its CI result was recorded",
-        member=member["number"],
-    )
-    return True
+) -> dict[str, Any] | None:
+    stale = stale_cleared_member(state)
+    if stale is None:
+        return None
+
+    members = state["members"]
+    stale_index = members.index(stale)
+    affected = members[stale_index:]
+    retired_at = utc_now()
+    retired_work = []
+    for member in affected:
+        work = retire_member_state_work(
+            stack_member_state_path(path, member["number"]),
+            pipeline_run=state["run_id"],
+            member=member["number"],
+            retired_at=retired_at,
+        )
+        if work is not None:
+            retired_work.append(work)
+    retired_attempt = {
+        "id": str(uuid.uuid4()),
+        "reason": "cleared_member_head_changed",
+        "retired_at": retired_at,
+        "previous_status": state.get("status"),
+        "previous_cursor": state.get("cursor"),
+        "member": stale["number"],
+        "previous_head_sha": stale.get("clean_at_head_sha"),
+        "current_head_sha": stale["head_sha"],
+        "affected_members": [member["number"] for member in affected],
+        "member_states": copy.deepcopy(affected),
+        "pending_format": copy.deepcopy(state.get("pending_format")),
+        "pending_conflict": copy.deepcopy(state.get("pending_conflict")),
+        "retired_work": retired_work,
+    }
+    state.setdefault("retired_attempts", []).append(retired_attempt)
+    for member in affected:
+        member["attempt"] = int(member.get("attempt") or 1) + 1
+        member["ci_status"] = "pending"
+        member["stage_outcome"] = None
+        member["clean_at_head_sha"] = None
+        member["member_state"] = None
+        member["dispatched_head_sha"] = None
+        member["skip_note"] = None
+    state["cursor"] = stale_index
+    state["status"] = "active"
+    state["outcome"] = None
+    state["reason"] = None
+    state["detail"] = None
+    state.pop("blocked_member", None)
+    state["pending_format"] = None
+    state["pending_conflict"] = None
+    save_state(path, state)
+    return retired_attempt
+
+
+def retired_attempt_summary(retired: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": retired["id"],
+        "member": retired["member"],
+        "previous_head_sha": retired["previous_head_sha"],
+        "current_head_sha": retired["current_head_sha"],
+        "affected_members": retired["affected_members"],
+        "retired_at": retired["retired_at"],
+    }
 
 
 def command_stack_start(args: argparse.Namespace) -> None:
@@ -4103,6 +4209,7 @@ def command_stack_start(args: argparse.Namespace) -> None:
         "members": [
             {
                 **member,
+                "attempt": 1,
                 "ci_status": "pending",
                 "stage_outcome": None,
                 "clean_at_head_sha": None,
@@ -4113,7 +4220,9 @@ def command_stack_start(args: argparse.Namespace) -> None:
             for member in stack["members"]
         ],
         "propagations": [],
+        "retired_attempts": [],
         "propagation_attempts": [],
+        "propagation_guards": [],
         "propagated_pushes": [],
         "superseded_pushes": [],
         "pending_format": None,
@@ -4140,7 +4249,7 @@ def command_stack_next(args: argparse.Namespace) -> None:
     require_tools()
     path = cli_path(args.state)
     state = load_stack_state(path)
-    if state.get("status") != "active":
+    if state.get("status") not in {"active", "complete"}:
         emit(
             {
                 "result": state.get("status"),
@@ -4156,7 +4265,17 @@ def command_stack_next(args: argparse.Namespace) -> None:
     except WorkflowError as error:
         stack_stop(path, state, "topology_changed", str(error))
         return
-    if stop_for_stale_cleared_member(path, state):
+    retired_attempt = retire_stale_cleared_attempt(path, state)
+    if state.get("status") != "active":
+        emit(
+            {
+                "result": state.get("status"),
+                "state": str(path),
+                "reason": state.get("reason"),
+                "detail": state.get("detail"),
+                "blocked_member": state.get("blocked_member"),
+            }
+        )
         return
     pending_format = state.get("pending_format")
     if isinstance(pending_format, dict):
@@ -4416,8 +4535,15 @@ def command_stack_next(args: argparse.Namespace) -> None:
         if not commit_contains(
             state["repository"], predecessor["head_sha"], member["head_sha"]
         ):
-            attempt = f"{predecessor['number']}:{predecessor['head_sha']}"
-            if attempt in set(state.get("propagation_attempts") or []):
+            guarded_snapshot = any(
+                guard.get("fixed_pr") == predecessor["number"]
+                and guard.get("fixed_head_sha") == predecessor["head_sha"]
+                and guard.get("member") == member["number"]
+                and guard.get("member_head_sha") == member["head_sha"]
+                for guard in state.get("propagation_guards") or []
+                if isinstance(guard, dict)
+            )
+            if guarded_snapshot:
                 stack_stop(
                     path,
                     state,
@@ -4438,6 +4564,15 @@ def command_stack_next(args: argparse.Namespace) -> None:
                     "expected_head": predecessor["head_sha"],
                     "next_member": member["number"],
                     "reason": "predecessor_head_is_not_contained",
+                    **(
+                        {
+                            "retired_attempt": retired_attempt_summary(
+                                retired_attempt
+                            )
+                        }
+                        if retired_attempt
+                        else {}
+                    ),
                 }
             )
             return
@@ -4452,6 +4587,7 @@ def command_stack_next(args: argparse.Namespace) -> None:
             "run_id": state["run_id"],
             "stack_number": state["stack_number"],
             "member": member["number"],
+            "member_attempt": member.get("attempt", 1),
             "title": member["title"],
             "target": member_target["pr_url"],
             "head_sha": member["head_sha"],
@@ -4461,6 +4597,11 @@ def command_stack_next(args: argparse.Namespace) -> None:
             "pipeline_run": state["run_id"],
             "pipeline_iteration": 1,
             "pipeline_max_iterations": 1,
+            **(
+                {"retired_attempt": retired_attempt_summary(retired_attempt)}
+                if retired_attempt
+                else {}
+            ),
         }
     )
 
@@ -4469,15 +4610,26 @@ def command_stack_record(args: argparse.Namespace) -> None:
     require_tools()
     path = cli_path(args.state)
     state = load_stack_state(path)
-    if state.get("status") != "active":
+    if state.get("status") not in {"active", "complete"}:
         raise WorkflowError("cannot record a member on a finished native stack run")
     try:
         refresh_stack_state(state)
     except WorkflowError as error:
         stack_stop(path, state, "topology_changed", str(error))
         return
-    if stop_for_stale_cleared_member(path, state):
+    retired_attempt = retire_stale_cleared_attempt(path, state)
+    if retired_attempt:
+        emit(
+            {
+                "result": "retired_attempt",
+                "state": str(path),
+                "retired_attempt": retired_attempt_summary(retired_attempt),
+                "next": "stack-next",
+            }
+        )
         return
+    if state.get("status") != "active":
+        raise WorkflowError("cannot record a member on a finished native stack run")
     cursor = int(state.get("cursor", 0))
     members = state["members"]
     if cursor >= len(members):
@@ -4562,15 +4714,26 @@ def command_stack_propagate(args: argparse.Namespace) -> None:
     require_tools()
     path = cli_path(args.state)
     state = load_stack_state(path)
-    if state.get("status") != "active":
+    if state.get("status") not in {"active", "complete"}:
         raise WorkflowError("cannot propagate a finished native stack run")
     try:
         refresh_stack_state(state)
     except WorkflowError as error:
         stack_stop(path, state, "topology_changed", str(error))
         return
-    if stop_for_stale_cleared_member(path, state):
+    retired_attempt = retire_stale_cleared_attempt(path, state)
+    if retired_attempt:
+        emit(
+            {
+                "result": "retired_attempt",
+                "state": str(path),
+                "retired_attempt": retired_attempt_summary(retired_attempt),
+                "next": "stack-next",
+            }
+        )
         return
+    if state.get("status") != "active":
+        raise WorkflowError("cannot propagate a finished native stack run")
     fixed = next(
         (
             member
@@ -4764,6 +4927,21 @@ def command_stack_propagate(args: argparse.Namespace) -> None:
     state.setdefault("propagations", []).append(propagation)
     state.setdefault("propagation_attempts", []).append(attempt)
     state["propagation_attempts"] = sorted(set(state["propagation_attempts"]))
+    guards = state.setdefault("propagation_guards", [])
+    fixed_index = next(
+        index
+        for index, member in enumerate(state["members"])
+        if member["number"] == args.fixed_pr
+    )
+    for member in state["members"][fixed_index + 1 :]:
+        guard = {
+            "fixed_pr": args.fixed_pr,
+            "fixed_head_sha": args.expected_head,
+            "member": member["number"],
+            "member_head_sha": member["head_sha"],
+        }
+        if guard not in guards:
+            guards.append(guard)
     if args.checkpoint_id:
         state.setdefault("propagated_pushes", []).append(args.checkpoint_id)
         state["propagated_pushes"] = sorted(set(state["propagated_pushes"]))
@@ -5005,7 +5183,17 @@ def command_stack_status(args: argparse.Namespace) -> None:
         except WorkflowError as error:
             stack_stop(path, state, "topology_changed", str(error))
             return
-        if stop_for_stale_cleared_member(path, state):
+        retired_attempt = retire_stale_cleared_attempt(path, state)
+        if retired_attempt:
+            emit(
+                {
+                    "result": "retired_attempt",
+                    "state": str(path),
+                    "status": state.get("status"),
+                    "retired_attempt": retired_attempt_summary(retired_attempt),
+                    "next": "stack-next",
+                }
+            )
             return
     emit(
         {
@@ -5021,6 +5209,7 @@ def command_stack_status(args: argparse.Namespace) -> None:
             "members": [
                 {
                     "number": member["number"],
+                    "attempt": member.get("attempt", 1),
                     "head_sha": member["head_sha"],
                     "ci_status": member.get("ci_status"),
                     "stage_outcome": member.get("stage_outcome"),
@@ -5031,6 +5220,7 @@ def command_stack_status(args: argparse.Namespace) -> None:
                 for member in state.get("members") or []
             ],
             "propagations": state.get("propagations") or [],
+            "retired_attempts": state.get("retired_attempts") or [],
             "pending_format": state.get("pending_format"),
             "pending_conflict": state.get("pending_conflict"),
             "reason": state.get("reason"),

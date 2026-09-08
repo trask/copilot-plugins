@@ -327,6 +327,16 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("If it returns `resolve_conflict`", section)
         self.assertIn("pr-conflict-resolver:pr-conflict-resolver", section)
         self.assertIn("rerun the exact `stack-propagate` action", section)
+        self.assertIn("For `retired_attempt`, return to `stack-next`", section)
+        self.assertIn(
+            "Write the final report only when its status is still `complete`",
+            section,
+        )
+        self.assertIn(
+            "`stack-next` retires that clearance and every dependent descendant",
+            section,
+        )
+        self.assertIn("keeps the same stack run and bounded pipeline budget", section)
         self.assertIn(
             "A higher member never starts until its direct predecessor is clear",
             section,
@@ -4871,16 +4881,204 @@ class NativeStackCoordinatorTest(unittest.TestCase):
         self.assertEqual("lower1", action["expected_head"])
         self.assertEqual(7, action["next_member"])
 
-    def test_parent_movement_after_clearance_stops_the_stack(self):
+    def test_cleared_member_movement_retires_it_and_its_descendants(self):
+        stack = native_stack()
+        started = self.start(stack)
+        lower_state = self.member_state(5, "lower1", started["run_id"])
+        self.record(stack, lower_state)
+        self.next(stack)
+        middle_state = self.member_state(7, "middle1", started["run_id"])
+        self.record(stack, middle_state)
+        self.next(stack)
+
+        pending = {
+            "id": "pending-upper",
+            "previous_head_sha": "upper1",
+            "head_sha": "upper2",
+            "commits": ["upper-fix"],
+            "kind": "fix",
+            "pipeline_run": started["run_id"],
+            "member": 9,
+            "validation": {"status": "passed", "commands": ["test"]},
+            "resume": {"command": "publish"},
+        }
+        pending_directory = self.root / "pending-upper"
+        pending_directory.mkdir()
+        pending_state = write_state(
+            pending_directory,
+            pr={
+                "number": 9,
+                "title": "PR 9",
+                "pr_url": "https://github.com/owner/repo/pull/9",
+                "repo_name": "owner/repo",
+                "head_sha": "upper1",
+            },
+            run={
+                "budget_scope": "pipeline",
+                "stack_guard": {
+                    "state": str(self.stack_state),
+                    "run_id": started["run_id"],
+                    "member": 9,
+                    "member_head_sha": "upper1",
+                },
+            },
+            pending_stack_push=pending,
+            reruns={
+                "build (linux)": {
+                    "count": 1,
+                    "name": "build",
+                    "run_id": 123,
+                    "head_sha": "upper1",
+                    "method": "empty_commit",
+                    "status": "prepared",
+                    "commit_sha": "upper2",
+                }
+            },
+        )
+        coordinator_member_state = MODULE.stack_member_state_path(
+            self.stack_state, 9
+        )
+        coordinator_member_state.write_text(
+            pending_state.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        coordinator = MODULE.load_stack_state(self.stack_state)
+        coordinator["propagations"] = [{"fixed_pr": 5, "head_sha": "lower1"}]
+        coordinator["propagation_attempts"] = ["5:lower1"]
+        coordinator["propagation_guards"] = [
+            {
+                "fixed_pr": 5,
+                "fixed_head_sha": "lower1",
+                "member": 7,
+                "member_head_sha": "middle1",
+            }
+        ]
+        coordinator["pending_format"] = {
+            "fixed_pr": 7,
+            "expected_head": "middle1",
+            "formatting_member": 9,
+        }
+        MODULE.save_state(self.stack_state, coordinator)
+
+        moved = native_stack(heads={5: "lower1", 7: "middle2", 9: "upper2"})
+        retired_result = self.next(moved, contains=False)
+        self.assertEqual("propagate", retired_result["result"])
+        self.assertEqual(5, retired_result["fixed_pr"])
+        self.assertEqual(7, retired_result["next_member"])
+        self.assertEqual(7, retired_result["retired_attempt"]["member"])
+
+        result = self.next(moved)
+        self.assertEqual("run_member", result["result"])
+        self.assertEqual(7, result["member"])
+        self.assertEqual("middle2", result["head_sha"])
+        self.assertEqual(2, result["member_attempt"])
+        self.assertNotIn("retired_attempt", result)
+
+        recovered = MODULE.load_stack_state(self.stack_state)
+        self.assertEqual("active", recovered["status"])
+        self.assertEqual(1, recovered["cursor"])
+        self.assertEqual("clear", recovered["members"][0]["ci_status"])
+        self.assertEqual("lower1", recovered["members"][0]["clean_at_head_sha"])
+        self.assertEqual(["push-5"], [
+            checkpoint["id"]
+            for checkpoint in recovered["members"][0]["accepted_pushes"]
+        ])
+        self.assertEqual("active", recovered["members"][1]["ci_status"])
+        self.assertIsNone(recovered["members"][1]["clean_at_head_sha"])
+        self.assertEqual("pending", recovered["members"][2]["ci_status"])
+        self.assertEqual(2, recovered["members"][2]["attempt"])
+        self.assertEqual(
+            [{"fixed_pr": 5, "head_sha": "lower1"}],
+            recovered["propagations"],
+        )
+        self.assertEqual(["5:lower1"], recovered["propagation_attempts"])
+        self.assertIsNone(recovered["pending_format"])
+        self.assertEqual(1, len(recovered["retired_attempts"]))
+        retired = recovered["retired_attempts"][0]
+        self.assertEqual("middle1", retired["previous_head_sha"])
+        self.assertEqual("middle2", retired["current_head_sha"])
+        self.assertEqual([7, 9], retired["affected_members"])
+        self.assertEqual(9, retired["retired_work"][0]["member"])
+        self.assertEqual(
+            "pending-upper",
+            retired["retired_work"][0]["pending_stack_push"]["id"],
+        )
+
+        recovered_member = MODULE.load_state(coordinator_member_state)
+        self.assertNotIn("pending_stack_push", recovered_member)
+        self.assertEqual(1, len(recovered_member["retired_stack_work"]))
+        self.assertEqual(
+            "retired", recovered_member["reruns"]["build (linux)"]["status"]
+        )
+
+        repeated = self.next(moved)
+        self.assertEqual("run_member", repeated["result"])
+        self.assertNotIn("retired_attempt", repeated)
+        self.assertEqual(
+            1,
+            len(MODULE.load_stack_state(self.stack_state)["retired_attempts"]),
+        )
+
+    def test_record_reports_retirement_instead_of_recording_stale_state(self):
         stack = native_stack()
         started = self.start(stack)
         lower_state = self.member_state(5, "lower1", started["run_id"])
         self.record(stack, lower_state)
         moved = native_stack(heads={5: "lower2", 7: "middle1", 9: "upper1"})
+        middle_state = self.member_state(7, "middle1", started["run_id"])
+
+        result = self.record(moved, middle_state)
+
+        self.assertEqual("retired_attempt", result["result"])
+        self.assertEqual(5, result["retired_attempt"]["member"])
+        self.assertEqual("stack-next", result["next"])
+
+    def test_propagate_reports_retirement_before_using_a_stale_checkpoint(self):
+        stack = native_stack()
+        started = self.start(stack)
+        lower_state = self.member_state(5, "lower1", started["run_id"])
+        self.record(stack, lower_state)
+        moved = native_stack(heads={5: "lower2", 7: "middle1", 9: "upper1"})
+
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=moved
+        ):
+            result = call(
+                "stack-propagate",
+                "--state",
+                str(self.stack_state),
+                "--fixed-pr",
+                "5",
+                "--expected-head",
+                "lower1",
+            )
+
+        self.assertEqual("retired_attempt", result["result"])
+        self.assertEqual(5, result["retired_attempt"]["member"])
+        self.assertEqual("stack-next", result["next"])
+
+    def test_completed_stack_reopens_when_a_cleared_member_moves(self):
+        stack = native_stack()
+        started = self.start(stack)
+        for number, head in ((5, "lower1"), (7, "middle1"), (9, "upper1")):
+            self.next(stack)
+            member_state = self.member_state(number, head, started["run_id"])
+            self.record(stack, member_state)
+        self.assertEqual("complete", self.next(stack)["result"])
+
+        moved = native_stack(heads={5: "lower1", 7: "middle2", 9: "upper2"})
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=moved
+        ):
+            status = call("stack-status", "--state", str(self.stack_state))
+        self.assertEqual("retired_attempt", status["result"])
+        self.assertEqual("active", status["status"])
+        self.assertEqual("stack-next", status["next"])
+
         result = self.next(moved)
-        self.assertEqual("stopped", result["result"])
-        self.assertEqual("cleared_member_head_changed", result["reason"])
-        self.assertEqual(5, result["blocked_member"])
+
+        self.assertEqual("run_member", result["result"])
+        self.assertEqual(7, result["member"])
+        self.assertNotIn("retired_attempt", result)
 
     def test_member_guard_rechecks_parent_after_the_child_is_released(self):
         stack = native_stack()
@@ -5162,6 +5360,23 @@ class NativeStackCoordinatorTest(unittest.TestCase):
         self.assertEqual(
             ["lower1", "middle2", "upper2"],
             [member["head_sha"] for member in saved["members"]],
+        )
+        self.assertEqual(
+            [
+                {
+                    "fixed_pr": 5,
+                    "fixed_head_sha": "lower1",
+                    "member": 7,
+                    "member_head_sha": "middle2",
+                },
+                {
+                    "fixed_pr": 5,
+                    "fixed_head_sha": "lower1",
+                    "member": 9,
+                    "member_head_sha": "upper2",
+                },
+            ],
+            saved["propagation_guards"],
         )
         command = run.call_args.args[0]
         self.assertIn("descendant-propagate", command)

@@ -234,8 +234,43 @@ def graphql_data(query: str, variables: dict[str, str | int | None]) -> dict[str
     return data
 
 
+def line_text_from_diff_hunk(
+    diff_hunk: Any, line: int | None, side: str | None
+) -> str | None:
+    if not isinstance(diff_hunk, str) or line is None or side not in {"LEFT", "RIGHT"}:
+        return None
+    lines = diff_hunk.split("\n")
+    if not lines:
+        return None
+    hunk = HUNK_PATTERN.match(lines[0].removesuffix("\r"))
+    if hunk is None:
+        return None
+    old_line = int(hunk.group("old"))
+    new_line = int(hunk.group("new"))
+    for raw_line in lines[1:]:
+        raw_line = raw_line.removesuffix("\r")
+        if raw_line.startswith("\\"):
+            continue
+        if raw_line.startswith("+"):
+            if side == "RIGHT" and new_line == line:
+                return raw_line[1:]
+            new_line += 1
+        elif raw_line.startswith("-"):
+            if side == "LEFT" and old_line == line:
+                return raw_line[1:]
+            old_line += 1
+        elif raw_line.startswith(" "):
+            if (side == "LEFT" and old_line == line) or (
+                side == "RIGHT" and new_line == line
+            ):
+                return raw_line[1:]
+            old_line += 1
+            new_line += 1
+    return None
+
+
 def normalize_review_thread_comment(
-    comment: dict[str, Any], thread_id: str
+    comment: dict[str, Any], thread_id: str, fallback_side: str
 ) -> dict[str, Any]:
     comment_id = comment.get("databaseId")
     url = comment.get("url")
@@ -251,6 +286,7 @@ def normalize_review_thread_comment(
     start_line = comment.get("startLine")
     if start_line is None:
         start_line = comment.get("originalStartLine")
+    side = fallback_side
     if isinstance(comment_id, bool) or not isinstance(comment_id, int):
         raise WorkflowError(f"review thread {thread_id} has a comment without a numeric ID")
     if not isinstance(url, str) or not url:
@@ -282,7 +318,13 @@ def normalize_review_thread_comment(
         "updated_at": updated_at,
         "path": path,
         "line": line,
+        "side": side,
         "start_line": start_line,
+        "start_side": side if start_line is not None else None,
+        "line_text": line_text_from_diff_hunk(comment.get("diffHunk"), line, side),
+        "start_line_text": line_text_from_diff_hunk(
+            comment.get("diffHunk"), start_line, side
+        ),
         "body": body,
     }
 
@@ -290,7 +332,7 @@ def normalize_review_thread_comment(
 def fetch_review_threads(pr: dict[str, Any]) -> list[dict[str, Any]]:
     comment_fields = (
         "databaseId url author{login} authorAssociation createdAt updatedAt "
-        "path line originalLine startLine originalStartLine body"
+        "path line originalLine startLine originalStartLine diffHunk body"
     )
     thread_query = (
         "query($owner:String!,$repo:String!,$number:Int!,$cursor:String){"
@@ -400,7 +442,7 @@ def fetch_review_threads(pr: dict[str, Any]) -> list[dict[str, Any]]:
                     "is_outdated": outdated,
                     "resolved": resolved,
                     "comments": [
-                        normalize_review_thread_comment(comment, thread_id)
+                        normalize_review_thread_comment(comment, thread_id, side)
                         for comment in all_comments
                     ],
                 }
@@ -574,14 +616,16 @@ def decode_diff_path(value: str) -> str | None:
     return value
 
 
-def parse_unified_diff(diff_text: str) -> dict[str, dict[str, dict[int, int]]]:
+def parse_unified_diff(
+    diff_text: str,
+) -> dict[str, dict[str, dict[int, int | str]]]:
     """Map changed lines to positions and all hunk lines to their hunk IDs.
 
     GitHub counts positions down from a file's first ``@@`` header, which itself
     is position 0, and every later line in that file counts, including
     subsequent ``@@`` headers and ``\\ No newline`` markers.
     """
-    anchors: dict[str, dict[str, dict[int, int]]] = {}
+    anchors: dict[str, dict[str, dict[int, int | str]]] = {}
     old_path: str | None = None
     new_path: str | None = None
     path: str | None = None
@@ -622,6 +666,8 @@ def parse_unified_diff(diff_text: str) -> dict[str, dict[str, dict[int, int]]]:
                     "RIGHT": {},
                     "LEFT_LINES": {},
                     "RIGHT_LINES": {},
+                    "LEFT_TEXT": {},
+                    "RIGHT_TEXT": {},
                 },
             )
             continue
@@ -649,16 +695,20 @@ def parse_unified_diff(diff_text: str) -> dict[str, dict[str, dict[int, int]]]:
         if raw_line.startswith("+"):
             anchors[path]["RIGHT"].setdefault(new_line, position)
             anchors[path]["RIGHT_LINES"].setdefault(new_line, hunk_id)
+            anchors[path]["RIGHT_TEXT"].setdefault(new_line, raw_line[1:])
             new_line += 1
             new_remaining -= 1
         elif raw_line.startswith("-"):
             anchors[path]["LEFT"].setdefault(old_line, position)
             anchors[path]["LEFT_LINES"].setdefault(old_line, hunk_id)
+            anchors[path]["LEFT_TEXT"].setdefault(old_line, raw_line[1:])
             old_line += 1
             old_remaining -= 1
         elif raw_line.startswith(" "):
             anchors[path]["LEFT_LINES"].setdefault(old_line, hunk_id)
             anchors[path]["RIGHT_LINES"].setdefault(new_line, hunk_id)
+            anchors[path]["LEFT_TEXT"].setdefault(old_line, raw_line[1:])
+            anchors[path]["RIGHT_TEXT"].setdefault(new_line, raw_line[1:])
             old_line += 1
             new_line += 1
             old_remaining -= 1
@@ -675,15 +725,64 @@ def parse_unified_diff(diff_text: str) -> dict[str, dict[str, dict[int, int]]]:
 
 
 def positions_by_path(
-    anchors: dict[str, dict[str, dict[int, int]]],
+    anchors: dict[str, dict[str, dict[int, int | str]]],
 ) -> dict[str, dict[int, tuple[str, int]]]:
     resolved: dict[str, dict[int, tuple[str, int]]] = {}
     for path, sides in anchors.items():
         for side in ("LEFT", "RIGHT"):
             lines = sides[side]
             for line, position in lines.items():
-                resolved.setdefault(path, {})[position] = (side, line)
+                if isinstance(position, int):
+                    resolved.setdefault(path, {})[position] = (side, line)
     return resolved
+
+
+def enrich_review_thread_anchor_text(
+    threads: list[dict[str, Any]],
+    anchors: dict[str, dict[str, dict[int, int | str]]],
+) -> list[dict[str, Any]]:
+    enriched = []
+    for thread in threads:
+        item = dict(thread)
+        path = item.get("path")
+        side = item.get("side")
+        line = item.get("line")
+        start_line = item.get("start_line")
+        path_anchors = anchors.get(path, {}) if isinstance(path, str) else {}
+        text_by_line = (
+            path_anchors.get(f"{side}_TEXT", {})
+            if side in {"LEFT", "RIGHT"}
+            else {}
+        )
+        line_text = text_by_line.get(line) if isinstance(line, int) else None
+        start_line_text = (
+            text_by_line.get(start_line) if isinstance(start_line, int) else None
+        )
+        comments = item.get("comments") or []
+        if line_text is None:
+            line_text = next(
+                (
+                    comment.get("line_text")
+                    for comment in comments
+                    if isinstance(comment, dict)
+                    and isinstance(comment.get("line_text"), str)
+                ),
+                None,
+            )
+        if start_line_text is None:
+            start_line_text = next(
+                (
+                    comment.get("start_line_text")
+                    for comment in comments
+                    if isinstance(comment, dict)
+                    and isinstance(comment.get("start_line_text"), str)
+                ),
+                None,
+            )
+        item["line_text"] = line_text
+        item["start_line_text"] = start_line_text
+        enriched.append(item)
+    return enriched
 
 
 def fetch_authoritative_diff(pr: dict[str, Any]) -> str:
@@ -731,7 +830,7 @@ def load_comments(path_value: str) -> list[dict[str, Any]]:
 
 def validate_comments(
     comments: list[dict[str, Any]],
-    anchors: dict[str, dict[str, dict[int, int]]],
+    anchors: dict[str, dict[str, dict[int, int | str]]],
 ) -> list[dict[str, Any]]:
     if not comments:
         raise WorkflowError("at least one inline comment is required")
@@ -974,7 +1073,7 @@ def verify_created_review(
     viewer: str,
     review_id: int,
     expected_comments: list[dict[str, Any]],
-    anchors: dict[str, dict[str, dict[int, int]]],
+    anchors: dict[str, dict[str, dict[int, int | str]]],
 ) -> dict[str, Any]:
     endpoint = f"repos/{pr['repo_name']}/pulls/{pr['number']}/reviews/{review_id}"
     review = gh_json(["api", endpoint])
@@ -1017,7 +1116,7 @@ def preflight(
 ) -> tuple[
     dict[str, Any],
     str,
-    dict[str, dict[str, dict[int, int]]],
+    dict[str, dict[str, dict[int, int | str]]],
     str | None,
     dict[str, Any] | None,
     list[dict[str, Any]],
@@ -1067,7 +1166,9 @@ def command_check(args: argparse.Namespace) -> None:
     if pending_url:
         emit({"result": "existing_pending_review", "review_url": pending_url})
         return
-    review_threads = fetch_review_threads(pr)
+    review_threads = enrich_review_thread_anchor_text(
+        fetch_review_threads(pr), anchors
+    )
     ensure_head_unchanged(pr, "after fetching existing review threads")
     context = {
         "copilot_review": copilot_review,

@@ -116,12 +116,15 @@ Keep the stack state path and run ID. Then repeat this protocol until it returns
 5. For `resume_publish`, rerun `publish` against `member_state`. Rebuild its validation arguments exactly from `validation`: pass every `commands` item as `--validated`, every `rewrote` item as `--rewrote`, or its `reason` as `--not-validated`. Pass no validation argument when its status is `unreported`.
 6. For `resume_rerun`, rerun `rerun --state <member_state> --check <check>`.
 7. For `propagate`, run the exact `stack-propagate` action it names, including `checkpoint_id` when present, then return to `stack-next`. For `resolve_conflict`, launch `pr-conflict-resolver:pr-conflict-resolver` for `blocked_member`, wait for its terminal result, and rerun `stack-propagate` with `fixed_pr` and `expected_head` from the checkpoint. For `format`, run the exact `stack-format` action it names. Keep the same stack state, formatter choice, and propagation checkpoint until formatting returns `formatted`; if it returns `formatter_failed`, fix the command or path before retrying. Then return to `stack-next`.
-8. For `complete`, read `stack-status` and write the final report.
-9. For `stopped`, read `stack-status` and report its reason, detail, and blocked member. Do not continue with a higher member.
+8. For `retired_attempt`, return to `stack-next`. The helper detected that a cleared member moved, archived unfinished publication work, and reset that member and its descendants. Do not run `stack-abort`, create a new stack run, or restore the old head.
+9. For `complete`, read `stack-status`. If it returns `retired_attempt`, return to `stack-next`. Write the final report only when its status is still `complete`.
+10. For `stopped`, read `stack-status` and report its reason, detail, and blocked member. Do not continue with a higher member.
 
 The ordered run starts at the bottom of the native stack. Members already green finish after one live read, so the first real repair naturally occurs at the lowest uncleared member. Continue through every descendant above the selected pull request as well. A higher member never starts until its direct predecessor is clear at its current head and its own head contains that predecessor.
 
 The helper owns all topology and containment decisions. Never infer that a descendant is current from branch names, an earlier stack snapshot, or a successful push. Never run `git rebase`, `git merge`, or `git push` to align stack members yourself.
+
+When a previously cleared member has a new live head, `stack-next` retires that clearance and every dependent descendant before returning the next action. The `retired_attempt` field names the old and new heads and the reset members. `stack-status` keeps the full audit record, including accepted pushes, propagation checkpoints, and any unfinished publication work. The recovery keeps the same stack run and bounded pipeline budget. Copy the returned pipeline position exactly.
 
 ## Target And Preflight
 

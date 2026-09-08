@@ -93,6 +93,59 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
 
+    def test_defines_repository_context_validation_and_recovery_states(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn("## Workflow state machine", instructions)
+        self.assertIn(
+            "A head change returns to **Snapshot** with empty candidates",
+            instructions,
+        )
+        self.assertIn(
+            "gets exactly one fresh replacement with the same candidate packet",
+            instructions,
+        )
+        self.assertIn(
+            "If that replacement also fails, stop before posting",
+            instructions,
+        )
+        self.assertIn("## Repository rules and validation map", instructions)
+        self.assertIn(
+            "from the repository root down to that path's closest ancestor",
+            instructions,
+        )
+        self.assertIn(
+            "apply the narrower rule only to the scope it names",
+            instructions,
+        )
+        self.assertIn(
+            "record the narrowest documented command, working directory, "
+            "prerequisites",
+            instructions,
+        )
+        self.assertIn(
+            "If no honest changed-line anchor demonstrates the defect, "
+            "drop the candidate",
+            instructions,
+        )
+
+    def test_documents_compact_thread_anchor_text(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "Every review thread and thread comment includes `line_text` and "
+            "`start_line_text`",
+            instructions,
+        )
+        self.assertIn(
+            "An outdated thread falls back to the original comment hunk",
+            instructions,
+        )
+        self.assertIn(
+            "A null text field means GitHub no longer supplied enough information",
+            instructions,
+        )
+
     def test_bare_pr_reference_starts_the_review(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
@@ -845,6 +898,33 @@ diff --git a/data.txt b/data.txt
         self.assertEqual(positions["docs/two.md"][2], ("LEFT", 11))
         self.assertNotIn(1, positions["src/one.py"])
 
+    def test_captures_line_text_for_changed_and_context_lines(self):
+        anchors = MODULE.parse_unified_diff(DIFF)
+
+        self.assertEqual(anchors["src/one.py"]["LEFT_TEXT"][2], "old two")
+        self.assertEqual(anchors["src/one.py"]["RIGHT_TEXT"][2], "new two")
+        self.assertEqual(anchors["src/one.py"]["LEFT_TEXT"][3], "context three")
+        self.assertEqual(anchors["src/one.py"]["RIGHT_TEXT"][3], "context three")
+
+    def test_extracts_original_line_text_from_a_comment_diff_hunk(self):
+        hunk = """\
+@@ -7,3 +7,3 @@
+-old seven
++new seven
+ context eight
+ context nine"""
+
+        self.assertEqual(
+            MODULE.line_text_from_diff_hunk(hunk, 7, "LEFT"), "old seven"
+        )
+        self.assertEqual(
+            MODULE.line_text_from_diff_hunk(hunk, 7, "RIGHT"), "new seven"
+        )
+        self.assertEqual(
+            MODULE.line_text_from_diff_hunk(hunk, 8, "RIGHT"), "context eight"
+        )
+        self.assertIsNone(MODULE.line_text_from_diff_hunk(hunk, 10, "RIGHT"))
+
     def test_parses_added_and_deleted_files(self):
         diff = """\
 diff --git a/new.txt b/new.txt
@@ -1345,6 +1425,13 @@ class PendingReviewTest(unittest.TestCase):
                 "originalLine": original_line,
                 "startLine": None,
                 "originalStartLine": None,
+                "diffHunk": (
+                    "@@ -7,3 +7,3 @@\n"
+                    "-old seven\n"
+                    "+new seven\n"
+                    " context eight\n"
+                    " context nine"
+                ),
                 "body": f"Comment {comment_id}",
             }
 
@@ -1440,6 +1527,10 @@ class PendingReviewTest(unittest.TestCase):
         self.assertEqual(
             [item["line"] for item in result[0]["comments"]],
             [7, 8],
+        )
+        self.assertEqual(
+            [item["line_text"] for item in result[0]["comments"]],
+            ["new seven", "context eight"],
         )
         self.assertEqual(result[0]["comments"][0]["author"], "maintainer")
         self.assertEqual(
@@ -1564,6 +1655,8 @@ class PendingReviewTest(unittest.TestCase):
         self.assertEqual(payload["review_threads"][0]["path"], "src/one.py")
         self.assertEqual(payload["review_threads"][0]["line"], 2)
         self.assertEqual(payload["review_threads"][0]["side"], "RIGHT")
+        self.assertEqual(payload["review_threads"][0]["line_text"], "new two")
+        self.assertIsNone(payload["review_threads"][0]["start_line_text"])
         self.assertTrue(payload["review_threads"][0]["is_resolved"])
         preflight.assert_called_once_with(
             pr["pr_url"], include_issue_comments=True
@@ -1751,7 +1844,16 @@ class PendingReviewTest(unittest.TestCase):
             self.assertEqual(context["copilot_review"], copilot_review)
             self.assertEqual(context["suppressed_comments"], suppressed)
             self.assertEqual(context["issue_comments"], issue_comments)
-            self.assertEqual(context["review_threads"], threads)
+            self.assertEqual(
+                context["review_threads"],
+                [
+                    {
+                        **threads[0],
+                        "line_text": None,
+                        "start_line_text": None,
+                    }
+                ],
+            )
 
     def test_check_counts_an_absent_copilot_review_as_zero(self):
         pr = {
