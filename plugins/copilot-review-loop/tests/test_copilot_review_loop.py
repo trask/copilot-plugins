@@ -95,6 +95,28 @@ class AgentInstructionsTest(unittest.TestCase):
     def setUp(self):
         self.instructions = AGENT.read_text(encoding="utf-8")
 
+    def test_requires_evidence_and_reuses_unchanged_review_decisions(self):
+        section = _agent_section(
+            self.instructions,
+            "## Investigation And Batching",
+        )
+
+        self.assertIn(
+            "find concrete evidence that the current code fails, is unsafe, "
+            "breaks an explicit requirement, or misses a known use case",
+            section,
+        )
+        self.assertIn("A suggestion from Copilot is not evidence", section)
+        self.assertIn(
+            "Do not investigate a repeated concern again when the relevant code "
+            "and evidence have not changed",
+            section,
+        )
+        self.assertIn(
+            "Reuse the earlier analysis and outcome",
+            section,
+        )
+
     def test_documents_the_helper_activity_stamp_without_overselling_it(self):
         """A reader who thinks the stamp proves liveness stops checking further.
 

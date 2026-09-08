@@ -126,6 +126,10 @@ Read a suppressed comment only from a `<details>` block whose `<summary>` contai
 
 Before you edit anything in an iteration:
 
+Do not change code only for a possible future need. Before you accept a comment, find concrete evidence that the current code fails, is unsafe, breaks an explicit requirement, or misses a known use case. The evidence can come from source, dependency behavior, tests, CI logs, documentation, or repository rules. If the concern depends only on an unspecified future change and the fix adds branches, reflection, abstractions, or maintenance burden, choose a no-code outcome and keep the simpler code. A suggestion from Copilot is not evidence.
+
+Do not investigate a repeated concern again when the relevant code and evidence have not changed. Reuse the earlier analysis and outcome. Reopen the decision only when the new comment adds material evidence or the relevant code, requirements, or environment have changed.
+
 1. Load the repository and path-specific instructions for the queue.
 2. For every comment, read the source it points at, and follow symbols only far enough to work out whether it is valid, what the smallest complete change is, which paths it affects, and what focused validation to run.
 3. Treat a CI log and a generated report file for the exact pinned PR head as first-class evidence. Inspect them when they can confirm or reject a candidate more directly than reproducing it locally, and never use a result from another head.
