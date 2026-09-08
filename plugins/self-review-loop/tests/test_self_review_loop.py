@@ -649,8 +649,9 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "Read `changed_files`, `pr_commits`, `pr_authored_files`, `history`, and "
-            "`history_commit_presence` from the complete result at `preflight_path`",
+            "Read the full `pr`, `changed_files`, `pr_commits`, `pr_authored_files`, "
+            "`history`, `history_commit_presence`, and `repository_context` from the "
+            "complete result at `preflight_path`",
             self.instructions,
         )
         self.assertIn(
@@ -658,12 +659,57 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn(
-            "The envelope's `counts.history_commits_missing` reports how many recorded "
-            "commits no longer appear",
+            "The envelope keeps `counts.history_commits_missing` for exact-SHA "
+            "reporting",
             self.instructions,
         )
         self.assertIn(
-            "Do not compare the history and PR commit lists by hand",
+            "Do not compare commit lists or reconstruct patch identity by hand",
+            self.instructions,
+        )
+
+    def test_defines_the_state_machine_and_repository_context_map(self):
+        self.assertIn("## Workflow State Machine", self.instructions)
+        self.assertIn(
+            "The helper's current result decides the transition", self.instructions
+        )
+        self.assertIn(
+            "Apply precedence in this order: the helper's head and state guards",
+            self.instructions,
+        )
+        self.assertIn("## Repository Context And Validation Map", self.instructions)
+        self.assertIn(
+            "It is a dependency-free discovery index over tracked files",
+            self.instructions,
+        )
+        for field in (
+            "exact command",
+            "working directory",
+            "prerequisites",
+            "files the check reads",
+            "expected cost",
+        ):
+            self.assertIn(field, self.instructions)
+        self.assertIn(
+            "The discovered files are a starting point, not an outer bound",
+            self.instructions,
+        )
+
+    def test_uses_patch_identity_without_treating_unknown_as_retained(self):
+        self.assertIn(
+            "an equivalent whitespace-preserving patch", self.instructions
+        )
+        self.assertIn(
+            "never treats commit-list presence alone as final-tree retention",
+            self.instructions,
+        )
+        self.assertIn(
+            "When `retained` is null, inspect the pinned diff and current code",
+            self.instructions,
+        )
+        self.assertIn(
+            "Review the finding again only when `retained` is false, or inspection "
+            "proves the fix is gone, and no intentional rejection settles it",
             self.instructions,
         )
 
@@ -1312,7 +1358,10 @@ class PullRequestMetadataTest(unittest.TestCase):
         payload = {
             "number": 7,
             "title": "Add a thing",
+            "body": "This changes the thing.",
             "url": "https://github.com/owner/repo/pull/7",
+            "state": "OPEN",
+            "isDraft": False,
             "headRefName": "feature",
             "headRefOid": "head",
             "headRepositoryOwner": {"login": "fork"},
@@ -1339,6 +1388,10 @@ class PullRequestMetadataTest(unittest.TestCase):
                 {"sha": "two", "message": "Second change"},
             ],
         )
+        self.assertEqual(metadata["body"], "This changes the thing.")
+        self.assertEqual(metadata["state"], "OPEN")
+        self.assertFalse(metadata["is_draft"])
+        self.assertIn("body", gh_json.call_args.args[0][-1])
         self.assertIn("commits", gh_json.call_args.args[0][-1])
 
     def test_base_sha_is_the_live_base_branch_tip_not_the_frozen_base_ref_oid(self):
@@ -1346,7 +1399,10 @@ class PullRequestMetadataTest(unittest.TestCase):
         payload = {
             "number": 7,
             "title": "Add a thing",
+            "body": "",
             "url": "https://github.com/owner/repo/pull/7",
+            "state": "OPEN",
+            "isDraft": False,
             "headRefName": "feature",
             "headRefOid": "head",
             "headRepositoryOwner": {"login": "fork"},
@@ -1363,6 +1419,166 @@ class PullRequestMetadataTest(unittest.TestCase):
             metadata = MODULE.metadata_for(target)
         self.assertEqual("live-tip", metadata["base_sha"])
         tip.assert_called_once_with("owner/repo", "main")
+
+
+class RepositoryContextTest(unittest.TestCase):
+    def test_groups_authored_paths_by_nearby_guidance_and_manifests(self):
+        context = MODULE.repository_context_from_files(
+            [
+                "AGENTS.md",
+                "CONTRIBUTING.md",
+                ".github/copilot-instructions.md",
+                ".github/instructions/python.instructions.md",
+                ".github/agents/knowledge/gradle.md",
+                ".github/workflows/ci.yml",
+                "package.json",
+                "src/AGENTS.md",
+                "src/service/CONTEXT.md",
+                "src/service/pyproject.toml",
+                "src/service/app.py",
+                "web/package.json",
+                "web/app.js",
+                "ignored/build.gradle",
+            ],
+            ["src/service/app.py", "web/app.js"],
+        )
+
+        self.assertEqual(context["scope"], "pr_authored_files")
+        self.assertEqual(context["knowledge_files"], [".github/agents/knowledge/gradle.md"])
+        self.assertEqual(
+            context["validation_sources"]["workflows"], [".github/workflows/ci.yml"]
+        )
+        groups = {tuple(group["paths"]): group for group in context["path_groups"]}
+        service = groups[("src/service/app.py",)]
+        self.assertIn("AGENTS.md", service["instruction_files"])
+        self.assertIn("src/AGENTS.md", service["instruction_files"])
+        self.assertIn("src/service/CONTEXT.md", service["instruction_files"])
+        self.assertEqual(
+            service["validation_sources"],
+            ["package.json", "src/service/pyproject.toml"],
+        )
+        web = groups[("web/app.js",)]
+        self.assertEqual(web["validation_sources"], ["package.json", "web/package.json"])
+        self.assertNotIn("ignored/build.gradle", service["validation_sources"])
+
+    def test_groups_paths_with_the_same_context(self):
+        context = MODULE.repository_context_from_files(
+            ["AGENTS.md", "src/pyproject.toml"],
+            ["src/a.py", "src/b.py"],
+        )
+
+        self.assertEqual(
+            context["path_groups"],
+            [
+                {
+                    "paths": ["src/a.py", "src/b.py"],
+                    "instruction_files": ["AGENTS.md"],
+                    "validation_sources": ["src/pyproject.toml"],
+                }
+            ],
+        )
+
+    def test_keeps_a_literal_backslash_in_a_git_path(self):
+        context = MODULE.repository_context_from_files(
+            ["AGENTS.md", "src/AGENTS.md", r"src\app.py"],
+            [r"src\app.py"],
+        )
+
+        self.assertEqual(context["path_groups"][0]["paths"], [r"src\app.py"])
+        self.assertEqual(
+            context["path_groups"][0]["instruction_files"], ["AGENTS.md"]
+        )
+
+    def test_reads_nul_delimited_paths_without_newline_translation(self):
+        response = SimpleNamespace(
+            returncode=0,
+            stdout=b"line\r\nbreak\0carriage\ronly\0",
+            stderr=b"",
+        )
+        with mock.patch.object(MODULE, "run_bytes", return_value=response):
+            paths = MODULE.git_z_paths(Path("repo"), "ls-files")
+
+        self.assertEqual(paths, ["line\r\nbreak", "carriage\ronly"])
+
+    def test_patch_identity_ignores_hunk_offsets_but_preserves_whitespace(self):
+        original = (
+            b"diff --git a/app.py b/app.py\n"
+            b"index 111..222 100644\n"
+            b"--- a/app.py\n"
+            b"+++ b/app.py\n"
+            b"@@ -2,2 +2,3 @@\n"
+            b" if ready:\n"
+            b"+    run()\n"
+        )
+        rebased = original.replace(
+            b"index 111..222 100644", b"index 333..444 100644"
+        ).replace(b"@@ -2,2 +2,3 @@", b"@@ -20,2 +20,3 @@")
+        changed_indentation = rebased.replace(b"+    run()", b"+run()")
+
+        self.assertEqual(
+            MODULE.patch_identity(original), MODULE.patch_identity(rebased)
+        )
+        self.assertNotEqual(
+            MODULE.patch_identity(original),
+            MODULE.patch_identity(changed_indentation),
+        )
+        carriage_return_one = original.replace(b"+    run()", b"+x\rindex first")
+        carriage_return_two = original.replace(b"+    run()", b"+x\rindex second")
+        self.assertNotEqual(
+            MODULE.patch_identity(carriage_return_one),
+            MODULE.patch_identity(carriage_return_two),
+        )
+        self.assertIsNone(MODULE.patch_identity(b""))
+
+
+class PatchRetentionTest(unittest.TestCase):
+    def response(self, returncode, stdout=b"", stderr=b""):
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def test_proves_present_absent_and_unknown_patch_states(self):
+        patch = b"diff --git a/app.py b/app.py\n"
+        cases = [
+            (
+                [
+                    self.response(0, patch),
+                    self.response(0),
+                    self.response(1),
+                ],
+                True,
+            ),
+            (
+                [
+                    self.response(0, patch),
+                    self.response(1),
+                    self.response(0),
+                ],
+                False,
+            ),
+            (
+                [
+                    self.response(0, patch),
+                    self.response(1),
+                    self.response(1),
+                ],
+                None,
+            ),
+            (
+                [
+                    self.response(0, patch),
+                    self.response(0),
+                    self.response(0),
+                ],
+                None,
+            ),
+            ([self.response(1, stderr=b"missing")], None),
+        ]
+        for responses, expected in cases:
+            with self.subTest(expected=expected), mock.patch.object(
+                MODULE, "run_bytes", side_effect=responses
+            ):
+                self.assertIs(
+                    MODULE.commit_patch_retention(Path("repo"), "commit"), expected
+                )
 
 
 class BaseRefTipTest(unittest.TestCase):
@@ -1578,20 +1794,69 @@ class HistoryTest(unittest.TestCase):
 
     def test_compares_only_recorded_history_commits_with_current_pr_commits(self):
         history = [
-            {"id": 1, "commit": "old"},
+            {"id": 1, "commit": "old", "patch_id": "same-patch"},
             {"id": 2, "commit": "current"},
-            {"id": 3, "commit": None},
-            {"id": 4},
+            {"id": 3, "commit": "unknown"},
+            {"id": 4, "commit": "gone", "patch_id": "gone-patch"},
+            {"id": 5, "commit": None},
+            {"id": 6},
         ]
 
         self.assertEqual(
             MODULE.compare_history_commits(
                 history,
-                [{"sha": "current"}, {"sha": "other"}],
+                [
+                    {"sha": "current", "patch_id": None},
+                    {"sha": "other", "patch_id": "same-patch"},
+                ],
+                {
+                    "old": True,
+                    "current": True,
+                    "unknown": None,
+                    "gone": False,
+                },
             ),
             [
-                {"history_id": 1, "commit": "old", "in_pr_commits": False},
-                {"history_id": 2, "commit": "current", "in_pr_commits": True},
+                {
+                    "history_id": 1,
+                    "commit": "old",
+                    "patch_id": "same-patch",
+                    "in_pr_commits": False,
+                    "retained": True,
+                    "match_kind": "equivalent_patch",
+                    "commit_match_kind": "equivalent_patch",
+                    "matching_commit": "other",
+                },
+                {
+                    "history_id": 2,
+                    "commit": "current",
+                    "patch_id": None,
+                    "in_pr_commits": True,
+                    "retained": True,
+                    "match_kind": "exact_commit",
+                    "commit_match_kind": "exact_commit",
+                    "matching_commit": "current",
+                },
+                {
+                    "history_id": 3,
+                    "commit": "unknown",
+                    "patch_id": None,
+                    "in_pr_commits": False,
+                    "retained": None,
+                    "match_kind": "unknown",
+                    "commit_match_kind": "unknown",
+                    "matching_commit": None,
+                },
+                {
+                    "history_id": 4,
+                    "commit": "gone",
+                    "patch_id": "gone-patch",
+                    "in_pr_commits": False,
+                    "retained": False,
+                    "match_kind": "missing",
+                    "commit_match_kind": "missing",
+                    "matching_commit": None,
+                },
             ],
         )
 
@@ -1784,9 +2049,12 @@ class CommitProvenanceTest(unittest.TestCase):
 
         with mock.patch.object(
             MODULE,
-            "git",
-            side_effect=["z.py\na.py\nz.py\n", "docs/readme.md\n"],
-        ) as git:
+            "git_z_paths",
+            side_effect=[
+                ["z.py", "a.py", "z.py"],
+                ["docs/readme.md"],
+            ],
+        ) as git_z_paths:
             result = MODULE.commit_provenance(Path("repo"), commits)
 
         self.assertEqual(
@@ -1801,7 +2069,7 @@ class CommitProvenanceTest(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            git.call_args_list,
+            git_z_paths.call_args_list,
             [
                 mock.call(
                     Path("repo"),
@@ -2016,7 +2284,11 @@ class StateCommandTest(unittest.TestCase):
             )
         )
 
-        with mock.patch.object(MODULE, "git", return_value="fullsha"):
+        with mock.patch.object(
+            MODULE, "git", return_value="fullsha"
+        ), mock.patch.object(
+            MODULE, "commit_patch_id", return_value="patch-1"
+        ):
             MODULE.command_record(
                 SimpleNamespace(
                     state=str(path),
@@ -2032,8 +2304,10 @@ class StateCommandTest(unittest.TestCase):
         candidate = state["review"]["candidates"][0]
         self.assertEqual(candidate["status"], "handled")
         self.assertEqual(candidate["commit"], "fullsha")
+        self.assertEqual(candidate["patch_id"], "patch-1")
         self.assertEqual(candidate["summary"], "fix the guard")
         self.assertEqual(state["review"]["batches"][0]["status"], "approved")
+        self.assertEqual(self.emitted[-1]["patch_id"], "patch-1")
 
     def test_resolve_marks_the_active_review_clean_at_its_pinned_head(self):
         path = write_state(self.directory)
@@ -2513,8 +2787,11 @@ class PreflightTest(unittest.TestCase):
         self.metadata = {
             "number": 7,
             "title": "Add a thing",
+            "body": "This changes the thing.",
             "pr_url": "https://github.com/owner/repo/pull/7",
             "repo_name": "owner/repo",
+            "state": "OPEN",
+            "is_draft": False,
             "upstream_owner": "owner",
             "upstream_repo": "repo",
             "head_owner": "fork",
@@ -2539,6 +2816,7 @@ class PreflightTest(unittest.TestCase):
         max_iterations=5,
         checked_out_branch=True,
         provenance=None,
+        retention=None,
         new_invocation=False,
         invocation_run=None,
         pipeline_run=None,
@@ -2564,6 +2842,7 @@ class PreflightTest(unittest.TestCase):
                 "files": ["app.py"],
             }
         ]
+        retention = retention or {"commit1": True}
         with (
             mock.patch.object(MODULE, "require_tools"),
             mock.patch.object(
@@ -2581,6 +2860,33 @@ class PreflightTest(unittest.TestCase):
                 MODULE,
                 "commit_provenance",
                 return_value=provenance,
+            ),
+            mock.patch.object(
+                MODULE,
+                "discover_repository_context",
+                return_value={
+                    "discovery_version": 1,
+                    "scope": "pr_authored_files",
+                    "instruction_files": ["AGENTS.md"],
+                    "knowledge_files": [".github/agents/knowledge/review.md"],
+                    "validation_sources": {
+                        "manifests": ["pyproject.toml"],
+                        "workflows": [".github/workflows/ci.yml"],
+                    },
+                    "path_groups": [
+                        {
+                            "paths": ["app.py"],
+                            "instruction_files": ["AGENTS.md"],
+                            "validation_sources": ["pyproject.toml"],
+                        }
+                    ],
+                    "discovery_rules": ["tracked repository files only"],
+                },
+            ),
+            mock.patch.object(
+                MODULE,
+                "commit_patch_retention",
+                side_effect=lambda _root, commit: retention.get(commit),
             ),
             mock.patch.object(MODULE, "run"),
         ):
@@ -2607,14 +2913,24 @@ class PreflightTest(unittest.TestCase):
         )
         self.assertEqual(envelope["diff_bytes"], len(DIFF.encode("utf-8")))
         self.assertEqual(
+            envelope["body_bytes"], len(self.metadata["body"].encode("utf-8"))
+        )
+        self.assertEqual(
             envelope["counts"],
             {
                 "changed_files": 1,
                 "diff_only_files": 0,
                 "history": 0,
                 "history_commits_missing": 0,
+                "history_fixes_unmatched": 0,
+                "history_fixes_unknown": 0,
+                "instruction_files": 1,
+                "knowledge_files": 1,
+                "path_context_groups": 1,
                 "pr_authored_files": 1,
                 "pr_commits": 1,
+                "validation_manifests": 1,
+                "validation_workflows": 1,
             },
         )
         for field in ("changed_files", "pr_commits", "history"):
@@ -2634,6 +2950,9 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(result["pr_authored_files"], ["app.py"])
         self.assertEqual(result["diff_only_files"], [])
         self.assertEqual(result["history_commit_presence"], [])
+        self.assertEqual(
+            result["repository_context"]["path_groups"][0]["paths"], ["app.py"]
+        )
         self.assertEqual(result["iteration"], 1)
         self.assertEqual(result["history"], [])
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -2798,17 +3117,83 @@ class PreflightTest(unittest.TestCase):
         result = self.full_result(envelope)
 
         self.assertEqual(envelope["counts"]["history_commits_missing"], 1)
+        self.assertEqual(envelope["counts"]["history_fixes_unmatched"], 0)
+        self.assertEqual(envelope["counts"]["history_fixes_unknown"], 1)
         self.assertEqual(
             result["history_commit_presence"],
             [
-                {"history_id": 1, "commit": "old", "in_pr_commits": False},
-                {"history_id": 2, "commit": "commit1", "in_pr_commits": True},
+                {
+                    "history_id": 1,
+                    "commit": "old",
+                    "patch_id": None,
+                    "in_pr_commits": False,
+                    "retained": None,
+                    "match_kind": "unknown",
+                    "commit_match_kind": "unknown",
+                    "matching_commit": None,
+                },
+                {
+                    "history_id": 2,
+                    "commit": "commit1",
+                    "patch_id": None,
+                    "in_pr_commits": True,
+                    "retained": True,
+                    "match_kind": "exact_commit",
+                    "commit_match_kind": "exact_commit",
+                    "matching_commit": "commit1",
+                },
             ],
         )
         state = MODULE.load_state(state_path)
         self.assertEqual(
             state["review"]["history_commit_presence"],
             result["history_commit_presence"],
+        )
+
+    def test_reports_a_rebased_history_fix_as_an_equivalent_patch(self):
+        state_path = write_state(
+            self.directory,
+            history=[
+                {
+                    "id": 1,
+                    "outcome": "addressed",
+                    "commit": "old",
+                    "patch_id": "stable-patch",
+                }
+            ],
+        )
+
+        envelope = self.preflight(
+            state_path,
+            provenance=[
+                {
+                    "sha": "commit1",
+                    "message": "Change app",
+                    "files": ["app.py"],
+                    "patch_id": "stable-patch",
+                }
+            ],
+            retention={"old": True},
+        )
+        result = self.full_result(envelope)
+
+        self.assertEqual(envelope["counts"]["history_commits_missing"], 1)
+        self.assertEqual(envelope["counts"]["history_fixes_unmatched"], 0)
+        self.assertEqual(envelope["counts"]["history_fixes_unknown"], 0)
+        self.assertEqual(
+            result["history_commit_presence"],
+            [
+                {
+                    "history_id": 1,
+                    "commit": "old",
+                    "patch_id": "stable-patch",
+                    "in_pr_commits": False,
+                    "retained": True,
+                    "match_kind": "equivalent_patch",
+                    "commit_match_kind": "equivalent_patch",
+                    "matching_commit": "commit1",
+                }
+            ],
         )
 
     def test_stops_at_the_iteration_cap(self):

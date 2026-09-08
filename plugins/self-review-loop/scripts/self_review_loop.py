@@ -7,6 +7,7 @@ import argparse
 import ast
 import base64
 import datetime as dt
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -45,6 +46,31 @@ SHARED_STATE_ENV = "COPILOT_PR_FLIGHT_STATE_REPO"
 SHARED_STATE_CONFIG = Path(".copilot/extensions/pr-flight/state-repo.json")
 SHARED_STATE_VERSION = 1
 SHARED_STATE_MAX_ATTEMPTS = 3
+HUNK_HEADER_BYTES_PATTERN = re.compile(
+    rb"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@"
+)
+REPOSITORY_GUIDANCE_NAMES = {
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CONTEXT.md",
+    "CONTRIBUTING.md",
+}
+VALIDATION_SOURCE_NAMES = {
+    ".pre-commit-config.yaml",
+    ".pre-commit-config.yml",
+    "Cargo.toml",
+    "Makefile",
+    "build.gradle",
+    "build.gradle.kts",
+    "go.mod",
+    "package.json",
+    "pom.xml",
+    "pyproject.toml",
+    "setup.cfg",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "tox.ini",
+}
 
 
 class WorkflowError(RuntimeError):
@@ -74,8 +100,211 @@ def run(
     return process
 
 
+def run_bytes(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    input_bytes: bytes | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    process = subprocess.run(
+        command,
+        cwd=str(cwd) if cwd else None,
+        input=input_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if check and process.returncode != 0:
+        detail = (
+            process.stderr.decode("utf-8", errors="replace").strip()
+            or process.stdout.decode("utf-8", errors="replace").strip()
+            or "no output"
+        )
+        raise WorkflowError(f"{' '.join(command)} failed ({process.returncode}): {detail}")
+    return process
+
+
 def git(repo_root: Path, *arguments: str) -> str:
     return run(["git", "-C", str(repo_root), *arguments]).stdout.strip()
+
+
+def git_z_paths(repo_root: Path, *arguments: str) -> list[str]:
+    if not arguments:
+        raise WorkflowError("git path command is required")
+    output = run_bytes(
+        ["git", "-C", str(repo_root), arguments[0], "-z", *arguments[1:]]
+    ).stdout
+    return [os.fsdecode(path) for path in output.split(b"\0") if path]
+
+
+def patch_identity(diff: bytes) -> str | None:
+    """Hash a commit-independent patch while preserving meaningful whitespace."""
+    if not diff:
+        return None
+    normalized = []
+    in_file_header = False
+    lines = diff.split(b"\n")
+    for index, content in enumerate(lines):
+        line = content + (b"\n" if index < len(lines) - 1 else b"")
+        if line.startswith(b"diff --git "):
+            in_file_header = True
+        elif in_file_header and line.startswith(b"index "):
+            continue
+        if line.startswith(b"@@ "):
+            line = HUNK_HEADER_BYTES_PATTERN.sub(b"@@ -0 +0 @@", line, count=1)
+            in_file_header = False
+        normalized.append(line)
+    content = b"".join(normalized)
+    return hashlib.sha256(content).hexdigest() if content else None
+
+
+def commit_patch_id(repo_root: Path, commit: str) -> str | None:
+    """Return a whitespace-preserving patch identity for one commit."""
+    show = run_bytes(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "show",
+            "--format=",
+            "--binary",
+            "--no-renames",
+            commit,
+        ],
+    )
+    return patch_identity(show.stdout)
+
+
+def commit_patch_retention(repo_root: Path, commit: str) -> bool | None:
+    """Prove whether a commit's exact patch is present or absent in the worktree."""
+    show = run_bytes(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "show",
+            "--format=",
+            "--binary",
+            "--no-renames",
+            commit,
+        ],
+        check=False,
+    )
+    if show.returncode != 0 or not show.stdout:
+        return None
+    reverse = run_bytes(
+        ["git", "-C", str(repo_root), "apply", "--reverse", "--check", "-"],
+        input_bytes=show.stdout,
+        check=False,
+    )
+    forward = run_bytes(
+        ["git", "-C", str(repo_root), "apply", "--check", "-"],
+        input_bytes=show.stdout,
+        check=False,
+    )
+    reverse_applies = reverse.returncode == 0
+    forward_applies = forward.returncode == 0
+    if reverse_applies == forward_applies:
+        return None
+    return reverse_applies
+
+
+def ancestor_directories(path: str) -> set[str]:
+    parts = path.split("/")[:-1]
+    return {"", *("/".join(parts[:index]) for index in range(1, len(parts) + 1))}
+
+
+def repository_context_from_files(
+    tracked_files: Iterable[str], authored_files: Iterable[str]
+) -> dict[str, Any]:
+    """Group tracked guidance and validation sources around authored paths."""
+    tracked = sorted({path for path in tracked_files if path})
+    authored = sorted({path for path in authored_files if path})
+    instruction_files = sorted(
+        path
+        for path in tracked
+        if Path(path).name in REPOSITORY_GUIDANCE_NAMES
+        or path == ".github/copilot-instructions.md"
+        or (
+            path.startswith(".github/instructions/")
+            and path.endswith(".instructions.md")
+        )
+    )
+    knowledge_files = sorted(
+        path
+        for path in tracked
+        if path.startswith(".github/agents/knowledge/") and path.endswith(".md")
+    )
+    workflow_files = sorted(
+        path
+        for path in tracked
+        if path.startswith(".github/workflows/")
+        and path.endswith((".yml", ".yaml"))
+    )
+    manifest_files = sorted(
+        path for path in tracked if Path(path).name in VALIDATION_SOURCE_NAMES
+    )
+    global_instructions = {
+        path
+        for path in instruction_files
+        if "/" not in path
+        or path == ".github/copilot-instructions.md"
+        or path.startswith(".github/instructions/")
+    }
+    grouped: dict[tuple[tuple[str, ...], tuple[str, ...]], list[str]] = {}
+    for path in authored:
+        ancestors = ancestor_directories(path)
+        scoped_instructions = tuple(
+            sorted(
+                global_instructions
+                | {
+                    candidate
+                    for candidate in instruction_files
+                    if candidate.rpartition("/")[0] in ancestors
+                }
+            )
+        )
+        scoped_validation = tuple(
+            candidate
+            for candidate in manifest_files
+            if candidate.rpartition("/")[0] in ancestors
+        )
+        grouped.setdefault((scoped_instructions, scoped_validation), []).append(path)
+    path_groups = [
+        {
+            "paths": paths,
+            "instruction_files": list(instructions),
+            "validation_sources": list(validation_sources),
+        }
+        for (instructions, validation_sources), paths in sorted(
+            grouped.items(), key=lambda item: item[1][0]
+        )
+    ]
+    return {
+        "discovery_version": 1,
+        "scope": "pr_authored_files",
+        "instruction_files": instruction_files,
+        "knowledge_files": knowledge_files,
+        "validation_sources": {
+            "manifests": manifest_files,
+            "workflows": workflow_files,
+        },
+        "path_groups": path_groups,
+        "discovery_rules": [
+            "tracked repository files only",
+            "root and ancestor guidance for each authored path",
+            "all .github/instructions and .github/agents/knowledge Markdown files",
+            "ancestor build manifests and all GitHub Actions workflows",
+        ],
+    }
+
+
+def discover_repository_context(
+    repo_root: Path, authored_files: Iterable[str]
+) -> dict[str, Any]:
+    tracked = git_z_paths(repo_root, "ls-files")
+    return repository_context_from_files(tracked, authored_files)
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -666,8 +895,8 @@ def resolve_target(value: str | None, repo_root: Path) -> dict[str, Any]:
 
 def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     fields = (
-        "number,title,url,headRefName,headRefOid,headRepositoryOwner,headRepository,"
-        "baseRefName,commits"
+        "number,title,body,url,state,isDraft,headRefName,headRefOid,"
+        "headRepositoryOwner,headRepository,baseRefName,commits"
     )
     metadata = gh_json(
         [
@@ -708,6 +937,9 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     title = metadata.get("title")
     if not isinstance(title, str) or not title.strip():
         raise WorkflowError("resolved PR metadata has no title")
+    body = metadata.get("body")
+    if not isinstance(body, str):
+        body = ""
     raw_commits = metadata.get("commits")
     if not isinstance(raw_commits, list):
         raise WorkflowError("resolved PR metadata has no commit list")
@@ -729,8 +961,11 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     return {
         "number": target["number"],
         "title": title.strip(),
+        "body": body,
         "pr_url": resolved["pr_url"],
         "repo_name": resolved["repo_name"],
+        "state": metadata.get("state"),
+        "is_draft": bool(metadata.get("isDraft")),
         "upstream_owner": resolved["owner"],
         "upstream_repo": resolved["repo"],
         "head_owner": head_owner["login"],
@@ -749,9 +984,8 @@ def commit_provenance(
     provenance = []
     for commit in commits:
         files = sorted(
-            {
-                line
-                for line in git(
+            set(
+                git_z_paths(
                     repo_root,
                     "diff-tree",
                     "--root",
@@ -760,12 +994,20 @@ def commit_provenance(
                     "-r",
                     "-m",
                     commit["sha"],
-                ).splitlines()
-                if line
-            }
+                )
+            )
         )
         provenance.append({**commit, "files": files})
     return provenance
+
+
+def add_patch_ids(
+    repo_root: Path, commits: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    for commit in commits:
+        if "patch_id" not in commit:
+            commit["patch_id"] = commit_patch_id(repo_root, commit["sha"])
+    return commits
 
 
 def require_checkout_head(local_head: str, pr_head: str) -> None:
@@ -1086,23 +1328,62 @@ def archive_review(state: dict[str, Any]) -> None:
                 "outcome": history_outcome(candidate),
                 "detail": candidate.get("rationale") or candidate.get("summary"),
                 "commit": candidate.get("commit"),
+                "patch_id": candidate.get("patch_id"),
             }
         )
 
 
 def compare_history_commits(
-    history: list[dict[str, Any]], pr_commits: list[dict[str, Any]]
+    history: list[dict[str, Any]],
+    pr_commits: list[dict[str, Any]],
+    retention: dict[str, bool | None] | None = None,
 ) -> list[dict[str, Any]]:
-    pr_commit_shas = {commit["sha"] for commit in pr_commits}
-    return [
-        {
-            "history_id": entry["id"],
-            "commit": entry["commit"],
-            "in_pr_commits": entry["commit"] in pr_commit_shas,
-        }
-        for entry in history
-        if entry.get("commit")
-    ]
+    retention = retention or {}
+    commits_by_sha = {commit["sha"]: commit for commit in pr_commits}
+    commits_by_patch = {
+        commit["patch_id"]: commit
+        for commit in pr_commits
+        if commit.get("patch_id") is not None
+    }
+    compared = []
+    for entry in history:
+        commit = entry.get("commit")
+        if not commit:
+            continue
+        patch_id = entry.get("patch_id")
+        if commit in commits_by_sha:
+            commit_match_kind = "exact_commit"
+            matching_commit = commit
+        elif patch_id is None:
+            commit_match_kind = "unknown"
+            matching_commit = None
+        elif patch_id in commits_by_patch:
+            commit_match_kind = "equivalent_patch"
+            matching_commit = commits_by_patch[patch_id]["sha"]
+        else:
+            commit_match_kind = "missing"
+            matching_commit = None
+        retained = retention.get(commit)
+        match_kind = (
+            commit_match_kind
+            if retained is True
+            else "missing"
+            if retained is False
+            else "unknown"
+        )
+        compared.append(
+            {
+                "history_id": entry["id"],
+                "commit": commit,
+                "patch_id": patch_id,
+                "in_pr_commits": commit in commits_by_sha,
+                "retained": retained,
+                "match_kind": match_kind,
+                "commit_match_kind": commit_match_kind,
+                "matching_commit": matching_commit,
+            }
+        )
+    return compared
 
 
 def pipeline_iteration_value(pipeline_iteration: Any) -> int | None:
@@ -1433,9 +1714,28 @@ def command_preflight(args: argparse.Namespace) -> None:
     archive_review(state)
     state["iterations"] = int(state.get("iterations", 0))
     migrate_budget_counters(state)
-    history_commit_presence = compare_history_commits(state["history"], pr_commits)
+    pr_commit_shas = {commit["sha"] for commit in pr_commits}
+    if any(
+        entry.get("commit") not in pr_commit_shas and entry.get("patch_id")
+        for entry in state["history"]
+    ):
+        add_patch_ids(repo_root, pr_commits)
+    history_retention = {
+        entry["commit"]: commit_patch_retention(repo_root, entry["commit"])
+        for entry in state["history"]
+        if entry.get("commit")
+    }
+    history_commit_presence = compare_history_commits(
+        state["history"], pr_commits, history_retention
+    )
     history_commits_missing = sum(
         not entry["in_pr_commits"] for entry in history_commit_presence
+    )
+    history_fixes_unmatched = sum(
+        entry["retained"] is False for entry in history_commit_presence
+    )
+    history_fixes_unknown = sum(
+        entry["retained"] is None for entry in history_commit_presence
     )
     max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
     pipeline = pipeline_scope(state, args)
@@ -1512,6 +1812,7 @@ def command_preflight(args: argparse.Namespace) -> None:
             updated_at=state["updated_at"],
         )
     changed_files = sorted(anchors)
+    repository_context = discover_repository_context(repo_root, pr_authored_files)
     preflight_path = preflight_path_for(state_path)
     payload = {
         "result": result,
@@ -1526,6 +1827,7 @@ def command_preflight(args: argparse.Namespace) -> None:
         "diff_only_files": diff_only_files,
         "history": state["history"],
         "history_commit_presence": history_commit_presence,
+        "repository_context": repository_context,
         "iteration": iteration,
         "max_iterations": max_iterations,
         "completed_iterations": completed_iterations,
@@ -1554,13 +1856,25 @@ def command_preflight(args: argparse.Namespace) -> None:
             "head_sha": metadata["head_sha"],
             "diff_path": str(diff_path),
             "diff_bytes": len(diff_text.encode("utf-8")),
+            "body_bytes": len(metadata["body"].encode("utf-8")),
             "counts": {
                 "changed_files": len(changed_files),
                 "diff_only_files": len(diff_only_files),
                 "history": len(state["history"]),
                 "history_commits_missing": history_commits_missing,
+                "history_fixes_unmatched": history_fixes_unmatched,
+                "history_fixes_unknown": history_fixes_unknown,
+                "instruction_files": len(repository_context["instruction_files"]),
+                "knowledge_files": len(repository_context["knowledge_files"]),
+                "path_context_groups": len(repository_context["path_groups"]),
                 "pr_authored_files": len(pr_authored_files),
                 "pr_commits": len(pr_commits),
+                "validation_manifests": len(
+                    repository_context["validation_sources"]["manifests"]
+                ),
+                "validation_workflows": len(
+                    repository_context["validation_sources"]["workflows"]
+                ),
             },
             "iteration": iteration,
             "max_iterations": max_iterations,
@@ -1656,14 +1970,18 @@ def command_record(args: argparse.Namespace) -> None:
     review = active_review(state)
     candidates = find_candidates(review, args.candidates)
     commit = args.commit
+    patch_id = None
     if commit:
-        commit = git(Path(state["repo_root"]), "rev-parse", commit)
+        repo_root = Path(state["repo_root"])
+        commit = git(repo_root, "rev-parse", commit)
+        patch_id = commit_patch_id(repo_root, commit)
     for candidate in candidates:
         candidate.update(
             {
                 "batch": args.batch,
                 "status": "handled",
                 "commit": commit,
+                "patch_id": patch_id,
                 "rationale": args.rationale,
                 "summary": args.summary,
             }
@@ -1678,6 +1996,7 @@ def command_record(args: argparse.Namespace) -> None:
             "state": str(path),
             "candidate_ids": args.candidates,
             "commit": commit,
+            "patch_id": patch_id,
             "rationale": args.rationale,
         }
     )
