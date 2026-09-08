@@ -2932,6 +2932,20 @@ class ResolvedTest(unittest.TestCase):
             self.git_try.call_args[0][1:],
         )
 
+    def test_resolved_records_files_for_descendant_propagation_state(self):
+        self.write("app.py", b"ours\ntheirs\n")
+        payload = self.resolve(
+            operation="descendant_propagation",
+            status="conflicted",
+            workspace=str(self.directory),
+            conflicts=[conflict_record("app.py")],
+            cascade={},
+        )
+        self.assertEqual("recorded", payload["result"])
+        saved = self.saved()
+        self.assertEqual("resolved", saved["conflicts"][0]["status"])
+        self.assertEqual([], payload["remaining_conflicts"])
+
     def test_remaining_conflicts_keep_the_run_on_resolved(self):
         self.write("app.py", b"ours\ntheirs\n")
         payload = self.resolve(
@@ -6908,6 +6922,35 @@ class StackAbortCommandTest(unittest.TestCase):
         self.assertIn("already published", str(self.error))
         self.remove.assert_not_called()
 
+    def test_a_descendant_propagation_conflict_is_aborted_and_workspace_removed(self):
+        state_path = write_state(
+            self.directory,
+            operation="descendant_propagation",
+            status="conflicted",
+            workspace=str(self.workspace),
+            cascade={"workspace": str(self.workspace)},
+        )
+        self.state_path = state_path
+        args = SimpleNamespace(state=str(state_path))
+        with mock.patch.object(
+            MODULE, "rebase_in_progress", return_value=True
+        ), mock.patch.object(
+            MODULE, "git_try", return_value=completed(0)
+        ) as git_try, mock.patch.object(MODULE, "force_rmtree") as remove, mock.patch.object(
+            MODULE, "emit"
+        ) as emit:
+            MODULE.command_stack_abort(args)
+
+        payload = emitted(emit)
+        self.assertEqual("aborted", payload["result"])
+        self.assertEqual("stack-rebase", payload["undone"])
+        git_try.assert_called_once_with(self.workspace, "rebase", "--abort")
+        remove.assert_called_once_with(self.workspace)
+        saved = self.saved()
+        self.assertEqual("aborted", saved["status"])
+        self.assertIsNone(saved["workspace"])
+        self.assertIsNone(saved["cascade"]["workspace"])
+
 
 class DescendantPropagationTest(unittest.TestCase):
     def stack(self):
@@ -7063,6 +7106,162 @@ class DescendantPropagationTest(unittest.TestCase):
         self.assertEqual("formatting_required", payload["result"])
         saved = MODULE.load_state(Path(args.state))
         self.assertEqual("formatting", saved["status"])
+        self.assertTrue(workspace.exists())
+
+    def test_descendant_propagation_preserves_a_conflict_for_resolution(self):
+        stack = self.stack()
+        root = temporary_directory(self)
+        args = SimpleNamespace(
+            target="owner/repo#11",
+            repo=None,
+            pull_request=None,
+            head_sha=None,
+            stack_number=77,
+            fixed_pr=11,
+            expected_head="fixed-head",
+            repo_root=None,
+            state=str(root / "propagation.json"),
+        )
+        workspace = root / "workspace"
+        workspace.mkdir()
+
+        def prepare(_workspace, partial):
+            partial["plan"] = [
+                {
+                    "index": 0,
+                    "number": 12,
+                    "branch": "tip",
+                    "branch_ref": "refs/heads/tip",
+                    "head_sha": "tip-head",
+                    "old_base": "fixed-head",
+                    "new_base_ref": "refs/remotes/origin/fixed",
+                }
+            ]
+            partial["current_index"] = 0
+
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "resolve_repo_root", return_value=root
+        ), mock.patch.object(
+            MODULE, "metadata_for", return_value=pr_metadata(number=11)
+        ), mock.patch.object(
+            MODULE,
+            "stack_membership",
+            return_value={"default_branch": "main", "stack": stack},
+        ), mock.patch.object(
+            MODULE, "external_stack_dependents", return_value=[]
+        ), mock.patch.object(
+            MODULE, "create_stack_workspace", return_value=workspace
+        ), mock.patch.object(
+            MODULE, "prepare_stack_cascade", side_effect=prepare
+        ), mock.patch.object(
+            MODULE,
+            "run_stack_cascade",
+            return_value=completed(MODULE.STACK_CONFLICT_EXIT, stderr="CONFLICT"),
+        ), mock.patch.object(
+            MODULE,
+            "collect_stack_conflicts",
+            return_value=[conflict_record("tip.txt")],
+        ), mock.patch.object(MODULE, "emit") as emit_mock:
+            MODULE.command_descendant_propagate(args)
+
+        payload = emitted(emit_mock)
+        self.assertEqual("conflicted", payload["result"])
+        self.assertEqual("resolved", payload["next"])
+        saved = MODULE.load_state(Path(args.state))
+        self.assertEqual("conflicted", saved["status"])
+        self.assertEqual(["tip.txt"], [item["path"] for item in saved["conflicts"]])
+        self.assertEqual(str(workspace), saved["workspace"])
+        self.assertTrue(workspace.exists())
+
+    def test_continue_resumes_a_resolved_descendant_propagation_conflict(self):
+        root = temporary_directory(self)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        cascade = {
+            "current_index": 0,
+            "formatting_index": 0,
+            "plan": [
+                {
+                    "index": 0,
+                    "number": 12,
+                    "branch": "tip",
+                    "branch_ref": "refs/heads/tip",
+                }
+            ],
+        }
+        state_path = write_state(
+            root,
+            operation="descendant_propagation",
+            status="conflicted",
+            workspace=str(workspace),
+            stack_number=77,
+            fixed_pr=11,
+            conflicts=[conflict_record("tip.txt", status="resolved")],
+            cascade=cascade,
+        )
+
+        with mock.patch.object(MODULE, "unmerged_entries", return_value=[]), mock.patch.object(
+            MODULE,
+            "continue_stack_cascade",
+            side_effect=lambda _workspace, stack: (
+                stack.update({"formatting_index": 0})
+                or completed(MODULE.STACK_FORMAT_EXIT)
+            ),
+        ), mock.patch.object(MODULE, "emit") as emit_mock:
+            MODULE.command_continue(SimpleNamespace(state=str(state_path)))
+
+        payload = emitted(emit_mock)
+        self.assertEqual("formatting_required", payload["result"])
+        self.assertEqual("stack-format", payload["next"])
+        self.assertEqual("formatting", MODULE.load_state(state_path)["status"])
+
+    def test_descendant_format_preserves_a_later_conflict_for_resolution(self):
+        root = temporary_directory(self)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        cascade = {
+            "formatting_index": 0,
+            "plan": [
+                {
+                    "index": 0,
+                    "number": 12,
+                    "branch": "tip",
+                    "branch_ref": "refs/heads/tip",
+                }
+            ],
+        }
+        state_path = write_state(
+            root,
+            operation="descendant_propagation",
+            status="formatting",
+            workspace=str(workspace),
+            stack_number=77,
+            fixed_pr=11,
+            cascade=cascade,
+        )
+        args = SimpleNamespace(
+            state=str(state_path),
+            format_command=None,
+            no_format=True,
+        )
+
+        with mock.patch.object(MODULE, "format_stack_member"), mock.patch.object(
+            MODULE,
+            "run_stack_cascade",
+            return_value=completed(MODULE.STACK_CONFLICT_EXIT, stderr="CONFLICT"),
+        ), mock.patch.object(
+            MODULE,
+            "collect_stack_conflicts",
+            return_value=[conflict_record("tip.txt")],
+        ), mock.patch.object(MODULE, "emit") as emit_mock:
+            MODULE.command_descendant_format(args, state_path, MODULE.load_state(state_path))
+
+        payload = emitted(emit_mock)
+        self.assertEqual("conflicted", payload["result"])
+        self.assertEqual("resolved", payload["next"])
+        saved = MODULE.load_state(state_path)
+        self.assertEqual("conflicted", saved["status"])
+        self.assertEqual(str(workspace), saved["workspace"])
         self.assertTrue(workspace.exists())
 
     def test_tip_propagation_creates_no_workspace_and_rewrites_nothing(self):

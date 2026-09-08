@@ -2390,13 +2390,38 @@ def command_attempt(args: argparse.Namespace) -> None:
 def command_resolved(args: argparse.Namespace) -> None:
     state_path = cli_path(args.state)
     state = load_state(state_path)
-    attempt = active_attempt(state)
+    propagation = state.get("operation") == "descendant_propagation"
+    if propagation:
+        if state.get("status") != "conflicted":
+            raise WorkflowError(
+                "no conflicted files are recorded for this descendant propagation "
+                f"(status {state.get('status')})"
+            )
+        workspace_value = state.get("workspace")
+        if not isinstance(workspace_value, str) or not workspace_value:
+            raise WorkflowError(
+                "the descendant propagation has no conflict workspace"
+            )
+        if not Path(workspace_value).exists():
+            raise WorkflowError(
+                f"the descendant propagation conflict workspace is missing: "
+                f"{workspace_value}"
+            )
+        attempt = {
+            "status": state["status"],
+            "strategy": "stack",
+            "conflicts": state.get("conflicts") or [],
+            "companion_resolutions": state.get("companion_resolutions") or [],
+        }
+        repo_root = Path(workspace_value)
+    else:
+        attempt = active_attempt(state)
+        repo_root = attempt_repo_root(state, attempt)
     if attempt["status"] not in {"conflicted", "escalated"}:
         raise WorkflowError(
             f"no conflicted files are recorded for this attempt (status "
             f"{attempt['status']})"
         )
-    repo_root = attempt_repo_root(state, attempt)
     conflicts = find_conflicts(attempt, args.paths)
     companion_paths = list(
         dict.fromkeys(
@@ -2561,6 +2586,10 @@ def command_resolved(args: argparse.Namespace) -> None:
     if companion_resolutions:
         attempt["companion_resolutions"] = companion_resolutions
 
+    if propagation:
+        state["conflicts"] = attempt["conflicts"]
+        if companion_resolutions:
+            state["companion_resolutions"] = companion_resolutions
     save_state(state_path, state)
     remaining = [
         conflict["path"]
@@ -2599,6 +2628,9 @@ def command_continue(args: argparse.Namespace) -> None:
     require_tools()
     state_path = cli_path(args.state)
     state = load_state(state_path)
+    if state.get("operation") == "descendant_propagation":
+        command_descendant_continue(state_path, state)
+        return
     attempt = active_attempt(state)
     repo_root = Path(state["repo_root"])
 
@@ -4152,6 +4184,130 @@ def command_stack_format(args: argparse.Namespace) -> None:
     finish_stack_rebase(state_path, state, attempt, workspace, process, "format")
 
 
+def descendant_propagation_attempt(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": f"stack-{state.get('stack_number')}-after-{state.get('fixed_pr')}",
+        "status": state.get("status"),
+        "attempt_number": 1,
+        "strategy": "stack",
+        "head_sha": state.get("fixed_head_sha"),
+        "base_sha": None,
+        "merge_base": None,
+        "conflicts": state.get("conflicts") or [],
+        "conflict_signature": conflict_signature(
+            conflict["path"] for conflict in state.get("conflicts") or []
+        ),
+    }
+
+
+def record_descendant_propagation_conflict(
+    state_path: Path,
+    state: dict[str, Any],
+    workspace: Path,
+    stack: dict[str, Any],
+    output: str,
+) -> None:
+    conflicts = collect_stack_conflicts(workspace, stack)
+    if not conflicts:
+        if rebase_in_progress(workspace):
+            git_try(workspace, "rebase", "--abort")
+        remove_stack_workspace({"stack": state})
+        save_state(state_path, state)
+        raise WorkflowError(
+            "the descendant propagation stopped without any unmerged paths: "
+            f"{output or 'no output'}"
+        )
+    stack["formatting_index"] = None
+    state["status"] = "conflicted"
+    state["detail"] = output
+    state["conflicts"] = conflicts
+    state["cascade"] = stack
+    save_state(state_path, state)
+    attempt = descendant_propagation_attempt(state)
+    conflicts_path = write_conflicts_result(state_path, state, attempt, "conflicted")
+    emit_conflicts(
+        state_path,
+        conflicts_path,
+        state,
+        attempt,
+        "conflicted",
+        {
+            "stack_number": state["stack_number"],
+            "fixed_pr": state["fixed_pr"],
+            "members_published": [],
+            "next": "resolved",
+        },
+    )
+
+
+def command_descendant_continue(
+    state_path: Path, state: dict[str, Any]
+) -> None:
+    if state.get("status") != "conflicted":
+        raise WorkflowError(
+            "a descendant propagation can only be continued from a conflict, not "
+            f"from {state.get('status')}"
+        )
+    workspace_value = state.get("workspace")
+    stack = state.get("cascade")
+    if not isinstance(workspace_value, str) or not workspace_value:
+        raise WorkflowError(
+            "the descendant propagation has no conflict workspace"
+        )
+    if not isinstance(stack, dict):
+        raise WorkflowError(
+            "the descendant propagation has no cascade plan for continuation"
+        )
+    workspace = Path(workspace_value)
+    if not workspace.exists():
+        raise WorkflowError(
+            f"the descendant propagation conflict workspace is missing: {workspace}"
+        )
+    unresolved = [
+        conflict["path"]
+        for conflict in state.get("conflicts") or []
+        if conflict.get("status") != "resolved"
+    ]
+    if unresolved:
+        raise WorkflowError(f"these conflicted files are not resolved yet: {unresolved}")
+    still_unmerged = [entry["path"] for entry in unmerged_entries(workspace)]
+    if still_unmerged:
+        raise WorkflowError(
+            f"git still reports these paths as unmerged: {still_unmerged}"
+        )
+    process = continue_stack_cascade(workspace, stack)
+    output = (process.stdout + process.stderr).strip()
+    if process.returncode == STACK_CONFLICT_EXIT:
+        record_descendant_propagation_conflict(
+            state_path, state, workspace, stack, output
+        )
+        return
+    if process.returncode != STACK_FORMAT_EXIT:
+        raise WorkflowError(
+            f"descendant propagation continuation failed (exit code "
+            f"{process.returncode}): {output or 'no output'}"
+        )
+    state["status"] = "formatting"
+    state["formatting_index"] = stack["formatting_index"]
+    state["cascade"] = stack
+    save_state(state_path, state)
+    member = stack["plan"][stack["formatting_index"]]
+    emit(
+        {
+            "result": "formatting_required",
+            "state": str(state_path),
+            "stack_number": state["stack_number"],
+            "fixed_pr": state["fixed_pr"],
+            "formatting_member": {
+                "number": member["number"],
+                "branch": member["branch"],
+                "index": member["index"],
+            },
+            "next": "stack-format",
+        }
+    )
+
+
 def command_descendant_format(
     args: argparse.Namespace, state_path: Path, state: dict[str, Any]
 ) -> None:
@@ -4212,18 +4368,8 @@ def command_descendant_format(
         )
         return
     if process.returncode == STACK_CONFLICT_EXIT:
-        state["status"] = "conflicted"
-        state["detail"] = output
-        remove_stack_workspace({"stack": state})
-        save_state(state_path, state)
-        emit(
-            {
-                "result": "conflicted",
-                "state": str(state_path),
-                "stack_number": state["stack_number"],
-                "fixed_pr": state["fixed_pr"],
-                "members_published": [],
-            }
+        record_descendant_propagation_conflict(
+            state_path, state, workspace, stack, output
         )
         return
     if process.returncode != 0:
@@ -4353,6 +4499,29 @@ def command_stack_continue(args: argparse.Namespace) -> None:
 def command_stack_abort(args: argparse.Namespace) -> None:
     state_path = cli_path(args.state)
     state = load_state(state_path)
+    if state.get("operation") == "descendant_propagation":
+        workspace_value = state.get("workspace")
+        undone = None
+        if isinstance(workspace_value, str) and workspace_value:
+            workspace = Path(workspace_value)
+            if workspace.exists():
+                if rebase_in_progress(workspace):
+                    git_try(workspace, "rebase", "--abort")
+                    undone = "stack-rebase"
+                force_rmtree(workspace)
+        state["workspace"] = None
+        if isinstance(state.get("cascade"), dict):
+            state["cascade"]["workspace"] = None
+        state["status"] = "aborted"
+        save_state(state_path, state)
+        emit(
+            {
+                "result": "aborted",
+                "state": str(state_path),
+                "undone": undone,
+            }
+        )
+        return
     attempt = state.get("attempt")
     undone = None
     if attempt is not None and attempt.get("status") == "published_refs":
@@ -4688,18 +4857,12 @@ def command_descendant_propagate(args: argparse.Namespace) -> None:
                 )
                 return
             if process.returncode == STACK_CONFLICT_EXIT:
-                state["status"] = "conflicted"
-                state["detail"] = (process.stdout + process.stderr).strip()
-                remove_stack_workspace({"stack": state})
-                save_state(state_path, state)
-                emit(
-                    {
-                        "result": "conflicted",
-                        "state": str(state_path),
-                        "stack_number": stack["number"],
-                        "fixed_pr": fixed_pr,
-                        "members_published": [],
-                    }
+                record_descendant_propagation_conflict(
+                    state_path,
+                    state,
+                    workspace,
+                    partial,
+                    (process.stdout + process.stderr).strip(),
                 )
                 return
             if process.returncode != 0:
