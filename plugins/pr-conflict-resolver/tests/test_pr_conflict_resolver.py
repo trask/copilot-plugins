@@ -390,6 +390,27 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn("git show <sha>", self.instructions)
 
+    def test_scans_all_replayed_paths_for_api_migrations(self):
+        self.assertIn("### Checking API migrations", self.instructions)
+        self.assertIn(
+            "Treat an interface, type, or method rename as a change to the whole "
+            "replay commit",
+            self.instructions,
+        )
+        self.assertIn(
+            "git diff-tree --no-commit-id --name-only -r --root REBASE_HEAD",
+            self.instructions,
+        )
+        self.assertIn(
+            "Search those paths and the conflicted files for both the old and new "
+            "symbol names",
+            self.instructions,
+        )
+        self.assertIn(
+            "A replayed file that had no textual conflict still needs this check",
+            self.instructions,
+        )
+
     def test_escalates_on_a_genuine_contradiction(self):
         self.assertIn("## Escalating On A Contradiction", self.instructions)
         self.assertIn(

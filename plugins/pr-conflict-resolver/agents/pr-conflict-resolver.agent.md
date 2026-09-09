@@ -168,6 +168,19 @@ Keep what both sides meant to do.
 - Never delete the other side's work to make a conflict go away. Never leave a conflict marker in a file.
 - Never widen the edit past the conflict. Resolving is not reviewing, and this agent does not get to improve code it did not conflict on.
 
+### Checking API migrations
+
+Treat an interface, type, or method rename as a change to the whole replay commit, not only to the files with conflict markers.
+
+Before accepting a one-side resolution or continuing a rebase that changes an API:
+
+1. List every path touched by the commit being replayed. During a rebase, use `git diff-tree --no-commit-id --name-only -r --root REBASE_HEAD`. For a merge, use the paths touched by the commits listed in `head_commits` and `base_commits`.
+2. Search those paths and the conflicted files for both the old and new symbol names. Include non-conflicted files. Inspect declarations, imports, constructors, factories, and callers.
+3. Make every caller use the declaration that the resolution keeps. When the replay commit touched a caller, pass it to `resolved --companion-paths` and record the migration in the rationale.
+4. Do not continue while the old and new APIs are mixed because a clean replay made the mismatch easy to miss. If the intended API is clear, fix every affected caller before continuing. If the two API designs genuinely conflict, abort and escalate a contradiction.
+
+Run this scan for every member and every conflict stop in a native stack. A replayed file that had no textual conflict still needs this check.
+
 Record every resolution with `resolved`. Write the rationale to a temporary UTF-8 file outside the repository and pass it with `--rationale-file`, so shell quoting cannot alter what you wrote. Delete that file afterward. Each rationale states what the head side wanted, what the base side wanted, and how the result holds both.
 
 The helper refuses a resolution that is byte-for-byte one side of the conflict. That refusal is usually correct and means you took a side. Pass `--accept-one-side` only when the other side's whole change is genuinely present in the result already, or when the file is generated and one side's copy is simply stale, and say which of those it is in the rationale.
