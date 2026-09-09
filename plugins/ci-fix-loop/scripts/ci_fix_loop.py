@@ -1139,6 +1139,11 @@ def classify_status_context(state: str) -> str:
     return STATUS_CONTEXT_CLASSES.get(state, "unknown")
 
 
+def actions_run_id(url: Any) -> int | None:
+    match = re.search(r"/actions/runs/(\d+)(?:/|$)", str(url or ""))
+    return int(match.group(1)) if match else None
+
+
 def normalize_rollup(nodes: Any) -> list[dict[str, Any]]:
     """Turn GitHub's status check rollup into one flat, classified list.
 
@@ -1172,6 +1177,7 @@ def normalize_rollup(nodes: Any) -> list[dict[str, Any]]:
                 "state": None,
                 "class": classify_check_run(status, conclusion),
                 "url": node.get("detailsUrl") or None,
+                "workflow_run_id": actions_run_id(node.get("detailsUrl")),
                 "started_at": node.get("startedAt") or None,
                 "completed_at": node.get("completedAt") or None,
                 "description": None,
@@ -1191,6 +1197,7 @@ def normalize_rollup(nodes: Any) -> list[dict[str, Any]]:
                 "state": state or None,
                 "class": classify_status_context(state),
                 "url": node.get("targetUrl") or None,
+                "workflow_run_id": None,
                 "started_at": node.get("createdAt") or None,
                 "completed_at": None,
                 "description": node.get("description") or None,
@@ -1250,11 +1257,17 @@ def update_check_tracking(
     """Record when each check was first seen and when it last entered not-started.
 
     A check that starts running, or that a re-run puts back in the queue, gets a
-    fresh not-started clock. An ordinary queue wait must never look like a check
-    that never starts.
+    fresh not-started clock. Queued jobs also get a fresh clock while another job
+    from the same Actions run is executing. Large matrices often release jobs in
+    batches, so their queue time alone does not show that the workflow is stuck.
     """
     stamp = now.isoformat().replace("+00:00", "Z")
     tracking = tracking if isinstance(tracking, dict) else {}
+    running_run_ids = {
+        check.get("workflow_run_id")
+        for check in checks
+        if check.get("workflow_run_id") is not None and check["class"] == "running"
+    }
     updated: dict[str, Any] = {}
     for check in checks:
         key = check["key"]
@@ -1266,9 +1279,11 @@ def update_check_tracking(
             "last_seen_at": stamp,
         }
         if check["class"] == "not_started":
+            workflow_is_running = check.get("workflow_run_id") in running_run_ids
             entry["not_started_since"] = (
                 previous.get("not_started_since")
-                if previous.get("last_class") == "not_started"
+                if not workflow_is_running
+                and previous.get("last_class") == "not_started"
                 and previous.get("not_started_since")
                 else stamp
             )

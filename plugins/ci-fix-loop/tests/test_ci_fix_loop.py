@@ -41,6 +41,7 @@ def check(
     *,
     kind="check_run",
     description=None,
+    workflow_run_id=None,
 ):
     return {
         "kind": kind,
@@ -52,6 +53,7 @@ def check(
         "state": None,
         "class": klass,
         "url": url,
+        "workflow_run_id": workflow_run_id,
         "started_at": None,
         "completed_at": completed_at,
         "description": description,
@@ -340,6 +342,19 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn(
             "A higher member never starts until its direct predecessor is clear",
             section,
+        )
+
+    def test_documents_safe_actions_log_downloads(self):
+        self.assertIn(
+            "gh run view --log-failed --allow-escape-sequences",
+            self.instructions,
+        )
+
+    def test_does_not_age_queued_jobs_while_their_workflow_executes(self):
+        self.assertIn(
+            "Queued matrix jobs do not spend their not-started grace while another "
+            "job from the same Actions run is executing.",
+            self.instructions,
         )
 
     def test_never_posts_anything_to_github(self):
@@ -1014,6 +1029,7 @@ class NormalizeRollupTest(unittest.TestCase):
         self.assertEqual("check:CI/build", checks[0]["key"])
         self.assertEqual("failed", checks[0]["class"])
         self.assertEqual("check_run", checks[0]["kind"])
+        self.assertEqual(1, checks[0]["workflow_run_id"])
 
     def test_normalizes_a_status_context(self):
         checks = MODULE.normalize_rollup(
@@ -1029,6 +1045,7 @@ class NormalizeRollupTest(unittest.TestCase):
         self.assertEqual("status:ci/external", checks[0]["key"])
         self.assertEqual("failed", checks[0]["class"])
         self.assertEqual("status", checks[0]["kind"])
+        self.assertIsNone(checks[0]["workflow_run_id"])
 
     def test_a_check_run_without_a_workflow_keeps_a_bare_key(self):
         checks = MODULE.normalize_rollup(
@@ -1107,6 +1124,45 @@ class CheckTrackingTest(unittest.TestCase):
         )
         self.assertEqual(stamp(), tracking["check:a"]["not_started_since"])
         self.assertEqual(0.0, MODULE.not_started_seconds(tracking, "check:a", NOW))
+
+    def test_an_executing_workflow_sibling_refreshes_the_queue_clock(self):
+        earlier = {
+            "check:a": {
+                "first_seen_at": stamp(30),
+                "last_class": "not_started",
+                "last_seen_at": stamp(30),
+                "not_started_since": stamp(30),
+            }
+        }
+        tracking = MODULE.update_check_tracking(
+            earlier,
+            [
+                check("check:a", klass="not_started", workflow_run_id=123),
+                check("check:b", klass="running", workflow_run_id=123),
+            ],
+            NOW,
+        )
+        self.assertEqual(stamp(), tracking["check:a"]["not_started_since"])
+        self.assertEqual(0.0, MODULE.not_started_seconds(tracking, "check:a", NOW))
+
+    def test_an_executing_different_workflow_does_not_refresh_the_queue_clock(self):
+        earlier = {
+            "check:a": {
+                "first_seen_at": stamp(30),
+                "last_class": "not_started",
+                "last_seen_at": stamp(30),
+                "not_started_since": stamp(30),
+            }
+        }
+        tracking = MODULE.update_check_tracking(
+            earlier,
+            [
+                check("check:a", klass="not_started", workflow_run_id=123),
+                check("check:b", klass="running", workflow_run_id=456),
+            ],
+            NOW,
+        )
+        self.assertEqual(stamp(30), tracking["check:a"]["not_started_since"])
 
     def test_a_check_that_left_the_queue_carries_no_clock(self):
         tracking = MODULE.update_check_tracking(

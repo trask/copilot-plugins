@@ -261,7 +261,7 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_declares_the_frontmatter_keys_the_sibling_loops_use(self):
         self.assertIn("name: PR Conflict Resolver", self.instructions)
         self.assertIn(
-            'description: "Explicit invocation only: never select automatically;',
+            "another user-selected maintenance agent explicitly dispatches it",
             self.instructions,
         )
         self.assertIn(
@@ -274,7 +274,11 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn("user-invocable: true", self.instructions)
-        self.assertIn("disable-model-invocation: true", self.instructions)
+        self.assertIn("disable-model-invocation: false", self.instructions)
+        self.assertIn(
+            "Never select or start this agent from general task context.",
+            self.instructions,
+        )
 
     def test_the_target_help_carries_the_argument_hint_condition(self):
         """Derived, not copied: drift in either surface fails here.
