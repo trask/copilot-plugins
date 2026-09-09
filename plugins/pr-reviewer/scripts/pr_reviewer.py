@@ -492,67 +492,118 @@ def parse_suppressed_comments(body: str | None) -> list[dict[str, Any]]:
             continue
         summary = re.sub(r"<[^>]+>", "", summary_match.group("summary"))
         normalized_summary = " ".join(summary.split()).casefold()
+        details_content = details[summary_match.end() :]
+        suppressed_sections: list[tuple[str, str]] = []
         if (
-            "suppressed comments" not in normalized_summary
-            and "comments suppressed" not in normalized_summary
+            "suppressed comments" in normalized_summary
+            or "comments suppressed" in normalized_summary
         ):
-            continue
-        found_suppressed_block = True
-        count_match = re.search(r"\((?P<count>\d+)\)\s*$", normalized_summary)
-        if not count_match:
-            raise WorkflowError(
-                "suppressed Copilot comments summary has no declared count"
-            )
-
-        content = details[summary_match.end() :]
-        headers = list(
-            re.finditer(
-                r"^\s*\*\*(?P<path>.+):(?P<line>\d+)\*\*\s*$",
-                content,
-                flags=re.MULTILINE,
-            )
-        )
-        block_entries: list[dict[str, Any]] = []
-        for index, header in enumerate(headers):
-            end = (
-                headers[index + 1].start()
-                if index + 1 < len(headers)
-                else len(content)
-            )
-            path = header.group("path").strip()
-            line = int(header.group("line"))
-            if not path or line <= 0:
-                raise WorkflowError("suppressed Copilot comment has an invalid location")
-            comment_body = content[header.end() : end].strip()
-            if comment_body.startswith("* "):
-                comment_body = comment_body[2:].lstrip()
-            if not comment_body:
-                raise WorkflowError(
-                    "suppressed Copilot comment has an empty body at "
-                    f"{path}:{line}"
+            suppressed_sections.append((normalized_summary, details_content))
+        else:
+            headings = list(
+                re.finditer(
+                    r"^\s*(?P<level>#{1,6})\s+"
+                    r"(?P<heading>.*(?:suppressed comments|comments suppressed).*)$",
+                    details_content,
+                    flags=re.IGNORECASE | re.MULTILINE,
                 )
-            block_entries.append(
-                {
-                    "path": path,
-                    "line": line,
-                    "body": comment_body,
-                }
             )
+            for heading in headings:
+                section_start = heading.end()
+                section_end = len(details_content)
+                heading_level = len(heading.group("level"))
+                for next_heading in re.finditer(
+                    r"^\s*(?P<level>#{1,6})\s+",
+                    details_content[section_start:],
+                    flags=re.MULTILINE,
+                ):
+                    if len(next_heading.group("level")) <= heading_level:
+                        section_end = section_start + next_heading.start()
+                        break
+                metadata = re.search(
+                    r"^\s*-\s+\*\*(?:Files reviewed|Comments generated|"
+                    r"Review effort level):\*\*",
+                    details_content[section_start:section_end],
+                    flags=re.IGNORECASE | re.MULTILINE,
+                )
+                if metadata:
+                    section_end = section_start + metadata.start()
+                suppressed_sections.append(
+                    (
+                        " ".join(heading.group("heading").split()).casefold(),
+                        details_content[section_start:section_end],
+                    )
+                )
 
-        declared_count = int(count_match.group("count"))
-        if len(block_entries) != declared_count:
-            raise WorkflowError(
-                "suppressed Copilot comments count mismatch: "
-                f"summary declares {declared_count}, parsed {len(block_entries)}"
+        for section_heading, content in suppressed_sections:
+            found_suppressed_block = True
+            count_match = re.search(
+                r"\((?P<count>\d+)\)\s*$", section_heading
             )
-        entries.extend(block_entries)
+            if not count_match:
+                raise WorkflowError(
+                    "suppressed Copilot comments summary has no declared count"
+                )
+
+            headers = list(
+                re.finditer(
+                    r"^\s*\*\*(?P<path>.+):(?P<line>\d+)\*\*\s*$",
+                    content,
+                    flags=re.MULTILINE,
+                )
+            )
+            block_entries: list[dict[str, Any]] = []
+            for index, header in enumerate(headers):
+                end = (
+                    headers[index + 1].start()
+                    if index + 1 < len(headers)
+                    else len(content)
+                )
+                path = header.group("path").strip()
+                line = int(header.group("line"))
+                if not path or line <= 0:
+                    raise WorkflowError(
+                        "suppressed Copilot comment has an invalid location"
+                    )
+                comment_body = content[header.end() : end].strip()
+                if comment_body.startswith("* "):
+                    comment_body = comment_body[2:].lstrip()
+                if not comment_body:
+                    raise WorkflowError(
+                        "suppressed Copilot comment has an empty body at "
+                        f"{path}:{line}"
+                    )
+                block_entries.append(
+                    {
+                        "path": path,
+                        "line": line,
+                        "body": comment_body,
+                    }
+                )
+
+            declared_count = int(count_match.group("count"))
+            if len(block_entries) != declared_count:
+                raise WorkflowError(
+                    "suppressed Copilot comments count mismatch: "
+                    f"summary declares {declared_count}, parsed {len(block_entries)}"
+                )
+            entries.extend(block_entries)
     normalized_body = body.casefold()
     if not found_suppressed_block and (
         "suppressed comments" in normalized_body
         or "comments suppressed" in normalized_body
     ):
+        suppressed_offset = min(
+            offset
+            for phrase in ("suppressed comments", "comments suppressed")
+            if (offset := normalized_body.find(phrase)) >= 0
+        )
+        excerpt = " ".join(
+            body[max(0, suppressed_offset - 80) : suppressed_offset + 240].split()
+        )
         raise WorkflowError(
-            "suppressed Copilot comments were not in a recognized details block"
+            "suppressed Copilot comments were not in a recognized details block; "
+            f"unrecognized layout near: {excerpt!r}"
         )
     return entries
 

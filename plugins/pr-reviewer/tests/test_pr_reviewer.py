@@ -1186,6 +1186,40 @@ assert result
             ],
         )
 
+    def test_parses_suppressed_heading_inside_review_details(self):
+        body = """
+<details>
+<summary>Review details</summary>
+
+### Suppressed comments (1)
+
+**model/network/common.yaml:27**
+* `network.local` groups stable attributes but is marked as development.
+```
+stability: development
+```
+
+- **Files reviewed:** 3/3 changed files
+- **Comments generated:** 2
+- **Review effort level:** Lite
+</details>
+"""
+
+        self.assertEqual(
+            MODULE.parse_suppressed_comments(body),
+            [
+                {
+                    "path": "model/network/common.yaml",
+                    "line": 27,
+                    "body": "`network.local` groups stable attributes but is marked "
+                    "as development.\n"
+                    "```\n"
+                    "stability: development\n"
+                    "```",
+                }
+            ],
+        )
+
     def test_rejects_missing_declared_count(self):
         body = """
 <details><summary>Suppressed comments</summary>
@@ -1226,7 +1260,9 @@ assert result
 * Preserve this fallback.
 """
 
-        with self.assertRaisesRegex(MODULE.WorkflowError, "recognized details block"):
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "unrecognized layout near:.*Suppressed comments"
+        ):
             MODULE.parse_suppressed_comments(body)
 
     def test_rejects_nonpositive_line(self):
