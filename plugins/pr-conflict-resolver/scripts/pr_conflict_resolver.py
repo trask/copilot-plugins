@@ -215,6 +215,7 @@ def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
         base_branch = member.get("baseRefName")
         head_sha = member.get("headRefOid")
         base_sha = member.get("baseRefOid")
+        state = member.get("state")
         timeline = member.get("timelineItems")
         events = timeline.get("nodes") if isinstance(timeline, dict) else None
         page_info = timeline.get("pageInfo") if isinstance(timeline, dict) else None
@@ -247,6 +248,7 @@ def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
             or not head_sha
             or not isinstance(base_sha, str)
             or not base_sha
+            or state not in {"OPEN", "CLOSED", "MERGED"}
         ):
             raise WorkflowError(
                 f"native stack member {number!r} is missing a required field"
@@ -260,6 +262,7 @@ def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
                 "mergeable": member.get("mergeable"),
                 "head_sha": head_sha,
                 "base_sha": base_sha,
+                "state": state,
                 "retargeted_from": retargeted_from,
                 "force_pushed": force_pushed,
             }
@@ -279,6 +282,30 @@ def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
         "trunk": trunk,
         "members": members,
     }
+
+
+def require_linear_open_stack(stack: dict[str, Any]) -> None:
+    if not stack.get("inactive_members"):
+        return
+    expected_base = stack["trunk"]
+    inactive_by_branch = {
+        member["head_branch"]: member for member in stack["inactive_members"]
+    }
+    for member in stack["members"]:
+        if member["base_branch"] != expected_base:
+            inactive = inactive_by_branch.get(member["base_branch"])
+            omitted = (
+                f"inactive pull request #{inactive['number']}"
+                if inactive is not None
+                else "an inactive stack member"
+            )
+            raise WorkflowError(
+                f"open native stack is not linear at pull request "
+                f"#{member['number']} after omitting {omitted}: "
+                f"{member['head_branch']!r} targets {member['base_branch']!r}, "
+                f"expected {expected_base!r}"
+            )
+        expected_base = member["head_branch"]
 
 
 def merged_predecessor(
@@ -355,7 +382,7 @@ def stack_membership(pr: dict[str, Any]) -> dict[str, Any]:
         "          nodes {"
         "            position"
         "            pullRequest {"
-        "              number headRefName baseRefName mergeable headRefOid baseRefOid"
+        "              number headRefName baseRefName mergeable headRefOid baseRefOid state"
         "              timelineItems(first: $first, itemTypes: ["
         "                AUTOMATIC_BASE_CHANGE_SUCCEEDED_EVENT,"
         "                HEAD_REF_FORCE_PUSHED_EVENT"
@@ -407,6 +434,19 @@ def stack_membership(pr: dict[str, Any]) -> dict[str, Any]:
     raw_stack = pull.get("stack")
     stack = parse_stack(raw_stack) if isinstance(raw_stack, dict) else None
     if stack is not None:
+        inactive_members = [
+            member for member in stack["members"] if member["state"] != "OPEN"
+        ]
+        open_members = [
+            member for member in stack["members"] if member["state"] == "OPEN"
+        ]
+        stack = {
+            **stack,
+            "size": len(open_members),
+            "members": open_members,
+            "inactive_members": inactive_members,
+        }
+        require_linear_open_stack(stack)
         for index, member in enumerate(stack["members"]):
             member["merged_predecessor"] = (
                 merged_predecessor(pr, member) if index == 0 else None

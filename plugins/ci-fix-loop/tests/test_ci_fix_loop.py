@@ -4650,6 +4650,35 @@ class MainTest(unittest.TestCase):
             self.assertEqual("cleaned_up", json.loads(stream.getvalue())["result"])
 
 
+class NativeStackParsingTest(unittest.TestCase):
+    def test_member_state_is_required(self):
+        raw = {
+            "number": 77,
+            "size": 1,
+            "baseRefName": "main",
+            "entries": {
+                "nodes": [
+                    {
+                        "position": 0,
+                        "pullRequest": {
+                            "number": 7,
+                            "title": "PR 7",
+                            "headRefName": "feature",
+                            "baseRefName": "main",
+                            "headRefOid": "head1",
+                            "isDraft": False,
+                        },
+                    }
+                ]
+            },
+        }
+
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "missing a required field"
+        ):
+            MODULE.parse_native_stack(raw)
+
+
 class NativeStackCoordinatorTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -4853,6 +4882,75 @@ class NativeStackCoordinatorTest(unittest.TestCase):
                     "--state",
                     str(self.stack_state),
                 )
+        self.assertFalse(self.stack_state.exists())
+
+    def test_merged_lower_members_are_omitted_from_the_active_stack(self):
+        stack = native_stack(
+            branches={
+                5: ("lower", "main"),
+                7: ("middle", "main"),
+                9: ("upper", "middle"),
+            }
+        )
+        stack["members"][0]["state"] = "MERGED"
+
+        started = self.start(stack)
+
+        self.assertEqual("stack", started["result"])
+        self.assertEqual([7, 9], started["members"])
+        self.assertEqual(
+            [{"number": 5, "state": "MERGED"}], started["inactive_members"]
+        )
+        self.assertEqual(
+            [7, 9],
+            [
+                member["number"]
+                for member in MODULE.load_stack_state(self.stack_state)["members"]
+            ],
+        )
+        first = self.next(stack)
+        self.assertEqual("run_member", first["result"])
+        self.assertEqual(7, first["member"])
+
+    def test_inactive_member_that_leaves_a_stack_gap_is_rejected(self):
+        stack = native_stack()
+        stack["members"][0]["state"] = "CLOSED"
+
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "not linear at pull request #7 after omitting inactive pull request #5",
+        ):
+            self.start(stack)
+
+        self.assertFalse(self.stack_state.exists())
+
+    def test_one_open_member_uses_the_single_pull_request_path(self):
+        stack = native_stack()
+        stack["members"][0]["state"] = "MERGED"
+        stack["members"][2]["state"] = "CLOSED"
+
+        result = self.start(stack)
+
+        self.assertEqual("single", result["result"])
+        self.assertEqual("no_open_stack_peers", result["reason"])
+        self.assertEqual(
+            [
+                {"number": 5, "state": "MERGED"},
+                {"number": 9, "state": "CLOSED"},
+            ],
+            result["inactive_members"],
+        )
+        self.assertFalse(self.stack_state.exists())
+
+    def test_selected_inactive_member_is_rejected(self):
+        stack = native_stack()
+        stack["members"][1]["state"] = "MERGED"
+
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "pull request #7 is MERGED, not open"
+        ):
+            self.start(stack)
+
         self.assertFalse(self.stack_state.exists())
 
     def test_middle_target_starts_at_the_bottom_and_continues_upward(self):
@@ -5833,6 +5931,17 @@ class NativeStackCoordinatorTest(unittest.TestCase):
         result = self.next(changed)
         self.assertEqual("stopped", result["result"])
         self.assertEqual("topology_changed", result["reason"])
+
+    def test_an_active_member_closing_stops_the_run(self):
+        stack = native_stack()
+        self.start(stack)
+        stack["members"][0]["state"] = "MERGED"
+
+        result = self.next(stack)
+
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual("topology_changed", result["reason"])
+        self.assertIn("member #5 is no longer open", result["detail"])
 
     def test_completed_stack_with_no_check_member_is_not_green(self):
         stack = native_stack()

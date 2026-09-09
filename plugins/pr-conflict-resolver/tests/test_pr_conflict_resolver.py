@@ -4755,6 +4755,7 @@ def stack_entry(
     base_oid=None,
     retargeted_from=None,
     force_pushed=False,
+    state="OPEN",
 ):
     entry = {
         "position": position,
@@ -4765,6 +4766,7 @@ def stack_entry(
             "mergeable": mergeable,
             "headRefOid": oid or f"oid{number}",
             "baseRefOid": base_oid or f"baseoid{number}",
+            "state": state,
         },
     }
     events = []
@@ -4900,6 +4902,55 @@ class StackMembershipTest(unittest.TestCase):
         }
         result = self.membership(stack=raw)
         self.assertEqual([5], [member["number"] for member in result["stack"]["members"]])
+
+    def test_merged_prefix_is_omitted_from_the_active_stack(self):
+        raw = {
+            "id": "S_1",
+            "number": 100,
+            "size": 4,
+            "baseRefName": "main",
+            "entries": {
+                "nodes": [
+                    stack_entry(0, 3, "merged-a", "main", state="MERGED"),
+                    stack_entry(1, 5, "merged-b", "main", state="MERGED"),
+                    stack_entry(2, 7, "feature", "main"),
+                    stack_entry(3, 9, "tip", "feature"),
+                ]
+            },
+        }
+
+        result = self.membership(stack=raw)
+
+        stack = result["stack"]
+        self.assertEqual([7, 9], [member["number"] for member in stack["members"]])
+        self.assertEqual(
+            [3, 5], [member["number"] for member in stack["inactive_members"]]
+        )
+        self.assertEqual(2, stack["size"])
+        MODULE.validate_stack_snapshot({**stack, "invoked_number": 7})
+        partial = MODULE.propagation_stack(stack, 7, "oid7")
+        self.assertEqual([9], [member["number"] for member in partial["members"]])
+
+    def test_inactive_member_that_leaves_a_stack_gap_is_rejected(self):
+        raw = {
+            "id": "S_1",
+            "number": 100,
+            "size": 3,
+            "baseRefName": "main",
+            "entries": {
+                "nodes": [
+                    stack_entry(0, 3, "lower", "main"),
+                    stack_entry(1, 5, "middle", "lower", state="CLOSED"),
+                    stack_entry(2, 7, "tip", "middle"),
+                ]
+            },
+        }
+
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "not linear at pull request #7 after omitting inactive pull request #5",
+        ):
+            self.membership(stack=raw)
 
     def test_a_missing_default_branch_is_a_hard_error(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "no.*default branch"):

@@ -842,6 +842,7 @@ def parse_native_stack(raw: Any) -> dict[str, Any] | None:
         head_branch = member.get("headRefName")
         base_branch = member.get("baseRefName")
         head_sha = member.get("headRefOid")
+        state = member.get("state")
         if (
             not isinstance(number, int)
             or not isinstance(title, str)
@@ -852,6 +853,7 @@ def parse_native_stack(raw: Any) -> dict[str, Any] | None:
             or not base_branch
             or not isinstance(head_sha, str)
             or not head_sha
+            or state not in {"OPEN", "CLOSED", "MERGED"}
         ):
             raise WorkflowError(
                 f"native stack member {number!r} is missing a required field"
@@ -865,7 +867,7 @@ def parse_native_stack(raw: Any) -> dict[str, Any] | None:
                 "base_branch": base_branch,
                 "head_sha": head_sha,
                 "is_draft": bool(member.get("isDraft")),
-                "state": member.get("state"),
+                "state": state,
             }
         )
     members.sort(
@@ -886,6 +888,45 @@ def parse_native_stack(raw: Any) -> dict[str, Any] | None:
         "trunk": trunk,
         "members": members,
     }
+
+
+def open_native_stack(stack: dict[str, Any]) -> dict[str, Any]:
+    open_members = [
+        member for member in stack["members"] if member.get("state") == "OPEN"
+    ]
+    inactive_members = [
+        member for member in stack["members"] if member.get("state") != "OPEN"
+    ]
+    return {
+        **stack,
+        "size": len(open_members),
+        "members": open_members,
+        "inactive_members": inactive_members,
+    }
+
+
+def require_linear_open_stack(stack: dict[str, Any]) -> None:
+    if not stack.get("inactive_members") or len(stack["members"]) < 2:
+        return
+    expected_base = stack["trunk"]
+    inactive_by_branch = {
+        member["head_branch"]: member for member in stack["inactive_members"]
+    }
+    for member in stack["members"]:
+        if member["base_branch"] != expected_base:
+            inactive = inactive_by_branch.get(member["base_branch"])
+            omitted = (
+                f"inactive pull request #{inactive['number']}"
+                if inactive is not None
+                else "an inactive stack member"
+            )
+            raise WorkflowError(
+                f"open native stack is not linear at pull request "
+                f"#{member['number']} after omitting {omitted}: "
+                f"{member['head_branch']!r} targets {member['base_branch']!r}, "
+                f"expected {expected_base!r}"
+            )
+        expected_base = member["head_branch"]
 
 
 def read_native_stack(target: dict[str, Any]) -> dict[str, Any] | None:
@@ -3887,6 +3928,21 @@ def refresh_stack_state(state: dict[str, Any]) -> dict[str, Any]:
             f"the selected pull request moved from native stack "
             f"{state.get('stack_number')} to {stack['number']}"
         )
+    live_by_number = {member["number"]: member for member in stack["members"]}
+    projected = open_native_stack(stack)
+    state["inactive_members"] = [
+        {"number": member["number"], "state": member["state"]}
+        for member in projected["inactive_members"]
+    ]
+    for recorded in state.get("members") or []:
+        live = live_by_number.get(recorded["number"])
+        if live is not None and live["state"] != "OPEN":
+            raise WorkflowError(
+                f"native stack member #{live['number']} is no longer open; "
+                f"GitHub reports it as {live['state']}"
+            )
+    require_linear_open_stack(projected)
+    stack = projected
     fingerprint = stack_topology_fingerprint(stack)
     if fingerprint != state.get("topology_fingerprint"):
         raise WorkflowError("the native stack topology changed during the CI run")
@@ -3906,10 +3962,6 @@ def refresh_stack_state(state: dict[str, Any]) -> dict[str, Any]:
                 "state": live["state"],
             }
         )
-        if live["state"] != "OPEN":
-            raise WorkflowError(
-                f"native stack member #{live['number']} is no longer open"
-            )
     return stack
 
 
@@ -4158,22 +4210,50 @@ def command_stack_start(args: argparse.Namespace) -> None:
             }
         )
         return
+    stack = open_native_stack(stack)
     selected = next(
         (member for member in stack["members"] if member["number"] == target["number"]),
         None,
     )
     if selected is None:
+        inactive = next(
+            (
+                member
+                for member in stack["inactive_members"]
+                if member["number"] == target["number"]
+            ),
+            None,
+        )
+        if inactive is not None:
+            raise WorkflowError(
+                f"pull request #{target['number']} is {inactive.get('state')}, not open"
+            )
         raise WorkflowError(
             f"pull request #{target['number']} is not present in its native stack"
         )
-    not_open = [
-        member["number"] for member in stack["members"] if member["state"] != "OPEN"
+    inactive_members = [
+        {
+            "number": member["number"],
+            "state": member.get("state"),
+        }
+        for member in stack["inactive_members"]
     ]
-    if not_open:
-        raise WorkflowError(
-            f"native stack members are no longer open: "
-            f"{', '.join(f'#{number}' for number in not_open)}"
+    require_linear_open_stack(stack)
+    if len(stack["members"]) == 1:
+        emit(
+            {
+                "result": "single",
+                "target": target["pr_url"],
+                "reason": "no_open_stack_peers",
+                "pr": {
+                    "number": target["number"],
+                    "pr_url": target["pr_url"],
+                    "repo_name": target["repo_name"],
+                },
+                "inactive_members": inactive_members,
+            }
         )
+        return
     resolver = conflict_resolver_script()
     if not resolver.is_file():
         raise WorkflowError(
@@ -4201,6 +4281,7 @@ def command_stack_start(args: argparse.Namespace) -> None:
             "title": selected["title"],
             "pr_url": target["pr_url"],
         },
+        "inactive_members": inactive_members,
         "stack_number": stack["number"],
         "stack_id": stack.get("id"),
         "trunk": stack["trunk"],
@@ -4241,6 +4322,7 @@ def command_stack_start(args: argparse.Namespace) -> None:
             "selected_pr": selected["number"],
             "selected_title": selected["title"],
             "members": [member["number"] for member in stack["members"]],
+            "inactive_members": inactive_members,
         }
     )
 
@@ -5206,6 +5288,7 @@ def command_stack_status(args: argparse.Namespace) -> None:
             "selected_pr": (state.get("target") or {}).get("number"),
             "cursor": state.get("cursor"),
             "outcome": state.get("outcome"),
+            "inactive_members": state.get("inactive_members") or [],
             "members": [
                 {
                     "number": member["number"],

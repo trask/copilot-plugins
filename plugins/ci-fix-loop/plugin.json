@@ -1,7 +1,7 @@
 {
   "name": "ci-fix-loop",
   "description": "Fix continuous integration failures on one pull request or bottom-up through a native stack, propagating each fix through its descendants.",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "author": {
     "name": "Trask Stalnaker"
   },
