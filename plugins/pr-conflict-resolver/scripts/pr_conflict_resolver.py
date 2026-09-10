@@ -4378,6 +4378,220 @@ def stack_member_paths(
     return {path for path in result.stdout.split("\0") if path}
 
 
+def git_path_set(
+    workspace: Path, arguments: list[str], *, purpose: str
+) -> set[str]:
+    result = git_try(workspace, *arguments)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WorkflowError(f"could not {purpose}: {detail}")
+    return {path for path in result.stdout.split("\0") if path}
+
+
+def untracked_paths(workspace: Path) -> set[str]:
+    return git_path_set(
+        workspace,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+        purpose="inspect untracked formatter paths",
+    )
+
+
+def ignored_paths(workspace: Path) -> set[str]:
+    return git_path_set(
+        workspace,
+        ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+        purpose="inspect ignored formatter paths",
+    )
+
+
+def index_blob_oid(workspace: Path, path: str) -> str | None:
+    result = git_try(
+        workspace,
+        "ls-files",
+        "--stage",
+        "-z",
+        "--",
+        literal_pathspec(path),
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WorkflowError(f"could not inspect the index for {path!r}: {detail}")
+    records = [record for record in result.stdout.split("\0") if record]
+    if len(records) != 1 or "\t" not in records[0]:
+        return None
+    metadata, recorded_path = records[0].split("\t", 1)
+    fields = metadata.split()
+    if recorded_path != path or len(fields) != 3 or fields[2] != "0":
+        return None
+    return fields[1]
+
+
+def cleaned_worktree_blob_oid(workspace: Path, path: str) -> str | None:
+    if not os.path.lexists(workspace / Path(path)):
+        return None
+    result = git_try(
+        workspace,
+        "hash-object",
+        f"--path={path}",
+        "--",
+        path,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WorkflowError(
+            f"could not compute the cleaned formatter content for {path!r}: {detail}"
+        )
+    return result.stdout.strip()
+
+
+def formatter_changed_paths(workspace: Path) -> tuple[set[str], set[str]]:
+    status = git_try(
+        workspace,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "-z",
+    )
+    if status.returncode != 0:
+        detail = status.stderr.strip() or status.stdout.strip() or "no output"
+        raise WorkflowError(f"could not inspect formatter changes: {detail}")
+    candidates = {
+        path
+        for entry in parse_status_z(status.stdout)
+        for path in (entry["path"], entry.get("origin"))
+        if path
+    }
+    unstaged = git_path_set(
+        workspace,
+        ["diff", "--name-only", "-z"],
+        purpose="inspect unstaged formatter changes",
+    )
+    staged = git_path_set(
+        workspace,
+        ["diff", "--cached", "--name-only", "-z"],
+        purpose="inspect staged formatter changes",
+    )
+    untracked = untracked_paths(workspace)
+    changed = unstaged | staged | untracked
+    unchanged_status = set()
+    for path in candidates - changed:
+        indexed = index_blob_oid(workspace, path)
+        cleaned = cleaned_worktree_blob_oid(workspace, path)
+        if indexed is not None and cleaned == indexed:
+            unchanged_status.add(path)
+        else:
+            changed.add(path)
+    return changed, unchanged_status
+
+
+def formatter_workspace_snapshot(workspace: Path) -> dict[str, Any]:
+    branch = git(workspace, "branch", "--show-current")
+    if not branch:
+        raise WorkflowError("the formatter workspace is not attached to a branch")
+    return {
+        "branch": branch,
+        "head": git(workspace, "rev-parse", "HEAD"),
+        "untracked": sorted(untracked_paths(workspace)),
+        "ignored": sorted(ignored_paths(workspace)),
+    }
+
+
+def clean_formatter_paths(
+    workspace: Path, paths: list[str], *, ignored: bool
+) -> None:
+    prefix = ["clean", "-f", "-f", "-d"]
+    if ignored:
+        prefix.append("-X")
+    prefix.append("--")
+    chunks: list[list[str]] = []
+    chunk: list[str] = []
+    length = sum(len(argument) + 1 for argument in prefix)
+    for path in paths:
+        pathspec = literal_pathspec(path)
+        path_length = len(pathspec) + 1
+        if chunk and length + path_length > 8_000:
+            chunks.append(chunk)
+            chunk = []
+            length = sum(len(argument) + 1 for argument in prefix)
+        chunk.append(pathspec)
+        length += path_length
+    if chunk:
+        chunks.append(chunk)
+    for pathspecs in chunks:
+        cleaned = git_try(workspace, *prefix, *pathspecs)
+        if cleaned.returncode != 0:
+            detail = cleaned.stderr.strip() or cleaned.stdout.strip() or "no output"
+            kind = " ignored" if ignored else ""
+            raise WorkflowError(
+                f"could not remove formatter-created{kind} files: {detail}"
+            )
+
+
+def restore_formatter_workspace(
+    workspace: Path, snapshot: dict[str, Any]
+) -> None:
+    in_progress = integration_in_progress(workspace)
+    if in_progress:
+        aborted = git_try(workspace, in_progress, "--abort")
+        if aborted.returncode != 0:
+            detail = aborted.stderr.strip() or aborted.stdout.strip() or "no output"
+            raise WorkflowError(
+                f"could not abort the formatter-started {in_progress}: {detail}"
+            )
+    checkout = git_try(
+        workspace,
+        "checkout",
+        "--force",
+        "-B",
+        snapshot["branch"],
+        snapshot["head"],
+    )
+    if checkout.returncode != 0:
+        detail = checkout.stderr.strip() or checkout.stdout.strip() or "no output"
+        raise WorkflowError(f"could not restore the formatting branch: {detail}")
+    reset = git_try(workspace, "reset", "--hard", snapshot["head"])
+    if reset.returncode != 0:
+        detail = reset.stderr.strip() or reset.stdout.strip() or "no output"
+        raise WorkflowError(f"could not restore formatter changes: {detail}")
+    created = sorted(untracked_paths(workspace) - set(snapshot["untracked"]))
+    if created:
+        clean_formatter_paths(workspace, created, ignored=False)
+    created_ignored = sorted(ignored_paths(workspace) - set(snapshot["ignored"]))
+    if created_ignored:
+        clean_formatter_paths(workspace, created_ignored, ignored=True)
+    remaining = sorted(
+        (untracked_paths(workspace) - set(snapshot["untracked"]))
+        | (ignored_paths(workspace) - set(snapshot["ignored"]))
+    )
+    if remaining:
+        raise WorkflowError(
+            "formatter rollback left newly created paths: " + ", ".join(remaining)
+        )
+    for ref, expected in snapshot.get("refs", {}).items():
+        if ref != f"refs/heads/{snapshot['branch']}":
+            restored = git_try(workspace, "update-ref", ref, expected)
+            if restored.returncode != 0:
+                detail = (
+                    restored.stderr.strip()
+                    or restored.stdout.strip()
+                    or "no output"
+                )
+                raise WorkflowError(
+                    f"could not restore formatter branch ref {ref!r}: {detail}"
+                )
+    require_no_integration_in_progress(workspace)
+    require_clean_worktree(workspace)
+    if git(workspace, "branch", "--show-current") != snapshot["branch"]:
+        raise WorkflowError("the formatter rollback did not restore the branch")
+    if git(workspace, "rev-parse", "HEAD") != snapshot["head"]:
+        raise WorkflowError("the formatter rollback did not restore the commit")
+    for ref, expected in snapshot.get("refs", {}).items():
+        if git(workspace, "rev-parse", ref) != expected:
+            raise WorkflowError(
+                f"the formatter rollback did not restore branch ref {ref!r}"
+            )
+
+
 def stack_formatting_checkpoints(stack: dict[str, Any]) -> list[dict[str, Any]]:
     checkpoints = stack.get("formatting_checkpoints")
     if not isinstance(checkpoints, list):
@@ -4456,127 +4670,154 @@ def format_stack_member(
         )
     require_no_integration_in_progress(workspace)
     require_clean_worktree(workspace)
-    branch = git(workspace, "branch", "--show-current")
-    if branch != member["branch"]:
-        checkout = git_try(workspace, "checkout", member["branch"])
-        if checkout.returncode != 0:
-            detail = checkout.stderr.strip() or checkout.stdout.strip() or "no output"
-            raise WorkflowError(
-                f"could not check out formatting branch {member['branch']!r}: {detail}"
-            )
+    snapshot = formatter_workspace_snapshot(workspace)
     before_sha = git(workspace, "rev-parse", member["branch_ref"])
-    allowed_paths = stack_member_paths(
-        workspace, member["new_base_ref"], member["branch_ref"]
-    )
-    output = ""
-    if format_command is not None:
-        process = run(format_command, cwd=workspace, check=False)
-        output = (process.stdout + process.stderr).strip()
-        attempt["formatting_last_run"] = {
-            "index": member["index"],
-            "number": member["number"],
-            "branch": member["branch"],
-            "command": format_command,
-            "returncode": process.returncode,
-            "output": output,
-            "recorded_at": utc_now(),
-        }
-        save_state(state_path, state)
-        if process.returncode != 0:
+    snapshot["refs"] = {member["branch_ref"]: before_sha}
+    try:
+        if snapshot["branch"] != member["branch"]:
+            checkout = git_try(workspace, "checkout", member["branch"])
+            if checkout.returncode != 0:
+                detail = (
+                    checkout.stderr.strip() or checkout.stdout.strip() or "no output"
+                )
+                raise WorkflowError(
+                    f"could not check out formatting branch {member['branch']!r}: "
+                    f"{detail}"
+                )
+        if git(workspace, "rev-parse", "HEAD") != before_sha:
             raise WorkflowError(
-                f"the formatter failed for PR #{member['number']} "
-                f"(exit code {process.returncode}): {output or 'no output'}"
+                f"formatting branch {member['branch']!r} is not checked out at its "
+                "recorded PR layer"
+            )
+        allowed_paths = stack_member_paths(
+            workspace, member["new_base_ref"], member["branch_ref"]
+        )
+        output = ""
+        if format_command is not None:
+            process = run(format_command, cwd=workspace, check=False)
+            output = (process.stdout + process.stderr).strip()
+            attempt["formatting_last_run"] = {
+                "index": member["index"],
+                "number": member["number"],
+                "branch": member["branch"],
+                "command": format_command,
+                "returncode": process.returncode,
+                "output": output,
+                "recorded_at": utc_now(),
+            }
+            save_state(state_path, state)
+            if process.returncode != 0:
+                raise WorkflowError(
+                    f"the formatter failed for PR #{member['number']} "
+                    f"(exit code {process.returncode}): {output or 'no output'}"
+                )
+        if (
+            git(workspace, "branch", "--show-current") != member["branch"]
+            or git(workspace, "rev-parse", "HEAD") != before_sha
+        ):
+            raise WorkflowError(
+                "the formatter moved the formatting branch or created a commit"
             )
 
-    status = git_try(workspace, "status", "--porcelain=v1", "-z")
-    if status.returncode != 0:
-        detail = status.stderr.strip() or status.stdout.strip() or "no output"
-        raise WorkflowError(f"could not inspect formatter changes: {detail}")
-    entries = parse_status_z(status.stdout)
-    changed_paths = sorted(
-        {
-            path
-            for entry in entries
-            for path in (entry["path"], entry.get("origin"))
-            if path
-        }
-    )
-    outside = [path for path in changed_paths if path not in allowed_paths]
-    if outside:
-        raise WorkflowError(
-            "the formatter changed files outside the current PR layer: "
-            + ", ".join(outside)
-        )
-    if changed_paths:
-        add = git_try(
-            workspace,
-            "add",
-            "--all",
-            "--",
-            *(literal_pathspec(path) for path in changed_paths),
-        )
-        if add.returncode != 0:
-            detail = add.stderr.strip() or add.stdout.strip() or "no output"
-            raise WorkflowError(f"could not stage formatting changes: {detail}")
-    staged = git_try(workspace, "diff", "--cached", "--name-only", "-z")
-    if staged.returncode != 0:
-        detail = staged.stderr.strip() or staged.stdout.strip() or "no output"
-        raise WorkflowError(f"could not inspect staged formatting changes: {detail}")
-    staged_paths = {path for path in staged.stdout.split("\0") if path}
-    staged_outside = sorted(staged_paths - allowed_paths)
-    if staged_outside:
-        raise WorkflowError(
-            "staged formatting changes outside the current PR layer: "
-            + ", ".join(staged_outside)
-        )
-    after_sha = before_sha
-    if staged_paths:
-        commit = git_try(
-            workspace,
-            "commit",
-            "--message",
-            f"Apply repository formatting for PR #{member['number']}",
-        )
-        if commit.returncode != 0:
-            detail = commit.stderr.strip() or commit.stdout.strip() or "no output"
-            raise WorkflowError(f"could not record formatting changes: {detail}")
-        after_sha = git(workspace, "rev-parse", member["branch_ref"])
-        if not is_ancestor(workspace, before_sha, after_sha):
+        changed_paths, unchanged_status = formatter_changed_paths(workspace)
+        outside = sorted(changed_paths - allowed_paths)
+        if outside:
             raise WorkflowError(
-                f"the formatting commit for PR #{member['number']} is not based on "
-                "the completed PR layer"
+                "the formatter changed files outside the current PR layer: "
+                + ", ".join(outside)
             )
-        committed = git_try(
+        paths_to_refresh = sorted(unchanged_status - changed_paths)
+        if paths_to_refresh:
+            refresh = git_try(
+                workspace,
+                "add",
+                "--",
+                *(literal_pathspec(path) for path in paths_to_refresh),
+            )
+            if refresh.returncode != 0:
+                detail = (
+                    refresh.stderr.strip() or refresh.stdout.strip() or "no output"
+                )
+                raise WorkflowError(
+                    f"could not refresh unchanged formatter paths: {detail}"
+                )
+        if changed_paths:
+            add = git_try(
+                workspace,
+                "add",
+                "--all",
+                "--",
+                *(literal_pathspec(path) for path in sorted(changed_paths)),
+            )
+            if add.returncode != 0:
+                detail = add.stderr.strip() or add.stdout.strip() or "no output"
+                raise WorkflowError(f"could not stage formatting changes: {detail}")
+        staged_paths = git_path_set(
             workspace,
-            "diff-tree",
-            "--no-commit-id",
-            "--name-only",
-            "-r",
-            "-z",
-            before_sha,
-            after_sha,
+            ["diff", "--cached", "--name-only", "-z"],
+            purpose="inspect staged formatting changes",
         )
-        if committed.returncode != 0:
-            detail = committed.stderr.strip() or committed.stdout.strip() or "no output"
-            raise WorkflowError(f"could not validate the formatting commit: {detail}")
-        committed_paths = {
-            path for path in committed.stdout.split("\0") if path
-        }
-        committed_outside = sorted(committed_paths - allowed_paths)
-        if committed_outside:
+        staged_outside = sorted(staged_paths - allowed_paths)
+        if staged_outside:
             raise WorkflowError(
-                "the formatting commit changed files outside the current PR layer: "
-                + ", ".join(committed_outside)
+                "staged formatting changes outside the current PR layer: "
+                + ", ".join(staged_outside)
             )
-    require_clean_worktree(workspace)
-    return record_formatting_checkpoint(
-        stack,
-        member,
-        before_sha=before_sha,
-        after_sha=after_sha,
-        changed_paths=sorted(staged_paths),
-        command=format_command,
-    )
+        after_sha = before_sha
+        if staged_paths:
+            commit = git_try(
+                workspace,
+                "commit",
+                "--message",
+                f"Apply repository formatting for PR #{member['number']}",
+            )
+            if commit.returncode != 0:
+                detail = commit.stderr.strip() or commit.stdout.strip() or "no output"
+                raise WorkflowError(f"could not record formatting changes: {detail}")
+            after_sha = git(workspace, "rev-parse", member["branch_ref"])
+            if not is_ancestor(workspace, before_sha, after_sha):
+                raise WorkflowError(
+                    f"the formatting commit for PR #{member['number']} is not based "
+                    "on the completed PR layer"
+                )
+            committed_paths = git_path_set(
+                workspace,
+                [
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    "-z",
+                    before_sha,
+                    after_sha,
+                ],
+                purpose="validate the formatting commit",
+            )
+            committed_outside = sorted(committed_paths - allowed_paths)
+            if committed_outside:
+                raise WorkflowError(
+                    "the formatting commit changed files outside the current PR "
+                    "layer: " + ", ".join(committed_outside)
+                )
+        require_clean_worktree(workspace)
+        checkpoint = record_formatting_checkpoint(
+            stack,
+            member,
+            before_sha=before_sha,
+            after_sha=after_sha,
+            changed_paths=sorted(staged_paths),
+            command=format_command,
+        )
+        save_state(state_path, state)
+        return checkpoint
+    except BaseException as error:
+        try:
+            restore_formatter_workspace(workspace, snapshot)
+        except Exception as rollback_error:
+            raise WorkflowError(
+                f"{error}; formatter rollback also failed: {rollback_error}"
+            ) from error
+        raise
 
 
 def finish_stack_rebase(

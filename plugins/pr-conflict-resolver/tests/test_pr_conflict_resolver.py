@@ -7776,8 +7776,12 @@ class StackFormatCommandTest(GitTestCase):
             self.feature_sha,
             self.git_in(self.workspace, "rev-parse", "refs/heads/feature"),
         )
+        self.assertEqual(
+            "main\n", (self.workspace / "main.txt").read_text(encoding="utf-8")
+        )
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
 
-    def test_a_failed_formatter_does_not_advance_and_dirty_retry_is_refused(self):
+    def test_a_failed_formatter_restores_the_workspace_and_can_be_retried(self):
         args = SimpleNamespace(
             state=str(self.state_path),
             format_command=[
@@ -7793,15 +7797,153 @@ class StackFormatCommandTest(GitTestCase):
             MODULE.command_stack_format(args)
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         self.assertEqual("formatting", state["attempt"]["status"])
-        retry = SimpleNamespace(
+        self.assertEqual(
+            "before\n",
+            (self.workspace / "feature.txt").read_text(encoding="utf-8"),
+        )
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+        _cascade, payload = self.run_format(sys.executable, "-c", "pass")
+        self.assertEqual("resolved", payload["result"])
+
+    def test_formatter_created_files_are_removed_after_rejection(self):
+        args = SimpleNamespace(
             state=str(self.state_path),
-            format_command=[sys.executable, "-c", "pass"],
+            format_command=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('generated.txt').write_text('bad\\n')",
+            ],
             no_format=False,
         )
         with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
-            MODULE.WorkflowError, "worktree is not clean"
+            MODULE.WorkflowError, "outside the current PR layer"
         ):
-            MODULE.command_stack_format(retry)
+            MODULE.command_stack_format(args)
+        self.assertFalse((self.workspace / "generated.txt").exists())
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+
+    def test_formatter_cleanup_batches_large_path_sets(self):
+        paths = [f"generated/{index:04d}-{'x' * 60}.txt" for index in range(1_000)]
+        with mock.patch.object(
+            MODULE, "git_try", return_value=completed(0)
+        ) as git_try:
+            MODULE.clean_formatter_paths(self.workspace, paths, ignored=False)
+        self.assertGreater(git_try.call_count, 1)
+        cleaned = [
+            argument
+            for call in git_try.call_args_list
+            for argument in call.args[1:]
+            if argument.startswith(":(literal)")
+        ]
+        self.assertEqual(
+            {MODULE.literal_pathspec(path) for path in paths}, set(cleaned)
+        )
+        for call in git_try.call_args_list:
+            self.assertLessEqual(
+                sum(len(str(argument)) + 1 for argument in call.args[1:]),
+                8_000,
+            )
+
+    def test_formatter_created_ignored_files_are_removed_after_failure(self):
+        self.write_in(self.workspace, ".gitignore", "ignored/\n")
+        self.commit_in(self.workspace, "ignore formatter output")
+        self.feature_sha = self.git_in(self.workspace, "rev-parse", "HEAD")
+        self.stack["members"][0]["head_sha"] = self.feature_sha
+        self.stack["plan"][0]["head_sha"] = self.feature_sha
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        state["attempt"]["stack"] = self.stack
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            format_command=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import subprocess; Path('ignored/tool-cache').mkdir(parents=True); subprocess.run(['git', 'init', 'ignored/tool-cache'], check=True, stdout=subprocess.DEVNULL); raise SystemExit(9)",
+            ],
+            no_format=False,
+        )
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "formatter failed"
+        ):
+            MODULE.command_stack_format(args)
+        self.assertFalse((self.workspace / "ignored" / "tool-cache").exists())
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+
+    def test_formatter_failure_restores_the_entry_branch(self):
+        self.git_in(self.workspace, "checkout", "main")
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            format_command=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('feature.txt').write_text('partial\\n'); raise SystemExit(9)",
+            ],
+            no_format=False,
+        )
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "formatter failed"
+        ):
+            MODULE.command_stack_format(args)
+        self.assertEqual(
+            "main", self.git_in(self.workspace, "branch", "--show-current")
+        )
+        self.assertEqual(
+            self.main_sha, self.git_in(self.workspace, "rev-parse", "HEAD")
+        )
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+
+    def test_formatter_commit_on_member_branch_is_rolled_back(self):
+        self.git_in(self.workspace, "checkout", "main")
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            format_command=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import subprocess; Path('feature.txt').write_text('committed\\n'); subprocess.run(['git', 'add', 'feature.txt'], check=True); subprocess.run(['git', 'commit', '-m', 'unexpected formatter commit'], check=True, stdout=subprocess.DEVNULL)",
+            ],
+            no_format=False,
+        )
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "formatter moved"
+        ):
+            MODULE.command_stack_format(args)
+        self.assertEqual(
+            self.feature_sha,
+            self.git_in(self.workspace, "rev-parse", "refs/heads/feature"),
+        )
+        self.assertEqual(
+            "main", self.git_in(self.workspace, "branch", "--show-current")
+        )
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+        _cascade, payload = self.run_format(sys.executable, "-c", "pass")
+        self.assertEqual("resolved", payload["result"])
+        self.assertEqual(
+            self.feature_sha,
+            self.git_in(self.workspace, "rev-parse", "refs/heads/feature"),
+        )
+
+    def test_cleaned_blob_matches_ignore_false_windows_dirtiness(self):
+        original_git_try = MODULE.git_try
+
+        def false_status_once(workspace, *arguments):
+            if arguments == (
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "-z",
+            ):
+                return completed(0, stdout=" M main.txt\0")
+            return original_git_try(workspace, *arguments)
+
+        with mock.patch.object(MODULE, "git_try", side_effect=false_status_once):
+            _cascade, payload = self.run_format(sys.executable, "-c", "pass")
+        self.assertEqual("resolved", payload["result"])
+        checkpoint = json.loads(
+            self.state_path.read_text(encoding="utf-8")
+        )["attempt"]["stack"]["formatting_checkpoints"][0]
+        self.assertFalse(checkpoint["changed"])
+        self.assertEqual([], checkpoint["paths"])
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
 
 
 class StackPublishCommandTest(unittest.TestCase):
