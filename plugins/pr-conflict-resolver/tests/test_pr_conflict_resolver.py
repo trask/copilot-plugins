@@ -7758,6 +7758,68 @@ class StackFormatCommandTest(GitTestCase):
         self.assertFalse(checkpoint["changed"])
         self.assertEqual(original, checkpoint["after_sha"])
 
+    def test_a_detached_rebase_result_attaches_the_member_before_formatting(self):
+        self.git_in(self.workspace, "checkout", "--detach", self.feature_sha)
+
+        _cascade, payload = self.run_format(sys.executable, "-c", "pass")
+
+        self.assertEqual("resolved", payload["result"])
+        self.assertEqual(
+            "feature", self.git_in(self.workspace, "branch", "--show-current")
+        )
+        self.assertEqual(
+            self.feature_sha, self.git_in(self.workspace, "rev-parse", "HEAD")
+        )
+
+    def test_formatter_failure_restores_a_detached_rebase_result(self):
+        self.git_in(self.workspace, "checkout", "--detach", self.feature_sha)
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            format_command=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('feature.txt').write_text('partial\\n'); raise SystemExit(9)",
+            ],
+            no_format=False,
+        )
+
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "formatter failed"
+        ):
+            MODULE.command_stack_format(args)
+
+        self.assertEqual("", self.git_in(self.workspace, "branch", "--show-current"))
+        self.assertEqual(
+            self.feature_sha, self.git_in(self.workspace, "rev-parse", "HEAD")
+        )
+        self.assertEqual(
+            self.feature_sha,
+            self.git_in(self.workspace, "rev-parse", "refs/heads/feature"),
+        )
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+
+    def test_a_detached_unrelated_commit_is_not_adopted_for_formatting(self):
+        self.git_in(self.workspace, "checkout", "--detach", self.main_sha)
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            format_command=[sys.executable, "-c", "pass"],
+            no_format=False,
+        )
+
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "not at the recorded PR layer"
+        ):
+            MODULE.command_stack_format(args)
+
+        self.assertEqual("", self.git_in(self.workspace, "branch", "--show-current"))
+        self.assertEqual(
+            self.main_sha, self.git_in(self.workspace, "rev-parse", "HEAD")
+        )
+        self.assertEqual(
+            self.feature_sha,
+            self.git_in(self.workspace, "rev-parse", "refs/heads/feature"),
+        )
+
     def test_formatter_changes_outside_the_current_member_are_refused(self):
         args = SimpleNamespace(
             state=str(self.state_path),

@@ -4485,11 +4485,8 @@ def formatter_changed_paths(workspace: Path) -> tuple[set[str], set[str]]:
 
 
 def formatter_workspace_snapshot(workspace: Path) -> dict[str, Any]:
-    branch = git(workspace, "branch", "--show-current")
-    if not branch:
-        raise WorkflowError("the formatter workspace is not attached to a branch")
     return {
-        "branch": branch,
+        "branch": git(workspace, "branch", "--show-current"),
         "head": git(workspace, "rev-parse", "HEAD"),
         "untracked": sorted(untracked_paths(workspace)),
         "ignored": sorted(ignored_paths(workspace)),
@@ -4538,17 +4535,15 @@ def restore_formatter_workspace(
             raise WorkflowError(
                 f"could not abort the formatter-started {in_progress}: {detail}"
             )
-    checkout = git_try(
-        workspace,
-        "checkout",
-        "--force",
-        "-B",
-        snapshot["branch"],
-        snapshot["head"],
+    checkout_arguments = (
+        ["checkout", "--force", "-B", snapshot["branch"], snapshot["head"]]
+        if snapshot["branch"]
+        else ["checkout", "--force", "--detach", snapshot["head"]]
     )
+    checkout = git_try(workspace, *checkout_arguments)
     if checkout.returncode != 0:
         detail = checkout.stderr.strip() or checkout.stdout.strip() or "no output"
-        raise WorkflowError(f"could not restore the formatting branch: {detail}")
+        raise WorkflowError(f"could not restore the formatter entry state: {detail}")
     reset = git_try(workspace, "reset", "--hard", snapshot["head"])
     if reset.returncode != 0:
         detail = reset.stderr.strip() or reset.stdout.strip() or "no output"
@@ -4674,6 +4669,10 @@ def format_stack_member(
     before_sha = git(workspace, "rev-parse", member["branch_ref"])
     snapshot["refs"] = {member["branch_ref"]: before_sha}
     try:
+        if not snapshot["branch"] and snapshot["head"] != before_sha:
+            raise WorkflowError(
+                "the detached formatter workspace is not at the recorded PR layer"
+            )
         if snapshot["branch"] != member["branch"]:
             checkout = git_try(workspace, "checkout", member["branch"])
             if checkout.returncode != 0:
