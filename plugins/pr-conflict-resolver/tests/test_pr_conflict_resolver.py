@@ -3515,6 +3515,256 @@ class ResolvedTest(unittest.TestCase):
                 MODULE.base_replacement_paths(self.directory, [conflict]),
             )
 
+    def test_empty_stack_metadata_recovers_a_replacement_from_parent_history(self):
+        conflict = conflict_record(
+            "tools/contract.json",
+            code="DU",
+            deletion=True,
+            base_commits=[],
+        )
+        with mock.patch.object(
+            MODULE,
+            "commits_touching",
+            return_value=[{"sha": "parent-merge"}],
+        ) as commits, mock.patch.object(
+            MODULE,
+            "commit_path_changes",
+            return_value=[
+                ("D", "tools/contract.json", None),
+                ("A", "tools/contract.yaml", None),
+            ],
+        ), mock.patch.object(
+            MODULE, "path_is_file_at_head", return_value=True
+        ):
+            self.assertEqual(
+                {"tools/contract.yaml"},
+                MODULE.base_replacement_paths(
+                    self.directory,
+                    [conflict],
+                    history_ranges=["base..rewritten-parent"],
+                ),
+            )
+        commits.assert_called_once_with(
+            self.directory,
+            "base..rewritten-parent",
+            "tools/contract.json",
+            include_merges=True,
+        )
+
+    def test_recorded_base_commits_do_not_expand_into_parent_history(self):
+        conflict = conflict_record(
+            "tools/contract.json",
+            code="UD",
+            deletion=True,
+            base_commits=[{"sha": "base-change"}],
+        )
+        with mock.patch.object(
+            MODULE, "commits_touching"
+        ) as commits, mock.patch.object(
+            MODULE,
+            "commit_path_changes",
+            return_value=[
+                ("D", "tools/contract.json", None),
+                ("A", "tools/contract.yaml", None),
+            ],
+        ), mock.patch.object(
+            MODULE, "path_is_file_at_head", return_value=True
+        ):
+            self.assertEqual(
+                {"tools/contract.yaml"},
+                MODULE.base_replacement_paths(
+                    self.directory,
+                    [conflict],
+                    history_ranges=["base..rewritten-parent"],
+                ),
+            )
+        commits.assert_not_called()
+
+    def test_recorded_base_commits_keep_each_explicit_replacement(self):
+        conflict = conflict_record(
+            "tools/contract.json",
+            code="UD",
+            deletion=True,
+            base_commits=[
+                {"sha": "yaml-replacement"},
+                {"sha": "yml-replacement"},
+            ],
+        )
+        with mock.patch.object(
+            MODULE,
+            "commit_path_changes",
+            side_effect=[
+                [
+                    ("D", "tools/contract.json", None),
+                    ("A", "tools/contract.yaml", None),
+                ],
+                [
+                    ("D", "tools/contract.json", None),
+                    ("A", "tools/contract.yml", None),
+                ],
+            ],
+        ), mock.patch.object(
+            MODULE, "path_is_file_at_head", return_value=True
+        ):
+            self.assertEqual(
+                {"tools/contract.yaml", "tools/contract.yml"},
+                MODULE.base_replacement_paths(self.directory, [conflict]),
+            )
+
+    def test_parent_history_requires_one_replacement_across_all_commits(self):
+        conflict = conflict_record(
+            "tools/contract.json",
+            code="DU",
+            deletion=True,
+            base_commits=[],
+        )
+        with mock.patch.object(
+            MODULE,
+            "commits_touching",
+            return_value=[
+                {"sha": "yaml-replacement"},
+                {"sha": "yml-replacement"},
+            ],
+        ), mock.patch.object(
+            MODULE,
+            "commit_path_changes",
+            side_effect=[
+                [
+                    ("D", "tools/contract.json", None),
+                    ("A", "tools/contract.yaml", None),
+                ],
+                [
+                    ("D", "tools/contract.json", None),
+                    ("A", "tools/contract.yml", None),
+                ],
+            ],
+        ), mock.patch.object(
+            MODULE, "path_is_file_at_head", return_value=True
+        ):
+            self.assertEqual(
+                set(),
+                MODULE.base_replacement_paths(
+                    self.directory,
+                    [conflict],
+                    history_ranges=["base..rewritten-parent"],
+                ),
+            )
+
+    def test_parent_history_rejects_a_distant_rename_destination(self):
+        conflict = conflict_record(
+            "tools/contract.json",
+            code="DU",
+            deletion=True,
+            base_commits=[],
+        )
+        with mock.patch.object(
+            MODULE,
+            "commits_touching",
+            return_value=[{"sha": "distant-rename"}],
+        ), mock.patch.object(
+            MODULE,
+            "commit_path_changes",
+            return_value=[
+                (
+                    "R100",
+                    "tools/contract.json",
+                    "archive/unrelated.json",
+                ),
+            ],
+        ), mock.patch.object(
+            MODULE, "path_is_file_at_head", return_value=True
+        ):
+            self.assertEqual(
+                set(),
+                MODULE.base_replacement_paths(
+                    self.directory,
+                    [conflict],
+                    history_ranges=["base..rewritten-parent"],
+                ),
+            )
+
+    def test_parent_history_uses_a_same_stem_addition_after_an_obsolete_rename(self):
+        conflict = conflict_record(
+            "tools/contract.json",
+            code="DU",
+            deletion=True,
+            base_commits=[],
+        )
+        with mock.patch.object(
+            MODULE,
+            "commits_touching",
+            return_value=[{"sha": "rename-and-replacement"}],
+        ), mock.patch.object(
+            MODULE,
+            "commit_path_changes",
+            return_value=[
+                (
+                    "R100",
+                    "tools/contract.json",
+                    "archive/unrelated.json",
+                ),
+                ("A", "tools/contract.yaml", None),
+            ],
+        ), mock.patch.object(
+            MODULE,
+            "path_is_file_at_head",
+            side_effect=lambda _repo, path: path == "tools/contract.yaml",
+        ):
+            self.assertEqual(
+                {"tools/contract.yaml"},
+                MODULE.base_replacement_paths(
+                    self.directory,
+                    [conflict],
+                    history_ranges=["base..rewritten-parent"],
+                ),
+            )
+
+    def test_stack_replacement_history_is_bounded_to_parent_lines(self):
+        repo = temporary_directory(self)
+        GitTestCase.git_in(repo, "init", "--initial-branch", "main", "--quiet")
+        GitTestCase.git_in(repo, "config", "user.name", "Resolver Test")
+        GitTestCase.git_in(repo, "config", "user.email", "resolver@example.invalid")
+        GitTestCase.write_in(repo, "base.txt", "base\n")
+        GitTestCase.commit_in(repo, "base")
+        parent_base = GitTestCase.git_in(repo, "rev-parse", "HEAD")
+        GitTestCase.git_in(repo, "checkout", "-b", "frozen-parent")
+        GitTestCase.write_in(repo, "parent.txt", "parent\n")
+        GitTestCase.commit_in(repo, "parent")
+        frozen_parent = GitTestCase.git_in(repo, "rev-parse", "HEAD")
+        GitTestCase.git_in(repo, "checkout", "main")
+        GitTestCase.write_in(repo, "trunk.txt", "trunk\n")
+        GitTestCase.commit_in(repo, "advance trunk")
+        rewritten_trunk = GitTestCase.git_in(repo, "rev-parse", "HEAD")
+        GitTestCase.git_in(repo, "checkout", "-b", "rewritten-parent")
+        GitTestCase.git_in(repo, "cherry-pick", frozen_parent)
+        attempt = attempt_record(
+            strategy="stack",
+            stack={
+                "current_index": 1,
+                "plan": [
+                    {
+                        "old_base": parent_base,
+                        "new_base_ref": rewritten_trunk,
+                        "head_sha": frozen_parent,
+                        "branch_ref": "refs/heads/rewritten-parent",
+                    },
+                    {
+                        "old_base": frozen_parent,
+                        "new_base_ref": "refs/heads/rewritten-parent",
+                    },
+                ],
+            },
+        )
+
+        self.assertEqual(
+            [
+                f"{parent_base}..{frozen_parent}",
+                f"{parent_base}..{rewritten_trunk}",
+                f"{rewritten_trunk}..refs/heads/rewritten-parent",
+            ],
+            MODULE.stack_replacement_history_ranges(repo, attempt),
+        )
+
     def test_a_same_stem_addition_in_another_directory_is_not_a_replacement(self):
         conflict = conflict_record(
             "tools/contract.json",
@@ -3568,6 +3818,97 @@ class ResolvedTest(unittest.TestCase):
                 set(), MODULE.base_replacement_paths(self.directory, [conflict])
             )
         inspect.assert_not_called()
+
+    def test_merge_replacement_changes_are_read_against_the_first_parent(self):
+        repo = temporary_directory(self)
+        self.assertEqual(
+            "",
+            GitTestCase.git_in(repo, "init", "--initial-branch", "main", "--quiet"),
+        )
+        GitTestCase.git_in(repo, "config", "user.name", "Resolver Test")
+        GitTestCase.git_in(repo, "config", "user.email", "resolver@example.invalid")
+        tools = repo / "tools"
+        tools.mkdir()
+        GitTestCase.write_in(repo, "tools/contract.json", "{}\n")
+        GitTestCase.commit_in(repo, "add contract")
+        GitTestCase.git_in(repo, "checkout", "-b", "replacement")
+        (tools / "contract.json").unlink()
+        GitTestCase.write_in(repo, "tools/contract.yaml", "ready: true\n")
+        GitTestCase.commit_in(repo, "replace contract")
+        GitTestCase.git_in(repo, "checkout", "main")
+        GitTestCase.write_in(repo, "main.txt", "main\n")
+        GitTestCase.commit_in(repo, "advance main")
+        GitTestCase.git_in(
+            repo,
+            "merge",
+            "--no-ff",
+            "--no-gpg-sign",
+            "replacement",
+            "--message",
+            "merge replacement",
+        )
+        merge = GitTestCase.git_in(repo, "rev-parse", "HEAD")
+
+        self.assertEqual(
+            [
+                ("D", "tools/contract.json", None),
+                ("A", "tools/contract.yaml", None),
+            ],
+            MODULE.commit_path_changes(repo, merge),
+        )
+
+    def test_descendant_conflicts_receive_the_preserved_cascade_plan(self):
+        self.write("contract.yaml", b"preserved query\n")
+        cascade = {
+            "current_index": 1,
+            "plan": [
+                {
+                    "old_base": "parent-base",
+                    "head_sha": "parent-head",
+                    "branch_ref": "refs/heads/parent",
+                },
+                {
+                    "old_base": "parent-head",
+                    "new_base_ref": "refs/heads/parent",
+                },
+            ],
+        }
+        with mock.patch.object(
+            MODULE, "replayed_commit_paths", return_value={"contract.json"}
+        ), mock.patch.object(
+            MODULE,
+            "stack_replacement_history_ranges",
+            return_value=["base..parent"],
+        ) as history, mock.patch.object(
+            MODULE,
+            "base_replacement_paths",
+            return_value={"contract.yaml"},
+        ) as replacements, mock.patch.object(
+            MODULE, "path_has_unstaged_changes", return_value=True
+        ):
+            self.resolve(
+                paths=("contract.json",),
+                companion_paths=("contract.yaml",),
+                accept_deletion=True,
+                operation="descendant_propagation",
+                status="conflicted",
+                workspace=str(self.directory),
+                conflicts=[
+                    conflict_record(
+                        "contract.json",
+                        code="DU",
+                        deletion=True,
+                    )
+                ],
+                cascade=cascade,
+            )
+        propagated_attempt = history.call_args.args[1]
+        self.assertEqual(cascade, propagated_attempt["stack"])
+        replacements.assert_called_once_with(
+            self.directory,
+            propagated_attempt["conflicts"],
+            history_ranges=["base..parent"],
+        )
 
     def test_a_companion_path_is_refused_for_a_merge(self):
         self.write("app.py", b"ours\ntheirs\n")

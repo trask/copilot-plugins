@@ -1481,12 +1481,17 @@ def stage_blobs(repo_root: Path, path: str) -> dict[str, bytes | None]:
 
 
 def commits_touching(
-    repo_root: Path, revision_range: str, path: str
+    repo_root: Path,
+    revision_range: str,
+    path: str,
+    *,
+    include_merges: bool = False,
 ) -> list[dict[str, str]]:
+    history_mode = "--full-history" if include_merges else "--no-merges"
     output = git_try(
         repo_root,
         "log",
-        "--no-merges",
+        history_mode,
         "--format=%H%x1f%an%x1f%aI%x1f%s",
         revision_range,
         "--",
@@ -1829,17 +1834,34 @@ def replayed_commit_paths(repo_root: Path) -> set[str]:
 def commit_path_changes(
     repo_root: Path, commit_sha: str
 ) -> list[tuple[str, str, str | None]]:
-    result = git_try(
-        repo_root,
-        "diff-tree",
-        "--no-commit-id",
-        "--name-status",
-        "-r",
-        "--root",
-        "-z",
-        "-M",
-        commit_sha,
-    )
+    ancestry = git_try(repo_root, "rev-list", "--parents", "-n", "1", commit_sha)
+    if ancestry.returncode != 0:
+        detail = ancestry.stderr.strip() or ancestry.stdout.strip() or "no output"
+        raise WorkflowError(f"could not inspect base commit {commit_sha}: {detail}")
+    commits = ancestry.stdout.split()
+    if not commits or commits[0] != commit_sha:
+        raise WorkflowError(f"could not read the ancestry of base commit {commit_sha}")
+    if len(commits) > 1:
+        arguments = [
+            "diff",
+            "--name-status",
+            "-z",
+            "-M",
+            commits[1],
+            commit_sha,
+        ]
+    else:
+        arguments = [
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            "--root",
+            "-z",
+            "-M",
+            commit_sha,
+        ]
+    result = git_try(repo_root, *arguments)
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "no output"
         raise WorkflowError(f"could not inspect base commit {commit_sha}: {detail}")
@@ -1869,16 +1891,35 @@ def path_is_file_at_head(repo_root: Path, path: str) -> bool:
 
 
 def base_replacement_paths(
-    repo_root: Path, conflicts: Iterable[dict[str, Any]]
+    repo_root: Path,
+    conflicts: Iterable[dict[str, Any]],
+    *,
+    history_ranges: Iterable[str] = (),
 ) -> set[str]:
     """Find narrow base-side destinations for conflicted deleted paths."""
     replacements = set()
     inspected_commits = set()
+    ranges = list(history_ranges)
     for conflict in conflicts:
         if not conflict.get("deletion"):
             continue
         source = conflict["path"]
-        for commit in conflict.get("base_commits") or []:
+        source_path = PurePosixPath(source)
+        candidates = set()
+        commits = conflict.get("base_commits") or []
+        history_fallback = not commits
+        if history_fallback:
+            commits = [
+                commit
+                for revision_range in ranges
+                for commit in commits_touching(
+                    repo_root,
+                    revision_range,
+                    source,
+                    include_merges=True,
+                )
+            ]
+        for commit in commits:
             sha = commit.get("sha")
             if not isinstance(sha, str) or not sha:
                 continue
@@ -1889,18 +1930,28 @@ def base_replacement_paths(
             changes = commit_path_changes(repo_root, sha)
             source_deleted = False
             for status, changed_source, destination in changes:
-                if (
-                    status.startswith("R")
-                    and changed_source == source
-                    and destination
-                    and path_is_file_at_head(repo_root, destination)
-                ):
-                    replacements.add(destination)
+                if status.startswith("R") and changed_source == source and destination:
+                    if history_fallback:
+                        source_deleted = True
+                    destination_path = PurePosixPath(destination)
+                    if (
+                        path_is_file_at_head(repo_root, destination)
+                        and (
+                            not history_fallback
+                            or (
+                                destination_path.parent == source_path.parent
+                                and destination_path.stem == source_path.stem
+                            )
+                        )
+                    ):
+                        if history_fallback:
+                            candidates.add(destination)
+                        else:
+                            replacements.add(destination)
                 elif status == "D" and changed_source == source:
                     source_deleted = True
             if not source_deleted:
                 continue
-            source_path = PurePosixPath(source)
             same_stem_additions = {
                 changed_source
                 for status, changed_source, _destination in changes
@@ -1910,8 +1961,52 @@ def base_replacement_paths(
                 and path_is_file_at_head(repo_root, changed_source)
             }
             if len(same_stem_additions) == 1:
-                replacements.update(same_stem_additions)
+                if history_fallback:
+                    candidates.update(same_stem_additions)
+                else:
+                    replacements.update(same_stem_additions)
+        if history_fallback and len(candidates) == 1:
+            replacements.update(candidates)
     return replacements
+
+
+def stack_replacement_history_ranges(
+    repo_root: Path, attempt: dict[str, Any]
+) -> list[str]:
+    """Bound replacement recovery to the frozen and rewritten parent histories."""
+    if attempt.get("strategy") != "stack":
+        return []
+    stack = attempt.get("stack") or {}
+    current = stack.get("current_index")
+    plan = stack.get("plan") or []
+    if not isinstance(current, int) or current < 0 or current >= len(plan):
+        return []
+
+    boundaries = []
+    member = plan[current]
+    boundaries.append((member.get("old_base"), member.get("new_base_ref")))
+    for parent in plan[:current]:
+        boundaries.extend(
+            [
+                (parent.get("old_base"), parent.get("head_sha")),
+                (parent.get("old_base"), parent.get("new_base_ref")),
+                (parent.get("new_base_ref"), parent.get("branch_ref")),
+            ]
+        )
+
+    ranges = []
+    for start, end in boundaries:
+        if (
+            isinstance(start, str)
+            and start
+            and isinstance(end, str)
+            and end
+            and is_ancestor(repo_root, start, end)
+        ):
+            revision_range = f"{start}..{end}"
+            if revision_range not in ranges:
+                ranges.append(revision_range)
+    return ranges
 
 
 def normalize_companion_path(path: str) -> str:
@@ -2830,6 +2925,7 @@ def command_resolved(args: argparse.Namespace) -> None:
         attempt = {
             "status": state["status"],
             "strategy": "stack",
+            "stack": state.get("cascade") or {},
             "conflicts": state.get("conflicts") or [],
             "companion_resolutions": state.get("companion_resolutions") or [],
         }
@@ -2867,7 +2963,11 @@ def command_resolved(args: argparse.Namespace) -> None:
         replayed_paths = replayed_commit_paths(repo_root)
         unrelated = [path for path in companion_paths if path not in replayed_paths]
         if unrelated:
-            replacement_paths = base_replacement_paths(repo_root, conflicts)
+            replacement_paths = base_replacement_paths(
+                repo_root,
+                conflicts,
+                history_ranges=stack_replacement_history_ranges(repo_root, attempt),
+            )
             unrelated = [path for path in unrelated if path not in replacement_paths]
         if unrelated:
             raise WorkflowError(
