@@ -517,6 +517,7 @@ class AgentInstructionsTest(unittest.TestCase):
             "stack-continue",
             "stack-format",
             "stack-abort",
+            "stack-validation-fix",
             "stack-publish",
         ):
             with self.subTest(command=command):
@@ -2107,6 +2108,14 @@ class StateHelpersTest(unittest.TestCase):
                     conflict_record("a.py", status="resolved", rationale="kept both"),
                     conflict_record("b.py"),
                 ],
+                stack={
+                    "validation_fix_checkpoints": [
+                        {
+                            "paths": ["caller.py"],
+                            "rationale": "The caller follows the resolved contract.",
+                        }
+                    ]
+                },
             ),
         }
         MODULE.archive_attempt(state)
@@ -2118,6 +2127,10 @@ class StateHelpersTest(unittest.TestCase):
         self.assertEqual(
             [{"path": "a.py", "kind": "both modified", "rationale": "kept both", "one_side": None}],
             entry["resolutions"],
+        )
+        self.assertEqual(
+            ["caller.py"],
+            entry["validation_fix_checkpoints"][0]["paths"],
         )
         self.assertTrue(entry["ended_at"].endswith("Z"))
 
@@ -6768,6 +6781,38 @@ class FetchMergedPredecessorTest(unittest.TestCase):
 
 
 class AtomicStackPushTest(unittest.TestCase):
+    def test_expected_repository_requires_one_matching_origin_push_url(self):
+        stack = stack_attempt_record(status="resolved")["stack"]
+        with mock.patch.object(
+            MODULE,
+            "git_try",
+            return_value=completed(
+                0, stdout="https://github.com/example/expected.git\n"
+            ),
+        ), mock.patch.object(
+            MODULE, "run", return_value=completed(0)
+        ) as runner:
+            MODULE.atomic_stack_push(
+                Path("/workspace"), stack, "example/expected"
+            )
+        runner.assert_called_once()
+
+    def test_mismatched_origin_blocks_atomic_publication(self):
+        stack = stack_attempt_record(status="resolved")["stack"]
+        with mock.patch.object(
+            MODULE,
+            "git_try",
+            return_value=completed(
+                0, stdout="https://github.com/example/other.git\n"
+            ),
+        ), mock.patch.object(MODULE, "run") as runner, self.assertRaisesRegex(
+            MODULE.WorkflowError, "expected example/expected"
+        ):
+            MODULE.atomic_stack_push(
+                Path("/workspace"), stack, "example/expected"
+            )
+        runner.assert_not_called()
+
     def test_every_member_uses_an_exact_lease_in_one_atomic_push(self):
         stack = stack_attempt_record(
             status="resolved",
@@ -8347,6 +8392,629 @@ class StackFormatCommandTest(GitTestCase):
         self.assertFalse(checkpoint["changed"])
         self.assertEqual([], checkpoint["paths"])
         self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+
+    def test_formatter_git_config_changes_are_rejected_and_restored(self):
+        self.git_in(self.workspace, "config", "resolver.guard", "original")
+
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "formatter command changed local Git configuration"
+        ):
+            self.run_format(
+                "git",
+                "config",
+                "resolver.guard",
+                "changed",
+            )
+
+        self.assertEqual(
+            "original",
+            self.git_in(self.workspace, "config", "--get", "resolver.guard"),
+        )
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+
+    def test_formatter_commit_hook_cannot_move_another_stack_ref(self):
+        self.git_in(self.workspace, "branch", "lower", self.main_sha)
+        self.stack["plan"].append(
+            {
+                "index": 1,
+                "number": 8,
+                "branch": "lower",
+                "branch_ref": "refs/heads/lower",
+                "head_sha": self.main_sha,
+                "new_base_ref": "refs/heads/feature",
+                "old_base": self.main_sha,
+            }
+        )
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        state["attempt"]["stack"]["plan"] = self.stack["plan"]
+        MODULE.save_state(self.state_path, state)
+        hooks = self.directory / "hooks"
+        hooks.mkdir()
+        hook = hooks / "pre-commit"
+        hook.write_text(
+            "#!/bin/sh\n"
+            "git update-ref refs/heads/lower refs/heads/feature\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        hook.chmod(0o755)
+        self.git_in(self.workspace, "config", "core.hooksPath", hooks.as_posix())
+
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "formatting commit moved stack ref 'refs/heads/lower'",
+        ):
+            self.run_format(
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('feature.txt').write_text('after\\n')",
+            )
+
+        self.assertEqual(
+            self.main_sha,
+            self.git_in(self.workspace, "rev-parse", "refs/heads/lower"),
+        )
+        self.assertEqual(
+            self.feature_sha,
+            self.git_in(self.workspace, "rev-parse", "refs/heads/feature"),
+        )
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+
+
+class StackValidationFixCommandTest(GitTestCase):
+    def setUp(self):
+        self.directory = temporary_directory(self)
+        self.workspace = self.directory / "workspace"
+        self.workspace.mkdir()
+        self.git_in(self.workspace, "init", "--initial-branch", "main")
+        self.git_in(self.workspace, "config", "user.name", "Stack Test")
+        self.git_in(self.workspace, "config", "user.email", "stack@example.invalid")
+        self.write_in(self.workspace, "base-caller.txt", "old expectation\n")
+        self.commit_in(self.workspace, "main")
+        self.main_sha = self.git_in(self.workspace, "rev-parse", "HEAD")
+        self.git_in(
+            self.workspace,
+            "update-ref",
+            "refs/remotes/origin/main",
+            self.main_sha,
+        )
+        self.git_in(self.workspace, "checkout", "-b", "feature")
+        self.write_in(self.workspace, "feature.txt", "resolved behavior\n")
+        self.commit_in(self.workspace, "feature")
+        self.feature_sha = self.git_in(self.workspace, "rev-parse", "HEAD")
+        self.stack = {
+            "number": 77,
+            "size": 1,
+            "trunk": "main",
+            "invoked_number": 7,
+            "members": [
+                {
+                    "number": 7,
+                    "head_branch": "feature",
+                    "base_branch": "main",
+                    "head_sha": self.feature_sha,
+                    "base_sha": self.main_sha,
+                }
+            ],
+            "workspace": str(self.workspace),
+            "plan": [
+                {
+                    "index": 0,
+                    "number": 7,
+                    "branch": "feature",
+                    "branch_ref": "refs/heads/feature",
+                    "head_sha": self.feature_sha,
+                    "new_base_ref": "refs/remotes/origin/main",
+                    "old_base": self.main_sha,
+                }
+            ],
+            "members_after": [
+                {
+                    "number": 7,
+                    "head_branch": "feature",
+                    "head_sha": self.feature_sha,
+                }
+            ],
+        }
+        self.state_path = write_state(
+            self.directory,
+            repo_root=str(self.workspace),
+            attempt=stack_attempt_record(status="resolved", stack=self.stack),
+        )
+
+    def run_fix(self, command, *, paths=None, rationale="Tests follow the contract."):
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            paths=paths or ["base-caller.txt"],
+            rationale=rationale,
+            rationale_file=None,
+            fix_command=command,
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "emit"
+        ) as emit:
+            MODULE.command_stack_validation_fix(args)
+        return emitted(emit)
+
+    def saved(self):
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def test_records_an_exact_base_side_validation_fix_on_the_final_member(self):
+        payload = self.run_fix(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "Path('base-caller.txt').write_text('new expectation\\n')"
+                ),
+            ]
+        )
+
+        self.assertEqual("validation_fix_recorded", payload["result"])
+        checkpoint = self.saved()["attempt"]["stack"][
+            "validation_fix_checkpoints"
+        ][0]
+        self.assertEqual(["base-caller.txt"], checkpoint["paths"])
+        self.assertEqual("Tests follow the contract.", checkpoint["rationale"])
+        self.assertNotEqual(self.feature_sha, checkpoint["after_sha"])
+        self.assertEqual(
+            checkpoint["after_sha"],
+            self.saved()["attempt"]["stack"]["members_after"][-1]["head_sha"],
+        )
+        self.assertEqual(
+            "new expectation\n",
+            (self.workspace / "base-caller.txt").read_text(encoding="utf-8"),
+        )
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+
+    def test_multiple_validation_fixes_form_a_linear_final_member_history(self):
+        first = self.run_fix(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "Path('base-caller.txt').write_text('new expectation\\n')"
+                ),
+            ]
+        )["checkpoint"]
+        second = self.run_fix(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "Path('base-caller.txt').write_text('final expectation\\n')"
+                ),
+            ],
+            rationale="A second validation exposed the final expectation.",
+        )["checkpoint"]
+
+        self.assertEqual(first["after_sha"], second["before_sha"])
+        self.assertTrue(
+            MODULE.is_ancestor(
+                self.workspace, self.feature_sha, second["after_sha"]
+            )
+        )
+        self.assertEqual(
+            2,
+            len(
+                self.saved()["attempt"]["stack"]["validation_fix_checkpoints"]
+            ),
+        )
+
+    def test_undeclared_changes_restore_the_workspace_and_stack_ref(self):
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            paths=["base-caller.txt"],
+            rationale="Only the base caller should change.",
+            rationale_file=None,
+            fix_command=[
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "Path('base-caller.txt').write_text('new expectation\\n'); "
+                    "Path('feature.txt').write_text('undeclared\\n')"
+                ),
+            ],
+        )
+
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "undeclared changes"
+        ):
+            MODULE.command_stack_validation_fix(args)
+
+        self.assertEqual(
+            self.feature_sha,
+            self.git_in(self.workspace, "rev-parse", "refs/heads/feature"),
+        )
+        self.assertEqual(
+            "old expectation\n",
+            (self.workspace / "base-caller.txt").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            "resolved behavior\n",
+            (self.workspace / "feature.txt").read_text(encoding="utf-8"),
+        )
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+
+    def test_failed_fix_command_restores_partial_changes(self):
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            paths=["base-caller.txt"],
+            rationale="Tests follow the contract.",
+            rationale_file=None,
+            fix_command=[
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "Path('base-caller.txt').write_text('partial\\n'); "
+                    "raise SystemExit(9)"
+                ),
+            ],
+        )
+
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "validation fix command failed"
+        ):
+            MODULE.command_stack_validation_fix(args)
+
+        self.assertEqual(
+            "old expectation\n",
+            (self.workspace / "base-caller.txt").read_text(encoding="utf-8"),
+        )
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+
+    def test_new_files_are_rejected_and_removed(self):
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            paths=["base-caller.txt"],
+            rationale="Tests follow the contract.",
+            rationale_file=None,
+            fix_command=[
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "Path('base-caller.txt').write_text('new expectation\\n'); "
+                    "Path('generated.txt').write_text('unexpected\\n')"
+                ),
+            ],
+        )
+
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "undeclared changes"
+        ):
+            MODULE.command_stack_validation_fix(args)
+
+        self.assertFalse((self.workspace / "generated.txt").exists())
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+
+    def test_declared_untracked_paths_are_rejected_before_the_command_runs(self):
+        marker = self.directory / "ran"
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            paths=["new-caller.txt"],
+            rationale="Tests follow the contract.",
+            rationale_file=None,
+            fix_command=[
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(marker)!r}).touch()",
+            ],
+        )
+
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "must be a tracked file"
+        ):
+            MODULE.command_stack_validation_fix(args)
+
+        self.assertFalse(marker.exists())
+
+    def test_paths_are_checked_after_attaching_the_final_member(self):
+        self.git_in(self.workspace, "rm", "base-caller.txt")
+        self.commit_in(self.workspace, "delete base caller")
+        deleted_tip = self.git_in(self.workspace, "rev-parse", "HEAD")
+        self.stack["members"][0]["head_sha"] = deleted_tip
+        self.stack["plan"][0]["head_sha"] = deleted_tip
+        self.stack["members_after"][0]["head_sha"] = deleted_tip
+        self.state_path = write_state(
+            self.directory,
+            repo_root=str(self.workspace),
+            attempt=stack_attempt_record(status="resolved", stack=self.stack),
+        )
+        self.git_in(self.workspace, "checkout", "main")
+        marker = self.directory / "ran"
+
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "tracked file at the final stack tip"
+        ):
+            MODULE.command_stack_validation_fix(
+                SimpleNamespace(
+                    state=str(self.state_path),
+                    paths=["base-caller.txt"],
+                    rationale="Tests follow the contract.",
+                    rationale_file=None,
+                    fix_command=[
+                        sys.executable,
+                        "-c",
+                        (
+                            "from pathlib import Path; "
+                            f"Path({str(marker)!r}).touch(); "
+                            "Path('base-caller.txt').write_text('re-added\\n')"
+                        ),
+                    ],
+                )
+            )
+
+        self.assertFalse(marker.exists())
+        self.assertEqual("main", self.git_in(self.workspace, "branch", "--show-current"))
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+
+    def test_only_resolved_stack_attempts_can_record_validation_fixes(self):
+        state = self.saved()
+        state["attempt"]["status"] = "formatting"
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "only after a stack cascade is resolved"
+        ):
+            MODULE.command_stack_validation_fix(
+                SimpleNamespace(
+                    state=str(self.state_path),
+                    paths=["base-caller.txt"],
+                    rationale="Tests follow the contract.",
+                    rationale_file=None,
+                    fix_command=[sys.executable, "-c", "pass"],
+                )
+            )
+
+    def test_detached_final_member_is_attached_before_recording_the_fix(self):
+        self.git_in(self.workspace, "checkout", "--detach", self.feature_sha)
+
+        payload = self.run_fix(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "Path('base-caller.txt').write_text('new expectation\\n')"
+                ),
+            ]
+        )
+
+        self.assertEqual("validation_fix_recorded", payload["result"])
+        self.assertEqual(
+            "feature", self.git_in(self.workspace, "branch", "--show-current")
+        )
+
+    def test_moving_a_lower_stack_ref_rolls_back_every_member(self):
+        self.git_in(self.workspace, "branch", "lower", self.main_sha)
+        self.stack["members"].insert(
+            0,
+            {
+                "number": 6,
+                "head_branch": "lower",
+                "base_branch": "main",
+                "head_sha": self.main_sha,
+                "base_sha": self.main_sha,
+            },
+        )
+        self.stack["plan"].insert(
+            0,
+            {
+                "index": 0,
+                "number": 6,
+                "branch": "lower",
+                "branch_ref": "refs/heads/lower",
+                "head_sha": self.main_sha,
+                "new_base_ref": "refs/remotes/origin/main",
+                "old_base": self.main_sha,
+            },
+        )
+        self.stack["plan"][1]["index"] = 1
+        self.stack["members_after"].insert(
+            0,
+            {
+                "number": 6,
+                "head_branch": "lower",
+                "head_sha": self.main_sha,
+            },
+        )
+        self.state_path = write_state(
+            self.directory,
+            repo_root=str(self.workspace),
+            attempt=stack_attempt_record(status="resolved", stack=self.stack),
+        )
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            paths=["base-caller.txt"],
+            rationale="Tests follow the contract.",
+            rationale_file=None,
+            fix_command=[
+                sys.executable,
+                "-c",
+                (
+                    "import subprocess; "
+                    "tree = subprocess.check_output(['git', 'rev-parse', "
+                    "'refs/heads/lower^{tree}'], text=True).strip(); "
+                    "moved = subprocess.check_output(['git', 'commit-tree', tree, "
+                    "'-p', 'refs/heads/lower', '-m', 'unexpected'], "
+                    "text=True).strip(); "
+                    "subprocess.run(['git', 'update-ref', 'refs/heads/lower', "
+                    "moved], check=True)"
+                ),
+            ],
+        )
+
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "moved stack ref 'refs/heads/lower'"
+        ):
+            MODULE.command_stack_validation_fix(args)
+
+        self.assertEqual(
+            self.main_sha,
+            self.git_in(self.workspace, "rev-parse", "refs/heads/lower"),
+        )
+        self.assertEqual(
+            self.feature_sha,
+            self.git_in(self.workspace, "rev-parse", "refs/heads/feature"),
+        )
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+
+    def test_git_config_changes_are_rejected_and_restored(self):
+        self.git_in(self.workspace, "config", "resolver.guard", "original")
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            paths=["base-caller.txt"],
+            rationale="Tests follow the contract.",
+            rationale_file=None,
+            fix_command=[
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; import subprocess; "
+                    "Path('base-caller.txt').write_text('new expectation\\n'); "
+                    "subprocess.run(['git', 'config', 'resolver.guard', 'changed'], "
+                    "check=True)"
+                ),
+            ],
+        )
+
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "validation fix command changed local Git configuration",
+        ):
+            MODULE.command_stack_validation_fix(args)
+
+        self.assertEqual(
+            "original",
+            self.git_in(self.workspace, "config", "--get", "resolver.guard"),
+        )
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+
+    def test_empty_inline_rationale_is_rejected(self):
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "rationale must not be empty"
+        ):
+            MODULE.command_stack_validation_fix(
+                SimpleNamespace(
+                    state=str(self.state_path),
+                    paths=["base-caller.txt"],
+                    rationale="  ",
+                    rationale_file=None,
+                    fix_command=[sys.executable, "-c", "pass"],
+                )
+            )
+
+    def test_output_failure_keeps_the_durable_validation_fix_commit(self):
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            paths=["base-caller.txt"],
+            rationale="Tests follow the contract.",
+            rationale_file=None,
+            fix_command=[
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "path = Path('base-caller.txt'); "
+                    "path.write_text(path.read_text() + 'new expectation\\n')"
+                ),
+            ],
+        )
+
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "emit", side_effect=BrokenPipeError
+        ), self.assertRaises(BrokenPipeError):
+            MODULE.command_stack_validation_fix(args)
+
+        state = self.saved()
+        checkpoint = state["attempt"]["stack"]["validation_fix_checkpoints"][0]
+        self.assertEqual(
+            checkpoint["after_sha"],
+            self.git_in(self.workspace, "rev-parse", "refs/heads/feature"),
+        )
+        self.assertEqual(
+            checkpoint["after_sha"],
+            state["attempt"]["stack"]["members_after"][-1]["head_sha"],
+        )
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "emit"
+        ) as emit:
+            MODULE.command_stack_validation_fix(args)
+        self.assertEqual(
+            checkpoint["after_sha"],
+            emitted(emit)["checkpoint"]["after_sha"],
+        )
+        self.assertEqual(
+            1,
+            len(
+                self.saved()["attempt"]["stack"]["validation_fix_checkpoints"]
+            ),
+        )
+        self.assertEqual(
+            "old expectation\nnew expectation\n",
+            (self.workspace / "base-caller.txt").read_text(encoding="utf-8"),
+        )
+
+    def test_an_unexpected_commit_is_rolled_back(self):
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            paths=["base-caller.txt"],
+            rationale="Tests follow the contract.",
+            rationale_file=None,
+            fix_command=[
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; import subprocess; "
+                    "Path('base-caller.txt').write_text('committed\\n'); "
+                    "subprocess.run(['git', 'add', 'base-caller.txt'], check=True); "
+                    "subprocess.run(['git', 'commit', '-m', 'unexpected'], "
+                    "check=True, stdout=subprocess.DEVNULL)"
+                ),
+            ],
+        )
+
+        with mock.patch.object(MODULE, "require_tools"), self.assertRaisesRegex(
+            MODULE.WorkflowError, "created a commit"
+        ):
+            MODULE.command_stack_validation_fix(args)
+
+        self.assertEqual(
+            self.feature_sha,
+            self.git_in(self.workspace, "rev-parse", "refs/heads/feature"),
+        )
+        self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+
+    def test_parser_preserves_validation_fix_command_arguments(self):
+        args = MODULE.build_parser().parse_args(
+            [
+                "stack-validation-fix",
+                "--state",
+                "state.json",
+                "--paths",
+                "caller.go",
+                "caller.rb",
+                "--rationale",
+                "Callers must follow the resolved contract.",
+                "--fix-command",
+                "--",
+                "python",
+                "fix.py",
+                "--strict",
+            ]
+        )
+
+        self.assertIs(args.function, MODULE.command_stack_validation_fix)
+        self.assertEqual(
+            ["python", "fix.py", "--strict"],
+            args.fix_command,
+        )
 
 
 class StackPublishCommandTest(unittest.TestCase):

@@ -21,6 +21,7 @@ from typing import Any, Iterable
 
 STATE_VERSION = 1
 FORMAT_COMMAND_ARGUMENT = "--format-command"
+FIX_COMMAND_ARGUMENT = "--fix-command"
 AUTOMATION_BLOCKER_KIND = "automation_blocker"
 MERGEABILITY_RETRY_DELAYS = (2, 4, 8, 16)
 PR_HEAD_LAG_RETRY_DELAY = 1
@@ -77,25 +78,33 @@ class MergedPredecessorLineageError(WorkflowError):
     pass
 
 
-class FormatterPassthroughArgumentParser(argparse.ArgumentParser):
+class CommandPassthroughArgumentParser(argparse.ArgumentParser):
     def parse_args(
         self,
         args: list[str] | None = None,
         namespace: argparse.Namespace | None = None,
     ) -> argparse.Namespace:
         arguments = list(sys.argv[1:] if args is None else args)
-        format_command = None
-        if arguments[:1] == ["stack-format"] and FORMAT_COMMAND_ARGUMENT in arguments:
-            marker = arguments.index(FORMAT_COMMAND_ARGUMENT)
-            format_command = arguments[marker + 1 :]
-            if format_command[:1] == ["--"]:
-                format_command.pop(0)
-            if not format_command:
-                self.error(f"{FORMAT_COMMAND_ARGUMENT} requires a formatter executable")
-            arguments = arguments[: marker + 1] + ["formatter-command"]
+        passthrough = None
+        passthrough_attribute = None
+        command_argument = None
+        if arguments[:1] == ["stack-format"]:
+            command_argument = FORMAT_COMMAND_ARGUMENT
+            passthrough_attribute = "format_command"
+        elif arguments[:1] == ["stack-validation-fix"]:
+            command_argument = FIX_COMMAND_ARGUMENT
+            passthrough_attribute = "fix_command"
+        if command_argument is not None and command_argument in arguments:
+            marker = arguments.index(command_argument)
+            passthrough = arguments[marker + 1 :]
+            if passthrough[:1] == ["--"]:
+                passthrough.pop(0)
+            if not passthrough:
+                self.error(f"{command_argument} requires an executable")
+            arguments = arguments[: marker + 1] + ["passthrough-command"]
         parsed = super().parse_args(arguments, namespace)
-        if format_command is not None:
-            parsed.format_command = format_command
+        if passthrough is not None and passthrough_attribute is not None:
+            setattr(parsed, passthrough_attribute, passthrough)
         return parsed
 
 
@@ -2068,6 +2077,9 @@ def archive_attempt(state: dict[str, Any]) -> None:
             "formatting_checkpoints": (
                 (attempt.get("stack") or {}).get("formatting_checkpoints") or []
             ),
+            "validation_fix_checkpoints": (
+                (attempt.get("stack") or {}).get("validation_fix_checkpoints") or []
+            ),
             "started_at": attempt.get("started_at"),
             "ended_at": utc_now(),
         }
@@ -2110,6 +2122,7 @@ def attempt_summary(attempt: dict[str, Any] | None) -> dict[str, Any] | None:
         "conflict_signature": attempt.get("conflict_signature"),
         "formatting_member": attempt.get("formatting_member"),
         "formatting_last_run": attempt.get("formatting_last_run"),
+        "validation_fix_last_run": attempt.get("validation_fix_last_run"),
         "conflict_statuses": count_by_status(attempt.get("conflicts")),
     }
 
@@ -4585,12 +4598,26 @@ def formatter_changed_paths(workspace: Path) -> tuple[set[str], set[str]]:
 
 
 def formatter_workspace_snapshot(workspace: Path) -> dict[str, Any]:
+    config_path = Path(git(workspace, "rev-parse", "--git-path", "config"))
+    if not config_path.is_absolute():
+        config_path = workspace / config_path
     return {
         "branch": git(workspace, "branch", "--show-current"),
         "head": git(workspace, "rev-parse", "HEAD"),
         "untracked": sorted(untracked_paths(workspace)),
         "ignored": sorted(ignored_paths(workspace)),
+        "config_path": config_path,
+        "config": config_path.read_bytes() if config_path.exists() else None,
     }
+
+
+def require_transaction_config_unchanged(
+    snapshot: dict[str, Any], operation: str
+) -> None:
+    config_path = snapshot["config_path"]
+    current = config_path.read_bytes() if config_path.exists() else None
+    if current != snapshot["config"]:
+        raise WorkflowError(f"the {operation} command changed local Git configuration")
 
 
 def clean_formatter_paths(
@@ -4627,6 +4654,12 @@ def clean_formatter_paths(
 def restore_formatter_workspace(
     workspace: Path, snapshot: dict[str, Any]
 ) -> None:
+    config_path = snapshot["config_path"]
+    if snapshot["config"] is None:
+        config_path.unlink(missing_ok=True)
+    else:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_bytes(snapshot["config"])
     in_progress = integration_in_progress(workspace)
     if in_progress:
         aborted = git_try(workspace, in_progress, "--abort")
@@ -4767,7 +4800,12 @@ def format_stack_member(
     require_clean_worktree(workspace)
     snapshot = formatter_workspace_snapshot(workspace)
     before_sha = git(workspace, "rev-parse", member["branch_ref"])
-    snapshot["refs"] = {member["branch_ref"]: before_sha}
+    snapshot["refs"] = {
+        plan_member["branch_ref"]: git(
+            workspace, "rev-parse", plan_member["branch_ref"]
+        )
+        for plan_member in stack.get("plan") or []
+    }
     try:
         if not snapshot["branch"] and snapshot["head"] != before_sha:
             raise WorkflowError(
@@ -4817,6 +4855,10 @@ def format_stack_member(
             raise WorkflowError(
                 "the formatter moved the formatting branch or created a commit"
             )
+        for ref, expected in snapshot["refs"].items():
+            if git(workspace, "rev-parse", ref) != expected:
+                raise WorkflowError(f"the formatter moved stack ref {ref!r}")
+        require_transaction_config_unchanged(snapshot, "formatter")
 
         changed_paths, unchanged_status = formatter_changed_paths(workspace)
         outside = sorted(changed_paths - allowed_paths)
@@ -4898,6 +4940,13 @@ def format_stack_member(
                     "the formatting commit changed files outside the current PR "
                     "layer: " + ", ".join(committed_outside)
                 )
+        for ref, expected in snapshot["refs"].items():
+            final_expected = after_sha if ref == member["branch_ref"] else expected
+            if git(workspace, "rev-parse", ref) != final_expected:
+                raise WorkflowError(
+                    f"the formatting commit moved stack ref {ref!r} unexpectedly"
+                )
+        require_transaction_config_unchanged(snapshot, "formatting commit")
         require_clean_worktree(workspace)
         checkpoint = record_formatting_checkpoint(
             stack,
@@ -5062,6 +5111,311 @@ def command_stack_format(args: argparse.Namespace) -> None:
     stack["formatting_index"] = index
     process = run_stack_cascade(workspace, stack, index + 1)
     finish_stack_rebase(state_path, state, attempt, workspace, process, "format")
+
+
+def stack_validation_fix_checkpoints(
+    stack: dict[str, Any],
+) -> list[dict[str, Any]]:
+    checkpoints = stack.get("validation_fix_checkpoints")
+    if not isinstance(checkpoints, list):
+        checkpoints = []
+        stack["validation_fix_checkpoints"] = checkpoints
+    return checkpoints
+
+
+def previous_validation_fix_checkpoint(
+    stack: dict[str, Any],
+    *,
+    current_sha: str,
+    paths: list[str],
+    rationale: str,
+    command: list[str],
+) -> dict[str, Any] | None:
+    checkpoints = stack_validation_fix_checkpoints(stack)
+    if not checkpoints:
+        return None
+    checkpoint = checkpoints[-1]
+    if (
+        checkpoint.get("after_sha") == current_sha
+        and checkpoint.get("paths") == paths
+        and checkpoint.get("rationale") == rationale
+        and checkpoint.get("command") == command
+    ):
+        return checkpoint
+    return None
+
+
+def command_stack_validation_fix(args: argparse.Namespace) -> None:
+    require_tools()
+    fix_command = list(args.fix_command)
+    if not fix_command:
+        raise WorkflowError("--fix-command requires an executable")
+    paths = list(
+        dict.fromkeys(normalize_companion_path(path) for path in args.paths)
+    )
+    if not paths:
+        raise WorkflowError("--paths requires at least one tracked file")
+    rationale = (
+        load_text_input(args.rationale_file, "rationale")
+        if args.rationale_file
+        else (args.rationale or "").strip()
+    )
+    if not rationale:
+        raise WorkflowError("validation fix rationale must not be empty")
+    state_path = cli_path(args.state)
+    state = load_state(state_path)
+    attempt = active_attempt(state)
+    if attempt.get("strategy") != "stack":
+        raise WorkflowError("this attempt is not a native-stack cascade")
+    if attempt["status"] != "resolved":
+        raise WorkflowError(
+            "validation fixes are allowed only after a stack cascade is resolved; "
+            f"this attempt is {attempt['status']}"
+        )
+    workspace = attempt_repo_root(state, attempt)
+    stack = attempt["stack"]
+    intended = stack.get("members_after")
+    plan = stack.get("plan") or []
+    if not intended or not plan:
+        raise WorkflowError(
+            "the resolved stack has no recorded member tips or cascade plan"
+        )
+    captured = validate_rebased_stack(workspace, stack)
+    if captured != intended:
+        raise WorkflowError(
+            "a stack branch moved after cascade validation; run stack-rebase again"
+        )
+    member = plan[-1]
+    before_sha = git(workspace, "rev-parse", member["branch_ref"])
+    if (
+        intended[-1].get("number") != member.get("number")
+        or intended[-1].get("head_sha") != before_sha
+    ):
+        raise WorkflowError(
+            "the final cascade member does not match the recorded publish tip"
+        )
+
+    require_no_integration_in_progress(workspace)
+    require_clean_worktree(workspace)
+    previous = previous_validation_fix_checkpoint(
+        stack,
+        current_sha=before_sha,
+        paths=paths,
+        rationale=rationale,
+        command=fix_command,
+    )
+    if previous is not None:
+        emit(
+            {
+                "result": "validation_fix_recorded",
+                "state": str(state_path),
+                "attempt": attempt_summary(attempt),
+                "checkpoint": previous,
+                "members_after": intended,
+                "next": "validate_then_stack-publish",
+            }
+        )
+        return
+    snapshot = formatter_workspace_snapshot(workspace)
+    snapshot["refs"] = {
+        plan_member["branch_ref"]: git(
+            workspace, "rev-parse", plan_member["branch_ref"]
+        )
+        for plan_member in plan
+    }
+    try:
+        if not snapshot["branch"] and snapshot["head"] != before_sha:
+            raise WorkflowError(
+                "the detached validation workspace is not at the final stack member"
+            )
+        if snapshot["branch"] != member["branch"]:
+            checkout = git_try(workspace, "checkout", member["branch"])
+            if checkout.returncode != 0:
+                detail = checkout.stderr.strip() or checkout.stdout.strip() or "no output"
+                raise WorkflowError(
+                    f"could not check out validation branch {member['branch']!r}: "
+                    f"{detail}"
+                )
+        if git(workspace, "rev-parse", "HEAD") != before_sha:
+            raise WorkflowError(
+                f"validation branch {member['branch']!r} is not checked out at its "
+                "recorded stack tip"
+            )
+        for path in paths:
+            if index_blob_oid(workspace, path) is None:
+                raise WorkflowError(
+                    "validation fix path must be a tracked file at the final stack "
+                    f"tip: {path}"
+                )
+
+        process = run(fix_command, cwd=workspace, check=False)
+        output = (process.stdout + process.stderr).strip()
+        attempt["validation_fix_last_run"] = {
+            "index": member["index"],
+            "number": member["number"],
+            "branch": member["branch"],
+            "paths": paths,
+            "rationale": rationale,
+            "command": fix_command,
+            "returncode": process.returncode,
+            "output": output,
+            "recorded_at": utc_now(),
+        }
+        save_state(state_path, state)
+        if process.returncode != 0:
+            raise WorkflowError(
+                f"the validation fix command failed for PR #{member['number']} "
+                f"(exit code {process.returncode}): {output or 'no output'}"
+            )
+        require_no_integration_in_progress(workspace)
+        if (
+            git(workspace, "branch", "--show-current") != member["branch"]
+            or git(workspace, "rev-parse", "HEAD") != before_sha
+        ):
+            raise WorkflowError(
+                "the validation fix command moved the final branch or created a commit"
+            )
+        for ref, expected in snapshot["refs"].items():
+            if git(workspace, "rev-parse", ref) != expected:
+                raise WorkflowError(
+                    f"the validation fix command moved stack ref {ref!r}"
+                )
+        require_transaction_config_unchanged(snapshot, "validation fix")
+
+        changed_paths, unchanged_status = formatter_changed_paths(workspace)
+        declared = set(paths)
+        if changed_paths != declared:
+            undeclared = sorted(changed_paths - declared)
+            unchanged = sorted(declared - changed_paths)
+            details = []
+            if undeclared:
+                details.append("undeclared changes: " + ", ".join(undeclared))
+            if unchanged:
+                details.append("declared paths unchanged: " + ", ".join(unchanged))
+            raise WorkflowError(
+                "the validation fix did not match its exact declared path set"
+                + (f" ({'; '.join(details)})" if details else "")
+            )
+        for path in paths:
+            target = workspace / Path(path)
+            if not target.is_file():
+                raise WorkflowError(
+                    f"validation fixes cannot add or delete files: {path}"
+                )
+            text = read_worktree_text(target)
+            if text is not None:
+                markers = parse_conflict_markers(text)
+                if markers["regions"] or markers["problems"]:
+                    raise WorkflowError(
+                        f"validation fix path still holds conflict markers: {path}"
+                    )
+        refresh_paths = sorted(unchanged_status - changed_paths)
+        if refresh_paths:
+            refresh = git_try(
+                workspace,
+                "add",
+                "--",
+                *(literal_pathspec(path) for path in refresh_paths),
+            )
+            if refresh.returncode != 0:
+                detail = refresh.stderr.strip() or refresh.stdout.strip() or "no output"
+                raise WorkflowError(
+                    f"could not refresh unchanged validation paths: {detail}"
+                )
+        add = git_try(
+            workspace,
+            "add",
+            "--",
+            *(literal_pathspec(path) for path in paths),
+        )
+        if add.returncode != 0:
+            detail = add.stderr.strip() or add.stdout.strip() or "no output"
+            raise WorkflowError(f"could not stage validation fixes: {detail}")
+        staged_paths = git_path_set(
+            workspace,
+            ["diff", "--cached", "--name-only", "-z"],
+            purpose="inspect staged validation fixes",
+        )
+        if staged_paths != declared:
+            raise WorkflowError(
+                "staged validation fixes do not match the declared path set"
+            )
+        commit = git_try(
+            workspace,
+            "commit",
+            "--message",
+            f"Fix stack validation for PR #{member['number']}",
+        )
+        if commit.returncode != 0:
+            detail = commit.stderr.strip() or commit.stdout.strip() or "no output"
+            raise WorkflowError(f"could not record validation fixes: {detail}")
+        after_sha = git(workspace, "rev-parse", member["branch_ref"])
+        if not is_ancestor(workspace, before_sha, after_sha):
+            raise WorkflowError(
+                "the validation fix commit is not based on the resolved stack tip"
+            )
+        committed_paths = git_path_set(
+            workspace,
+            [
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "-z",
+                before_sha,
+                after_sha,
+            ],
+            purpose="validate the validation fix commit",
+        )
+        if committed_paths != declared:
+            raise WorkflowError(
+                "the validation fix commit does not match the declared path set"
+            )
+        updated_intended = [dict(entry) for entry in intended]
+        updated_intended[-1]["head_sha"] = after_sha
+        if validate_rebased_stack(workspace, stack) != updated_intended:
+            raise WorkflowError(
+                "the validation fix changed the resolved stack unexpectedly"
+            )
+        for ref, expected in snapshot["refs"].items():
+            final_expected = after_sha if ref == member["branch_ref"] else expected
+            if git(workspace, "rev-parse", ref) != final_expected:
+                raise WorkflowError(
+                    f"validation fix commit moved stack ref {ref!r} unexpectedly"
+                )
+        require_transaction_config_unchanged(snapshot, "validation fix commit")
+        require_clean_worktree(workspace)
+        checkpoint = {
+            "index": member["index"],
+            "number": member["number"],
+            "branch": member["branch"],
+            "before_sha": before_sha,
+            "after_sha": after_sha,
+            "paths": paths,
+            "rationale": rationale,
+            "command": fix_command,
+            "recorded_at": utc_now(),
+        }
+        stack_validation_fix_checkpoints(stack).append(checkpoint)
+        stack["members_after"] = updated_intended
+        save_state(state_path, state)
+        result = {
+            "result": "validation_fix_recorded",
+            "state": str(state_path),
+            "attempt": attempt_summary(attempt),
+            "checkpoint": checkpoint,
+            "members_after": updated_intended,
+            "next": "validate_then_stack-publish",
+        }
+    except BaseException as error:
+        try:
+            restore_formatter_workspace(workspace, snapshot)
+        except Exception as rollback_error:
+            raise WorkflowError(
+                f"{error}; validation fix rollback also failed: {rollback_error}"
+            ) from error
+        raise
+    emit(result)
 
 
 def descendant_propagation_attempt(state: dict[str, Any]) -> dict[str, Any]:
@@ -5569,9 +5923,11 @@ def command_stack_abort(args: argparse.Namespace) -> None:
 
 
 def atomic_stack_push(
-    workspace: Path, stack: dict[str, Any]
+    workspace: Path, stack: dict[str, Any], expected_repo: str | None = None
 ) -> subprocess.CompletedProcess[str]:
     """Publish only stack members, atomically, with exact pre-cascade leases."""
+    if expected_repo is not None:
+        require_origin_push_repo(workspace, expected_repo)
     intended = stack.get("members_after") or []
     baseline = {
         member["head_branch"]: member["head_sha"] for member in stack["members"]
@@ -5588,6 +5944,23 @@ def atomic_stack_push(
         for member in intended
     )
     return run(command, check=False)
+
+
+def require_origin_push_repo(workspace: Path, repo_name: str) -> None:
+    result = git_try(workspace, "remote", "get-url", "--push", "--all", "origin")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WorkflowError(f"could not verify the origin push URL: {detail}")
+    urls = [line for line in result.stdout.splitlines() if line]
+    repositories = [github_repo_from_remote(url) for url in urls]
+    if len(repositories) != 1 or repositories[0] is None:
+        raise WorkflowError(
+            "origin must have exactly one GitHub push URL before stack publication"
+        )
+    if repositories[0].lower() != repo_name.lower():
+        raise WorkflowError(
+            f"origin push URL points to {repositories[0]}, expected {repo_name}"
+        )
 
 
 def stack_snapshot_key(stack: dict[str, Any]) -> tuple[Any, ...]:
@@ -5924,7 +6297,7 @@ def command_descendant_propagate(args: argparse.Namespace) -> None:
                 "pull requests outside the native stack began depending on branches "
                 f"the propagation would rewrite: {listed}"
             )
-        push = atomic_stack_push(workspace, partial)
+        push = atomic_stack_push(workspace, partial, pr["repo_name"])
         if push.returncode != 0 and not propagation_landed(pr, intended):
             detail = push.stderr.strip() or push.stdout.strip() or "no output"
             raise WorkflowError(f"atomic descendant propagation failed: {detail}")
@@ -6001,7 +6374,7 @@ def command_stack_publish(args: argparse.Namespace) -> None:
                 "was published"
             )
 
-        push = atomic_stack_push(workspace, stack)
+        push = atomic_stack_push(workspace, stack, pr["repo_name"])
         push_detail = push.stderr.strip() or push.stdout.strip() or "no output"
         mismatched = []
         for member in intended:
@@ -6313,7 +6686,7 @@ def command_cleanup(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = FormatterPassthroughArgumentParser(description=__doc__)
+    parser = CommandPassthroughArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     preflight = subparsers.add_parser(
@@ -6455,6 +6828,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stack_abort.add_argument("--state", required=True)
     stack_abort.set_defaults(function=command_stack_abort)
+
+    stack_validation_fix = subparsers.add_parser(
+        "stack-validation-fix",
+        help=(
+            "atomically record an explicit validation repair on the final stack "
+            "member"
+        ),
+    )
+    stack_validation_fix.add_argument("--state", required=True)
+    stack_validation_fix.add_argument("--paths", nargs="+", required=True)
+    validation_rationale = stack_validation_fix.add_mutually_exclusive_group(
+        required=True
+    )
+    validation_rationale.add_argument("--rationale")
+    validation_rationale.add_argument(
+        "--rationale-file", help="UTF-8 rationale file, or - for standard input"
+    )
+    stack_validation_fix.add_argument(
+        "--fix-command",
+        nargs="+",
+        required=True,
+        help=(
+            "executable and arguments that make the declared fixes in the cascade "
+            "workspace; this must be the last helper option because all remaining "
+            "arguments are passed through"
+        ),
+    )
+    stack_validation_fix.set_defaults(function=command_stack_validation_fix)
 
     stack_publish = subparsers.add_parser(
         "stack-publish",

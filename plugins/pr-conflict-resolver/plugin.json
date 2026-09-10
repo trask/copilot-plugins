@@ -1,7 +1,7 @@
 {
   "name": "pr-conflict-resolver",
   "description": "Resolve the merge conflicts on a pull request in one pass by keeping both sides' intent, then push the resolution.",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "author": {
     "name": "Trask Stalnaker"
   },
