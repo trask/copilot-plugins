@@ -73,6 +73,10 @@ class WorkflowError(RuntimeError):
     pass
 
 
+class MergedPredecessorLineageError(WorkflowError):
+    pass
+
+
 class FormatterPassthroughArgumentParser(argparse.ArgumentParser):
     def parse_args(
         self,
@@ -241,6 +245,50 @@ def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
         head_sha = member.get("headRefOid")
         base_sha = member.get("baseRefOid")
         state = member.get("state")
+        commits = member.get("commits")
+        commit_nodes = commits.get("nodes") if isinstance(commits, dict) else None
+        commit_page_info = (
+            commits.get("pageInfo") if isinstance(commits, dict) else None
+        )
+        commit_total = commits.get("totalCount") if isinstance(commits, dict) else None
+        commits_complete = (
+            isinstance(commit_page_info, dict)
+            and commit_page_info.get("hasNextPage") is False
+            and isinstance(commit_total, int)
+            and isinstance(commit_nodes, list)
+            and commit_total == len(commit_nodes)
+        )
+        if (
+            not isinstance(commit_nodes, list)
+            or not isinstance(commit_page_info, dict)
+            or not isinstance(commit_page_info.get("hasNextPage"), bool)
+            or not isinstance(commit_total, int)
+            or commit_total < len(commit_nodes)
+            or (
+                commit_page_info.get("hasNextPage") is False
+                and commit_total != len(commit_nodes)
+            )
+            or (
+                commit_page_info.get("hasNextPage") is True
+                and commit_total <= len(commit_nodes)
+            )
+        ):
+            raise WorkflowError(
+                f"native stack member #{number} has incomplete commit history"
+            )
+        commit_shas = []
+        for commit_node in commit_nodes:
+            commit = (
+                commit_node.get("commit")
+                if isinstance(commit_node, dict)
+                else None
+            )
+            commit_sha = commit.get("oid") if isinstance(commit, dict) else None
+            if not isinstance(commit_sha, str) or not commit_sha:
+                raise WorkflowError(
+                    f"native stack member #{number} has incomplete commit history"
+                )
+            commit_shas.append(commit_sha)
         timeline = member.get("timelineItems")
         events = timeline.get("nodes") if isinstance(timeline, dict) else None
         page_info = timeline.get("pageInfo") if isinstance(timeline, dict) else None
@@ -287,6 +335,8 @@ def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
                 "mergeable": member.get("mergeable"),
                 "head_sha": head_sha,
                 "base_sha": base_sha,
+                "commits": commit_shas,
+                "commits_complete": commits_complete,
                 "state": state,
                 "retargeted_from": retargeted_from,
                 "force_pushed": force_pushed,
@@ -408,6 +458,11 @@ def stack_membership(pr: dict[str, Any]) -> dict[str, Any]:
         "            position"
         "            pullRequest {"
         "              number headRefName baseRefName mergeable headRefOid baseRefOid state"
+        "              commits(first: $first) {"
+        "                totalCount"
+        "                pageInfo { hasNextPage }"
+        "                nodes { commit { oid } }"
+        "              }"
         "              timelineItems(first: $first, itemTypes: ["
         "                AUTOMATIC_BASE_CHANGE_SUCCEEDED_EVENT,"
         "                HEAD_REF_FORCE_PUSHED_EVENT"
@@ -2018,7 +2073,11 @@ def checkout_pr_branch(
 
 
 def planned_stack_attempt(
-    metadata: dict[str, Any], stack: dict[str, Any], attempt_number: int
+    metadata: dict[str, Any],
+    stack: dict[str, Any],
+    attempt_number: int,
+    fallback_strategy: dict[str, Any] | None = None,
+    fallback_requested_strategy: str = "auto",
 ) -> dict[str, Any]:
     """Build the planned attempt for a native-stack cascade.
 
@@ -2034,6 +2093,7 @@ def planned_stack_attempt(
             "mergeable": member.get("mergeable"),
             "head_sha": member["head_sha"],
             "base_sha": member["base_sha"],
+            "commits": list(member.get("commits") or []),
             "merged_predecessor": member.get("merged_predecessor"),
         }
         for member in stack["members"]
@@ -2048,6 +2108,8 @@ def planned_stack_attempt(
             "resolved by cascading a rebase through the trunk"
         ),
         "strategy_warnings": [],
+        "fallback_strategy": fallback_strategy,
+        "fallback_requested_strategy": fallback_requested_strategy,
         "head_sha": metadata["head_sha"],
         "base_sha": metadata["base_sha"],
         "merge_base": None,
@@ -2144,6 +2206,8 @@ def command_preflight(args: argparse.Namespace) -> None:
     state["merge_methods"] = merge_methods
     state["default_branch"] = default_branch
     state["stack"] = stack
+    state["push_blockers"] = push_blockers
+    state["external_dependents"] = external_dependents
 
     # Every preflight opens a new attempt and numbers it one higher than the last,
     # so an explicit re-invocation always starts a fresh one. The number is what
@@ -2229,7 +2293,13 @@ def command_preflight(args: argparse.Namespace) -> None:
         }
         state["attempt"] = attempt
     elif result == "stack_rebase":
-        state["attempt"] = planned_stack_attempt(metadata, stack, attempt_number)
+        state["attempt"] = planned_stack_attempt(
+            metadata,
+            stack,
+            attempt_number,
+            strategy_choice,
+            args.strategy,
+        )
     else:
         state["attempt"] = {
             "id": f"pr-{metadata['number']}-attempt-{attempt_number}",
@@ -2435,86 +2505,259 @@ def start_integration(
     )
 
 
+def require_owned_merge(repo_root: Path, attempt: dict[str, Any]) -> None:
+    head_sha = git(repo_root, "rev-parse", "HEAD")
+    merge_head = git(repo_root, "rev-parse", "MERGE_HEAD")
+    if head_sha != attempt["head_sha"] or merge_head != attempt["base_sha"]:
+        raise WorkflowError(
+            "refusing to resume an unrecognized merge: expected "
+            f"HEAD {attempt['head_sha']} and MERGE_HEAD {attempt['base_sha']}, "
+            f"found HEAD {head_sha} and MERGE_HEAD {merge_head}"
+        )
+
+
+def require_owned_rebase(repo_root: Path, attempt: dict[str, Any]) -> None:
+    values = {}
+    for name in ("orig-head", "onto"):
+        value = None
+        for directory in ("rebase-merge", "rebase-apply"):
+            location = git_try(
+                repo_root, "rev-parse", "--git-path", f"{directory}/{name}"
+            )
+            if location.returncode != 0:
+                continue
+            path = Path(location.stdout.strip())
+            if not path.is_absolute():
+                path = repo_root / path
+            if path.is_file():
+                try:
+                    value = path.read_text(encoding="utf-8").strip()
+                except OSError as error:
+                    raise WorkflowError(
+                        f"could not inspect the active rebase's {name}: {error}"
+                    ) from error
+                break
+        values[name] = value
+    if (
+        values["orig-head"] != attempt["head_sha"]
+        or values["onto"] != attempt["base_sha"]
+    ):
+        raise WorkflowError(
+            "refusing to resume an unrecognized rebase: expected "
+            f"orig-head {attempt['head_sha']} and onto {attempt['base_sha']}, "
+            f"found orig-head {values['orig-head']} and onto {values['onto']}"
+        )
+
+
+def require_owned_active_integration(
+    repo_root: Path, attempt: dict[str, Any]
+) -> str:
+    strategy = attempt.get("strategy")
+    if strategy not in {"merge", "rebase"}:
+        raise WorkflowError(
+            f"attempt strategy {strategy!r} does not own a single-branch integration"
+        )
+    active = integration_in_progress(repo_root)
+    if active != strategy:
+        detail = f"a {active} is active" if active else "no integration is active"
+        raise WorkflowError(
+            f"the recorded {strategy} cannot continue because {detail}"
+        )
+    if active == "merge":
+        require_owned_merge(repo_root, attempt)
+    else:
+        require_owned_rebase(repo_root, attempt)
+    return active
+
+
+def restartable_integration(repo_root: Path, attempt: dict[str, Any]) -> bool:
+    """Return whether the integration command left the checkout unchanged."""
+    if integration_in_progress(repo_root) is not None:
+        return False
+    if git(repo_root, "rev-parse", "HEAD") != attempt["head_sha"]:
+        return False
+    require_clean_worktree(repo_root)
+    return True
+
+
+def resume_integration(
+    repo_root: Path, attempt: dict[str, Any]
+) -> subprocess.CompletedProcess[str] | None:
+    """Recover an integration this attempt recorded before starting git."""
+    strategy = attempt["strategy"]
+    active = integration_in_progress(repo_root)
+    recorded_returncode = attempt.get("integration_returncode")
+    returncode = (
+        recorded_returncode if isinstance(recorded_returncode, int) else None
+    )
+
+    if active is not None and active != strategy:
+        raise WorkflowError(
+            f"refusing to resume: this attempt started a {strategy}, but git reports "
+            f"an active {active}"
+        )
+    if strategy == "merge" and active == "merge":
+        require_owned_merge(repo_root, attempt)
+        return subprocess.CompletedProcess(
+            args=["git", "merge"],
+            returncode=returncode if returncode is not None else 0,
+            stdout=str(attempt.get("command_output") or ""),
+            stderr="",
+        )
+    if strategy == "rebase" and active == "rebase":
+        require_owned_rebase(repo_root, attempt)
+        return subprocess.CompletedProcess(
+            args=["git", "rebase"],
+            returncode=returncode if returncode is not None else 1,
+            stdout=str(attempt.get("command_output") or ""),
+            stderr="",
+        )
+    if strategy == "rebase" and returncode == 0:
+        expected_head = attempt.get("integration_head_sha")
+        if not isinstance(expected_head, str) or not expected_head:
+            raise WorkflowError(
+                "the completed rebase has no recorded result commit; refusing to "
+                "adopt the current checkout"
+            )
+        require_clean_worktree(repo_root)
+        current_head = git(repo_root, "rev-parse", "HEAD")
+        if current_head != expected_head:
+            raise WorkflowError(
+                "refusing to resume the completed rebase: expected HEAD "
+                f"{expected_head}, found {current_head}"
+            )
+        return subprocess.CompletedProcess(
+            args=["git", "rebase"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+    if restartable_integration(repo_root, attempt):
+        return None
+    raise WorkflowError(
+        f"could not prove the helper-started {strategy} is still active, complete, "
+        "or safe to restart"
+    )
+
+
+def abort_failed_integration(repo_root: Path, attempt: dict[str, Any]) -> None:
+    active = integration_in_progress(repo_root)
+    if active is None:
+        return
+    if active != attempt["strategy"]:
+        raise WorkflowError(
+            f"the failed {attempt['strategy']} left an unrelated {active} active; "
+            "refusing to abort it"
+        )
+    if active == "merge":
+        require_owned_merge(repo_root, attempt)
+    else:
+        require_owned_rebase(repo_root, attempt)
+    process = git_try(repo_root, active, "--abort")
+    if process.returncode != 0:
+        detail = process.stderr.strip() or process.stdout.strip() or "no output"
+        raise WorkflowError(f"could not abort the failed {active}: {detail}")
+
+
 def command_attempt(args: argparse.Namespace) -> None:
     require_tools()
     state_path = cli_path(args.state)
     state = load_state(state_path)
     attempt = active_attempt(state)
-    if attempt["status"] != "planned":
+    if attempt["status"] not in {"planned", "integrating"}:
         raise WorkflowError(
             f"this attempt is already {attempt['status']}; run preflight to start "
             "the next one"
         )
+    if attempt["strategy"] not in {"merge", "rebase"}:
+        raise WorkflowError("preflight did not choose an integration strategy")
+
     repo_root = Path(state["repo_root"])
     pr = state["pr"]
-    require_clean_worktree(repo_root)
-    require_no_integration_in_progress(repo_root)
+    if attempt["status"] == "planned":
+        require_clean_worktree(repo_root)
+        require_no_integration_in_progress(repo_root)
 
-    stray = attached_to_other_branch(repo_root, pr["head_branch"])
-    if stray is not None:
-        raise WorkflowError(
-            f"branch mismatch: local {stray!r}, PR head {pr['head_branch']!r}"
-        )
-    local_head = git(repo_root, "rev-parse", "HEAD")
-    if local_head != attempt["head_sha"]:
-        raise WorkflowError(
-            f"HEAD mismatch: local {local_head}, pinned head {attempt['head_sha']}"
+        stray = attached_to_other_branch(repo_root, pr["head_branch"])
+        if stray is not None:
+            raise WorkflowError(
+                f"branch mismatch: local {stray!r}, PR head {pr['head_branch']!r}"
+            )
+        local_head = git(repo_root, "rev-parse", "HEAD")
+        if local_head != attempt["head_sha"]:
+            raise WorkflowError(
+                f"HEAD mismatch: local {local_head}, pinned head "
+                f"{attempt['head_sha']}"
+            )
+
+        upstream_repo = f"{pr['upstream_owner']}/{pr['upstream_repo']}"
+        remote = find_remote(repo_root, upstream_repo, push=False)
+        fetch_reference(repo_root, remote, pr["base_branch"], pr["base_sha"])
+        merge_base = git(repo_root, "merge-base", pr["base_sha"], attempt["head_sha"])
+        attempt["merge_base"] = merge_base
+        attempt["original_subjects"] = commit_subjects(
+            repo_root, f"{merge_base}..{attempt['head_sha']}"
         )
 
-    upstream_repo = f"{pr['upstream_owner']}/{pr['upstream_repo']}"
-    remote = find_remote(repo_root, upstream_repo, push=False)
-    fetch_reference(repo_root, remote, pr["base_branch"], pr["base_sha"])
-    merge_base = git(repo_root, "merge-base", pr["base_sha"], attempt["head_sha"])
-    attempt["merge_base"] = merge_base
-    attempt["original_subjects"] = commit_subjects(
-        repo_root, f"{merge_base}..{attempt['head_sha']}"
-    )
+        if is_ancestor(repo_root, pr["base_sha"], attempt["head_sha"]):
+            # The base tip is already contained in the head, so there is genuinely
+            # nothing to integrate. GitHub can report CONFLICTING against that
+            # topology, and a merge changing nothing would hide the contradiction.
+            attempt["status"] = "escalated"
+            escalation = record_escalation(
+                state,
+                kind="contradiction",
+                reason=(
+                    f"the base branch tip {pr['base_sha']} is already an ancestor of "
+                    f"the head {attempt['head_sha']}, so there is nothing to "
+                    f"integrate, yet GitHub reports {pr['head_branch']} as "
+                    f"conflicting with {pr['base_branch']}"
+                ),
+                recommended_action=(
+                    "a person must work out why GitHub still reports a conflict"
+                ),
+                attempt_number=attempt["attempt_number"],
+            )
+            archive_attempt(state)
+            save_state(state_path, state)
+            emit(
+                {
+                    "result": "already_integrated",
+                    "state": str(state_path),
+                    "attempt": attempt_summary(attempt),
+                    "escalation": escalation,
+                }
+            )
+            return
 
-    if is_ancestor(repo_root, pr["base_sha"], attempt["head_sha"]):
-        # The base tip is already contained in the head, so there is genuinely
-        # nothing to integrate. Deciding this from the merge afterwards would
-        # infer it from the merge changing nothing; asking git directly lets the
-        # escalation state the fact and name the two commits it compared. GitHub
-        # can report CONFLICTING against a base tip that is already an ancestor,
-        # and that stale flag is exactly what leaves this resolver with no work.
-        attempt["status"] = "escalated"
-        escalation = record_escalation(
-            state,
-            kind="contradiction",
-            reason=(
-                f"the base branch tip {pr['base_sha']} is already an ancestor of the "
-                f"head {attempt['head_sha']}, so there is nothing to integrate, yet "
-                f"GitHub reports {pr['head_branch']} as conflicting with "
-                f"{pr['base_branch']}"
-            ),
-            recommended_action="a person must work out why GitHub still reports a conflict",
-            attempt_number=attempt["attempt_number"],
-        )
-        archive_attempt(state)
+        attempt["status"] = "integrating"
+        attempt.pop("integration_returncode", None)
+        attempt.pop("command_output", None)
         save_state(state_path, state)
-        emit(
-            {
-                "result": "already_integrated",
-                "state": str(state_path),
-                "attempt": attempt_summary(attempt),
-                "escalation": escalation,
-            }
-        )
-        return
+        process = start_integration(repo_root, attempt, pr["base_sha"])
+    else:
+        process = resume_integration(repo_root, attempt)
+        if process is None:
+            process = start_integration(repo_root, attempt, attempt["base_sha"])
 
-    process = start_integration(repo_root, attempt, pr["base_sha"])
+    integration_head_sha = None
+    if attempt["strategy"] == "rebase" and process.returncode == 0:
+        integration_head_sha = git(repo_root, "rev-parse", "HEAD")
+    attempt["integration_returncode"] = process.returncode
+    attempt["command_output"] = (process.stdout + process.stderr).strip()
+    if integration_head_sha is not None:
+        attempt["integration_head_sha"] = integration_head_sha
+    save_state(state_path, state)
     conflicts = collect_conflicts(
         repo_root,
         head_sha=attempt["head_sha"],
         base_sha=pr["base_sha"],
-        merge_base=merge_base,
+        merge_base=attempt["merge_base"],
     )
     attempt["conflicts"] = conflicts
     attempt["conflict_signature"] = conflict_signature(
         conflict["path"] for conflict in conflicts
     )
-    attempt["command_output"] = (process.stdout + process.stderr).strip()
-
     if conflicts:
         attempt["status"] = "conflicted"
         save_state(state_path, state)
@@ -2530,6 +2773,10 @@ def command_attempt(args: argparse.Namespace) -> None:
         return
 
     if process.returncode != 0:
+        abort_failed_integration(repo_root, attempt)
+        attempt["status"] = "planned"
+        attempt.pop("integration_returncode", None)
+        save_state(state_path, state)
         detail = (process.stderr.strip() or process.stdout.strip() or "no output")
         raise WorkflowError(
             f"{attempt['strategy']} failed without leaving a conflicted file: {detail}"
@@ -2582,6 +2829,8 @@ def command_resolved(args: argparse.Namespace) -> None:
             f"no conflicted files are recorded for this attempt (status "
             f"{attempt['status']})"
         )
+    if not propagation and attempt.get("strategy") in {"merge", "rebase"}:
+        require_owned_active_integration(repo_root, attempt)
     conflicts = find_conflicts(attempt, args.paths)
     companion_paths = list(
         dict.fromkeys(
@@ -2797,6 +3046,8 @@ def command_continue(args: argparse.Namespace) -> None:
         return
     attempt = active_attempt(state)
     repo_root = Path(state["repo_root"])
+    if attempt.get("strategy") in {"merge", "rebase"}:
+        require_owned_active_integration(repo_root, attempt)
 
     unresolved = [
         conflict["path"]
@@ -2904,10 +3155,14 @@ def command_abort(args: argparse.Namespace) -> None:
     attempt = state.get("attempt")
     repo_root = Path(state["repo_root"])
     in_progress = integration_in_progress(repo_root)
-    if in_progress == "rebase":
-        run(["git", "-C", str(repo_root), "rebase", "--abort"])
-    elif in_progress == "merge":
-        run(["git", "-C", str(repo_root), "merge", "--abort"])
+    if in_progress:
+        if not attempt or attempt.get("status") not in {"integrating", "conflicted"}:
+            raise WorkflowError(
+                f"refusing to abort an unrecognized {in_progress} without an active "
+                "helper-started integration"
+            )
+        require_owned_active_integration(repo_root, attempt)
+        run(["git", "-C", str(repo_root), in_progress, "--abort"])
     if attempt is not None and attempt.get("status") not in {"published"}:
         attempt["status"] = "aborted"
         archive_attempt(state)
@@ -3635,6 +3890,58 @@ def recover_rewritten_parent_boundary(
     return boundary
 
 
+def recover_merged_predecessor_boundary(
+    workspace: Path, member: dict[str, Any], predecessor: dict[str, Any]
+) -> str:
+    """Choose a predecessor boundary only when the complete child range is known."""
+    merge_sha = predecessor.get("merge_sha")
+    if merge_sha != member["base_sha"]:
+        raise WorkflowError(
+            f"merged predecessor pull request #{predecessor['number']} does not "
+            f"match historical base {member['base_sha']}"
+        )
+    original_head = predecessor["head_sha"]
+    child_sha = member["head_sha"]
+    if is_ancestor(workspace, original_head, child_sha):
+        return original_head
+
+    if member.get("commits_complete") is not True:
+        detail = (
+            "GitHub did not expose its complete pull request commit list, so the "
+            "exact merge-result boundary cannot be proved"
+        )
+    elif is_ancestor(workspace, merge_sha, child_sha):
+        actual_commits = [
+            line
+            for line in git(
+                workspace,
+                "rev-list",
+                "--reverse",
+                "--topo-order",
+                f"{merge_sha}..{child_sha}",
+            ).splitlines()
+            if line
+        ]
+        recorded_commits = member.get("commits")
+        if (
+            isinstance(recorded_commits, list)
+            and recorded_commits
+            and actual_commits == recorded_commits
+        ):
+            return merge_sha
+        detail = (
+            "the complete commit range above its merge result does not match "
+            "GitHub's recorded pull request commits"
+        )
+    else:
+        detail = "its exact merge result is not an ancestor of the child"
+    raise MergedPredecessorLineageError(
+        f"the original head {original_head} of merged predecessor pull request "
+        f"#{predecessor['number']} is not an ancestor of {member['head_branch']!r}, "
+        f"and {detail}"
+    )
+
+
 def prepare_stack_cascade(
     workspace: Path, stack: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -3690,18 +3997,9 @@ def prepare_stack_cascade(
             old_base = parent_sha
         elif index == 0 and member.get("merged_predecessor") is not None:
             predecessor = member["merged_predecessor"]
-            old_base = predecessor["head_sha"]
-            if predecessor.get("merge_sha") != member["base_sha"]:
-                raise WorkflowError(
-                    f"merged predecessor pull request #{predecessor['number']} does not "
-                    f"match historical base {member['base_sha']}"
-                )
-            if not is_ancestor(workspace, old_base, child_sha):
-                raise WorkflowError(
-                    f"the original head {old_base} of merged predecessor pull request "
-                    f"#{predecessor['number']} is not an ancestor of "
-                    f"{member['head_branch']!r}"
-                )
+            old_base = recover_merged_predecessor_boundary(
+                workspace, member, predecessor
+            )
         else:
             historical_base = member["base_sha"]
             try:
@@ -4577,6 +4875,125 @@ def command_descendant_format(
     )
 
 
+def singleton_merge_fallback_eligible(
+    state: dict[str, Any], attempt: dict[str, Any]
+) -> bool:
+    stack = attempt.get("stack")
+    fallback = attempt.get("fallback_strategy")
+    relations = state.get("relations")
+    pr = state.get("pr")
+    if (
+        not isinstance(stack, dict)
+        or not isinstance(fallback, dict)
+        or fallback.get("strategy") != "merge"
+        or not isinstance(relations, dict)
+        or not isinstance(pr, dict)
+        or state.get("push_blockers") != []
+        or state.get("external_dependents") != []
+        or relations.get("stacked_on") is not None
+        or relations.get("dependents") != []
+        or stack.get("size") != 1
+        or len(stack.get("members") or []) != 1
+        or stack.get("invoked_number") != pr.get("number")
+        or stack["members"][0].get("number") != pr.get("number")
+        or stack.get("trunk") != state.get("default_branch")
+        or pr.get("base_branch") != state.get("default_branch")
+    ):
+        return False
+    return True
+
+
+def refresh_singleton_merge_fallback(
+    state: dict[str, Any], attempt: dict[str, Any]
+) -> None:
+    """Refresh every remote guard before discarding the native-stack plan."""
+    frozen_pr = state["pr"]
+    current_pr = metadata_for(parse_target(frozen_pr["pr_url"]))
+    require_open_pull_request(current_pr)
+    stable_fields = (
+        "number",
+        "head_owner",
+        "head_repo",
+        "head_branch",
+        "head_sha",
+        "base_branch",
+        "base_sha",
+    )
+    changed = [
+        field
+        for field in stable_fields
+        if current_pr.get(field) != frozen_pr.get(field)
+    ]
+    if changed:
+        raise WorkflowError(
+            "the pull request changed before the single-branch fallback: "
+            + ", ".join(changed)
+        )
+
+    frozen_stack = attempt["stack"]
+    detection = stack_membership(current_pr)
+    current_stack = detection.get("stack")
+    if detection.get("default_branch") != state.get("default_branch"):
+        raise WorkflowError(
+            "the repository default branch changed before the single-branch fallback"
+        )
+    if (
+        current_stack is None
+        or stack_snapshot_key(current_stack) != stack_snapshot_key(frozen_stack)
+    ):
+        raise WorkflowError(
+            "the native stack changed before the single-branch fallback"
+        )
+
+    relations = stack_relations(current_pr)
+    merge_methods = repository_merge_methods(current_pr["repo_name"])
+    state["pr"] = current_pr
+    state["default_branch"] = detection["default_branch"]
+    state["relations"] = relations
+    state["merge_methods"] = merge_methods
+    state["push_blockers"] = push_safety_blockers(current_pr, relations)
+    state["external_dependents"] = external_stack_dependents(
+        current_pr, current_stack
+    )
+    attempt["stack"] = current_stack
+    attempt["fallback_strategy"] = choose_strategy(
+        attempt["fallback_requested_strategy"],
+        merge_methods=merge_methods,
+        relations=relations,
+    )
+
+
+def configure_singleton_merge_fallback(
+    state: dict[str, Any],
+    attempt: dict[str, Any],
+    error: MergedPredecessorLineageError,
+) -> bool:
+    """Convert one isolated default-branch stack member to a guarded merge."""
+    if not singleton_merge_fallback_eligible(state, attempt):
+        return False
+    stack = attempt["stack"]
+    fallback = attempt["fallback_strategy"]
+
+    attempt["stack_fallback"] = {
+        "stack_number": stack.get("number"),
+        "reason": str(error),
+    }
+    attempt.pop("stack", None)
+    attempt.pop("fallback_strategy", None)
+    attempt.pop("fallback_requested_strategy", None)
+    attempt["status"] = "planned"
+    attempt["strategy"] = "merge"
+    attempt["strategy_reason"] = (
+        "the isolated native-stack member has unrecoverable predecessor lineage; "
+        "a merge into its default-branch base keeps the existing commits reachable"
+    )
+    attempt["strategy_warnings"] = list(fallback.get("warnings") or [])
+    attempt["merge_base"] = None
+    attempt["conflicts"] = []
+    attempt["conflict_signature"] = None
+    return True
+
+
 def command_stack_rebase(args: argparse.Namespace) -> None:
     require_tools()
     state_path = cli_path(args.state)
@@ -4630,6 +5047,24 @@ def command_stack_rebase(args: argparse.Namespace) -> None:
 
     try:
         prepare_stack_cascade(workspace, stack)
+    except MergedPredecessorLineageError as error:
+        remove_stack_workspace(attempt)
+        if singleton_merge_fallback_eligible(state, attempt):
+            refresh_singleton_merge_fallback(state, attempt)
+        if configure_singleton_merge_fallback(state, attempt, error):
+            save_state(state_path, state)
+            emit(
+                {
+                    "result": "single_branch_fallback",
+                    "state": str(state_path),
+                    "attempt": attempt_summary(attempt),
+                    "reason": str(error),
+                    "next": "attempt",
+                }
+            )
+            return
+        save_state(state_path, state)
+        raise
     except WorkflowError:
         remove_stack_workspace(attempt)
         save_state(state_path, state)
@@ -5330,11 +5765,10 @@ def stage_outcome(state: dict[str, Any] | None) -> str | None:
     disagreement between the two is this field being wrong rather than the live
     answer being wrong.
 
-    Only an ending some command actually recorded gets a word. Nothing here is
-    inferred from the shape of the state, because `preflight` writes the state before
-    any work happens, so a run killed at any point leaves a state byte-identical to
-    one still going. Reading a mid-flight state as a failed run is not detecting a
-    crash; the information to tell those apart was never written.
+    Only an ending some command actually recorded gets a word. The `planned` and
+    `integrating` states are resumable work, not endings. A caller cannot tell from
+    either state whether the process is still running or waiting for another helper
+    call, so reading one as failure would turn recoverable work into an escalation.
 
     That distinction decides who wins a disagreement. A caller prefers this word over
     its own reading, on the grounds that the run watched itself. That holds for a

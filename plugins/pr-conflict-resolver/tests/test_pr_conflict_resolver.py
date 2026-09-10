@@ -394,6 +394,30 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertIn("git show <sha>", self.instructions)
 
+    def test_documents_recoverable_helper_interruptions_and_stack_fallbacks(self):
+        self.assertIn(
+            "records `integrating` before it starts git", self.instructions
+        )
+        self.assertIn(
+            "`HEAD` and `MERGE_HEAD` match the frozen attempt",
+            self.instructions,
+        )
+        self.assertIn(
+            "`orig-head` and `onto` match",
+            self.instructions,
+        )
+        self.assertIn(
+            "complete ordered range above it equals GitHub's complete recorded "
+            "commit list",
+            self.instructions,
+        )
+        self.assertIn("reports `single_branch_fallback`", self.instructions)
+        self.assertIn(
+            "If it reports `single_branch_fallback`, run `attempt` with the same "
+            "state.",
+            self.instructions,
+        )
+
     def test_scans_all_replayed_paths_for_api_migrations(self):
         self.assertIn("### Checking API migrations", self.instructions)
         self.assertIn(
@@ -2705,7 +2729,13 @@ class PreflightTest(unittest.TestCase):
         )
 
 
-def fake_git(head="head1", branch="feature", merge_base="merge0", heads=None):
+def fake_git(
+    head="head1",
+    branch="feature",
+    merge_base="merge0",
+    merge_head="base1",
+    heads=None,
+):
     remaining = list(heads) if heads else None
 
     def call(_root, *arguments):
@@ -2715,6 +2745,8 @@ def fake_git(head="head1", branch="feature", merge_base="merge0", heads=None):
             if remaining:
                 return remaining.pop(0)
             return head
+        if arguments[:2] == ("rev-parse", "MERGE_HEAD"):
+            return merge_head
         if arguments[0] == "merge-base":
             return merge_base
         raise AssertionError(f"unexpected git call: {arguments}")
@@ -2737,6 +2769,7 @@ class AttemptTest(unittest.TestCase):
         **state_overrides,
     ):
         state_path = write_state(self.directory, **state_overrides)
+        self.state_path = state_path
         args = SimpleNamespace(state=str(state_path))
         with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
             MODULE, "require_clean_worktree"
@@ -2759,10 +2792,13 @@ class AttemptTest(unittest.TestCase):
         ), mock.patch.object(
             MODULE, "merge_in_progress", return_value=merging
         ), mock.patch.object(
+            MODULE, "rebase_in_progress", return_value=False
+        ), mock.patch.object(
+            MODULE, "git_try", return_value=completed(0)
+        ), mock.patch.object(
             MODULE, "emit"
         ) as emit:
             MODULE.command_attempt(args)
-        self.state_path = state_path
         self.fetch = fetch
         self.start = start
         return emitted(emit)
@@ -2836,7 +2872,51 @@ class AttemptTest(unittest.TestCase):
         )
         self.assertEqual("no_conflicts", payload["result"])
         self.assertEqual("publish", payload["next"])
-        self.assertEqual("resolved", self.saved()["attempt"]["status"])
+        saved = self.saved()["attempt"]
+        self.assertEqual("resolved", saved["status"])
+        self.assertEqual("rebased1", saved["integration_head_sha"])
+
+    def test_a_successful_rebase_checkpoints_its_result_atomically(self):
+        state_path = write_state(
+            self.directory, attempt=self.planned(strategy="rebase")
+        )
+        real_save_state = MODULE.save_state
+        save_count = 0
+
+        def interrupted_save(path, state):
+            nonlocal save_count
+            save_count += 1
+            real_save_state(path, state)
+            if save_count == 2:
+                raise MODULE.WorkflowError("interrupted after checkpoint")
+
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "require_clean_worktree"
+        ), mock.patch.object(
+            MODULE, "require_no_integration_in_progress"
+        ), mock.patch.object(
+            MODULE, "git", side_effect=fake_git(heads=["head1", "rebased1"])
+        ), mock.patch.object(
+            MODULE, "find_remote", return_value="origin"
+        ), mock.patch.object(
+            MODULE, "fetch_reference"
+        ), mock.patch.object(
+            MODULE, "commit_subjects", return_value=["Add a thing"]
+        ), mock.patch.object(
+            MODULE, "is_ancestor", return_value=False
+        ), mock.patch.object(
+            MODULE, "start_integration", return_value=completed(0)
+        ), mock.patch.object(
+            MODULE, "save_state", side_effect=interrupted_save
+        ):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "interrupted after checkpoint"
+            ):
+                MODULE.command_attempt(SimpleNamespace(state=str(state_path)))
+
+        saved = json.loads(state_path.read_text(encoding="utf-8"))["attempt"]
+        self.assertEqual(0, saved["integration_returncode"])
+        self.assertEqual("rebased1", saved["integration_head_sha"])
 
     def test_a_base_already_in_the_head_escalates_as_a_contradiction(self):
         # is_ancestor is decided before the merge runs, so a merge that would
@@ -2874,6 +2954,152 @@ class AttemptTest(unittest.TestCase):
     def test_a_failure_with_no_conflicted_file_is_reported(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "without leaving a conflicted file"):
             self.attempt(process=completed(128, "", "fatal: bad object"), attempt=self.planned())
+        self.assertEqual("planned", self.saved()["attempt"]["status"])
+
+    def test_an_interrupted_status_read_preserves_a_started_merge_for_retry(self):
+        state_path = write_state(self.directory, attempt=self.planned())
+        args = SimpleNamespace(state=str(state_path))
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "require_clean_worktree"
+        ), mock.patch.object(
+            MODULE, "require_no_integration_in_progress"
+        ), mock.patch.object(
+            MODULE, "git", side_effect=fake_git()
+        ), mock.patch.object(
+            MODULE, "find_remote", return_value="origin"
+        ), mock.patch.object(
+            MODULE, "fetch_reference"
+        ), mock.patch.object(
+            MODULE, "commit_subjects", return_value=["Add a thing"]
+        ), mock.patch.object(
+            MODULE, "is_ancestor", return_value=False
+        ), mock.patch.object(
+            MODULE, "start_integration", return_value=completed(1, "", "CONFLICT")
+        ), mock.patch.object(
+            MODULE,
+            "collect_conflicts",
+            side_effect=MODULE.WorkflowError("could not read status"),
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "could not read status"):
+                MODULE.command_attempt(args)
+
+        saved = json.loads(state_path.read_text(encoding="utf-8"))["attempt"]
+        self.assertEqual("integrating", saved["status"])
+        self.assertEqual(1, saved["integration_returncode"])
+        self.assertEqual("CONFLICT", saved["command_output"])
+
+    def test_a_retry_resumes_the_exact_helper_started_merge(self):
+        attempt = self.planned()
+        attempt.update(
+            status="integrating",
+            integration_returncode=1,
+            command_output="CONFLICT",
+        )
+        state_path = write_state(self.directory, attempt=attempt)
+        args = SimpleNamespace(state=str(state_path))
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "git", side_effect=fake_git()
+        ), mock.patch.object(
+            MODULE, "merge_in_progress", return_value=True
+        ), mock.patch.object(
+            MODULE, "rebase_in_progress", return_value=False
+        ), mock.patch.object(
+            MODULE, "start_integration"
+        ) as start, mock.patch.object(
+            MODULE, "collect_conflicts", return_value=[conflict_record()]
+        ), mock.patch.object(
+            MODULE, "emit"
+        ) as emit:
+            MODULE.command_attempt(args)
+
+        start.assert_not_called()
+        self.assertEqual("conflicted", emitted(emit)["result"])
+        saved = json.loads(state_path.read_text(encoding="utf-8"))["attempt"]
+        self.assertEqual("conflicted", saved["status"])
+        self.assertEqual("CONFLICT", saved["command_output"])
+
+    def test_a_retry_rejects_a_different_active_merge(self):
+        attempt = self.planned()
+        attempt.update(
+            status="integrating",
+            integration_returncode=1,
+            command_output="CONFLICT",
+        )
+        state_path = write_state(self.directory, attempt=attempt)
+        args = SimpleNamespace(state=str(state_path))
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "git", side_effect=fake_git(merge_head="other-base")
+        ), mock.patch.object(
+            MODULE, "merge_in_progress", return_value=True
+        ), mock.patch.object(
+            MODULE, "rebase_in_progress", return_value=False
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "MERGE_HEAD base1"):
+                MODULE.command_attempt(args)
+
+    def test_a_retry_checks_the_active_rebase_before_resuming_it(self):
+        attempt = self.planned(strategy="rebase")
+        attempt.update(
+            status="integrating",
+            integration_returncode=1,
+            command_output="CONFLICT",
+        )
+        state_path = write_state(self.directory, attempt=attempt)
+        args = SimpleNamespace(state=str(state_path))
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "git", side_effect=fake_git()
+        ), mock.patch.object(
+            MODULE, "merge_in_progress", return_value=False
+        ), mock.patch.object(
+            MODULE, "rebase_in_progress", return_value=True
+        ), mock.patch.object(
+            MODULE, "require_owned_rebase"
+        ) as require_owned, mock.patch.object(
+            MODULE, "start_integration"
+        ) as start, mock.patch.object(
+            MODULE, "collect_conflicts", return_value=[conflict_record()]
+        ), mock.patch.object(
+            MODULE, "emit"
+        ):
+            MODULE.command_attempt(args)
+
+        require_owned.assert_called_once()
+        self.assertEqual(self.directory, require_owned.call_args.args[0])
+        self.assertEqual("head1", require_owned.call_args.args[1]["head_sha"])
+        self.assertEqual("base1", require_owned.call_args.args[1]["base_sha"])
+        start.assert_not_called()
+
+    def test_a_retry_rejects_an_unrecorded_completed_rebase(self):
+        attempt = self.planned(strategy="rebase")
+        attempt.update(status="integrating", integration_returncode=0)
+        state_path = write_state(self.directory, attempt=attempt)
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "merge_in_progress", return_value=False
+        ), mock.patch.object(
+            MODULE, "rebase_in_progress", return_value=False
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "no recorded result commit"):
+                MODULE.command_attempt(SimpleNamespace(state=str(state_path)))
+
+    def test_a_retry_rejects_a_different_completed_rebase_head(self):
+        attempt = self.planned(strategy="rebase")
+        attempt.update(
+            status="integrating",
+            integration_returncode=0,
+            integration_head_sha="rebased1",
+        )
+        state_path = write_state(self.directory, attempt=attempt)
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "require_clean_worktree"
+        ), mock.patch.object(
+            MODULE, "git", return_value="other-head"
+        ), mock.patch.object(
+            MODULE, "merge_in_progress", return_value=False
+        ), mock.patch.object(
+            MODULE, "rebase_in_progress", return_value=False
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "expected HEAD rebased1"):
+                MODULE.command_attempt(SimpleNamespace(state=str(state_path)))
 
     def test_an_attempt_that_already_ran_is_refused(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "already conflicted"):
@@ -2918,6 +3144,24 @@ class StartIntegrationTest(unittest.TestCase):
         self.assertEqual("true", environment["GIT_SEQUENCE_EDITOR"])
 
 
+class RequireOwnedRebaseTest(unittest.TestCase):
+    def test_the_rebase_metadata_must_match_the_frozen_attempt(self):
+        directory = temporary_directory(self)
+        rebase = directory / "rebase-merge"
+        rebase.mkdir()
+        (rebase / "orig-head").write_text("other-head\n", encoding="utf-8")
+        (rebase / "onto").write_text("base1\n", encoding="utf-8")
+
+        def path_lookup(_repo_root, *_args):
+            return completed(0, str(directory / _args[-1]))
+
+        with mock.patch.object(MODULE, "git_try", side_effect=path_lookup):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "unrecognized rebase"):
+                MODULE.require_owned_rebase(
+                    directory, attempt_record(head_sha="head1", base_sha="base1")
+                )
+
+
 class ResolvedTest(unittest.TestCase):
     def setUp(self):
         self.directory = temporary_directory(self)
@@ -2957,11 +3201,14 @@ class ResolvedTest(unittest.TestCase):
         ), mock.patch.object(
             MODULE, "git_try", return_value=add or completed(0)
         ) as git_try, mock.patch.object(
+            MODULE, "require_owned_active_integration"
+        ) as require_owned, mock.patch.object(
             MODULE, "emit"
         ) as emit:
             MODULE.command_resolved(args)
         self.state_path = state_path
         self.git_try = git_try
+        self.require_owned = require_owned
         return emitted(emit)
 
     def saved(self):
@@ -2984,6 +3231,7 @@ class ResolvedTest(unittest.TestCase):
             ("add", "--all", "--", ":(literal)app.py"),
             self.git_try.call_args[0][1:],
         )
+        self.require_owned.assert_called_once()
 
     def test_resolved_records_files_for_descendant_propagation_state(self):
         self.write("app.py", b"ours\ntheirs\n")
@@ -3460,6 +3708,8 @@ class CompanionPathIntegrationTest(unittest.TestCase):
             repo_root=str(self.repo),
             attempt=attempt_record(
                 strategy="rebase",
+                head_sha=self.git("rev-parse", "REBASE_HEAD"),
+                base_sha=self.git("rev-parse", "main"),
                 conflicts=[
                     conflict_record(
                         "legacy.py",
@@ -3533,6 +3783,8 @@ class ContinueTest(unittest.TestCase):
         with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
             MODULE, "unmerged_entries", return_value=[{"path": path} for path in unmerged]
         ), mock.patch.object(
+            MODULE, "require_owned_active_integration"
+        ) as require_owned, mock.patch.object(
             MODULE, "merge_in_progress", return_value=merging
         ), mock.patch.object(
             MODULE, "git_try", return_value=commit or completed(0)
@@ -3551,6 +3803,7 @@ class ContinueTest(unittest.TestCase):
         self.state_path = state_path
         self.git_try = git_try
         self.runner = runner
+        self.require_owned = require_owned
         return emitted(emit)
 
     def saved(self):
@@ -3563,6 +3816,7 @@ class ContinueTest(unittest.TestCase):
         self.assertEqual("publish", payload["next"])
         self.assertEqual("resolved", self.saved()["attempt"]["status"])
         self.assertEqual("commit", self.git_try.call_args[0][1])
+        self.require_owned.assert_called_once()
 
     def test_the_merge_message_is_written_to_a_temporary_file_that_is_removed(self):
         self.run_continue(
@@ -3850,11 +4104,14 @@ class AbortTest(unittest.TestCase):
         with mock.patch.object(
             MODULE, "integration_in_progress", return_value=in_progress
         ), mock.patch.object(MODULE, "run") as runner, mock.patch.object(
+            MODULE, "require_owned_active_integration"
+        ) as require_owned, mock.patch.object(
             MODULE, "git", return_value="head1"
         ), mock.patch.object(MODULE, "emit") as emit:
             MODULE.command_abort(args)
         self.state_path = state_path
         self.runner = runner
+        self.require_owned = require_owned
         return emitted(emit)
 
     def saved(self):
@@ -3868,6 +4125,7 @@ class AbortTest(unittest.TestCase):
         state = self.saved()
         self.assertIsNone(state["attempt"])
         self.assertEqual("aborted", state["history"][0]["status"])
+        self.require_owned.assert_called_once()
 
     def test_an_in_progress_rebase_is_undone(self):
         payload = self.abort(in_progress="rebase")
@@ -3887,6 +4145,33 @@ class AbortTest(unittest.TestCase):
     def test_aborting_with_no_attempt_is_harmless(self):
         payload = self.abort(attempt=None)
         self.assertEqual("aborted", payload["result"])
+
+    def test_an_unrecognized_active_integration_is_not_aborted(self):
+        state_path = write_state(self.directory, attempt=None)
+        with mock.patch.object(
+            MODULE, "integration_in_progress", return_value="merge"
+        ), mock.patch.object(MODULE, "run") as runner:
+            with self.assertRaisesRegex(MODULE.WorkflowError, "unrecognized merge"):
+                MODULE.command_abort(SimpleNamespace(state=str(state_path)))
+        runner.assert_not_called()
+
+    def test_a_planned_attempt_does_not_own_a_matching_active_merge(self):
+        state_path = write_state(
+            self.directory, attempt=attempt_record(status="planned")
+        )
+        with mock.patch.object(
+            MODULE, "integration_in_progress", return_value="merge"
+        ), mock.patch.object(
+            MODULE, "require_owned_active_integration"
+        ) as require_owned, mock.patch.object(
+            MODULE, "run"
+        ) as runner:
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "helper-started integration"
+            ):
+                MODULE.command_abort(SimpleNamespace(state=str(state_path)))
+        require_owned.assert_not_called()
+        runner.assert_not_called()
 
 
 class EscalateTest(unittest.TestCase):
@@ -4753,7 +5038,11 @@ class RealGitConflictTest(GitTestCase):
         state_path = write_state(
             state_directory,
             repo_root=str(self.repo),
-            attempt=attempt_record(conflicts=conflicts),
+            attempt=attempt_record(
+                head_sha=self.head_sha,
+                base_sha=self.base_sha,
+                conflicts=conflicts,
+            ),
         )
         self.write("app.py", "def greet():\n    return 'hello!'\n")
         with self.assertRaisesRegex(MODULE.WorkflowError, "byte-for-byte the base side"):
@@ -4781,7 +5070,11 @@ class RealGitConflictTest(GitTestCase):
         state_path = write_state(
             state_directory,
             repo_root=str(self.repo),
-            attempt=attempt_record(conflicts=conflicts),
+            attempt=attempt_record(
+                head_sha=self.head_sha,
+                base_sha=self.base_sha,
+                conflicts=conflicts,
+            ),
         )
         with self.assertRaisesRegex(MODULE.WorkflowError, "still holds conflict markers"):
             MODULE.command_resolved(
@@ -4799,7 +5092,11 @@ class RealGitConflictTest(GitTestCase):
     def test_aborting_restores_the_branch(self):
         self.start_merge()
         state_directory = temporary_directory(self)
-        state_path = write_state(state_directory, repo_root=str(self.repo))
+        state_path = write_state(
+            state_directory,
+            repo_root=str(self.repo),
+            attempt=attempt_record(head_sha=self.head_sha, base_sha=self.base_sha),
+        )
         with mock.patch.object(MODULE, "emit") as emit:
             MODULE.command_abort(SimpleNamespace(state=str(state_path)))
         payload = emitted(emit)
@@ -4985,7 +5282,10 @@ def stack_entry(
     retargeted_from=None,
     force_pushed=False,
     state="OPEN",
+    commit_oids=None,
 ):
+    head_oid = oid or f"oid{number}"
+    commit_oids = list(commit_oids or [head_oid])
     entry = {
         "position": position,
         "pullRequest": {
@@ -4993,9 +5293,16 @@ def stack_entry(
             "headRefName": head,
             "baseRefName": base,
             "mergeable": mergeable,
-            "headRefOid": oid or f"oid{number}",
+            "headRefOid": head_oid,
             "baseRefOid": base_oid or f"baseoid{number}",
             "state": state,
+            "commits": {
+                "totalCount": len(commit_oids),
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [
+                    {"commit": {"oid": commit_oid}} for commit_oid in commit_oids
+                ],
+            },
         },
     }
     events = []
@@ -5075,6 +5382,19 @@ class ParseStackTest(unittest.TestCase):
         entry = stack_entry(0, 7, "feature", "main", force_pushed=True)
         entry["pullRequest"]["timelineItems"]["pageInfo"]["hasNextPage"] = True
         with self.assertRaisesRegex(MODULE.WorkflowError, "incomplete branch history"):
+            MODULE.parse_stack(self.raw([entry]))
+
+    def test_paginated_commit_history_is_recorded_as_incomplete(self):
+        entry = stack_entry(0, 7, "feature", "main")
+        entry["pullRequest"]["commits"]["totalCount"] = 2
+        entry["pullRequest"]["commits"]["pageInfo"]["hasNextPage"] = True
+        stack = MODULE.parse_stack(self.raw([entry]))
+        self.assertFalse(stack["members"][0]["commits_complete"])
+
+    def test_a_commit_count_mismatch_is_rejected(self):
+        entry = stack_entry(0, 7, "feature", "main")
+        entry["pullRequest"]["commits"]["totalCount"] = 2
+        with self.assertRaisesRegex(MODULE.WorkflowError, "incomplete commit history"):
             MODULE.parse_stack(self.raw([entry]))
 
     def test_an_unreadable_member_is_a_hard_error(self):
@@ -5652,6 +5972,130 @@ class StackCascadePlanTest(unittest.TestCase):
             MODULE, "fetch_merged_predecessor"
         ):
             with self.assertRaisesRegex(MODULE.WorkflowError, "not an ancestor"):
+                MODULE.prepare_stack_cascade(Path("/workspace"), self.stack)
+
+    def test_a_retargeted_bottom_member_accepts_an_exact_merged_result_boundary(self):
+        member = self.stack["members"][0]
+        member["base_sha"] = "merged-lower"
+        member["commits"] = ["commit-a", "aaa"]
+        member["commits_complete"] = True
+        member["merged_predecessor"] = {
+            "number": 4,
+            "head_branch": "old-lower",
+            "head_sha": "old-lower-head",
+            "merge_sha": "merged-lower",
+        }
+        ancestry = {
+            ("base1", "aaa"): False,
+            ("old-lower-head", "aaa"): False,
+            ("merged-lower", "aaa"): True,
+            ("aaa", "head1"): True,
+        }
+
+        def git_call(_root, *args):
+            tips = {
+                "refs/remotes/origin/main": "base1",
+                "refs/remotes/origin/v143": "aaa",
+                "refs/remotes/origin/feature": "head1",
+            }
+            if args[0] == "rev-parse" and args[1] in tips:
+                return tips[args[1]]
+            if args[0] == "rev-list":
+                self.assertEqual(
+                    (
+                        "rev-list",
+                        "--reverse",
+                        "--topo-order",
+                        "merged-lower..aaa",
+                    ),
+                    args,
+                )
+                return "commit-a\naaa"
+            raise AssertionError(f"unexpected git call: {args}")
+
+        with mock.patch.object(MODULE, "git", side_effect=git_call), mock.patch.object(
+            MODULE,
+            "is_ancestor",
+            side_effect=lambda _root, left, right: ancestry.get((left, right), False),
+        ), mock.patch.object(MODULE, "git_try", return_value=completed(0)), mock.patch.object(
+            MODULE, "fetch_merged_predecessor"
+        ):
+            plan = MODULE.prepare_stack_cascade(Path("/workspace"), self.stack)
+
+        self.assertEqual("merged-lower", plan[0]["old_base"])
+
+    def test_a_merged_result_boundary_requires_the_exact_recorded_commit_range(self):
+        member = self.stack["members"][0]
+        member["base_sha"] = "merged-lower"
+        member["commits"] = ["commit-a", "aaa"]
+        member["commits_complete"] = True
+        member["merged_predecessor"] = {
+            "number": 4,
+            "head_branch": "old-lower",
+            "head_sha": "old-lower-head",
+            "merge_sha": "merged-lower",
+        }
+
+        def git_call(_root, *args):
+            tips = {
+                "refs/remotes/origin/main": "base1",
+                "refs/remotes/origin/v143": "aaa",
+                "refs/remotes/origin/feature": "head1",
+            }
+            if args[0] == "rev-parse" and args[1] in tips:
+                return tips[args[1]]
+            if args[0] == "rev-list":
+                return "commit-a\nextra\naaa"
+            raise AssertionError(f"unexpected git call: {args}")
+
+        with mock.patch.object(MODULE, "git", side_effect=git_call), mock.patch.object(
+            MODULE,
+            "is_ancestor",
+            side_effect=lambda _root, left, right: (left, right)
+            == ("merged-lower", "aaa"),
+        ), mock.patch.object(MODULE, "git_try", return_value=completed(0)), mock.patch.object(
+            MODULE, "fetch_merged_predecessor"
+        ):
+            with self.assertRaisesRegex(
+                MODULE.MergedPredecessorLineageError,
+                "complete commit range",
+            ):
+                MODULE.prepare_stack_cascade(Path("/workspace"), self.stack)
+
+    def test_a_merged_result_boundary_requires_a_complete_github_commit_list(self):
+        member = self.stack["members"][0]
+        member["base_sha"] = "merged-lower"
+        member["commits"] = ["commit-a"]
+        member["commits_complete"] = False
+        member["merged_predecessor"] = {
+            "number": 4,
+            "head_branch": "old-lower",
+            "head_sha": "old-lower-head",
+            "merge_sha": "merged-lower",
+        }
+
+        def git_call(_root, *args):
+            tips = {
+                "refs/remotes/origin/main": "base1",
+                "refs/remotes/origin/v143": "aaa",
+                "refs/remotes/origin/feature": "head1",
+            }
+            if args[0] == "rev-parse" and args[1] in tips:
+                return tips[args[1]]
+            raise AssertionError(f"unexpected git call: {args}")
+
+        with mock.patch.object(MODULE, "git", side_effect=git_call), mock.patch.object(
+            MODULE,
+            "is_ancestor",
+            side_effect=lambda _root, left, right: (left, right)
+            == ("merged-lower", "aaa"),
+        ), mock.patch.object(MODULE, "git_try", return_value=completed(0)), mock.patch.object(
+            MODULE, "fetch_merged_predecessor"
+        ):
+            with self.assertRaisesRegex(
+                MODULE.MergedPredecessorLineageError,
+                "complete pull request commit list",
+            ):
                 MODULE.prepare_stack_cascade(Path("/workspace"), self.stack)
 
     def test_multiple_merge_bases_are_rejected_as_ambiguous(self):
@@ -6697,6 +7141,91 @@ class ContinueStackCascadeTest(unittest.TestCase):
         self.assertIsNone(stack["current_index"])
 
 
+class RefreshSingletonFallbackTest(unittest.TestCase):
+    def setUp(self):
+        self.stack = {
+            "number": 167,
+            "size": 1,
+            "trunk": "main",
+            "invoked_number": 7,
+            "members": [
+                {
+                    "number": 7,
+                    "head_branch": "feature",
+                    "base_branch": "main",
+                    "head_sha": "head1",
+                    "base_sha": "base1",
+                }
+            ],
+        }
+        self.state = {
+            "pr": pr_metadata(),
+            "default_branch": "main",
+            "relations": dict(NO_RELATIONS),
+            "push_blockers": [],
+            "external_dependents": [],
+        }
+        self.attempt = {
+            "stack": self.stack,
+            "fallback_requested_strategy": "auto",
+        }
+
+    def test_a_moved_base_refuses_the_fallback_refresh(self):
+        with mock.patch.object(
+            MODULE, "metadata_for", return_value=pr_metadata(base_sha="base2")
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "base_sha"):
+                MODULE.refresh_singleton_merge_fallback(self.state, self.attempt)
+
+    def test_the_refresh_replaces_every_remote_guard(self):
+        relations = {"stacked_on": None, "dependents": [{"number": 8}]}
+        with mock.patch.object(
+            MODULE, "metadata_for", return_value=pr_metadata()
+        ), mock.patch.object(
+            MODULE,
+            "stack_membership",
+            return_value={"default_branch": "main", "stack": self.stack},
+        ), mock.patch.object(
+            MODULE, "stack_relations", return_value=relations
+        ), mock.patch.object(
+            MODULE,
+            "repository_merge_methods",
+            return_value=ALL_MERGE_METHODS,
+        ), mock.patch.object(
+            MODULE, "push_safety_blockers", return_value=["blocked"]
+        ), mock.patch.object(
+            MODULE, "external_stack_dependents", return_value=[{"number": 9}]
+        ):
+            MODULE.refresh_singleton_merge_fallback(self.state, self.attempt)
+
+        self.assertEqual(relations, self.state["relations"])
+        self.assertEqual(["blocked"], self.state["push_blockers"])
+        self.assertEqual([{"number": 9}], self.state["external_dependents"])
+        self.assertEqual("merge", self.attempt["fallback_strategy"]["strategy"])
+
+    def test_merge_method_changes_replace_the_fallback_decision(self):
+        with mock.patch.object(
+            MODULE, "metadata_for", return_value=pr_metadata()
+        ), mock.patch.object(
+            MODULE,
+            "stack_membership",
+            return_value={"default_branch": "main", "stack": self.stack},
+        ), mock.patch.object(
+            MODULE, "stack_relations", return_value=dict(NO_RELATIONS)
+        ), mock.patch.object(
+            MODULE,
+            "repository_merge_methods",
+            return_value=REBASE_ONLY_MERGE_METHODS,
+        ), mock.patch.object(
+            MODULE, "push_safety_blockers", return_value=[]
+        ), mock.patch.object(
+            MODULE, "external_stack_dependents", return_value=[]
+        ):
+            MODULE.refresh_singleton_merge_fallback(self.state, self.attempt)
+
+        self.assertEqual("rebase", self.attempt["fallback_strategy"]["strategy"])
+
+
 class StackRebaseCommandTest(unittest.TestCase):
     def setUp(self):
         self.directory = temporary_directory(self)
@@ -6711,9 +7240,19 @@ class StackRebaseCommandTest(unittest.TestCase):
         rebase_in_progress=False,
         attempt=None,
         repair_segments=None,
+        prepare_error=None,
+        refresh_side_effect=None,
+        **state_overrides,
     ):
         attempt = attempt or stack_attempt_record()
-        state_path = write_state(self.directory, attempt=attempt)
+        state_path = write_state(
+            self.directory,
+            attempt=attempt,
+            default_branch="main",
+            push_blockers=[],
+            external_dependents=[],
+            **state_overrides,
+        )
 
         args = SimpleNamespace(state=str(state_path))
         with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
@@ -6723,7 +7262,10 @@ class StackRebaseCommandTest(unittest.TestCase):
             "repair_native_stack_topology",
             return_value=repair_segments or [],
         ) as repair, mock.patch.object(
-            MODULE, "prepare_stack_cascade", return_value=[]
+            MODULE,
+            "prepare_stack_cascade",
+            return_value=[],
+            side_effect=prepare_error,
         ), mock.patch.object(
             MODULE, "run_stack_cascade", return_value=rebase or completed(0)
         ), mock.patch.object(
@@ -6735,6 +7277,10 @@ class StackRebaseCommandTest(unittest.TestCase):
         ), mock.patch.object(
             MODULE, "remove_stack_workspace"
         ) as remove, mock.patch.object(
+            MODULE,
+            "refresh_singleton_merge_fallback",
+            side_effect=refresh_side_effect,
+        ) as refresh, mock.patch.object(
             MODULE, "emit"
         ) as emit:
             self.error = None
@@ -6747,6 +7293,7 @@ class StackRebaseCommandTest(unittest.TestCase):
         self.emit = emit
         self.create_workspace = create_workspace
         self.repair = repair
+        self.refresh = refresh
         return emitted(emit) if emit.called else None
 
     def saved(self):
@@ -6823,6 +7370,162 @@ class StackRebaseCommandTest(unittest.TestCase):
         self.assertIsNotNone(self.error)
         self.assertIn("without any unmerged paths", str(self.error))
         self.remove.assert_called_once()
+
+    def test_an_isolated_default_branch_member_falls_back_to_merge(self):
+        attempt = stack_attempt_record(
+            fallback_strategy={
+                "strategy": "merge",
+                "reason": "merge is safe",
+                "warnings": [],
+            },
+            stack={
+                "size": 1,
+                "trunk": "main",
+                "invoked_number": 7,
+                "members": [
+                    {
+                        "number": 7,
+                        "head_branch": "feature",
+                        "base_branch": "main",
+                        "head_sha": "head1",
+                        "base_sha": "base1",
+                    }
+                ],
+            },
+        )
+        error = MODULE.MergedPredecessorLineageError("unrecoverable lineage")
+
+        payload = self.run_rebase(attempt=attempt, prepare_error=error)
+
+        self.assertIsNone(self.error)
+        self.assertEqual("single_branch_fallback", payload["result"])
+        self.assertEqual("attempt", payload["next"])
+        saved = self.saved()["attempt"]
+        self.assertEqual("planned", saved["status"])
+        self.assertEqual("merge", saved["strategy"])
+        self.assertNotIn("stack", saved)
+        self.assertEqual("unrecoverable lineage", saved["stack_fallback"]["reason"])
+        self.remove.assert_called_once()
+        self.refresh.assert_called_once()
+
+    def test_refreshed_relations_can_cancel_the_single_branch_fallback(self):
+        attempt = stack_attempt_record(
+            fallback_strategy={
+                "strategy": "merge",
+                "reason": "merge is safe",
+                "warnings": [],
+            },
+            stack={
+                "size": 1,
+                "trunk": "main",
+                "invoked_number": 7,
+                "members": [
+                    {
+                        "number": 7,
+                        "head_branch": "feature",
+                        "base_branch": "main",
+                        "head_sha": "head1",
+                        "base_sha": "base1",
+                    }
+                ],
+            },
+        )
+        error = MODULE.MergedPredecessorLineageError("unrecoverable lineage")
+
+        def add_dependent(state, _attempt):
+            state["relations"]["dependents"] = [{"number": 8}]
+
+        payload = self.run_rebase(
+            attempt=attempt,
+            prepare_error=error,
+            refresh_side_effect=add_dependent,
+        )
+
+        self.assertIsNone(payload)
+        self.assertIs(self.error, error)
+        self.assertEqual("stack", self.saved()["attempt"]["strategy"])
+
+    def test_a_multi_member_stack_does_not_fall_back_to_merge(self):
+        attempt = stack_attempt_record(
+            fallback_strategy={
+                "strategy": "merge",
+                "reason": "merge is safe",
+                "warnings": [],
+            }
+        )
+        error = MODULE.MergedPredecessorLineageError("unrecoverable lineage")
+
+        self.run_rebase(attempt=attempt, prepare_error=error)
+
+        self.assertIs(self.error, error)
+        self.assertFalse(self.emit.called)
+        self.remove.assert_called_once()
+
+    def test_singleton_merge_fallback_rejects_each_unsafe_condition(self):
+        def valid():
+            state = {
+                "default_branch": "main",
+                "push_blockers": [],
+                "external_dependents": [],
+                "relations": dict(NO_RELATIONS),
+                "pr": pr_metadata(base_branch="main"),
+            }
+            attempt = stack_attempt_record(
+                fallback_strategy={
+                    "strategy": "merge",
+                    "reason": "merge is safe",
+                    "warnings": [],
+                },
+                stack={
+                    "size": 1,
+                    "trunk": "main",
+                    "invoked_number": 7,
+                    "members": [{"number": 7}],
+                },
+            )
+            return state, attempt
+
+        cases = {
+            "multiple members": lambda state, attempt: attempt["stack"].update(
+                size=2
+            ),
+            "different invoked pull request": lambda state, attempt: attempt[
+                "stack"
+            ].update(invoked_number=8),
+            "non-default trunk": lambda state, attempt: attempt["stack"].update(
+                trunk="release"
+            ),
+            "non-default pull request base": lambda state, attempt: state[
+                "pr"
+            ].update(base_branch="release"),
+            "open predecessor": lambda state, attempt: state["relations"].update(
+                stacked_on={"number": 4}
+            ),
+            "dependent": lambda state, attempt: state["relations"].update(
+                dependents=[{"number": 8}]
+            ),
+            "external dependent": lambda state, attempt: state.update(
+                external_dependents=[{"number": 9}]
+            ),
+            "push blocker": lambda state, attempt: state.update(
+                push_blockers=["fork"]
+            ),
+            "rebase-only decision": lambda state, attempt: attempt[
+                "fallback_strategy"
+            ].update(strategy="rebase"),
+        }
+        error = MODULE.MergedPredecessorLineageError("unrecoverable lineage")
+
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                state, attempt = valid()
+                mutate(state, attempt)
+                self.assertFalse(
+                    MODULE.configure_singleton_merge_fallback(
+                        state, attempt, error
+                    )
+                )
+                self.assertEqual("stack", attempt["strategy"])
 
 
 class StackFormatCommandTest(GitTestCase):
