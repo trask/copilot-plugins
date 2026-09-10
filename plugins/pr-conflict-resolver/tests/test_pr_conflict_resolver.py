@@ -411,6 +411,10 @@ class AgentInstructionsTest(unittest.TestCase):
             "commit list",
             self.instructions,
         )
+        self.assertIn(
+            "complete frozen predecessor and child commit lists",
+            self.instructions,
+        )
         self.assertIn("reports `single_branch_fallback`", self.instructions)
         self.assertIn(
             "If it reports `single_branch_fallback`, run `attempt` with the same "
@@ -2513,6 +2517,16 @@ class PreflightTest(unittest.TestCase):
                         "mergeable": "CONFLICTING",
                         "head_sha": "head1",
                         "base_sha": "old-a",
+                        "commits": ["head1"],
+                        "commits_complete": True,
+                        "merged_predecessor": {
+                            "number": 5,
+                            "head_branch": "old-parent",
+                            "head_sha": "parent-head",
+                            "merge_sha": "old-a",
+                            "commits": ["parent-head"],
+                            "commits_complete": True,
+                        },
                     },
                 ],
             },
@@ -2531,6 +2545,11 @@ class PreflightTest(unittest.TestCase):
         )
         # The baseline head SHAs are captured so publish can prove what moved.
         self.assertEqual("aaa", attempt["stack"]["members"][0]["head_sha"])
+        frozen_child = attempt["stack"]["members"][1]
+        self.assertTrue(frozen_child["commits_complete"])
+        self.assertEqual(
+            ["parent-head"], frozen_child["merged_predecessor"]["commits"]
+        )
 
     def test_whole_stack_preflight_records_clean_members_without_a_cascade(self):
         members = [
@@ -5547,6 +5566,48 @@ class StackMembershipTest(unittest.TestCase):
         )
         resolve.assert_called_once()
 
+    def test_a_merged_predecessor_reuses_its_complete_native_stack_commits(self):
+        raw = {
+            "id": "S_1",
+            "number": 100,
+            "size": 2,
+            "baseRefName": "main",
+            "entries": {
+                "nodes": [
+                    stack_entry(
+                        0,
+                        5,
+                        "lower",
+                        "main",
+                        state="MERGED",
+                        commit_oids=["parent-a", "oid5"],
+                    ),
+                    stack_entry(
+                        1,
+                        7,
+                        "feature",
+                        "main",
+                        base_oid="merged",
+                        retargeted_from="lower",
+                    ),
+                ]
+            },
+        }
+        predecessor = {
+            "number": 5,
+            "head_branch": "lower",
+            "head_sha": "oid5",
+            "merge_sha": "merged",
+        }
+        with mock.patch.object(
+            MODULE, "merged_predecessor", return_value=predecessor
+        ):
+            result = self.membership(stack=raw)
+
+        frozen = result["stack"]["members"][0]["merged_predecessor"]
+        self.assertEqual(["parent-a", "oid5"], frozen["commits"])
+        self.assertTrue(frozen["commits_complete"])
+
     def test_only_the_bottom_member_resolves_a_merged_predecessor(self):
         raw = {
             "id": "S_1",
@@ -6097,6 +6158,63 @@ class StackCascadePlanTest(unittest.TestCase):
                 "complete pull request commit list",
             ):
                 MODULE.prepare_stack_cascade(Path("/workspace"), self.stack)
+
+    def test_complete_frozen_lists_recover_a_corrected_predecessor_tip(self):
+        member = self.stack["members"][0]
+        member["base_sha"] = "merged-lower"
+        member["commits"] = [
+            "parent-a",
+            "child-a",
+            "parent-boundary",
+            "merge-parent",
+            "child-b",
+            "aaa",
+        ]
+        member["commits_complete"] = True
+        member["merged_predecessor"] = {
+            "number": 4,
+            "head_branch": "old-lower",
+            "head_sha": "parent-final",
+            "merge_sha": "merged-lower",
+            "commits": ["parent-a", "parent-boundary", "parent-final"],
+            "commits_complete": True,
+        }
+        ancestry = {
+            ("base1", "aaa"): False,
+            ("parent-final", "aaa"): False,
+            ("merged-lower", "aaa"): False,
+            ("aaa", "head1"): True,
+        }
+
+        def git_call(_root, *args):
+            tips = {
+                "refs/remotes/origin/main": "base1",
+                "refs/remotes/origin/v143": "aaa",
+                "refs/remotes/origin/feature": "head1",
+            }
+            if args[0] == "rev-parse" and args[1] in tips:
+                return tips[args[1]]
+            if args == ("merge-base", "--all", "parent-final", "aaa"):
+                return "parent-boundary"
+            if args == (
+                "rev-list",
+                "--reverse",
+                "--topo-order",
+                "parent-boundary..aaa",
+            ):
+                return "child-a\nmerge-parent\nchild-b\naaa"
+            raise AssertionError(f"unexpected git call: {args}")
+
+        with mock.patch.object(MODULE, "git", side_effect=git_call), mock.patch.object(
+            MODULE,
+            "is_ancestor",
+            side_effect=lambda _root, left, right: ancestry.get((left, right), False),
+        ), mock.patch.object(MODULE, "git_try", return_value=completed(0)), mock.patch.object(
+            MODULE, "fetch_merged_predecessor"
+        ):
+            plan = MODULE.prepare_stack_cascade(Path("/workspace"), self.stack)
+
+        self.assertEqual("parent-boundary", plan[0]["old_base"])
 
     def test_multiple_merge_bases_are_rejected_as_ambiguous(self):
         def git_call(_root, *args):
@@ -7179,12 +7297,15 @@ class RefreshSingletonFallbackTest(unittest.TestCase):
 
     def test_the_refresh_replaces_every_remote_guard(self):
         relations = {"stacked_on": None, "dependents": [{"number": 8}]}
+        refreshed_stack = {
+            key: value for key, value in self.stack.items() if key != "invoked_number"
+        }
         with mock.patch.object(
             MODULE, "metadata_for", return_value=pr_metadata()
         ), mock.patch.object(
             MODULE,
             "stack_membership",
-            return_value={"default_branch": "main", "stack": self.stack},
+            return_value={"default_branch": "main", "stack": refreshed_stack},
         ), mock.patch.object(
             MODULE, "stack_relations", return_value=relations
         ), mock.patch.object(
@@ -7202,6 +7323,7 @@ class RefreshSingletonFallbackTest(unittest.TestCase):
         self.assertEqual(["blocked"], self.state["push_blockers"])
         self.assertEqual([{"number": 9}], self.state["external_dependents"])
         self.assertEqual("merge", self.attempt["fallback_strategy"]["strategy"])
+        self.assertEqual(7, self.attempt["stack"]["invoked_number"])
 
     def test_merge_method_changes_replace_the_fallback_decision(self):
         with mock.patch.object(

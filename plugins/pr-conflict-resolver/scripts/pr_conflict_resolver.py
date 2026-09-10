@@ -528,9 +528,21 @@ def stack_membership(pr: dict[str, Any]) -> dict[str, Any]:
         }
         require_linear_open_stack(stack)
         for index, member in enumerate(stack["members"]):
-            member["merged_predecessor"] = (
+            predecessor = (
                 merged_predecessor(pr, member) if index == 0 else None
             )
+            if predecessor is not None:
+                matches = [
+                    inactive
+                    for inactive in inactive_members
+                    if inactive["number"] == predecessor["number"]
+                    and inactive["head_branch"] == predecessor["head_branch"]
+                    and inactive["head_sha"] == predecessor["head_sha"]
+                ]
+                if len(matches) == 1:
+                    predecessor["commits"] = list(matches[0]["commits"])
+                    predecessor["commits_complete"] = matches[0]["commits_complete"]
+            member["merged_predecessor"] = predecessor
     return {"default_branch": default_branch, "stack": stack}
 
 
@@ -2094,6 +2106,7 @@ def planned_stack_attempt(
             "head_sha": member["head_sha"],
             "base_sha": member["base_sha"],
             "commits": list(member.get("commits") or []),
+            "commits_complete": member.get("commits_complete") is True,
             "merged_predecessor": member.get("merged_predecessor"),
         }
         for member in stack["members"]
@@ -3893,7 +3906,7 @@ def recover_rewritten_parent_boundary(
 def recover_merged_predecessor_boundary(
     workspace: Path, member: dict[str, Any], predecessor: dict[str, Any]
 ) -> str:
-    """Choose a predecessor boundary only when the complete child range is known."""
+    """Choose a predecessor boundary only from complete frozen commit ranges."""
     merge_sha = predecessor.get("merge_sha")
     if merge_sha != member["base_sha"]:
         raise WorkflowError(
@@ -3905,8 +3918,9 @@ def recover_merged_predecessor_boundary(
     if is_ancestor(workspace, original_head, child_sha):
         return original_head
 
+    exact_merge_detail: str
     if member.get("commits_complete") is not True:
-        detail = (
+        exact_merge_detail = (
             "GitHub did not expose its complete pull request commit list, so the "
             "exact merge-result boundary cannot be proved"
         )
@@ -3929,16 +3943,71 @@ def recover_merged_predecessor_boundary(
             and actual_commits == recorded_commits
         ):
             return merge_sha
-        detail = (
+        exact_merge_detail = (
             "the complete commit range above its merge result does not match "
             "GitHub's recorded pull request commits"
         )
     else:
-        detail = "its exact merge result is not an ancestor of the child"
+        exact_merge_detail = "its exact merge result is not an ancestor of the child"
+
+    predecessor_commits = predecessor.get("commits")
+    child_commits = member.get("commits")
+    if (
+        predecessor.get("commits_complete") is True
+        and member.get("commits_complete") is True
+        and isinstance(predecessor_commits, list)
+        and predecessor_commits
+        and isinstance(child_commits, list)
+        and child_commits
+    ):
+        try:
+            merge_base_output = git(
+                workspace,
+                "merge-base",
+                "--all",
+                original_head,
+                child_sha,
+            )
+        except WorkflowError:
+            merge_base_output = ""
+        merge_bases = [line for line in merge_base_output.splitlines() if line]
+        if len(merge_bases) == 1:
+            boundary = merge_bases[0]
+            predecessor_set = set(predecessor_commits)
+            child_set = set(child_commits)
+            shared_from_child = [
+                commit for commit in child_commits if commit in predecessor_set
+            ]
+            shared_from_predecessor = [
+                commit for commit in predecessor_commits if commit in child_set
+            ]
+            expected_child_commits = [
+                commit for commit in child_commits if commit not in predecessor_set
+            ]
+            actual_child_commits = [
+                line
+                for line in git(
+                    workspace,
+                    "rev-list",
+                    "--reverse",
+                    "--topo-order",
+                    f"{boundary}..{child_sha}",
+                ).splitlines()
+                if line
+            ]
+            if (
+                shared_from_child == shared_from_predecessor
+                and shared_from_predecessor
+                and boundary == shared_from_predecessor[-1]
+                and actual_child_commits == expected_child_commits
+            ):
+                return boundary
+
     raise MergedPredecessorLineageError(
         f"the original head {original_head} of merged predecessor pull request "
         f"#{predecessor['number']} is not an ancestor of {member['head_branch']!r}, "
-        f"and {detail}"
+        f"{exact_merge_detail}, and the complete frozen predecessor and child "
+        "commit lists do not prove a unique shared predecessor boundary"
     )
 
 
@@ -4955,6 +5024,7 @@ def refresh_singleton_merge_fallback(
     state["external_dependents"] = external_stack_dependents(
         current_pr, current_stack
     )
+    current_stack["invoked_number"] = frozen_stack["invoked_number"]
     attempt["stack"] = current_stack
     attempt["fallback_strategy"] = choose_strategy(
         attempt["fallback_requested_strategy"],
