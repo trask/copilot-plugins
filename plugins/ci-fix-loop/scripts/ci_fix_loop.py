@@ -4926,12 +4926,13 @@ def command_stack_record(args: argparse.Namespace) -> None:
         )
     member_run = member_state.get("run") or {}
     guard = member_run.get("stack_guard") or {}
+    dispatched_head = member.get("dispatched_head_sha") or member["head_sha"]
     if (
         member_state.get("budget_scope") != "pipeline"
         or member_run.get("budget_scope") != "pipeline"
         or guard.get("run_id") != state["run_id"]
         or guard.get("member") != member["number"]
-        or guard.get("member_head_sha") != member["head_sha"]
+        or guard.get("member_head_sha") != dispatched_head
         or cli_path(str(guard.get("state") or "")) != path
     ):
         raise WorkflowError(
@@ -4940,7 +4941,22 @@ def command_stack_record(args: argparse.Namespace) -> None:
         )
     outcome = stage_outcome(member_state)
     clean_head = member_state.get("clean_at_head_sha")
+    accepted = [
+        checkpoint
+        for checkpoint in member_state.get("accepted_pushes") or []
+        if checkpoint.get("pipeline_run") == state["run_id"]
+    ]
     if outcome not in STACK_CLEAR_OUTCOMES or clean_head != member["head_sha"]:
+        member.update(
+            {
+                "ci_status": "blocked",
+                "stage_outcome": outcome,
+                "clean_at_head_sha": clean_head,
+                "iterations": int(member_state.get("iterations", 0)),
+                "accepted_pushes": accepted,
+                "skip_note": member_state.get("skip_note"),
+            }
+        )
         escalation = member_state.get("escalation") or {}
         detail = (
             escalation.get("detail")
@@ -4957,11 +4973,6 @@ def command_stack_record(args: argparse.Namespace) -> None:
             member=member["number"],
         )
         return
-    accepted = [
-        checkpoint
-        for checkpoint in member_state.get("accepted_pushes") or []
-        if checkpoint.get("pipeline_run") == state["run_id"]
-    ]
     member.update(
         {
             "ci_status": "clear",

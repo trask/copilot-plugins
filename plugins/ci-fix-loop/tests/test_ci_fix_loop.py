@@ -5475,6 +5475,45 @@ class NativeStackCoordinatorTest(unittest.TestCase):
         self.assertEqual("member_not_clear", result["reason"])
         self.assertEqual(5, result["blocked_member"])
 
+    def test_record_preserves_head_change_escalation_from_dispatched_head(self):
+        stack = native_stack()
+        started = self.start(stack)
+        self.next(stack)
+        escalated = self.member_state(5, "lower1", started["run_id"])
+        state = MODULE.load_state(escalated)
+        state["outcome"] = None
+        state["clean_at_head_sha"] = None
+        state["escalation"] = {
+            "reason": "head_changed",
+            "detail": (
+                "the PR head moved from lower1 to lower2 while this iteration "
+                "was reading its checks"
+            ),
+        }
+        MODULE.save_state(escalated, state)
+        moved = native_stack(heads={5: "lower2", 7: "middle1", 9: "upper1"})
+
+        result = self.record(moved, escalated)
+
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual("member_not_clear", result["reason"])
+        saved = MODULE.load_stack_state(self.stack_state)
+        member = saved["members"][0]
+        self.assertEqual("lower2", member["head_sha"])
+        self.assertEqual("lower1", member["dispatched_head_sha"])
+        self.assertEqual("blocked", member["ci_status"])
+        self.assertEqual("escalated", member["stage_outcome"])
+
+    def test_record_rejects_result_for_undispatched_moved_head(self):
+        stack = native_stack()
+        started = self.start(stack)
+        self.next(stack)
+        moved = native_stack(heads={5: "lower2", 7: "middle1", 9: "upper1"})
+        undispatched = self.member_state(5, "lower2", started["run_id"])
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "was not produced"):
+            self.record(moved, undispatched)
+
     def test_record_rejects_a_clear_marker_from_another_stack_run(self):
         stack = native_stack()
         self.start(stack)
