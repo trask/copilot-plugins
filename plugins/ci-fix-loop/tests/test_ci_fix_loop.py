@@ -232,6 +232,36 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertIn("wait-for-auto-retry", self.instructions)
         self.assertIn("retry_started", self.instructions)
         self.assertIn("retry_not_detected", self.instructions)
+        self.assertIn(
+            "Wait through every automatic attempt the workflow",
+            self.instructions,
+        )
+        self.assertIn(
+            "use the helper's `rerun` action once rather than escalating",
+            self.instructions,
+        )
+
+    def test_dependency_download_failures_do_not_become_unfixable(self):
+        self.assertIn(
+            "download a dependency",
+            self.instructions,
+        )
+        self.assertIn(
+            "the helper initially marks the check `pr_caused`.",
+            self.instructions,
+        )
+        self.assertIn(
+            "Never call an infrastructure failure",
+            self.instructions,
+        )
+        self.assertIn(
+            "`unfixable_failure` merely because the exact CI command passes locally",
+            self.instructions,
+        )
+        self.assertIn(
+            "Do not run `skip`.",
+            self.instructions,
+        )
 
     def test_tells_the_agent_that_no_progress_is_its_claim_to_make(self):
         self.assertIn(

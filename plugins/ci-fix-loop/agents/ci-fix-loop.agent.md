@@ -34,7 +34,7 @@ Run `stack-start` for a standalone invocation or `preflight` for an orchestrated
 - A check that never starts, and a check that waits for a maintainer to approve a fork's workflow run, escalates straight away. Never wait for one of those indefinitely; they cannot resolve on their own.
 - A pull request whose head reports no applicable checks is a skip, never a pass. Record it with `resolve --outcome no_checks` and report the helper's one-line note. A broken continuous integration configuration must never look like a green pipeline.
 - GitHub states whether the checks pass, and this loop's own state never does. Read the live checks every time you are asked to run, however recently the state says they passed.
-- The helper owns every decision about what the loop does next. Run `checks`, then do exactly what its `action` says. Never decide for yourself that a failure is pre-existing, that a check is a flake, or that the loop may stop.
+- The helper owns every decision about what the loop does next. Run `checks`, then do exactly what its `action` says, except for the required automatic-retry detour in **Reading The Checks** when the job log proves an infrastructure failure. Never decide for yourself that a failure is pre-existing, that a check is a flake without concrete log evidence, or that the loop may stop.
 - Never disable, delete, skip, or weaken a check to make it pass. Do not add a skip marker, do not loosen an assertion, do not raise a timeout to hide a hang, and do not edit a workflow file to stop a job from running. Fix the cause instead, or escalate. The helper refuses two of those forms outright: `record` and `publish` both read the commit and stop the run when it deletes a test file, or adds a skip, disable, or ignore annotation to one. That refusal has no override and no rationale gets past it, so when it fires, fix what the test caught or escalate the failure as `unfixable_failure`.
 - Never touch a test's expectations to match broken behavior. Change a test only when the pull request deliberately changed the behavior the test asserts, and say so in the commit message.
 - Never push a fix you have not run. Reproduce the failing check, fix it, run that same check again, and clear **Local Validation Before A Push** before you publish. A failure nothing here can reproduce is published with its reason recorded, never held back.
@@ -182,15 +182,26 @@ Run `checks --state <path> --wait` after every successful `preflight` and after 
 
 Read the complete result at `checks_path` when you need each check's URL, workflow name, timing, or the base-commit conclusion the helper compared it with.
 
-When a concrete failure is `TIMED_OUT`, names a runner-owned timeout, or otherwise
-shows that the repository may retry it automatically, inspect the workflow that
-owns the run before escalating it. If that workflow reruns failed pull-request
-jobs, run `wait-for-auto-retry --state <path> --check <key>` rather than `skip` or
-`escalate` solely because the local reproduction passed. On `retry_started`, go
-back to `checks --state <path> --wait`; if the command returns
-`retry_not_detected`, confirm whether the workflow was ineligible or still queued
-before making the final escalation. A retry that fails with a code or assertion
-related to the pull request can then be attributed and fixed normally.
+When a concrete failure is `TIMED_OUT`, names a runner-owned timeout, cannot
+download a dependency, loses a network connection, or otherwise shows an
+infrastructure failure, inspect the workflow that owns the run before
+attributing, fixing, skipping, or escalating it. This detour applies even when
+the base commit passed and the helper initially marks the check `pr_caused`.
+
+If the repository automatically reruns failed pull-request jobs, record the
+check as `flake` with the concrete log evidence, then run
+`wait-for-auto-retry --state <path> --check <key>`. On `retry_started`, go back
+to `checks --state <path> --wait`. If that attempt fails for the same
+infrastructure reason and the workflow allows another automatic attempt, run
+`wait-for-auto-retry` again. Wait through every automatic attempt the workflow
+allows. If `retry_not_detected` says the automatic retry did not start in time,
+run `checks` once more to avoid racing a delayed retry. When the same failure is
+still present, use the helper's `rerun` action once rather than escalating.
+
+A retry that fails with code or an assertion related to the pull request can be
+attributed and fixed normally. Never call an infrastructure failure
+`unfixable_failure` merely because the exact CI command passes locally without a
+source change.
 
 Act on the returned failure before waiting for `pending_checks`. A failed aggregate such as `required-status-check` may remain in the snapshot and counts, but when a concrete underlying job failed it is listed under `aggregate_checks` rather than diagnosed as a second root cause. Once a check is attributed `pr_caused`, fix it before diagnosing lower-priority failures. Once it is attributed `pre_existing`, leave it alone and continue with any other actionable failures or pending checks.
 
@@ -224,8 +235,9 @@ For each batch:
 3. Run that same command again, and confirm it now passes. Then run the rest of **Local Validation Before A Push**, because a fix for one check routinely breaks another.
 4. Confirm that the dirty paths belong only to the current batch. Stop rather than include an unrelated change.
 5. Stage only the paths this batch owns and create one commit using **Commit Content**. Then run `record` with the batch ID, a short `--summary`, and `--commit <sha>`.
-6. If you cannot fix the failure safely, run `skip` with a precise technical reason, leave every local change in place, stop the whole loop, and report the stop condition.
-7. Continue straight to the next batch.
+6. If the exact command passes without a source change and the CI log shows an unrelated dependency download, network, runner, or other infrastructure failure, return to the automatic-retry detour in **Reading The Checks**. Do not run `skip`.
+7. If you cannot fix the failure safely for any other reason, run `skip` with a precise technical reason, leave every local change in place, stop the whole loop, and report the stop condition.
+8. Continue straight to the next batch.
 
 Follow the repository's own validation rules.
 
