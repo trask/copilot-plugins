@@ -22,6 +22,7 @@ import uuid
 
 
 STATE_VERSION = 1
+FORMAT_COMMAND_ARGUMENT = "--format-command"
 STACK_STATE_KIND = "native_stack"
 STACK_ENTRIES_PAGE = 100
 DEFAULT_MAX_ITERATIONS = 5
@@ -59,6 +60,28 @@ RERUN_PERMISSION_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+
+
+class FormatterPassthroughArgumentParser(argparse.ArgumentParser):
+    def parse_args(
+        self,
+        args: list[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace:
+        arguments = list(sys.argv[1:] if args is None else args)
+        format_command = None
+        if arguments[:1] == ["stack-format"] and FORMAT_COMMAND_ARGUMENT in arguments:
+            marker = arguments.index(FORMAT_COMMAND_ARGUMENT)
+            format_command = arguments[marker + 1 :]
+            if format_command[:1] == ["--"]:
+                format_command.pop(0)
+            if not format_command:
+                self.error(f"{FORMAT_COMMAND_ARGUMENT} requires a formatter executable")
+            arguments = arguments[: marker + 1] + ["formatter-command"]
+        parsed = super().parse_args(arguments, namespace)
+        if format_command is not None:
+            parsed.format_command = format_command
+        return parsed
 
 # One classified vocabulary for every check, whatever GitHub calls it. Anything
 # this loop does not recognize becomes "unknown", which escalates rather than
@@ -5528,7 +5551,7 @@ def command_cleanup(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = FormatterPassthroughArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     stack_start = subparsers.add_parser(
@@ -5585,7 +5608,11 @@ def build_parser() -> argparse.ArgumentParser:
     format_choice.add_argument(
         "--format-command",
         nargs="+",
-        help="formatter executable and arguments, run in the propagation workspace",
+        help=(
+            "formatter executable and arguments, run in the propagation workspace; "
+            "this must be the last helper option because all remaining arguments "
+            "are passed through"
+        ),
     )
     format_choice.add_argument(
         "--no-format",

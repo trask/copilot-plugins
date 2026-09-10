@@ -620,7 +620,8 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_an_escalated_run_cannot_read_like_an_uneventful_one(self):
         self.assertIn("never let an escalated run read like an uneventful one", self.instructions)
         self.assertIn("names the escalation kind", self.instructions)
-        self.assertIn("a person has to decide", self.instructions)
+        self.assertIn("`requires_user_decision`", self.instructions)
+        self.assertIn("does not claim that a person has to choose", self.instructions)
         self.assertIn("still conflicted and the branch untouched", self.instructions)
 
     def test_the_report_agrees_with_the_machine_readable_outcome(self):
@@ -2121,6 +2122,32 @@ class StateHelpersTest(unittest.TestCase):
         self.assertEqual(2, escalation["attempt_number"])
         self.assertTrue(escalation["recorded_at"].endswith("Z"))
 
+    def test_loading_an_old_escalation_defaults_to_a_user_decision(self):
+        directory = temporary_directory(self)
+        path = write_state(
+            directory,
+            escalation={"kind": "contradiction", "reason": "both cannot hold"},
+        )
+        self.assertTrue(
+            MODULE.load_state(path)["escalation"]["requires_user_decision"]
+        )
+
+    def test_only_automation_blockers_omit_a_user_decision(self):
+        for kind in MODULE.ESCALATION_KINDS:
+            with self.subTest(kind=kind):
+                state = {}
+                escalation = MODULE.record_escalation(
+                    state,
+                    kind=kind,
+                    reason="reason",
+                    recommended_action="action",
+                    attempt_number=1,
+                )
+                self.assertEqual(
+                    kind != MODULE.AUTOMATION_BLOCKER_KIND,
+                    escalation["requires_user_decision"],
+                )
+
     def test_every_escalation_kind_is_declared(self):
         self.assertEqual(
             (
@@ -2130,6 +2157,7 @@ class StateHelpersTest(unittest.TestCase):
                 "ad_hoc_base",
                 "stack_external_dependents",
                 "validation",
+                "automation_blocker",
                 "other",
             ),
             MODULE.ESCALATION_KINDS,
@@ -3100,6 +3128,36 @@ class ResolvedTest(unittest.TestCase):
             self.git_try.call_args[0][1:],
         )
 
+    def test_a_base_side_replacement_for_a_deleted_conflict_is_a_companion(self):
+        self.write("contract.json", b"")
+        self.write("contract.yaml", b"preserved replayed behavior\n")
+        conflict = conflict_record(
+            "contract.json",
+            code="UD",
+            deletion=True,
+            base_commits=[{"sha": "base-change"}],
+        )
+        with mock.patch.object(
+            MODULE,
+            "replayed_commit_paths",
+            return_value={"contract.json"},
+        ), mock.patch.object(
+            MODULE,
+            "base_replacement_paths",
+            return_value={"contract.yaml"},
+        ), mock.patch.object(
+            MODULE, "path_has_unstaged_changes", return_value=True
+        ):
+            payload = self.resolve(
+                paths=("contract.json",),
+                companion_paths=("contract.yaml",),
+                accept_deletion=True,
+                attempt=attempt_record(strategy="rebase", conflicts=[conflict]),
+            )
+        self.assertEqual(
+            [{"path": "contract.yaml", "deleted": False}], payload["companions"]
+        )
+
     def test_a_companion_path_outside_the_replayed_commit_is_refused(self):
         self.write("app.py", b"ours\ntheirs\n")
         self.write("unrelated.py", b"unrelated edit\n")
@@ -3107,9 +3165,13 @@ class ResolvedTest(unittest.TestCase):
             MODULE,
             "replayed_commit_paths",
             return_value={"app.py"},
+        ), mock.patch.object(
+            MODULE,
+            "base_replacement_paths",
+            return_value=set(),
         ), self.assertRaisesRegex(
             MODULE.WorkflowError,
-            "not touched by the commit currently being replayed",
+            "nor proven base-side replacements",
         ):
             self.resolve(
                 companion_paths=("unrelated.py",),
@@ -3118,6 +3180,127 @@ class ResolvedTest(unittest.TestCase):
                     conflicts=[conflict_record("app.py")],
                 ),
             )
+
+    def test_a_renamed_base_path_is_a_proven_replacement(self):
+        conflict = conflict_record(
+            "old/contract.json",
+            code="UD",
+            deletion=True,
+            base_commits=[{"sha": "base-change"}],
+        )
+        with mock.patch.object(
+            MODULE,
+            "commit_path_changes",
+            return_value=[
+                ("R072", "old/contract.json", "new/contract.yaml"),
+                ("A", "new/unrelated.md", None),
+            ],
+        ), mock.patch.object(
+            MODULE, "path_is_file_at_head", return_value=True
+        ):
+            self.assertEqual(
+                {"new/contract.yaml"},
+                MODULE.base_replacement_paths(self.directory, [conflict]),
+            )
+
+    def test_ambiguous_same_stem_additions_are_not_proven_replacements(self):
+        conflict = conflict_record(
+            "tools/contract.json",
+            code="UD",
+            deletion=True,
+            base_commits=[{"sha": "base-change"}],
+        )
+        with mock.patch.object(
+            MODULE,
+            "commit_path_changes",
+            return_value=[
+                ("D", "tools/contract.json", None),
+                ("A", "tools/contract.yaml", None),
+                ("A", "tools/contract.yml", None),
+            ],
+        ), mock.patch.object(
+            MODULE, "path_is_file_at_head", return_value=True
+        ):
+            self.assertEqual(
+                set(), MODULE.base_replacement_paths(self.directory, [conflict])
+            )
+
+    def test_a_same_stem_addition_in_the_deleting_commit_is_a_replacement(self):
+        conflict = conflict_record(
+            "tools/contract.json",
+            code="UD",
+            deletion=True,
+            base_commits=[{"sha": "base-change"}],
+        )
+        with mock.patch.object(
+            MODULE,
+            "commit_path_changes",
+            return_value=[
+                ("D", "tools/contract.json", None),
+                ("A", "tools/contract.yaml", None),
+                ("A", "tools/policy.yaml", None),
+            ],
+        ), mock.patch.object(
+            MODULE, "path_is_file_at_head", return_value=True
+        ):
+            self.assertEqual(
+                {"tools/contract.yaml"},
+                MODULE.base_replacement_paths(self.directory, [conflict]),
+            )
+
+    def test_a_same_stem_addition_in_another_directory_is_not_a_replacement(self):
+        conflict = conflict_record(
+            "tools/contract.json",
+            code="UD",
+            deletion=True,
+            base_commits=[{"sha": "base-change"}],
+        )
+        with mock.patch.object(
+            MODULE,
+            "commit_path_changes",
+            return_value=[
+                ("D", "tools/contract.json", None),
+                ("A", "archive/contract.yaml", None),
+            ],
+        ), mock.patch.object(
+            MODULE, "path_is_file_at_head", return_value=True
+        ):
+            self.assertEqual(
+                set(), MODULE.base_replacement_paths(self.directory, [conflict])
+            )
+
+    def test_an_obsolete_rename_destination_is_not_a_replacement(self):
+        conflict = conflict_record(
+            "old/contract.json",
+            code="UD",
+            deletion=True,
+            base_commits=[{"sha": "base-change"}],
+        )
+        with mock.patch.object(
+            MODULE,
+            "commit_path_changes",
+            return_value=[
+                ("R100", "old/contract.json", "intermediate/contract.json"),
+            ],
+        ), mock.patch.object(
+            MODULE, "path_is_file_at_head", return_value=False
+        ):
+            self.assertEqual(
+                set(), MODULE.base_replacement_paths(self.directory, [conflict])
+            )
+
+    def test_a_base_commit_that_did_not_delete_the_conflict_proves_nothing(self):
+        conflict = conflict_record(
+            "tools/contract.json",
+            code="UU",
+            deletion=False,
+            base_commits=[{"sha": "base-change"}],
+        )
+        with mock.patch.object(MODULE, "commit_path_changes") as inspect:
+            self.assertEqual(
+                set(), MODULE.base_replacement_paths(self.directory, [conflict])
+            )
+        inspect.assert_not_called()
 
     def test_a_companion_path_is_refused_for_a_merge(self):
         self.write("app.py", b"ours\ntheirs\n")
@@ -3311,6 +3494,18 @@ class CompanionPathIntegrationTest(unittest.TestCase):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         companion = state["attempt"]["companion_resolutions"][0]
         self.assertEqual("moved.py", companion["path"])
+
+    def test_commit_path_changes_parses_the_replayed_move(self):
+        changes = MODULE.commit_path_changes(
+            self.repo, self.git("rev-parse", "REBASE_HEAD")
+        )
+        changed_paths = {
+            path
+            for _status, source, destination in changes
+            for path in (source, destination)
+            if path
+        }
+        self.assertEqual({"legacy.py", "moved.py"}, changed_paths)
 
 
 class ContinueTest(unittest.TestCase):
@@ -3731,6 +3926,23 @@ class EscalateTest(unittest.TestCase):
         state = self.saved()
         self.assertEqual("escalated", state["attempt"]["status"])
         self.assertEqual(1, len(state["history"]))
+        self.assertTrue(payload["escalation"]["requires_user_decision"])
+
+    def test_an_automation_blocker_does_not_claim_a_user_decision(self):
+        payload = self.escalate(
+            kind="automation_blocker",
+            reason="the helper rejected a proven rename destination",
+            recommended_action="upgrade the helper and rerun",
+        )
+        self.assertFalse(payload["escalation"]["requires_user_decision"])
+
+    def test_an_automation_blocker_requires_a_recovery_action(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "must name the helper change"):
+            self.escalate(
+                kind="automation_blocker",
+                reason="the helper rejected a proven rename destination",
+                recommended_action=None,
+            )
 
     def test_the_reason_can_come_from_a_file(self):
         reason = self.directory / "reason.txt"
@@ -3827,6 +4039,18 @@ class StageOutcomeTest(unittest.TestCase):
         outcome = MODULE.stage_outcome(
             self.state(
                 attempt=attempt_record(status="mergeable", mergeable_at_head_sha=None)
+            )
+        )
+        self.assertEqual("escalated", outcome)
+
+    def test_an_automation_blocker_remains_machine_readable_as_escalated(self):
+        outcome = MODULE.stage_outcome(
+            self.state(
+                escalation={
+                    "kind": "automation_blocker",
+                    "reason": "the helper cannot represent the resolution",
+                    "requires_user_decision": False,
+                }
             )
         )
         self.assertEqual("escalated", outcome)
@@ -4013,6 +4237,7 @@ class StatusCommandTest(unittest.TestCase):
             "kind": "contradiction",
             "reason": "both sides changed the same guard",
             "recommended_action": "a person must choose",
+            "requires_user_decision": True,
             "attempt_number": 1,
             "recorded_at": "2026-01-01T00:00:00Z",
         }
@@ -7128,6 +7353,34 @@ class DescendantPropagationTest(unittest.TestCase):
         )
         self.assertIs(args.function, MODULE.command_stack_format)
         self.assertTrue(args.no_format)
+
+    def test_parser_preserves_formatter_option_arguments(self):
+        args = MODULE.build_parser().parse_args(
+            [
+                "stack-format",
+                "--state",
+                "state.json",
+                "--format-command",
+                "--",
+                "cargo",
+                "fmt",
+                "--manifest-path",
+                "tools/http/Cargo.toml",
+                "--",
+                "--check",
+            ]
+        )
+        self.assertEqual(
+            [
+                "cargo",
+                "fmt",
+                "--manifest-path",
+                "tools/http/Cargo.toml",
+                "--",
+                "--check",
+            ],
+            args.format_command,
+        )
 
     def test_descendant_propagation_stops_for_formatting_before_publishing(self):
         stack = self.stack()

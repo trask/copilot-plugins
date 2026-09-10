@@ -6054,6 +6054,32 @@ class NativeStackCoordinatorTest(unittest.TestCase):
             }.issubset(subparsers.choices)
         )
 
+    def test_parser_preserves_stack_formatter_option_arguments(self):
+        args = run_arguments(
+            "stack-format",
+            "--state",
+            "state.json",
+            "--format-command",
+            "--",
+            "cargo",
+            "fmt",
+            "--manifest-path",
+            "tools/http/Cargo.toml",
+            "--",
+            "--check",
+        )
+        self.assertEqual(
+            [
+                "cargo",
+                "fmt",
+                "--manifest-path",
+                "tools/http/Cargo.toml",
+                "--",
+                "--check",
+            ],
+            args.format_command,
+        )
+
 
 class LocalValidationRecordTest(unittest.TestCase):
     """The record is what makes the push requirement falsifiable.

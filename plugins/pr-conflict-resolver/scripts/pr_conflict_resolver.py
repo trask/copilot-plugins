@@ -8,7 +8,7 @@ import datetime as dt
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
@@ -20,6 +20,8 @@ from typing import Any, Iterable
 
 
 STATE_VERSION = 1
+FORMAT_COMMAND_ARGUMENT = "--format-command"
+AUTOMATION_BLOCKER_KIND = "automation_blocker"
 MERGEABILITY_RETRY_DELAYS = (2, 4, 8, 16)
 PR_HEAD_LAG_RETRY_DELAY = 1
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
@@ -60,6 +62,7 @@ ESCALATION_KINDS = (
     "ad_hoc_base",
     "stack_external_dependents",
     "validation",
+    AUTOMATION_BLOCKER_KIND,
     "other",
 )
 STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
@@ -68,6 +71,28 @@ RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 class WorkflowError(RuntimeError):
     pass
+
+
+class FormatterPassthroughArgumentParser(argparse.ArgumentParser):
+    def parse_args(
+        self,
+        args: list[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace:
+        arguments = list(sys.argv[1:] if args is None else args)
+        format_command = None
+        if arguments[:1] == ["stack-format"] and FORMAT_COMMAND_ARGUMENT in arguments:
+            marker = arguments.index(FORMAT_COMMAND_ARGUMENT)
+            format_command = arguments[marker + 1 :]
+            if format_command[:1] == ["--"]:
+                format_command.pop(0)
+            if not format_command:
+                self.error(f"{FORMAT_COMMAND_ARGUMENT} requires a formatter executable")
+            arguments = arguments[: marker + 1] + ["formatter-command"]
+        parsed = super().parse_args(arguments, namespace)
+        if format_command is not None:
+            parsed.format_command = format_command
+        return parsed
 
 
 def run(
@@ -638,6 +663,12 @@ def load_state(path: Path) -> dict[str, Any]:
     state = json.loads(path.read_text(encoding="utf-8"))
     if state.get("version") != STATE_VERSION:
         raise WorkflowError(f"unsupported state version in {path}")
+    escalation = state.get("escalation")
+    if isinstance(escalation, dict):
+        escalation.setdefault(
+            "requires_user_decision",
+            escalation.get("kind") != AUTOMATION_BLOCKER_KIND,
+        )
     return state
 
 
@@ -1728,6 +1759,94 @@ def replayed_commit_paths(repo_root: Path) -> set[str]:
     return {path for path in result.stdout.split("\0") if path}
 
 
+def commit_path_changes(
+    repo_root: Path, commit_sha: str
+) -> list[tuple[str, str, str | None]]:
+    result = git_try(
+        repo_root,
+        "diff-tree",
+        "--no-commit-id",
+        "--name-status",
+        "-r",
+        "--root",
+        "-z",
+        "-M",
+        commit_sha,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WorkflowError(f"could not inspect base commit {commit_sha}: {detail}")
+    fields = result.stdout.split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    changes = []
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        index += 1
+        path_count = 2 if status.startswith(("R", "C")) else 1
+        if index + path_count > len(fields):
+            raise WorkflowError(
+                f"could not parse changed paths from base commit {commit_sha}"
+            )
+        source = fields[index]
+        destination = fields[index + 1] if path_count == 2 else None
+        index += path_count
+        changes.append((status, source, destination))
+    return changes
+
+
+def path_is_file_at_head(repo_root: Path, path: str) -> bool:
+    result = git_try(repo_root, "cat-file", "-t", f"HEAD:{path}")
+    return result.returncode == 0 and result.stdout.strip() == "blob"
+
+
+def base_replacement_paths(
+    repo_root: Path, conflicts: Iterable[dict[str, Any]]
+) -> set[str]:
+    """Find narrow base-side destinations for conflicted deleted paths."""
+    replacements = set()
+    inspected_commits = set()
+    for conflict in conflicts:
+        if not conflict.get("deletion"):
+            continue
+        source = conflict["path"]
+        for commit in conflict.get("base_commits") or []:
+            sha = commit.get("sha")
+            if not isinstance(sha, str) or not sha:
+                continue
+            cache_key = (sha, source)
+            if cache_key in inspected_commits:
+                continue
+            inspected_commits.add(cache_key)
+            changes = commit_path_changes(repo_root, sha)
+            source_deleted = False
+            for status, changed_source, destination in changes:
+                if (
+                    status.startswith("R")
+                    and changed_source == source
+                    and destination
+                    and path_is_file_at_head(repo_root, destination)
+                ):
+                    replacements.add(destination)
+                elif status == "D" and changed_source == source:
+                    source_deleted = True
+            if not source_deleted:
+                continue
+            source_path = PurePosixPath(source)
+            same_stem_additions = {
+                changed_source
+                for status, changed_source, _destination in changes
+                if status == "A"
+                and PurePosixPath(changed_source).parent == source_path.parent
+                and PurePosixPath(changed_source).stem == source_path.stem
+                and path_is_file_at_head(repo_root, changed_source)
+            }
+            if len(same_stem_additions) == 1:
+                replacements.update(same_stem_additions)
+    return replacements
+
+
 def normalize_companion_path(path: str) -> str:
     normalized = path.replace("\\", "/")
     if (
@@ -1805,6 +1924,7 @@ def record_escalation(
         "kind": kind,
         "reason": reason,
         "recommended_action": recommended_action,
+        "requires_user_decision": kind != AUTOMATION_BLOCKER_KIND,
         "attempt_number": attempt_number,
         "recorded_at": utc_now(),
     }
@@ -2485,9 +2605,13 @@ def command_resolved(args: argparse.Namespace) -> None:
         replayed_paths = replayed_commit_paths(repo_root)
         unrelated = [path for path in companion_paths if path not in replayed_paths]
         if unrelated:
+            replacement_paths = base_replacement_paths(repo_root, conflicts)
+            unrelated = [path for path in unrelated if path not in replacement_paths]
+        if unrelated:
             raise WorkflowError(
-                "companion paths are not touched by the commit currently being "
-                f"replayed: {unrelated}"
+                "companion paths are neither touched by the commit currently being "
+                "replayed nor proven base-side replacements for a conflicted deleted "
+                f"path: {unrelated}"
             )
     rationale = (
         load_text_input(args.rationale_file, "rationale")
@@ -2806,6 +2930,11 @@ def command_escalate(args: argparse.Namespace) -> None:
     reason = (
         load_text_input(args.reason_file, "reason") if args.reason_file else args.reason
     )
+    if args.kind == AUTOMATION_BLOCKER_KIND and not args.recommended_action:
+        raise WorkflowError(
+            "an automation blocker must name the helper change or upgrade that "
+            "allows the run to continue"
+        )
     escalation = record_escalation(
         state,
         kind=args.kind,
@@ -4192,6 +4321,10 @@ def finish_stack_rebase(
 
 def command_stack_format(args: argparse.Namespace) -> None:
     require_tools()
+    if args.format_command is not None:
+        args.format_command = list(args.format_command)
+        if not args.format_command:
+            raise WorkflowError("--format-command requires a formatter executable")
     state_path = cli_path(args.state)
     state = load_state(state_path)
     if state.get("operation") == "descendant_propagation":
@@ -5336,7 +5469,7 @@ def command_cleanup(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = FormatterPassthroughArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     preflight = subparsers.add_parser(
@@ -5459,7 +5592,11 @@ def build_parser() -> argparse.ArgumentParser:
     format_choice.add_argument(
         "--format-command",
         nargs="+",
-        help="formatter executable and arguments, run in the cascade workspace",
+        help=(
+            "formatter executable and arguments, run in the cascade workspace; "
+            "this must be the last helper option because all remaining arguments "
+            "are passed through"
+        ),
     )
     format_choice.add_argument(
         "--no-format",
