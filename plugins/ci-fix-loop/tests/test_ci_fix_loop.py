@@ -954,6 +954,162 @@ class BaseRefTipTest(unittest.TestCase):
                 MODULE.base_ref_tip("owner/repo", "gone")
 
 
+class AuthoritativeDiffTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path("repo")
+        self.pr = {
+            "pr_url": "https://github.com/owner/repo/pull/7",
+            "repo_name": "owner/repo",
+            "base_branch": "main",
+            "base_sha": "base1",
+            "head_sha": "head1",
+        }
+
+    def response(self, returncode=0, stdout="", stderr=""):
+        return SimpleNamespace(
+            returncode=returncode, stdout=stdout, stderr=stderr
+        )
+
+    def test_uses_the_github_rendered_diff_when_available(self):
+        with mock.patch.object(
+            MODULE, "run", return_value=self.response(stdout=DIFF)
+        ) as run:
+            result, source = MODULE.fetch_authoritative_diff(self.root, self.pr)
+
+        self.assertEqual(DIFF, result)
+        self.assertEqual("github", source)
+        run.assert_called_once_with(
+            [
+                "gh",
+                "pr",
+                "diff",
+                self.pr["pr_url"],
+                "--repo",
+                self.pr["repo_name"],
+            ],
+            check=False,
+        )
+
+    def test_uses_a_local_merge_base_diff_when_github_rejects_its_size(self):
+        responses = [
+            self.response(
+                returncode=1,
+                stderr="HTTP 406: PullRequest.diff too_large",
+            ),
+            self.response(),
+            self.response(stdout="false\n"),
+            self.response(stdout=DIFF),
+        ]
+        with mock.patch.object(MODULE, "run", side_effect=responses) as run:
+            result, source = MODULE.fetch_authoritative_diff(self.root, self.pr)
+
+        self.assertEqual(DIFF, result)
+        self.assertEqual("local_merge_base", source)
+        self.assertEqual(
+            [
+                "git",
+                "-c",
+                "diff.noprefix=false",
+                "-c",
+                "diff.algorithm=myers",
+                "-c",
+                "diff.context=3",
+                "-c",
+                "diff.renames=true",
+                "-C",
+                str(self.root),
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--no-relative",
+                "--find-renames",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "-U3",
+                "base1...head1",
+                "--",
+            ],
+            run.call_args_list[-1].args[0],
+        )
+
+    def test_fetches_the_base_branch_when_the_pinned_commit_is_missing(self):
+        responses = [
+            self.response(
+                returncode=1,
+                stderr="PullRequest.diff too_large (HTTP 406)",
+            ),
+            self.response(returncode=1),
+            self.response(stdout="origin\n"),
+            self.response(stdout="git@github.com:owner/repo.git\n"),
+            self.response(),
+            self.response(),
+            self.response(stdout="false\n"),
+            self.response(stdout=DIFF),
+        ]
+        with mock.patch.object(MODULE, "run", side_effect=responses) as run:
+            result, source = MODULE.fetch_authoritative_diff(self.root, self.pr)
+
+        self.assertEqual(DIFF, result)
+        self.assertEqual("local_merge_base", source)
+        self.assertEqual(
+            [
+                "git",
+                "-C",
+                str(self.root),
+                "fetch",
+                "--no-tags",
+                "origin",
+                "refs/heads/main",
+            ],
+            run.call_args_list[4].args[0],
+        )
+        self.assertEqual(
+            {"GIT_TERMINAL_PROMPT": "0"},
+            run.call_args_list[4].kwargs["env"],
+        )
+
+    def test_preserves_non_size_diff_failures(self):
+        with mock.patch.object(
+            MODULE,
+            "run",
+            return_value=self.response(
+                returncode=1, stderr="HTTP 403: Resource not accessible"
+            ),
+        ) as run:
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "Resource not accessible"
+            ):
+                MODULE.fetch_authoritative_diff(self.root, self.pr)
+
+        self.assertEqual(1, run.call_count)
+
+    def test_does_not_fall_back_for_another_too_large_resource(self):
+        with mock.patch.object(
+            MODULE,
+            "run",
+            return_value=self.response(
+                returncode=1, stderr="HTTP 406: CheckRun.output too_large"
+            ),
+        ) as run:
+            with self.assertRaisesRegex(MODULE.WorkflowError, "CheckRun.output"):
+                MODULE.fetch_authoritative_diff(self.root, self.pr)
+
+        self.assertEqual(1, run.call_count)
+
+    def test_reads_every_local_changed_path_from_nul_delimited_output(self):
+        with mock.patch.object(
+            MODULE,
+            "run",
+            return_value=self.response(stdout="z.py\0dir/a\nb.py\0z.py\0"),
+        ) as run:
+            paths = MODULE.changed_files_from_local_diff(self.root, self.pr)
+
+        self.assertEqual(["dir/a\nb.py", "z.py"], paths)
+        self.assertIn("-z", run.call_args.args[0])
+        self.assertIn("base1...head1", run.call_args.args[0])
+
+
 class PathHelperTest(unittest.TestCase):
     def test_state_path_uses_the_orchestrator_naming(self):
         target = MODULE.parse_target("owner/repo#7")
@@ -4257,7 +4413,11 @@ class PreflightCommandTest(unittest.TestCase):
         )
         stack.enter_context(mock.patch.object(MODULE, "checkout_pr", return_value=True))
         stack.enter_context(
-            mock.patch.object(MODULE, "fetch_authoritative_diff", return_value=DIFF)
+            mock.patch.object(
+                MODULE,
+                "fetch_authoritative_diff",
+                return_value=(DIFF, "github"),
+            )
         )
         stack.enter_context(
             mock.patch.object(MODULE, "changed_files_for", return_value=["app.py"])
@@ -4285,6 +4445,14 @@ class PreflightCommandTest(unittest.TestCase):
         self.assertEqual(5, payload["max_iterations"])
         self.assertEqual(DIFF, Path(payload["diff_path"]).read_text(encoding="utf-8"))
         self.assertTrue(Path(payload["preflight_path"]).is_file())
+        self.assertEqual("github", payload["diff_source"])
+        preflight = json.loads(
+            Path(payload["preflight_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual("github", preflight["diff_source"])
+        self.assertEqual(
+            "github", MODULE.load_state(Path(payload["state"]))["run"]["diff_source"]
+        )
 
     def test_refuses_a_dirty_worktree(self):
         with contextlib.ExitStack() as stack:

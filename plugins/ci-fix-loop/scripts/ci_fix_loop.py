@@ -45,6 +45,10 @@ SHORT_TARGET_PATTERN = re.compile(
     r"^(?P<owner>[^/\s]+)/(?P<repo>[^#/\s]+)#(?P<number>\d+)$"
 )
 NON_FAST_FORWARD_PATTERN = re.compile(r"fast[- ]forward|divergent", re.IGNORECASE)
+DIFF_TOO_LARGE_PATTERN = re.compile(
+    r"(?:PullRequest\.diff.*too_large|too_large.*PullRequest\.diff)",
+    re.IGNORECASE | re.DOTALL,
+)
 RUN_URL_PATTERN = re.compile(r"/actions/runs/(?P<run>\d+)")
 JOB_URL_PATTERN = re.compile(r"/(?:job|jobs)/(?P<job>\d+)")
 LEGACY_JOB_URL_PATTERN = re.compile(r"/runs/(?P<job>\d+)(?:$|[/?#])")
@@ -293,6 +297,7 @@ def run(
     cwd: Path | None = None,
     input_text: str | None = None,
     check: bool = True,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     process = subprocess.run(
         command,
@@ -303,6 +308,7 @@ def run(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        env=None if env is None else {**os.environ, **env},
     )
     if check and process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip() or "no output"
@@ -1049,6 +1055,30 @@ def changed_files_for(pr: dict[str, Any]) -> list[str]:
     return sorted(set(paths))
 
 
+def changed_files_from_local_diff(
+    repo_root: Path, pr: dict[str, Any]
+) -> list[str]:
+    result = run(
+        [
+            "git",
+            "-c",
+            "diff.renames=true",
+            "-C",
+            str(repo_root),
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--find-renames",
+            "--name-only",
+            "-z",
+            f"{pr['base_sha']}...{pr['head_sha']}",
+            "--",
+        ]
+    )
+    return sorted({path for path in result.stdout.split("\0") if path})
+
+
 def commit_provenance(
     repo_root: Path, commits: list[dict[str, str]]
 ) -> list[dict[str, Any]]:
@@ -1134,8 +1164,128 @@ def checkout_pr(
     return on_pr_branch
 
 
-def fetch_authoritative_diff(pr: dict[str, Any]) -> str:
-    return run(["gh", "pr", "diff", pr["pr_url"], "--repo", pr["repo_name"]]).stdout
+def fetch_remote_for(repo_root: Path, repo_name: str) -> str:
+    expected = repo_name.casefold()
+    for remote in git(repo_root, "remote").splitlines():
+        result = run(
+            ["git", "-C", str(repo_root), "remote", "get-url", remote],
+            check=False,
+        )
+        if result.returncode != 0:
+            continue
+        parsed = github_repo_from_remote(result.stdout.strip())
+        if parsed is not None and parsed.casefold() == expected:
+            return remote
+    return f"https://github.com/{repo_name}.git"
+
+
+def fetch_authoritative_diff(
+    repo_root: Path, pr: dict[str, Any]
+) -> tuple[str, str]:
+    command = ["gh", "pr", "diff", pr["pr_url"], "--repo", pr["repo_name"]]
+    result = run(command, check=False)
+    if result.returncode == 0:
+        return result.stdout, "github"
+
+    detail = result.stderr.strip() or result.stdout.strip() or "no output"
+    if not DIFF_TOO_LARGE_PATTERN.search(detail):
+        raise WorkflowError(
+            f"{' '.join(command)} failed ({result.returncode}): {detail}"
+        )
+
+    base_sha = pr["base_sha"]
+    if (
+        run(
+            ["git", "-C", str(repo_root), "cat-file", "-e", f"{base_sha}^{{commit}}"],
+            check=False,
+        ).returncode
+        != 0
+    ):
+        fetch = run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "fetch",
+                "--no-tags",
+                fetch_remote_for(repo_root, pr["repo_name"]),
+                f"refs/heads/{pr['base_branch']}",
+            ],
+            check=False,
+            env={"GIT_TERMINAL_PROMPT": "0"},
+        )
+        if fetch.returncode != 0:
+            fetch_detail = fetch.stderr.strip() or fetch.stdout.strip() or "no output"
+            raise WorkflowError(
+                "GitHub rejected the pull request diff as too large, and fetching "
+                f"the pinned base commit failed ({fetch.returncode}): {fetch_detail}"
+            )
+        if (
+            run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_root),
+                    "cat-file",
+                    "-e",
+                    f"{base_sha}^{{commit}}",
+                ],
+                check=False,
+            ).returncode
+            != 0
+        ):
+            raise WorkflowError(
+                "GitHub rejected the pull request diff as too large, and the pinned "
+                f"base commit {base_sha} is unavailable after fetching "
+                f"{pr['repo_name']}:{pr['base_branch']}"
+            )
+
+    shallow = run(
+        ["git", "-C", str(repo_root), "rev-parse", "--is-shallow-repository"],
+        check=False,
+    )
+    if shallow.returncode != 0 or shallow.stdout.strip() != "false":
+        raise WorkflowError(
+            "GitHub rejected the pull request diff as too large, and the local "
+            "fallback requires a complete, non-shallow repository history"
+        )
+
+    fallback = run(
+        [
+            "git",
+            "-c",
+            "diff.noprefix=false",
+            "-c",
+            "diff.algorithm=myers",
+            "-c",
+            "diff.context=3",
+            "-c",
+            "diff.renames=true",
+            "-C",
+            str(repo_root),
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--no-relative",
+            "--find-renames",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "-U3",
+            f"{base_sha}...{pr['head_sha']}",
+            "--",
+        ],
+        check=False,
+    )
+    if fallback.returncode != 0:
+        fallback_detail = (
+            fallback.stderr.strip() or fallback.stdout.strip() or "no output"
+        )
+        raise WorkflowError(
+            "GitHub rejected the pull request diff as too large, and the local "
+            f"merge-base diff failed ({fallback.returncode}): {fallback_detail}"
+        )
+    return fallback.stdout, "local_merge_base"
 
 
 def entry_typename(node: dict[str, Any]) -> str:
@@ -2423,8 +2573,12 @@ def command_preflight(args: argparse.Namespace) -> None:
         )
     require_checkout_head(git(repo_root, "rev-parse", "HEAD"), metadata["head_sha"])
 
-    diff_text = fetch_authoritative_diff(metadata)
-    changed_files = changed_files_for(metadata)
+    diff_text, diff_source = fetch_authoritative_diff(repo_root, metadata)
+    changed_files = (
+        changed_files_from_local_diff(repo_root, metadata)
+        if diff_source == "local_merge_base"
+        else changed_files_for(metadata)
+    )
     refreshed = metadata_for(target)
     if refreshed["head_sha"] != metadata["head_sha"]:
         raise WorkflowError(
@@ -2523,6 +2677,7 @@ def command_preflight(args: argparse.Namespace) -> None:
                 "head_sha": metadata["head_sha"],
                 "base_sha": metadata["base_sha"],
                 "diff_path": str(diff_path),
+                "diff_source": diff_source,
                 "changed_files": changed_files,
                 "pr_commits": pr_commits,
                 "checks": [],
@@ -2577,6 +2732,7 @@ def command_preflight(args: argparse.Namespace) -> None:
         "head_sha": metadata["head_sha"],
         "base_sha": metadata["base_sha"],
         "diff_path": str(diff_path),
+        "diff_source": diff_source,
         "changed_files": changed_files,
         "pr_commits": pr_commits,
         "history": state["history"],
@@ -2613,6 +2769,7 @@ def command_preflight(args: argparse.Namespace) -> None:
             "head_sha": metadata["head_sha"],
             "base_sha": metadata["base_sha"],
             "diff_path": str(diff_path),
+            "diff_source": diff_source,
             "diff_bytes": len(diff_text.encode("utf-8")),
             "counts": {
                 "changed_files": len(changed_files),
