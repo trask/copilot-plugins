@@ -59,6 +59,12 @@ class WorkflowError(RuntimeError):
         self.details = details or {}
 
 
+def windows_no_window_options() -> dict[str, int]:
+    if not IS_WINDOWS:
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+
+
 def run(
     command: list[str],
     *,
@@ -75,6 +81,7 @@ def run(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        **windows_no_window_options(),
     )
     if check and process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip() or "no output"

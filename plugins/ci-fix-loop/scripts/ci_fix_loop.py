@@ -291,6 +291,12 @@ class RerunPermissionDenied(WorkflowError):
     pass
 
 
+def windows_no_window_options() -> dict[str, int]:
+    if not IS_WINDOWS:
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+
+
 def run(
     command: list[str],
     *,
@@ -309,6 +315,7 @@ def run(
         stderr=subprocess.PIPE,
         check=False,
         env=None if env is None else {**os.environ, **env},
+        **windows_no_window_options(),
     )
     if check and process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip() or "no output"

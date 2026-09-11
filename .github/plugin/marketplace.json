@@ -11,25 +11,25 @@
     {
       "name": "pr-reviewer",
       "description": "Review a GitHub pull request and create a verified pending review with high-confidence inline comments.",
-      "version": "1.6.5",
+      "version": "1.6.6",
       "source": "./plugins/pr-reviewer"
     },
     {
       "name": "copilot-review-loop",
       "description": "Address Copilot pull request review comments, publish fixes, and repeat until the review is clean.",
-      "version": "1.0.48",
+      "version": "1.0.49",
       "source": "./plugins/copilot-review-loop"
     },
     {
       "name": "self-review-loop",
       "description": "Review a GitHub pull request, verify each finding independently, and commit the fixes without posting review comments.",
-      "version": "1.2.4",
+      "version": "1.2.5",
       "source": "./plugins/self-review-loop"
     },
     {
       "name": "pr-description",
       "description": "Review and automatically update a pull request title and description with head verification.",
-      "version": "1.0.30",
+      "version": "1.0.31",
       "source": "./plugins/pr-description"
     },
     {
@@ -41,19 +41,19 @@
     {
       "name": "pr-conflict-resolver",
       "description": "Resolve the merge conflicts on a pull request in one pass by keeping both sides' intent, then push the resolution.",
-      "version": "1.0.14",
+      "version": "1.0.15",
       "source": "./plugins/pr-conflict-resolver"
     },
     {
       "name": "ci-fix-loop",
       "description": "Fix continuous integration failures on one pull request or bottom-up through a native stack, propagating each fix through its descendants.",
-      "version": "1.5.2",
+      "version": "1.5.3",
       "source": "./plugins/ci-fix-loop"
     },
     {
       "name": "historical-pr-audit",
       "description": "Audit an already-merged GitHub pull request against its own historical snapshot, verify each finding independently, and commit the fixes on a separate audit branch.",
-      "version": "1.0.2",
+      "version": "1.0.3",
       "source": "./plugins/historical-pr-audit"
     }
   ]

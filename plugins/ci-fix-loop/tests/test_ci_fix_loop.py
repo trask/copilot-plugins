@@ -20,6 +20,40 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+class WindowsSubprocessTest(unittest.TestCase):
+    def test_run_hides_windows_console_processes(self):
+        completed = MODULE.subprocess.CompletedProcess(["formatter"], 0, "", "")
+        with (
+            mock.patch.object(MODULE, "IS_WINDOWS", True),
+            mock.patch.object(
+                MODULE.subprocess,
+                "CREATE_NO_WINDOW",
+                0x08000000,
+                create=True,
+            ),
+            mock.patch.object(
+                MODULE.subprocess, "run", return_value=completed
+            ) as subprocess_run,
+        ):
+            MODULE.run(["formatter"])
+
+        self.assertEqual(
+            subprocess_run.call_args.kwargs["creationflags"], 0x08000000
+        )
+
+    def test_run_leaves_non_windows_process_options_unchanged(self):
+        completed = MODULE.subprocess.CompletedProcess(["formatter"], 0, "", "")
+        with (
+            mock.patch.object(MODULE, "IS_WINDOWS", False),
+            mock.patch.object(
+                MODULE.subprocess, "run", return_value=completed
+            ) as subprocess_run,
+        ):
+            MODULE.run(["formatter"])
+
+        self.assertNotIn("creationflags", subprocess_run.call_args.kwargs)
+
+
 NOW = dt.datetime(2026, 1, 1, 12, 0, 0, tzinfo=dt.timezone.utc)
 DIFF = """diff --git a/app.py b/app.py
 --- a/app.py

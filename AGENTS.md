@@ -18,9 +18,14 @@ pull request. See [Publication](#publication) for the rest of the flow.
 
 ## Windows subprocesses
 
-- Every background or monitor path that starts a console program on Windows must
-  use `CREATE_NO_WINDOW`, preferably through the plugin's shared launch helper,
-  and must have regression coverage for the creation flags.
+- Every production Python subprocess path that can start a console program on
+  Windows must use `CREATE_NO_WINDOW`, including foreground helpers, background
+  workers, monitors, schedulers, and arbitrary formatter or fixer commands.
+  Prefer the plugin's shared launch helper and add regression coverage for every
+  direct `subprocess.run` or `subprocess.Popen` wrapper.
+- Apply `CREATE_NO_WINDOW` at every process boundary. Windows does not guarantee
+  that the flag protects grandchildren, so a hidden parent must not rely on it
+  to hide console programs started by nested scripts.
 - Poll process state through the Windows API. Do not run `tasklist` or another
   console utility from a polling loop.
 

@@ -15,6 +15,41 @@ assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
+
+class WindowsSubprocessTest(unittest.TestCase):
+    def test_run_hides_windows_console_processes(self):
+        completed = MODULE.subprocess.CompletedProcess(["gh"], 0, "", "")
+        with (
+            mock.patch.object(MODULE, "IS_WINDOWS", True),
+            mock.patch.object(
+                MODULE.subprocess,
+                "CREATE_NO_WINDOW",
+                0x08000000,
+                create=True,
+            ),
+            mock.patch.object(
+                MODULE.subprocess, "run", return_value=completed
+            ) as subprocess_run,
+        ):
+            MODULE.run(["gh"])
+
+        self.assertEqual(
+            subprocess_run.call_args.kwargs["creationflags"], 0x08000000
+        )
+
+    def test_run_leaves_non_windows_process_options_unchanged(self):
+        completed = MODULE.subprocess.CompletedProcess(["gh"], 0, "", "")
+        with (
+            mock.patch.object(MODULE, "IS_WINDOWS", False),
+            mock.patch.object(
+                MODULE.subprocess, "run", return_value=completed
+            ) as subprocess_run,
+        ):
+            MODULE.run(["gh"])
+
+        self.assertNotIn("creationflags", subprocess_run.call_args.kwargs)
+
+
 DIFF = """\
 diff --git a/src/one.py b/src/one.py
 index 1111111..2222222 100644

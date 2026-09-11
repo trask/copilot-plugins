@@ -7,6 +7,7 @@ import argparse
 import ast
 from collections import Counter
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -30,10 +31,17 @@ COPILOT_LOGINS = {
     "copilot-pull-request-reviewer",
     "copilot-pull-request-reviewer[bot]",
 }
+IS_WINDOWS = os.name == "nt"
 
 
 class WorkflowError(RuntimeError):
     pass
+
+
+def windows_no_window_options() -> dict[str, int]:
+    if not IS_WINDOWS:
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
 
 
 def run(
@@ -50,6 +58,7 @@ def run(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        **windows_no_window_options(),
     )
     if check and process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip() or "no output"

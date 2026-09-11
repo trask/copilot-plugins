@@ -108,6 +108,12 @@ class CommandPassthroughArgumentParser(argparse.ArgumentParser):
         return parsed
 
 
+def windows_no_window_options() -> dict[str, int]:
+    if not IS_WINDOWS:
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+
+
 def run(
     command: list[str],
     *,
@@ -127,6 +133,7 @@ def run(
         stderr=subprocess.PIPE,
         check=False,
         env=env,
+        **windows_no_window_options(),
     )
     if check and process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip() or "no output"
@@ -148,6 +155,7 @@ def git_bytes(repo_root: Path, *arguments: str) -> bytes | None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        **windows_no_window_options(),
     )
     return process.stdout if process.returncode == 0 else None
 

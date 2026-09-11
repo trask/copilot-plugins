@@ -22,6 +22,40 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+class WindowsSubprocessTest(unittest.TestCase):
+    def test_run_hides_windows_console_processes(self):
+        completed = MODULE.subprocess.CompletedProcess(["git"], 0, "", "")
+        with (
+            mock.patch.object(MODULE, "IS_WINDOWS", True),
+            mock.patch.object(
+                MODULE.subprocess,
+                "CREATE_NO_WINDOW",
+                0x08000000,
+                create=True,
+            ),
+            mock.patch.object(
+                MODULE.subprocess, "run", return_value=completed
+            ) as subprocess_run,
+        ):
+            MODULE.run(["git"])
+
+        self.assertEqual(
+            subprocess_run.call_args.kwargs["creationflags"], 0x08000000
+        )
+
+    def test_run_leaves_non_windows_process_options_unchanged(self):
+        completed = MODULE.subprocess.CompletedProcess(["git"], 0, "", "")
+        with (
+            mock.patch.object(MODULE, "IS_WINDOWS", False),
+            mock.patch.object(
+                MODULE.subprocess, "run", return_value=completed
+            ) as subprocess_run,
+        ):
+            MODULE.run(["git"])
+
+        self.assertNotIn("creationflags", subprocess_run.call_args.kwargs)
+
+
 def _literal_strings(node: ast.AST) -> set[str]:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return {node.value}
