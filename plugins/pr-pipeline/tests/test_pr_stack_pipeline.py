@@ -257,10 +257,8 @@ class DelegationTest(unittest.TestCase):
 class ModelTest(unittest.TestCase):
     def test_models_match_the_single_pull_request_pipeline(self):
         models = COMMON.stage_models(None)
-        self.assertEqual("claude-opus-5", models[MODULE.STAGE_SELF_REVIEW])
         for stage in MODULE.PHASE_NAMES:
-            if stage != MODULE.STAGE_SELF_REVIEW:
-                self.assertEqual("gpt-5.6-sol", models[stage])
+            self.assertEqual("gpt-5.6-sol", models[stage])
 
     def test_worker_commands_use_the_pipeline_flags(self):
         entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CI]
@@ -2267,6 +2265,11 @@ class LauncherTest(unittest.TestCase):
 class AgentInstructionTest(unittest.TestCase):
     def setUp(self):
         self.text = AGENT.read_text(encoding="utf-8")
+
+    def test_requires_the_exact_primary_model_and_effort(self):
+        self.assertIn("model is exactly `gpt-5.6-sol`", self.text)
+        self.assertIn("reasoning effort is exactly `high`", self.text)
+        self.assertIn("The user cannot override this gate", self.text)
 
     def test_requires_a_chat_only_retrospective_after_the_terminal_response(self):
         self.assertIn("## Retrospective", self.text)

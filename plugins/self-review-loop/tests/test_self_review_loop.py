@@ -246,12 +246,14 @@ class AgentInstructionsTest(unittest.TestCase):
             2,
         )
 
-    def test_keeps_the_claude_only_model_gate(self):
+    def test_requires_the_exact_primary_route_and_independent_evaluator(self):
         self.assertIn("## Model Gate", self.instructions)
-        self.assertIn("Run only on a Claude model.", self.instructions)
+        self.assertIn("model is exactly `gpt-5.6-sol`", self.instructions)
+        self.assertIn("reasoning effort is exactly `high`", self.instructions)
+        self.assertIn("The user cannot override this gate", self.instructions)
         self.assertIn(
-            "using agent type **general-purpose**, model **GPT-5.6 Sol**, and "
-            "reasoning effort **max**",
+            "using agent type **general-purpose**, model `claude-sonnet-5`, and "
+            "reasoning effort `high`",
             self.instructions,
         )
         self.assertIn(
@@ -266,6 +268,8 @@ class AgentInstructionsTest(unittest.TestCase):
             "for **each candidate separately**",
             self.instructions,
         )
+        self.assertNotIn("claude-opus-5", self.instructions.lower())
+        self.assertNotIn("reasoning effort **max**", self.instructions)
 
     def test_defines_the_bar_each_evaluator_judges_against(self):
         self.assertIn("## Evaluation Standard", self.instructions)

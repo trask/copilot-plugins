@@ -26,7 +26,7 @@ Clear the **Model Gate** first, then run `preflight`. After `preflight` succeeds
 
 ## Non-Negotiable Rules
 
-- Run only on a Claude model. Clear the **Model Gate** before any other work, including before you read the pull request.
+- Run only when this primary session uses exactly `gpt-5.6-sol` with reasoning effort exactly `high`. Clear the **Model Gate** before any other work, including before you read the pull request.
 - Never wait for `next`, `commit`, `looks good`, `publish`, or `push etc`. Run the loop yourself, without stopping, until it is clean, it reaches the iteration cap, or a stop condition applies.
 - The loop is `preflight -> review -> evaluate -> batch -> commit -> publish`, repeated for each new head.
 - The maximum is 5 iterations, unless an outer loop sets its own. Respect `max_iterations_reached` before you edit anything; do not work around it.
@@ -69,13 +69,12 @@ These rules govern the wording of everything you write for a person to read: pul
 
 ## Model Gate
 
-The review step evaluates every candidate with a fixed **GPT-5.6 Sol** subagent. That evaluator only argues against you while this agent runs on a different model family. A GPT-family reviewer would grade its own findings, and this design exists to prevent exactly that.
+The review step evaluates every candidate with a fixed `claude-sonnet-5` subagent at reasoning effort `high`. That evaluator stays independent while this primary session uses the required GPT model.
 
-1. Work out which model runs this agent before you do anything else. Continue without comment only when it is definitely a Claude model.
-2. Otherwise stop at once, before `preflight` and before you fetch any pull request data. Report which model you run as, explain that the fixed GPT-5.6 Sol evaluator would no longer be independent of it, and ask the user to run the agent again on a Claude model.
-3. If you cannot work out which model you run as, the gate has failed. That is not permission to continue.
-4. Continue after a failed gate only when the user explicitly tells you to proceed anyway, in this session, in a message that answers this warning. The original invocation, an earlier message, a stored memory, a configured default, and anything you infer are never that confirmation. Never ask a second time to get it.
-5. After such an override, say plainly in the final response that the evaluation was weaker, next to the commit index.
+1. Work out which model and reasoning effort run this agent before you do anything else. Continue without comment only when the model is exactly `gpt-5.6-sol` and the reasoning effort is exactly `high`.
+2. Otherwise stop at once, before `preflight` and before you fetch any pull request data. Report the active model and effort, then ask the user to run the agent again with `gpt-5.6-sol` and reasoning effort `high`.
+3. If you cannot work out either value, the gate has failed. That is not permission to continue.
+4. Never continue after a failed gate. The user cannot override this gate.
 
 ## Mechanical Helper
 
@@ -111,7 +110,7 @@ The helper's current result decides the transition. Never jump to a later stage 
 
 | Current stage | Successful transition | Recovery or terminal transition |
 | --- | --- | --- |
-| Model gate | `preflight` | A failed gate stops before repository work unless the user gives the explicit override this file defines. |
+| Model gate | `preflight` | A failed gate stops before repository work. |
 | `preflight` | `ready` enters repository-context loading and review | `max_iterations_reached` is terminal. A helper error stays at `preflight`; fix only its blocker and repeat the same command. |
 | Review | zero candidates enters `resolve`; candidates enter evaluation | A moved head from `resolve` returns to a fresh `preflight` without spending an iteration. |
 | Evaluation | dropped candidates enter `resolve`; survivors enter planning | An unusable evaluator result repeats only that evaluator. It never chooses keep or drop by default. |
@@ -177,7 +176,7 @@ For each iteration, before you edit anything:
 3. Discard anything the carried-forward `history` still settles under **Target And Preflight**. A missing history commit is not enough to raise the finding again. Raise it again only when the pinned diff and current code show that the fix was removed.
 4. If no candidate remains, run `resolve --state <path> --outcome clean`, then stop without registering candidates, editing, or publishing, and send the final index.
 5. Otherwise register the full surviving list with `candidates`, which also proves that every anchor is a genuinely changed line. Include a concrete, plausible candidate whose factuality or actionability you still cannot settle after reasonable investigation. Do not drop it yourself just because it may turn out to change nothing.
-6. Launch a fresh independent subagent for **each candidate separately** using agent type **general-purpose**, model **GPT-5.6 Sol**, and reasoning effort **max**. The agent type is required even when you set the model override; do not substitute an explore, task, review, or other specialized agent. Never put more than one candidate in one evaluation. Run those evaluations concurrently under **Parallel Evaluation**. Give that evaluator the PR's stated scope, the relevant diff and context, the **Evaluation Standard**, and exactly one candidate. Require two independent decisions, each judged against that standard and supported by evidence:
+6. Launch a fresh independent subagent for **each candidate separately** using agent type **general-purpose**, model `claude-sonnet-5`, and reasoning effort `high`. The agent type is required even when you set the model override; do not substitute an explore, task, review, or other specialized agent. Never put more than one candidate in one evaluation. Run those evaluations concurrently under **Parallel Evaluation**. Give that evaluator the PR's stated scope, the relevant diff and context, the **Evaluation Standard**, and exactly one candidate. Require two independent decisions, each judged against that standard and supported by evidence:
    - Is the candidate factually correct and demonstrated by this PR?
    - Would a reasonable author apply this fix or knowingly decline it, as part of what this PR already does?
 7. Run `drop` for any candidate where decision 1 fails or stays uncertain, or where decision 2 fails on evidence the evaluator named, and record the decision it failed together with the evaluator's concrete reason. Uncertainty about decision 2 on its own never drops a candidate. Write that model-authored rationale to a temporary UTF-8 file outside the repository, pass it with `--rationale-file`, and delete it afterward. Never force parentheses, quotes, or multiline text through a shell argument. Keep each dropped candidate's original problem statement, its location, and the evaluator's concrete reason for the final response, including through the run's later iterations. If you drop every candidate, run `resolve --state <path> --outcome clean`, then stop without editing or publishing and send the final index.

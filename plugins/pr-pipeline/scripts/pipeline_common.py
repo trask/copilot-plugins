@@ -27,7 +27,8 @@ from typing import Any, Callable
 
 DEFAULT_STAGE_MODEL = "gpt-5.6-sol"
 DEFAULT_EFFORT = "high"
-CLAUDE_FAMILY = "claude"
+SELF_REVIEW_MODEL = "gpt-5.6-sol"
+SELF_REVIEW_EFFORT = "high"
 IS_WINDOWS = os.name == "nt"
 
 PR_URL_PATTERN = re.compile(
@@ -70,8 +71,9 @@ STAGES: tuple[dict[str, Any], ...] = (
         "agent": f"{STAGE_SELF_REVIEW}:{STAGE_SELF_REVIEW}",
         "module": "self_review_loop",
         "marker": ("review", "clean_at_head_sha"),
-        "model": "claude-opus-5",
-        "requires_family": CLAUDE_FAMILY,
+        "model": SELF_REVIEW_MODEL,
+        "required_model": SELF_REVIEW_MODEL,
+        "required_effort": SELF_REVIEW_EFFORT,
     },
     {
         "stage": STAGE_CI,
@@ -1477,13 +1479,24 @@ def inspect_stages(
     return [inspect(entry, target, head_sha, base_sha) for entry in STAGES]
 
 
-def stage_models(overrides: list[str] | None) -> dict[str, str]:
-    """Resolve the model each stage runs on, honoring per-stage overrides.
+def validate_stage_route(entry: dict[str, Any], model: str, effort: str) -> None:
+    required_model = entry.get("required_model")
+    if required_model and model != required_model:
+        raise WorkflowError(
+            f"{entry['stage']} requires exactly model {required_model}, not {model}"
+        )
+    required_effort = entry.get("required_effort")
+    if required_effort and effort != required_effort:
+        raise WorkflowError(
+            f"{entry['stage']} requires exactly reasoning effort "
+            f"{required_effort}, not {effort}"
+        )
 
-    Self review is the one stage pinned to a Claude model, because it depends
-    on that family's review behavior; an override that changes its family is
-    rejected instead of silently accepted.
-    """
+
+def stage_models(
+    overrides: list[str] | None, effort: str = DEFAULT_EFFORT
+) -> dict[str, str]:
+    """Resolve stage models and enforce stages with fixed model routes."""
     models = {entry["stage"]: entry["model"] for entry in STAGES}
     for assignment in overrides or []:
         stage, separator, model = assignment.partition("=")
@@ -1493,12 +1506,7 @@ def stage_models(overrides: list[str] | None) -> dict[str, str]:
             )
         models[stage] = model.strip()
     for entry in STAGES:
-        family = entry.get("requires_family")
-        if family and family not in models[entry["stage"]].lower():
-            raise WorkflowError(
-                f"{entry['stage']} requires a {family} model, not "
-                f"{models[entry['stage']]}"
-            )
+        validate_stage_route(entry, models[entry["stage"]], effort)
     return models
 
 
@@ -1561,6 +1569,7 @@ def stage_command(
     prompt: str | None = None,
     resolve_program: Callable[[str], str] = resolve_launch_program,
 ) -> list[str]:
+    validate_stage_route(entry, model, effort)
     return [
         resolve_program("copilot"),
         "-p",

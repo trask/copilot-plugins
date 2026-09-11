@@ -2932,6 +2932,7 @@ def start_scheduler(
 
 
 def command_start(args: argparse.Namespace) -> None:
+    common.stage_models(args.stage_model, args.effort)
     kickoff = load_kickoff(args)
     repo_root = (
         Path(args.repo_root).resolve() if args.repo_root else common.resolve_repo_root()
@@ -3134,7 +3135,7 @@ def command_run(args: argparse.Namespace) -> None:
     pipeline = StackPipeline(
         kickoff,
         repo_root,
-        models=common.stage_models(args.stage_model),
+        models=common.stage_models(args.stage_model, args.effort),
         effort=args.effort,
         run_id=validate_run_id(args.run_id) if args.run_id else None,
         report=reporter,

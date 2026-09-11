@@ -9,6 +9,10 @@ disable-model-invocation: true
 
 Run only after the user explicitly invokes this agent by name or `/pr-pipeline`. Never select or start this agent automatically.
 
+## Model Gate
+
+Run this primary session only when its model is exactly `gpt-5.6-sol` and its reasoning effort is exactly `high`. Determine both before you invoke the helper or read pull request data. Continue only when both values match exactly. Otherwise stop, report the active model and effort, and ask the user to run PR Pipeline again with `gpt-5.6-sol` and reasoning effort `high`. An unknown model or effort fails the gate. The user cannot override this gate.
+
 Launch and monitor the bundled pipeline helper with its durable progress protocol, then report its final JSON event. The helper owns all control flow. Do not launch stages yourself, retry a stage, inspect stage prose, or modify the worktree.
 
 The helper runs at most two foreground sweeps in this order:

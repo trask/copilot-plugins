@@ -43,7 +43,6 @@ WorkflowError = common.WorkflowError
 MAX_SWEEPS = 2
 DEFAULT_STAGE_MODEL = common.DEFAULT_STAGE_MODEL
 DEFAULT_EFFORT = common.DEFAULT_EFFORT
-CLAUDE_FAMILY = common.CLAUDE_FAMILY
 IS_WINDOWS = common.IS_WINDOWS
 
 STAGE_CONFLICT = common.STAGE_CONFLICT
@@ -854,6 +853,7 @@ def scheduler_command(
 
 
 def command_start(args: argparse.Namespace) -> None:
+    stage_models(args.stage_model, args.effort)
     repo_root = resolve_repo_root()
     target = resolve_target(args.target, repo_root)
     run_id = uuid.uuid4().hex
@@ -925,7 +925,7 @@ def command_run(args: argparse.Namespace) -> None:
     event_log = Path(args.event_log).resolve() if args.event_log else None
     reporter = ProgressReporter(target=target, event_log=event_log)
     options = {
-        "models": stage_models(args.stage_model),
+        "models": stage_models(args.stage_model, args.effort),
         "effort": args.effort,
         "report": reporter,
     }

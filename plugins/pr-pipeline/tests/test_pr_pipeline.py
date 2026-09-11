@@ -502,11 +502,38 @@ class StageContractTest(unittest.TestCase):
             {entry["stage"]: entry["marker"] for entry in MODULE.STAGES},
         )
 
-    def test_only_self_review_requires_claude(self):
+    def test_self_review_requires_the_exact_model_and_effort(self):
         models = MODULE.stage_models(None)
-        self.assertIn("claude", models[MODULE.STAGE_SELF_REVIEW])
-        with self.assertRaisesRegex(MODULE.WorkflowError, "requires a claude model"):
-            MODULE.stage_models(["self-review-loop=gpt-5.6-sol"])
+        self.assertEqual("gpt-5.6-sol", models[MODULE.STAGE_SELF_REVIEW])
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "requires exactly model gpt-5.6-sol",
+        ):
+            MODULE.stage_models(["self-review-loop=claude-sonnet-5"])
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "requires exactly reasoning effort high",
+        ):
+            MODULE.stage_models(None, "max")
+
+    def test_self_review_launch_revalidates_the_exact_route(self):
+        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_SELF_REVIEW]
+        for model, effort, error in (
+            ("claude-sonnet-5", "high", "requires exactly model gpt-5.6-sol"),
+            ("gpt-5.6-sol", "max", "requires exactly reasoning effort high"),
+        ):
+            with (
+                self.subTest(model=model, effort=effort),
+                self.assertRaisesRegex(MODULE.WorkflowError, error),
+            ):
+                MODULE.common.stage_command(
+                    entry,
+                    target(),
+                    model=model,
+                    effort=effort,
+                    arguments=[],
+                    resolve_program=lambda name: name,
+                )
 
     def test_pipeline_position_is_one_run_and_two_sweeps(self):
         entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CI]
@@ -1233,6 +1260,12 @@ class WorktreeSafetyTest(unittest.TestCase):
 
 
 class AgentInstructionTest(unittest.TestCase):
+    def test_requires_the_exact_primary_model_and_effort(self):
+        text = AGENT.read_text(encoding="utf-8")
+        self.assertIn("model is exactly `gpt-5.6-sol`", text)
+        self.assertIn("reasoning effort is exactly `high`", text)
+        self.assertIn("The user cannot override this gate", text)
+
     def test_requires_a_chat_only_retrospective_after_the_terminal_response(self):
         text = AGENT.read_text(encoding="utf-8")
         self.assertIn("## Retrospective", text)
