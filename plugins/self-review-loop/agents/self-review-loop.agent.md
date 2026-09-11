@@ -26,7 +26,7 @@ Clear the **Model Gate** first, then run `preflight`. After `preflight` succeeds
 
 ## Non-Negotiable Rules
 
-- Run only when this primary session uses exactly `gpt-5.6-sol` with reasoning effort exactly `high`. Clear the **Model Gate** before any other work, including before you read the pull request.
+- Run only when this primary session uses exactly `gpt-5.6-sol`. When the runtime exposes the primary session's reasoning effort, require it to be exactly `high`. Clear the **Model Gate** before any other work, including before you read the pull request.
 - Never wait for `next`, `commit`, `looks good`, `publish`, or `push etc`. Run the loop yourself, without stopping, until it is clean, it reaches the iteration cap, or a stop condition applies.
 - The loop is `preflight -> review -> evaluate -> batch -> commit -> publish`, repeated for each new head.
 - The maximum is 5 iterations, unless an outer loop sets its own. Respect `max_iterations_reached` before you edit anything; do not work around it.
@@ -71,10 +71,11 @@ These rules govern the wording of everything you write for a person to read: pul
 
 The review step evaluates every candidate with a fixed `claude-sonnet-5` subagent at reasoning effort `high`. That evaluator stays independent while this primary session uses the required GPT model.
 
-1. Work out which model and reasoning effort run this agent before you do anything else. Continue without comment only when the model is exactly `gpt-5.6-sol` and the reasoning effort is exactly `high`.
-2. Otherwise stop at once, before `preflight` and before you fetch any pull request data. Report the active model and effort, then ask the user to run the agent again with `gpt-5.6-sol` and reasoning effort `high`.
-3. If you cannot work out either value, the gate has failed. That is not permission to continue.
-4. Never continue after a failed gate. The user cannot override this gate.
+1. Work out which model runs this agent before you do anything else. Also inspect the reasoning effort when the runtime exposes it.
+2. Continue without comment when the model is exactly `gpt-5.6-sol` and the effort is either exactly `high` or unavailable. The app does not always expose the primary session's effort to the agent, so an unavailable effort does not fail the gate.
+3. Otherwise stop at once, before `preflight` and before you fetch any pull request data. Report the active model and any exposed effort, then ask the user to run the agent again with `gpt-5.6-sol` and reasoning effort `high`.
+4. If you cannot work out the model, the gate has failed. That is not permission to continue.
+5. Never continue after a failed gate. The user cannot override this gate.
 
 ## Mechanical Helper
 

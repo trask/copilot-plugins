@@ -249,7 +249,19 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_requires_the_exact_primary_route_and_independent_evaluator(self):
         self.assertIn("## Model Gate", self.instructions)
         self.assertIn("model is exactly `gpt-5.6-sol`", self.instructions)
-        self.assertIn("reasoning effort is exactly `high`", self.instructions)
+        self.assertIn(
+            "When the runtime exposes the primary session's reasoning effort, "
+            "require it to be exactly `high`",
+            self.instructions,
+        )
+        self.assertIn(
+            "an unavailable effort does not fail the gate",
+            self.instructions,
+        )
+        self.assertIn(
+            "If you cannot work out the model, the gate has failed",
+            self.instructions,
+        )
         self.assertIn("The user cannot override this gate", self.instructions)
         self.assertIn(
             "using agent type **general-purpose**, model `claude-sonnet-5`, and "
