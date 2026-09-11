@@ -2266,9 +2266,14 @@ class AgentInstructionTest(unittest.TestCase):
     def setUp(self):
         self.text = AGENT.read_text(encoding="utf-8")
 
-    def test_requires_the_exact_primary_model_and_effort(self):
+    def test_requires_the_exact_primary_model_and_exposed_effort(self):
         self.assertIn("model is exactly `gpt-5.6-sol`", self.text)
-        self.assertIn("reasoning effort is exactly `high`", self.text)
+        self.assertIn(
+            "effort is either exactly `high` or unavailable",
+            self.text,
+        )
+        self.assertIn("an unavailable effort does not fail the gate", self.text)
+        self.assertIn("If you cannot determine the model", self.text)
         self.assertIn("The user cannot override this gate", self.text)
 
     def test_requires_a_chat_only_retrospective_after_the_terminal_response(self):
