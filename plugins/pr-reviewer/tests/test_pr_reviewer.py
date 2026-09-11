@@ -610,17 +610,27 @@ class AgentInstructionsTest(unittest.TestCase):
         )
         self.assertNotIn("a triviality, a style preference", instructions)
 
-    def test_requires_the_exact_primary_model_and_effort_before_review_work(self):
+    def test_requires_the_exact_primary_model_and_exposed_effort_before_review_work(
+        self,
+    ):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn("## Model Gate", instructions)
         self.assertIn("model is exactly `gpt-5.6-sol`", instructions)
-        self.assertIn("reasoning effort is exactly `high`", instructions)
+        self.assertIn(
+            "When the runtime exposes the primary session's reasoning effort, "
+            "require it to be exactly `high`",
+            instructions,
+        )
         self.assertIn("Clear the **Model Gate**", instructions)
         self.assertIn("fixed `claude-sonnet-5` subagent", instructions)
         self.assertIn("run the agent again with `gpt-5.6-sol`", instructions)
         self.assertIn("before `check` and before you fetch any pull request data", instructions)
-        self.assertIn("If you cannot work out either value, the gate has failed", instructions)
+        self.assertIn(
+            "an unavailable effort does not fail the gate",
+            instructions,
+        )
+        self.assertIn("If you cannot work out the model, the gate has failed", instructions)
         self.assertIn("The user cannot override this gate", instructions)
         self.assertNotIn("claude-opus-5", instructions.lower())
         self.assertNotIn("GPT-family model", instructions)

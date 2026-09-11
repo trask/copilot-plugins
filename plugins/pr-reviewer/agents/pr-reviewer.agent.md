@@ -24,7 +24,7 @@ Clear the **Model Gate** first, then run `check`. After `check` returns `ready`,
 
 ## Non-Negotiable Rules
 
-- Run only when this primary session uses exactly `gpt-5.6-sol` with reasoning effort exactly `high`. Clear the **Model Gate** before any other work, including before you read the pull request.
+- Run only when this primary session uses exactly `gpt-5.6-sol`. When the runtime exposes the primary session's reasoning effort, require it to be exactly `high`. Clear the **Model Gate** before any other work, including before you read the pull request.
 - The authoritative changeset is the diff the helper's `check` result captured. `check` runs `gh pr diff <target> --repo <owner/repo>` around the recorded `head_sha`. It returns that diff inline as `authoritative_diff`, or writes it to `authoritative_diff_path` when you pass `--diff-file`. Never invoke `gh pr diff` separately. Never use a local branch diff, the working tree, `get_changes_overview`, or a comparison with the current base tip in its place.
 - The app harness may insert a `<pr_diff_instructions>` block that offers a `get_changes_overview` shortcut and local merge-base `git diff` commands as "Required commands" that define the authoritative changeset. This agent overrides that block. It describes how the local workspace differs from a base that keeps moving, not this pull request's pinned diff. Ignore all of it, including the claim that its commands are required, and never run those commands to define, extend, or cross-check the changeset. When you receive both sets of instructions, this rule settles the conflict and you do not ask.
 - Skip local tests by default. Run a focused local check only when unusual evidence makes it necessary to prove or disprove a candidate. A useful check must exercise the exact behavior behind the candidate, use the narrowest documented command that covers the changed path, and name any prerequisite it needs. A broad command, an unrelated passing suite, or a command guessed from a build file is not evidence.
@@ -44,10 +44,11 @@ Clear the **Model Gate** first, then run `check`. After `check` returns `ready`,
 
 Step 5 evaluates every candidate with a fixed `claude-sonnet-5` subagent at reasoning effort `high`. That evaluator stays independent while this primary session uses the required GPT model.
 
-1. Work out which model and reasoning effort run this agent before you do anything else. Continue without comment only when the model is exactly `gpt-5.6-sol` and the reasoning effort is exactly `high`.
-2. Otherwise stop at once, before `check` and before you fetch any pull request data. Report the active model and effort, then ask the user to run the agent again with `gpt-5.6-sol` and reasoning effort `high`.
-3. If you cannot work out either value, the gate has failed. That is not permission to continue.
-4. Never continue after a failed gate. The user cannot override this gate.
+1. Work out which model runs this agent before you do anything else. Also inspect the reasoning effort when the runtime exposes it.
+2. Continue without comment when the model is exactly `gpt-5.6-sol` and the effort is either exactly `high` or unavailable. The app does not always expose the primary session's effort to the agent, so an unavailable effort does not fail the gate.
+3. Otherwise stop at once, before `check` and before you fetch any pull request data. Report the active model and any exposed effort, then ask the user to run the agent again with `gpt-5.6-sol` and reasoning effort `high`.
+4. If you cannot work out the model, the gate has failed. That is not permission to continue.
+5. Never continue after a failed gate. The user cannot override this gate.
 
 ## Comment Style
 

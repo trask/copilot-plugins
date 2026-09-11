@@ -34,8 +34,8 @@ finding with its own separate evaluator. It then creates a pending review that
 holds only the findings it can confirm, and verifies that every inline comment
 points at a real line of that diff.
 
-Run this agent on a Claude model. It checks its own findings with GPT-5.6 Sol,
-and that check only works when the evaluator comes from another model family.
+Run this agent with GPT-5.6 Sol at high reasoning effort. It checks each finding
+with a separate Claude Sonnet 5 evaluator.
 
 ### Copilot Review Loop
 
