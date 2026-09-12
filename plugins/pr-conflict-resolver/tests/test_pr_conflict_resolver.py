@@ -316,9 +316,9 @@ class AgentInstructionsTest(unittest.TestCase):
             self.instructions,
         )
         self.assertIn("user-invocable: true", self.instructions)
-        self.assertIn("disable-model-invocation: false", self.instructions)
+        self.assertIn("disable-model-invocation: true", self.instructions)
         self.assertIn(
-            "Never select or start this agent from general task context.",
+            "Never select or start this agent automatically.",
             self.instructions,
         )
 
@@ -8581,6 +8581,32 @@ class StackValidationFixCommandTest(GitTestCase):
     def saved(self):
         return json.loads(self.state_path.read_text(encoding="utf-8"))
 
+    def use_descendant_propagation_state(self):
+        source_stack = {
+            "number": self.stack["number"],
+            "size": self.stack["size"],
+            "trunk": self.stack["trunk"],
+            "invoked_number": self.stack["invoked_number"],
+            "members": self.stack["members"],
+        }
+        self.state_path = write_state(
+            self.directory,
+            operation="descendant_propagation",
+            status="resolved",
+            workspace=str(self.workspace),
+            stack_number=self.stack["number"],
+            fixed_pr=6,
+            fixed_head_sha=self.main_sha,
+            source_stack=source_stack,
+            source_snapshot=MODULE.stack_snapshot_fingerprint(source_stack),
+            cascade=self.stack,
+            members_after=self.stack["members_after"],
+            expected_post_fingerprint=MODULE.propagated_stack_fingerprint(
+                source_stack, self.stack["members_after"]
+            ),
+            attempt=None,
+        )
+
     def test_records_an_exact_base_side_validation_fix_on_the_final_member(self):
         payload = self.run_fix(
             [
@@ -8609,6 +8635,78 @@ class StackValidationFixCommandTest(GitTestCase):
             (self.workspace / "base-caller.txt").read_text(encoding="utf-8"),
         )
         self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
+
+    def test_records_a_validation_fix_for_a_resolved_descendant_propagation(self):
+        self.use_descendant_propagation_state()
+
+        payload = self.run_fix(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "Path('base-caller.txt').write_text('new expectation\\n')"
+                ),
+            ]
+        )
+
+        self.assertEqual("validation_fix_recorded", payload["result"])
+        self.assertEqual("validate_then_descendant-propagate", payload["next"])
+        state = self.saved()
+        checkpoint = state["cascade"]["validation_fix_checkpoints"][0]
+        self.assertEqual(checkpoint["after_sha"], state["members_after"][-1]["head_sha"])
+        self.assertEqual(
+            checkpoint["after_sha"],
+            state["cascade"]["members_after"][-1]["head_sha"],
+        )
+        self.assertEqual(
+            MODULE.propagated_stack_fingerprint(
+                state["source_stack"], state["members_after"]
+            ),
+            state["expected_post_fingerprint"],
+        )
+        self.assertEqual(
+            checkpoint["after_sha"],
+            self.git_in(self.workspace, "rev-parse", "refs/heads/feature"),
+        )
+
+    def test_reuses_a_descendant_validation_fix_after_output_failure(self):
+        self.use_descendant_propagation_state()
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; "
+                "path = Path('base-caller.txt'); "
+                "path.write_text(path.read_text() + 'new expectation\\n')"
+            ),
+        ]
+        args = SimpleNamespace(
+            state=str(self.state_path),
+            paths=["base-caller.txt"],
+            rationale="Tests follow the contract.",
+            rationale_file=None,
+            fix_command=command,
+        )
+
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "emit", side_effect=BrokenPipeError
+        ), self.assertRaises(BrokenPipeError):
+            MODULE.command_stack_validation_fix(args)
+
+        first = self.saved()["cascade"]["validation_fix_checkpoints"][0]
+        payload = self.run_fix(command)
+
+        self.assertEqual(first["after_sha"], payload["checkpoint"]["after_sha"])
+        self.assertEqual("validate_then_descendant-propagate", payload["next"])
+        self.assertEqual(
+            1,
+            len(self.saved()["cascade"]["validation_fix_checkpoints"]),
+        )
+        self.assertEqual(
+            "old expectation\nnew expectation\n",
+            (self.workspace / "base-caller.txt").read_text(encoding="utf-8"),
+        )
 
     def test_multiple_validation_fixes_form_a_linear_final_member_history(self):
         first = self.run_fix(

@@ -5153,6 +5153,68 @@ def previous_validation_fix_checkpoint(
     return None
 
 
+def stack_validation_fix_context(
+    state: dict[str, Any],
+) -> tuple[dict[str, Any], Path, dict[str, Any], list[dict[str, Any]], str]:
+    if state.get("operation") == "descendant_propagation":
+        if state.get("status") != "resolved":
+            raise WorkflowError(
+                "validation fixes are allowed only after a descendant propagation "
+                f"is resolved; this propagation is {state.get('status')}"
+            )
+        workspace_value = state.get("workspace")
+        if not isinstance(workspace_value, str) or not workspace_value:
+            raise WorkflowError(
+                "the resolved descendant propagation has no preserved workspace"
+            )
+        workspace = Path(workspace_value)
+        if not workspace.exists():
+            raise WorkflowError(
+                "the resolved descendant propagation workspace is missing: "
+                f"{workspace}"
+            )
+        stack = state.get("cascade")
+        intended = state.get("members_after")
+        if not isinstance(stack, dict) or not isinstance(intended, list):
+            raise WorkflowError(
+                "the resolved descendant propagation has no recorded member tips "
+                "or cascade plan"
+            )
+        if not isinstance(state.get("source_stack"), dict):
+            raise WorkflowError(
+                "the descendant propagation has no source stack snapshot for "
+                "publication"
+            )
+        stack["members_after"] = intended
+        attempt = descendant_propagation_attempt(state)
+        attempt["stack"] = stack
+        attempt["validation_fix_last_run"] = state.get("validation_fix_last_run")
+        return (
+            attempt,
+            workspace,
+            stack,
+            intended,
+            "validate_then_descendant-propagate",
+        )
+
+    attempt = active_attempt(state)
+    if attempt.get("strategy") != "stack":
+        raise WorkflowError("this attempt is not a native-stack cascade")
+    if attempt["status"] != "resolved":
+        raise WorkflowError(
+            "validation fixes are allowed only after a stack cascade is resolved; "
+            f"this attempt is {attempt['status']}"
+        )
+    stack = attempt["stack"]
+    return (
+        attempt,
+        attempt_repo_root(state, attempt),
+        stack,
+        stack.get("members_after"),
+        "validate_then_stack-publish",
+    )
+
+
 def command_stack_validation_fix(args: argparse.Namespace) -> None:
     require_tools()
     fix_command = list(args.fix_command)
@@ -5172,17 +5234,10 @@ def command_stack_validation_fix(args: argparse.Namespace) -> None:
         raise WorkflowError("validation fix rationale must not be empty")
     state_path = cli_path(args.state)
     state = load_state(state_path)
-    attempt = active_attempt(state)
-    if attempt.get("strategy") != "stack":
-        raise WorkflowError("this attempt is not a native-stack cascade")
-    if attempt["status"] != "resolved":
-        raise WorkflowError(
-            "validation fixes are allowed only after a stack cascade is resolved; "
-            f"this attempt is {attempt['status']}"
-        )
-    workspace = attempt_repo_root(state, attempt)
-    stack = attempt["stack"]
-    intended = stack.get("members_after")
+    propagation = state.get("operation") == "descendant_propagation"
+    attempt, workspace, stack, intended, next_action = stack_validation_fix_context(
+        state
+    )
     plan = stack.get("plan") or []
     if not intended or not plan:
         raise WorkflowError(
@@ -5220,7 +5275,7 @@ def command_stack_validation_fix(args: argparse.Namespace) -> None:
                 "attempt": attempt_summary(attempt),
                 "checkpoint": previous,
                 "members_after": intended,
-                "next": "validate_then_stack-publish",
+                "next": next_action,
             }
         )
         return
@@ -5258,7 +5313,7 @@ def command_stack_validation_fix(args: argparse.Namespace) -> None:
 
         process = run(fix_command, cwd=workspace, check=False)
         output = (process.stdout + process.stderr).strip()
-        attempt["validation_fix_last_run"] = {
+        last_run = {
             "index": member["index"],
             "number": member["number"],
             "branch": member["branch"],
@@ -5269,6 +5324,9 @@ def command_stack_validation_fix(args: argparse.Namespace) -> None:
             "output": output,
             "recorded_at": utc_now(),
         }
+        attempt["validation_fix_last_run"] = last_run
+        if propagation:
+            state["validation_fix_last_run"] = last_run
         save_state(state_path, state)
         if process.returncode != 0:
             raise WorkflowError(
@@ -5406,6 +5464,13 @@ def command_stack_validation_fix(args: argparse.Namespace) -> None:
         }
         stack_validation_fix_checkpoints(stack).append(checkpoint)
         stack["members_after"] = updated_intended
+        if propagation:
+            source_stack = state.get("source_stack")
+            assert isinstance(source_stack, dict)
+            state["members_after"] = updated_intended
+            state["expected_post_fingerprint"] = propagated_stack_fingerprint(
+                source_stack, updated_intended
+            )
         save_state(state_path, state)
         result = {
             "result": "validation_fix_recorded",
@@ -5413,7 +5478,7 @@ def command_stack_validation_fix(args: argparse.Namespace) -> None:
             "attempt": attempt_summary(attempt),
             "checkpoint": checkpoint,
             "members_after": updated_intended,
-            "next": "validate_then_stack-publish",
+            "next": next_action,
         }
     except BaseException as error:
         try:
