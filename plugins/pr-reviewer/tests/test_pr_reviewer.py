@@ -1,7 +1,7 @@
 import importlib.util
-import io
 import json
 from pathlib import Path
+import re
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -77,807 +77,61 @@ index 3333333..4444444 100644
 """
 
 
-class AgentInstructionsTest(unittest.TestCase):
-    def test_names_the_session_from_check_metadata_idempotently(self):
+class ThinCoordinatorInstructionsTest(unittest.TestCase):
+    def test_uses_only_the_coordinator_and_fixed_evaluator(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn("tools: [read, search, execute, agent, rename_session]", instructions)
-        self.assertIn("## Session Naming", instructions)
-        self.assertIn(
-            "ensure the session name is `PR Review: <PR number> - <PR title>`",
-            instructions,
-        )
-        self.assertIn(
-            "If the harness has already supplied a name beginning "
-            "`PR Review: <PR number> - `",
-            instructions,
-        )
-        self.assertIn("do not call `rename_session`", instructions)
-        self.assertIn(
-            "Otherwise call `rename_session` once with the name you want when the "
-            "runtime exposes that tool",
-            instructions,
-        )
-        self.assertIn(
-            "If the tool is unavailable, or it reports that it skipped the rename",
-            instructions,
-        )
-        self.assertIn(
-            "continue without retrying or reporting it as retrospective friction",
-            instructions,
-        )
-        self.assertIn("Never use an interim number-only name", instructions)
-        self.assertNotIn("call `rename_session` again", instructions)
-        self.assertNotIn("immediately call `rename_session`", instructions)
-
-    def test_allows_only_honest_changed_line_proxies_for_unchanged_code(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn(
-            "A changed line may anchor a defect whose complete cause or fix also "
-            "involves unchanged code",
-            instructions,
-        )
-        self.assertIn(
-            "only when that changed line genuinely demonstrates the defect or "
-            "incomplete fix",
-            instructions,
-        )
-        self.assertIn(
-            "never use an unrelated changed line as a proxy",
-            instructions,
-        )
-
-    def test_defines_repository_context_validation_and_recovery_states(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn("## Workflow state machine", instructions)
-        self.assertIn(
-            "A head change returns to **Snapshot** with empty candidates",
-            instructions,
-        )
-        self.assertIn(
-            "gets exactly one fresh replacement with the same candidate packet",
-            instructions,
-        )
-        self.assertIn(
-            "If that replacement also fails, stop before posting",
-            instructions,
-        )
-        self.assertIn("## Repository rules and validation map", instructions)
-        self.assertIn(
-            "from the repository root down to that path's closest ancestor",
-            instructions,
-        )
-        self.assertIn(
-            "apply the narrower rule only to the scope it names",
-            instructions,
-        )
-        self.assertIn(
-            "record the narrowest documented command, working directory, "
-            "prerequisites",
-            instructions,
-        )
-        self.assertIn(
-            "If no honest changed-line anchor demonstrates the defect, "
-            "drop the candidate",
-            instructions,
-        )
-
-    def test_documents_compact_thread_anchor_text(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn(
-            "Every review thread and thread comment includes `line_text` and "
-            "`start_line_text`",
-            instructions,
-        )
-        self.assertIn(
-            "An outdated thread falls back to the original comment hunk",
-            instructions,
-        )
-        self.assertIn(
-            "A null text field means GitHub no longer supplied enough information",
-            instructions,
-        )
-
-    def test_bare_pr_reference_starts_the_review(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn("## Activation: Bare PR References Start The Review", instructions)
-        self.assertIn("a message containing only a PR URL", instructions)
-        self.assertIn("bare PR number (such as `123` or `#123`)", instructions)
-        self.assertIn(
-            "combine it with the current workspace's GitHub repository as `owner/repo#number`",
-            instructions,
-        )
-        self.assertIn("Do not ask what action the user wants", instructions)
-        self.assertIn("defer to the generic `github-pr-diff-review` skill", instructions)
-
-    def test_is_manual_only_and_requires_independent_candidate_checks(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn("name: PR Reviewer", instructions)
-        self.assertIn("user-invocable: true", instructions)
+        self.assertIn("tools: [execute, agent, rename_session]", instructions)
         self.assertIn("disable-model-invocation: true", instructions)
-        self.assertIn("gh pr diff", instructions)
-        self.assertIn(
-            "The authoritative changeset is the diff the helper's `check` result "
-            "captured",
-            instructions,
-        )
-        self.assertIn(
-            "Never invoke `gh pr diff` separately",
-            instructions,
-        )
-        self.assertIn("`get_changes_overview`", instructions)
-        self.assertIn("`<pr_diff_instructions>`", instructions)
-        self.assertIn("This agent overrides that block", instructions)
-        self.assertIn(
-            "Use the diff at `authoritative_diff_path` from the same `check` result "
-            "as the complete patch",
-            instructions,
-        )
-        self.assertIn("Do not fetch the diff again with any tool", instructions)
-        self.assertIn(
-            "`check <target> --diff-file <short-lived-diff-path> "
-            "--context-file <short-lived-context-path>`",
-            instructions,
-        )
-        self.assertIn(
-            "read that envelope straight from the command output",
-            instructions,
-        )
-        self.assertIn(
-            "the review context from `context_path`",
-            instructions,
-        )
-        self.assertIn(
-            "check what you read against `context_counts`",
-            instructions,
-        )
-        self.assertIn(
-            "Delete both written files after you post the review",
-            instructions,
-        )
-        self.assertIn(
-            "using agent type **general-purpose**, model `claude-sonnet-5`, "
-            "and reasoning effort `high`",
-            instructions,
-        )
-        self.assertIn(
-            "for **each distinct accumulated candidate separately**",
-            instructions,
-        )
-        self.assertIn("Never add a top-level review body", instructions)
-        self.assertIn("Skip local tests by default", instructions)
-        self.assertIn("Record every dropped candidate", instructions)
-        self.assertIn("If no candidate survives", instructions)
-        self.assertIn(
-            "every suppressed Copilot comment that `check` returns", instructions
-        )
-        self.assertIn("latest completed, non-dismissed Copilot review", instructions)
-        self.assertIn("every entry in `suppressed_comments`", instructions)
-        self.assertIn("Merge candidates that demonstrate the same defect", instructions)
-        self.assertIn(
-            "every entry in `review_threads`, whether resolved or not", instructions
-        )
-        self.assertIn(
-            "Use existing inline threads to avoid repeating feedback", instructions
-        )
-        self.assertIn(
-            "top-level `path`, `line`, `side`, `start_line`, `start_side`, "
-            "`is_resolved`, and `is_outdated` fields",
-            instructions,
-        )
-        self.assertIn("classify it as **resolved-by-code**", instructions)
-        self.assertIn(
-            "even while GitHub still reports the thread unresolved", instructions
-        )
-        self.assertIn(
-            "applies to a candidate you found yourself and to a candidate you "
-            "derived from a suppressed Copilot comment",
-            instructions,
-        )
-        self.assertIn("derive an honest single-line or range anchor", instructions)
-        self.assertIn("fails instead of dropping them without saying so", instructions)
+        self.assertIn("`PR Review: <PR number> - <PR title>`", instructions)
+        self.assertIn("`python \"$helper\" check <target> --model <model>`", instructions)
+        self.assertIn("`check` is the sole authoritative local preflight", instructions)
+        self.assertIn("model exactly `claude-sonnet-5`", instructions)
+        self.assertIn("reasoning effort exactly `high`", instructions)
+        self.assertIn("Never replace it with the selected worker model", instructions)
+        self.assertIn("must not call tools, execute code, run probes", instructions)
+        self.assertIn("If the runtime cannot guarantee that exact evaluator", instructions)
 
-    def test_evaluates_candidates_with_commit_and_related_pr_context(self):
+    def test_forbids_local_analysis_and_fallbacks(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn("Never run another local repository command", instructions)
+        self.assertIn("Never run repository scripts", instructions)
+        self.assertIn("Never invoke `gh pr diff` yourself", instructions)
+        self.assertIn("Never use a local diff", instructions)
+        self.assertIn("Cloud Sandboxes", instructions)
+        self.assertIn("local fallback after managed cloud failure", instructions)
+        self.assertIn("Do not invoke `cloud_task.py` yourself", instructions)
+
+    def test_preserves_pending_review_and_recovery_contract(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn("--state <state> --run-id <run_id>", instructions)
+        self.assertIn("creates exactly one viewer-owned pending review", instructions)
+        self.assertIn("never submits it", instructions)
+        self.assertIn("Never call `post` again", instructions)
+        self.assertIn("Never use direct `gh api` mutation as a fallback", instructions)
+        self.assertIn("no findings and no GitHub mutation", instructions)
+
+    def test_all_evaluator_rejections_end_without_posting(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn(
-            "commit history, and explicitly linked issues or pull requests",
+            "every fixed Claude evaluator rejects them, report no findings",
             instructions,
         )
-        self.assertIn(
-            "search the same repository's open pull requests for a related or "
-            "split-out fix",
-            instructions,
-        )
-        self.assertIn("Inspect only the matches that look plausible", instructions)
-        self.assertIn(
-            "Do not scan every open pull request without limit", instructions
-        )
-        self.assertIn(
-            "every plausible related open pull request you found for this candidate",
-            instructions,
-        )
-        self.assertIn(
-            "Say so explicitly when the targeted search found no plausible related "
-            "open pull request",
-            instructions,
-        )
-        self.assertIn("the `issue_comments` that `check` returned", instructions)
-        self.assertIn(
-            "do not promote it to a candidate or spend an evaluator run on it",
-            instructions,
-        )
-        self.assertIn(
-            "Let the evaluator read live GitHub state", instructions
-        )
-        self.assertIn(
-            "Treat that new evidence as provisional until you read it yourself, "
-            "without changing anything",
-            instructions,
-        )
-
-    def test_compares_changed_code_with_strong_repository_precedents(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn(
-            "For each changed area, find the closest existing implementations in "
-            "the same repository",
-            instructions,
-        )
-        self.assertIn(
-            "especially sibling implementations of the same feature or "
-            "instrumentation",
-            instructions,
-        )
-        self.assertIn(
-            "Read enough of them to tell whether they establish a strong, directly "
-            "applicable precedent",
-            instructions,
-        )
-        self.assertIn(
-            "Compare each changed area with the closest implementations you found",
-            instructions,
-        )
-        self.assertIn(
-            "multiple comparable implementations use the same pattern",
-            instructions,
-        )
-        self.assertIn(
-            "comparable code uses one canonical shared helper or structure",
-            instructions,
-        )
-        self.assertIn(
-            "when it solves the same problem under the same relevant constraints",
-            instructions,
-        )
-        self.assertIn(
-            "Record the paths and symbols that establish the precedent, the exact "
-            "way this PR departs from it",
-            instructions,
-        )
-        self.assertIn(
-            "A single similar file, a broad style preference, or novelty by itself "
-            "establishes nothing",
-            instructions,
-        )
-        self.assertIn(
-            "build a candidate even when no written repository instruction names "
-            "the pattern and the departure has not caused a runtime defect",
-            instructions,
-        )
-        self.assertIn(
-            "demonstrated impact or exact precedent departure",
-            instructions,
-        )
-        self.assertIn(
-            "For a precedent candidate, also give it the cited paths and symbols, "
-            "the pattern they establish, why that pattern applies here, the exact "
-            "departure",
-            instructions,
-        )
-
-    def test_runs_fresh_discovery_passes_with_an_exclusion_ledger(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn("## Iterative Discovery", instructions)
-        self.assertIn(
-            "Discovery is sequential because each pass excludes what all earlier "
-            "passes found",
-            instructions,
-        )
-        self.assertIn(
-            "Run at most **5 valid discovery passes**",
-            instructions,
-        )
-        self.assertIn(
-            "Launch every pass as a fresh subagent using model `gpt-5.6-sol` "
-            "with reasoning effort `high`",
-            instructions,
-        )
-        self.assertIn(
-            "Give it the fixed evidence packet from workflow step 2, the complete "
-            "authoritative diff, the full review context from workflow step 3",
-            instructions,
-        )
-        self.assertIn(
-            "Write each ledger entry as a concise root-cause exclusion with its "
-            "demonstrated impact, path and line or range",
-            instructions,
-        )
-        self.assertIn(
-            "It must not return, reword, expand, or spend its result explaining one "
-            "of those findings",
-            instructions,
-        )
-        self.assertIn(
-            "Rediscovering a ledger entry is a cue to keep reviewing, not a reason "
-            "to finish",
-            instructions,
-        )
-        self.assertIn(
-            "Merge the same root cause before adding distinct candidates to the "
-            "accumulated list and exclusion ledger",
-            instructions,
-        )
-        self.assertIn(
-            "A response that returns only ledger duplicates, stops after discussing "
-            "a known finding, skips a changed area, or gives no explicit clean result "
-            "is invalid",
-            instructions,
-        )
-        self.assertIn(
-            "Retry an invalid or failed pass once with a new subagent and the same "
-            "pass number",
-            instructions,
-        )
-        self.assertIn(
-            "Stop after the first valid clean pass",
-            instructions,
-        )
-        self.assertIn(
-            "If pass 5 adds candidates, keep them all and proceed without a sixth "
-            "pass",
-            instructions,
-        )
-        self.assertIn(
-            "Never apply proposed fixes locally between passes",
-            instructions,
-        )
-        self.assertIn(
-            "The loop never creates a partial pending review",
-            instructions,
-        )
-
-    def test_evaluates_every_distinct_accumulated_candidate_once(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn(
-            "After discovery ends, launch a fresh independent subagent for **each "
-            "distinct accumulated candidate separately**",
-            instructions,
-        )
-        self.assertIn(
-            "never evaluate the same root cause twice",
-            instructions,
-        )
-        self.assertIn(
-            "Only after this loop ends may you search related open pull requests for "
-            "each distinct accumulated candidate, run **Parallel Evaluation**, "
-            "rewrite surviving comments, or call `post`",
-            instructions,
-        )
-        self.assertIn(
-            "Run `post <target> --expected-head <recorded-head_sha> --comments "
-            "<file-or->` exactly once",
-            instructions,
-        )
-
-    def test_runs_candidate_evaluations_in_parallel(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn("## Parallel Evaluation", instructions)
-        self.assertIn(
-            "Run those evaluations concurrently under **Parallel Evaluation**",
-            instructions,
-        )
-        self.assertIn(
-            "Launch each candidate's evaluator with the task tool in "
-            "`mode: background`, and keep at most **5 evaluators in flight**",
-            instructions,
-        )
-        self.assertIn(
-            "overrides the general guidance against launching a background agent "
-            "and then reading its result",
-            instructions,
-        )
-        self.assertIn(
-            "Running evaluators at the same time never relaxes the isolation rule", instructions
-        )
-        self.assertIn("Evaluators only read.", instructions)
-        self.assertIn(
-            "no evaluator may change GitHub, edit a file, or run a git command "
-            "that writes",
-            instructions,
-        )
-        self.assertIn(
-            "Consume the collected verdicts in candidate order whatever order they "
-            "finish in",
-            instructions,
-        )
-        self.assertIn(
-            "Run an evaluator again, alone and for its own candidate, when it "
-            "fails, times out, or returns a verdict you cannot use",
-            instructions,
-        )
-        self.assertIn(
-            "never let a missing verdict decide by default to keep or drop the "
-            "candidate",
-            instructions,
-        )
-        self.assertIn(
-            "The run's single `post` still happens in this agent, after you "
-            "collect every verdict",
-            instructions,
-        )
-
-    def test_defines_the_bar_each_evaluator_judges_against(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn("## Evaluation Standard", instructions)
-        self.assertIn(
-            "Give it the **Evaluation Standard** as well, and require two "
-            "independent decisions, each judged against that standard and "
-            "supported by evidence",
-            instructions,
-        )
-        self.assertIn(
-            "Would a reasonable author apply this fix or knowingly decline it, "
-            "as part of what this PR already does?",
-            instructions,
-        )
-        self.assertIn(
-            "each evaluator judges against a fixed bar instead of its own taste",
-            instructions,
-        )
-        self.assertIn(
-            "Decision 1 asks whether this PR demonstrates the candidate as fact. "
-            "Nothing here relaxes it.",
-            instructions,
-        )
-        self.assertIn(
-            "needs no user-visible impact, needs no runtime defect behind it, "
-            "and needs no large fix",
-            instructions,
-        )
-        self.assertIn("- dead code this PR creates.", instructions)
-        self.assertIn(
-            "a departure from the reviewed repository's own instructions, when "
-            "the evaluator can name the instruction",
-            instructions,
-        )
-        self.assertIn(
-            "an unexplained departure from a strong, directly applicable repository "
-            "precedent, when the evaluator can cite the precedent and show why it "
-            "applies",
-            instructions,
-        )
-        self.assertIn(
-            '"Unexplained" means the repository instructions, PR context, linked '
-            "work, maintainer comments, and code constraints give no concrete "
-            "reason for the difference",
-            instructions,
-        )
-        self.assertIn(
-            "It never means the author had to write a rationale",
-            instructions,
-        )
-        self.assertIn(
-            "documentation, naming, or a test that this PR makes wrong or "
-            "misleading",
-            instructions,
-        )
-        self.assertIn(
-            "A preference with no repository instruction or strong, directly "
-            "applicable precedent behind it does not clear decision 2",
-            instructions,
-        )
-
-    def test_rejects_unprovable_doubt_and_worth_uncertainty_as_drop_reasons(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn("Both decisions need demonstrated doubt", instructions)
-        self.assertIn(
-            "never drops one because a caller, a use, or a reason might exist "
-            "somewhere unseen",
-            instructions,
-        )
-        self.assertIn(
-            '"It cannot be ruled out" states that evidence is missing, so it '
-            "decides nothing",
-            instructions,
-        )
-        self.assertIn(
-            "Each verdict names the decision it failed and the evidence behind "
-            "that decision",
-            instructions,
-        )
-        self.assertIn(
-            "Drop the candidate when decision 1 fails or stays uncertain, or "
-            "when decision 2 fails on evidence the evaluator named",
-            instructions,
-        )
-        self.assertIn(
-            "Uncertainty about decision 2 on its own never drops a candidate",
-            instructions,
-        )
-        self.assertIn(
-            "Record every dropped candidate, the decision it failed, and its "
-            "concrete reason",
-            instructions,
-        )
-
-    def test_keeps_prefer_silence_from_blocking_the_evaluator(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn(
-            '"Prefer silence" sets the bar for a final finding, not for '
-            "reaching the evaluator",
-            instructions,
-        )
-        self.assertIn(
-            "Build a candidate when this PR demonstrates it concretely and the "
-            "**Evaluation Standard** admits it",
-            instructions,
-        )
-        self.assertIn(
-            "even when you cannot settle by yourself whether it is worth fixing",
-            instructions,
-        )
-        self.assertIn(
-            "a preference with no repository instruction behind it, or an issue "
-            "that already existed",
-            instructions,
-        )
-        self.assertNotIn("a triviality, a style preference", instructions)
-
-    def test_requires_the_exact_primary_model_and_exposed_effort_before_review_work(
-        self,
-    ):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn("## Model Gate", instructions)
-        self.assertIn("model is exactly `gpt-5.6-sol`", instructions)
-        self.assertIn(
-            "When the runtime exposes the primary session's reasoning effort, "
-            "require it to be exactly `high`",
-            instructions,
-        )
-        self.assertIn("Clear the **Model Gate**", instructions)
-        self.assertIn("fixed `claude-sonnet-5` subagent", instructions)
-        self.assertIn("run the agent again with `gpt-5.6-sol`", instructions)
-        self.assertIn("before `check` and before you fetch any pull request data", instructions)
-        self.assertIn(
-            "an unavailable effort does not fail the gate",
-            instructions,
-        )
-        self.assertIn("If you cannot work out the model, the gate has failed", instructions)
-        self.assertIn("The user cannot override this gate", instructions)
-        self.assertNotIn("claude-opus-5", instructions.lower())
-        self.assertNotIn("GPT-family model", instructions)
-
-    def test_requires_one_recorded_head_snapshot_for_analysis_and_posting(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn("record its `head_sha` as the immutable review snapshot", instructions)
-        self.assertIn("Analyze only that snapshot", instructions)
-        self.assertIn(
-            "`post <target> --expected-head <recorded-head_sha> --comments <file-or->`",
-            instructions,
-        )
-        self.assertIn("start the entire review again from `check`", instructions)
-        self.assertIn("never move or re-anchor old findings", instructions)
-
-    def test_prefers_contiguous_diff_suggestions_without_a_hard_line_limit(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn(
-            "whenever the complete fix can be expressed confidently as one contiguous "
-            "replacement in the PR diff",
-            instructions,
-        )
-        self.assertIn(
-            "There is no fixed line limit",
-            instructions,
-        )
-        self.assertIn(
-            "Assume a suggestion of 10 lines or fewer is appropriate",
-            instructions,
-        )
-        self.assertIn(
-            "still prefer a longer suggestion when the replacement is mechanical, "
-            "local, and unambiguous",
-            instructions,
-        )
-        self.assertIn(
-            "Use prose only when the fix needs the author to decide something, "
-            "touches places that do not adjoin, depends on context you do not "
-            "have, or cannot be written safely as one contiguous replacement",
-            instructions,
-        )
-        self.assertIn("write separate suggestions for ranges that do not adjoin", instructions)
-        self.assertIn("`start_line` plus `start_side`", instructions)
-        self.assertIn(
-            "do not accept prose in its place and do not impose a hard line cap",
-            instructions,
-        )
-        self.assertIn(
-            "Write each body exactly as UTF-8 to its own short-lived text file",
-            instructions,
-        )
-        self.assertIn(
-            "serialize the array with a real JSON serializer", instructions
-        )
-        self.assertIn("Python `json.dump`", instructions)
-        self.assertIn("PowerShell `ConvertTo-Json`", instructions)
-        self.assertIn("Never write JSON text by hand", instructions)
-        self.assertIn(
-            "double apostrophes for a literal here-string", instructions
-        )
-
-    def test_handles_a_created_but_unverified_review_without_a_second_mutation(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn("was created but verification failed", instructions)
-        self.assertIn("Never re-run `post`", instructions)
-        self.assertIn("would create a duplicate review", instructions)
-        self.assertIn("read the created review with `gh api`, without changing it", instructions)
-        self.assertIn("exactly what the helper could not verify", instructions)
-        self.assertIn(
-            "sits under the rule that a run changes GitHub at most once",
-            instructions,
-        )
-        self.assertIn("You may always read GitHub with `gh api`", instructions)
-
-    def test_closes_every_run_with_a_categorized_retrospective(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn("## PR Reviewer Agent Retrospective", instructions)
-        self.assertIn("**PR Reviewer Agent Retrospective**", instructions)
-        self.assertIn(
-            "Silence is the normal outcome, and a run that went smoothly reports "
-            "nothing",
-            instructions,
-        )
-        self.assertIn(
-            "Produce the retrospective on every terminal outcome, including "
-            "`existing_pending_review`, a review with no findings, a helper error, "
-            "and a failed **Model Gate**",
-            instructions,
-        )
-        for category in (
-            "- **Agent**:",
-            "- **Helper**:",
-            "- **General instructions**:",
-            "- **Repository**:",
-        ):
-            self.assertIn(category, instructions)
-        self.assertIn(
-            "Report only friction you actually hit in this run", instructions
-        )
-        self.assertIn("The retrospective is advice, and it belongs in chat only", instructions)
-        self.assertIn(
-            "never turn it into a review comment or any other GitHub mutation",
-            instructions,
-        )
-        self.assertIn(
-            "Workflow feedback only; this is not a PR finding and no change was "
-            "made automatically.",
-            instructions,
-        )
-        self.assertIn("**Options:**", instructions)
-        self.assertIn("Apply a suggestion in a separate follow-up.", instructions)
-        self.assertIn("Explain the tradeoffs before deciding.", instructions)
-        self.assertIn("Leave it as advisory feedback.", instructions)
-        self.assertIn("Omit the entire retrospective", instructions)
-        self.assertIn("must be the very last block", instructions)
-        self.assertIn(
-            "The options are inert choices for the user's next turn", instructions
-        )
-        self.assertIn(
-            "the third options item marks the end of the output", instructions
-        )
-        self.assertIn(
-            "never emit a short final response and then a fuller report",
-            instructions,
-        )
-        self.assertIn("never send a recap after the retrospective", instructions)
-        self.assertIn(
-            "never replaces, reorders, or alters the required final response",
-            instructions,
-        )
-
-    def test_emits_one_compact_final_response_with_clickable_links(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn("## Final Response", instructions)
-        self.assertIn("Emit exactly one terminal response", instructions)
-        self.assertIn(
-            "Assemble every applicable section first, then send the whole report in "
-            "one message",
-            instructions,
-        )
-        self.assertIn(
-            "The first `**Result:**` line begins the only terminal report",
-            instructions,
-        )
-        self.assertIn(
-            "render `**Result:**`, `**Review:**`, and `**PR:**` at most once each",
-            instructions,
-        )
-        self.assertIn(
-            "never begin another report after the retrospective or the options",
-            instructions,
-        )
-        self.assertIn(
-            "do not report progress while the workflow continues", instructions
-        )
-        self.assertIn(
-            "**Result:** No findings. No GitHub mutation was made.", instructions
-        )
-        self.assertIn(
-            "**PR:** [#<pr_number> <pr_title>](<pr_url>)", instructions
-        )
-        self.assertIn(
-            "**Review:** [Open pending review](<review_url>)", instructions
-        )
-        self.assertIn(
-            "The **PR Reviewer Agent Retrospective** is the only content allowed "
-            "after the `**PR:**` line",
-            instructions,
-        )
-
-    def test_sends_the_terminal_response_as_the_last_message(self):
-        instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn(
-            "The terminal response is the run's last message", instructions
-        )
-        self.assertIn(
-            "send it in a message that calls no tool, and never follow it with a "
-            "recap or a second summary",
-            instructions,
-        )
-        self.assertIn(
-            "Emit exactly one terminal response and make it the last message of the "
-            "run",
-            instructions,
-        )
-        self.assertIn("Finish every tool call the run needs", instructions)
-        self.assertIn(
-            "attach any part of it to a message that also calls a tool", instructions
-        )
-        self.assertIn("Once you send it the run is over", instructions)
-        self.assertIn(
-            "never send another message because a tool result, a reminder, or a "
-            "turn boundary invites one",
-            instructions,
-        )
-        self.assertIn(
-            "never open with a narrative recap of what the run did", instructions
-        )
+        self.assertIn("Do not serialize a comments file", instructions)
+        self.assertIn("do not call `post`", instructions)
 
 
 class ParseTargetTest(unittest.TestCase):
     def test_parses_url_and_short_target(self):
         url = MODULE.parse_target("https://github.com/owner/repo/pull/42/")
         short = MODULE.parse_target("owner/repo#42")
+        bare = MODULE.parse_target("42", repo_name="owner/repo")
 
         self.assertEqual(url, short)
+        self.assertEqual(url, bare)
         self.assertEqual(url["repo_name"], "owner/repo")
         self.assertEqual(url["number"], 42)
 
@@ -888,9 +142,19 @@ class ParseTargetTest(unittest.TestCase):
 
         self.assertEqual(target, MODULE.parse_target("owner/repo#42"))
 
-    def test_rejects_non_pr_target(self):
-        with self.assertRaisesRegex(MODULE.WorkflowError, "GitHub PR URL"):
+    def test_rejects_context_free_bare_number(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "repository workspace"):
             MODULE.parse_target("42")
+
+    def test_resolves_workspace_repository_context(self):
+        with mock.patch.object(
+            MODULE,
+            "gh_json",
+            return_value={"nameWithOwner": "owner/repo"},
+        ) as gh_json:
+            self.assertEqual(MODULE.repository_context(), "owner/repo")
+
+        gh_json.assert_called_once_with(["repo", "view", "--json", "nameWithOwner"])
 
 
 class UnifiedDiffTest(unittest.TestCase):
@@ -992,6 +256,24 @@ diff --git a/old.txt b/old.txt
 
         self.assertEqual(anchors["new.txt"]["RIGHT"], {1: 1, 2: 2})
         self.assertEqual(anchors["old.txt"]["LEFT"], {1: 1, 2: 2})
+
+    def test_extracts_a_left_anchored_excerpt_from_a_deleted_file(self):
+        diff = """\
+diff --git a/old.txt b/old.txt
+deleted file mode 100644
+index 1111111..0000000
+--- a/old.txt
++++ /dev/null
+@@ -1,2 +0,0 @@
+-one
+-two
+"""
+
+        excerpt = MODULE.extract_diff_excerpt(diff, "old.txt", "LEFT", 2)
+
+        self.assertIn("--- a/old.txt", excerpt)
+        self.assertIn("+++ /dev/null", excerpt)
+        self.assertIn("-two", excerpt)
 
     def test_fetches_the_authoritative_gh_pr_diff(self):
         pr = {
@@ -1651,403 +933,26 @@ class PendingReviewTest(unittest.TestCase):
             f"{pr['pr_url']}#pullrequestreview-7",
         )
 
-    def test_check_ready_emits_captured_head_sha_and_pr_identity(self):
-        pr = {
-            "repo_name": "owner/repo",
-            "number": 42,
-            "title": "Fix the reviewer",
-            "pr_url": "https://github.com/owner/repo/pull/42",
-            "head_sha": "abc123",
-        }
-        anchors = MODULE.parse_unified_diff(DIFF)
-
-        with (
-            mock.patch.object(
-                MODULE,
-                "preflight",
-                return_value=(
-                    pr,
-                    "viewer",
-                    anchors,
-                    None,
-                    {"id": 10, "url": "https://example.test/review/10"},
-                    [
-                        {
-                            "path": "src/one.py",
-                            "line": 2,
-                            "body": "Preserve the old behavior.",
-                        }
-                    ],
-                    [
-                        {
-                            "id": 17,
-                            "url": "https://example.test/comment/17",
-                            "author": "maintainer",
-                            "author_association": "MEMBER",
-                            "created_at": "2026-08-11T12:00:00Z",
-                            "updated_at": "2026-08-11T12:01:00Z",
-                            "body": "Please split this into a follow-up.",
-                        }
-                    ],
-                    DIFF,
-                ),
-            ) as preflight,
-            mock.patch.object(
-                MODULE,
-                "fetch_review_threads",
-                return_value=[
-                    {
-                        "id": "THREAD_1",
-                        "path": "src/one.py",
-                        "line": 2,
-                        "side": "RIGHT",
-                        "start_line": None,
-                        "start_side": None,
-                        "is_resolved": True,
-                        "is_outdated": False,
-                        "resolved": True,
-                        "comments": [
-                            {
-                                "id": 20,
-                                "author": "maintainer",
-                                "path": "src/one.py",
-                                "line": 2,
-                                "body": "Already raised.",
-                            }
-                        ],
-                    }
-                ],
-            ),
-            mock.patch.object(MODULE, "ensure_head_unchanged"),
-            mock.patch.object(MODULE, "emit") as emit,
-        ):
-            MODULE.command_check(SimpleNamespace(
-                target=pr["pr_url"], diff_file=None, context_file=None
-            ))
-
-        payload = emit.call_args.args[0]
-        self.assertEqual(payload["result"], "ready")
-        self.assertEqual(payload["head_sha"], "abc123")
-        self.assertEqual(payload["pr_number"], 42)
-        self.assertEqual(payload["pr_title"], "Fix the reviewer")
-        self.assertEqual(payload["authoritative_diff"], DIFF)
-        self.assertEqual(payload["copilot_review"]["id"], 10)
-        self.assertEqual(payload["suppressed_comments"][0]["path"], "src/one.py")
-        self.assertEqual(payload["issue_comments"][0]["author"], "maintainer")
-        self.assertEqual(payload["review_threads"][0]["id"], "THREAD_1")
-        self.assertEqual(payload["review_threads"][0]["path"], "src/one.py")
-        self.assertEqual(payload["review_threads"][0]["line"], 2)
-        self.assertEqual(payload["review_threads"][0]["side"], "RIGHT")
-        self.assertEqual(payload["review_threads"][0]["line_text"], "new two")
-        self.assertIsNone(payload["review_threads"][0]["start_line_text"])
-        self.assertTrue(payload["review_threads"][0]["is_resolved"])
-        preflight.assert_called_once_with(
-            pr["pr_url"], include_issue_comments=True
-        )
-
-    def test_check_ready_emits_empty_suppressed_fields_without_copilot_review(self):
-        pr = {
-            "repo_name": "owner/repo",
-            "number": 42,
-            "title": "Fix the reviewer",
-            "pr_url": "https://github.com/owner/repo/pull/42",
-            "head_sha": "abc123",
-        }
-        anchors = MODULE.parse_unified_diff(DIFF)
-
-        with (
-            mock.patch.object(
-                MODULE,
-                "preflight",
-                return_value=(pr, "viewer", anchors, None, None, [], [], DIFF),
-            ),
-            mock.patch.object(MODULE, "fetch_review_threads", return_value=[]),
-            mock.patch.object(MODULE, "ensure_head_unchanged"),
-            mock.patch.object(MODULE, "emit") as emit,
-        ):
-            MODULE.command_check(SimpleNamespace(
-                target=pr["pr_url"], diff_file=None, context_file=None
-            ))
-
-        payload = emit.call_args.args[0]
-        self.assertIsNone(payload["copilot_review"])
-        self.assertEqual(payload["suppressed_comments"], [])
-        self.assertEqual(payload["issue_comments"], [])
-        self.assertEqual(payload["review_threads"], [])
-        self.assertEqual(payload["authoritative_diff"], DIFF)
-        self.assertNotIn("authoritative_diff_path", payload)
-
-    def test_check_writes_the_diff_to_the_requested_file(self):
-        pr = {
-            "repo_name": "owner/repo",
-            "number": 42,
-            "title": "Fix the reviewer",
-            "pr_url": "https://github.com/owner/repo/pull/42",
-            "head_sha": "abc123",
-        }
-        anchors = MODULE.parse_unified_diff(DIFF)
-
-        with tempfile.TemporaryDirectory() as directory:
-            target_path = Path(directory) / "nested" / "diff.patch"
-            with (
-                mock.patch.object(
-                    MODULE,
-                    "preflight",
-                    return_value=(pr, "viewer", anchors, None, None, [], [], DIFF),
-                ),
-                mock.patch.object(MODULE, "fetch_review_threads", return_value=[]),
-                mock.patch.object(MODULE, "ensure_head_unchanged"),
-                mock.patch.object(MODULE, "emit") as emit,
-            ):
-                MODULE.command_check(
-                    SimpleNamespace(
-                        target=pr["pr_url"],
-                        diff_file=str(target_path),
-                        context_file=None,
-                    )
-                )
-
-            payload = emit.call_args.args[0]
-            self.assertEqual(payload["result"], "ready")
-            self.assertNotIn("authoritative_diff", payload)
-            self.assertEqual(
-                payload["authoritative_diff_path"], str(target_path.resolve())
-            )
-            self.assertEqual(
-                payload["authoritative_diff_bytes"], len(DIFF.encode("utf-8"))
-            )
-            self.assertEqual(payload["head_sha"], "abc123")
-            self.assertEqual(payload["changed_files"], sorted(anchors))
-            with target_path.open(encoding="utf-8", newline="") as handle:
-                self.assertEqual(handle.read(), DIFF)
-            self.assertNotIn(DIFF, json.dumps(payload))
-
-    def test_check_fails_when_the_diff_file_cannot_be_written(self):
-        pr = {
-            "repo_name": "owner/repo",
-            "number": 42,
-            "title": "Fix the reviewer",
-            "pr_url": "https://github.com/owner/repo/pull/42",
-            "head_sha": "abc123",
-        }
-        anchors = MODULE.parse_unified_diff(DIFF)
-
-        with tempfile.TemporaryDirectory() as directory:
-            blocker = Path(directory) / "blocker"
-            blocker.write_text("not a directory", encoding="utf-8")
-            with (
-                mock.patch.object(
-                    MODULE,
-                    "preflight",
-                    return_value=(pr, "viewer", anchors, None, None, [], [], DIFF),
-                ),
-                mock.patch.object(MODULE, "fetch_review_threads", return_value=[]),
-                mock.patch.object(MODULE, "ensure_head_unchanged"),
-                mock.patch.object(MODULE, "emit") as emit,
-            ):
-                with self.assertRaisesRegex(
-                    MODULE.WorkflowError, "could not write the authoritative diff file"
-                ):
-                    MODULE.command_check(
-                        SimpleNamespace(
-                            target=pr["pr_url"],
-                            diff_file=str(blocker / "diff.patch"),
-                            context_file=None,
-                        )
-                    )
-
-            emit.assert_not_called()
-
-    def test_check_writes_the_review_context_to_the_requested_file(self):
-        pr = {
-            "repo_name": "owner/repo",
-            "number": 42,
-            "title": "Fix the reviewer",
-            "pr_url": "https://github.com/owner/repo/pull/42",
-            "head_sha": "abc123",
-        }
-        anchors = MODULE.parse_unified_diff(DIFF)
-        copilot_review = {"id": 10, "url": "https://example.test/review/10"}
-        suppressed = [{"path": "src/one.py", "line": 2, "body": "Lead."}]
-        issue_comments = [{"author": "maintainer", "body": "Deferred."}]
-        threads = [{"id": "THREAD_1", "path": "src/one.py", "line": 2}]
-
-        with tempfile.TemporaryDirectory() as directory:
-            context_path = Path(directory) / "nested" / "context.json"
-            with (
-                mock.patch.object(
-                    MODULE,
-                    "preflight",
-                    return_value=(
-                        pr,
-                        "viewer",
-                        anchors,
-                        None,
-                        copilot_review,
-                        suppressed,
-                        issue_comments,
-                        DIFF,
-                    ),
-                ),
-                mock.patch.object(
-                    MODULE, "fetch_review_threads", return_value=threads
-                ),
-                mock.patch.object(MODULE, "ensure_head_unchanged"),
-                mock.patch.object(MODULE, "emit") as emit,
-            ):
-                MODULE.command_check(
-                    SimpleNamespace(
-                        target=pr["pr_url"],
-                        diff_file=None,
-                        context_file=str(context_path),
-                    )
-                )
-
-            payload = emit.call_args.args[0]
-            self.assertEqual(payload["result"], "ready")
-            self.assertEqual(payload["context_path"], str(context_path.resolve()))
-            self.assertEqual(
-                payload["context_counts"],
-                {
-                    "copilot_review": 1,
-                    "issue_comments": 1,
-                    "review_threads": 1,
-                    "suppressed_comments": 1,
-                },
-            )
-            for field in (
-                "copilot_review",
-                "suppressed_comments",
-                "issue_comments",
-                "review_threads",
-            ):
-                self.assertNotIn(field, payload)
-            self.assertEqual(payload["authoritative_diff"], DIFF)
-            context = json.loads(context_path.read_text(encoding="utf-8"))
-            self.assertEqual(context["copilot_review"], copilot_review)
-            self.assertEqual(context["suppressed_comments"], suppressed)
-            self.assertEqual(context["issue_comments"], issue_comments)
-            self.assertEqual(
-                context["review_threads"],
-                [
-                    {
-                        **threads[0],
-                        "line_text": None,
-                        "start_line_text": None,
-                    }
-                ],
-            )
-
-    def test_check_counts_an_absent_copilot_review_as_zero(self):
-        pr = {
-            "repo_name": "owner/repo",
-            "number": 42,
-            "title": "Fix the reviewer",
-            "pr_url": "https://github.com/owner/repo/pull/42",
-            "head_sha": "abc123",
-        }
-        anchors = MODULE.parse_unified_diff(DIFF)
-
-        with tempfile.TemporaryDirectory() as directory:
-            context_path = Path(directory) / "context.json"
-            with (
-                mock.patch.object(
-                    MODULE,
-                    "preflight",
-                    return_value=(pr, "viewer", anchors, None, None, [], [], DIFF),
-                ),
-                mock.patch.object(MODULE, "fetch_review_threads", return_value=[]),
-                mock.patch.object(MODULE, "ensure_head_unchanged"),
-                mock.patch.object(MODULE, "emit") as emit,
-            ):
-                MODULE.command_check(
-                    SimpleNamespace(
-                        target=pr["pr_url"],
-                        diff_file=None,
-                        context_file=str(context_path),
-                    )
-                )
-
-            self.assertEqual(
-                emit.call_args.args[0]["context_counts"],
-                {
-                    "copilot_review": 0,
-                    "issue_comments": 0,
-                    "review_threads": 0,
-                    "suppressed_comments": 0,
-                },
-            )
-
-    def test_check_fails_when_the_context_file_cannot_be_written(self):
-        pr = {
-            "repo_name": "owner/repo",
-            "number": 42,
-            "title": "Fix the reviewer",
-            "pr_url": "https://github.com/owner/repo/pull/42",
-            "head_sha": "abc123",
-        }
-        anchors = MODULE.parse_unified_diff(DIFF)
-
-        with tempfile.TemporaryDirectory() as directory:
-            blocker = Path(directory) / "blocker"
-            blocker.write_text("not a directory", encoding="utf-8")
-            with (
-                mock.patch.object(
-                    MODULE,
-                    "preflight",
-                    return_value=(pr, "viewer", anchors, None, None, [], [], DIFF),
-                ),
-                mock.patch.object(MODULE, "fetch_review_threads", return_value=[]),
-                mock.patch.object(MODULE, "ensure_head_unchanged"),
-                mock.patch.object(MODULE, "emit") as emit,
-            ):
-                with self.assertRaisesRegex(
-                    MODULE.WorkflowError, "could not write the review context file"
-                ):
-                    MODULE.command_check(
-                        SimpleNamespace(
-                            target=pr["pr_url"],
-                            diff_file=None,
-                            context_file=str(blocker / "context.json"),
-                        )
-                    )
-
-            emit.assert_not_called()
-
-    def test_check_parser_defaults_the_diff_file_to_none(self):
-        parser = MODULE.build_parser()
-
-        self.assertIsNone(
-            parser.parse_args(["check", "owner/repo#42"]).diff_file
-        )
-        self.assertEqual(
-            parser.parse_args(
-                ["check", "owner/repo#42", "--diff-file", "out.patch"]
-            ).diff_file,
-            "out.patch",
-        )
-
-    def test_check_parser_defaults_the_context_file_to_none(self):
-        parser = MODULE.build_parser()
-
-        self.assertIsNone(
-            parser.parse_args(["check", "owner/repo#42"]).context_file
-        )
-        self.assertEqual(
-            parser.parse_args(
-                ["check", "owner/repo#42", "--context-file", "context.json"]
-            ).context_file,
-            "context.json",
-        )
-
 
 class ResolvePrTest(unittest.TestCase):
     def metadata(self, **overrides):
         base = {
             "number": 42,
             "title": "Fix the reviewer",
-            "url": "https://github.com/owner/repo/pull/42",
-            "headRefOid": "abc123",
+            "body": "Body",
+            "html_url": "https://github.com/owner/repo/pull/42",
+            "state": "open",
+            "draft": False,
+            "base": {
+                "repo": {"full_name": "owner/repo"},
+                "ref": "main",
+                "sha": "1" * 40,
+            },
+            "head": {
+                "repo": {"full_name": "owner/repo"},
+                "ref": "feature",
+                "sha": "2" * 40,
+            },
         }
         base.update(overrides)
         return base
@@ -2061,8 +966,11 @@ class ResolvePrTest(unittest.TestCase):
             result = MODULE.resolve_pr(target)
 
         self.assertEqual(result["title"], "Fix the reviewer")
-        self.assertEqual(result["head_sha"], "abc123")
-        self.assertIn("title", gh_json.call_args.args[0][-1].split(","))
+        self.assertEqual(result["head_sha"], "2" * 40)
+        self.assertEqual(
+            gh_json.call_args.args[0],
+            ["api", "repos/owner/repo/pulls/42"],
+        )
 
     def test_rejects_metadata_without_a_title(self):
         target = MODULE.parse_target("owner/repo#42")
@@ -2098,7 +1006,7 @@ class HeadStabilityTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 MODULE.WorkflowError,
-                "PR head changed after fetching the authoritative diff and review context",
+                "PR head changed after fetching the authoritative diff",
             ):
                 MODULE.preflight(self.pr["pr_url"])
 
@@ -2140,6 +1048,969 @@ class HeadStabilityTest(unittest.TestCase):
         fetch_diff.assert_not_called()
 
 
+class ManagedCoordinatorTest(unittest.TestCase):
+    def setUp(self):
+        self.pr = {
+            "owner": "owner",
+            "repo": "repo",
+            "repo_name": "owner/repo",
+            "number": 42,
+            "pr_url": "https://github.com/owner/repo/pull/42",
+            "url": "https://github.com/owner/repo/pull/42",
+            "title": "Fix the reviewer",
+            "body": "Body",
+            "state": "open",
+            "is_draft": False,
+            "base": {
+                "repository": "owner/repo",
+                "ref": "main",
+                "sha": "1" * 40,
+            },
+            "head": {
+                "repository": "owner/repo",
+                "ref": "feature",
+                "sha": "2" * 40,
+            },
+            "head_sha": "2" * 40,
+            "cross_repository": False,
+        }
+        self.identity = {"head": "4" * 40, "status": ""}
+        self.validation = [
+            {"command": "validate", "status": "passed", "detail": "complete"}
+        ]
+
+    def result(self, **overrides):
+        request_id = "request-1"
+        generated_head = "3" * 40
+        value = {
+            "schema": MODULE.AGENT_TASK_RESULT_SCHEMA,
+            "status": "success",
+            "mode": "report",
+            "repository": {"name_with_owner": self.pr["repo_name"]},
+            "pull_request": MODULE.expected_cloud_pull_request(self.pr),
+            "requested_model": "gpt-5.6-sol",
+            "policy": MODULE.AGENT_TASK_POLICY_IDENTITY,
+            "task": {
+                "id": "task-1",
+                "url": "https://github.com/owner/repo/agent-tasks/1",
+                "state": "completed",
+                "base_ref": "feature",
+                "base_sha": self.pr["head_sha"],
+            },
+            "generated": {
+                "branch": "copilot/task-1",
+                "head_sha": generated_head,
+                "commits": [],
+            },
+            "application": {
+                "status": "not_applicable",
+                "final_local_head": self.identity["head"],
+            },
+            "report": {
+                "path": f".github/agent-task-reports/{request_id}.md",
+                "commit": generated_head,
+                "sha256": "5" * 64,
+            },
+            "worker_receipt": {
+                "path": f".github/agent-task-receipts/{request_id}.json",
+                "commit": generated_head,
+            },
+            "validation": {"complete": True, "outcomes": self.validation},
+            "error": None,
+        }
+        value.update(overrides)
+        return value
+
+    def report(self, candidates=None):
+        return {
+            "schema": MODULE.CANDIDATE_REPORT_SCHEMA,
+            "request_id": "request-1",
+            "repository": self.pr["repo_name"],
+            "pull_request": {
+                "number": self.pr["number"],
+                "head_sha": self.pr["head_sha"],
+                "base_sha": self.pr["base"]["sha"],
+                "requested_model": "gpt-5.6-sol",
+                "policy": MODULE.AGENT_TASK_POLICY_IDENTITY,
+            },
+            "review_complete": True,
+            "changed_files": ["src/one.py", "docs/two.md"],
+            "validations": [
+                {"name": name, "status": "passed", "evidence": "complete"}
+                for name in MODULE.EXPECTED_REPORT_VALIDATIONS
+            ],
+            "candidates": candidates or [],
+        }
+
+    def candidate(self, **overrides):
+        value = {
+            "candidate_id": "candidate-1",
+            "path": "src/one.py",
+            "anchor": {
+                "side": "RIGHT",
+                "start_line": None,
+                "start_side": None,
+                "line": 2,
+            },
+            "severity": "blocking",
+            "title": "Wrong result",
+            "explanation": "The changed branch returns the wrong result.",
+            "evidence": ["The changed line reaches the failing branch."],
+            "confidence": 0.98,
+            "probes": [
+                {
+                    "command": "python isolated_probe.py",
+                    "status": "passed",
+                    "outcome": "The probe returned the wrong value.",
+                }
+            ],
+        }
+        value.update(overrides)
+        return value
+
+    def receipt(self):
+        return json.dumps(
+            {
+                "schema": MODULE.AGENT_TASK_RECEIPT_SCHEMA,
+                "request_id": "request-1",
+                "policy": MODULE.AGENT_TASK_POLICY_IDENTITY,
+                "mode": "report",
+                "repository": self.pr["repo_name"],
+                "pull_request_head_sha": self.pr["head_sha"],
+                "validation_complete": True,
+                "validation": self.validation,
+            }
+        )
+
+    def test_discovers_only_the_pinned_managed_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            helper = home / "skills" / "cloud" / "scripts" / "cloud_task.py"
+            helper.parent.mkdir(parents=True)
+            helper.write_bytes(b"# managed fixture helper\n")
+            fixture_digest = (
+                "9bd2a4c3aa9362cfecd631ed69c6cebac47623d7a41f6a43da7eecbe6ca79637"
+            )
+            self.assertEqual(MODULE.sha256_file(helper), fixture_digest)
+            self.assertEqual(
+                MODULE.REQUIRED_CLOUD_TASK_SHA256,
+                "6135e20cf5d23728c02263e69feebe825b6cada216ca4e8552e65adcb6d7f62b",
+            )
+            self.assertNotEqual(
+                MODULE.REQUIRED_CLOUD_TASK_SHA256,
+                MODULE.AGENT_TASK_POLICY_IDENTITY["sha256"],
+            )
+            manifest = {
+                "version": 3,
+                "source": {
+                    "path": str(home.resolve()),
+                    "commit": MODULE.REQUIRED_CONFIG_COMMIT,
+                    "dirty": False,
+                },
+                "entries": ["skills/cloud"],
+                "contents": {
+                    "skills/cloud": {
+                        "scripts/cloud_task.py": fixture_digest
+                    }
+                },
+            }
+            (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            with (
+                mock.patch.object(MODULE, "copilot_home", return_value=home),
+                mock.patch.object(
+                    MODULE, "REQUIRED_CLOUD_TASK_SHA256", fixture_digest
+                ),
+            ):
+                self.assertEqual(MODULE.discover_cloud_task(), helper.resolve())
+
+            manifest["source"]["commit"] = "0" * 40
+            (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            with mock.patch.object(MODULE, "copilot_home", return_value=home):
+                with self.assertRaisesRegex(MODULE.WorkflowError, "missing or too old"):
+                    MODULE.discover_cloud_task()
+
+    def test_missing_helper_and_wrong_hash_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            manifest = {
+                "version": 3,
+                "source": {
+                    "path": str(home.resolve()),
+                    "commit": MODULE.REQUIRED_CONFIG_COMMIT,
+                    "dirty": False,
+                },
+                "entries": ["skills/cloud"],
+                "contents": {
+                    "skills/cloud": {
+                        "scripts/cloud_task.py": MODULE.REQUIRED_CLOUD_TASK_SHA256
+                    }
+                },
+            }
+            (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            with mock.patch.object(MODULE, "copilot_home", return_value=home):
+                with self.assertRaisesRegex(MODULE.WorkflowError, "does not match"):
+                    MODULE.discover_cloud_task()
+
+    def test_validates_success_and_no_findings_reports(self):
+        result = self.result()
+        remote = MODULE.validate_success_result(
+            result,
+            pr=self.pr,
+            requested_model="gpt-5.6-sol",
+            identity=self.identity,
+        )
+        report = MODULE.validate_candidate_report(
+            json.dumps(self.report()),
+            request_id=remote["request_id"],
+            pr=self.pr,
+            requested_model="gpt-5.6-sol",
+            anchors=MODULE.parse_unified_diff(DIFF),
+        )
+
+        self.assertEqual(report["candidates"], [])
+        self.assertEqual(remote["generated_head"], "3" * 40)
+
+    def test_validates_candidate_schema_and_changed_anchor(self):
+        report = MODULE.validate_candidate_report(
+            json.dumps(self.report([self.candidate()])),
+            request_id="request-1",
+            pr=self.pr,
+            requested_model="gpt-5.6-sol",
+            anchors=MODULE.parse_unified_diff(DIFF),
+        )
+
+        self.assertEqual(report["candidates"][0]["candidate_id"], "candidate-1")
+        excerpt = MODULE.extract_diff_excerpt(DIFF, "src/one.py", "RIGHT", 2)
+        self.assertIn("+++ b/src/one.py", excerpt)
+        self.assertIn("+new four", excerpt)
+        self.assertNotIn("@@ -20,2 +21,2 @@", excerpt)
+
+        stale = self.candidate()
+        stale["anchor"]["line"] = 999
+        with self.assertRaisesRegex(MODULE.WorkflowError, "not a changed RIGHT line"):
+            MODULE.validate_candidate_report(
+                json.dumps(self.report([stale])),
+                request_id="request-1",
+                pr=self.pr,
+                requested_model="gpt-5.6-sol",
+                anchors=MODULE.parse_unified_diff(DIFF),
+            )
+
+    def test_rejects_orphaned_and_opposite_candidate_start_sides(self):
+        orphaned = self.candidate()
+        orphaned["anchor"]["start_side"] = "RIGHT"
+        opposite = self.candidate()
+        opposite["anchor"].update(
+            {"start_line": 2, "start_side": "LEFT", "line": 4}
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "provide start_line and start_side together"
+        ):
+            MODULE.validate_candidate_report(
+                json.dumps(self.report([orphaned])),
+                request_id="request-1",
+                pr=self.pr,
+                requested_model="gpt-5.6-sol",
+                anchors=MODULE.parse_unified_diff(DIFF),
+            )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "same diff side"):
+            MODULE.validate_candidate_report(
+                json.dumps(self.report([opposite])),
+                request_id="request-1",
+                pr=self.pr,
+                requested_model="gpt-5.6-sol",
+                anchors=MODULE.parse_unified_diff(DIFF),
+            )
+
+    def test_rejects_malformed_candidates_and_credentials(self):
+        malformed = self.candidate()
+        malformed["evidence"] = []
+        with self.assertRaisesRegex(MODULE.WorkflowError, "candidate 0 is malformed"):
+            MODULE.validate_candidate_report(
+                json.dumps(self.report([malformed])),
+                request_id="request-1",
+                pr=self.pr,
+                requested_model="gpt-5.6-sol",
+                anchors=MODULE.parse_unified_diff(DIFF),
+            )
+
+        credential = self.candidate(
+            evidence=["token=github_pat_" + "a" * 20]
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "credentials"):
+            MODULE.validate_candidate_report(
+                json.dumps(self.report([credential])),
+                request_id="request-1",
+                pr=self.pr,
+                requested_model="gpt-5.6-sol",
+                anchors=MODULE.parse_unified_diff(DIFF),
+            )
+
+    def test_rejects_wrong_policy_repo_pr_head_and_model(self):
+        cases = [
+            ("policy", {"policy": {"id": "wrong", "version": 1, "sha256": "x"}}),
+            ("repository", {"repository": {"name_with_owner": "other/repo"}}),
+            ("pull request", {"pull_request": {}}),
+            ("model", {"requested_model": "gpt-5.6-terra"}),
+        ]
+        for label, change in cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(MODULE.WorkflowError, "does not match"):
+                    MODULE.validate_result_identity(
+                        self.result(**change),
+                        pr=self.pr,
+                        requested_model="gpt-5.6-sol",
+                        identity=self.identity,
+                    )
+
+    def test_rejects_malformed_results_tasks_and_incomplete_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result_path = Path(directory) / "result.json"
+            result_path.write_text('{"schema":', encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.WorkflowError, "invalid JSON"):
+                MODULE.load_agent_task_result(result_path)
+
+        malformed_task = self.result(task={})
+        with self.assertRaisesRegex(MODULE.WorkflowError, "malformed task"):
+            MODULE.validate_success_result(
+                malformed_task,
+                pr=self.pr,
+                requested_model="gpt-5.6-sol",
+                identity=self.identity,
+            )
+        incomplete = self.result(validation={"complete": False, "outcomes": []})
+        with self.assertRaisesRegex(MODULE.WorkflowError, "malformed task|identity"):
+            MODULE.validate_success_result(
+                incomplete,
+                pr=self.pr,
+                requested_model="gpt-5.6-sol",
+                identity=self.identity,
+            )
+
+    def test_rejects_wrong_receipt_and_unexpected_commits(self):
+        wrong_receipt = json.loads(self.receipt())
+        wrong_receipt["request_id"] = "other"
+        with self.assertRaisesRegex(MODULE.WorkflowError, "does not match"):
+            MODULE.validate_worker_receipt(
+                json.dumps(wrong_receipt),
+                request_id="request-1",
+                pr=self.pr,
+                validation=self.validation,
+            )
+
+        remote = MODULE.validate_success_result(
+            self.result(),
+            pr=self.pr,
+            requested_model="gpt-5.6-sol",
+            identity=self.identity,
+        )
+        commit = {
+            "sha": remote["generated_head"],
+            "parents": [{"sha": self.pr["head_sha"]}],
+            "files": [
+                {"filename": remote["report_path"]},
+                {"filename": remote["receipt_path"]},
+                {"filename": "unexpected.txt"},
+            ],
+        }
+        with mock.patch.object(MODULE, "gh_json", return_value=commit):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "exactly one"):
+                MODULE.validate_report_commit(self.pr, remote)
+
+    def test_rejects_wrong_task_and_report_identity(self):
+        wrong_task = self.result()
+        wrong_task["task"]["base_sha"] = "9" * 40
+        with self.assertRaisesRegex(MODULE.WorkflowError, "malformed task"):
+            MODULE.validate_success_result(
+                wrong_task,
+                pr=self.pr,
+                requested_model="gpt-5.6-sol",
+                identity=self.identity,
+            )
+
+        wrong_report = self.report()
+        wrong_report["request_id"] = "other"
+        with self.assertRaisesRegex(MODULE.WorkflowError, "identity"):
+            MODULE.validate_candidate_report(
+                json.dumps(wrong_report),
+                request_id="request-1",
+                pr=self.pr,
+                requested_model="gpt-5.6-sol",
+                anchors=MODULE.parse_unified_diff(DIFF),
+            )
+
+    def test_rejects_incomplete_or_reordered_report_validation(self):
+        report = self.report()
+        report["validations"] = list(reversed(report["validations"]))
+        with self.assertRaisesRegex(MODULE.WorkflowError, "out of order"):
+            MODULE.validate_candidate_report(
+                json.dumps(report),
+                request_id="request-1",
+                pr=self.pr,
+                requested_model="gpt-5.6-sol",
+                anchors=MODULE.parse_unified_diff(DIFF),
+            )
+
+    def test_task_failure_is_deterministic(self):
+        error = MODULE.task_failure_from_result(
+            self.result(
+                status="failure",
+                error={"code": "task_failed", "message": "worker stopped"},
+            )
+        )
+        self.assertEqual(str(error), "Agent Task failed [task_failed]: worker stopped")
+
+    def test_check_invokes_managed_helper_once_and_cleans_transient_files(self):
+        report_text = json.dumps(self.report())
+        result = self.result()
+        result["report"]["sha256"] = MODULE.sha256_text(report_text)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_root = root / "repo"
+            repo_root.mkdir()
+            state_path = root / "state" / "run.json"
+            helper = root / "managed" / "cloud_task.py"
+            helper.parent.mkdir()
+            helper.write_text("helper", encoding="utf-8")
+            calls = []
+
+            def invoke(command, **kwargs):
+                calls.append(command)
+                result_path = Path(command[command.index("--result-file") + 1])
+                result_path.write_text(json.dumps(result), encoding="utf-8")
+                return MODULE.subprocess.CompletedProcess(command, 0, "ignored", "")
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "preflight",
+                    return_value=(
+                        self.pr,
+                        "viewer",
+                        MODULE.parse_unified_diff(DIFF),
+                        None,
+                        None,
+                        [],
+                        [],
+                        DIFF,
+                    ),
+                ),
+                mock.patch.object(MODULE, "fetch_review_threads", return_value=[]),
+                mock.patch.object(
+                    MODULE,
+                    "fetch_changed_paths",
+                    return_value=["src/one.py", "docs/two.md"],
+                ),
+                mock.patch.object(MODULE, "ensure_head_unchanged"),
+                mock.patch.object(MODULE, "ensure_snapshot_unchanged"),
+                mock.patch.object(
+                    MODULE,
+                    "resolve_viewer_permissions",
+                    return_value={
+                        "login": "viewer",
+                        "repository_role": "write",
+                        "permissions": {
+                            "admin": False,
+                            "maintain": False,
+                            "push": True,
+                            "triage": True,
+                            "pull": True,
+                        },
+                    },
+                ),
+                mock.patch.object(MODULE, "local_identity", return_value=self.identity),
+                mock.patch.object(MODULE, "state_path_for", return_value=state_path),
+                mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+                mock.patch.object(MODULE, "run", side_effect=invoke),
+                mock.patch.object(MODULE, "validate_report_commit"),
+                mock.patch.object(
+                    MODULE,
+                    "fetch_committed_text",
+                    side_effect=[report_text, self.receipt()],
+                ),
+                mock.patch.object(MODULE, "ensure_snapshot_unchanged"),
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_check(
+                    SimpleNamespace(
+                        target=self.pr["pr_url"],
+                        model="sol",
+                        repo_root=str(repo_root),
+                    )
+                )
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(
+                calls[0],
+                [
+                    MODULE.sys.executable,
+                    str(helper),
+                    "--report",
+                    "--model",
+                    "sol",
+                    "--pr",
+                    self.pr["url"],
+                    "--prompt-file",
+                    str(state_path.with_name("run--prompt.txt")),
+                    "--result-file",
+                    str(state_path.with_name("run--result.json")),
+                    "--policy",
+                    "marketplace-agent-worker@1",
+                ],
+            )
+            self.assertFalse(state_path.with_name("run--prompt.txt").exists())
+            self.assertFalse(state_path.with_name("run--result.json").exists())
+            self.assertFalse(state_path.with_name("run--report.json").exists())
+            self.assertFalse(state_path.with_name("run--receipt.json").exists())
+            self.assertEqual(emit.call_args.args[0]["candidate_count"], 0)
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["agent_task"]["status"], "validated")
+            self.assertEqual(saved["mutation"]["status"], "not_attempted")
+            self.assertNotIn("authoritative_diff", saved)
+            self.assertNotIn("context", saved)
+
+    def test_check_failure_preserves_recovery_state_without_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_root = root / "repo"
+            repo_root.mkdir()
+            state_path = root / "state" / "run.json"
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "preflight",
+                    return_value=(
+                        self.pr,
+                        "viewer",
+                        MODULE.parse_unified_diff(DIFF),
+                        None,
+                        None,
+                        [],
+                        [],
+                        DIFF,
+                    ),
+                ),
+                mock.patch.object(MODULE, "fetch_review_threads", return_value=[]),
+                mock.patch.object(
+                    MODULE,
+                    "fetch_changed_paths",
+                    return_value=["src/one.py", "docs/two.md"],
+                ),
+                mock.patch.object(MODULE, "ensure_head_unchanged"),
+                mock.patch.object(MODULE, "ensure_snapshot_unchanged"),
+                mock.patch.object(
+                    MODULE,
+                    "resolve_viewer_permissions",
+                    return_value={"login": "viewer"},
+                ),
+                mock.patch.object(MODULE, "local_identity", return_value=self.identity),
+                mock.patch.object(MODULE, "state_path_for", return_value=state_path),
+                mock.patch.object(
+                    MODULE,
+                    "discover_cloud_task",
+                    side_effect=MODULE.WorkflowError("helper unavailable"),
+                ),
+                mock.patch.object(MODULE, "run") as run,
+            ):
+                with self.assertRaisesRegex(MODULE.WorkflowError, "helper unavailable"):
+                    MODULE.command_check(
+                        SimpleNamespace(
+                            target=self.pr["pr_url"],
+                            model="sol",
+                            repo_root=str(repo_root),
+                        )
+                    )
+
+            run.assert_not_called()
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["agent_task"]["status"], "failed")
+            self.assertEqual(saved["agent_task"]["recovery_files"], [str(state_path)])
+            self.assertNotIn("authoritative_diff", saved)
+            self.assertNotIn("context", saved)
+
+    def test_cleanup_failure_names_every_retained_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "prompt.txt"
+            second = Path(directory) / "result.json"
+            first.write_text("prompt", encoding="utf-8")
+            second.write_text("result", encoding="utf-8")
+
+            with mock.patch.object(
+                Path,
+                "unlink",
+                side_effect=OSError("access denied"),
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    f"{re.escape(str(first))}.*{re.escape(str(second))}",
+                ):
+                    MODULE.remove_transient_artifacts([first, second])
+
+    def test_evaluator_rejection_and_failure_are_fail_closed(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn("Keep a candidate only when both booleans are true", instructions)
+        self.assertIn("A failure or malformed verdict gets one fresh replacement", instructions)
+        self.assertIn("If that also fails, stop before mutation", instructions)
+
+
+class GuardedPostingTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        self.pr = {
+            "owner": "owner",
+            "repo": "repo",
+            "repo_name": "owner/repo",
+            "number": 42,
+            "pr_url": "https://github.com/owner/repo/pull/42",
+            "url": "https://github.com/owner/repo/pull/42",
+            "title": "Fix the reviewer",
+            "body": "Body",
+            "state": "open",
+            "is_draft": False,
+            "base": {
+                "repository": "owner/repo",
+                "ref": "main",
+                "sha": "1" * 40,
+            },
+            "head": {
+                "repository": "owner/repo",
+                "ref": "feature",
+                "sha": "2" * 40,
+            },
+            "head_sha": "2" * 40,
+            "cross_repository": False,
+        }
+        self.anchors = MODULE.parse_unified_diff(DIFF)
+        self.candidate = {
+            "candidate_id": "candidate-1",
+            "path": "src/one.py",
+            "anchor": {
+                "side": "RIGHT",
+                "start_line": None,
+                "start_side": None,
+                "line": 2,
+            },
+            "severity": "blocking",
+            "title": "Wrong result",
+            "explanation": "The changed branch returns the wrong result.",
+            "evidence": ["evidence"],
+            "confidence": 0.99,
+            "probes": [
+                {"command": "none", "status": "not_run", "outcome": "static proof"}
+            ],
+        }
+        self.state_path = self.directory / "state.json"
+        self.comments_path = self.directory / "comments.json"
+
+    def write_state(self, status="not_attempted"):
+        self.state_path.write_text(
+            json.dumps(
+                {
+                    "version": MODULE.STATE_VERSION,
+                    "run_id": "run-1",
+                    "pr": self.pr,
+                    "viewer": {"login": "viewer"},
+                    "candidates": [self.candidate],
+                    "mutation": {"status": status},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def args(self):
+        return SimpleNamespace(
+            target=self.pr["pr_url"],
+            expected_head=self.pr["head_sha"],
+            state=str(self.state_path),
+            run_id="run-1",
+            comments=str(self.comments_path),
+        )
+
+    def write_comments(self):
+        self.comments_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "candidate_id": "candidate-1",
+                        "path": "src/one.py",
+                        "line": 2,
+                        "side": "RIGHT",
+                        "body": "This returns the wrong result.",
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    def test_creates_exactly_one_guarded_viewer_owned_pending_review(self):
+        self.write_state()
+        self.write_comments()
+        review = {
+            "id": 9,
+            "state": "PENDING",
+            "user": {"login": "viewer"},
+            "commit_id": self.pr["head_sha"],
+            "html_url": f"{self.pr['pr_url']}#pullrequestreview-9",
+        }
+        with (
+            mock.patch.object(
+                MODULE,
+                "preflight",
+                return_value=(
+                    self.pr,
+                    "viewer",
+                    self.anchors,
+                    None,
+                    None,
+                    [],
+                    [],
+                    DIFF,
+                ),
+            ),
+            mock.patch.object(MODULE, "ensure_snapshot_unchanged"),
+            mock.patch.object(MODULE, "gh_json", return_value=review) as gh_json,
+            mock.patch.object(
+                MODULE, "verify_created_review", return_value=review
+            ) as verify,
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_post(self.args())
+
+        self.assertEqual(gh_json.call_count, 1)
+        payload = gh_json.call_args.kwargs["input_payload"]
+        self.assertEqual(set(payload), {"commit_id", "comments"})
+        self.assertNotIn("candidate_id", payload["comments"][0])
+        verify.assert_called_once()
+        saved = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["mutation"]["status"], "verified")
+        self.assertEqual(emit.call_args.args[0]["result"], "created_pending_review")
+
+    def test_recovers_an_existing_pending_review_without_mutation(self):
+        self.write_state(status="attempted")
+        pending_url = f"{self.pr['pr_url']}#pullrequestreview-9"
+        with (
+            mock.patch.object(
+                MODULE,
+                "preflight",
+                return_value=(
+                    self.pr,
+                    "viewer",
+                    {},
+                    pending_url,
+                    None,
+                    [],
+                    [],
+                    None,
+                ),
+            ),
+            mock.patch.object(MODULE, "gh_json") as gh_json,
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_post(self.args())
+
+        gh_json.assert_not_called()
+        self.assertEqual(emit.call_args.args[0]["review_url"], pending_url)
+
+    def test_one_mutation_guard_blocks_a_second_attempt(self):
+        self.write_state(status="attempted")
+        with mock.patch.object(
+            MODULE,
+            "preflight",
+            return_value=(
+                self.pr,
+                "viewer",
+                self.anchors,
+                None,
+                None,
+                [],
+                [],
+                DIFF,
+            ),
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "one-mutation guard"):
+                MODULE.command_post(self.args())
+
+    def test_mutation_claim_is_atomic_and_persistent(self):
+        self.write_state()
+        _, state = MODULE.load_run_state(str(self.state_path))
+
+        MODULE.claim_mutation(self.state_path, state)
+
+        guard = self.state_path.with_name(f"{self.state_path.name}.mutation-guard")
+        self.assertTrue(guard.is_file())
+        with self.assertRaisesRegex(MODULE.WorkflowError, "already claimed"):
+            MODULE.claim_mutation(self.state_path, state)
+
+    def test_rejects_stale_identity_and_changed_candidate_anchor(self):
+        self.write_state()
+        self.write_comments()
+        changed = {**self.pr, "base": {**self.pr["base"], "sha": "9" * 40}}
+        with mock.patch.object(
+            MODULE,
+            "preflight",
+            return_value=(
+                changed,
+                "viewer",
+                self.anchors,
+                None,
+                None,
+                [],
+                [],
+                DIFF,
+            ),
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "live pull request state"):
+                MODULE.command_post(self.args())
+
+        self.write_state()
+        values = json.loads(self.comments_path.read_text(encoding="utf-8"))
+        values[0]["line"] = 4
+        self.comments_path.write_text(json.dumps(values), encoding="utf-8")
+        with mock.patch.object(
+            MODULE,
+            "preflight",
+            return_value=(
+                self.pr,
+                "viewer",
+                self.anchors,
+                None,
+                None,
+                [],
+                [],
+                DIFF,
+            ),
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "changed its validated"):
+                MODULE.command_post(self.args())
+
+    def test_final_snapshot_recheck_blocks_every_live_identity_change(self):
+        changes = {
+            "base": {
+                **self.pr,
+                "base": {**self.pr["base"], "sha": "9" * 40},
+            },
+            "draft": {**self.pr, "is_draft": True},
+            "open": {**self.pr, "state": "closed"},
+            "head": {
+                **self.pr,
+                "head": {**self.pr["head"], "sha": "9" * 40},
+                "head_sha": "9" * 40,
+            },
+        }
+        for field, changed in changes.items():
+            with self.subTest(field=field):
+                self.write_state()
+                self.write_comments()
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "preflight",
+                        return_value=(
+                            self.pr,
+                            "viewer",
+                            self.anchors,
+                            None,
+                            None,
+                            [],
+                            [],
+                            DIFF,
+                        ),
+                    ),
+                    mock.patch.object(MODULE, "resolve_pr", return_value=changed),
+                    mock.patch.object(MODULE, "claim_mutation") as claim,
+                    mock.patch.object(MODULE, "gh_json") as gh_json,
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.WorkflowError, "live pull request state changed"
+                    ):
+                        MODULE.command_post(self.args())
+
+                claim.assert_not_called()
+                gh_json.assert_not_called()
+
+    def test_created_but_unverified_state_is_persisted(self):
+        self.write_state()
+        self.write_comments()
+        review = {
+            "id": 9,
+            "html_url": f"{self.pr['pr_url']}#pullrequestreview-9",
+        }
+        with (
+            mock.patch.object(
+                MODULE,
+                "preflight",
+                return_value=(
+                    self.pr,
+                    "viewer",
+                    self.anchors,
+                    None,
+                    None,
+                    [],
+                    [],
+                    DIFF,
+                ),
+            ),
+            mock.patch.object(MODULE, "ensure_snapshot_unchanged"),
+            mock.patch.object(MODULE, "gh_json", return_value=review),
+            mock.patch.object(
+                MODULE,
+                "verify_created_review",
+                side_effect=MODULE.WorkflowError("verification failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "was created"):
+                MODULE.command_post(self.args())
+
+        saved = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["mutation"]["status"], "created_unverified")
+
+    def test_api_failure_leaves_the_one_mutation_guard_claimed(self):
+        self.write_state()
+        self.write_comments()
+        with (
+            mock.patch.object(
+                MODULE,
+                "preflight",
+                return_value=(
+                    self.pr,
+                    "viewer",
+                    self.anchors,
+                    None,
+                    None,
+                    [],
+                    [],
+                    DIFF,
+                ),
+            ),
+            mock.patch.object(MODULE, "ensure_snapshot_unchanged"),
+            mock.patch.object(
+                MODULE,
+                "gh_json",
+                side_effect=MODULE.WorkflowError("GitHub API failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "GitHub API failed"):
+                MODULE.command_post(self.args())
+
+        saved = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["mutation"]["status"], "attempted")
+        self.assertTrue(
+            self.state_path.with_name(
+                f"{self.state_path.name}.mutation-guard"
+            ).is_file()
+        )
+
+
 class PostingTest(unittest.TestCase):
     def setUp(self):
         self.pr = {
@@ -2163,199 +2034,6 @@ class PostingTest(unittest.TestCase):
         path.write_text(json.dumps(self.comments), encoding="utf-8")
         return path
 
-    def test_payload_omits_body_and_event_and_success_is_verified(self):
-        created = {"id": 9, "html_url": f"{self.pr['pr_url']}#pullrequestreview-9"}
-        verified = {
-            **created,
-            "commit_id": self.pr["head_sha"],
-            "state": "PENDING",
-            "user": {"login": "viewer"},
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            comments_path = self.write_comments(directory)
-            with (
-                mock.patch.object(
-                    MODULE,
-                    "preflight",
-                    return_value=(
-                        self.pr,
-                        "viewer",
-                        self.anchors,
-                        None,
-                        None,
-                        [],
-                        [],
-                        DIFF,
-                    ),
-                ) as preflight,
-                mock.patch.object(MODULE, "gh_json", return_value=created) as gh_json,
-                mock.patch.object(
-                    MODULE, "verify_created_review", return_value=verified
-                ) as verify,
-                mock.patch.object(MODULE, "ensure_head_unchanged") as ensure_head,
-                mock.patch.object(MODULE, "emit") as emit,
-            ):
-                MODULE.command_post(
-                    SimpleNamespace(
-                        target=self.pr["pr_url"],
-                        expected_head=self.pr["head_sha"],
-                        comments=str(comments_path),
-                    )
-                )
-
-        payload = gh_json.call_args.kwargs["input_payload"]
-        preflight.assert_called_once_with(self.pr["pr_url"], self.pr["head_sha"])
-        self.assertNotIn("body", payload)
-        self.assertNotIn("event", payload)
-        self.assertEqual(payload["commit_id"], "abc123")
-        self.assertEqual(payload["comments"], self.comments)
-        verify.assert_called_once_with(
-            self.pr, "viewer", 9, self.comments, self.anchors
-        )
-        ensure_head.assert_called_once_with(
-            self.pr, "immediately before creating the review"
-        )
-        self.assertEqual(emit.call_args.args[0]["result"], "created_pending_review")
-        self.assertEqual(
-            emit.call_args.args[0]["review_url"],
-            f"{self.pr['pr_url']}#pullrequestreview-9",
-        )
-
-    def test_post_verification_failure_is_exposed(self):
-        created = {"id": 9, "html_url": f"{self.pr['pr_url']}#pullrequestreview-9"}
-        with tempfile.TemporaryDirectory() as directory:
-            comments_path = self.write_comments(directory)
-            with (
-                mock.patch.object(
-                    MODULE,
-                    "preflight",
-                    return_value=(
-                        self.pr,
-                        "viewer",
-                        self.anchors,
-                        None,
-                        None,
-                        [],
-                        [],
-                        DIFF,
-                    ),
-                ),
-                mock.patch.object(MODULE, "gh_json", return_value=created),
-                mock.patch.object(
-                    MODULE,
-                    "verify_created_review",
-                    side_effect=MODULE.WorkflowError("state is SUBMITTED"),
-                ),
-                mock.patch.object(MODULE, "ensure_head_unchanged"),
-            ):
-                with self.assertRaisesRegex(
-                    MODULE.WorkflowError,
-                    "was created but verification failed: state is SUBMITTED",
-                ) as caught:
-                    MODULE.command_post(
-                        SimpleNamespace(
-                            target=self.pr["pr_url"],
-                            expected_head=self.pr["head_sha"],
-                            comments=str(comments_path),
-                        )
-                    )
-
-        self.assertIn(created["html_url"], str(caught.exception))
-
-    def test_head_change_immediately_before_post_prevents_creation(self):
-        with (
-            mock.patch.object(
-                MODULE,
-                "preflight",
-                return_value=(
-                    self.pr,
-                    "viewer",
-                    self.anchors,
-                    None,
-                    None,
-                    [],
-                    [],
-                    DIFF,
-                ),
-            ),
-            mock.patch.object(MODULE, "load_comments", return_value=self.comments),
-            mock.patch.object(
-                MODULE,
-                "ensure_head_unchanged",
-                side_effect=MODULE.WorkflowError(
-                    "PR head changed immediately before creating the review"
-                ),
-            ),
-            mock.patch.object(MODULE, "gh_json") as gh_json,
-        ):
-            with self.assertRaisesRegex(
-                MODULE.WorkflowError,
-                "PR head changed immediately before creating the review",
-            ):
-                MODULE.command_post(
-                    SimpleNamespace(
-                        target=self.pr["pr_url"],
-                        expected_head=self.pr["head_sha"],
-                        comments="comments.json",
-                    )
-                )
-
-        gh_json.assert_not_called()
-
-    def test_post_rejects_preflight_head_mismatch_before_mutation(self):
-        changed = {**self.pr, "head_sha": "def456"}
-        with (
-            mock.patch.object(
-                MODULE,
-                "preflight",
-                return_value=(
-                    changed,
-                    "viewer",
-                    self.anchors,
-                    None,
-                    None,
-                    [],
-                    [],
-                    DIFF,
-                ),
-            ),
-            mock.patch.object(MODULE, "load_comments") as load_comments,
-            mock.patch.object(MODULE, "gh_json") as gh_json,
-        ):
-            with self.assertRaisesRegex(
-                MODULE.WorkflowError,
-                "does not match the snapshot analyzed by check",
-            ):
-                MODULE.command_post(
-                    SimpleNamespace(
-                        target=self.pr["pr_url"],
-                        expected_head=self.pr["head_sha"],
-                        comments="comments.json",
-                    )
-                )
-
-        load_comments.assert_not_called()
-        gh_json.assert_not_called()
-
-    def test_post_parser_requires_expected_head(self):
-        parser = MODULE.build_parser()
-
-        with (
-            mock.patch.object(MODULE.sys, "stderr", new=io.StringIO()),
-            self.assertRaises(SystemExit),
-        ):
-            parser.parse_args(["post", self.pr["pr_url"], "--comments", "comments.json"])
-        args = parser.parse_args(
-            [
-                "post",
-                self.pr["pr_url"],
-                "--expected-head",
-                self.pr["head_sha"],
-                "--comments",
-                "comments.json",
-            ]
-        )
-        self.assertEqual(args.expected_head, self.pr["head_sha"])
 
     def test_review_verification_rejects_commit_mismatch(self):
         review = {

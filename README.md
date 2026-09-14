@@ -29,13 +29,17 @@ Restart Copilot after you install or update a plugin.
 
 ### PR Reviewer
 
-Reads the pull request diff that GitHub reports, and checks each possible
-finding with its own separate evaluator. It then creates a pending review that
-holds only the findings it can confirm, and verifies that every inline comment
-points at a real line of that diff.
+Uses a managed GitHub Agent Task to inspect the complete pinned pull request
+diff and run focused probes in isolation. The local coordinator validates the
+task's committed report and receipt, then checks each candidate with a separate
+Claude evaluator before it creates and verifies one pending review.
 
 Run this agent with GPT-5.6 Sol at high reasoning effort. It checks each finding
-with a separate Claude Sonnet 5 evaluator.
+with a separate Claude Sonnet 5 evaluator. It requires the managed `cloud`
+skill from copilot-config commit
+`a553877be1b887302aff375eb629e644d7aef186` and policy
+`marketplace-agent-worker@1`. It never uses Cloud Sandboxes or a local-analysis
+fallback.
 
 ### Copilot Review Loop
 
