@@ -28,8 +28,8 @@
     },
     {
       "name": "pr-description",
-      "description": "Review and automatically update a pull request title and description with head verification.",
-      "version": "1.0.31",
+      "description": "Review and update a pull request title and description through a managed GitHub Agent Task.",
+      "version": "1.0.32",
       "source": "./plugins/pr-description"
     },
     {

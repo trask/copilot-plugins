@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
 import importlib.util
 import inspect
 import io
@@ -94,7 +95,93 @@ def write_state(directory: Path, **overrides) -> Path:
     return path
 
 
-class AgentInstructionsTest(unittest.TestCase):
+def agent_task_preflight(**pr_overrides):
+    head_sha = "1" * 40
+    base_sha = "2" * 40
+    pr = pr_metadata(
+        head_sha=head_sha,
+        state="open",
+        base={"repository": "owner/repo", "ref": "main", "sha": base_sha},
+        head={"repository": "owner/repo", "ref": "feature", "sha": head_sha},
+        cross_repository=False,
+        **pr_overrides,
+    )
+    return {
+        "repository_root": "repo",
+        "pr": pr,
+        "viewer": {
+            "login": "viewer",
+            "repository_role": "write",
+            "permissions": {
+                "admin": False,
+                "maintain": False,
+                "push": True,
+                "triage": True,
+                "pull": True,
+            },
+        },
+    }
+
+
+def agent_task_result(preflight=None, **overrides):
+    preflight = preflight or agent_task_preflight()
+    pr = preflight["pr"]
+    generated_head = "3" * 40
+    request_id = "request-1"
+    result = {
+        "schema": MODULE.AGENT_TASK_RESULT_SCHEMA,
+        "status": "success",
+        "mode": "report",
+        "repository": {"name_with_owner": pr["repo_name"]},
+        "pull_request": MODULE.expected_cloud_pull_request(preflight),
+        "requested_model": "gpt-5.6-sol",
+        "policy": {
+            "id": "marketplace-agent-worker",
+            "version": 1,
+            "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
+        },
+        "task": {
+            "id": "task-1",
+            "url": "https://github.com/owner/repo/agent-tasks/task-1",
+            "state": "completed",
+            "base_ref": pr["head"]["ref"],
+            "base_sha": pr["head_sha"],
+        },
+        "generated": {
+            "branch": "copilot/agent-task",
+            "head_sha": generated_head,
+            "commits": [],
+        },
+        "application": {
+            "status": "not_applicable",
+            "final_local_head": "4" * 40,
+        },
+        "report": {
+            "path": f".github/agent-task-reports/{request_id}.md",
+            "commit": generated_head,
+            "sha256": "5" * 64,
+        },
+        "worker_receipt": {
+            "path": f".github/agent-task-receipts/{request_id}.json",
+            "commit": generated_head,
+        },
+        "validation": {
+            "complete": True,
+            "outcomes": [
+                {
+                    "command": "review complete diff",
+                    "status": "passed",
+                    "detail": "All changed files were reviewed.",
+                }
+            ],
+        },
+        "error": None,
+    }
+    result.update(overrides)
+    return result
+
+
+class LegacyAgentInstructions:
     def setUp(self):
         self.instructions = AGENT.read_text(encoding="utf-8")
 
@@ -628,6 +715,514 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertEqual(plugin["version"], "1.0.31")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
+
+
+class AgentTaskCoordinatorTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temporary.name).resolve()
+        self.addCleanup(self.temporary.cleanup)
+        self.repo_root = self.directory / "repo"
+        self.repo_root.mkdir()
+        self.preflight = agent_task_preflight()
+        self.identity = {
+            "branch": "feature",
+            "head": "4" * 40,
+            "status": "",
+        }
+        self.validation = [
+            {
+                "command": "review complete diff",
+                "status": "passed",
+                "detail": "All changed files were reviewed.",
+            }
+        ]
+        self.helper_commands = []
+
+    def proposal_report(self, *, decision="keep", title=None, body=None):
+        pr = self.preflight["pr"]
+        value = {
+            "schema": MODULE.PR_DESCRIPTION_PROPOSAL_SCHEMA,
+            "request_id": "request-1",
+            "repository": "owner/repo",
+            "pull_request": {
+                "number": 7,
+                "head_sha": pr["head_sha"],
+                "current_title_sha256": MODULE.sha256_text(pr["title"]),
+                "current_body_sha256": MODULE.sha256_text(pr["body"]),
+            },
+            "decision": decision,
+            "proposal": {
+                "title": pr["title"] if title is None else title,
+                "body": pr["body"] if body is None else body,
+            },
+            "evidence": {
+                "changed_files": [
+                    {"path": "src/app.py", "detail": "Adds the public behavior."}
+                ],
+                "title_basis": "Names the changed behavior.",
+                "body_basis": "Covers the user-facing scope.",
+            },
+        }
+        return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+    def receipt(self):
+        return json.dumps(
+            {
+                "schema": MODULE.AGENT_TASK_RECEIPT_SCHEMA,
+                "request_id": "request-1",
+                "policy": {
+                    "id": "marketplace-agent-worker",
+                    "version": 1,
+                    "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
+                },
+                "mode": "report",
+                "repository": "owner/repo",
+                "pull_request_head_sha": self.preflight["pr"]["head_sha"],
+                "validation_complete": True,
+                "validation": self.validation,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    def result(self, report_content):
+        value = agent_task_result(self.preflight)
+        value["report"]["sha256"] = MODULE.sha256_text(report_content)
+        return value
+
+    def command_patches(self, result, report_content, receipt_content):
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        index = self.directory / "owner--repo--7.json"
+        emitted = []
+
+        def helper_run(command, **kwargs):
+            self.helper_commands.append(command)
+            result_path = Path(command[command.index("--result-file") + 1])
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "ignored report", "")
+
+        def validated_no_change(path, state, **kwargs):
+            state["validated_head_sha"] = self.preflight["pr"]["head_sha"]
+            MODULE.save_state(path, state)
+            return {
+                "result": "validated",
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+                "validated_head_sha": self.preflight["pr"]["head_sha"],
+            }
+
+        patches = (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=self.preflight
+            ),
+            mock.patch.object(MODULE, "default_state_path", return_value=index),
+            mock.patch.object(MODULE, "update_run_index"),
+            mock.patch.object(MODULE, "refresh_run_index"),
+            mock.patch.object(MODULE, "local_identity", return_value=self.identity),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "run", side_effect=helper_run),
+            mock.patch.object(
+                MODULE,
+                "fetch_committed_text",
+                side_effect=[report_content, receipt_content],
+            ),
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                return_value=pr_metadata(head_sha=self.preflight["pr"]["head_sha"]),
+            ),
+            mock.patch.object(
+                MODULE, "pull_request_file_paths", return_value=["src/app.py"]
+            ),
+            mock.patch.object(
+                MODULE, "validate_no_change", side_effect=validated_no_change
+            ),
+            mock.patch.object(MODULE, "emit", emitted.append),
+            mock.patch.object(MODULE.secrets, "token_hex", return_value="run-1"),
+        )
+        return patches, emitted, index
+
+    def run_command_with(self, result, report_content, receipt_content):
+        patches, emitted, index = self.command_patches(
+            result, report_content, receipt_content
+        )
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            MODULE.command_agent_task(
+                SimpleNamespace(target="owner/repo#7", repo_root=None, model="sol")
+            )
+        return emitted, index
+
+    def test_agent_definition_uses_only_the_managed_agent_task_path(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+        self.assertIn("You are a thin local coordinator", instructions)
+        self.assertIn("agent-task <target>", instructions)
+        self.assertIn("marketplace-agent-worker@1", instructions)
+        self.assertIn("Never use Cloud Sandboxes", instructions)
+        self.assertIn("Never run `gh pr diff`", instructions)
+        self.assertIn("Never scrape", instructions)
+        plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
+        self.assertNotIn("custom_agent", plugin)
+
+    def test_manifest_and_marketplace_versions_match(self):
+        plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
+        marketplace = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
+        entry = next(
+            item for item in marketplace["plugins"] if item["name"] == plugin["name"]
+        )
+        self.assertEqual(plugin["version"], "1.0.32")
+        self.assertEqual(entry["version"], plugin["version"])
+
+    def test_discovers_only_the_pinned_managed_helper(self):
+        home = self.directory / ".copilot"
+        helper = home / MODULE.CLOUD_TASK_RELATIVE_PATH
+        helper.parent.mkdir(parents=True)
+        helper.write_text("# helper\n", encoding="utf-8")
+        manifest = {
+            "version": MODULE.CONFIG_MANIFEST_VERSION,
+            "source": {
+                "path": str(self.directory),
+                "commit": MODULE.REQUIRED_CONFIG_COMMIT,
+                "dirty": False,
+            },
+            "entries": [MODULE.CLOUD_TASK_MANAGED_ENTRY],
+            "contents": {
+                MODULE.CLOUD_TASK_MANAGED_ENTRY: {
+                    "scripts/cloud_task.py": MODULE.REQUIRED_CLOUD_TASK_SHA256
+                }
+            },
+        }
+        (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        with (
+            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
+            mock.patch.object(
+                MODULE,
+                "sha256_file",
+                return_value=MODULE.REQUIRED_CLOUD_TASK_SHA256,
+            ),
+        ):
+            self.assertEqual(MODULE.discover_cloud_task(), helper.resolve())
+
+        manifest["source"]["commit"] = "0" * 40
+        (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        with (
+            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
+            self.assertRaisesRegex(MODULE.WorkflowError, "missing or too old"),
+        ):
+            MODULE.discover_cloud_task()
+
+    def test_missing_managed_helper_reports_the_prerequisite(self):
+        home = self.directory / "empty-home"
+        home.mkdir()
+        with (
+            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "managed Copilot configuration manifest"
+            ),
+        ):
+            MODULE.discover_cloud_task()
+
+    def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
+        head_sha = self.preflight["pr"]["head_sha"]
+        payload = {
+            "state": "open",
+            "title": "Current title",
+            "body": "Current body",
+            "base": {
+                "repo": {"full_name": "owner/repo"},
+                "ref": "main",
+                "sha": "2" * 40,
+            },
+            "head": {
+                "repo": {"full_name": "owner/repo"},
+                "ref": "feature",
+                "sha": head_sha,
+            },
+        }
+        repository = {
+            "role_name": None,
+            "permissions": {
+                "admin": False,
+                "maintain": False,
+                "push": True,
+                "triage": True,
+                "pull": True,
+            },
+        }
+        with (
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                return_value=pr_metadata(head_sha=head_sha),
+            ),
+            mock.patch.object(
+                MODULE, "gh_json", side_effect=[payload, repository, {"login": "viewer"}]
+            ),
+        ):
+            context = MODULE.agent_task_preflight(
+                self.repo_root, MODULE.parse_target("owner/repo#7")
+            )
+
+        self.assertEqual(context["pr"]["base"]["sha"], "2" * 40)
+        self.assertEqual(context["pr"]["head"]["sha"], head_sha)
+        self.assertEqual(context["viewer"]["login"], "viewer")
+        self.assertIsNone(context["viewer"]["repository_role"])
+        self.assertTrue(context["viewer"]["permissions"]["push"])
+
+    def test_validates_success_envelope_receipt_report_and_proposal(self):
+        report_content = self.proposal_report()
+        result = self.result(report_content)
+        remote = MODULE.validate_success_result(
+            result,
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+            identity=self.identity,
+        )
+        MODULE.validate_worker_receipt(
+            self.receipt(),
+            request_id=remote["request_id"],
+            preflight=self.preflight,
+            validation=remote["validation"],
+        )
+        proposal = MODULE.validate_proposal_report(
+            report_content,
+            request_id=remote["request_id"],
+            preflight=self.preflight,
+            changed_files=["src/app.py"],
+        )
+        self.assertEqual(proposal["decision"], "keep")
+
+    def test_rejects_policy_repository_pr_head_and_task_mismatches(self):
+        mutations = {
+            "policy": lambda value: value.update(
+                policy={**value["policy"], "sha256": "0" * 64}
+            ),
+            "repository": lambda value: value.update(
+                repository={"name_with_owner": "other/repo"}
+            ),
+            "pull request": lambda value: value.update(
+                pull_request={**value["pull_request"], "number": 8}
+            ),
+            "head": lambda value: value.update(
+                pull_request={**value["pull_request"], "head_sha": "9" * 40}
+            ),
+            "task": lambda value: value["task"].update(base_sha="9" * 40),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                value = self.result(self.proposal_report())
+                mutate(value)
+                with self.assertRaises(MODULE.WorkflowError):
+                    MODULE.validate_success_result(
+                        value,
+                        preflight=self.preflight,
+                        requested_model="gpt-5.6-sol",
+                        identity=self.identity,
+                    )
+
+    def test_rejects_incomplete_validation(self):
+        value = self.result(self.proposal_report())
+        value["validation"] = {"complete": False, "outcomes": []}
+        with self.assertRaisesRegex(MODULE.WorkflowError, "validation"):
+            MODULE.validate_success_result(
+                value,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+                identity=self.identity,
+            )
+
+    def test_rejects_malformed_result_and_receipt(self):
+        result_path = self.directory / "result.json"
+        result_path.write_text(
+            json.dumps({"schema": MODULE.AGENT_TASK_RESULT_SCHEMA}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "schema or fields"):
+            MODULE.load_agent_task_result(result_path)
+        receipt = json.loads(self.receipt())
+        receipt["request_id"] = "other"
+        with self.assertRaisesRegex(MODULE.WorkflowError, "does not match"):
+            MODULE.validate_worker_receipt(
+                json.dumps(receipt),
+                request_id="request-1",
+                preflight=self.preflight,
+                validation=self.validation,
+            )
+
+    def test_rejects_malformed_report_and_proposal(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "invalid JSON"):
+            MODULE.validate_proposal_report(
+                "not-json",
+                request_id="request-1",
+                preflight=self.preflight,
+                changed_files=["src/app.py"],
+            )
+        report = json.loads(self.proposal_report())
+        report["decision"] = "replace"
+        with self.assertRaisesRegex(MODULE.WorkflowError, "decision"):
+            MODULE.validate_proposal_report(
+                json.dumps(report),
+                request_id="request-1",
+                preflight=self.preflight,
+                changed_files=["src/app.py"],
+            )
+        report = json.loads(self.proposal_report())
+        report["evidence"]["changed_files"] = []
+        with self.assertRaisesRegex(MODULE.WorkflowError, "exact changed file"):
+            MODULE.validate_proposal_report(
+                json.dumps(report),
+                request_id="request-1",
+                preflight=self.preflight,
+                changed_files=["src/app.py"],
+            )
+
+    def test_rejects_credentials_before_dispatch(self):
+        preflight = agent_task_preflight(body="token=github_pat_abcdefghijklmnopqrstuvwxyz")
+        prompt = MODULE.build_worker_prompt(preflight)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "credentials"):
+            MODULE.require_no_credentials(prompt, source="Agent Task prompt")
+
+    def test_success_uses_atomic_result_not_stdout_and_cleans_artifacts(self):
+        report_content = self.proposal_report()
+        emitted, index = self.run_command_with(
+            self.result(report_content), report_content, self.receipt()
+        )
+        state = MODULE.load_run_state(index.with_name("owner--repo--7--run-1.json"))
+        self.assertEqual(emitted[-1]["result"], "validated")
+        self.assertEqual(state["agent_task"]["status"], "completed")
+        self.assertTrue(state["agent_task"]["artifacts_removed"])
+        self.assertNotIn("prompt_file", state["agent_task"])
+        command = self.helper_commands[-1]
+        self.assertIn("--report", command)
+        self.assertEqual(
+            command[command.index("--policy") + 1],
+            "marketplace-agent-worker@1",
+        )
+        self.assertNotIn("--custom-agent", command)
+        result_path = Path(command[command.index("--result-file") + 1])
+        prompt_path = Path(command[command.index("--prompt-file") + 1])
+        self.assertTrue(result_path.is_absolute())
+        self.assertTrue(prompt_path.is_absolute())
+        self.assertNotIn(self.repo_root, result_path.parents)
+        self.assertNotIn(self.repo_root, prompt_path.parents)
+        self.assertEqual(
+            list(self.directory.glob("*--agent-task-*")),
+            [],
+        )
+
+    def test_task_failure_keeps_recovery_artifacts_and_never_mutates(self):
+        report_content = self.proposal_report()
+        result = self.result(report_content)
+        result["status"] = "error"
+        result["error"] = {"code": "task_failed", "message": "task failed"}
+        patches, _, index = self.command_patches(
+            result, report_content, self.receipt()
+        )
+        run_patcher = next(
+            patcher
+            for patcher in patches
+            if patcher.attribute == "run"
+        )
+        patches = tuple(patcher for patcher in patches if patcher is not run_patcher)
+
+        def failed_run(command, **kwargs):
+            result_path = Path(command[command.index("--result-file") + 1])
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 1, "ignored", "ignored")
+
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            stack.enter_context(mock.patch.object(MODULE, "run", side_effect=failed_run))
+            with self.assertRaisesRegex(MODULE.WorkflowError, "task_failed"):
+                MODULE.command_agent_task(
+                    SimpleNamespace(target="owner/repo#7", repo_root=None, model="sol")
+                )
+        state = MODULE.load_run_state(index.with_name("owner--repo--7--run-1.json"))
+        self.assertEqual(state["agent_task"]["status"], "failed")
+        self.assertEqual(len(state["agent_task"]["recovery_files"]), 2)
+
+    def test_stale_pr_and_local_drift_refuse_mutation(self):
+        report_content = self.proposal_report()
+        result = self.result(report_content)
+        for label, drift in (("PR head moved", False), ("local repository changed", True)):
+            with self.subTest(label=label):
+                patches, _, _ = self.command_patches(
+                    result, report_content, self.receipt()
+                )
+                patches = tuple(
+                    patcher
+                    for patcher in patches
+                    if patcher.attribute not in {"metadata_for", "local_identity"}
+                )
+                identity_values = (
+                    [self.identity, {**self.identity, "status": " M file.py"}]
+                    if drift
+                    else [self.identity, self.identity]
+                )
+                with contextlib.ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    stack.enter_context(
+                        mock.patch.object(
+                            MODULE, "local_identity", side_effect=identity_values
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            MODULE,
+                            "metadata_for",
+                            return_value=pr_metadata(
+                                head_sha=(
+                                    self.preflight["pr"]["head_sha"]
+                                    if drift
+                                    else "9" * 40
+                                )
+                            ),
+                        )
+                    )
+                    with self.assertRaisesRegex(MODULE.WorkflowError, label):
+                        MODULE.command_agent_task(
+                            SimpleNamespace(
+                                target="owner/repo#7", repo_root=None, model="sol"
+                            )
+                        )
+                for artifact in self.directory.glob("*--agent-task-*"):
+                    artifact.unlink()
+
+    def test_cleanup_failure_records_verified_partial_failure(self):
+        report_content = self.proposal_report()
+        result = self.result(report_content)
+        patches, _, index = self.command_patches(
+            result, report_content, self.receipt()
+        )
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            stack.enter_context(
+                mock.patch.object(Path, "unlink", side_effect=OSError("locked"))
+            )
+            with self.assertRaisesRegex(MODULE.WorkflowError, "cleanup failed"):
+                MODULE.command_agent_task(
+                    SimpleNamespace(target="owner/repo#7", repo_root=None, model="sol")
+                )
+        state = MODULE.load_run_state(index.with_name("owner--repo--7--run-1.json"))
+        self.assertEqual(state["agent_task"]["status"], "failed_after_mutation")
+        self.assertTrue(state["agent_task"]["recovery_files"])
 
 
 class TargetParsingTest(unittest.TestCase):
@@ -2222,6 +2817,17 @@ class ParserShapeTest(unittest.TestCase):
 
     def test_parses_every_command_shape(self):
         cases = (
+            (
+                [
+                    "agent-task",
+                    "owner/repo#7",
+                    "--repo-root",
+                    "repo",
+                    "--model",
+                    "terra",
+                ],
+                "command_agent_task",
+            ),
             (
                 ["preflight", "owner/repo#7", "--repo-root", "repo", "--state", "state"],
                 "command_preflight",

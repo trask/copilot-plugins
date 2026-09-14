@@ -58,10 +58,16 @@ and that check only works when the evaluator comes from another model family.
 
 ### PR Description
 
-Reviews the current pull request title and description against the diff. It
-validates ideal text unchanged or automatically applies a better title and
-description. It checks every outcome against the pinned pull request head and
-the exact live text.
+Uses a managed GitHub Agent Task to review the current pull request title and
+description against the complete diff. The local coordinator pins the pull
+request and permission context, validates the task's committed report and
+receipt, then keeps ideal text or applies the proposed replacement through
+GitHub's authenticated API.
+
+This plugin requires the managed `cloud` skill from copilot-config commit
+`a553877be1b887302aff375eb629e644d7aef186`. It runs `cloud_task.py` with policy
+`marketplace-agent-worker@1`. The backend is GitHub Agent Tasks through local
+`gh api`; there is no Cloud Sandbox, custom agent, or local-analysis fallback.
 
 ### PR Pipeline
 
