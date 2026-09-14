@@ -37,7 +37,7 @@ Claude evaluator before it creates and verifies one pending review.
 Run this agent with GPT-5.6 Sol at high reasoning effort. It checks each finding
 with a separate Claude Sonnet 5 evaluator. It requires the managed `cloud`
 skill from copilot-config commit
-`a553877be1b887302aff375eb629e644d7aef186` and policy
+`e67d61da91c514eeea12179997aa4f35d3d737da` and policy
 `marketplace-agent-worker@1`. It never uses Cloud Sandboxes or a local-analysis
 fallback.
 
@@ -50,15 +50,17 @@ repeats until the review is clean or it reaches a stop condition.
 
 ### Self Review Loop
 
-Reads the pull request diff that GitHub reports and checks each possible
-finding with its own separate evaluator. It then commits the fixes instead of
-posting review comments. Each commit records the finding, the analysis, and the
-upsides and downsides, so you can read the reasoning in git. It pushes after
-every pass and reviews the new head again, until a whole pass finds nothing or
-it reaches a stop condition.
+Uses one managed GitHub Agent Task to review the pinned pull request, fix every
+validated finding in scope, and run the repository's formatting, tests, and
+builds. The local coordinator validates the task's commit history, report,
+receipt, and live branch identity before it imports and pushes the fix commits.
+A clean review leaves the branch unchanged.
 
-Run this agent on a Claude model. It checks its own findings with GPT-5.6 Sol,
-and that check only works when the evaluator comes from another model family.
+This plugin requires the managed `cloud` skill from copilot-config commit
+`e67d61da91c514eeea12179997aa4f35d3d737da`. It runs `cloud_task.py` with policy
+`marketplace-agent-worker@1`. The backend is GitHub Agent Tasks through local
+`gh api`; there is no Cloud Sandbox, custom agent, local repository analysis,
+or local execution fallback.
 
 ### PR Description
 
@@ -69,7 +71,7 @@ receipt, then keeps ideal text or applies the proposed replacement through
 GitHub's authenticated API.
 
 This plugin requires the managed `cloud` skill from copilot-config commit
-`a553877be1b887302aff375eb629e644d7aef186`. It runs `cloud_task.py` with policy
+`e67d61da91c514eeea12179997aa4f35d3d737da`. It runs `cloud_task.py` with policy
 `marketplace-agent-worker@1`. The backend is GitHub Agent Tasks through local
 `gh api`; there is no Cloud Sandbox, custom agent, or local-analysis fallback.
 
@@ -131,13 +133,12 @@ for it before it edits or pushes any stack member.
 
 ### Historical PR Audit
 
-Audits a pull request that already merged, without changing it. It pins the
-exact base and head commits that pull request merged from, captures the diff and
-the discussion GitHub reported for that snapshot, and moves a fresh session
-branch to the historical head so the code around it is the code the author
-wrote. It checks each possible finding with its own separate evaluator, commits
-the fixes on a branch named `trask-pr-audit-<number>`, and audits the new head
-again until a whole pass finds nothing.
+Uses one managed GitHub Agent Task to audit a merged pull request against its
+pinned historical base, head, diff, and discussion. The worker compares changed
+areas with sibling implementations, fixes every validated finding, and runs the
+historical tree's formatting, tests, and builds. The local coordinator validates
+the task's commit history, report, receipt, and live repository identity before
+it imports and pushes the fixes to `trask-pr-audit-<number>`.
 
 It also compares each changed area with the closest sibling implementations in
 that historical tree, and treats an unexplained departure from a strong,
@@ -146,8 +147,11 @@ directly applicable precedent as a finding worth raising.
 The merged pull request never changes. The audit branch is the only thing this
 agent pushes, and a first pass that finds nothing pushes no branch at all.
 
-Run this agent on a Claude model. It checks its own findings with GPT-5.6 Sol,
-and that check only works when the evaluator comes from another model family.
+This plugin requires the managed `cloud` skill from copilot-config commit
+`e67d61da91c514eeea12179997aa4f35d3d737da`. It runs `cloud_task.py` with policy
+`marketplace-agent-worker@1`. The backend is GitHub Agent Tasks through local
+`gh api`; there is no Cloud Sandbox, custom agent, local repository analysis,
+or local execution fallback.
 
 ### Optional PR Flight State Sharing
 

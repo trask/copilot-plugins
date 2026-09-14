@@ -176,7 +176,7 @@ def _agent_section(text, heading):
     return "\n".join(body)
 
 
-class AgentInstructionsTest(unittest.TestCase):
+class LegacyAgentInstructions:
     def setUp(self):
         self.instructions = AGENT.read_text(encoding="utf-8")
 

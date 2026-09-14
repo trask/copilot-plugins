@@ -712,7 +712,7 @@ class LegacyAgentInstructions:
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.31")
+        self.assertEqual(plugin["version"], "1.0.33")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -880,10 +880,18 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.32")
+        self.assertEqual(plugin["version"], "1.0.33")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_discovers_only_the_pinned_managed_helper(self):
+        self.assertEqual(
+            MODULE.REQUIRED_CONFIG_COMMIT,
+            "e67d61da91c514eeea12179997aa4f35d3d737da",
+        )
+        self.assertEqual(
+            MODULE.REQUIRED_CLOUD_TASK_SHA256,
+            "fa57bff76e2e2854d1bd73ea77a761e9e14ebcd89b89a7d90e91c6d28c73ff5f",
+        )
         home = self.directory / ".copilot"
         helper = home / MODULE.CLOUD_TASK_RELATIVE_PATH
         helper.parent.mkdir(parents=True)

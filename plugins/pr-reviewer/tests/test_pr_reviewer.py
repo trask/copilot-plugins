@@ -1194,7 +1194,11 @@ class ManagedCoordinatorTest(unittest.TestCase):
             self.assertEqual(MODULE.sha256_file(helper), fixture_digest)
             self.assertEqual(
                 MODULE.REQUIRED_CLOUD_TASK_SHA256,
-                "6135e20cf5d23728c02263e69feebe825b6cada216ca4e8552e65adcb6d7f62b",
+                "fa57bff76e2e2854d1bd73ea77a761e9e14ebcd89b89a7d90e91c6d28c73ff5f",
+            )
+            self.assertEqual(
+                MODULE.REQUIRED_CONFIG_COMMIT,
+                "e67d61da91c514eeea12179997aa4f35d3d737da",
             )
             self.assertNotEqual(
                 MODULE.REQUIRED_CLOUD_TASK_SHA256,
