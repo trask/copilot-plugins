@@ -43,6 +43,10 @@ class WindowsSubprocessTest(unittest.TestCase):
         self.assertEqual(
             subprocess_run.call_args.kwargs["creationflags"], 0x08000000
         )
+        environment = subprocess_run.call_args.kwargs["env"]
+        index = int(environment["GIT_CONFIG_COUNT"]) - 1
+        self.assertEqual(environment[f"GIT_CONFIG_KEY_{index}"], "core.hooksPath")
+        self.assertEqual(environment[f"GIT_CONFIG_VALUE_{index}"], os.devnull)
 
     def test_run_leaves_non_windows_process_options_unchanged(self):
         completed = MODULE.subprocess.CompletedProcess(["formatter"], 0, "", "")
@@ -1099,6 +1103,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
+        self.assertIn("loop <target>", instructions)
         self.assertIn("marketplace-agent-worker@4", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("`custom_agent`", instructions)
@@ -1678,6 +1683,228 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             MODULE.check_snapshot_sha256(first),
             MODULE.check_snapshot_sha256(second),
         )
+
+    def test_one_task_primitive_refuses_a_partial_check_suite(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        state_path = self.root / "partial-state.json"
+        preflight = copy.deepcopy(self.preflight)
+        preflight["repository_root"] = str(repo)
+        preflight["check_snapshot"]["decision"]["pending_checks"] = ["check:queued"]
+        arguments = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                self.preflight["pr"]["pr_url"],
+                "--repo-root",
+                str(repo),
+                "--state",
+                str(state_path),
+            ]
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value={"repo_name": "owner/repo", "number": 7},
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=preflight
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(arguments)
+
+        self.assertEqual(emit.call_args.args[0]["result"], "waiting")
+        discover.assert_not_called()
+
+    def test_local_coordinator_waits_for_a_stable_terminal_check_set(self):
+        pending = copy.deepcopy(self.preflight)
+        pending["check_snapshot"]["decision"]["pending_checks"] = ["check:queued"]
+        stable = copy.deepcopy(self.preflight)
+        args = SimpleNamespace(
+            wait_timeout=10,
+            poll_interval=0,
+            poll_max_interval=0,
+            poll_jitter=0,
+            stability_polls=2,
+            debounce_seconds=0,
+            stack_state=None,
+        )
+        state_path = self.root / "coordinator.json"
+        with (
+            mock.patch.object(
+                MODULE,
+                "agent_task_preflight",
+                side_effect=[pending, stable, stable],
+            ) as preflight,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            result = MODULE.wait_for_stable_ci_preflight(
+                args,
+                repo_root=self.root,
+                target={"repo_name": "owner/repo", "number": 7},
+                state_path=state_path,
+            )
+
+        self.assertEqual(result["check_snapshot"]["sha256"], stable["check_snapshot"]["sha256"])
+        self.assertEqual(preflight.call_count, 3)
+        self.assertEqual(
+            MODULE.load_state(state_path)["coordinator"]["status"],
+            "ready",
+        )
+
+    def test_local_coordinator_skips_a_consumed_snapshot_until_it_changes(self):
+        consumed = copy.deepcopy(self.preflight)
+        fresh = copy.deepcopy(self.preflight)
+        fresh["pr"]["head_sha"] = "9" * 40
+        fresh["check_snapshot"]["head_sha"] = "9" * 40
+        fresh["check_snapshot"]["sha256"] = "a" * 64
+        state_path = self.root / "coordinator.json"
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "coordinator": {
+                    "processed_snapshots": [
+                        {
+                            "snapshot_sha256": consumed["check_snapshot"]["sha256"],
+                            "head_sha": consumed["pr"]["head_sha"],
+                            "task_id": "task-old",
+                        }
+                    ]
+                },
+            },
+        )
+        args = SimpleNamespace(
+            wait_timeout=10,
+            poll_interval=0,
+            poll_max_interval=0,
+            poll_jitter=0,
+            stability_polls=2,
+            debounce_seconds=0,
+            stack_state=None,
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "agent_task_preflight",
+                side_effect=[consumed, consumed, fresh, fresh],
+            ) as preflight,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            result = MODULE.wait_for_stable_ci_preflight(
+                args,
+                repo_root=self.root,
+                target={"repo_name": "owner/repo", "number": 7},
+                state_path=state_path,
+            )
+
+        self.assertEqual(result["pr"]["head_sha"], "9" * 40)
+        self.assertEqual(preflight.call_count, 4)
+
+    def test_local_coordinator_records_a_bounded_wait_timeout(self):
+        state_path = self.root / "timeout.json"
+        args = SimpleNamespace(
+            wait_timeout=0,
+            poll_interval=0,
+            poll_max_interval=0,
+            poll_jitter=0,
+            stability_polls=2,
+            debounce_seconds=0,
+            stack_state=None,
+        )
+        with (
+            mock.patch.object(MODULE, "agent_task_preflight") as preflight,
+            self.assertRaisesRegex(MODULE.WorkflowError, "timed out"),
+        ):
+            MODULE.wait_for_stable_ci_preflight(
+                args,
+                repo_root=self.root,
+                target={"repo_name": "owner/repo", "number": 7},
+                state_path=state_path,
+            )
+
+        preflight.assert_not_called()
+        self.assertEqual(
+            MODULE.load_state(state_path)["coordinator"]["status"],
+            "blocked",
+        )
+
+    def test_local_coordinator_resumes_waiting_and_dispatches_each_new_snapshot_once(self):
+        first = copy.deepcopy(self.preflight)
+        second = copy.deepcopy(self.preflight)
+        second["pr"]["head_sha"] = "9" * 40
+        second["check_snapshot"]["head_sha"] = "9" * 40
+        second["check_snapshot"]["sha256"] = "a" * 64
+        repo_root = self.root / "repo"
+        repo_root.mkdir()
+        state_path = self.root / "coordinator.json"
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "created_at": MODULE.utc_now(),
+                "iterations": 0,
+                "history": [],
+            },
+        )
+        args = MODULE.build_parser().parse_args(
+            [
+                "loop",
+                "owner/repo#7",
+                "--repo-root",
+                str(repo_root),
+                "--state",
+                str(state_path),
+                "--poll-interval",
+                "0",
+                "--poll-max-interval",
+                "0",
+                "--debounce-seconds",
+                "0",
+            ]
+        )
+        dispatched = []
+
+        def run_iteration(iteration_args):
+            dispatched.append(iteration_args._preflight["check_snapshot"]["sha256"])
+            MODULE.emit(
+                {
+                    "result": "published" if len(dispatched) == 1 else "escalated",
+                    "state": str(state_path),
+                    "task": {"id": f"task-{len(dispatched)}"},
+                }
+            )
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value={"repo_name": "owner/repo", "number": 7},
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_stable_ci_preflight",
+                side_effect=[first, second],
+            ),
+            mock.patch.object(
+                MODULE, "command_agent_task", side_effect=run_iteration
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            MODULE.command_loop(args)
+
+        self.assertEqual(
+            dispatched,
+            [first["check_snapshot"]["sha256"], second["check_snapshot"]["sha256"]],
+        )
+        processed = MODULE.load_state(state_path)["coordinator"]["processed_snapshots"]
+        self.assertEqual([entry["task_id"] for entry in processed], ["task-1", "task-2"])
 
     def test_cleanup_removes_only_state_owned_agent_task_artifacts(self):
         state_path = self.root / "state.json"
@@ -7000,93 +7227,19 @@ class NativeStackCoordinatorTest(unittest.TestCase):
             saved["pending_conflict"]["detail"],
         )
 
-    def test_stack_format_resolves_a_repository_local_windows_wrapper(self):
-        stack = native_stack()
-        self.start(stack)
-        wrapper = self.root / "gradlew.bat"
-        wrapper.write_text("@echo off\r\n", encoding="utf-8")
-        resolver_state = MODULE.stack_propagation_state_path(
-            self.stack_state, 5, "lower1"
-        )
-        MODULE.save_state(
-            resolver_state,
-            {"status": "formatting", "operation": "descendant_propagation"},
-        )
-        state = MODULE.load_stack_state(self.stack_state)
-        state["pending_format"] = {
-            "fixed_pr": 5,
-            "expected_head": "lower1",
-            "resolver_state": str(resolver_state),
-            "formatting_member": {"number": 7, "branch": "middle", "index": 0},
-        }
-        MODULE.save_state(self.stack_state, state)
-        process = SimpleNamespace(
-            returncode=0,
-            stdout=json.dumps({"result": "resolved"}),
-            stderr="",
-        )
-        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
-            MODULE, "read_native_stack", return_value=stack
-        ), mock.patch.object(
-            MODULE, "conflict_resolver_script", return_value=self.resolver
-        ), mock.patch.object(MODULE, "run", return_value=process) as run:
-            result = call(
-                "stack-format",
-                "--state",
-                str(self.stack_state),
-                "--format-command",
-                "gradlew.bat",
-                "spotlessApply",
+    def test_stack_format_has_no_local_formatter_execution_path(self):
+        parser = MODULE.build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "stack-format",
+                    "--state",
+                    str(self.stack_state),
+                    "--format-command",
+                    "gradlew.bat",
+                    "spotlessApply",
+                ]
             )
-        self.assertEqual("formatted", result["result"])
-        command = run.call_args.args[0]
-        self.assertEqual(str(wrapper.resolve()), command[command.index("--format-command") + 1])
-
-    def test_stack_format_keeps_a_failed_command_retryable(self):
-        stack = native_stack()
-        self.start(stack)
-        resolver_state = MODULE.stack_propagation_state_path(
-            self.stack_state, 5, "lower1"
-        )
-        MODULE.save_state(
-            resolver_state,
-            {"status": "formatting", "operation": "descendant_propagation"},
-        )
-        state = MODULE.load_stack_state(self.stack_state)
-        state["pending_format"] = {
-            "fixed_pr": 5,
-            "expected_head": "lower1",
-            "resolver_state": str(resolver_state),
-            "formatting_member": {"number": 7, "branch": "middle", "index": 0},
-        }
-        MODULE.save_state(self.stack_state, state)
-        process = SimpleNamespace(
-            returncode=1,
-            stdout="",
-            stderr="[WinError 2] The system cannot find the file specified",
-        )
-        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
-            MODULE, "read_native_stack", return_value=stack
-        ), mock.patch.object(
-            MODULE, "conflict_resolver_script", return_value=self.resolver
-        ), mock.patch.object(MODULE, "run", return_value=process):
-            result = call(
-                "stack-format",
-                "--state",
-                str(self.stack_state),
-                "--format-command",
-                "gradlew.bat",
-                "spotlessApply",
-            )
-        self.assertEqual("format", result["result"])
-        self.assertEqual("formatter_failed", result["reason"])
-        self.assertEqual("active", MODULE.load_stack_state(self.stack_state)["status"])
-        self.assertEqual(
-            1,
-            MODULE.load_stack_state(self.stack_state)["pending_format"][
-                "format_attempts"
-            ],
-        )
 
     def test_success_without_containment_stops_instead_of_retrying_forever(self):
         stack = native_stack()
@@ -7199,31 +7352,14 @@ class NativeStackCoordinatorTest(unittest.TestCase):
             }.issubset(subparsers.choices)
         )
 
-    def test_parser_preserves_stack_formatter_option_arguments(self):
+    def test_parser_requires_an_explicit_no_format_declaration(self):
         args = run_arguments(
             "stack-format",
             "--state",
             "state.json",
-            "--format-command",
-            "--",
-            "cargo",
-            "fmt",
-            "--manifest-path",
-            "tools/http/Cargo.toml",
-            "--",
-            "--check",
+            "--no-format",
         )
-        self.assertEqual(
-            [
-                "cargo",
-                "fmt",
-                "--manifest-path",
-                "tools/http/Cargo.toml",
-                "--",
-                "--check",
-            ],
-            args.format_command,
-        )
+        self.assertTrue(args.no_format)
 
 
 class LocalValidationRecordTest(unittest.TestCase):

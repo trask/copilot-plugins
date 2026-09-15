@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import re
 import secrets
 import shutil
@@ -34,6 +35,11 @@ GH_REVIEWER_ALIAS_VERSION = (2, 88, 0)
 COPILOT_REQUEST_RETRY_DELAYS = (2, 4, 8, 16)
 STATE_VERSION = 3
 DEFAULT_MAX_ITERATIONS = 5
+DEFAULT_WATCH_TIMEOUT = 7200.0
+DEFAULT_MAX_WATCH_INTERVAL = 300.0
+DEFAULT_STABILITY_POLLS = 2
+DEFAULT_DEBOUNCE_SECONDS = 10.0
+DEFAULT_POLL_JITTER = 0.2
 STAGE_PROGRESS_PHASES = frozenset(
     {"waiting_for_review", "addressing_comments", "validating"}
 )
@@ -91,6 +97,7 @@ STAGE_OUTCOME_BY_RESULT = {
     "head_changed": "no_progress",
     "cancelled_locally": "no_progress",
     "stopped": "no_progress",
+    "timeout": "escalated",
 }
 IS_WINDOWS = os.name == "nt"
 # A pasted review or comment fragment is accepted and ignored: the queue is always
@@ -146,6 +153,18 @@ def windows_no_window_options() -> dict[str, int]:
     return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
 
 
+def subprocess_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    try:
+        count = int(environment.get("GIT_CONFIG_COUNT", "0"))
+    except ValueError as error:
+        raise WorkflowError("GIT_CONFIG_COUNT is not an integer") from error
+    environment["GIT_CONFIG_COUNT"] = str(count + 1)
+    environment[f"GIT_CONFIG_KEY_{count}"] = "core.hooksPath"
+    environment[f"GIT_CONFIG_VALUE_{count}"] = os.devnull
+    return environment
+
+
 def run(
     command: list[str],
     *,
@@ -162,6 +181,7 @@ def run(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        env=subprocess_environment(),
         **windows_no_window_options(),
     )
     if check and process.returncode != 0:
@@ -186,6 +206,7 @@ def run_bytes(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        env=subprocess_environment(),
         **windows_no_window_options(),
     )
     if check and process.returncode != 0:
@@ -2454,6 +2475,10 @@ def command_watch(args: argparse.Namespace) -> None:
         }
     )
     removal_seen_at: float | None = None
+    deadline = time.monotonic() + max(
+        0.0, float(getattr(args, "timeout", DEFAULT_WATCH_TIMEOUT))
+    )
+    poll_attempt = 0
     try:
         while True:
             state = load_state(path)
@@ -2463,13 +2488,30 @@ def command_watch(args: argparse.Namespace) -> None:
                 save_state(path, state)
                 emit(result)
                 return
+            if time.monotonic() >= deadline:
+                result = watcher_result(state, {"result": "timeout"})
+                save_state(path, state)
+                emit(result)
+                return
             pr = state["pr"]
-            pr_payload = gh_json(
-                [
-                    "api",
-                    f"repos/{pr['upstream_owner']}/{pr['upstream_repo']}/pulls/{pr['number']}",
-                ]
-            )
+            try:
+                pr_payload = gh_json(
+                    [
+                        "api",
+                        f"repos/{pr['upstream_owner']}/{pr['upstream_repo']}/pulls/{pr['number']}",
+                    ]
+                )
+            except WorkflowError as error:
+                if not is_rate_limit_error(error):
+                    raise
+                monitoring["last_rate_limit"] = {
+                    "observed_at": utc_now(),
+                    "detail": str(error),
+                }
+                save_state(path, state)
+                time.sleep(review_poll_delay(args, poll_attempt))
+                poll_attempt += 1
+                continue
             actual_head = pr_payload["head"]["sha"]
             if actual_head != monitoring["head_sha"]:
                 result = watcher_result(
@@ -2483,9 +2525,21 @@ def command_watch(args: argparse.Namespace) -> None:
                 save_state(path, state)
                 emit(result)
                 return
-            reviews = fetch_reviews(
-                pr["upstream_owner"], pr["upstream_repo"], pr["number"]
-            )
+            try:
+                reviews = fetch_reviews(
+                    pr["upstream_owner"], pr["upstream_repo"], pr["number"]
+                )
+            except WorkflowError as error:
+                if not is_rate_limit_error(error):
+                    raise
+                monitoring["last_rate_limit"] = {
+                    "observed_at": utc_now(),
+                    "detail": str(error),
+                }
+                save_state(path, state)
+                time.sleep(review_poll_delay(args, poll_attempt))
+                poll_attempt += 1
+                continue
             review = matching_review(reviews, monitoring)
             if review:
                 if str(review.get("state", "")).upper() == "DISMISSED":
@@ -2526,10 +2580,21 @@ def command_watch(args: argparse.Namespace) -> None:
                 save_state(path, state)
                 emit(result)
                 return
-
-            timeline = fetch_timeline(
-                pr["upstream_owner"], pr["upstream_repo"], pr["number"]
-            )
+            try:
+                timeline = fetch_timeline(
+                    pr["upstream_owner"], pr["upstream_repo"], pr["number"]
+                )
+            except WorkflowError as error:
+                if not is_rate_limit_error(error):
+                    raise
+                monitoring["last_rate_limit"] = {
+                    "observed_at": utc_now(),
+                    "detail": str(error),
+                }
+                save_state(path, state)
+                time.sleep(review_poll_delay(args, poll_attempt))
+                poll_attempt += 1
+                continue
             removed = any(
                 event.get("event") == "review_request_removed"
                 and event.get("created_at")
@@ -2550,7 +2615,8 @@ def command_watch(args: argparse.Namespace) -> None:
                     return
             else:
                 removal_seen_at = None
-            time.sleep(args.interval)
+            time.sleep(review_poll_delay(args, poll_attempt))
+            poll_attempt += 1
     except KeyboardInterrupt:
         state = load_state(path)
         watcher_result(state, {"result": "stopped"}, status="stopped")
@@ -3077,6 +3143,23 @@ def comment_identity(comment: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def review_snapshot_sha256(preflight: dict[str, Any]) -> str:
+    identity = {
+        "head_sha": preflight["pr"]["head_sha"],
+        "base_sha": preflight["pr"]["base_sha"],
+        "head_review_id": preflight.get("head_review_id"),
+        "comments": sorted(
+            preflight["comment_identities"],
+            key=lambda item: (
+                str(item.get("source")),
+                int(item["id"]),
+                str(item.get("thread_id")),
+            ),
+        ),
+    }
+    return sha256_text(json.dumps(identity, separators=(",", ":"), sort_keys=True))
+
+
 def agent_task_preflight(repo_root: Path, target: dict[str, Any]) -> dict[str, Any]:
     pr = metadata_for(target)
     if pr["state"] != "OPEN":
@@ -3193,7 +3276,7 @@ def expected_cloud_pull_request(preflight: dict[str, Any]) -> dict[str, Any]:
 def build_worker_prompt(
     preflight: dict[str, Any],
     *,
-    remaining_iterations: int,
+    iteration_allowance: int,
     prior_history: list[dict[str, Any]],
 ) -> str:
     pr = preflight["pr"]
@@ -3213,7 +3296,7 @@ def build_worker_prompt(
             "body_sha256": sha256_text(pr["body"]),
         },
         "viewer": preflight["viewer"],
-        "remaining_iteration_budget": remaining_iterations,
+        "iteration_allowance": iteration_allowance,
         "comments": [
             {**identity, "body": comment.get("body", "")}
             for identity, comment in zip(
@@ -3260,7 +3343,9 @@ def build_worker_prompt(
         "pull request, immutable head, and exact unresolved Copilot comments below. "
         "Investigate every comment against the repository. Make every warranted edit, "
         "including tests and related files. Run all formatters, probes, builds, tests, "
-        "and validation remotely. The local coordinator will do none of that work.\n\n"
+        "and validation remotely. The local coordinator will do none of that work. "
+        "Do not sleep, poll, watch, wait for CI, wait for another review, or start "
+        "another iteration. Produce this iteration's artifacts and exit.\n\n"
         "Put fixes in linear, single-parent commits before the final report-and-validation "
         "artifact commit. Create no empty fix commit. The final artifact commit must "
         "contain only the managed report and validation artifact. A no-code result still "
@@ -3379,6 +3464,197 @@ def wait_for_fresh_copilot_state(
     )
 
 
+def is_rate_limit_error(error: BaseException) -> bool:
+    text = str(error).casefold()
+    return (
+        "rate limit" in text
+        or "secondary rate" in text
+        or "http 429" in text
+        or "api rate limit exceeded" in text
+    )
+
+
+def review_poll_delay(args: argparse.Namespace, attempt: int) -> float:
+    base = max(
+        0.0,
+        float(getattr(args, "interval", getattr(args, "watch_interval", 30.0))),
+    )
+    maximum = max(
+        base, float(getattr(args, "max_interval", DEFAULT_MAX_WATCH_INTERVAL))
+    )
+    delay = min(maximum, base * (2 ** min(attempt, 8)))
+    jitter = max(
+        0.0, min(1.0, float(getattr(args, "poll_jitter", DEFAULT_POLL_JITTER)))
+    )
+    if delay and jitter:
+        delay *= random.uniform(1.0 - jitter, 1.0 + jitter)
+    return max(0.0, delay)
+
+
+def review_coordinator_state(path: Path) -> dict[str, Any]:
+    if path.is_file():
+        return load_state(path)
+    return {
+        "version": STATE_VERSION,
+        "created_at": utc_now(),
+        "iterations": 0,
+        "history": [],
+    }
+
+
+def processed_review_snapshot_ids(state: dict[str, Any]) -> set[str]:
+    coordinator = state.get("coordinator")
+    if not isinstance(coordinator, dict):
+        return set()
+    entries = coordinator.get("processed_snapshots")
+    if not isinstance(entries, list):
+        return set()
+    return {
+        entry["snapshot_sha256"]
+        for entry in entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("snapshot_sha256"), str)
+    }
+
+
+def update_review_coordinator(
+    path: Path,
+    *,
+    status: str,
+    preflight: dict[str, Any] | None = None,
+    snapshot_sha256: str | None = None,
+    stable_polls: int | None = None,
+    detail: str | None = None,
+) -> None:
+    state = review_coordinator_state(path)
+    coordinator = state.setdefault("coordinator", {})
+    coordinator["status"] = status
+    coordinator["observed_at"] = utc_now()
+    if preflight is not None:
+        coordinator["head_sha"] = preflight["pr"]["head_sha"]
+    if snapshot_sha256 is not None:
+        coordinator["snapshot_sha256"] = snapshot_sha256
+    if stable_polls is not None:
+        coordinator["stable_polls"] = stable_polls
+    if detail is not None:
+        coordinator["detail"] = detail
+    save_state(path, state)
+
+
+def wait_for_stable_review_preflight(
+    args: argparse.Namespace,
+    *,
+    repo_root: Path,
+    target: dict[str, Any],
+    state_path: Path,
+) -> dict[str, Any]:
+    required = max(1, int(getattr(args, "stability_polls", 1)))
+    deadline = time.monotonic() + max(
+        0.0, float(getattr(args, "wait_timeout", DEFAULT_WATCH_TIMEOUT))
+    )
+    stable_identity: str | None = None
+    stable_polls = 0
+    attempt = 0
+    while True:
+        if time.monotonic() >= deadline:
+            update_review_coordinator(
+                state_path,
+                status="blocked",
+                detail="timed out waiting for new stable Copilot feedback",
+            )
+            raise WorkflowError(
+                "local coordinator timed out waiting for new stable Copilot feedback",
+                details={"state": str(state_path), "reason": "timeout"},
+            )
+        try:
+            preflight = agent_task_preflight(repo_root, target)
+        except WorkflowError as error:
+            if not is_rate_limit_error(error):
+                raise
+            update_review_coordinator(
+                state_path,
+                status="rate_limited",
+                detail=str(error),
+            )
+            time.sleep(review_poll_delay(args, attempt))
+            attempt += 1
+            continue
+        if not preflight["comments"]:
+            return preflight
+        identity = review_snapshot_sha256(preflight)
+        state = review_coordinator_state(state_path)
+        already_processed = identity in processed_review_snapshot_ids(state)
+        if already_processed:
+            stable_identity = None
+            stable_polls = 0
+            status = "waiting_for_feedback"
+        elif identity == stable_identity:
+            stable_polls += 1
+            status = "stabilizing"
+        else:
+            stable_identity = identity
+            stable_polls = 1
+            status = "stabilizing"
+        update_review_coordinator(
+            state_path,
+            status=status,
+            preflight=preflight,
+            snapshot_sha256=identity,
+            stable_polls=stable_polls,
+            detail=(
+                "waiting for the actionable feedback set to change"
+                if already_processed
+                else "waiting for the actionable feedback set to remain stable"
+            ),
+        )
+        if not already_processed and stable_polls >= required:
+            debounce = float(getattr(args, "debounce_seconds", 0.0))
+            if debounce > 0:
+                time.sleep(debounce)
+                confirmation = agent_task_preflight(repo_root, target)
+                if review_snapshot_sha256(confirmation) != identity:
+                    stable_identity = None
+                    stable_polls = 0
+                    attempt = 0
+                    continue
+                preflight = confirmation
+            update_review_coordinator(
+                state_path,
+                status="ready",
+                preflight=preflight,
+                snapshot_sha256=identity,
+                stable_polls=stable_polls,
+            )
+            return preflight
+        time.sleep(review_poll_delay(args, attempt))
+        attempt += 1
+
+
+def record_processed_review_snapshot(
+    state: dict[str, Any],
+    preflight: dict[str, Any],
+    *,
+    task_id: str,
+) -> None:
+    coordinator = state.setdefault("coordinator", {})
+    entries = coordinator.setdefault("processed_snapshots", [])
+    identity = review_snapshot_sha256(preflight)
+    if not any(
+        isinstance(entry, dict) and entry.get("snapshot_sha256") == identity
+        for entry in entries
+    ):
+        entries.append(
+            {
+                "head_sha": preflight["pr"]["head_sha"],
+                "snapshot_sha256": identity,
+                "task_id": task_id,
+                "recorded_at": utc_now(),
+            }
+        )
+    coordinator["status"] = "waiting_for_review"
+    coordinator["observed_at"] = utc_now()
+
+
 def continue_after_review_request(
     args: argparse.Namespace,
     state_path: Path,
@@ -3388,6 +3664,11 @@ def continue_after_review_request(
             state=str(state_path),
             interval=args.watch_interval,
             cancellation_grace=args.cancellation_grace,
+            timeout=getattr(args, "wait_timeout", DEFAULT_WATCH_TIMEOUT),
+            max_interval=getattr(
+                args, "poll_max_interval", DEFAULT_MAX_WATCH_INTERVAL
+            ),
+            poll_jitter=getattr(args, "poll_jitter", DEFAULT_POLL_JITTER),
         )
     )
     state = load_state(state_path)
@@ -3487,7 +3768,41 @@ def command_agent_task(args: argparse.Namespace) -> None:
         remaining = int(task_state["remaining_iterations"])
         save_state(state_path, state)
     else:
-        preflight = agent_task_preflight(repo_root, target)
+        active = existing.get("agent_task") if isinstance(existing, dict) else None
+        if isinstance(active, dict) and active.get("status") not in {
+            "completed",
+            "consumed",
+        }:
+            raise WorkflowError(
+                "an unfinished Agent Task already owns this state; use its "
+                "recovery_command"
+            )
+        monitoring = existing.get("monitoring") if isinstance(existing, dict) else None
+        if isinstance(monitoring, dict) and monitoring.get("status") in {
+            "requested",
+            "running",
+        }:
+            watcher_pid = monitoring.get("pid")
+            if (
+                monitoring.get("status") == "running"
+                and watcher_pid != os.getpid()
+                and process_is_running(watcher_pid)
+            ):
+                raise WorkflowError(
+                    f"watcher is already running with pid {watcher_pid}"
+                )
+            monitoring["status"] = "requested"
+            monitoring.pop("pid", None)
+            save_state(state_path, existing)
+            continue_after_review_request(args, state_path)
+            return
+        preflight = wait_for_stable_review_preflight(
+            args,
+            repo_root=repo_root,
+            target=target,
+            state_path=state_path,
+        )
+        existing = load_state(state_path) if state_path.is_file() else None
         require_no_credentials(
             json.dumps(preflight, ensure_ascii=False, sort_keys=True),
             source="Agent Task preflight",
@@ -3502,15 +3817,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
             }
         else:
             state = existing
-            active = state.get("agent_task")
-            if isinstance(active, dict) and active.get("status") not in {
-                "completed",
-                "consumed",
-            }:
-                raise WorkflowError(
-                    "an unfinished Agent Task already owns this state; use its "
-                    "recovery_command"
-                )
         state["repo_root"] = str(repo_root)
         state["pr"] = pr
         state["queue"] = {
@@ -3634,9 +3940,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
         if args.resume:
             result = load_agent_task_result(result_path)
         else:
+            require_live_comments(preflight)
             prompt = build_worker_prompt(
                 preflight,
-                remaining_iterations=remaining,
+                iteration_allowance=1,
                 prior_history=state.get("history") or [],
             )
             require_no_credentials(prompt, source="Agent Task prompt")
@@ -3858,6 +4165,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
             for item in report["comments"]
         )
         charge_iteration(state)
+        record_processed_review_snapshot(
+            state,
+            preflight,
+            task_id=remote["task_id"],
+        )
         set_stage_progress(state, "waiting_for_review")
         task_state["status"] = "completed"
         task_state["completed_at"] = utc_now()
@@ -4036,6 +4348,31 @@ def build_parser() -> argparse.ArgumentParser:
     agent_task.add_argument("--pipeline-iteration", type=int)
     agent_task.add_argument("--pipeline-max-iterations", type=int)
     agent_task.add_argument("--watch-interval", type=float, default=30.0)
+    agent_task.add_argument(
+        "--poll-max-interval",
+        type=float,
+        default=DEFAULT_MAX_WATCH_INTERVAL,
+    )
+    agent_task.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=DEFAULT_WATCH_TIMEOUT,
+    )
+    agent_task.add_argument(
+        "--stability-polls",
+        type=int,
+        default=DEFAULT_STABILITY_POLLS,
+    )
+    agent_task.add_argument(
+        "--debounce-seconds",
+        type=float,
+        default=DEFAULT_DEBOUNCE_SECONDS,
+    )
+    agent_task.add_argument(
+        "--poll-jitter",
+        type=float,
+        default=DEFAULT_POLL_JITTER,
+    )
     agent_task.add_argument("--cancellation-grace", type=float, default=120.0)
     agent_task.add_argument(
         "--resume",
@@ -4151,6 +4488,9 @@ def build_parser() -> argparse.ArgumentParser:
     watch = subparsers.add_parser("watch", help="watch one requested Copilot review")
     watch.add_argument("--state", required=True)
     watch.add_argument("--interval", type=float, default=30.0)
+    watch.add_argument("--max-interval", type=float, default=DEFAULT_MAX_WATCH_INTERVAL)
+    watch.add_argument("--timeout", type=float, default=DEFAULT_WATCH_TIMEOUT)
+    watch.add_argument("--poll-jitter", type=float, default=DEFAULT_POLL_JITTER)
     watch.add_argument("--cancellation-grace", type=float, default=120.0)
     watch.set_defaults(function=command_watch)
 

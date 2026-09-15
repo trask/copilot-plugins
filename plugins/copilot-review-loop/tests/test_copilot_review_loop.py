@@ -1,4 +1,5 @@
 import argparse
+import copy
 from contextlib import ExitStack
 import importlib.util
 import ast
@@ -39,6 +40,10 @@ class WindowsSubprocessTest(unittest.TestCase):
             MODULE.run(["git"])
 
         self.assertEqual(subprocess_run.call_args.kwargs["creationflags"], 0x08000000)
+        environment = subprocess_run.call_args.kwargs["env"]
+        index = int(environment["GIT_CONFIG_COUNT"]) - 1
+        self.assertEqual(environment[f"GIT_CONFIG_KEY_{index}"], "core.hooksPath")
+        self.assertEqual(environment[f"GIT_CONFIG_VALUE_{index}"], os.devnull)
 
     def test_run_leaves_non_windows_process_options_unchanged(self):
         completed = MODULE.subprocess.CompletedProcess(["git"], 0, "", "")
@@ -1083,17 +1088,137 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_prompt_is_self_contained_versioned_and_treats_inputs_as_untrusted(self):
         prompt = MODULE.build_worker_prompt(
             self.preflight,
-            remaining_iterations=4,
+            iteration_allowance=1,
             prior_history=[],
         )
         self.assertIn("worker prompt version 2", prompt)
-        self.assertIn('"remaining_iteration_budget": 4', prompt)
+        self.assertIn('"iteration_allowance": 1', prompt)
+        self.assertIn("Do not sleep, poll, watch", prompt)
         self.assertIn('"thread_id": "PRRT_thread"', prompt)
         self.assertIn("untrusted data", prompt)
         self.assertIn("local-execution fallback", prompt)
         self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
         self.assertIn("`{{MARKETPLACE_VALIDATION_PATH}}`", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
+
+    def test_local_coordinator_waits_for_stable_actionable_feedback(self):
+        state_path = self.directory / "stable-state.json"
+        arguments = self.arguments(state_path)
+        arguments.stability_polls = 2
+        arguments.debounce_seconds = 0
+        arguments.wait_timeout = 10
+        arguments.interval = 0
+        arguments.max_interval = 0
+        arguments.poll_jitter = 0
+        with (
+            mock.patch.object(
+                MODULE,
+                "agent_task_preflight",
+                side_effect=[self.preflight, self.preflight],
+            ) as preflight,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            result = MODULE.wait_for_stable_review_preflight(
+                arguments,
+                repo_root=self.repo_root,
+                target=MODULE.parse_target("owner/repo#7"),
+                state_path=state_path,
+            )
+
+        self.assertEqual(
+            MODULE.review_snapshot_sha256(result),
+            MODULE.review_snapshot_sha256(self.preflight),
+        )
+        self.assertEqual(preflight.call_count, 2)
+        self.assertEqual(
+            MODULE.load_state(state_path)["coordinator"]["status"],
+            "ready",
+        )
+
+    def test_local_coordinator_does_not_redispatch_a_consumed_feedback_snapshot(self):
+        state_path = self.directory / "deduplicated-state.json"
+        consumed_id = MODULE.review_snapshot_sha256(self.preflight)
+        fresh = copy.deepcopy(self.preflight)
+        fresh["head_review_id"] = 9002
+        fresh["comments"][0]["id"] = 18
+        fresh["comment_identities"] = [
+            MODULE.comment_identity(fresh["comments"][0])
+        ]
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "coordinator": {
+                    "processed_snapshots": [
+                        {
+                            "snapshot_sha256": consumed_id,
+                            "head_sha": self.head,
+                            "task_id": "task-old",
+                        }
+                    ]
+                },
+            },
+        )
+        arguments = self.arguments(state_path)
+        arguments.stability_polls = 2
+        arguments.debounce_seconds = 0
+        arguments.wait_timeout = 10
+        arguments.interval = 0
+        arguments.max_interval = 0
+        arguments.poll_jitter = 0
+        with (
+            mock.patch.object(
+                MODULE,
+                "agent_task_preflight",
+                side_effect=[self.preflight, self.preflight, fresh, fresh],
+            ) as preflight,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            result = MODULE.wait_for_stable_review_preflight(
+                arguments,
+                repo_root=self.repo_root,
+                target=MODULE.parse_target("owner/repo#7"),
+                state_path=state_path,
+            )
+
+        self.assertEqual(result["comment_identities"][0]["id"], 18)
+        self.assertEqual(preflight.call_count, 4)
+
+    def test_restart_resumes_the_existing_review_request_without_a_new_task(self):
+        state_path = self.directory / "requested-state.json"
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "created_at": MODULE.utc_now(),
+                "iterations": 1,
+                "history": [],
+                "monitoring": {
+                    "status": "requested",
+                    "head_sha": self.head,
+                    "baseline_review_id": 10,
+                },
+            },
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE, "continue_after_review_request"
+            ) as continuation,
+            mock.patch.object(MODULE, "agent_task_preflight") as preflight,
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+        ):
+            MODULE.command_agent_task(self.arguments(state_path))
+
+        continuation.assert_called_once()
+        preflight.assert_not_called()
+        discover.assert_not_called()
 
     def test_validates_success_and_no_op_receipts(self):
         remote = self.remote()
@@ -1468,6 +1593,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(state["iterations"], 1)
         self.assertEqual(state["agent_task"]["status"], "completed")
         self.assertTrue(state["agent_task"]["artifacts_removed"])
+        self.assertEqual(
+            state["coordinator"]["processed_snapshots"][0]["task_id"],
+            "task-1",
+        )
 
     def test_task_error_keeps_artifacts_without_redispatching(self):
         state_path = self.directory / "resume-state.json"
@@ -1498,6 +1627,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
             mock.patch.object(
                 MODULE, "local_identity", return_value=self.preflight["identity"]
+            ),
+            mock.patch.object(
+                MODULE, "require_live_comments", return_value=[self.comment]
             ),
             mock.patch.object(MODULE.secrets, "token_hex", return_value="run-1"),
         )
@@ -4347,6 +4479,43 @@ class CopilotReviewTest(unittest.TestCase):
         ]
 
         self.assertEqual(MODULE.matching_review(reviews, monitoring)["id"], 101)
+
+    def test_watch_records_a_bounded_timeout(self):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "pr": {"upstream_owner": "owner", "upstream_repo": "repo", "number": 7},
+            "monitoring": {
+                "status": "requested",
+                "head_sha": "abc123",
+                "baseline_review_id": 100,
+                "copilot_bot_id": "BOT_1",
+                "request_start": "2026-05-01T12:00:00Z",
+                "cancel_requested": False,
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(path, state)
+            args = SimpleNamespace(
+                state=str(path),
+                interval=0,
+                max_interval=0,
+                timeout=1,
+                poll_jitter=0,
+                cancellation_grace=0,
+            )
+            with (
+                mock.patch.object(MODULE.time, "monotonic", side_effect=[0, 2]),
+                mock.patch.object(MODULE, "gh_json") as gh_json,
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_watch(args)
+
+            saved = MODULE.load_state(path)
+
+        gh_json.assert_not_called()
+        self.assertEqual(saved["monitoring"]["result"], {"result": "timeout"})
+        self.assertEqual(emit.call_args_list[-1].args[0], {"result": "timeout"})
 
     def test_tolerates_github_timestamp_precision(self):
         monitoring = {

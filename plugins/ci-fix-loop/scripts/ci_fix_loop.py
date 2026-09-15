@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import re
 import secrets
 import shutil
@@ -26,7 +27,6 @@ import uuid
 
 
 STATE_VERSION = 1
-FORMAT_COMMAND_ARGUMENT = "--format-command"
 STACK_STATE_KIND = "native_stack"
 STACK_ENTRIES_PAGE = 100
 DEFAULT_MAX_ITERATIONS = 5
@@ -35,6 +35,12 @@ DEFAULT_POLL_INTERVAL = 60
 DEFAULT_POLL_TIMEOUT = 300
 DEFAULT_NOT_STARTED_GRACE = 900
 DEFAULT_AUTO_RETRY_TIMEOUT = 600
+DEFAULT_COORDINATOR_POLL_INTERVAL = 15.0
+DEFAULT_COORDINATOR_MAX_POLL_INTERVAL = 300.0
+DEFAULT_COORDINATOR_WAIT_TIMEOUT = 7200.0
+DEFAULT_COORDINATOR_STABILITY_POLLS = 2
+DEFAULT_COORDINATOR_DEBOUNCE_SECONDS = 10.0
+DEFAULT_COORDINATOR_JITTER = 0.2
 MAX_RERUNS_PER_CHECK = 1
 PR_HEAD_LAG_RETRY_DELAY = 1
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
@@ -102,27 +108,6 @@ RERUN_PERMISSION_PATTERNS = (
     ),
 )
 
-
-class FormatterPassthroughArgumentParser(argparse.ArgumentParser):
-    def parse_args(
-        self,
-        args: list[str] | None = None,
-        namespace: argparse.Namespace | None = None,
-    ) -> argparse.Namespace:
-        arguments = list(sys.argv[1:] if args is None else args)
-        format_command = None
-        if arguments[:1] == ["stack-format"] and FORMAT_COMMAND_ARGUMENT in arguments:
-            marker = arguments.index(FORMAT_COMMAND_ARGUMENT)
-            format_command = arguments[marker + 1 :]
-            if format_command[:1] == ["--"]:
-                format_command.pop(0)
-            if not format_command:
-                self.error(f"{FORMAT_COMMAND_ARGUMENT} requires a formatter executable")
-            arguments = arguments[: marker + 1] + ["formatter-command"]
-        parsed = super().parse_args(arguments, namespace)
-        if format_command is not None:
-            parsed.format_command = format_command
-        return parsed
 
 # One classified vocabulary for every check, whatever GitHub calls it. Anything
 # this loop does not recognize becomes "unknown", which escalates rather than
@@ -336,6 +321,18 @@ def windows_no_window_options() -> dict[str, int]:
     return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
 
 
+def subprocess_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
+    environment = {**os.environ, **(extra or {})}
+    try:
+        count = int(environment.get("GIT_CONFIG_COUNT", "0"))
+    except ValueError as error:
+        raise WorkflowError("GIT_CONFIG_COUNT is not an integer") from error
+    environment["GIT_CONFIG_COUNT"] = str(count + 1)
+    environment[f"GIT_CONFIG_KEY_{count}"] = "core.hooksPath"
+    environment[f"GIT_CONFIG_VALUE_{count}"] = os.devnull
+    return environment
+
+
 def run(
     command: list[str],
     *,
@@ -353,7 +350,7 @@ def run(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
-        env=None if env is None else {**os.environ, **env},
+        env=subprocess_environment(env),
         **windows_no_window_options(),
     )
     if check and process.returncode != 0:
@@ -378,6 +375,7 @@ def run_bytes(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        env=subprocess_environment(),
         **windows_no_window_options(),
     )
     if check and process.returncode != 0:
@@ -403,8 +401,31 @@ def git_z_paths(repo_root: Path, *arguments: str) -> list[str]:
     return [os.fsdecode(path) for path in output.split(b"\0") if path]
 
 
+_EMIT_CAPTURE: list[dict[str, Any]] | None = None
+
+
 def emit(payload: dict[str, Any]) -> None:
+    if _EMIT_CAPTURE is not None:
+        _EMIT_CAPTURE.append(payload)
+        return
     print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
+
+
+def capture_command(
+    function: Any, args: argparse.Namespace
+) -> list[dict[str, Any]]:
+    global _EMIT_CAPTURE
+    if _EMIT_CAPTURE is not None:
+        raise WorkflowError("cannot nest coordinator command capture")
+    captured: list[dict[str, Any]] = []
+    _EMIT_CAPTURE = captured
+    try:
+        function(args)
+    finally:
+        _EMIT_CAPTURE = None
+    if not captured:
+        raise WorkflowError("coordinator subcommand returned no result")
+    return captured
 
 
 def gh_json(arguments: list[str]) -> Any:
@@ -1250,26 +1271,6 @@ def conflict_resolver_script() -> Path:
         / "scripts"
         / "pr_conflict_resolver.py"
     )
-
-
-def resolve_formatter_command(
-    repo_root: Path, command: list[str]
-) -> list[str]:
-    if not command:
-        raise WorkflowError("the formatter command is empty")
-    executable = Path(command[0])
-    if executable.is_absolute():
-        return list(command)
-    candidates = [repo_root / executable]
-    if IS_WINDOWS and not executable.suffix:
-        candidates.extend(
-            repo_root / f"{executable}{suffix}"
-            for suffix in (".bat", ".cmd", ".exe")
-        )
-    for candidate in candidates:
-        if candidate.is_file():
-            return [str(candidate.resolve()), *command[1:]]
-    return list(command)
 
 
 def changed_files_for(pr: dict[str, Any]) -> list[str]:
@@ -4464,7 +4465,10 @@ def agent_task_preflight(
         ),
     )
     failing_keys = (
-        list(decision["checks"]) if decision["decision"] == "failures" else []
+        list(decision["checks"])
+        if decision["decision"] == "failures"
+        and not decision.get("pending_checks")
+        else []
     )
     baseline = baseline_conclusions(pr, pr["base_sha"]) if failing_keys else {}
     by_key = {check["key"]: check for check in checks}
@@ -4596,7 +4600,8 @@ def build_worker_prompt(
         "only the supplied failing-check snapshot. Perform every repository read, "
         "search, edit, build, test, probe, formatting step, and validation yourself. "
         "The local coordinator will not inspect repository content or run a command "
-        "for you. Use the failing logs and digests below, then inspect the repository "
+        "for you. Do not sleep, poll, watch, wait for CI, wait for reviews, or start "
+        "another iteration. Use the failing logs and digests below, then inspect the repository "
         "as needed to distinguish pull-request failures, pre-existing failures, and "
         "flakes. Fix only failures caused by this pull request. Never weaken, skip, "
         "delete, or disable a check or test.\n\n"
@@ -5249,11 +5254,14 @@ def command_agent_task(args: argparse.Namespace) -> None:
             task_state["recovery_task_id"] = recovery_task_id
             save_state(state_path, state)
     else:
-        preflight = agent_task_preflight(
+        supplied_preflight = getattr(args, "_preflight", None)
+        preflight = supplied_preflight or agent_task_preflight(
             repo_root,
             target,
             stack_state=cli_path(args.stack_state) if args.stack_state else None,
         )
+        if supplied_preflight is not None:
+            require_live_check_snapshot(preflight)
         pr = preflight["pr"]
         if existing is None:
             state = {
@@ -5371,6 +5379,22 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     "reason": decision["reason"],
                     "detail": decision["detail"],
                     "head_sha": pr["head_sha"],
+                }
+            )
+            return
+        if decision.get("pending_checks"):
+            save_state(state_path, state)
+            emit(
+                {
+                    "result": "waiting",
+                    "state": str(state_path),
+                    "reason": "checks_running",
+                    "detail": (
+                        "the failing-check set is not actionable until every "
+                        "current-head check is terminal"
+                    ),
+                    "head_sha": pr["head_sha"],
+                    "pending_checks": decision["pending_checks"],
                 }
             )
             return
@@ -5521,7 +5545,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     }
                 )
             raise
-
     try:
         result = load_agent_task_result(result_path)
         if result.get("status") != "success":
@@ -5860,6 +5883,266 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     }
                 )
         raise
+
+
+def coordinator_delay(args: argparse.Namespace, attempt: int) -> float:
+    base = max(0.0, float(args.poll_interval))
+    maximum = max(base, float(args.poll_max_interval))
+    delay = min(maximum, base * (2 ** min(attempt, 8)))
+    jitter = max(0.0, min(1.0, float(args.poll_jitter)))
+    if delay and jitter:
+        delay *= random.uniform(1.0 - jitter, 1.0 + jitter)
+    return max(0.0, delay)
+
+
+def is_rate_limit_error(error: BaseException) -> bool:
+    text = str(error).casefold()
+    return (
+        "rate limit" in text
+        or "secondary rate" in text
+        or "http 429" in text
+        or "api rate limit exceeded" in text
+    )
+
+
+def coordinator_file_state(path: Path) -> dict[str, Any]:
+    if path.is_file():
+        return load_state(path)
+    return {
+        "version": STATE_VERSION,
+        "created_at": utc_now(),
+        "iterations": 0,
+        "history": [],
+        "reruns": {},
+        "escalation": None,
+    }
+
+
+def update_coordinator_state(
+    path: Path,
+    *,
+    status: str,
+    head_sha: str | None = None,
+    snapshot_sha256: str | None = None,
+    stable_polls: int | None = None,
+    detail: str | None = None,
+) -> dict[str, Any]:
+    state = coordinator_file_state(path)
+    coordinator = state.setdefault("coordinator", {})
+    coordinator["status"] = status
+    coordinator["observed_at"] = utc_now()
+    if head_sha is not None:
+        coordinator["head_sha"] = head_sha
+    if snapshot_sha256 is not None:
+        coordinator["snapshot_sha256"] = snapshot_sha256
+    if stable_polls is not None:
+        coordinator["stable_polls"] = stable_polls
+    if detail is not None:
+        coordinator["detail"] = detail
+    save_state(path, state)
+    return state
+
+
+def processed_ci_snapshot_ids(state: dict[str, Any]) -> set[str]:
+    coordinator = state.get("coordinator")
+    if not isinstance(coordinator, dict):
+        return set()
+    entries = coordinator.get("processed_snapshots")
+    if not isinstance(entries, list):
+        return set()
+    return {
+        entry["snapshot_sha256"]
+        for entry in entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("snapshot_sha256"), str)
+    }
+
+
+def ci_preflight_is_stable_candidate(preflight: dict[str, Any]) -> bool:
+    decision = preflight["check_snapshot"]["decision"]
+    if decision["decision"] == "failures":
+        return not decision.get("pending_checks")
+    return decision["decision"] in {"green", "no_checks", "escalate"}
+
+
+def wait_for_stable_ci_preflight(
+    args: argparse.Namespace,
+    *,
+    repo_root: Path,
+    target: dict[str, Any],
+    state_path: Path,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + max(0.0, float(args.wait_timeout))
+    stable_identity: str | None = None
+    stable_polls = 0
+    attempt = 0
+    required_stability = max(1, int(args.stability_polls))
+    while True:
+        if time.monotonic() >= deadline:
+            update_coordinator_state(
+                state_path,
+                status="blocked",
+                detail="timed out waiting for a stable terminal CI check set",
+            )
+            raise WorkflowError(
+                "local coordinator timed out waiting for a stable terminal CI check set",
+                details={"state": str(state_path), "reason": "timeout"},
+            )
+        try:
+            preflight = agent_task_preflight(
+                repo_root,
+                target,
+                stack_state=(
+                    cli_path(args.stack_state) if args.stack_state else None
+                ),
+            )
+        except WorkflowError as error:
+            if not is_rate_limit_error(error):
+                raise
+            update_coordinator_state(
+                state_path,
+                status="rate_limited",
+                detail=str(error),
+            )
+            time.sleep(coordinator_delay(args, attempt))
+            attempt += 1
+            continue
+
+        snapshot = preflight["check_snapshot"]
+        identity = snapshot["sha256"]
+        decision = snapshot["decision"]
+        state = coordinator_file_state(state_path)
+        already_processed = identity in processed_ci_snapshot_ids(state)
+        candidate = ci_preflight_is_stable_candidate(preflight) and not (
+            decision["decision"] == "failures" and already_processed
+        )
+        if candidate and identity == stable_identity:
+            stable_polls += 1
+        elif candidate:
+            stable_identity = identity
+            stable_polls = 1
+        else:
+            stable_identity = None
+            stable_polls = 0
+        status = (
+            "stabilizing"
+            if candidate
+            else "waiting_for_change"
+            if already_processed
+            else "waiting_for_checks"
+        )
+        update_coordinator_state(
+            state_path,
+            status=status,
+            head_sha=snapshot["head_sha"],
+            snapshot_sha256=identity,
+            stable_polls=stable_polls,
+            detail=decision["detail"],
+        )
+        if candidate and stable_polls >= required_stability:
+            if float(args.debounce_seconds) > 0:
+                time.sleep(float(args.debounce_seconds))
+                confirmation = agent_task_preflight(
+                    repo_root,
+                    target,
+                    stack_state=(
+                        cli_path(args.stack_state) if args.stack_state else None
+                    ),
+                )
+                if confirmation["check_snapshot"]["sha256"] != identity:
+                    stable_identity = None
+                    stable_polls = 0
+                    attempt = 0
+                    continue
+                preflight = confirmation
+            update_coordinator_state(
+                state_path,
+                status="ready",
+                head_sha=snapshot["head_sha"],
+                snapshot_sha256=identity,
+                stable_polls=stable_polls,
+                detail=decision["detail"],
+            )
+            return preflight
+        time.sleep(coordinator_delay(args, attempt))
+        attempt += 1
+
+
+def record_processed_ci_snapshot(
+    state_path: Path,
+    preflight: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    state = load_state(state_path)
+    coordinator = state.setdefault("coordinator", {})
+    entries = coordinator.setdefault("processed_snapshots", [])
+    identity = preflight["check_snapshot"]["sha256"]
+    if not any(
+        isinstance(entry, dict) and entry.get("snapshot_sha256") == identity
+        for entry in entries
+    ):
+        task = result.get("task") if isinstance(result.get("task"), dict) else {}
+        entries.append(
+            {
+                "head_sha": preflight["pr"]["head_sha"],
+                "snapshot_sha256": identity,
+                "task_id": task.get("id"),
+                "result": result["result"],
+                "recorded_at": utc_now(),
+            }
+        )
+    coordinator["status"] = "waiting_for_checks"
+    coordinator["observed_at"] = utc_now()
+    save_state(state_path, state)
+
+
+def command_loop(args: argparse.Namespace) -> None:
+    require_tools()
+    repo_root = resolve_repo_root(args.repo_root)
+    target = resolve_target(args.target, repo_root)
+    state_path = cli_path(args.state) if args.state else default_state_path(target)
+    require_outside_repository(state_path, repo_root)
+    try:
+        while True:
+            preflight = wait_for_stable_ci_preflight(
+                args,
+                repo_root=repo_root,
+                target=target,
+                state_path=state_path,
+            )
+            iteration_args = argparse.Namespace(**vars(args))
+            iteration_args._preflight = preflight
+            results = capture_command(command_agent_task, iteration_args)
+            result = results[-1]
+            task = result.get("task")
+            if isinstance(task, dict) and isinstance(task.get("id"), str):
+                record_processed_ci_snapshot(state_path, preflight, result)
+            if result["result"] == "published":
+                if args.stack_state:
+                    emit(result)
+                    return
+                continue
+            if result["result"] == "rerun":
+                for check_key in result.get("action_checks") or []:
+                    capture_command(
+                        command_rerun,
+                        argparse.Namespace(state=str(state_path), check=check_key),
+                    )
+                continue
+            if result["result"] in {"waiting", "snapshot_already_processed"}:
+                continue
+            emit(result)
+            return
+    except KeyboardInterrupt as error:
+        update_coordinator_state(
+            state_path,
+            status="cancelled",
+            detail="local coordinator was cancelled",
+        )
+        raise WorkflowError(
+            "local coordinator was cancelled",
+            details={"state": str(state_path), "reason": "cancelled"},
+        ) from error
 
 
 def load_stack_state(path: Path) -> dict[str, Any]:
@@ -7165,13 +7448,12 @@ def command_stack_format(args: argparse.Namespace) -> None:
             member=fixed_pr,
         )
         return
-    if args.no_format:
-        format_arguments = ["--no-format"]
-    else:
-        format_command = resolve_formatter_command(
-            Path(state["repo_root"]), args.format_command or []
+    if not args.no_format:
+        raise WorkflowError(
+            "local formatter execution is disabled; use a hosted worker or pass "
+            "--no-format only when the repository requires no formatting"
         )
-        format_arguments = ["--format-command", *format_command]
+    format_arguments = ["--no-format"]
 
     def retryable_format_failure(detail: str) -> None:
         pending["last_error"] = detail
@@ -7548,7 +7830,7 @@ def command_cleanup(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = FormatterPassthroughArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     agent_task = subparsers.add_parser(
@@ -7588,6 +7870,69 @@ def build_parser() -> argparse.ArgumentParser:
         help="continue the same task import or retry it with --input-result-file",
     )
     agent_task.set_defaults(function=command_agent_task)
+
+    loop = subparsers.add_parser(
+        "loop",
+        help="wait locally and dispatch one managed task per stable failing snapshot",
+    )
+    loop.add_argument(
+        "target",
+        nargs="?",
+        help=(
+            "PR URL or owner/repo#number; omit only from a worktree "
+            "attached to the PR's branch"
+        ),
+    )
+    loop.add_argument("--repo-root")
+    loop.add_argument("--state")
+    loop.add_argument("--stack-state")
+    loop.add_argument(
+        "--model",
+        choices=sorted(MODEL_ALIASES),
+        default="sol",
+    )
+    loop.add_argument(
+        "--max-iterations",
+        type=int,
+        default=DEFAULT_MAX_ITERATIONS,
+    )
+    loop_invocation = loop.add_mutually_exclusive_group()
+    loop_invocation.add_argument("--new-invocation", action="store_true")
+    loop_invocation.add_argument("--invocation-run")
+    loop.add_argument("--pipeline-run")
+    loop.add_argument("--pipeline-iteration", type=int)
+    loop.add_argument("--pipeline-max-iterations", type=int)
+    loop.add_argument(
+        "--poll-interval",
+        type=float,
+        default=DEFAULT_COORDINATOR_POLL_INTERVAL,
+    )
+    loop.add_argument(
+        "--poll-max-interval",
+        type=float,
+        default=DEFAULT_COORDINATOR_MAX_POLL_INTERVAL,
+    )
+    loop.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=DEFAULT_COORDINATOR_WAIT_TIMEOUT,
+    )
+    loop.add_argument(
+        "--stability-polls",
+        type=int,
+        default=DEFAULT_COORDINATOR_STABILITY_POLLS,
+    )
+    loop.add_argument(
+        "--debounce-seconds",
+        type=float,
+        default=DEFAULT_COORDINATOR_DEBOUNCE_SECONDS,
+    )
+    loop.add_argument(
+        "--poll-jitter",
+        type=float,
+        default=DEFAULT_COORDINATOR_JITTER,
+    )
+    loop.set_defaults(resume=False, function=command_loop)
 
     stack_start = subparsers.add_parser(
         "stack-start",
@@ -7636,23 +7981,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     stack_format = subparsers.add_parser(
         "stack-format",
-        help="run the repository formatter for a pending propagated stack layer",
+        help="continue a propagated stack layer that requires no formatting",
     )
     stack_format.add_argument("--state", required=True)
-    format_choice = stack_format.add_mutually_exclusive_group(required=True)
-    format_choice.add_argument(
-        "--format-command",
-        nargs="+",
-        help=(
-            "formatter executable and arguments, run in the propagation workspace; "
-            "this must be the last helper option because all remaining arguments "
-            "are passed through"
-        ),
-    )
-    format_choice.add_argument(
+    stack_format.add_argument(
         "--no-format",
         action="store_true",
-        help="record that this repository has no formatting step for this layer",
+        required=True,
+        help="continue only when this repository has no formatting step for this layer",
     )
     stack_format.set_defaults(function=command_stack_format)
 
@@ -7859,7 +8195,8 @@ def main() -> int:
         args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:
-        emit({"result": "error", "error": str(error)})
+        details = error.details if isinstance(error, WorkflowError) else {}
+        emit({"result": "error", "error": str(error), **details})
         return 1
 
 
