@@ -1182,6 +1182,34 @@ class ManagedCoordinatorTest(unittest.TestCase):
             }
         )
 
+    def test_worker_prompt_requires_artifact_commit_for_no_findings(self):
+        prompt = MODULE.build_worker_prompt(
+            self.pr,
+            {"login": "viewer"},
+            "gpt-5.6-sol",
+            ["src/one.py", "docs/two.md"],
+        )
+
+        self.assertEqual(MODULE.WORKER_PROMPT_VERSION, 2)
+        self.assertIn(
+            "Completing the review always requires repository artifacts on the "
+            "generated task branch.",
+            prompt,
+        )
+        self.assertIn(
+            "create the exact final commit required by the marketplace policy footer",
+            prompt,
+        )
+        self.assertIn("even when the candidates array is empty", prompt)
+        self.assertIn(
+            "A chat response without the committed artifacts is a failed task",
+            prompt,
+        )
+        self.assertIn(
+            "These artifacts are the only repository changes you may make",
+            prompt,
+        )
+
     def test_validates_success_and_no_findings_reports(self):
         result = self.result()
         remote = MODULE.validate_success_result(
