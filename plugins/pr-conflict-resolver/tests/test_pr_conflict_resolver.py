@@ -877,10 +877,6 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
 
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
-            MODULE.REQUIRED_CONFIG_COMMIT,
-            "fa29f3db620bcf2b17797f548ee9a149c696029f",
-        )
-        self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
             "3f9807c392bb31dc3ddcfe74d367b620f417dffc00b1904c78415da43c8b9ad9",
         )
@@ -941,40 +937,6 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             ("run-1", 2, 5),
         )
         self.assertTrue(parsed.whole_stack)
-
-    def test_discovers_only_the_exact_managed_conflict_helper(self):
-        home = temporary_directory(self)
-        helper = home / MODULE.CONFLICT_TASK_RELATIVE_PATH
-        helper.parent.mkdir(parents=True)
-        helper.write_text("helper", encoding="utf-8")
-        manifest = {
-            "version": MODULE.CONFIG_MANIFEST_VERSION,
-            "source": {
-                "path": "C:/source",
-                "commit": MODULE.REQUIRED_CONFIG_COMMIT,
-                "dirty": False,
-            },
-            "entries": [MODULE.CONFLICT_TASK_MANAGED_ENTRY],
-            "contents": {
-                MODULE.CONFLICT_TASK_MANAGED_ENTRY: {
-                    "scripts/cloud_conflict_task.py": (
-                        MODULE.REQUIRED_CONFLICT_TASK_SHA256
-                    )
-                }
-            },
-        }
-        (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
-            json.dumps(manifest), encoding="utf-8"
-        )
-        with (
-            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
-            mock.patch.object(
-                MODULE,
-                "sha256_file",
-                return_value=MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            ),
-        ):
-            self.assertEqual(MODULE.discover_conflict_task(), helper.resolve())
 
     def test_rejects_malformed_or_failed_validation(self):
         bad_values = [

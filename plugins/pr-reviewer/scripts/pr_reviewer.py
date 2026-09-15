@@ -39,14 +39,10 @@ COPILOT_LOGINS = {
     "copilot-pull-request-reviewer[bot]",
 }
 IS_WINDOWS = os.name == "nt"
-CONFIG_MANIFEST_VERSION = 3
-CONFIG_MANIFEST_NAME = ".copilot-config-manifest.json"
-REQUIRED_CONFIG_COMMIT = "e67d61da91c514eeea12179997aa4f35d3d737da"
 REQUIRED_CLOUD_TASK_SHA256 = (
     "fa57bff76e2e2854d1bd73ea77a761e9e14ebcd89b89a7d90e91c6d28c73ff5f"
 )
-CLOUD_TASK_MANAGED_ENTRY = "skills/cloud"
-CLOUD_TASK_RELATIVE_PATH = Path("skills/cloud/scripts/cloud_task.py")
+CLOUD_TASK_FILENAME = "cloud_task.py"
 AGENT_TASK_POLICY = "marketplace-agent-worker@1"
 AGENT_TASK_POLICY_IDENTITY = {
     "id": "marketplace-agent-worker",
@@ -135,7 +131,7 @@ def sha256_file(path: Path) -> str:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
     except OSError as error:
-        raise WorkflowError(f"could not read managed helper {path}: {error}") from error
+        raise WorkflowError(f"could not read bundled helper {path}: {error}") from error
     return digest.hexdigest()
 
 
@@ -192,42 +188,16 @@ def copilot_home() -> Path:
 
 
 def discover_cloud_task() -> Path:
-    home = copilot_home().resolve()
-    manifest = load_json_object(
-        home / CONFIG_MANIFEST_NAME,
-        description="managed Copilot configuration manifest",
-    )
-    source = manifest.get("source")
-    contents = manifest.get("contents")
-    helper_contents = (
-        contents.get(CLOUD_TASK_MANAGED_ENTRY)
-        if isinstance(contents, dict)
-        else None
-    )
-    source_path = source.get("path") if isinstance(source, dict) else None
+    helper = Path(__file__).resolve().with_name(CLOUD_TASK_FILENAME)
     if (
-        manifest.get("version") != CONFIG_MANIFEST_VERSION
-        or not isinstance(manifest.get("entries"), list)
-        or CLOUD_TASK_MANAGED_ENTRY not in manifest["entries"]
-        or not isinstance(source_path, str)
-        or not Path(source_path).is_absolute()
-        or source.get("commit") != REQUIRED_CONFIG_COMMIT
-        or source.get("dirty") is not False
-        or not isinstance(helper_contents, dict)
-        or helper_contents.get("scripts/cloud_task.py")
-        != REQUIRED_CLOUD_TASK_SHA256
+        helper.is_symlink()
+        or not helper.is_file()
+        or sha256_file(helper) != REQUIRED_CLOUD_TASK_SHA256
     ):
         raise WorkflowError(
-            "the managed cloud helper is missing or too old; sync copilot-config "
-            f"commit {REQUIRED_CONFIG_COMMIT}"
+            "the bundled Agent Tasks helper is missing or failed integrity validation"
         )
-    helper = home / CLOUD_TASK_RELATIVE_PATH
-    if not helper.is_file() or sha256_file(helper) != REQUIRED_CLOUD_TASK_SHA256:
-        raise WorkflowError(
-            "the installed managed cloud helper is missing or does not match "
-            f"copilot-config commit {REQUIRED_CONFIG_COMMIT}; sync Copilot configuration"
-        )
-    return helper.resolve()
+    return helper
 
 
 def atomic_write_text(path: Path, value: str) -> None:

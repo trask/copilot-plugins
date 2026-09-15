@@ -1112,7 +1112,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.0", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.1", json.loads(PLUGIN.read_text())["version"])
 
     def test_prompt_pins_snapshot_allowance_model_policy_and_worker_boundary(self):
         prompt = MODULE.build_worker_prompt(
@@ -1143,45 +1143,6 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertEqual("focused failure log\n", content)
         self.assertIn("--job", run.call_args.args[0])
         self.assertIn("2", run.call_args.args[0])
-
-    def test_discovers_only_the_pinned_managed_helper(self):
-        home = self.root / ".copilot"
-        helper = home / MODULE.CLOUD_TASK_RELATIVE_PATH
-        helper.parent.mkdir(parents=True)
-        helper.write_text("# helper\n", encoding="utf-8")
-        manifest = {
-            "version": MODULE.CONFIG_MANIFEST_VERSION,
-            "source": {
-                "path": str(self.root.resolve()),
-                "commit": MODULE.REQUIRED_CONFIG_COMMIT,
-                "dirty": False,
-            },
-            "entries": [MODULE.CLOUD_TASK_MANAGED_ENTRY],
-            "contents": {
-                MODULE.CLOUD_TASK_MANAGED_ENTRY: {
-                    "scripts/cloud_task.py": MODULE.REQUIRED_CLOUD_TASK_SHA256
-                }
-            },
-        }
-        (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
-            json.dumps(manifest), encoding="utf-8"
-        )
-        with (
-            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
-            mock.patch.object(
-                MODULE, "sha256_file", return_value=MODULE.REQUIRED_CLOUD_TASK_SHA256
-            ),
-        ):
-            self.assertEqual(helper.resolve(), MODULE.discover_cloud_task())
-        manifest["source"]["commit"] = "0" * 40
-        (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
-            json.dumps(manifest), encoding="utf-8"
-        )
-        with (
-            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
-            self.assertRaises(MODULE.WorkflowError),
-        ):
-            MODULE.discover_cloud_task()
 
     def test_accepts_noop_and_complete_relevant_validation(self):
         remote = self.remote()

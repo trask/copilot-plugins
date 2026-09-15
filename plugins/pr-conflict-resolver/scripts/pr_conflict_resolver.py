@@ -70,16 +70,10 @@ ESCALATION_KINDS = (
 STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
-CONFIG_MANIFEST_VERSION = 3
-CONFIG_MANIFEST_NAME = ".copilot-config-manifest.json"
-REQUIRED_CONFIG_COMMIT = "fa29f3db620bcf2b17797f548ee9a149c696029f"
 REQUIRED_CONFLICT_TASK_SHA256 = (
     "3f9807c392bb31dc3ddcfe74d367b620f417dffc00b1904c78415da43c8b9ad9"
 )
-CONFLICT_TASK_MANAGED_ENTRY = "skills/cloud-conflict"
-CONFLICT_TASK_RELATIVE_PATH = Path(
-    "skills/cloud-conflict/scripts/cloud_conflict_task.py"
-)
+CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@1"
 CONFLICT_POLICY_SHA256 = (
     "7fcb65dff47f5dc76f790f999de202e28692c5207dba7d3ff007145a327e6c67"
@@ -6808,7 +6802,7 @@ def sha256_file(path: Path) -> str:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
     except OSError as error:
-        raise WorkflowError(f"could not read managed helper {path}: {error}") from error
+        raise WorkflowError(f"could not read bundled helper {path}: {error}") from error
     return digest.hexdigest()
 
 
@@ -6845,56 +6839,18 @@ def require_no_credentials(value: str, *, source: str) -> None:
         raise WorkflowError(f"{source} appears to contain credentials")
 
 
-def copilot_home() -> Path:
-    configured = os.environ.get("COPILOT_HOME")
-    return cli_path(configured) if configured else Path.home() / ".copilot"
-
-
 def discover_conflict_task() -> Path:
-    home = copilot_home().resolve()
-    manifest_path = home / CONFIG_MANIFEST_NAME
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise WorkflowError(
-            f"could not read managed Copilot configuration manifest: {error}"
-        ) from error
-    source = manifest.get("source") if isinstance(manifest, dict) else None
-    contents = manifest.get("contents") if isinstance(manifest, dict) else None
-    entry_contents = (
-        contents.get(CONFLICT_TASK_MANAGED_ENTRY)
-        if isinstance(contents, dict)
-        else None
-    )
-    recorded_hash = (
-        entry_contents.get("scripts/cloud_conflict_task.py")
-        if isinstance(entry_contents, dict)
-        else None
-    )
+    helper = Path(__file__).resolve().with_name(CONFLICT_TASK_FILENAME)
     if (
-        not isinstance(manifest, dict)
-        or manifest.get("version") != CONFIG_MANIFEST_VERSION
-        or not isinstance(manifest.get("entries"), list)
-        or CONFLICT_TASK_MANAGED_ENTRY not in manifest["entries"]
-        or not isinstance(source, dict)
-        or source.get("commit") != REQUIRED_CONFIG_COMMIT
-        or source.get("dirty") is not False
-        or recorded_hash != REQUIRED_CONFLICT_TASK_SHA256
-    ):
-        raise WorkflowError(
-            "the managed conflict helper is missing or too old; sync "
-            f"copilot-config commit {REQUIRED_CONFIG_COMMIT}"
-        )
-    helper = home / CONFLICT_TASK_RELATIVE_PATH
-    if (
-        not helper.is_file()
+        helper.is_symlink()
+        or not helper.is_file()
         or sha256_file(helper) != REQUIRED_CONFLICT_TASK_SHA256
     ):
         raise WorkflowError(
-            "the installed managed conflict helper does not match copilot-config "
-            f"commit {REQUIRED_CONFIG_COMMIT}"
+            "the bundled conflict Agent Tasks helper is missing or failed "
+            "integrity validation"
         )
-    return helper.resolve()
+    return helper
 
 
 def atomic_write_text(path: Path, value: str) -> None:

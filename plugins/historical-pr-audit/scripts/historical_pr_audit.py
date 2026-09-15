@@ -44,14 +44,10 @@ CANDIDATE_KEYS = {"path", "line", "side", "body"}
 GITHUB_PR_DIFF = "github_pr_diff"
 CUMULATIVE_GIT_DIFF = "cumulative_git_diff"
 BARE_TARGET_PATTERN = re.compile(r"^#?(?P<number>\d+)$")
-CONFIG_MANIFEST_VERSION = 3
-CONFIG_MANIFEST_NAME = ".copilot-config-manifest.json"
-REQUIRED_CONFIG_COMMIT = "e67d61da91c514eeea12179997aa4f35d3d737da"
 REQUIRED_CLOUD_TASK_SHA256 = (
     "fa57bff76e2e2854d1bd73ea77a761e9e14ebcd89b89a7d90e91c6d28c73ff5f"
 )
-CLOUD_TASK_MANAGED_ENTRY = "skills/cloud"
-CLOUD_TASK_RELATIVE_PATH = Path("skills/cloud/scripts/cloud_task.py")
+CLOUD_TASK_FILENAME = "cloud_task.py"
 AGENT_TASK_POLICY = "marketplace-agent-worker@1"
 AGENT_TASK_POLICY_SHA256 = (
     "c87e380b050a2af8c275eb2413893304ca7b7ff28bd1ae074a07ae5e66c40189"
@@ -2280,7 +2276,7 @@ def sha256_file(path: Path) -> str:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
     except OSError as error:
-        raise WorkflowError(f"could not read managed helper {path}: {error}") from error
+        raise WorkflowError(f"could not read bundled helper {path}: {error}") from error
     return digest.hexdigest()
 
 
@@ -2329,52 +2325,17 @@ def load_json_object(path: Path, *, description: str) -> dict[str, Any]:
     return value
 
 
-def copilot_home() -> Path:
-    configured = os.environ.get("COPILOT_HOME")
-    return cli_path(configured) if configured else Path.home() / ".copilot"
-
-
 def discover_cloud_task() -> Path:
-    home = copilot_home().resolve()
-    manifest = load_json_object(
-        home / CONFIG_MANIFEST_NAME,
-        description="managed Copilot configuration manifest",
-    )
-    source = manifest.get("source")
-    entries = manifest.get("entries")
-    contents = manifest.get("contents")
-    helper_contents = (
-        contents.get(CLOUD_TASK_MANAGED_ENTRY)
-        if isinstance(contents, dict)
-        else None
-    )
-    source_path = source.get("path") if isinstance(source, dict) else None
-    recorded_hash = (
-        helper_contents.get("scripts/cloud_task.py")
-        if isinstance(helper_contents, dict)
-        else None
-    )
+    helper = Path(__file__).resolve().with_name(CLOUD_TASK_FILENAME)
     if (
-        manifest.get("version") != CONFIG_MANIFEST_VERSION
-        or not isinstance(entries, list)
-        or CLOUD_TASK_MANAGED_ENTRY not in entries
-        or not isinstance(source_path, str)
-        or not Path(source_path).is_absolute()
-        or source.get("commit") != REQUIRED_CONFIG_COMMIT
-        or source.get("dirty") is not False
-        or recorded_hash != REQUIRED_CLOUD_TASK_SHA256
+        helper.is_symlink()
+        or not helper.is_file()
+        or sha256_file(helper) != REQUIRED_CLOUD_TASK_SHA256
     ):
         raise WorkflowError(
-            "the managed cloud helper is missing or too old; sync copilot-config "
-            f"commit {REQUIRED_CONFIG_COMMIT}"
+            "the bundled Agent Tasks helper is missing or failed integrity validation"
         )
-    helper = home / CLOUD_TASK_RELATIVE_PATH
-    if not helper.is_file() or sha256_file(helper) != REQUIRED_CLOUD_TASK_SHA256:
-        raise WorkflowError(
-            "the installed managed cloud helper is missing or does not match "
-            f"copilot-config commit {REQUIRED_CONFIG_COMMIT}; sync Copilot configuration"
-        )
-    return helper.resolve()
+    return helper
 
 
 def require_outside_repository(path: Path, repo_root: Path) -> None:
@@ -3414,7 +3375,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
     state_path = cli_path(args.state) if args.state else default_state_path(target)
     require_outside_repository(state_path, repo_root)
 
-    # Provenance is checked before branch preparation or publication can mutate git.
+    # Helper integrity is checked before branch preparation or publication can mutate git.
     helper = discover_cloud_task()
     requested_model = MODEL_ALIASES[args.model]
     max_iterations = args.max_iterations

@@ -1331,7 +1331,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.0")
+        self.assertEqual(plugin["version"], "1.3.1")
         self.assertNotIn("custom_agent", plugin)
 
     def test_prompt_is_versioned_self_contained_and_fail_closed(self):
@@ -1346,55 +1346,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("structured fields Finding", prompt)
         self.assertIn("explicit no-change receipt", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
-
-    def test_discovers_only_the_pinned_managed_helper(self):
-        self.assertEqual(
-            MODULE.REQUIRED_CONFIG_COMMIT,
-            "e67d61da91c514eeea12179997aa4f35d3d737da",
-        )
-        self.assertEqual(
-            MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "fa57bff76e2e2854d1bd73ea77a761e9e14ebcd89b89a7d90e91c6d28c73ff5f",
-        )
-        home = self.directory / ".copilot"
-        helper = home / MODULE.CLOUD_TASK_RELATIVE_PATH
-        helper.parent.mkdir(parents=True)
-        helper.write_text("# helper\n", encoding="utf-8")
-        manifest = {
-            "version": MODULE.CONFIG_MANIFEST_VERSION,
-            "source": {
-                "path": str(self.directory),
-                "commit": MODULE.REQUIRED_CONFIG_COMMIT,
-                "dirty": False,
-            },
-            "entries": [MODULE.CLOUD_TASK_MANAGED_ENTRY],
-            "contents": {
-                MODULE.CLOUD_TASK_MANAGED_ENTRY: {
-                    "scripts/cloud_task.py": MODULE.REQUIRED_CLOUD_TASK_SHA256
-                }
-            },
-        }
-        (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
-            json.dumps(manifest), encoding="utf-8"
-        )
-        with (
-            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
-            mock.patch.object(
-                MODULE,
-                "sha256_file",
-                return_value=MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            ),
-        ):
-            self.assertEqual(MODULE.discover_cloud_task(), helper.resolve())
-        manifest["source"]["commit"] = "0" * 40
-        (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
-            json.dumps(manifest), encoding="utf-8"
-        )
-        with (
-            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
-            self.assertRaisesRegex(MODULE.WorkflowError, "missing or too old"),
-        ):
-            MODULE.discover_cloud_task()
 
     def test_validates_result_receipt_and_explicit_no_change_report(self):
         remote = self.remote()

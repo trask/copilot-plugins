@@ -35,7 +35,7 @@ Run `python "$helper" check <target> --model <model>` once. Use `python3` on POS
 
 Never run another local repository command. Never read, search, import, build, test, install, execute, hook, generate a probe for, or analyze pull request code locally. Never run repository scripts. Never invoke `gh pr diff` yourself. Never use a local diff, `get_changes_overview`, Cloud Sandboxes, or a local fallback after managed cloud failure. Stop on a helper error and report its recovery files.
 
-The managed helper must come through `~/.copilot/.copilot-config-manifest.json`, pinned to `trask/copilot-config` commit `e67d61da91c514eeea12179997aa4f35d3d737da`. It must run with policy `marketplace-agent-worker@1`. Do not invoke `cloud_task.py` yourself and do not scrape its standard output.
+The Agent Tasks runtime is bundled with this plugin. The coordinator loads only its adjacent `cloud_task.py`, verifies its pinned SHA-256, and runs it with policy `marketplace-agent-worker@1`. Do not invoke `cloud_task.py` yourself and do not scrape its standard output.
 
 ## Fixed independent evaluator
 

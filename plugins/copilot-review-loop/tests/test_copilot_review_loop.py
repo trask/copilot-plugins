@@ -1093,7 +1093,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("does not support `--input-result-file`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.0")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.1")
 
     def test_prompt_is_self_contained_versioned_and_treats_inputs_as_untrusted(self):
         prompt = MODULE.build_worker_prompt(
@@ -1107,53 +1107,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("untrusted data", prompt)
         self.assertIn("local-execution fallback", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
-
-    def test_discovers_only_the_pinned_helper_and_policy(self):
-        self.assertEqual(
-            MODULE.REQUIRED_CONFIG_COMMIT,
-            "e67d61da91c514eeea12179997aa4f35d3d737da",
-        )
-        self.assertEqual(
-            MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "fa57bff76e2e2854d1bd73ea77a761e9e14ebcd89b89a7d90e91c6d28c73ff5f",
-        )
-        self.assertEqual(
-            MODULE.AGENT_TASK_POLICY_SHA256,
-            "c87e380b050a2af8c275eb2413893304ca7b7ff28bd1ae074a07ae5e66c40189",
-        )
-        home = self.directory / ".copilot"
-        helper = home / MODULE.CLOUD_TASK_RELATIVE_PATH
-        helper.parent.mkdir(parents=True)
-        helper.write_text("# helper\n", encoding="utf-8")
-        manifest = {
-            "version": 3,
-            "source": {
-                "path": str(self.directory),
-                "commit": MODULE.REQUIRED_CONFIG_COMMIT,
-                "dirty": False,
-            },
-            "entries": [MODULE.CLOUD_TASK_MANAGED_ENTRY],
-            "contents": {
-                MODULE.CLOUD_TASK_MANAGED_ENTRY: {
-                    "scripts/cloud_task.py": MODULE.REQUIRED_CLOUD_TASK_SHA256
-                }
-            },
-        }
-        (home / MODULE.CONFIG_MANIFEST_NAME).write_text(json.dumps(manifest))
-        with (
-            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
-            mock.patch.object(
-                MODULE, "sha256_file", return_value=MODULE.REQUIRED_CLOUD_TASK_SHA256
-            ),
-        ):
-            self.assertEqual(MODULE.discover_cloud_task(), helper.resolve())
-        manifest["source"]["commit"] = "0" * 40
-        (home / MODULE.CONFIG_MANIFEST_NAME).write_text(json.dumps(manifest))
-        with (
-            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
-            self.assertRaisesRegex(MODULE.WorkflowError, "missing or too old"),
-        ):
-            MODULE.discover_cloud_task()
 
     def test_validates_success_and_no_op_receipts(self):
         remote = self.remote()

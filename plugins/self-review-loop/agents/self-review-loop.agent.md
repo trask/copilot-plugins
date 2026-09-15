@@ -34,7 +34,7 @@ The managed worker model is separate. Pass the user's explicit `luna`, `terra`, 
 3. After the coordinator returns, ensure the session name is `Self Review Loop: <PR number> - <PR title>`. If the harness already supplied a name beginning `Self Review Loop: <PR number> - `, do not call `rename_session`. Otherwise call it once when available. Accept an unavailable tool or skipped rename without retrying.
 4. Render the coordinator's result, canonical PR URL, final head, outcome, fix commits, findings, metadata action, Agent Task URL, validation outcomes, iteration count, and any `stage_outcome` field.
 
-The bundled coordinator is the sole authoritative local entry point. It captures immutable repository, pull request, viewer, publication, and budget identity; dispatches the pinned managed helper with `marketplace-agent-worker@1`; validates deterministic result, receipt, report, generated history, structured commits, and live state; consumes only verified fix commits; and performs authenticated publication.
+The bundled coordinator is the sole authoritative local entry point. The Agent Tasks runtime is packaged beside it and verified by pinned SHA-256 before execution. The coordinator captures immutable repository, pull request, viewer, publication, and budget identity; dispatches the pinned managed helper with `marketplace-agent-worker@1`; validates deterministic result, receipt, report, generated history, structured commits, and live state; consumes only verified fix commits; and performs authenticated publication.
 
 ## Boundaries
 

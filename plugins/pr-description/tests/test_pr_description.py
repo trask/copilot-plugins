@@ -712,7 +712,7 @@ class LegacyAgentInstructions:
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.33")
+        self.assertEqual(plugin["version"], "1.0.34")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -880,69 +880,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.33")
+        self.assertEqual(plugin["version"], "1.0.34")
         self.assertEqual(entry["version"], plugin["version"])
-
-    def test_discovers_only_the_pinned_managed_helper(self):
-        self.assertEqual(
-            MODULE.REQUIRED_CONFIG_COMMIT,
-            "e67d61da91c514eeea12179997aa4f35d3d737da",
-        )
-        self.assertEqual(
-            MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "fa57bff76e2e2854d1bd73ea77a761e9e14ebcd89b89a7d90e91c6d28c73ff5f",
-        )
-        home = self.directory / ".copilot"
-        helper = home / MODULE.CLOUD_TASK_RELATIVE_PATH
-        helper.parent.mkdir(parents=True)
-        helper.write_text("# helper\n", encoding="utf-8")
-        manifest = {
-            "version": MODULE.CONFIG_MANIFEST_VERSION,
-            "source": {
-                "path": str(self.directory),
-                "commit": MODULE.REQUIRED_CONFIG_COMMIT,
-                "dirty": False,
-            },
-            "entries": [MODULE.CLOUD_TASK_MANAGED_ENTRY],
-            "contents": {
-                MODULE.CLOUD_TASK_MANAGED_ENTRY: {
-                    "scripts/cloud_task.py": MODULE.REQUIRED_CLOUD_TASK_SHA256
-                }
-            },
-        }
-        (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
-            json.dumps(manifest), encoding="utf-8"
-        )
-        with (
-            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
-            mock.patch.object(
-                MODULE,
-                "sha256_file",
-                return_value=MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            ),
-        ):
-            self.assertEqual(MODULE.discover_cloud_task(), helper.resolve())
-
-        manifest["source"]["commit"] = "0" * 40
-        (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
-            json.dumps(manifest), encoding="utf-8"
-        )
-        with (
-            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
-            self.assertRaisesRegex(MODULE.WorkflowError, "missing or too old"),
-        ):
-            MODULE.discover_cloud_task()
-
-    def test_missing_managed_helper_reports_the_prerequisite(self):
-        home = self.directory / "empty-home"
-        home.mkdir()
-        with (
-            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
-            self.assertRaisesRegex(
-                MODULE.WorkflowError, "managed Copilot configuration manifest"
-            ),
-        ):
-            MODULE.discover_cloud_task()
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
         head_sha = self.preflight["pr"]["head_sha"]

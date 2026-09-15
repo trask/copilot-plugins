@@ -35,11 +35,9 @@ task's committed report and receipt, then checks each candidate with a separate
 Claude evaluator before it creates and verifies one pending review.
 
 Run this agent with GPT-5.6 Sol at high reasoning effort. It checks each finding
-with a separate Claude Sonnet 5 evaluator. It requires the managed `cloud`
-skill from copilot-config commit
-`e67d61da91c514eeea12179997aa4f35d3d737da` and policy
-`marketplace-agent-worker@1`. It never uses Cloud Sandboxes or a local-analysis
-fallback.
+with a separate Claude Sonnet 5 evaluator. The plugin bundles and verifies its
+Agent Tasks runtime and uses policy `marketplace-agent-worker@1`. It never uses
+Cloud Sandboxes or a local-analysis fallback.
 
 ### Copilot Review Loop
 
@@ -47,6 +45,9 @@ Works through the Copilot pull request review comments that nobody has resolved
 yet. It groups comments that share one cause into one commit, pushes the fixes,
 and asks Copilot to review again when the current head has no clean review. It
 repeats until the review is clean or it reaches a stop condition.
+
+The plugin bundles and verifies its Agent Tasks runtime. Authentication stays
+in local `gh api`; repository analysis and execution stay in GitHub Agent Tasks.
 
 ### Self Review Loop
 
@@ -56,8 +57,7 @@ builds. The local coordinator validates the task's commit history, report,
 receipt, and live branch identity before it imports and pushes the fix commits.
 A clean review leaves the branch unchanged.
 
-This plugin requires the managed `cloud` skill from copilot-config commit
-`e67d61da91c514eeea12179997aa4f35d3d737da`. It runs `cloud_task.py` with policy
+The plugin bundles and verifies `cloud_task.py`, then runs it with policy
 `marketplace-agent-worker@1`. The backend is GitHub Agent Tasks through local
 `gh api`; there is no Cloud Sandbox, custom agent, local repository analysis,
 or local execution fallback.
@@ -70,8 +70,7 @@ request and permission context, validates the task's committed report and
 receipt, then keeps ideal text or applies the proposed replacement through
 GitHub's authenticated API.
 
-This plugin requires the managed `cloud` skill from copilot-config commit
-`e67d61da91c514eeea12179997aa4f35d3d737da`. It runs `cloud_task.py` with policy
+The plugin bundles and verifies `cloud_task.py`, then runs it with policy
 `marketplace-agent-worker@1`. The backend is GitHub Agent Tasks through local
 `gh api`; there is no Cloud Sandbox, custom agent, or local-analysis fallback.
 
@@ -116,6 +115,10 @@ integration starts another run. It never posts anything to GitHub. Its
 machine-facing descendant propagation operation uses the same topology checks and
 atomic publisher after a lower stack member receives a CI fix.
 
+The plugin bundles and verifies its dedicated conflict Agent Tasks runtime.
+Authentication stays in local `gh api`; conflict analysis and validation stay
+in GitHub Agent Tasks.
+
 ### CI Fix Loop
 
 Fixes only failures attributable to the pull request. A standalone run on a
@@ -124,6 +127,10 @@ repair work at the lowest failure, and uses PR Conflict Resolver to propagate
 each fixed head through its descendants before their checks run. It does not run
 the review, description, or other PR Pipeline stages. A pull request outside a
 native stack keeps the single-PR behavior.
+
+The plugin bundles and verifies its Agent Tasks runtime. Authentication stays
+in local `gh api`; CI diagnosis, edits, and validation stay in GitHub Agent
+Tasks.
 
 Each member gets five charged iterations. A PR Pipeline run keeps its existing
 five charged iterations per outer pass and absolute ten across two passes. Every
@@ -147,8 +154,7 @@ directly applicable precedent as a finding worth raising.
 The merged pull request never changes. The audit branch is the only thing this
 agent pushes, and a first pass that finds nothing pushes no branch at all.
 
-This plugin requires the managed `cloud` skill from copilot-config commit
-`e67d61da91c514eeea12179997aa4f35d3d737da`. It runs `cloud_task.py` with policy
+The plugin bundles and verifies `cloud_task.py`, then runs it with policy
 `marketplace-agent-worker@1`. The backend is GitHub Agent Tasks through local
 `gh api`; there is no Cloud Sandbox, custom agent, local repository analysis,
 or local execution fallback.

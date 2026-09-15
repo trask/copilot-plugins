@@ -193,11 +193,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read, edit, search", instructions)
         self.assertNotIn("custom_agent:", instructions)
 
-    def test_pins_helper_and_policy_provenance(self):
-        self.assertEqual(
-            MODULE.REQUIRED_CONFIG_COMMIT,
-            "e67d61da91c514eeea12179997aa4f35d3d737da",
-        )
+    def test_pins_bundled_helper_and_policy_integrity(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
             "fa57bff76e2e2854d1bd73ea77a761e9e14ebcd89b89a7d90e91c6d28c73ff5f",
@@ -364,48 +360,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs, {"cwd": Path("C:/repo"), "check": False})
         self.assertNotIn("ApiClient", MODULE.execute_managed_agent_task.__code__.co_names)
         self.assertNotIn("start_task", MODULE.execute_managed_agent_task.__code__.co_names)
-
-    def test_provenance_fails_closed_before_use(self):
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            with mock.patch.object(MODULE, "copilot_home", return_value=home):
-                with self.assertRaisesRegex(MODULE.WorkflowError, "does not exist"):
-                    MODULE.discover_cloud_task()
-            helper = home / "skills" / "cloud" / "scripts" / "cloud_task.py"
-            helper.parent.mkdir(parents=True)
-            helper.write_text("helper", encoding="utf-8")
-            manifest = {
-                "version": MODULE.CONFIG_MANIFEST_VERSION,
-                "source": {
-                    "path": str(home.resolve()),
-                    "commit": "wrong",
-                    "dirty": False,
-                },
-                "entries": [MODULE.CLOUD_TASK_MANAGED_ENTRY],
-                "contents": {
-                    MODULE.CLOUD_TASK_MANAGED_ENTRY: {
-                        "scripts/cloud_task.py": MODULE.REQUIRED_CLOUD_TASK_SHA256
-                    }
-                },
-            }
-            (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
-                json.dumps(manifest), encoding="utf-8"
-            )
-            with (
-                mock.patch.object(MODULE, "copilot_home", return_value=home),
-                mock.patch.object(
-                    MODULE,
-                    "sha256_file",
-                    return_value=MODULE.REQUIRED_CLOUD_TASK_SHA256,
-                ),
-            ):
-                with self.assertRaisesRegex(MODULE.WorkflowError, "missing or too old"):
-                    MODULE.discover_cloud_task()
-                manifest["source"]["commit"] = MODULE.REQUIRED_CONFIG_COMMIT
-                (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
-                    json.dumps(manifest), encoding="utf-8"
-                )
-                self.assertEqual(MODULE.discover_cloud_task(), helper.resolve())
 
     def test_result_binds_identity_artifacts_and_receipt_only_no_change(self):
         remote = MODULE.validate_success_result(
