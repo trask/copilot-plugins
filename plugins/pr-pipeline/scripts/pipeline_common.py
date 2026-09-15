@@ -56,6 +56,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "marker": ("mergeable_at_head_sha",),
         "base_marker": ("attempt", "base_sha"),
         "model": DEFAULT_STAGE_MODEL,
+        "pipeline_position": False,
     },
     {
         "stage": STAGE_COPILOT_REVIEW,
@@ -1515,6 +1516,8 @@ def stage_accepts_pipeline_position(
     *,
     script_for: Callable[[dict[str, Any]], Path] = stage_script_path,
 ) -> bool:
+    if entry.get("pipeline_position") is False:
+        return False
     try:
         return PIPELINE_RUN_FLAG in script_for(entry).read_text(encoding="utf-8")
     except OSError:
@@ -1531,8 +1534,8 @@ def pipeline_arguments(
 ) -> list[str]:
     """Give a stage its position in the pipeline so its own budget can shrink.
 
-    A stage that does not understand these flags is left alone, so a stage
-    helper that predates them keeps its standalone behavior.
+    A stage that is excluded from pipeline budgeting or does not understand
+    these flags is left alone.
     """
     if not accepts(entry):
         return []
