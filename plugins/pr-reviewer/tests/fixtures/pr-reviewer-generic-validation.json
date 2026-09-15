@@ -1,0 +1,22 @@
+[
+  {
+    "command": "full-diff-reviewed",
+    "status": "passed",
+    "detail": "Reviewed the complete authoritative pull request diff."
+  },
+  {
+    "command": "changed-files-covered",
+    "status": "passed",
+    "detail": "Reviewed every changed file exactly once."
+  },
+  {
+    "command": "candidates-evidenced",
+    "status": "passed",
+    "detail": "Every candidate is supported by concrete evidence."
+  },
+  {
+    "command": "probes-isolated",
+    "status": "passed",
+    "detail": "Every executed probe was focused and isolated."
+  }
+]

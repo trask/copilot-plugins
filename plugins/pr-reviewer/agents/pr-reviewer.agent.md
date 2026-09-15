@@ -37,6 +37,8 @@ Never run another local repository command. Never read, search, import, build, t
 
 The coordinator discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies its pinned SHA-256, and runs it with policy `marketplace-agent-worker@4`. The worker runs validation remotely; the dispatcher treats its command strings as inert data and independently attests identity, history, paths, and artifact digests. Do not invoke `cloud_task.py` yourself and do not scrape its standard output.
 
+The candidate report contains review identity, changed-file coverage, and candidates only. Review completeness is recorded once in the separate generic validation artifact, with exactly `full-diff-reviewed`, `changed-files-covered`, `candidates-evidenced`, and `probes-isolated` outcomes.
+
 ## Fixed independent evaluator
 
 An empty `candidates` array is a successful no-findings review. Do not call `post`.

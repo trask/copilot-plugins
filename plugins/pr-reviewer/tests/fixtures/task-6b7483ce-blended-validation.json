@@ -1,0 +1,12 @@
+[
+  {
+    "validation": "immutable_pull_request_identity",
+    "passed": true,
+    "details": "Confirmed the exact pull request head."
+  },
+  {
+    "validation": "authoritative_complete_diff",
+    "passed": true,
+    "details": "Inspected the complete pull request diff."
+  }
+]

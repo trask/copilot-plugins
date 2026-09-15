@@ -57,9 +57,9 @@ AGENT_TASK_RESULT_SCHEMA = {
 }
 CANDIDATE_REPORT_SCHEMA = {
     "id": "github.copilot.pr-review-candidates",
-    "version": 1,
+    "version": 2,
 }
-WORKER_PROMPT_VERSION = 3
+WORKER_PROMPT_VERSION = 4
 STATE_VERSION = 1
 MODEL_ALIASES = {
     "luna": "gpt-5.6-luna",
@@ -74,7 +74,7 @@ REPORT_PATH_PATTERN = re.compile(
 RECEIPT_PATH_PATTERN = re.compile(
     r"^\.github/agent-task-validations/(?P<request_id>[A-Za-z0-9][A-Za-z0-9._-]*)\.json$"
 )
-EXPECTED_REPORT_VALIDATIONS = [
+REQUIRED_VALIDATION_COMMANDS = [
     "full-diff-reviewed",
     "changed-files-covered",
     "candidates-evidenced",
@@ -1632,10 +1632,6 @@ def build_worker_prompt(
         },
         "review_complete": True,
         "changed_files": ["<every changed repository-relative path in diff order>"],
-        "validations": [
-            {"name": name, "status": "passed", "evidence": "<concrete evidence>"}
-            for name in EXPECTED_REPORT_VALIDATIONS
-        ],
         "candidates": [
             {
                 "candidate_id": "<stable unique id>",
@@ -1661,6 +1657,14 @@ def build_worker_prompt(
             }
         ],
     }
+    validation_shape = [
+        {
+            "command": command,
+            "status": "passed",
+            "detail": "<concrete evidence>",
+        }
+        for command in REQUIRED_VALIDATION_COMMANDS
+    ]
     return (
         f"PR Reviewer marketplace worker prompt version {WORKER_PROMPT_VERSION}.\n\n"
         "You are the remote discovery worker for a thin local PR Reviewer coordinator. "
@@ -1673,7 +1677,11 @@ def build_worker_prompt(
         "candidate report directly to `{{MARKETPLACE_REPORT_PATH}}` and the strict "
         "validation array directly to `{{MARKETPLACE_VALIDATION_PATH}}`; the dispatcher "
         "replaces both placeholders with exact paths before task creation. Do not choose "
-        "alternate artifact names, and do not commit scratch files. Then create the exact "
+        "alternate artifact names, and do not commit scratch files. The validation file "
+        "must contain exactly this JSON array in this order, with concrete detail; do not "
+        "use `validation`, `passed`, `details`, `name`, or `evidence` keys in that file:\n"
+        f"{json.dumps(validation_shape, ensure_ascii=False, sort_keys=True)}\n\n"
+        "Then create the exact "
         "final commit required by the marketplace policy footer. Do this even "
         "when the candidates array is empty. A chat response without the committed "
         "artifacts is a failed task. These artifacts are the only repository changes "
@@ -1690,9 +1698,9 @@ def build_worker_prompt(
         "candidate must use an honest changed-line anchor. A range must remain on one "
         "side in one hunk and include a changed line. Record exact probe commands and "
         "outcomes; use command 'none' with status 'not_run' and a concrete reason when "
-        "static evidence is sufficient. Mark each ordered validation passed only after "
-        "the complete review establishes it. Return an empty candidates array for no "
-        "findings.\n\n"
+        "static evidence is sufficient. Record review-completeness checks only in the "
+        "separate validation file after the complete review establishes them. Return an "
+        "empty candidates array for no findings.\n\n"
         "Write the report file as one UTF-8 JSON object with no Markdown fence and no "
         "text before or after it. Use exactly the keys and nesting in this shape. List "
         "every changed file exactly once in diff order. Do not include credentials.\n"
@@ -1761,6 +1769,10 @@ def validate_validation_outcomes(value: Any) -> list[dict[str, str]]:
         outcomes.append(outcome)
     if len(commands) != len(set(commands)):
         raise WorkflowError("Agent Task validation contains duplicate outcomes")
+    if commands != REQUIRED_VALIDATION_COMMANDS:
+        raise WorkflowError(
+            "Agent Task validation is incomplete or has unexpected command identifiers"
+        )
     return outcomes
 
 
@@ -1956,21 +1968,6 @@ def validate_worker_receipt(
     validate_validation_outcomes(artifact)
 
 
-def validate_report_validations(value: Any) -> None:
-    if not isinstance(value, list) or len(value) != len(EXPECTED_REPORT_VALIDATIONS):
-        raise WorkflowError("candidate report validation is incomplete")
-    for expected_name, validation in zip(EXPECTED_REPORT_VALIDATIONS, value):
-        if (
-            not isinstance(validation, dict)
-            or set(validation) != {"name", "status", "evidence"}
-            or validation.get("name") != expected_name
-            or validation.get("status") != "passed"
-            or not isinstance(validation.get("evidence"), str)
-            or not validation["evidence"].strip()
-        ):
-            raise WorkflowError("candidate report validation is incomplete or out of order")
-
-
 def candidate_anchor(candidate: dict[str, Any]) -> dict[str, Any]:
     anchor = candidate["anchor"]
     value = {
@@ -2003,7 +2000,6 @@ def validate_candidate_report(
         "pull_request",
         "review_complete",
         "changed_files",
-        "validations",
         "candidates",
     }
     expected_pr = {
@@ -2027,7 +2023,6 @@ def validate_candidate_report(
         or not isinstance(report.get("candidates"), list)
     ):
         raise WorkflowError("Agent Task candidate report identity or fields are malformed")
-    validate_report_validations(report.get("validations"))
     candidate_ids: list[str] = []
     signatures: list[tuple[Any, ...]] = []
     for index, candidate in enumerate(report["candidates"]):

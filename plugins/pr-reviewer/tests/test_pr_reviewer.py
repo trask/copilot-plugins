@@ -1076,7 +1076,12 @@ class ManagedCoordinatorTest(unittest.TestCase):
         }
         self.identity = {"head": "4" * 40, "status": ""}
         self.validation = [
-            {"command": "validate", "status": "passed", "detail": "complete"}
+            {
+                "command": command,
+                "status": "passed",
+                "detail": "complete",
+            }
+            for command in MODULE.REQUIRED_VALIDATION_COMMANDS
         ]
 
     def result(self, **overrides):
@@ -1136,10 +1141,6 @@ class ManagedCoordinatorTest(unittest.TestCase):
             },
             "review_complete": True,
             "changed_files": ["src/one.py", "docs/two.md"],
-            "validations": [
-                {"name": name, "status": "passed", "evidence": "complete"}
-                for name in MODULE.EXPECTED_REPORT_VALIDATIONS
-            ],
             "candidates": candidates or [],
         }
 
@@ -1180,7 +1181,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
             ["src/one.py", "docs/two.md"],
         )
 
-        self.assertEqual(MODULE.WORKER_PROMPT_VERSION, 3)
+        self.assertEqual(MODULE.WORKER_PROMPT_VERSION, 4)
         self.assertIn(
             "Completing the review always requires repository artifacts on the "
             "generated task branch.",
@@ -1198,6 +1199,12 @@ class ManagedCoordinatorTest(unittest.TestCase):
         self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
         self.assertIn("`{{MARKETPLACE_VALIDATION_PATH}}`", prompt)
         self.assertIn("Do not choose alternate artifact names", prompt)
+        self.assertIn('"command": "full-diff-reviewed"', prompt)
+        self.assertIn('"command": "changed-files-covered"', prompt)
+        self.assertIn('"command": "candidates-evidenced"', prompt)
+        self.assertIn('"command": "probes-isolated"', prompt)
+        self.assertNotIn('"validations":', prompt)
+        self.assertNotIn('"name": "full-diff-reviewed"', prompt)
         self.assertNotIn("candidate-report.json", prompt)
         self.assertNotIn("worker-validation.json", prompt)
         self.assertIn(
@@ -1423,10 +1430,16 @@ class ManagedCoordinatorTest(unittest.TestCase):
                 anchors=MODULE.parse_unified_diff(DIFF),
             )
 
-    def test_rejects_incomplete_or_reordered_report_validation(self):
+    def test_rejects_legacy_report_validation_field(self):
         report = self.report()
-        report["validations"] = list(reversed(report["validations"]))
-        with self.assertRaisesRegex(MODULE.WorkflowError, "out of order"):
+        report["validations"] = [
+            {
+                "name": "full-diff-reviewed",
+                "status": "passed",
+                "evidence": "complete",
+            }
+        ]
+        with self.assertRaisesRegex(MODULE.WorkflowError, "fields are malformed"):
             MODULE.validate_candidate_report(
                 json.dumps(report),
                 request_id="request-1",
@@ -1434,6 +1447,52 @@ class ManagedCoordinatorTest(unittest.TestCase):
                 requested_model="gpt-5.6-sol",
                 anchors=MODULE.parse_unified_diff(DIFF),
             )
+
+    def test_rejects_production_blended_validation_and_wrong_commands(self):
+        blended = json.loads(
+            (
+                Path(__file__).parent
+                / "fixtures"
+                / "task-6b7483ce-blended-validation.json"
+            ).read_text(encoding="utf-8")
+        )
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "incomplete or malformed",
+        ):
+            MODULE.validate_validation_outcomes(blended)
+
+        wrong_commands = [
+            {
+                "command": f"other-{index}",
+                "status": "passed",
+                "detail": "complete",
+            }
+            for index, _ in enumerate(MODULE.REQUIRED_VALIDATION_COMMANDS)
+        ]
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "unexpected command identifiers",
+        ):
+            MODULE.validate_validation_outcomes(wrong_commands)
+
+    def test_accepts_single_generic_validation_fixture(self):
+        validation = json.loads(
+            (
+                Path(__file__).parent
+                / "fixtures"
+                / "pr-reviewer-generic-validation.json"
+            ).read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(
+            MODULE.validate_validation_outcomes(validation),
+            validation,
+        )
+        self.assertEqual(
+            [outcome["command"] for outcome in validation],
+            MODULE.REQUIRED_VALIDATION_COMMANDS,
+        )
 
     def test_task_failure_is_deterministic(self):
         error = MODULE.task_failure_from_result(
