@@ -3019,8 +3019,16 @@ def fetch_worker_receipt(
         "validation",
     }
     if set(data) != expected_keys:
+        missing = sorted(expected_keys - set(data))
+        unexpected = sorted(set(data) - expected_keys)
+        differences = []
+        if missing:
+            differences.append(f"missing fields: {', '.join(missing)}")
+        if unexpected:
+            differences.append(f"unexpected fields: {', '.join(unexpected)}")
         raise CloudError(
-            "marketplace worker receipt has unexpected or missing fields",
+            "marketplace worker receipt has unexpected or missing fields: "
+            + "; ".join(differences),
             "malformed_report",
         )
     expected_schema = {
@@ -3408,6 +3416,14 @@ def execute(
             all_commits,
             expected_paths,
         )
+        commits = list(worker_history.code_commits)
+        if result is not None:
+            result.generated_head = generated_head
+            result.cloud_commits = commits
+            result.receipt_commit = worker_history.receipt_commit
+            if report_path is not None:
+                result.report_path = report_path
+                result.report_commit = worker_history.receipt_commit
         if (
             options.allow_merged_pr
             and generated_head != worker_history.receipt_commit
@@ -3434,7 +3450,6 @@ def execute(
             expected_mode=expected_receipt_mode,
             pull_request=pull_request,
         )
-        commits = list(worker_history.code_commits)
         if report_path is not None:
             try:
                 policy_report = fetch_report(
@@ -3468,14 +3483,9 @@ def execute(
                 validation_outcomes=outcomes,
             )
         if result is not None:
-            result.generated_head = generated_head
-            result.cloud_commits = commits
-            result.receipt_commit = worker_history.receipt_commit
             result.validation_complete = True
             result.validation_outcomes = outcomes
             if report_path is not None and policy_report is not None:
-                result.report_path = report_path
-                result.report_commit = worker_history.receipt_commit
                 result.report_sha256 = report_digest
 
     if options.monitor_only:
