@@ -45,13 +45,13 @@ Use `--model sol` unless the caller selected another supported model. The helper
 
 Every failing-check iteration launches exactly one managed GitHub Agent Task through `agent-task`. The coordinator pins the open pull request, local branch, head, base, authenticated viewer, check rollup, failing logs and their digests, model, policy, and one-iteration allowance before dispatch.
 
-The command discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies its SHA-256 `ed67915330f8dafb538fbbc32389d282e0e9264fb11b7242350d5754d9b75614`, and invokes it with `--result-file`, `--policy marketplace-agent-worker@1`, and absolute prompt and result paths outside the repository. The policy SHA-256 is `c87e380b050a2af8c275eb2413893304ca7b7ff28bd1ae074a07ae5e66c40189`.
+The command discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies its pinned SHA-256, and invokes it with `--result-file`, `--policy marketplace-agent-worker@2`, and absolute prompt and result paths outside the repository.
 
 Never use Cloud Sandboxes or a local fallback. Never pass `custom_agent`. Never pass credentials. Never read helper stdout as a result. Never run `gh pr diff`, a repository command, a formatter, a build, a test, or a probe.
 
-The worker owns all repository analysis and execution. It diagnoses the exact observed failures, makes the edits, adds or updates tests, formats the changes, runs relevant builds and tests, validates every repair, and emits linear fix commits followed by one report-and-receipt artifact commit.
+The worker owns all repository analysis and execution. It diagnoses the exact observed failures, makes the edits, adds or updates tests, formats the changes, runs relevant builds and tests, validates every repair, and emits linear fix commits followed by one report-and-validation artifact commit.
 
-The coordinator accepts only `github.copilot.agent-task-result` version 1 and `github.copilot.agent-task-receipt` version 1. It validates task, repository, pull request, head, base, model, policy, request, report, receipt, ordered commit history, artifact commit, changed paths, complete passed validation, failure coverage, test-suppression absence, credential absence, local identity, local cleanliness, live pull request identity, and the unchanged failing-check snapshot. It imports and pushes only fix commits with an exact lease on the frozen head.
+The coordinator accepts only the pinned result and policy identities. It treats worker validation commands as inert data, verifies the report and strict remote-validation artifact against dispatcher-owned digests, and independently validates task, repository, pull request, head, base, model, request, ordered history, paths, complete passed validation, credential absence, local identity, live pull request identity, and the unchanged failing-check snapshot. It imports and pushes only fix commits with an exact lease on the frozen head.
 
 If `agent-task` fails, keep its `recovery_command` and `recovery_files`. Run that exact recovery command. It revalidates the retained task identity and result and never launches an unrelated task. The pinned helper does not support `--input-result-file` for open-pull-request apply-with-report tasks, so a failed remote task remains a visible blocker while successful results remain resumable through import and publication. Do not delete recovery artifacts by hand. The coordinator removes them only after it consumes and publishes or records the verified result.
 
@@ -70,7 +70,7 @@ Follow the `result` exactly:
 - `escalated`: stop and report the durable reason and next action.
 - `max_iterations_reached`: stop before launching another task.
 
-Do not start a second Agent Task for the same iteration. If state reports an unfinished task, use its recovery command. If the head, base, checks, local branch, local status, generated history, report, receipt, validation, or paths drift, stop on the coordinator error. Never reset, stash, amend, cherry-pick, import another commit, or work around a failed gate.
+Do not start a second Agent Task for the same iteration. If state reports an unfinished task, use its recovery command. If the head, base, checks, local branch, local status, generated history, report, validation artifact, or paths drift, stop on the coordinator error. Never reset, stash, amend, cherry-pick, import another commit, or work around a failed gate.
 
 The default budget is five distinct failing-check snapshots. A reread of the same snapshot does not spend another iteration or launch another task. A changed check rollup or a fix that moves the head spends the next iteration. Pipeline budgets retain their outer position and absolute cap.
 

@@ -42,26 +42,22 @@ PROPAGATION_CONTAINMENT_RETRY_DELAYS = (1, 2, 4)
 EMPTY_RERUN_COMMIT_MESSAGE = "ci: rerun checks"
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "ed67915330f8dafb538fbbc32389d282e0e9264fb11b7242350d5754d9b75614"
+    "66a76fa96d8eafd8b256ae5477777aab0a190d4b99a05cb90c56e03fc8dc8565"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
 CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
-AGENT_TASK_POLICY = "marketplace-agent-worker@1"
+AGENT_TASK_POLICY = "marketplace-agent-worker@2"
 AGENT_TASK_POLICY_SHA256 = (
-    "c87e380b050a2af8c275eb2413893304ca7b7ff28bd1ae074a07ae5e66c40189"
+    "33bb702b099ee1c7dd933f81396c3081279a781c9c8e04e7d4a0dee9317d5714"
 )
 AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
-    "version": 1,
-}
-AGENT_TASK_RECEIPT_SCHEMA = {
-    "id": "github.copilot.agent-task-receipt",
-    "version": 1,
+    "version": 2,
 }
 CI_FIX_REPORT_SCHEMA = {
     "id": "github.copilot.ci-fix-loop-report",
-    "version": 1,
+    "version": 2,
 }
 WORKER_PROMPT_VERSION = 1
 MODEL_ALIASES = {
@@ -75,7 +71,7 @@ REPORT_PATH_PATTERN = re.compile(
     r"^\.github/agent-task-reports/(?P<request_id>[A-Za-z0-9][A-Za-z0-9._-]*)\.md$"
 )
 RECEIPT_PATH_PATTERN = re.compile(
-    r"^\.github/agent-task-receipts/(?P<request_id>[A-Za-z0-9][A-Za-z0-9._-]*)\.json$"
+    r"^\.github/agent-task-validations/(?P<request_id>[A-Za-z0-9][A-Za-z0-9._-]*)\.json$"
 )
 CI_FIX_COMMIT_FIELDS = ("Failing check", "Cause", "Fix", "Validation")
 PR_URL_PATTERN = re.compile(
@@ -4548,7 +4544,7 @@ def build_worker_prompt(
         "requested_model": requested_model,
         "policy": {
             "id": "marketplace-agent-worker",
-            "version": 1,
+            "version": 2,
             "sha256": AGENT_TASK_POLICY_SHA256,
         },
         "iteration_allowance": iteration_allowance,
@@ -4610,9 +4606,9 @@ def build_worker_prompt(
         "must cover each such check with one or more passed validation commands. Put "
         "each independent fix in a linear single-parent commit. Each fix commit message "
         "must contain non-empty `Failing check:`, `Cause:`, `Fix:`, and `Validation:` "
-        "fields. Do not change the report or receipt paths in a fix commit. Create no "
+        "fields. Do not change the report or validation paths in a fix commit. Create no "
         "fix commit for a flake, pre-existing failure, unfixable failure, or no-op.\n\n"
-        "The managed apply-with-report contract creates the final report-and-receipt "
+        "The managed apply-with-report contract creates the final report-and-validation "
         "artifact commit. The artifact commit must follow every fix commit. Do not push "
         "the pull request branch, rerun checks, or change pull request metadata. The "
         "local coordinator owns authenticated publication and reruns.\n\n"
@@ -4712,7 +4708,7 @@ def validate_recovery_result_identity(
     pr = preflight["pr"]
     expected_policy = {
         "id": "marketplace-agent-worker",
-        "version": 1,
+        "version": 2,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     task = result.get("task")
@@ -4756,7 +4752,7 @@ def validate_success_result(
 ) -> dict[str, Any]:
     expected_policy = {
         "id": "marketplace-agent-worker",
-        "version": 1,
+        "version": 2,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     if (
@@ -4812,7 +4808,7 @@ def validate_success_result(
         or not isinstance(report, dict)
         or set(report) != {"path", "commit", "sha256"}
         or not isinstance(receipt, dict)
-        or set(receipt) != {"path", "commit"}
+        or set(receipt) != {"path", "commit", "sha256"}
         or not isinstance(validation, dict)
         or set(validation) != {"complete", "outcomes"}
     ):
@@ -4837,6 +4833,8 @@ def validate_success_result(
         or receipt.get("commit") != generated["head_sha"]
         or not isinstance(report.get("sha256"), str)
         or not re.fullmatch(r"[0-9a-f]{64}", report["sha256"])
+        or not isinstance(receipt.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", receipt["sha256"])
         or application
         != {
             "status": "applied" if commits else "no_changes",
@@ -4859,6 +4857,7 @@ def validate_success_result(
         "report_path": report["path"],
         "receipt_path": receipt["path"],
         "report_sha256": report["sha256"],
+        "receipt_sha256": receipt["sha256"],
         "validation": outcomes,
     }
 
@@ -4894,39 +4893,18 @@ def validate_worker_receipt(
     request_id: str,
     preflight: dict[str, Any],
     validation: list[dict[str, str]],
-) -> dict[str, Any]:
-    require_no_credentials(content, source="Agent Task worker receipt")
-    receipt = parse_strict_json(content, description="Agent Task worker receipt")
-    expected_policy = {
-        "id": "marketplace-agent-worker",
-        "version": 1,
-        "sha256": AGENT_TASK_POLICY_SHA256,
-    }
-    if (
-        not isinstance(receipt, dict)
-        or set(receipt)
-        != {
-            "schema",
-            "request_id",
-            "policy",
-            "mode",
-            "repository",
-            "pull_request_head_sha",
-            "validation_complete",
-            "validation",
-        }
-        or receipt.get("schema") != AGENT_TASK_RECEIPT_SCHEMA
-        or receipt.get("request_id") != request_id
-        or receipt.get("policy") != expected_policy
-        or receipt.get("mode") != "apply_with_report"
-        or receipt.get("repository") != preflight["pr"]["repo_name"]
-        or receipt.get("pull_request_head_sha") != preflight["pr"]["head_sha"]
-        or receipt.get("validation_complete") is not True
-        or receipt.get("validation") != validation
-    ):
-        raise WorkflowError("Agent Task worker receipt does not match the pinned request")
-    validate_validation_outcomes(receipt["validation"])
-    return receipt
+) -> list[dict[str, str]]:
+    require_no_credentials(content, source="Agent Task worker validation")
+    artifact = parse_strict_json(
+        content,
+        description="Agent Task worker validation",
+    )
+    if artifact != validation:
+        raise WorkflowError(
+            "Agent Task worker validation does not match the dispatcher result"
+        )
+    validate_validation_outcomes(artifact)
+    return artifact
 
 
 def validate_ci_fix_report(
@@ -5118,7 +5096,7 @@ def validate_generated_history(
     if artifact_paths != sorted([remote["report_path"], remote["receipt_path"]]):
         raise WorkflowError("final Agent Task artifact commit changed unexpected paths")
     changed: set[str] = set()
-    reserved = (".github/agent-task-reports/", ".github/agent-task-receipts/")
+    reserved = (".github/agent-task-reports/", ".github/agent-task-validations/")
     for commit in remote["commits"]:
         paths = git_z_paths(
             repo_root,
@@ -5587,8 +5565,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
             pr["repo_name"],
             remote["receipt_path"],
             remote["generated_head"],
-            description="worker receipt",
+            description="worker validation",
         )
+        if sha256_text(receipt_content) != remote["receipt_sha256"]:
+            raise WorkflowError("Agent Task worker validation digest does not match")
         validate_worker_receipt(
             receipt_content,
             request_id=remote["request_id"],

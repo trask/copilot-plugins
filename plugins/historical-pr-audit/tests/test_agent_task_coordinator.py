@@ -57,7 +57,7 @@ def result(commits=None):
         "requested_model": "gpt-5.6-sol",
         "policy": {
             "id": "marketplace-agent-worker",
-            "version": 1,
+            "version": 2,
             "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
         },
         "task": {
@@ -82,8 +82,9 @@ def result(commits=None):
             "sha256": "5" * 64,
         },
         "worker_receipt": {
-            "path": ".github/agent-task-receipts/request-1.json",
+            "path": ".github/agent-task-validations/request-1.json",
             "commit": generated_head,
+            "sha256": MODULE.sha256_text(json.dumps(receipt())),
         },
         "validation": {
             "complete": True,
@@ -110,20 +111,7 @@ def interrupted_result():
 
 
 def receipt():
-    return {
-        "schema": MODULE.AGENT_TASK_RECEIPT_SCHEMA,
-        "request_id": "request-1",
-        "policy": {
-            "id": "marketplace-agent-worker",
-            "version": 1,
-            "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
-        },
-        "mode": "apply_with_report",
-        "repository": METADATA["repo_name"],
-        "pull_request_head_sha": METADATA["head_sha"],
-        "validation_complete": True,
-        "validation": [dict(item) for item in VALIDATION],
-    }
+    return [dict(item) for item in VALIDATION]
 
 
 def report(commits=None, outcome=None):
@@ -196,11 +184,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pins_shared_helper_and_policy_integrity(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "ed67915330f8dafb538fbbc32389d282e0e9264fb11b7242350d5754d9b75614",
+            "66a76fa96d8eafd8b256ae5477777aab0a190d4b99a05cb90c56e03fc8dc8565",
         )
         self.assertEqual(
             MODULE.AGENT_TASK_POLICY_SHA256,
-            "c87e380b050a2af8c275eb2413893304ca7b7ff28bd1ae074a07ae5e66c40189",
+            "33bb702b099ee1c7dd933f81396c3081279a781c9c8e04e7d4a0dee9317d5714",
         )
 
     def test_prompt_is_versioned_untrusted_and_remote_only(self):
@@ -252,7 +240,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "--result-file",
             str(first_result),
             "--policy",
-            "marketplace-agent-worker@1",
+            "marketplace-agent-worker@2",
         ]
         self.assertEqual(
             MODULE.agent_task_command(
@@ -506,16 +494,16 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_receipt_rejects_wrong_identity_incomplete_validation_and_credentials(self):
         cases = []
         wrong = receipt()
-        wrong["pull_request_head_sha"] = "9" * 40
+        wrong[0]["unexpected"] = "identity"
         cases.append(wrong)
         incomplete = receipt()
-        incomplete["validation_complete"] = False
+        incomplete.clear()
         cases.append(incomplete)
         failed = receipt()
-        failed["validation"][0]["status"] = "failed"
+        failed[0]["status"] = "failed"
         cases.append(failed)
         credential = receipt()
-        credential["validation"][0]["detail"] = "token=github_pat_example_value_123456"
+        credential[0]["detail"] = "token=github_pat_example_value_123456"
         cases.append(credential)
         for value in cases:
             with self.subTest(value=value), self.assertRaises(MODULE.WorkflowError):

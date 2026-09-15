@@ -994,7 +994,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "requested_model": "gpt-5.6-sol",
             "policy": {
                 "id": "marketplace-agent-worker",
-                "version": 1,
+                "version": 2,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -1019,8 +1019,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "sha256": "4" * 64,
             },
             "worker_receipt": {
-                "path": ".github/agent-task-receipts/request-1.json",
+                "path": ".github/agent-task-validations/request-1.json",
                 "commit": self.artifact,
+                "sha256": MODULE.sha256_text(json.dumps(self.validation)),
             },
             "validation": {"complete": True, "outcomes": self.validation},
             "error": None,
@@ -1034,22 +1035,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
 
     def receipt(self):
-        return json.dumps(
-            {
-                "schema": MODULE.AGENT_TASK_RECEIPT_SCHEMA,
-                "request_id": "request-1",
-                "policy": {
-                    "id": "marketplace-agent-worker",
-                    "version": 1,
-                    "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
-                },
-                "mode": "apply_with_report",
-                "repository": "owner/repo",
-                "pull_request_head_sha": self.head,
-                "validation_complete": True,
-                "validation": self.validation,
-            }
-        )
+        return json.dumps(self.validation)
 
     def report(self, commits=None):
         commits = [] if commits is None else commits
@@ -1088,12 +1074,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_thin_and_version_is_bumped(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-worker@1", instructions)
+        self.assertIn("marketplace-agent-worker@2", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("does not support `--input-result-file`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.4")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.5")
 
     def test_prompt_is_self_contained_versioned_and_treats_inputs_as_untrusted(self):
         prompt = MODULE.build_worker_prompt(

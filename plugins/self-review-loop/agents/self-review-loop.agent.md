@@ -34,17 +34,17 @@ The managed worker model is separate. Pass the user's explicit `luna`, `terra`, 
 3. After the coordinator returns, ensure the session name is `Self Review Loop: <PR number> - <PR title>`. If the harness already supplied a name beginning `Self Review Loop: <PR number> - `, do not call `rename_session`. Otherwise call it once when available. Accept an unavailable tool or skipped rename without retrying.
 4. Render the coordinator's result, canonical PR URL, final head, outcome, fix commits, findings, metadata action, Agent Task URL, validation outcomes, iteration count, and any `stage_outcome` field.
 
-The bundled coordinator is the sole authoritative local entry point. It discovers the separately installed `agent-tasks-runtime@trask-plugins` skill and verifies the runtime by pinned SHA-256 before execution. The coordinator captures immutable repository, pull request, viewer, publication, and budget identity; dispatches the pinned managed helper with `marketplace-agent-worker@1`; validates deterministic result, receipt, report, generated history, structured commits, and live state; consumes only verified fix commits; and performs authenticated publication.
+The bundled coordinator is the sole authoritative local entry point. It discovers the separately installed `agent-tasks-runtime@trask-plugins` skill and verifies the runtime by pinned SHA-256 before execution. The coordinator captures immutable repository, pull request, viewer, publication, and budget identity; dispatches the pinned managed helper with `marketplace-agent-worker@2`; treats remote command strings as inert data; validates the deterministic result, validation artifact, report, generated history, structured commits, and live state; consumes only verified fix commits; and performs authenticated publication.
 
 ## Boundaries
 
 - Never run `gh pr diff`, read or search repository files, inspect repository instructions, analyze code, make edits, run builds, tests, probes, formatters, hooks, or repository programs locally. Agent Tasks performs every substantive repository action.
 - Never use Cloud Sandboxes, marketplace `custom_agent`, a local agent, local analysis or execution, or any fallback when the managed helper fails.
-- Never invoke `cloud_task.py` yourself, scrape its standard output, import its final report-and-receipt artifact commit, rerun repository validation locally, or publish with direct commands.
+- Never invoke `cloud_task.py` yourself, scrape its standard output, import its final report-and-validation artifact commit, rerun repository validation locally, or publish with direct commands.
 - Authentication stays local. Never put credentials, environment data, tokens, headers, or cookies in a prompt, result, report, state, or chat response.
-- Stop on every coordinator error. Report the returned state path, task URL or ID, generated branch and head, ordered fix commits, receipt and report paths, retained recovery files, and exact `recovery_command`. Run that command only when the user asks to resume.
-- The coordinator rejects merge commits, unexpected paths or history, malformed or stale reports, receipts, identities, pull request metadata, incomplete validation, credentials, local drift, and live head, base, title, or body drift. Never work around a rejection.
-- A receipt-only result with no fix commits is the explicit successful no-change outcome. Do not push or manufacture a commit.
+- Stop on every coordinator error. Report the returned state path, task URL or ID, generated branch and head, ordered fix commits, validation and report paths, retained recovery files, and exact `recovery_command`. Run that command only when the user asks to resume.
+- The coordinator rejects merge commits, unexpected paths or history, malformed or stale reports, validation artifacts, identities, pull request metadata, incomplete validation, credentials, local drift, and live head, base, title, or body drift. Never work around a rejection.
+- A report-and-validation-only result with no fix commits is the explicit successful no-change outcome. Do not push or manufacture a commit.
 - State and recovery artifacts remain durable until verified import and authenticated publication both succeed. Cleanup happens only after successful consumption.
 - The helper may publish verified fix commits to the pull request's existing head repository and branch and may correct an inaccurate title or description proposed by the worker. It never posts review comments or submits a review.
 

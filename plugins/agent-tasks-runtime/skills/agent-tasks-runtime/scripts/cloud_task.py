@@ -39,17 +39,15 @@ BLOCKED_STATES = {"waiting_for_user", "idle"}
 KNOWN_STATES = ACTIVE_STATES | SUCCESS_STATES | ERROR_STATES | BLOCKED_STATES
 SHA_PATTERN = re.compile(r"\A[0-9a-fA-F]{40}\Z")
 REPORT_DIRECTORY = ".github/agent-task-reports"
-RECEIPT_DIRECTORY = ".github/agent-task-receipts"
+VALIDATION_DIRECTORY = ".github/agent-task-validations"
 REPORT_MARKER = "----- /cloud report instructions -----"
 APPLY_WITH_REPORT_MARKER = "----- /cloud apply-with-report instructions -----"
 PR_CONTEXT_MARKER = "----- /cloud source pull request -----"
 POLICY_MARKER = "----- marketplace agent worker policy -----"
 RESULT_SCHEMA_ID = "github.copilot.agent-task-result"
 RESULT_SCHEMA_VERSION = 1
-RECEIPT_SCHEMA_ID = "github.copilot.agent-task-receipt"
-RECEIPT_SCHEMA_VERSION = 1
 MARKETPLACE_POLICY_ID = "marketplace-agent-worker"
-MARKETPLACE_POLICY_VERSION = 1
+MARKETPLACE_POLICY_VERSION = 2
 MARKETPLACE_POLICY_SPEC = {
     "id": MARKETPLACE_POLICY_ID,
     "version": MARKETPLACE_POLICY_VERSION,
@@ -63,6 +61,9 @@ MARKETPLACE_POLICY_SPEC = {
     "require_linear_generated_history": True,
     "require_expected_paths_only": True,
     "require_complete_successful_validation": True,
+    "worker_artifact": "remote-validation-array",
+    "dispatcher_attestation": True,
+    "worker_identity_echo": False,
 }
 MARKETPLACE_POLICY_HASH = hashlib.sha256(
     json.dumps(
@@ -235,6 +236,7 @@ class ResultEnvelope:
     report_sha256: str | None = None
     receipt_path: str | None = None
     receipt_commit: str | None = None
+    receipt_sha256: str | None = None
     validation_complete: bool = False
     validation_outcomes: list[dict[str, str]] | None = None
     status: str = "error"
@@ -298,6 +300,7 @@ class ResultEnvelope:
                 {
                     "path": self.receipt_path,
                     "commit": self.receipt_commit,
+                    "sha256": self.receipt_sha256,
                 }
                 if self.receipt_path is not None
                 else None
@@ -561,7 +564,7 @@ def parse_args(args: Sequence[str]) -> Options:
     ):
         raise CloudError(
             "historical apply-with-report requires --prompt-file, "
-            "--result-file, and --policy marketplace-agent-worker@1",
+            f"--result-file, and --policy {MARKETPLACE_POLICY_SELECTOR}",
             "policy_required",
         )
     if task_id is not None and not (
@@ -751,9 +754,10 @@ def read_dispatch_result(path: Path) -> dict[str, object]:
         or not isinstance(task.get("base_sha"), str)
         or not SHA_PATTERN.fullmatch(task["base_sha"])
         or not isinstance(receipt, dict)
-        or set(receipt) != {"path", "commit"}
+        or set(receipt) != {"path", "commit", "sha256"}
         or not isinstance(receipt.get("path"), str)
         or receipt.get("commit") is not None
+        or receipt.get("sha256") is not None
         or generated
         != {
             "branch": None,
@@ -956,13 +960,20 @@ def read_apply_result(path: Path) -> dict[str, object]:
             )
         )
         or not isinstance(receipt, dict)
-        or set(receipt) != {"path", "commit"}
+        or set(receipt) != {"path", "commit", "sha256"}
         or not isinstance(receipt.get("path"), str)
         or (
             receipt.get("commit") is not None
             and (
                 not isinstance(receipt.get("commit"), str)
                 or not SHA_PATTERN.fullmatch(receipt["commit"])
+            )
+        )
+        or (
+            receipt.get("sha256") is not None
+            and (
+                not isinstance(receipt.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", receipt["sha256"])
             )
         )
         or not isinstance(validation, dict)
@@ -1046,6 +1057,7 @@ def read_apply_result(path: Path) -> dict[str, object]:
             or not generated.get("branch")
             or not generated.get("head_sha")
             or receipt.get("commit") is None
+            or receipt.get("sha256") is None
             or report is None
             or report.get("commit") is None
             or report.get("sha256") is None
@@ -1097,17 +1109,17 @@ def policy_metadata(options: Options) -> dict[str, object] | None:
 
 def receipt_path(request_id: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", request_id):
-        raise CloudError("invalid worker receipt request id", "receipt_invalid")
-    return f"{RECEIPT_DIRECTORY}/{request_id}.json"
+        raise CloudError("invalid worker validation request id", "receipt_invalid")
+    return f"{VALIDATION_DIRECTORY}/{request_id}.json"
 
 
 def validate_receipt_path(path: str) -> None:
     if not re.fullmatch(
-        rf"{re.escape(RECEIPT_DIRECTORY)}/[A-Za-z0-9][A-Za-z0-9._-]*\.json",
+        rf"{re.escape(VALIDATION_DIRECTORY)}/[A-Za-z0-9][A-Za-z0-9._-]*\.json",
         path,
     ):
         raise CloudError(
-            f"invalid worker receipt path {path!r}",
+            f"invalid worker validation path {path!r}",
             "receipt_invalid",
         )
 
@@ -1306,7 +1318,7 @@ def validate_apply_result_identity(
         or report.get("path") != expected_report_path
     ):
         raise CloudError(
-            "prior result report and receipt request IDs do not match",
+            "prior result report and validation request IDs do not match",
             "task_identity_mismatch",
         )
     commits = generated.get("commits")
@@ -1334,6 +1346,7 @@ def validate_prior_generated_result(
     code_commits: Sequence[str],
     receipt_path_value: str,
     receipt_commit: str,
+    receipt_sha256: str,
     report_path_value: str,
     report_commit: str,
     report_sha256: str,
@@ -1354,6 +1367,7 @@ def validate_prior_generated_result(
         (generated.get("head_sha"), generated_head, "generated head"),
         (receipt.get("path"), receipt_path_value, "receipt path"),
         (receipt.get("commit"), receipt_commit, "receipt commit"),
+        (receipt.get("sha256"), receipt_sha256, "receipt SHA-256"),
     )
     for prior, current, field in comparisons:
         if prior is not None and prior != current:
@@ -1400,72 +1414,6 @@ def build_policy_prompt(
     repository: str,
     pull_request: PullRequestSnapshot | None,
 ) -> str:
-    expected_pr_head = pull_request.head_sha if pull_request is not None else None
-    receipt_contract = {
-        "schema": {
-            "id": RECEIPT_SCHEMA_ID,
-            "version": RECEIPT_SCHEMA_VERSION,
-        },
-        "request_id": request_id,
-        "policy": {
-            "id": MARKETPLACE_POLICY_ID,
-            "version": MARKETPLACE_POLICY_VERSION,
-            "sha256": MARKETPLACE_POLICY_HASH,
-        },
-        "mode": mode,
-        "repository": repository,
-        "pull_request_head_sha": expected_pr_head,
-        "validation_complete": True,
-        "validation": [
-            {
-                "command": "<exact command or deterministic review check>",
-                "status": "passed",
-                "detail": "<concise outcome>",
-            }
-        ],
-    }
-    receipt_contract_json = json.dumps(
-        receipt_contract,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    encoded_receipt_contract = base64.b64encode(
-        receipt_contract_json.encode("utf-8")
-    ).decode("ascii")
-    validation_path = f"{receipt}.validation.json"
-    receipt_literal = json.dumps(receipt, ensure_ascii=True)
-    validation_path_literal = json.dumps(validation_path, ensure_ascii=True)
-    validation_check = (
-        'isinstance(validation,list) and validation and all(isinstance(item,dict) '
-        'and set(item)=={"command","detail","status"} and '
-        'isinstance(item["command"],str) and item["command"].strip() and '
-        'item["status"]=="passed" and isinstance(item["detail"],str) and '
-        'item["detail"].strip() for item in validation)'
-    )
-    generate_receipt = (
-        "import base64,json,pathlib;"
-        f"receipt=pathlib.Path({receipt_literal});"
-        f"validation_path=pathlib.Path({validation_path_literal});"
-        'validation=json.loads(validation_path.read_text(encoding="utf-8"));'
-        f"assert {validation_check};"
-        f'data=json.loads(base64.b64decode("{encoded_receipt_contract}"));'
-        'data["validation"]=validation;'
-        "receipt.parent.mkdir(parents=True,exist_ok=True);"
-        'receipt.write_text(json.dumps(data,sort_keys=True)+"\\n",encoding="utf-8");'
-        "validation_path.unlink()"
-    )
-    verify_receipt = (
-        "import base64,json,pathlib;"
-        f'expected=json.loads(base64.b64decode("{encoded_receipt_contract}"));'
-        f"actual=json.loads(pathlib.Path({receipt_literal}).read_text("
-        'encoding="utf-8"));'
-        'validation=actual.get("validation");'
-        'expected["validation"]=validation;'
-        "assert actual==expected;"
-        'assert actual["validation_complete"] is True;'
-        f"assert {validation_check}"
-    )
     expected_paths = [receipt]
     if mode in {"report", "apply_with_report"}:
         expected_paths.insert(0, f"{REPORT_DIRECTORY}/{request_id}.md")
@@ -1474,35 +1422,20 @@ def build_policy_prompt(
         f"{POLICY_MARKER}\n"
         f"Policy: {MARKETPLACE_POLICY_SELECTOR}\n"
         f"Policy SHA-256: {MARKETPLACE_POLICY_HASH}\n"
-        f"Request ID: {request_id}\n"
         "Authentication stays in the local dispatcher. Do not request, read, "
         "print, persist, or transmit credentials, tokens, keys, cookies, or "
         "authorization headers. Do not select or invoke a custom_agent. Do not "
         "use a local-execution fallback.\n"
-        "Before finishing, validate the final result. Every validation entry "
-        "must describe an exact command or deterministic review check that "
-        "passed. A failed, skipped, missing, or incomplete validation is not a "
-        "successful result.\n"
-        f"Required receipt JSON template:\n{receipt_contract_json}\n"
-        "Do not hand-author or reconstruct the receipt. Write only the final "
-        f"validation JSON array to `{validation_path}`, then run this exact "
-        "generator from the repository root:\n"
-        "```sh\n"
-        f"python3 -c '{generate_receipt}'\n"
-        "```\n"
-        "Immediately before the final receipt commit, run this exact verifier. "
-        "If it fails, fix the receipt and rerun it; do not commit an unverified "
-        "receipt:\n"
-        "```sh\n"
-        f"python3 -c '{verify_receipt}'\n"
-        "```\n"
-        "After all code and report work is final, create exactly one final "
-        "single-parent receipt commit. Its changed paths must be exactly "
-        f"{json.dumps(expected_paths)} and it must contain no other change. "
-        "Do not add commits afterward. In code mode, put all code changes in "
-        "preceding commits. In report mode, make no preceding commit. In "
-        "apply-with-report mode, preserve the required structured fix commits "
-        "before this final report-and-receipt commit.\n"
+        "Run every required validation on the hosted worker. After validation "
+        f"passes, write `{receipt}` as a nonempty JSON array. Every element must "
+        "contain exactly `command`, `status`, and `detail`; all three values must "
+        "be nonempty strings and `status` must be `passed`. Record commands as "
+        "evidence only. Do not write request, policy, repository, pull request, "
+        "task, or completion metadata.\n"
+        "Create exactly one final single-parent artifact commit whose changed "
+        f"paths are exactly {json.dumps(expected_paths)}. Put code changes in "
+        "preceding linear commits, make no preceding commit in report mode, and "
+        "do not add commits afterward.\n"
         f"{POLICY_MARKER}"
     )
 
@@ -1965,7 +1898,7 @@ class GitRepository:
     ) -> WorkerHistory:
         if not commits:
             raise CloudError(
-                "the generated branch did not contain a worker receipt commit",
+                "the generated branch did not contain a worker validation commit",
                 "malformed_history",
             )
         receipt_commit = commits[-1]
@@ -1988,7 +1921,7 @@ class GitRepository:
         code_head = code_commits[-1] if code_commits else base_sha
         if parents[1] != code_head:
             raise CloudError(
-                "the worker receipt commit is not directly based on the "
+                "the worker validation commit is not directly based on the "
                 "generated code head",
                 "malformed_history",
             )
@@ -2005,7 +1938,7 @@ class GitRepository:
         if tuple(sorted(changed_paths)) != tuple(sorted(expected_paths)):
             rendered = ", ".join(changed_paths) if changed_paths else "no paths"
             raise CloudError(
-                "the worker receipt commit changed unexpected paths: "
+                "the worker validation commit changed unexpected paths: "
                 f"{rendered}; expected {', '.join(expected_paths)}",
                 "unexpected_paths",
             )
@@ -2838,7 +2771,9 @@ def task_payload(
         prompt = build_pr_prompt(prompt, pull_request)
     if options.policy is not None:
         if request_id is None or worker_receipt is None or repository is None:
-            raise AssertionError("policy mode did not allocate worker receipt metadata")
+            raise AssertionError(
+                "policy mode did not allocate worker validation metadata"
+            )
         prompt = build_policy_prompt(
             prompt,
             request_id=request_id,
@@ -3040,10 +2975,6 @@ def fetch_worker_receipt(
     repository: str,
     receipt: str,
     head_ref: str,
-    *,
-    request_id: str,
-    expected_mode: str,
-    pull_request: PullRequestSnapshot | None,
 ) -> tuple[list[dict[str, str]], str]:
     validate_receipt_path(receipt)
     try:
@@ -3052,78 +2983,16 @@ def fetch_worker_receipt(
     except (CloudError, json.JSONDecodeError) as error:
         message = str(error) if isinstance(error, CloudError) else error.msg
         raise CloudError(
-            f"malformed marketplace worker receipt {receipt}: {message}",
+            f"malformed marketplace worker validation {receipt}: {message}",
             "malformed_report",
         ) from None
-    if not isinstance(data, dict):
-        raise CloudError(
-            "marketplace worker receipt is not a JSON object",
-            "malformed_report",
-        )
-    expected_keys = {
-        "schema",
-        "request_id",
-        "policy",
-        "mode",
-        "repository",
-        "pull_request_head_sha",
-        "validation_complete",
-        "validation",
-    }
-    if set(data) != expected_keys:
-        missing = sorted(expected_keys - set(data))
-        unexpected = sorted(set(data) - expected_keys)
-        differences = []
-        if missing:
-            differences.append(f"missing fields: {', '.join(missing)}")
-        if unexpected:
-            differences.append(f"unexpected fields: {', '.join(unexpected)}")
-        raise CloudError(
-            "marketplace worker receipt has unexpected or missing fields: "
-            + "; ".join(differences),
-            "malformed_report",
-        )
-    expected_schema = {
-        "id": RECEIPT_SCHEMA_ID,
-        "version": RECEIPT_SCHEMA_VERSION,
-    }
-    expected_policy = {
-        "id": MARKETPLACE_POLICY_ID,
-        "version": MARKETPLACE_POLICY_VERSION,
-        "sha256": MARKETPLACE_POLICY_HASH,
-    }
-    expected_pr_head = pull_request.head_sha if pull_request is not None else None
-    identities = (
-        (data.get("schema"), expected_schema, "schema"),
-        (data.get("request_id"), request_id, "request id"),
-        (data.get("policy"), expected_policy, "policy"),
-        (data.get("mode"), expected_mode, "mode"),
-        (data.get("repository"), repository, "repository"),
-        (data.get("pull_request_head_sha"), expected_pr_head, "pull request head"),
-    )
-    for actual, expected, field in identities:
-        if actual != expected:
-            code = (
-                "task_identity_mismatch"
-                if field in {"request id", "repository", "pull request head"}
-                else "policy_rejected"
-                if field == "policy"
-                else "malformed_report"
-            )
-            raise CloudError(
-                f"marketplace worker receipt {field} does not match the request",
-                code,
-            )
-    validation = data.get("validation")
-    if data.get("validation_complete") is not True or not isinstance(
-        validation, list
-    ) or not validation:
+    if not isinstance(data, list) or not data:
         raise CloudError(
             "marketplace worker validation is incomplete",
             "validation_incomplete",
         )
     outcomes: list[dict[str, str]] = []
-    for outcome in validation:
+    for outcome in data:
         if not isinstance(outcome, dict) or set(outcome) != {
             "command",
             "status",
@@ -3459,6 +3328,9 @@ def execute(
             pull_request.head_sha if pull_request is not None else base.sha
         )
         all_commits = git.cloud_commits(root, recorded_base_sha, tracking_ref)
+        if result is not None:
+            result.generated_head = generated_head
+            result.cloud_commits = list(all_commits)
         expected_paths = [receipt]
         if report_path is not None:
             expected_paths.append(report_path)
@@ -3470,7 +3342,6 @@ def execute(
         )
         commits = list(worker_history.code_commits)
         if result is not None:
-            result.generated_head = generated_head
             result.cloud_commits = commits
             result.receipt_commit = worker_history.receipt_commit
             if report_path is not None:
@@ -3490,17 +3361,11 @@ def execute(
                 "before its report receipt",
                 "unexpected_commits",
             )
-        expected_receipt_mode = (
-            "dispatch_only" if options.monitor_only else mode_name(options)
-        )
-        outcomes, _ = fetch_worker_receipt(
+        outcomes, validation_digest = fetch_worker_receipt(
             api,
             repository,
             receipt,
             refs.head,
-            request_id=request_id,
-            expected_mode=expected_receipt_mode,
-            pull_request=pull_request,
         )
         if report_path is not None:
             try:
@@ -3529,6 +3394,7 @@ def execute(
                 code_commits=worker_history.code_commits,
                 receipt_path_value=receipt,
                 receipt_commit=worker_history.receipt_commit,
+                receipt_sha256=validation_digest,
                 report_path_value=report_path,
                 report_commit=worker_history.receipt_commit,
                 report_sha256=report_digest,
@@ -3537,6 +3403,7 @@ def execute(
         if result is not None:
             result.validation_complete = True
             result.validation_outcomes = outcomes
+            result.receipt_sha256 = validation_digest
             if report_path is not None and policy_report is not None:
                 result.report_sha256 = report_digest
 

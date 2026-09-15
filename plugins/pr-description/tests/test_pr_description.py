@@ -137,7 +137,7 @@ def agent_task_result(preflight=None, **overrides):
         "requested_model": "gpt-5.6-sol",
         "policy": {
             "id": "marketplace-agent-worker",
-            "version": 1,
+            "version": 2,
             "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
         },
         "task": {
@@ -162,8 +162,21 @@ def agent_task_result(preflight=None, **overrides):
             "sha256": "5" * 64,
         },
         "worker_receipt": {
-            "path": f".github/agent-task-receipts/{request_id}.json",
+            "path": f".github/agent-task-validations/{request_id}.json",
             "commit": generated_head,
+            "sha256": MODULE.sha256_text(
+                json.dumps(
+                    [
+                        {
+                            "command": "review complete diff",
+                            "status": "passed",
+                            "detail": "All changed files were reviewed.",
+                        }
+                    ],
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            ),
         },
         "validation": {
             "complete": True,
@@ -712,7 +725,7 @@ class LegacyAgentInstructions:
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.37")
+        self.assertEqual(plugin["version"], "1.0.38")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -768,20 +781,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     def receipt(self):
         return json.dumps(
-            {
-                "schema": MODULE.AGENT_TASK_RECEIPT_SCHEMA,
-                "request_id": "request-1",
-                "policy": {
-                    "id": "marketplace-agent-worker",
-                    "version": 1,
-                    "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
-                },
-                "mode": "report",
-                "repository": "owner/repo",
-                "pull_request_head_sha": self.preflight["pr"]["head_sha"],
-                "validation_complete": True,
-                "validation": self.validation,
-            },
+            self.validation,
             separators=(",", ":"),
             sort_keys=True,
         )
@@ -867,7 +867,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("You are a thin local coordinator", instructions)
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-worker@1", instructions)
+        self.assertIn("marketplace-agent-worker@2", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertIn("Never scrape", instructions)
@@ -880,7 +880,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.37")
+        self.assertEqual(plugin["version"], "1.0.38")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1001,7 +1001,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.WorkflowError, "schema or fields"):
             MODULE.load_agent_task_result(result_path)
         receipt = json.loads(self.receipt())
-        receipt["request_id"] = "other"
+        receipt[0]["unexpected"] = "other"
         with self.assertRaisesRegex(MODULE.WorkflowError, "does not match"):
             MODULE.validate_worker_receipt(
                 json.dumps(receipt),
@@ -1057,7 +1057,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("--report", command)
         self.assertEqual(
             command[command.index("--policy") + 1],
-            "marketplace-agent-worker@1",
+            "marketplace-agent-worker@2",
         )
         self.assertNotIn("--custom-agent", command)
         result_path = Path(command[command.index("--result-file") + 1])

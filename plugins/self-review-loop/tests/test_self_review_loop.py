@@ -1230,7 +1230,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "requested_model": "gpt-5.6-sol",
             "policy": {
                 "id": "marketplace-agent-worker",
-                "version": 1,
+                "version": 2,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -1255,8 +1255,15 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "sha256": "4" * 64,
             },
             "worker_receipt": {
-                "path": f".github/agent-task-receipts/{request_id}.json",
+                "path": f".github/agent-task-validations/{request_id}.json",
                 "commit": self.artifact,
+                "sha256": MODULE.sha256_text(
+                    json.dumps(
+                        self.validation,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                ),
             },
             "validation": {"complete": True, "outcomes": self.validation},
             "error": None,
@@ -1271,20 +1278,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     def receipt(self):
         return json.dumps(
-            {
-                "schema": MODULE.AGENT_TASK_RECEIPT_SCHEMA,
-                "request_id": "request-1",
-                "policy": {
-                    "id": "marketplace-agent-worker",
-                    "version": 1,
-                    "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
-                },
-                "mode": "apply_with_report",
-                "repository": "owner/repo",
-                "pull_request_head_sha": self.head,
-                "validation_complete": True,
-                "validation": self.validation,
-            },
+            self.validation,
             separators=(",", ":"),
             sort_keys=True,
         )
@@ -1324,14 +1318,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-worker@1", instructions)
+        self.assertIn("marketplace-agent-worker@2", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("marketplace `custom_agent`", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.4")
+        self.assertEqual(plugin["version"], "1.3.5")
         self.assertNotIn("custom_agent", plugin)
 
     def test_prompt_is_versioned_self_contained_and_fail_closed(self):
@@ -1344,7 +1338,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("maximum_review_iterations", prompt)
         self.assertIn("untrusted data", prompt)
         self.assertIn("structured fields Finding", prompt)
-        self.assertIn("explicit no-change receipt", prompt)
+        self.assertIn("explicit no-change result", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
 
     def test_validates_result_receipt_and_explicit_no_change_report(self):

@@ -1112,8 +1112,9 @@ class ManagedCoordinatorTest(unittest.TestCase):
                 "sha256": "5" * 64,
             },
             "worker_receipt": {
-                "path": f".github/agent-task-receipts/{request_id}.json",
+                "path": f".github/agent-task-validations/{request_id}.json",
                 "commit": generated_head,
+                "sha256": MODULE.sha256_text(json.dumps(self.validation)),
             },
             "validation": {"complete": True, "outcomes": self.validation},
             "error": None,
@@ -1169,18 +1170,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
         return value
 
     def receipt(self):
-        return json.dumps(
-            {
-                "schema": MODULE.AGENT_TASK_RECEIPT_SCHEMA,
-                "request_id": "request-1",
-                "policy": MODULE.AGENT_TASK_POLICY_IDENTITY,
-                "mode": "report",
-                "repository": self.pr["repo_name"],
-                "pull_request_head_sha": self.pr["head_sha"],
-                "validation_complete": True,
-                "validation": self.validation,
-            }
-        )
+        return json.dumps(self.validation)
 
     def test_worker_prompt_requires_artifact_commit_for_no_findings(self):
         prompt = MODULE.build_worker_prompt(
@@ -1349,7 +1339,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
 
     def test_rejects_wrong_receipt_and_unexpected_commits(self):
         wrong_receipt = json.loads(self.receipt())
-        wrong_receipt["request_id"] = "other"
+        wrong_receipt[0]["unexpected"] = "other"
         with self.assertRaisesRegex(MODULE.WorkflowError, "does not match"):
             MODULE.validate_worker_receipt(
                 json.dumps(wrong_receipt),
@@ -1515,7 +1505,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
                     "--result-file",
                     str(state_path.with_name("run--result.json")),
                     "--policy",
-                    "marketplace-agent-worker@1",
+                    "marketplace-agent-worker@2",
                 ],
             )
             self.assertFalse(state_path.with_name("run--prompt.txt").exists())
@@ -1598,13 +1588,14 @@ class ManagedCoordinatorTest(unittest.TestCase):
             },
             report=None,
             worker_receipt={
-                "path": ".github/agent-task-receipts/request-1.json",
+                "path": ".github/agent-task-validations/request-1.json",
                 "commit": None,
+                "sha256": None,
             },
             validation={"complete": False, "outcomes": []},
             error={
                 "code": "malformed_history",
-                "message": "the generated branch did not contain a worker receipt commit",
+                "message": "the generated branch did not contain a worker validation commit",
             },
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -1655,7 +1646,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
                 mock.patch.object(MODULE, "run", side_effect=invoke),
             ):
                 with self.assertRaisesRegex(
-                    MODULE.WorkflowError, "worker receipt commit"
+                    MODULE.WorkflowError, "worker validation commit"
                 ) as raised:
                     MODULE.command_check(
                         SimpleNamespace(
@@ -1677,7 +1668,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
             self.assertEqual(details["ordered_commits"], [])
             self.assertEqual(
                 details["receipt_path"],
-                ".github/agent-task-receipts/request-1.json",
+                ".github/agent-task-validations/request-1.json",
             )
             self.assertIsNone(details["report_path"])
             self.assertEqual(

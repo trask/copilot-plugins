@@ -981,7 +981,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "requested_model": "gpt-5.6-sol",
             "policy": {
                 "id": "marketplace-agent-worker",
-                "version": 1,
+                "version": 2,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -1006,8 +1006,15 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 "sha256": "4" * 64,
             },
             "worker_receipt": {
-                "path": ".github/agent-task-receipts/request-1.json",
+                "path": ".github/agent-task-validations/request-1.json",
                 "commit": self.artifact,
+                "sha256": MODULE.sha256_text(
+                    json.dumps(
+                        self.validation,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                ),
             },
             "validation": {"complete": True, "outcomes": self.validation},
             "error": None,
@@ -1076,20 +1083,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
     def receipt(self):
         return json.dumps(
-            {
-                "schema": MODULE.AGENT_TASK_RECEIPT_SCHEMA,
-                "request_id": "request-1",
-                "policy": {
-                    "id": "marketplace-agent-worker",
-                    "version": 1,
-                    "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
-                },
-                "mode": "apply_with_report",
-                "repository": "owner/repo",
-                "pull_request_head_sha": self.head,
-                "validation_complete": True,
-                "validation": self.validation,
-            },
+            self.validation,
             separators=(",", ":"),
             sort_keys=True,
         )
@@ -1106,13 +1100,13 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-worker@1", instructions)
+        self.assertIn("marketplace-agent-worker@2", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("`custom_agent`", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.4", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.5", json.loads(PLUGIN.read_text())["version"])
 
     def test_prompt_pins_snapshot_allowance_model_policy_and_worker_boundary(self):
         prompt = MODULE.build_worker_prompt(
@@ -1194,7 +1188,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         with self.assertRaises(MODULE.WorkflowError):
             self.validate_report(json.dumps(report))
         receipt = json.loads(self.receipt())
-        receipt["request_id"] = "other"
+        receipt[0]["unexpected"] = "other"
         with self.assertRaises(MODULE.WorkflowError):
             MODULE.validate_worker_receipt(
                 json.dumps(receipt),
