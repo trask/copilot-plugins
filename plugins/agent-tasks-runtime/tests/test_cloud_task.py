@@ -2,7 +2,9 @@ import base64
 import importlib.util
 import json
 from pathlib import Path
+import re
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -20,6 +22,101 @@ assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
+
+
+class PolicyPromptTest(unittest.TestCase):
+    def test_mechanically_generates_and_verifies_complete_receipt(self):
+        receipt = ".github/agent-task-receipts/request-1.json"
+        pull_request = SimpleNamespace(head_sha="1" * 40)
+
+        prompt = MODULE.build_policy_prompt(
+            "Review the pull request.",
+            request_id="request-1",
+            receipt=receipt,
+            mode="apply_with_report",
+            repository="owner/repo",
+            pull_request=pull_request,
+        )
+
+        template_prefix = "Required receipt JSON template:\n"
+        template = json.loads(
+            prompt.split(template_prefix, 1)[1].splitlines()[0]
+        )
+        self.assertEqual(
+            template,
+            {
+                "schema": {
+                    "id": MODULE.RECEIPT_SCHEMA_ID,
+                    "version": MODULE.RECEIPT_SCHEMA_VERSION,
+                },
+                "request_id": "request-1",
+                "policy": {
+                    "id": MODULE.MARKETPLACE_POLICY_ID,
+                    "version": MODULE.MARKETPLACE_POLICY_VERSION,
+                    "sha256": MODULE.MARKETPLACE_POLICY_HASH,
+                },
+                "mode": "apply_with_report",
+                "repository": "owner/repo",
+                "pull_request_head_sha": "1" * 40,
+                "validation_complete": True,
+                "validation": [
+                    {
+                        "command": "<exact command or deterministic review check>",
+                        "status": "passed",
+                        "detail": "<concise outcome>",
+                    }
+                ],
+            },
+        )
+        self.assertIn("Do not hand-author or reconstruct the receipt.", prompt)
+        self.assertIn(f"`{receipt}.validation.json`", prompt)
+        self.assertIn('actual["validation_complete"] is True', prompt)
+        self.assertIn("Do not select or invoke a custom_agent.", prompt)
+
+        scripts = re.findall(r"```sh\npython3 -c '([^']+)'\n```", prompt)
+        self.assertEqual(len(scripts), 2)
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            generated_receipt = temporary_root / receipt
+            validation_path = generated_receipt.with_name(
+                generated_receipt.name + ".validation.json"
+            )
+            validation_path.parent.mkdir(parents=True)
+            validation_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "command": "git diff --check",
+                            "status": "passed",
+                            "detail": "No whitespace errors.",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            executable_scripts = [
+                script.replace(
+                    json.dumps(receipt),
+                    json.dumps(str(generated_receipt)),
+                ).replace(
+                    json.dumps(f"{receipt}.validation.json"),
+                    json.dumps(str(validation_path)),
+                )
+                for script in scripts
+            ]
+
+            exec(executable_scripts[0], {})
+            exec(executable_scripts[1], {})
+
+            generated = json.loads(generated_receipt.read_text(encoding="utf-8"))
+            self.assertEqual(generated["validation_complete"], True)
+            self.assertEqual(set(generated), set(template))
+            self.assertFalse(validation_path.exists())
+
+            del generated["validation_complete"]
+            generated_receipt.write_text(json.dumps(generated), encoding="utf-8")
+            with self.assertRaises(AssertionError):
+                exec(executable_scripts[1], {})
 
 
 class ReceiptFailureTest(unittest.TestCase):

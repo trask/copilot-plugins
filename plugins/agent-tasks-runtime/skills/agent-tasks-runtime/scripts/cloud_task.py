@@ -1424,6 +1424,48 @@ def build_policy_prompt(
             }
         ],
     }
+    receipt_contract_json = json.dumps(
+        receipt_contract,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    encoded_receipt_contract = base64.b64encode(
+        receipt_contract_json.encode("utf-8")
+    ).decode("ascii")
+    validation_path = f"{receipt}.validation.json"
+    receipt_literal = json.dumps(receipt, ensure_ascii=True)
+    validation_path_literal = json.dumps(validation_path, ensure_ascii=True)
+    validation_check = (
+        'isinstance(validation,list) and validation and all(isinstance(item,dict) '
+        'and set(item)=={"command","detail","status"} and '
+        'isinstance(item["command"],str) and item["command"].strip() and '
+        'item["status"]=="passed" and isinstance(item["detail"],str) and '
+        'item["detail"].strip() for item in validation)'
+    )
+    generate_receipt = (
+        "import base64,json,pathlib;"
+        f"receipt=pathlib.Path({receipt_literal});"
+        f"validation_path=pathlib.Path({validation_path_literal});"
+        'validation=json.loads(validation_path.read_text(encoding="utf-8"));'
+        f"assert {validation_check};"
+        f'data=json.loads(base64.b64decode("{encoded_receipt_contract}"));'
+        'data["validation"]=validation;'
+        "receipt.parent.mkdir(parents=True,exist_ok=True);"
+        'receipt.write_text(json.dumps(data,sort_keys=True)+"\\n",encoding="utf-8");'
+        "validation_path.unlink()"
+    )
+    verify_receipt = (
+        "import base64,json,pathlib;"
+        f'expected=json.loads(base64.b64decode("{encoded_receipt_contract}"));'
+        f"actual=json.loads(pathlib.Path({receipt_literal}).read_text("
+        'encoding="utf-8"));'
+        'validation=actual.get("validation");'
+        'expected["validation"]=validation;'
+        "assert actual==expected;"
+        'assert actual["validation_complete"] is True;'
+        f"assert {validation_check}"
+    )
     expected_paths = [receipt]
     if mode in {"report", "apply_with_report"}:
         expected_paths.insert(0, f"{REPORT_DIRECTORY}/{request_id}.md")
@@ -1441,9 +1483,19 @@ def build_policy_prompt(
         "must describe an exact command or deterministic review check that "
         "passed. A failed, skipped, missing, or incomplete validation is not a "
         "successful result.\n"
-        f"Write this exact JSON shape to `{receipt}` with the placeholders "
-        "replaced by complete validation outcomes:\n"
-        f"{json.dumps(receipt_contract, ensure_ascii=False, sort_keys=True)}\n"
+        f"Required receipt JSON template:\n{receipt_contract_json}\n"
+        "Do not hand-author or reconstruct the receipt. Write only the final "
+        f"validation JSON array to `{validation_path}`, then run this exact "
+        "generator from the repository root:\n"
+        "```sh\n"
+        f"python3 -c '{generate_receipt}'\n"
+        "```\n"
+        "Immediately before the final receipt commit, run this exact verifier. "
+        "If it fails, fix the receipt and rerun it; do not commit an unverified "
+        "receipt:\n"
+        "```sh\n"
+        f"python3 -c '{verify_receipt}'\n"
+        "```\n"
         "After all code and report work is final, create exactly one final "
         "single-parent receipt commit. Its changed paths must be exactly "
         f"{json.dumps(expected_paths)} and it must contain no other change. "
