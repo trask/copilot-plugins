@@ -1110,7 +1110,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.11", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.12", json.loads(PLUGIN.read_text())["version"])
 
     def test_prompt_pins_snapshot_allowance_model_policy_and_worker_boundary(self):
         prompt = MODULE.build_worker_prompt(
@@ -1905,6 +1905,110 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         processed = MODULE.load_state(state_path)["coordinator"]["processed_snapshots"]
         self.assertEqual([entry["task_id"] for entry in processed], ["task-1", "task-2"])
+
+    def test_pending_rerun_transition_recovers_completed_checks_after_restart(self):
+        state_path = self.root / "coordinator.json"
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "created_at": MODULE.utc_now(),
+                "iterations": 0,
+                "history": [],
+            },
+        )
+        result = {"result": "rerun", "task": {"id": "task-1"}}
+
+        completed = MODULE.prepare_pending_ci_rerun(
+            state_path,
+            self.preflight,
+            result,
+            ["check:a", "check:b"],
+        )
+        MODULE.record_completed_ci_rerun(state_path, "check:a")
+        recovered = MODULE.prepare_pending_ci_rerun(
+            state_path,
+            self.preflight,
+            result,
+            ["check:a", "check:b"],
+        )
+
+        self.assertEqual(completed, set())
+        self.assertEqual(recovered, {"check:a"})
+        coordinator = MODULE.load_state(state_path)["coordinator"]
+        self.assertNotIn("processed_snapshots", coordinator)
+
+    def test_local_coordinator_stops_when_rerun_is_unsupported(self):
+        repo_root = self.root / "repo"
+        repo_root.mkdir()
+        state_path = self.root / "coordinator.json"
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "created_at": MODULE.utc_now(),
+                "iterations": 0,
+                "history": [],
+            },
+        )
+        args = MODULE.build_parser().parse_args(
+            [
+                "loop",
+                "owner/repo#7",
+                "--repo-root",
+                str(repo_root),
+                "--state",
+                str(state_path),
+            ]
+        )
+
+        def run_iteration(_args):
+            MODULE.emit(
+                {
+                    "result": "rerun",
+                    "state": str(state_path),
+                    "task": {"id": "task-1"},
+                    "action_checks": ["check:a"],
+                }
+            )
+
+        def reject_rerun(_args):
+            MODULE.emit(
+                {
+                    "result": "no_rerun_support",
+                    "state": str(state_path),
+                    "check": "check:a",
+                }
+            )
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value={"repo_name": "owner/repo", "number": 7},
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_stable_ci_preflight",
+                return_value=self.preflight,
+            ) as wait,
+            mock.patch.object(MODULE, "command_agent_task", side_effect=run_iteration),
+            mock.patch.object(MODULE, "command_rerun", side_effect=reject_rerun),
+            contextlib.redirect_stdout(output),
+        ):
+            MODULE.command_loop(args)
+
+        self.assertEqual(json.loads(output.getvalue())["result"], "no_rerun_support")
+        self.assertEqual(wait.call_count, 1)
+        coordinator = MODULE.load_state(state_path)["coordinator"]
+        self.assertNotIn("pending_rerun", coordinator)
+        self.assertEqual(
+            coordinator["processed_snapshots"][0]["snapshot_sha256"],
+            self.preflight["check_snapshot"]["sha256"],
+        )
 
     def test_cleanup_removes_only_state_owned_agent_task_artifacts(self):
         state_path = self.root / "state.json"

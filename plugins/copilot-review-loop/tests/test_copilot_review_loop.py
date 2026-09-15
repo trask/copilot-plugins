@@ -1083,7 +1083,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("does not support `--input-result-file`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.11")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.12")
 
     def test_prompt_is_self_contained_versioned_and_treats_inputs_as_untrusted(self):
         prompt = MODULE.build_worker_prompt(
@@ -4516,6 +4516,66 @@ class CopilotReviewTest(unittest.TestCase):
         gh_json.assert_not_called()
         self.assertEqual(saved["monitoring"]["result"], {"result": "timeout"})
         self.assertEqual(emit.call_args_list[-1].args[0], {"result": "timeout"})
+
+    def test_watch_retries_rate_limited_review_comments_with_local_backoff(self):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "pr": {"upstream_owner": "owner", "upstream_repo": "repo", "number": 7},
+            "monitoring": {
+                "status": "requested",
+                "head_sha": "abc123",
+                "baseline_review_id": 100,
+                "copilot_bot_id": "BOT_1",
+                "request_start": "2026-05-01T12:00:00Z",
+                "cancel_requested": False,
+            },
+        }
+        review = {
+            "id": 101,
+            "html_url": "https://example.test/review/101",
+            "body": "",
+            "state": "COMMENTED",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(path, state)
+            args = SimpleNamespace(
+                state=str(path),
+                interval=1,
+                max_interval=10,
+                timeout=60,
+                poll_jitter=0,
+                cancellation_grace=0,
+            )
+            with (
+                mock.patch.object(MODULE.time, "monotonic", return_value=0),
+                mock.patch.object(MODULE.time, "sleep") as sleep,
+                mock.patch.object(
+                    MODULE, "gh_json", return_value={"head": {"sha": "abc123"}}
+                ),
+                mock.patch.object(MODULE, "fetch_reviews", return_value=[review]),
+                mock.patch.object(MODULE, "matching_review", return_value=review),
+                mock.patch.object(
+                    MODULE,
+                    "gh_paginated",
+                    side_effect=[
+                        MODULE.WorkflowError("API rate limit exceeded"),
+                        [],
+                    ],
+                ) as comments,
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_watch(args)
+
+            saved = MODULE.load_state(path)
+
+        self.assertEqual(comments.call_count, 2)
+        sleep.assert_called_once_with(1)
+        self.assertIn("rate limit", saved["monitoring"]["last_rate_limit"]["detail"])
+        self.assertEqual(
+            emit.call_args_list[-1].args[0]["result"],
+            MODULE.WATCHER_REVIEW_CLEAN,
+        )
 
     def test_tolerates_github_timestamp_precision(self):
         monitoring = {

@@ -2552,10 +2552,22 @@ def command_watch(args: argparse.Namespace) -> None:
                         },
                     )
                 else:
-                    comments = gh_paginated(
-                        f"repos/{pr['upstream_owner']}/{pr['upstream_repo']}/pulls/"
-                        f"{pr['number']}/reviews/{review['id']}/comments?per_page=100"
-                    )
+                    try:
+                        comments = gh_paginated(
+                            f"repos/{pr['upstream_owner']}/{pr['upstream_repo']}/pulls/"
+                            f"{pr['number']}/reviews/{review['id']}/comments?per_page=100"
+                        )
+                    except WorkflowError as error:
+                        if not is_rate_limit_error(error):
+                            raise
+                        monitoring["last_rate_limit"] = {
+                            "observed_at": utc_now(),
+                            "detail": str(error),
+                        }
+                        save_state(path, state)
+                        time.sleep(review_poll_delay(args, poll_attempt))
+                        poll_attempt += 1
+                        continue
                     suppressed = parse_suppressed_comments(review.get("body"))
                     clean = not comments and not suppressed
                     if clean:

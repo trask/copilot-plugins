@@ -6091,8 +6091,61 @@ def record_processed_ci_snapshot(
                 "recorded_at": utc_now(),
             }
         )
+    coordinator.pop("pending_rerun", None)
     coordinator["status"] = "waiting_for_checks"
     coordinator["observed_at"] = utc_now()
+    save_state(state_path, state)
+
+
+def prepare_pending_ci_rerun(
+    state_path: Path,
+    preflight: dict[str, Any],
+    result: dict[str, Any],
+    checks: list[str],
+) -> set[str]:
+    state = load_state(state_path)
+    coordinator = state.setdefault("coordinator", {})
+    task = result.get("task") if isinstance(result.get("task"), dict) else {}
+    expected = {
+        "head_sha": preflight["pr"]["head_sha"],
+        "snapshot_sha256": preflight["check_snapshot"]["sha256"],
+        "task_id": task.get("id"),
+        "checks": checks,
+    }
+    pending = coordinator.get("pending_rerun")
+    if isinstance(pending, dict):
+        actual = {key: pending.get(key) for key in expected}
+        if actual != expected:
+            raise WorkflowError(
+                "stored pending CI re-run does not match the current task result",
+                details={"expected": expected, "actual": actual},
+            )
+    else:
+        pending = {
+            **expected,
+            "completed_checks": [],
+            "recorded_at": utc_now(),
+        }
+        coordinator["pending_rerun"] = pending
+        save_state(state_path, state)
+    completed = pending.get("completed_checks")
+    return {
+        check
+        for check in completed
+        if isinstance(check, str)
+    } if isinstance(completed, list) else set()
+
+
+def record_completed_ci_rerun(state_path: Path, check: str) -> None:
+    state = load_state(state_path)
+    coordinator = state.get("coordinator")
+    pending = coordinator.get("pending_rerun") if isinstance(coordinator, dict) else None
+    if not isinstance(pending, dict):
+        raise WorkflowError("CI re-run completion has no pending coordinator transition")
+    completed = pending.setdefault("completed_checks", [])
+    if check not in completed:
+        completed.append(check)
+    pending["updated_at"] = utc_now()
     save_state(state_path, state)
 
 
@@ -6115,20 +6168,52 @@ def command_loop(args: argparse.Namespace) -> None:
             results = capture_command(command_agent_task, iteration_args)
             result = results[-1]
             task = result.get("task")
-            if isinstance(task, dict) and isinstance(task.get("id"), str):
-                record_processed_ci_snapshot(state_path, preflight, result)
+            has_task = isinstance(task, dict) and isinstance(task.get("id"), str)
             if result["result"] == "published":
+                if has_task:
+                    record_processed_ci_snapshot(state_path, preflight, result)
                 if args.stack_state:
                     emit(result)
                     return
                 continue
             if result["result"] == "rerun":
-                for check_key in result.get("action_checks") or []:
-                    capture_command(
+                if not has_task:
+                    raise WorkflowError("CI re-run result has no Agent Task identity")
+                check_keys = result.get("action_checks") or []
+                if not all(isinstance(check, str) for check in check_keys):
+                    raise WorkflowError("CI re-run result has invalid check identities")
+                completed = prepare_pending_ci_rerun(
+                    state_path,
+                    preflight,
+                    result,
+                    check_keys,
+                )
+                for check_key in check_keys:
+                    if check_key in completed:
+                        continue
+                    rerun_results = capture_command(
                         command_rerun,
                         argparse.Namespace(state=str(state_path), check=check_key),
                     )
+                    rerun_result = rerun_results[-1]
+                    if rerun_result["result"] in {
+                        "rerun_requested",
+                        "empty_commit_published",
+                    }:
+                        record_completed_ci_rerun(state_path, check_key)
+                        continue
+                    if rerun_result["result"] == "no_rerun_support":
+                        record_processed_ci_snapshot(state_path, preflight, result)
+                        emit(rerun_result)
+                        return
+                    raise WorkflowError(
+                        f"CI re-run returned unexpected result "
+                        f"{rerun_result['result']!r}"
+                    )
+                record_processed_ci_snapshot(state_path, preflight, result)
                 continue
+            if has_task:
+                record_processed_ci_snapshot(state_path, preflight, result)
             if result["result"] in {"waiting", "snapshot_already_processed"}:
                 continue
             emit(result)
