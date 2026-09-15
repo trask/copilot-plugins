@@ -1505,7 +1505,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
                     "--result-file",
                     str(state_path.with_name("run--result.json")),
                     "--policy",
-                    "marketplace-agent-worker@3",
+                    "marketplace-agent-worker@4",
                 ],
             )
             self.assertFalse(state_path.with_name("run--prompt.txt").exists())

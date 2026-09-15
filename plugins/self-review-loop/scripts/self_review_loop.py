@@ -75,14 +75,14 @@ VALIDATION_SOURCE_NAMES = {
     "tox.ini",
 }
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "2e55613128d057afadd1e0fd7814b0b232e55bc5743cef9e981812a355978b3a"
+    "fde33df61ebdb6d004ca939710e59cc4a5088dc25d270afac442516c1c2aaeb8"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
 CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
-AGENT_TASK_POLICY = "marketplace-agent-worker@3"
+AGENT_TASK_POLICY = "marketplace-agent-worker@4"
 AGENT_TASK_POLICY_SHA256 = (
-    "d39e81ee05237481ad5360d217dd6cfbe88de6b89c9d8b7b5f8cbb8bbf7a3703"
+    "04c1f4c1098ef0419f2bd94b8be120e303218588f2804ed79c0d706c8c2915ad"
 )
 AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
@@ -1299,7 +1299,6 @@ def build_worker_prompt(
         },
         "outcome": "cleared or max_iterations_reached",
         "iterations_used": "<integer from 1 through the supplied maximum>",
-        "fix_commits": ["<ordered full fix commit SHA>"],
         "findings": [
             {
                 "id": "<stable finding identifier>",
@@ -2746,7 +2745,7 @@ def validate_success_result(
 ) -> dict[str, Any]:
     expected_policy = {
         "id": "marketplace-agent-worker",
-        "version": 3,
+        "version": 4,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     if (
@@ -2984,7 +2983,6 @@ def validate_self_review_report(
         "pull_request",
         "outcome",
         "iterations_used",
-        "fix_commits",
         "findings",
         "validation",
         "pull_request_metadata",
@@ -3008,7 +3006,6 @@ def validate_self_review_report(
         or isinstance(report.get("iterations_used"), bool)
         or not isinstance(report.get("iterations_used"), int)
         or not 1 <= report["iterations_used"] <= max_iterations
-        or report.get("fix_commits") != remote["commits"]
         or report.get("validation") != remote["validation"]
         or not isinstance(report.get("findings"), list)
     ):

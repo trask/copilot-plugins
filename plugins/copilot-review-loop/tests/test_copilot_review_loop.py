@@ -994,7 +994,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "requested_model": "gpt-5.6-sol",
             "policy": {
                 "id": "marketplace-agent-worker",
-                "version": 3,
+                "version": 4,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -1054,7 +1054,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     "body_sha256": MODULE.sha256_text("Current body"),
                 },
                 "outcome": "addressed" if fixed else "no_changes",
-                "fix_commits": commits,
                 "comments": [
                     {
                         **identity,
@@ -1074,12 +1073,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_thin_and_version_is_bumped(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-worker@3", instructions)
+        self.assertIn("marketplace-agent-worker@4", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("does not support `--input-result-file`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.8")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.9")
 
     def test_prompt_is_self_contained_versioned_and_treats_inputs_as_untrusted(self):
         prompt = MODULE.build_worker_prompt(
@@ -1120,7 +1119,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             remote=remote,
             paths_by_commit={self.fix: ["src/app.py"]},
         )
-        self.assertEqual(report["fix_commits"], [self.fix])
+        self.assertEqual(remote["commits"], [self.fix])
+        self.assertNotIn("fix_commits", report)
         with self.assertRaisesRegex(MODULE.WorkflowError, "unexpected paths"):
             MODULE.validate_copilot_review_report(
                 self.report([self.fix]),

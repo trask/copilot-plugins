@@ -57,7 +57,7 @@ def result(commits=None):
         "requested_model": "gpt-5.6-sol",
         "policy": {
             "id": "marketplace-agent-worker",
-            "version": 3,
+            "version": 4,
             "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
         },
         "task": {
@@ -152,7 +152,6 @@ def report(commits=None, outcome=None):
         "outcome": outcome,
         "iterations": iterations,
         "max_iterations": 5,
-        "fix_commits": commits,
         "commits": [
             {"sha": sha, "summary": "Fix finding", "paths": ["app.py"]}
             for sha in commits
@@ -185,11 +184,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pins_shared_helper_and_policy_integrity(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "2e55613128d057afadd1e0fd7814b0b232e55bc5743cef9e981812a355978b3a",
+            "fde33df61ebdb6d004ca939710e59cc4a5088dc25d270afac442516c1c2aaeb8",
         )
         self.assertEqual(
             MODULE.AGENT_TASK_POLICY_SHA256,
-            "d39e81ee05237481ad5360d217dd6cfbe88de6b89c9d8b7b5f8cbb8bbf7a3703",
+            "04c1f4c1098ef0419f2bd94b8be120e303218588f2804ed79c0d706c8c2915ad",
         )
 
     def test_prompt_is_versioned_untrusted_and_remote_only(self):
@@ -241,7 +240,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "--result-file",
             str(first_result),
             "--policy",
-            "marketplace-agent-worker@3",
+            "marketplace-agent-worker@4",
         ]
         self.assertEqual(
             MODULE.agent_task_command(

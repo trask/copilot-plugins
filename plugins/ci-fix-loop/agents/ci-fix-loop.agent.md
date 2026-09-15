@@ -45,7 +45,7 @@ Use `--model sol` unless the caller selected another supported model. The helper
 
 Every failing-check iteration launches exactly one managed GitHub Agent Task through `agent-task`. The coordinator pins the open pull request, local branch, head, base, authenticated viewer, check rollup, failing logs and their digests, model, policy, and one-iteration allowance before dispatch.
 
-The command discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies its pinned SHA-256, and invokes it with `--result-file`, `--policy marketplace-agent-worker@3`, and absolute prompt and result paths outside the repository.
+The command discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies its pinned SHA-256, and invokes it with `--result-file`, `--policy marketplace-agent-worker@4`, and absolute prompt and result paths outside the repository.
 
 Never use Cloud Sandboxes or a local fallback. Never pass `custom_agent`. Never pass credentials. Never read helper stdout as a result. Never run `gh pr diff`, a repository command, a formatter, a build, a test, or a probe.
 

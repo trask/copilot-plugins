@@ -45,14 +45,14 @@ GITHUB_PR_DIFF = "github_pr_diff"
 CUMULATIVE_GIT_DIFF = "cumulative_git_diff"
 BARE_TARGET_PATTERN = re.compile(r"^#?(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "2e55613128d057afadd1e0fd7814b0b232e55bc5743cef9e981812a355978b3a"
+    "fde33df61ebdb6d004ca939710e59cc4a5088dc25d270afac442516c1c2aaeb8"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
 CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
-AGENT_TASK_POLICY = "marketplace-agent-worker@3"
+AGENT_TASK_POLICY = "marketplace-agent-worker@4"
 AGENT_TASK_POLICY_SHA256 = (
-    "d39e81ee05237481ad5360d217dd6cfbe88de6b89c9d8b7b5f8cbb8bbf7a3703"
+    "04c1f4c1098ef0419f2bd94b8be120e303218588f2804ed79c0d706c8c2915ad"
 )
 AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
@@ -2467,7 +2467,6 @@ def build_worker_prompt(
             }
         ],
         "max_iterations": max_iterations,
-        "fix_commits": ["<ordered full fix commit SHA>"],
         "commits": [
             {
                 "sha": "<full fix commit SHA>",
@@ -2667,7 +2666,7 @@ def validate_success_result(
 ) -> dict[str, Any]:
     expected_policy = {
         "id": "marketplace-agent-worker",
-        "version": 3,
+        "version": 4,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     task = result.get("task")
@@ -2837,7 +2836,6 @@ def validate_audit_report(
             "outcome",
             "iterations",
             "max_iterations",
-            "fix_commits",
             "commits",
             "validation",
             "pipeline",
@@ -2853,7 +2851,6 @@ def validate_audit_report(
         or not isinstance(report.get("iterations"), list)
         or not report["iterations"]
         or len(report["iterations"]) > max_iterations
-        or report.get("fix_commits") != commits
         or not isinstance(report.get("commits"), list)
         or not isinstance(report.get("pipeline"), dict)
     ):
@@ -3215,7 +3212,7 @@ def validate_recovery_result_identity(
 ) -> bool:
     expected_policy = {
         "id": "marketplace-agent-worker",
-        "version": 3,
+        "version": 4,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     if (

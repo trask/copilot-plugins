@@ -47,7 +47,7 @@ POLICY_MARKER = "----- marketplace agent worker policy -----"
 RESULT_SCHEMA_ID = "github.copilot.agent-task-result"
 RESULT_SCHEMA_VERSION = 1
 MARKETPLACE_POLICY_ID = "marketplace-agent-worker"
-MARKETPLACE_POLICY_VERSION = 3
+MARKETPLACE_POLICY_VERSION = 4
 MARKETPLACE_POLICY_SPEC = {
     "id": MARKETPLACE_POLICY_ID,
     "version": MARKETPLACE_POLICY_VERSION,
@@ -61,7 +61,8 @@ MARKETPLACE_POLICY_SPEC = {
     "require_linear_generated_history": True,
     "require_expected_paths_only": True,
     "require_fix_commit_correlation": True,
-    "require_ordered_report_commit_mapping": True,
+    "human_report": "nonempty-utf8-markdown",
+    "dispatcher_generated_commit_order": True,
     "require_complete_successful_validation": True,
     "worker_artifact": "remote-validation-array",
     "dispatcher_attestation": True,
@@ -1576,9 +1577,9 @@ def build_policy_prompt(
         "preceding linear commits, make no preceding commit in report mode, and "
         "do not add commits afterward. In apply-with-report mode, every fix commit "
         "must have a concise normal message with one nonempty `Finding: <identifier>` "
-        "line. Put the complete workflow-defined inventory and reasoning in the "
-        "report, and include a top-level `fix_commits` array listing every full fix "
-        "commit SHA in generated order.\n"
+        "line, unique among the generated fix commits. Keep the report as nonempty "
+        "UTF-8 Markdown for humans. The dispatcher derives and records generated "
+        "fix commit order; do not echo commit SHAs for dispatcher attestation.\n"
         f"{POLICY_MARKER}"
     )
 
@@ -2159,71 +2160,30 @@ class GitRepository:
         return ReportHistory(code_head, code_commits, report_commit)
 
     def require_correlated_fix_commits(
-        self, root: Path, commits: Sequence[str], report_content: str
+        self, root: Path, commits: Sequence[str]
     ) -> None:
-        def reject_duplicate_keys(
-            pairs: list[tuple[str, object]],
-        ) -> dict[str, object]:
-            parsed: dict[str, object] = {}
-            for key, value in pairs:
-                if key in parsed:
-                    raise CloudError(
-                        f"marketplace worker report contains duplicate key {key!r}",
-                        "malformed_report",
-                    )
-                parsed[key] = value
-            return parsed
-
-        try:
-            report = json.loads(
-                report_content,
-                object_pairs_hook=reject_duplicate_keys,
-            )
-        except json.JSONDecodeError as error:
-            raise CloudError(
-                f"marketplace worker report is not valid JSON: {error}",
-                "malformed_report",
-            ) from error
-        if not isinstance(report, dict) or "fix_commits" not in report:
-            raise CloudError(
-                "marketplace worker report is missing the ordered fix_commits mapping",
-                "malformed_report",
-            )
-        reported_commits = report["fix_commits"]
-        if (
-            not isinstance(reported_commits, list)
-            or any(
-                not isinstance(commit, str)
-                or SHA_PATTERN.fullmatch(commit) is None
-                or commit.lower() != commit
-                for commit in reported_commits
-            )
-            or len(set(reported_commits)) != len(reported_commits)
-        ):
-            raise CloudError(
-                "marketplace worker report has a malformed fix_commits mapping",
-                "malformed_report",
-            )
-        if list(commits) != reported_commits:
-            raise CloudError(
-                "marketplace worker report fix_commits mapping does not match "
-                "generated fix commits in order",
-                "malformed_report",
-            )
+        correlations: set[str] = set()
         for commit in commits:
             message = self._run(root, "show", "-s", "--format=%B", commit).stdout
-            if (
-                re.search(
-                    rf"(?m)^{FIX_COMMIT_CORRELATION_FIELD}:[ \t]+\S",
-                    message,
-                )
-                is None
-            ):
+            matches = re.findall(
+                rf"(?m)^{FIX_COMMIT_CORRELATION_FIELD}:[ \t]+"
+                r"([^\r\n]*\S)[ \t]*$",
+                message,
+            )
+            if len(matches) != 1:
                 raise CloudError(
-                    f"fix commit {commit} is missing a nonempty "
+                    f"fix commit {commit} must contain exactly one nonempty "
                     f"{FIX_COMMIT_CORRELATION_FIELD}: correlation",
                     "malformed_history",
                 )
+            correlation = matches[0].strip()
+            if correlation in correlations:
+                raise CloudError(
+                    f"fix commit {commit} reuses Finding: correlation "
+                    f"{correlation!r}",
+                    "malformed_history",
+                )
+            correlations.add(correlation)
 
     def fast_forward(
         self, snapshot: WorktreeSnapshot, tracking_ref: str
@@ -3661,7 +3621,7 @@ def execute(
             if report is None:
                 raise AssertionError("policy mode did not retrieve its report")
             git.require_correlated_fix_commits(
-                snapshot.root, history.code_commits, report
+                snapshot.root, history.code_commits
             )
         else:
             try:
@@ -3672,7 +3632,7 @@ def execute(
                 if not report.strip():
                     raise CloudError("the committed report is empty")
                 git.require_correlated_fix_commits(
-                    snapshot.root, history.code_commits, report
+                    snapshot.root, history.code_commits
                 )
             except CloudError as error:
                 raise _missing_report_context(error, final, refs) from None

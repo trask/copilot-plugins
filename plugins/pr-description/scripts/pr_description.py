@@ -54,14 +54,14 @@ SHARED_STATE_CONFIG = Path(".copilot/extensions/pr-flight/state-repo.json")
 SHARED_STATE_VERSION = 1
 SHARED_STATE_MAX_ATTEMPTS = 3
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "2e55613128d057afadd1e0fd7814b0b232e55bc5743cef9e981812a355978b3a"
+    "fde33df61ebdb6d004ca939710e59cc4a5088dc25d270afac442516c1c2aaeb8"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
 CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
-AGENT_TASK_POLICY = "marketplace-agent-worker@3"
+AGENT_TASK_POLICY = "marketplace-agent-worker@4"
 AGENT_TASK_POLICY_SHA256 = (
-    "d39e81ee05237481ad5360d217dd6cfbe88de6b89c9d8b7b5f8cbb8bbf7a3703"
+    "04c1f4c1098ef0419f2bd94b8be120e303218588f2804ed79c0d706c8c2915ad"
 )
 AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
@@ -1535,7 +1535,7 @@ def validate_result_identity(
 ) -> None:
     expected_policy = {
         "id": "marketplace-agent-worker",
-        "version": 3,
+        "version": 4,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     repository = result.get("repository")

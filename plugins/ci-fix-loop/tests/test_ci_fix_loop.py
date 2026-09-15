@@ -981,7 +981,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "requested_model": "gpt-5.6-sol",
             "policy": {
                 "id": "marketplace-agent-worker",
-                "version": 3,
+                "version": 4,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -1053,7 +1053,6 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 },
                 "iteration_allowance": 1,
                 "outcome": outcome,
-                "fix_commits": commits,
                 "failures": [
                     {
                         "key": failure["key"],
@@ -1100,13 +1099,13 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-worker@3", instructions)
+        self.assertIn("marketplace-agent-worker@4", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("`custom_agent`", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.8", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.9", json.loads(PLUGIN.read_text())["version"])
 
     def test_prompt_pins_snapshot_allowance_model_policy_and_worker_boundary(self):
         prompt = MODULE.build_worker_prompt(
@@ -1160,7 +1159,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             ),
             commits=[commit],
         )
-        self.assertEqual([commit], report["fix_commits"])
+        self.assertNotIn("fix_commits", report)
 
     def test_accepts_rerun_preexisting_and_unfixable_outcomes(self):
         for outcome, disposition in (
