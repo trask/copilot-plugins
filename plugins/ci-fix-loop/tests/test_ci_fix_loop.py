@@ -1100,13 +1100,13 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-worker@2", instructions)
+        self.assertIn("marketplace-agent-worker@3", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("`custom_agent`", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.5", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.6", json.loads(PLUGIN.read_text())["version"])
 
     def test_prompt_pins_snapshot_allowance_model_policy_and_worker_boundary(self):
         prompt = MODULE.build_worker_prompt(
@@ -1264,8 +1264,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             f"{commit} {self.head}",
             f"{self.artifact} {commit}",
             (
-                "Fix CI\n\nFailing check: test\nCause: bug\nFix: code\n"
-                "Validation: focused test\n"
+                "Fix CI\n\nFinding: failing-test\n"
             ),
         ]
         with (

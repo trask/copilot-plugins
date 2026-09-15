@@ -42,14 +42,14 @@ PROPAGATION_CONTAINMENT_RETRY_DELAYS = (1, 2, 4)
 EMPTY_RERUN_COMMIT_MESSAGE = "ci: rerun checks"
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "66a76fa96d8eafd8b256ae5477777aab0a190d4b99a05cb90c56e03fc8dc8565"
+    "a3b69079775b769bd5845cbf7a8d4136fdc7ece5b535b5dcbb448d8cb8d329ba"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
 CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
-AGENT_TASK_POLICY = "marketplace-agent-worker@2"
+AGENT_TASK_POLICY = "marketplace-agent-worker@3"
 AGENT_TASK_POLICY_SHA256 = (
-    "33bb702b099ee1c7dd933f81396c3081279a781c9c8e04e7d4a0dee9317d5714"
+    "d39e81ee05237481ad5360d217dd6cfbe88de6b89c9d8b7b5f8cbb8bbf7a3703"
 )
 AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
@@ -73,7 +73,7 @@ REPORT_PATH_PATTERN = re.compile(
 RECEIPT_PATH_PATTERN = re.compile(
     r"^\.github/agent-task-validations/(?P<request_id>[A-Za-z0-9][A-Za-z0-9._-]*)\.json$"
 )
-CI_FIX_COMMIT_FIELDS = ("Failing check", "Cause", "Fix", "Validation")
+FIX_COMMIT_CORRELATION_FIELD = "Finding"
 PR_URL_PATTERN = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
     r"/?(?:#\S*)?$"
@@ -4604,9 +4604,9 @@ def build_worker_prompt(
         "Make the smallest complete fix, format it, and run every focused validation "
         "relevant to each observed failure. A successful fix or already-fixed result "
         "must cover each such check with one or more passed validation commands. Put "
-        "each independent fix in a linear single-parent commit. Each fix commit message "
-        "must contain non-empty `Failing check:`, `Cause:`, `Fix:`, and `Validation:` "
-        "fields. Do not change the report or validation paths in a fix commit. Create no "
+        "each independent fix in a linear single-parent commit. Give every fix commit a "
+        "concise normal message with one nonempty `Finding: <identifier>` line. Do not "
+        "change the report or validation paths in a fix commit. Create no "
         "fix commit for a flake, pre-existing failure, unfixable failure, or no-op.\n\n"
         "The managed apply-with-report contract creates the final report-and-validation "
         "artifact commit. The artifact commit must follow every fix commit. Do not push "
@@ -5110,14 +5110,14 @@ def validate_generated_history(
             raise WorkflowError(f"fix commit {commit} changed an Agent Task artifact")
         changed.update(paths)
         message = git(repo_root, "show", "-s", "--format=%B", commit)
-        missing = [
-            field
-            for field in CI_FIX_COMMIT_FIELDS
-            if re.search(rf"(?m)^{re.escape(field)}:[ \t]*\S", message) is None
-        ]
-        if missing:
+        if (
+            re.search(
+                rf"(?m)^{FIX_COMMIT_CORRELATION_FIELD}:[ \t]*\S", message
+            )
+            is None
+        ):
             raise WorkflowError(
-                f"fix commit {commit} does not satisfy the CI fix commit contract"
+                f"fix commit {commit} does not contain a finding correlation"
             )
     if sorted(changed) != expected_paths:
         raise WorkflowError("fix commits changed unexpected or unreported paths")

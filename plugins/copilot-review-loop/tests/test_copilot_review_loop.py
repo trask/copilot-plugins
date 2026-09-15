@@ -1074,12 +1074,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_thin_and_version_is_bumped(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-worker@2", instructions)
+        self.assertIn("marketplace-agent-worker@3", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("does not support `--input-result-file`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.5")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.6")
 
     def test_prompt_is_self_contained_versioned_and_treats_inputs_as_untrusted(self):
         prompt = MODULE.build_worker_prompt(

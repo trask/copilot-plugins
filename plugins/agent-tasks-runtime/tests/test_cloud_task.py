@@ -36,7 +36,7 @@ class PolicyPromptTest(unittest.TestCase):
             pull_request=SimpleNamespace(head_sha="1" * 40),
         )
 
-        self.assertIn("Policy: marketplace-agent-worker@2", prompt)
+        self.assertIn("Policy: marketplace-agent-worker@3", prompt)
         self.assertIn(f"write `{validation_path}` as a nonempty JSON array", prompt)
         self.assertIn("exactly `command`, `status`, and `detail`", prompt)
         self.assertIn("`status` must be `passed`", prompt)
@@ -54,28 +54,32 @@ class PolicyPromptTest(unittest.TestCase):
         self.assertNotIn("validation_complete", prompt)
         self.assertNotIn("python3 -c", prompt)
         self.assertNotIn("pull_request_head_sha", prompt)
+        self.assertIn("`Finding: <identifier>`", prompt)
+        self.assertIn("top-level `fix_commits` array", prompt)
 
-    def test_v1_policy_is_explicitly_rejected(self):
+    def test_older_policies_are_explicitly_rejected(self):
         result_path = str((Path.cwd().parent / "result.json").resolve())
-        with self.assertRaisesRegex(
-            MODULE.CloudError,
-            "unknown policy 'marketplace-agent-worker@1'; expected "
-            "marketplace-agent-worker@2",
-        ) as raised:
-            MODULE.parse_args(
-                [
-                    "--apply-with-report",
-                    "--pr",
-                    "owner/repo#1",
-                    "--result-file",
-                    result_path,
-                    "--policy",
-                    "marketplace-agent-worker@1",
-                    "Review.",
-                ]
-            )
+        for version in (1, 2):
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(
+                    MODULE.CloudError,
+                    f"unknown policy 'marketplace-agent-worker@{version}'; expected "
+                    "marketplace-agent-worker@3",
+                ) as raised:
+                    MODULE.parse_args(
+                        [
+                            "--apply-with-report",
+                            "--pr",
+                            "owner/repo#1",
+                            "--result-file",
+                            result_path,
+                            "--policy",
+                            f"marketplace-agent-worker@{version}",
+                            "Review.",
+                        ]
+                    )
 
-        self.assertEqual(raised.exception.code, "policy_unknown")
+                self.assertEqual(raised.exception.code, "policy_unknown")
 
 
 class ValidationArtifactTest(unittest.TestCase):
@@ -242,6 +246,73 @@ class WorkerHistoryTest(unittest.TestCase):
                 [".github/agent-task-validations/request-1.json"],
             )
 
+    def test_accepts_one_field_commit_and_exact_report_mapping(self):
+        fix = "2" * 40
+        repository = self.repository(
+            {
+                ("show", "-s"): "Fix inconsistent instrumentation\n\nFinding: finding-7\n",
+            }
+        )
+
+        repository.require_correlated_fix_commits(
+            Path("C:/repo"),
+            [fix],
+            json.dumps({"fix_commits": [fix], "findings": [{"id": "finding-7"}]}),
+        )
+
+    def test_rejects_missing_commit_correlation(self):
+        fix = "2" * 40
+        repository = self.repository({("show", "-s"): "Fix inconsistency\n"})
+
+        with self.assertRaisesRegex(MODULE.CloudError, "Finding: correlation") as raised:
+            repository.require_correlated_fix_commits(
+                Path("C:/repo"),
+                [fix],
+                json.dumps({"fix_commits": [fix]}),
+            )
+
+        self.assertEqual(raised.exception.code, "malformed_history")
+
+    def test_rejects_missing_or_reordered_report_commit_mapping(self):
+        first = "2" * 40
+        second = "3" * 40
+        repository = self.repository(
+            {("show", "-s"): "Fix inconsistency\n\nFinding: finding-7\n"}
+        )
+        cases = [
+            {},
+            {"fix_commits": [first]},
+            {"fix_commits": [second, first]},
+            {"fix_commits": [first[:12], second]},
+            {"fix_commits": [first, first]},
+        ]
+
+        for report in cases:
+            with self.subTest(report=report):
+                with self.assertRaises(MODULE.CloudError) as raised:
+                    repository.require_correlated_fix_commits(
+                        Path("C:/repo"),
+                        [first, second],
+                        json.dumps(report),
+                    )
+                self.assertEqual(raised.exception.code, "malformed_report")
+
+    def test_rejects_invalid_json_and_duplicate_report_keys(self):
+        repository = self.repository({})
+
+        for report in (
+            "{",
+            '{"fix_commits":[],"fix_commits":[]}',
+        ):
+            with self.subTest(report=report):
+                with self.assertRaises(MODULE.CloudError) as raised:
+                    repository.require_correlated_fix_commits(
+                        Path("C:/repo"),
+                        [],
+                        report,
+                    )
+                self.assertEqual(raised.exception.code, "malformed_report")
+
 
 class DispatcherFinalizationTest(unittest.TestCase):
     def setUp(self):
@@ -249,7 +320,12 @@ class DispatcherFinalizationTest(unittest.TestCase):
         self.base_sha = "1" * 40
         self.code_commit = "2" * 40
         self.artifact_commit = "3" * 40
-        self.report = "Complete consistency report.\n"
+        self.report = json.dumps(
+            {
+                "fix_commits": [self.code_commit],
+                "findings": [{"id": "finding-7", "reason": "Full report reasoning."}],
+            }
+        )
         self.snapshot = MODULE.WorktreeSnapshot(
             self.root,
             "owner/repo",
@@ -400,9 +476,10 @@ class DispatcherFinalizationTest(unittest.TestCase):
             hashlib.sha256(self.report.encode("utf-8")).hexdigest(),
         )
         self.assertTrue(result.validation_complete)
-        repository.require_structured_fix_commits.assert_called_once_with(
+        repository.require_correlated_fix_commits.assert_called_once_with(
             self.root,
             (self.code_commit,),
+            self.report,
         )
         repository.fast_forward.assert_called_once_with(
             self.snapshot,

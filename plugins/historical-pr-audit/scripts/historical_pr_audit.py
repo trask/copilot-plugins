@@ -45,14 +45,14 @@ GITHUB_PR_DIFF = "github_pr_diff"
 CUMULATIVE_GIT_DIFF = "cumulative_git_diff"
 BARE_TARGET_PATTERN = re.compile(r"^#?(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "66a76fa96d8eafd8b256ae5477777aab0a190d4b99a05cb90c56e03fc8dc8565"
+    "a3b69079775b769bd5845cbf7a8d4136fdc7ece5b535b5dcbb448d8cb8d329ba"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
 CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
-AGENT_TASK_POLICY = "marketplace-agent-worker@2"
+AGENT_TASK_POLICY = "marketplace-agent-worker@3"
 AGENT_TASK_POLICY_SHA256 = (
-    "33bb702b099ee1c7dd933f81396c3081279a781c9c8e04e7d4a0dee9317d5714"
+    "d39e81ee05237481ad5360d217dd6cfbe88de6b89c9d8b7b5f8cbb8bbf7a3703"
 )
 AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
@@ -76,17 +76,7 @@ REPORT_PATH_PATTERN = re.compile(
 RECEIPT_PATH_PATTERN = re.compile(
     r"^\.github/agent-task-validations/(?P<request_id>[A-Za-z0-9][A-Za-z0-9._-]*)\.json$"
 )
-FIX_COMMIT_FIELDS = (
-    "Finding",
-    "Changed code",
-    "Compliant exemplar",
-    "Frequency",
-    "Disposition",
-    "Applicable rules",
-    "Rule-conflict gate",
-    "Why avoidable",
-    "Validation",
-)
+FIX_COMMIT_CORRELATION_FIELD = "Finding"
 
 # Five commit identities travel through this workflow and none of them is
 # interchangeable with another:
@@ -2477,6 +2467,7 @@ def build_worker_prompt(
             }
         ],
         "max_iterations": max_iterations,
+        "fix_commits": ["<ordered full fix commit SHA>"],
         "commits": [
             {
                 "sha": "<full fix commit SHA>",
@@ -2519,9 +2510,9 @@ def build_worker_prompt(
         "outside the merged pull request's scope.\n\n"
         "For each accepted root cause, edit the historical tree, add or update focused "
         "tests, run formatting and complete focused validation, and create one linear "
-        "single-parent fix commit. Never create a merge commit. Every fix commit body "
-        "must contain the marketplace policy's structured fields. Group findings that "
-        "share one cause and keep unrelated causes in separate commits. A failed, "
+        "single-parent fix commit. Never create a merge commit. Give every fix commit "
+        "a concise normal message with one nonempty `Finding: <identifier>` line. Group "
+        "findings that share one cause and keep unrelated causes in separate commits. A failed, "
         "skipped, or incomplete validation stops the task without a successful result.\n\n"
         "Repeat the audit against the cumulative diff from the pinned original base "
         "through the current task head until a complete pass is clean or the limit is "
@@ -2846,6 +2837,7 @@ def validate_audit_report(
             "outcome",
             "iterations",
             "max_iterations",
+            "fix_commits",
             "commits",
             "validation",
             "pipeline",
@@ -2861,6 +2853,7 @@ def validate_audit_report(
         or not isinstance(report.get("iterations"), list)
         or not report["iterations"]
         or len(report["iterations"]) > max_iterations
+        or report.get("fix_commits") != commits
         or not isinstance(report.get("commits"), list)
         or not isinstance(report.get("pipeline"), dict)
     ):
@@ -3018,14 +3011,14 @@ def validate_imported_commits(
             raise WorkflowError(f"generated commit {commit} changed unexpected paths")
         body = git(repo_root, "show", "-s", "--format=%B", commit)
         require_no_credentials(body, source=f"generated commit {commit} body")
-        missing = [
-            field
-            for field in FIX_COMMIT_FIELDS
-            if re.search(rf"(?m)^{re.escape(field)}:[ \t]+\S", body) is None
-        ]
-        if missing:
+        if (
+            re.search(
+                rf"(?m)^{FIX_COMMIT_CORRELATION_FIELD}:[ \t]+\S", body
+            )
+            is None
+        ):
             raise WorkflowError(
-                f"generated commit {commit} has a malformed body: {', '.join(missing)}"
+                f"generated commit {commit} does not contain a finding correlation"
             )
 
 

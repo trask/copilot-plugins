@@ -1318,14 +1318,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-worker@2", instructions)
+        self.assertIn("marketplace-agent-worker@3", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("marketplace `custom_agent`", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.5")
+        self.assertEqual(plugin["version"], "1.3.6")
         self.assertNotIn("custom_agent", plugin)
 
     def test_prompt_is_versioned_self_contained_and_fail_closed(self):
@@ -1337,7 +1337,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("worker prompt version 1", prompt)
         self.assertIn("maximum_review_iterations", prompt)
         self.assertIn("untrusted data", prompt)
-        self.assertIn("structured fields Finding", prompt)
+        self.assertIn("`Finding: <identifier>`", prompt)
         self.assertIn("explicit no-change result", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
 
@@ -1448,7 +1448,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 remote=remote,
             )
 
-    def test_rejects_unstructured_fix_commits_and_unexpected_history(self):
+    def test_rejects_uncorrelated_fix_commits_and_unexpected_history(self):
         fix = "5" * 40
         remote = self.remote(commits=[fix])
         with (
@@ -1479,7 +1479,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     ["src/app.py"],
                 ],
             ),
-            self.assertRaisesRegex(MODULE.WorkflowError, "structured fix"),
+            self.assertRaisesRegex(MODULE.WorkflowError, "finding correlation"),
         ):
             MODULE.validate_generated_history(
                 self.repo_root,

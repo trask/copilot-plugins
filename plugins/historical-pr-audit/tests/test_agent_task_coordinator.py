@@ -152,6 +152,7 @@ def report(commits=None, outcome=None):
         "outcome": outcome,
         "iterations": iterations,
         "max_iterations": 5,
+        "fix_commits": commits,
         "commits": [
             {"sha": sha, "summary": "Fix finding", "paths": ["app.py"]}
             for sha in commits
@@ -184,11 +185,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pins_shared_helper_and_policy_integrity(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "66a76fa96d8eafd8b256ae5477777aab0a190d4b99a05cb90c56e03fc8dc8565",
+            "a3b69079775b769bd5845cbf7a8d4136fdc7ece5b535b5dcbb448d8cb8d329ba",
         )
         self.assertEqual(
             MODULE.AGENT_TASK_POLICY_SHA256,
-            "33bb702b099ee1c7dd933f81396c3081279a781c9c8e04e7d4a0dee9317d5714",
+            "d39e81ee05237481ad5360d217dd6cfbe88de6b89c9d8b7b5f8cbb8bbf7a3703",
         )
 
     def test_prompt_is_versioned_untrusted_and_remote_only(self):
@@ -240,7 +241,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "--result-file",
             str(first_result),
             "--policy",
-            "marketplace-agent-worker@2",
+            "marketplace-agent-worker@3",
         ]
         self.assertEqual(
             MODULE.agent_task_command(
@@ -731,9 +732,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     def test_import_rejects_merge_unexpected_paths_and_bad_body(self):
         commit = "6" * 40
-        valid_body = "\n".join(
-            f"{field}: value" for field in MODULE.FIX_COMMIT_FIELDS
-        )
+        valid_body = "Fix historical finding\n\nFinding: finding-1\n"
 
         def run_case(parents, paths, body, identity=None):
             def fake_git(_repo, *arguments):

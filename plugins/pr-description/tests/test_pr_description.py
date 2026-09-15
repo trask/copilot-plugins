@@ -725,7 +725,7 @@ class LegacyAgentInstructions:
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.38")
+        self.assertEqual(plugin["version"], "1.0.39")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -867,7 +867,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("You are a thin local coordinator", instructions)
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-worker@2", instructions)
+        self.assertIn("marketplace-agent-worker@3", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertIn("Never scrape", instructions)
@@ -880,7 +880,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.38")
+        self.assertEqual(plugin["version"], "1.0.39")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1057,7 +1057,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("--report", command)
         self.assertEqual(
             command[command.index("--policy") + 1],
-            "marketplace-agent-worker@2",
+            "marketplace-agent-worker@3",
         )
         self.assertNotIn("--custom-agent", command)
         result_path = Path(command[command.index("--result-file") + 1])

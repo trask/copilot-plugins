@@ -75,14 +75,14 @@ VALIDATION_SOURCE_NAMES = {
     "tox.ini",
 }
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "66a76fa96d8eafd8b256ae5477777aab0a190d4b99a05cb90c56e03fc8dc8565"
+    "a3b69079775b769bd5845cbf7a8d4136fdc7ece5b535b5dcbb448d8cb8d329ba"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
 CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
-AGENT_TASK_POLICY = "marketplace-agent-worker@2"
+AGENT_TASK_POLICY = "marketplace-agent-worker@3"
 AGENT_TASK_POLICY_SHA256 = (
-    "33bb702b099ee1c7dd933f81396c3081279a781c9c8e04e7d4a0dee9317d5714"
+    "d39e81ee05237481ad5360d217dd6cfbe88de6b89c9d8b7b5f8cbb8bbf7a3703"
 )
 AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
@@ -106,17 +106,7 @@ REPORT_PATH_PATTERN = re.compile(
 RECEIPT_PATH_PATTERN = re.compile(
     r"^\.github/agent-task-validations/(?P<request_id>[A-Za-z0-9][A-Za-z0-9._-]*)\.json$"
 )
-STRUCTURED_FIX_FIELDS = (
-    "Finding",
-    "Changed code",
-    "Compliant exemplar",
-    "Frequency",
-    "Disposition",
-    "Applicable rules",
-    "Rule-conflict gate",
-    "Why avoidable",
-    "Validation",
-)
+FIX_COMMIT_CORRELATION_FIELD = "Finding"
 
 
 class WorkflowError(RuntimeError):
@@ -1355,11 +1345,11 @@ def build_worker_prompt(
         "a failed or skipped validation in a successful result. Never ask the local "
         "coordinator to run code, inspect files, or retry validation.\n\n"
         "Put substantive fixes in linear, single-parent commits before the final "
-        "report-and-validation artifact commit. Every fix commit must include the exact "
-        "structured fields Finding, Changed code, Compliant exemplar, Frequency, "
-        "Disposition, Applicable rules, Rule-conflict gate, Why avoidable, and "
-        "Validation, with `Disposition: avoidable`. Do not put report or validation paths "
-        "in fix commits. If no code change is needed, create no fix commit: the final "
+        "report-and-validation artifact commit. Give every fix commit a concise normal "
+        "message with one nonempty `Finding: <identifier>` line. Keep the complete "
+        "finding inventory, reasoning, and validation evidence in the final report and "
+        "validation artifact. Do not put report or validation paths in fix commits. If no "
+        "code change is needed, create no fix commit: the final "
         "report-and-validation commit is the explicit no-change result and must say the "
         "pull request was cleared. The managed apply-with-report contract supplies the "
         "final artifact paths and commit rules.\n\n"
@@ -2966,16 +2956,14 @@ def validate_generated_history(
         if any(path.startswith(reserved) for path in paths):
             raise WorkflowError(f"fix commit {commit} changed an Agent Task artifact")
         message = git(repo_root, "show", "-s", "--format=%B", commit)
-        missing = [
-            field
-            for field in STRUCTURED_FIX_FIELDS
-            if re.search(rf"(?m)^{re.escape(field)}:[ \t]+\S", message) is None
-        ]
-        if missing or re.search(
-            r"(?im)^Disposition:[ \t]+avoidable[ \t]*$", message
-        ) is None:
+        if (
+            re.search(
+                rf"(?m)^{FIX_COMMIT_CORRELATION_FIELD}:[ \t]+\S", message
+            )
+            is None
+        ):
             raise WorkflowError(
-                f"fix commit {commit} does not satisfy the structured fix contract"
+                f"fix commit {commit} does not contain a finding correlation"
             )
 
 
