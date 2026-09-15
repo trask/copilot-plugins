@@ -1079,7 +1079,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("does not support `--input-result-file`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.7")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.8")
 
     def test_prompt_is_self_contained_versioned_and_treats_inputs_as_untrusted(self):
         prompt = MODULE.build_worker_prompt(

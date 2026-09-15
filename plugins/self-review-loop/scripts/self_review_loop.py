@@ -75,7 +75,7 @@ VALIDATION_SOURCE_NAMES = {
     "tox.ini",
 }
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "a3b69079775b769bd5845cbf7a8d4136fdc7ece5b535b5dcbb448d8cb8d329ba"
+    "2e55613128d057afadd1e0fd7814b0b232e55bc5743cef9e981812a355978b3a"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"

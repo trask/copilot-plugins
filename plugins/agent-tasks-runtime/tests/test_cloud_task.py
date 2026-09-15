@@ -82,6 +82,203 @@ class PolicyPromptTest(unittest.TestCase):
                 self.assertEqual(raised.exception.code, "policy_unknown")
 
 
+class InterruptedApplyRecoveryTest(unittest.TestCase):
+    def setUp(self):
+        self.task_id = "task-1"
+        self.request_id = "request-1"
+        self.repository = "owner/repo"
+        self.model = "gpt-5.6-sol"
+        self.report_path = (
+            f".github/agent-task-reports/{self.request_id}.md"
+        )
+        self.validation_path = (
+            f".github/agent-task-validations/{self.request_id}.json"
+        )
+        self.pull_request = MODULE.PullRequestSnapshot(
+            7,
+            "https://github.com/owner/repo/pull/7",
+            "OPEN",
+            "owner/repo",
+            "main",
+            "4" * 40,
+            "fork/repo",
+            "feature",
+            "1" * 40,
+            True,
+        )
+        self.prompt = MODULE.build_policy_prompt(
+            MODULE.build_pr_prompt(
+                MODULE.build_apply_with_report_prompt(
+                    "Review the pull request.",
+                    self.report_path,
+                    self.validation_path,
+                ),
+                self.pull_request,
+            ),
+            request_id=self.request_id,
+            receipt=self.validation_path,
+            mode="apply_with_report",
+            repository=self.repository,
+            pull_request=self.pull_request,
+        )
+        self.task = {
+            "id": self.task_id,
+            "state": "completed",
+            "created_at": "2026-09-15T00:00:00Z",
+            "repository": {"id": 1},
+            "owner": {"id": 2},
+            "sessions": [
+                {
+                    "id": "session-1",
+                    "task_id": self.task_id,
+                    "state": "completed",
+                    "created_at": "2026-09-15T00:00:00Z",
+                    "model": f"sweagent-capi:{self.model}",
+                    "base_ref": self.pull_request.head_sha,
+                    "repository": {"id": 1},
+                    "owner": {"id": 2},
+                    "prompt": self.prompt,
+                }
+            ],
+        }
+
+    def validate(self, task=None, **overrides):
+        arguments = {
+            "task_id": self.task_id,
+            "repository": self.repository,
+            "model": self.model,
+            "pull_request": self.pull_request,
+            "request_id": self.request_id,
+            "report_path": self.report_path,
+            "worker_receipt": self.validation_path,
+        }
+        arguments.update(overrides)
+        MODULE.validate_interrupted_apply_task(
+            self.task if task is None else task,
+            **arguments,
+        )
+
+    def mutated_task(self, **session_updates):
+        task = json.loads(json.dumps(self.task))
+        task["sessions"][0].update(session_updates)
+        return task
+
+    def test_accepts_exact_live_apply_with_report_identity(self):
+        self.validate()
+
+    def test_parse_requires_complete_recovery_identity(self):
+        result_path = str((Path.cwd().parent / "result.json").resolve())
+        options = MODULE.parse_args(
+            [
+                "--resume-apply-with-report",
+                "--model",
+                "sol",
+                "--pr",
+                "owner/repo#7",
+                "--task-id",
+                self.task_id,
+                "--worker-receipt",
+                self.validation_path,
+                "--result-file",
+                result_path,
+                "--policy",
+                MODULE.MARKETPLACE_POLICY_SELECTOR,
+            ]
+        )
+
+        self.assertTrue(options.apply_with_report)
+        self.assertTrue(options.resume_apply_with_report)
+        self.assertFalse(options.monitor_only)
+        self.assertEqual(options.prompt, "")
+        self.assertEqual(MODULE.mode_name(options), "apply_with_report")
+
+    def test_parse_preserves_current_monitor_mode(self):
+        result_path = str((Path.cwd().parent / "result.json").resolve())
+        options = MODULE.parse_args(
+            [
+                "--monitor-only",
+                "--model",
+                "sol",
+                "--pr",
+                "owner/repo#7",
+                "--task-id",
+                self.task_id,
+                "--worker-receipt",
+                self.validation_path,
+                "--result-file",
+                result_path,
+                "--policy",
+                MODULE.MARKETPLACE_POLICY_SELECTOR,
+            ]
+        )
+
+        self.assertTrue(options.monitor_only)
+        self.assertFalse(options.apply_with_report)
+        self.assertFalse(options.resume_apply_with_report)
+        self.assertEqual(MODULE.mode_name(options), "monitor_only")
+
+    def test_rejects_mode_path_and_policy_prompt_mismatches(self):
+        cases = {
+            "mode": self.prompt.replace(
+                MODULE.APPLY_WITH_REPORT_MARKER,
+                MODULE.REPORT_MARKER,
+            ),
+            "path": self.prompt.replace(self.request_id, "other-request"),
+            "policy": self.prompt.replace(
+                MODULE.MARKETPLACE_POLICY_HASH,
+                "0" * 64,
+            ),
+        }
+        for name, prompt in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(MODULE.CloudError) as raised:
+                    self.validate(self.mutated_task(prompt=prompt))
+                self.assertEqual(
+                    raised.exception.code,
+                    "task_identity_mismatch",
+                )
+
+    def test_rejects_source_model_and_task_mismatches(self):
+        task_mismatch = self.mutated_task(task_id="other-task")
+        cases = {
+            "source": (
+                self.task,
+                {"pull_request": MODULE.PullRequestSnapshot(
+                    **{
+                        **self.pull_request.__dict__,
+                        "head_sha": "9" * 40,
+                    }
+                )},
+            ),
+            "model": (
+                self.mutated_task(model="sweagent-capi:gpt-6-astra"),
+                {},
+            ),
+            "task": (task_mismatch, {}),
+        }
+        for name, (task, overrides) in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(MODULE.CloudError) as raised:
+                    self.validate(task, **overrides)
+                self.assertEqual(
+                    raised.exception.code,
+                    "task_identity_mismatch",
+                )
+
+    def test_rejects_missing_malformed_or_ambiguous_prompt(self):
+        cases = [
+            self.mutated_task(prompt=None),
+            self.mutated_task(prompt="not a managed prompt"),
+            self.mutated_task(
+                prompt=self.prompt + "\n" + MODULE.POLICY_MARKER
+            ),
+        ]
+        for task in cases:
+            with self.subTest(prompt=task["sessions"][0]["prompt"]):
+                with self.assertRaises(MODULE.CloudError):
+                    self.validate(task)
+
+
 class ValidationArtifactTest(unittest.TestCase):
     def fetch(self, payload):
         content = payload if isinstance(payload, str) else json.dumps(payload) + "\n"
@@ -400,8 +597,18 @@ class DispatcherFinalizationTest(unittest.TestCase):
         )
         return repository
 
-    def execute(self, repository, *, worker_validation=None, mutation_error=None):
+    def execute(
+        self,
+        repository,
+        *,
+        options=None,
+        task=None,
+        worker_validation=None,
+        mutation_error=None,
+    ):
         result = MODULE.ResultEnvelope()
+        options = self.options if options is None else options
+        task = self.task if task is None else task
         outcomes = worker_validation or [
             {
                 "command": "git diff --check",
@@ -433,8 +640,9 @@ class DispatcherFinalizationTest(unittest.TestCase):
                 "validate_policy_before_mutation",
                 mutation,
             ),
-            mock.patch.object(MODULE, "start_task", return_value=self.task),
-            mock.patch.object(MODULE, "monitor_task", return_value=self.task),
+            mock.patch.object(MODULE, "start_task", return_value=task) as start,
+            mock.patch.object(MODULE, "get_task", return_value=task),
+            mock.patch.object(MODULE, "monitor_task", return_value=task),
             mock.patch.object(
                 MODULE,
                 "fetch_worker_receipt",
@@ -447,17 +655,17 @@ class DispatcherFinalizationTest(unittest.TestCase):
             ),
         ):
             code = MODULE.execute(
-                self.options,
+                options,
                 cwd=self.root,
                 uuid_factory=lambda: "request-1",
                 result=result,
             )
-        return code, result, mutation
+        return code, result, mutation, start
 
     def test_successfully_attests_and_applies_only_fix_commits(self):
         repository = self.repository()
 
-        code, result, mutation = self.execute(repository)
+        code, result, mutation, _ = self.execute(repository)
 
         self.assertEqual(code, 0)
         self.assertEqual(result.status, "success")
@@ -486,6 +694,119 @@ class DispatcherFinalizationTest(unittest.TestCase):
             self.code_commit,
         )
         self.assertGreaterEqual(mutation.call_count, 2)
+
+    def test_recovers_interrupted_apply_with_report_without_starting_task(self):
+        validation_path = (
+            ".github/agent-task-validations/request-1.json"
+        )
+        report_path = ".github/agent-task-reports/request-1.md"
+        prompt = MODULE.build_policy_prompt(
+            MODULE.build_pr_prompt(
+                MODULE.build_apply_with_report_prompt(
+                    "Review the pull request.",
+                    report_path,
+                    validation_path,
+                ),
+                self.pull_request,
+            ),
+            request_id="request-1",
+            receipt=validation_path,
+            mode="apply_with_report",
+            repository="owner/repo",
+            pull_request=self.pull_request,
+        )
+        task = {
+            **self.task,
+            "created_at": "2026-09-15T00:00:00Z",
+            "repository": {"id": 1},
+            "owner": {"id": 2},
+            "sessions": [
+                {
+                    "id": "session-1",
+                    "task_id": "task-1",
+                    "state": "completed",
+                    "created_at": "2026-09-15T00:00:00Z",
+                    "model": "sweagent-capi:gpt-5.6-sol",
+                    "base_ref": "feature",
+                    "repository": {"id": 1},
+                    "owner": {"id": 2},
+                    "prompt": prompt,
+                }
+            ],
+        }
+        options = MODULE.Options(
+            report=False,
+            model="gpt-5.6-sol",
+            prompt="",
+            pull_request=MODULE.PrReference(
+                7,
+                "owner/repo",
+                "owner/repo#7",
+            ),
+            apply_with_report=True,
+            resume_apply_with_report=True,
+            result_file=Path("C:/state/recovery-result.json"),
+            policy=MODULE.MARKETPLACE_POLICY_SELECTOR,
+            task_id="task-1",
+            worker_receipt=validation_path,
+        )
+        repository = self.repository()
+
+        code, result, _, start = self.execute(
+            repository,
+            options=options,
+            task=task,
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(result.mode, "apply_with_report")
+        self.assertEqual(result.application_status, "applied")
+        start.assert_not_called()
+        repository.fast_forward.assert_called_once_with(
+            self.snapshot,
+            self.code_commit,
+        )
+
+    def test_monitor_only_keeps_validation_only_history_semantics(self):
+        validation_path = (
+            ".github/agent-task-validations/request-1.json"
+        )
+        options = MODULE.Options(
+            report=False,
+            model="gpt-5.6-sol",
+            prompt="",
+            pull_request=MODULE.PrReference(
+                7,
+                "owner/repo",
+                "owner/repo#7",
+            ),
+            monitor_only=True,
+            result_file=Path("C:/state/monitor-result.json"),
+            policy=MODULE.MARKETPLACE_POLICY_SELECTOR,
+            task_id="task-1",
+            worker_receipt=validation_path,
+        )
+        repository = self.repository()
+        repository.root.return_value = self.root
+        repository.repository_name.return_value = "owner/repo"
+        repository.matching_remote.return_value = "origin"
+
+        code, result, _, start = self.execute(
+            repository,
+            options=options,
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(result.mode, "monitor_only")
+        self.assertEqual(result.application_status, "not_applicable")
+        start.assert_not_called()
+        repository.worker_history.assert_called_once_with(
+            self.root,
+            self.base_sha,
+            [self.code_commit, self.artifact_commit],
+            [validation_path],
+        )
+        repository.fast_forward.assert_not_called()
 
     def test_identity_or_live_head_failure_prevents_application(self):
         repository = self.repository()

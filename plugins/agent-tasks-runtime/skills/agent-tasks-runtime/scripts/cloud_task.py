@@ -119,6 +119,7 @@ class Options:
     dispatch_only: bool = False
     monitor_only: bool = False
     apply_with_report: bool = False
+    resume_apply_with_report: bool = False
     result_file: Path | None = None
     policy: str | None = None
     task_id: str | None = None
@@ -329,6 +330,7 @@ def parse_args(args: Sequence[str]) -> Options:
     dispatch_only = False
     monitor_only = False
     apply_with_report = False
+    resume_apply_with_report = False
     model_alias = "sol"
     prompt_file: str | None = None
     pull_request: PrReference | None = None
@@ -363,7 +365,18 @@ def parse_args(args: Sequence[str]) -> Options:
             index += 1
             continue
         if token == "--apply-with-report":
+            if apply_with_report:
+                raise CloudError("--apply-with-report mode may be specified only once")
             apply_with_report = True
+            index += 1
+            continue
+        if token == "--resume-apply-with-report":
+            if apply_with_report:
+                raise CloudError(
+                    "--apply-with-report mode may be specified only once"
+                )
+            apply_with_report = True
+            resume_apply_with_report = True
             index += 1
             continue
         if token == "--allow-merged-pr":
@@ -513,14 +526,14 @@ def parse_args(args: Sequence[str]) -> Options:
         prompt = read_prompt_file(prompt_file)
     elif inline_prompt:
         prompt = inline_prompt
-    elif monitor_only and task_id is not None:
+    elif (monitor_only or resume_apply_with_report) and task_id is not None:
         prompt = ""
     else:
         raise CloudError("a prompt is required")
     if sum((report, dispatch_only, monitor_only, apply_with_report)) > 1:
         raise CloudError(
-            "--report, --dispatch-only, --monitor-only, and --apply-with-report "
-            "are mutually exclusive"
+            "--report, --dispatch-only, --monitor-only, --apply-with-report, "
+            "and --resume-apply-with-report are mutually exclusive"
         )
     if (dispatch_only or monitor_only or apply_with_report) and pull_request is None:
         if dispatch_only:
@@ -561,6 +574,7 @@ def parse_args(args: Sequence[str]) -> Options:
         )
     if task_id is not None and not (
         monitor_only
+        or resume_apply_with_report
         or (
             apply_with_report
             and allow_merged_pr
@@ -568,11 +582,13 @@ def parse_args(args: Sequence[str]) -> Options:
         )
     ):
         raise CloudError(
-            "--task-id is valid only with --monitor-only",
+            "--task-id is valid only with --monitor-only, "
+            "--resume-apply-with-report, or supported result recovery",
             "task_identity_invalid",
         )
     if worker_receipt is not None and not (
         monitor_only
+        or resume_apply_with_report
         or (
             apply_with_report
             and allow_merged_pr
@@ -580,7 +596,8 @@ def parse_args(args: Sequence[str]) -> Options:
         )
     ):
         raise CloudError(
-            "--worker-receipt is valid only with --monitor-only",
+            "--worker-receipt is valid only with --monitor-only, "
+            "--resume-apply-with-report, or supported result recovery",
             "receipt_invalid",
         )
     if (
@@ -604,6 +621,32 @@ def parse_args(args: Sequence[str]) -> Options:
                 "--worker-receipt",
                 "receipt_invalid",
             )
+    if resume_apply_with_report:
+        if (
+            pull_request is None
+            or task_id is None
+            or worker_receipt is None
+            or result_file is None
+            or policy != MARKETPLACE_POLICY_SELECTOR
+        ):
+            raise CloudError(
+                "--resume-apply-with-report requires --pr, --task-id, "
+                f"--worker-receipt, --result-file, and --policy "
+                f"{MARKETPLACE_POLICY_SELECTOR}",
+                "policy_required",
+            )
+        if prompt_file is not None or inline_prompt:
+            raise CloudError(
+                "--resume-apply-with-report retrieves the authoritative prompt "
+                "from the Agent Task and does not accept a caller prompt",
+                "policy_rejected",
+            )
+        if allow_merged_pr or input_result_file is not None:
+            raise CloudError(
+                "--resume-apply-with-report cannot be combined with historical "
+                "or result-file recovery options",
+                "policy_rejected",
+            )
     return Options(
         report=report,
         model=MODEL_IDS[model_alias],
@@ -612,6 +655,7 @@ def parse_args(args: Sequence[str]) -> Options:
         dispatch_only=dispatch_only,
         monitor_only=monitor_only,
         apply_with_report=apply_with_report,
+        resume_apply_with_report=resume_apply_with_report,
         result_file=result_file,
         policy=policy,
         task_id=task_id,
@@ -1087,6 +1131,109 @@ def mode_name(options: Options) -> str:
     if options.report:
         return "report"
     return "code"
+
+
+def validate_interrupted_apply_task(
+    task: Mapping[str, object],
+    *,
+    task_id: str,
+    repository: str,
+    model: str,
+    pull_request: PullRequestSnapshot,
+    request_id: str,
+    report_path: str,
+    worker_receipt: str,
+) -> None:
+    if task.get("id") != task_id:
+        raise CloudError(
+            "Agent Task identity does not match the interrupted recovery request",
+            "task_identity_mismatch",
+        )
+    sessions = task.get("sessions")
+    if not isinstance(sessions, list) or len(sessions) != 1:
+        raise CloudError(
+            "interrupted apply-with-report recovery requires exactly one Agent "
+            "Task session",
+            "task_identity_mismatch",
+        )
+    session = sessions[0]
+    if not isinstance(session, dict):
+        raise CloudError(
+            "Agent Task session identity is malformed",
+            "task_identity_mismatch",
+        )
+    task_repository = task.get("repository")
+    task_owner = task.get("owner")
+    expected_models = {model, f"sweagent-capi:{model}"}
+    if (
+        session.get("task_id") != task_id
+        or session.get("model") not in expected_models
+        or session.get("base_ref") != task_base_ref(pull_request)
+        or not isinstance(task_repository, dict)
+        or not isinstance(task_repository.get("id"), int)
+        or isinstance(task_repository.get("id"), bool)
+        or session.get("repository") != task_repository
+        or not isinstance(task_owner, dict)
+        or not isinstance(task_owner.get("id"), int)
+        or isinstance(task_owner.get("id"), bool)
+        or session.get("owner") != task_owner
+    ):
+        raise CloudError(
+            "Agent Task session, model, repository, owner, or source base does "
+            "not match the interrupted recovery request",
+            "task_identity_mismatch",
+        )
+    prompt = session.get("prompt")
+    if not isinstance(prompt, str) or not prompt:
+        raise CloudError(
+            "Agent Task session has no authoritative prompt",
+            "malformed_report",
+        )
+    expected_prefix = build_pr_prompt("", pull_request)
+    expected_apply_suffix = build_apply_with_report_prompt(
+        "",
+        report_path,
+        worker_receipt,
+    )
+    expected_policy_suffix = build_policy_prompt(
+        "",
+        request_id=request_id,
+        receipt=worker_receipt,
+        mode="apply_with_report",
+        repository=repository,
+        pull_request=pull_request,
+    )
+    markers = (
+        PR_CONTEXT_MARKER,
+        APPLY_WITH_REPORT_MARKER,
+        POLICY_MARKER,
+    )
+    if (
+        any(prompt.count(marker) != 2 for marker in markers)
+        or REPORT_MARKER in prompt
+        or not prompt.startswith(expected_prefix)
+        or not prompt.endswith(expected_policy_suffix)
+    ):
+        raise CloudError(
+            "Agent Task prompt does not prove the original apply-with-report "
+            "policy and source identity",
+            "task_identity_mismatch",
+        )
+    before_policy = prompt[: -len(expected_policy_suffix)]
+    if not before_policy.endswith(expected_apply_suffix):
+        raise CloudError(
+            "Agent Task prompt does not prove the expected report and validation "
+            "artifact paths",
+            "task_identity_mismatch",
+        )
+    workflow_prompt = before_policy[
+        len(expected_prefix) : -len(expected_apply_suffix)
+    ]
+    if not workflow_prompt.strip():
+        raise CloudError(
+            "Agent Task prompt has no workflow instructions",
+            "malformed_report",
+        )
 
 
 def policy_metadata(options: Options) -> dict[str, object] | None:
@@ -3248,6 +3395,25 @@ def execute(
             result.receipt_path = receipt
     if options.task_id is not None:
         initial = get_task(api, repository, options.task_id)
+        if options.resume_apply_with_report:
+            if (
+                pull_request is None
+                or report_path is None
+                or receipt is None
+            ):
+                raise AssertionError(
+                    "interrupted apply-with-report recovery lost required identity"
+                )
+            validate_interrupted_apply_task(
+                initial,
+                task_id=options.task_id,
+                repository=repository,
+                model=options.model,
+                pull_request=pull_request,
+                request_id=request_id,
+                report_path=report_path,
+                worker_receipt=receipt,
+            )
     else:
         initial = start_task(
             api,

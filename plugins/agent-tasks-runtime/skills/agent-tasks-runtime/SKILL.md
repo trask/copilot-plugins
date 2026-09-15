@@ -22,3 +22,10 @@ a `Finding:` correlation; the report owns the complete reasoning and must map
 every full fix-commit SHA in generated order. The dispatcher writes the trusted
 identity, artifact digests, and completion state only to the result file outside
 the target repository.
+
+If an apply-with-report dispatcher is interrupted after task creation and no
+dispatch result survives, `--resume-apply-with-report` can recover the known
+task. Recovery reads the hosted task session prompt and requires its exact task,
+model, repository, source pull request, policy, report path, and validation path
+before normal apply-with-report checks can run. A caller-supplied mode or prompt
+cannot establish that provenance.
