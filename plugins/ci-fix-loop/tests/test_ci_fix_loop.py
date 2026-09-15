@@ -1,9 +1,11 @@
 import argparse
+import copy
 import contextlib
 import datetime as dt
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import re
 import tempfile
@@ -14,6 +16,7 @@ from unittest import mock
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "ci_fix_loop.py"
 AGENT = Path(__file__).parents[1] / "agents" / "ci-fix-loop.agent.md"
+PLUGIN = Path(__file__).parents[1] / "plugin.json"
 SPEC = importlib.util.spec_from_file_location("ci_fix_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -52,6 +55,26 @@ class WindowsSubprocessTest(unittest.TestCase):
             MODULE.run(["formatter"])
 
         self.assertNotIn("creationflags", subprocess_run.call_args.kwargs)
+
+    def test_run_bytes_hides_windows_console_processes(self):
+        completed = MODULE.subprocess.CompletedProcess(["git"], 0, b"", b"")
+        with (
+            mock.patch.object(MODULE, "IS_WINDOWS", True),
+            mock.patch.object(
+                MODULE.subprocess,
+                "CREATE_NO_WINDOW",
+                0x08000000,
+                create=True,
+            ),
+            mock.patch.object(
+                MODULE.subprocess, "run", return_value=completed
+            ) as subprocess_run,
+        ):
+            MODULE.run_bytes(["git"])
+
+        self.assertEqual(
+            subprocess_run.call_args.kwargs["creationflags"], 0x08000000
+        )
 
 
 NOW = dt.datetime(2026, 1, 1, 12, 0, 0, tzinfo=dt.timezone.utc)
@@ -224,7 +247,7 @@ def _agent_section(text, heading):
     return "\n".join(body)
 
 
-class AgentInstructionsTest(unittest.TestCase):
+class LegacyAgentInstructionsReference:
     def setUp(self):
         self.instructions = AGENT.read_text(encoding="utf-8")
 
@@ -879,6 +902,851 @@ class AgentInstructionsTest(unittest.TestCase):
             "omit only from a worktree attached to the PR's branch", self.instructions
         )
         self.assertNotIn("omit to use the current branch's PR", self.instructions)
+
+
+class ManagedAgentTaskContractTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.head = "1" * 40
+        self.base = "2" * 40
+        self.artifact = "3" * 40
+        self.validation = [
+            {
+                "command": "python -m unittest tests.test_widget",
+                "status": "passed",
+                "detail": "The failing test passes.",
+            }
+        ]
+        failure = {
+            "key": "check:CI/test",
+            "name": "test",
+            "workflow": "CI",
+            "url": "https://github.com/owner/repo/actions/runs/1/job/2",
+            "conclusion": "FAILURE",
+            "baseline_conclusion": "SUCCESS",
+            "baseline_verdict": "pr_caused",
+            "log": "AssertionError: expected 2\n",
+            "log_sha256": MODULE.sha256_text("AssertionError: expected 2\n"),
+        }
+        snapshot = {
+            "head_sha": self.head,
+            "base_sha": self.base,
+            "observed_at": "2026-01-01T00:00:00Z",
+            "rollup": [],
+            "rollup_sha256": MODULE.sha256_text("[]"),
+            "decision": {
+                "decision": "failures",
+                "reason": "checks_failed",
+                "checks": [failure["key"]],
+                "detail": "test failed",
+            },
+            "failures": [failure],
+        }
+        snapshot["sha256"] = MODULE.check_snapshot_sha256(snapshot)
+        self.preflight = {
+            "repository_root": str(self.root),
+            "identity": {"branch": "feature", "head": self.head, "status": ""},
+            "pr": {
+                "number": 7,
+                "title": "Fix widget",
+                "body": "",
+                "pr_url": "https://github.com/owner/repo/pull/7",
+                "repo_name": "owner/repo",
+                "state": "OPEN",
+                "head_owner": "owner",
+                "head_repo": "repo",
+                "head_repository": "owner/repo",
+                "head_branch": "feature",
+                "head_sha": self.head,
+                "base_branch": "main",
+                "base_sha": self.base,
+                "cross_repository": False,
+            },
+            "viewer": {"login": "viewer", "permissions": {"push": True}},
+            "stack_guard": None,
+            "check_snapshot": snapshot,
+        }
+
+    def result(self, commits=None):
+        commits = [] if commits is None else commits
+        final_head = commits[-1] if commits else self.head
+        return {
+            "schema": MODULE.AGENT_TASK_RESULT_SCHEMA,
+            "status": "success",
+            "mode": "apply_with_report",
+            "repository": {"name_with_owner": "owner/repo"},
+            "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
+            "requested_model": "gpt-5.6-sol",
+            "policy": {
+                "id": "marketplace-agent-worker",
+                "version": 1,
+                "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
+            },
+            "task": {
+                "id": "task-1",
+                "url": "https://github.com/owner/repo/agent-tasks/task-1",
+                "state": "completed",
+                "base_ref": "feature",
+                "base_sha": self.head,
+            },
+            "generated": {
+                "branch": "copilot/agent-task",
+                "head_sha": self.artifact,
+                "commits": commits,
+            },
+            "application": {
+                "status": "applied" if commits else "no_changes",
+                "final_local_head": final_head,
+            },
+            "report": {
+                "path": ".github/agent-task-reports/request-1.md",
+                "commit": self.artifact,
+                "sha256": "4" * 64,
+            },
+            "worker_receipt": {
+                "path": ".github/agent-task-receipts/request-1.json",
+                "commit": self.artifact,
+            },
+            "validation": {"complete": True, "outcomes": self.validation},
+            "error": None,
+        }
+
+    def remote(self, commits=None):
+        return MODULE.validate_success_result(
+            self.result(commits),
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+        )
+
+    def report(
+        self,
+        *,
+        commits=None,
+        outcome="no_change",
+        disposition="already_fixed",
+        changed_paths=None,
+        coverage=True,
+    ):
+        commits = [] if commits is None else commits
+        failure = self.preflight["check_snapshot"]["failures"][0]
+        return json.dumps(
+            {
+                "schema": MODULE.CI_FIX_REPORT_SCHEMA,
+                "request_id": "request-1",
+                "repository": "owner/repo",
+                "pull_request": {
+                    "number": 7,
+                    "head_sha": self.head,
+                    "base_sha": self.base,
+                    "check_snapshot_sha256": self.preflight["check_snapshot"][
+                        "sha256"
+                    ],
+                },
+                "iteration_allowance": 1,
+                "outcome": outcome,
+                "fix_commits": commits,
+                "failures": [
+                    {
+                        "key": failure["key"],
+                        "name": failure["name"],
+                        "log_sha256": failure["log_sha256"],
+                        "disposition": disposition,
+                        "reason": "The focused test proves the result.",
+                        "commit": commits[0] if disposition == "fixed" else None,
+                    }
+                ],
+                "validation": self.validation,
+                "validation_coverage": (
+                    [
+                        {
+                            "check_key": failure["key"],
+                            "commands": [self.validation[0]["command"]],
+                        }
+                    ]
+                    if coverage
+                    else []
+                ),
+                "changed_paths": [] if changed_paths is None else changed_paths,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    def receipt(self):
+        return json.dumps(
+            {
+                "schema": MODULE.AGENT_TASK_RECEIPT_SCHEMA,
+                "request_id": "request-1",
+                "policy": {
+                    "id": "marketplace-agent-worker",
+                    "version": 1,
+                    "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
+                },
+                "mode": "apply_with_report",
+                "repository": "owner/repo",
+                "pull_request_head_sha": self.head,
+                "validation_complete": True,
+                "validation": self.validation,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    def validate_report(self, content, commits=None):
+        return MODULE.validate_ci_fix_report(
+            content,
+            request_id="request-1",
+            preflight=self.preflight,
+            remote=self.remote(commits),
+            iteration_allowance=1,
+        )
+
+    def test_agent_definition_is_a_thin_managed_coordinator(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+        self.assertIn("agent-task <target>", instructions)
+        self.assertIn("marketplace-agent-worker@1", instructions)
+        self.assertIn("Never use Cloud Sandboxes", instructions)
+        self.assertIn("`custom_agent`", instructions)
+        self.assertIn("Never run `gh pr diff`", instructions)
+        self.assertNotIn("tools: [read", instructions)
+        self.assertNotIn("tools: [edit", instructions)
+        self.assertEqual("1.6.0", json.loads(PLUGIN.read_text())["version"])
+
+    def test_prompt_pins_snapshot_allowance_model_policy_and_worker_boundary(self):
+        prompt = MODULE.build_worker_prompt(
+            self.preflight,
+            iteration_allowance=1,
+            prior_history=[],
+            requested_model="gpt-5.6-sol",
+        )
+        self.assertIn("sole repository worker", prompt)
+        self.assertIn(self.preflight["check_snapshot"]["sha256"], prompt)
+        self.assertIn(MODULE.AGENT_TASK_POLICY_SHA256, prompt)
+        self.assertIn('"iteration_allowance": 1', prompt)
+        self.assertIn("Never select a marketplace `custom_agent`", prompt)
+        self.assertIn("use Cloud Sandboxes", prompt)
+        MODULE.require_no_credentials(prompt, source="prompt")
+
+    def test_failed_log_download_is_scoped_to_the_exact_job(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        completed = MODULE.subprocess.CompletedProcess(
+            ["gh"], 0, "focused failure log\n", ""
+        )
+        with (
+            mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+            mock.patch.object(MODULE, "run", return_value=completed) as run,
+        ):
+            content = MODULE.fetch_failed_check_log(self.preflight["pr"], check)
+
+        self.assertEqual("focused failure log\n", content)
+        self.assertIn("--job", run.call_args.args[0])
+        self.assertIn("2", run.call_args.args[0])
+
+    def test_discovers_only_the_pinned_managed_helper(self):
+        home = self.root / ".copilot"
+        helper = home / MODULE.CLOUD_TASK_RELATIVE_PATH
+        helper.parent.mkdir(parents=True)
+        helper.write_text("# helper\n", encoding="utf-8")
+        manifest = {
+            "version": MODULE.CONFIG_MANIFEST_VERSION,
+            "source": {
+                "path": str(self.root.resolve()),
+                "commit": MODULE.REQUIRED_CONFIG_COMMIT,
+                "dirty": False,
+            },
+            "entries": [MODULE.CLOUD_TASK_MANAGED_ENTRY],
+            "contents": {
+                MODULE.CLOUD_TASK_MANAGED_ENTRY: {
+                    "scripts/cloud_task.py": MODULE.REQUIRED_CLOUD_TASK_SHA256
+                }
+            },
+        }
+        (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        with (
+            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
+            mock.patch.object(
+                MODULE, "sha256_file", return_value=MODULE.REQUIRED_CLOUD_TASK_SHA256
+            ),
+        ):
+            self.assertEqual(helper.resolve(), MODULE.discover_cloud_task())
+        manifest["source"]["commit"] = "0" * 40
+        (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        with (
+            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
+            self.assertRaises(MODULE.WorkflowError),
+        ):
+            MODULE.discover_cloud_task()
+
+    def test_accepts_noop_and_complete_relevant_validation(self):
+        remote = self.remote()
+        MODULE.validate_worker_receipt(
+            self.receipt(),
+            request_id=remote["request_id"],
+            preflight=self.preflight,
+            validation=remote["validation"],
+        )
+        report = self.validate_report(self.report())
+        self.assertEqual("no_change", report["outcome"])
+
+    def test_accepts_a_fixed_result_with_ordered_commits_and_paths(self):
+        commit = "5" * 40
+        report = self.validate_report(
+            self.report(
+                commits=[commit],
+                outcome="fixed",
+                disposition="fixed",
+                changed_paths=["src/widget.py"],
+            ),
+            commits=[commit],
+        )
+        self.assertEqual([commit], report["fix_commits"])
+
+    def test_accepts_rerun_preexisting_and_unfixable_outcomes(self):
+        for outcome, disposition in (
+            ("rerun", "flake"),
+            ("pre_existing", "pre_existing"),
+            ("unfixable", "unfixable"),
+        ):
+            with self.subTest(outcome=outcome):
+                report = self.validate_report(
+                    self.report(outcome=outcome, disposition=disposition)
+                )
+                self.assertEqual(outcome, report["outcome"])
+
+    def test_rejects_malformed_mismatched_result_report_and_receipt(self):
+        wrong = self.result()
+        wrong["policy"]["sha256"] = "0" * 64
+        with self.assertRaises(MODULE.WorkflowError):
+            MODULE.validate_success_result(
+                wrong,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+            )
+        report = json.loads(self.report())
+        report["pull_request"]["check_snapshot_sha256"] = "0" * 64
+        with self.assertRaises(MODULE.WorkflowError):
+            self.validate_report(json.dumps(report))
+        receipt = json.loads(self.receipt())
+        receipt["request_id"] = "other"
+        with self.assertRaises(MODULE.WorkflowError):
+            MODULE.validate_worker_receipt(
+                json.dumps(receipt),
+                request_id="request-1",
+                preflight=self.preflight,
+                validation=self.validation,
+            )
+
+    def test_rejects_incomplete_or_irrelevant_validation(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "cover"):
+            self.validate_report(self.report(coverage=False))
+        report = json.loads(self.report())
+        report["validation_coverage"][0]["commands"] = ["not executed"]
+        with self.assertRaisesRegex(MODULE.WorkflowError, "relevance"):
+            self.validate_report(json.dumps(report))
+        incomplete = self.result()
+        incomplete["validation"] = {"complete": False, "outcomes": []}
+        with self.assertRaises(MODULE.WorkflowError):
+            MODULE.validate_success_result(
+                incomplete,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+            )
+
+    def test_rejects_credentials_in_result_report_receipt_and_logs(self):
+        for source, value in (
+            ("result", json.dumps(self.result()) + " token=secret-value"),
+            ("report", self.report() + " password=hunter2"),
+            ("receipt", self.receipt() + " Authorization: Bearer abc"),
+            ("log", "github_pat_abcdefghijklmnopqrstuvwxyz"),
+        ):
+            with self.subTest(source=source), self.assertRaisesRegex(
+                MODULE.WorkflowError, "credentials"
+            ):
+                MODULE.require_no_credentials(value, source=source)
+
+    def test_rejects_unexpected_history_merges_paths_and_commit_messages(self):
+        commit = "5" * 40
+        remote = self.remote([commit])
+        with (
+            mock.patch.object(MODULE, "git", return_value=""),
+            self.assertRaisesRegex(MODULE.WorkflowError, "unexpected"),
+        ):
+            MODULE.validate_generated_history(
+                self.root,
+                base_sha=self.head,
+                remote=remote,
+                expected_paths=["src/widget.py"],
+            )
+        with (
+            mock.patch.object(
+                MODULE,
+                "git",
+                side_effect=[
+                    f"{commit}\n{self.artifact}",
+                    f"{commit} {self.head} {'9' * 40}",
+                ],
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "merge"),
+        ):
+            MODULE.validate_generated_history(
+                self.root,
+                base_sha=self.head,
+                remote=remote,
+                expected_paths=["src/widget.py"],
+            )
+
+    def test_rejects_unexpected_artifact_and_fix_paths(self):
+        commit = "5" * 40
+        remote = self.remote([commit])
+        messages = [
+            f"{commit}\n{self.artifact}",
+            f"{commit} {self.head}",
+            f"{self.artifact} {commit}",
+            (
+                "Fix CI\n\nFailing check: test\nCause: bug\nFix: code\n"
+                "Validation: focused test\n"
+            ),
+        ]
+        with (
+            mock.patch.object(MODULE, "git", side_effect=messages),
+            mock.patch.object(
+                MODULE,
+                "git_z_paths",
+                side_effect=[
+                    [remote["report_path"], "unexpected.txt"],
+                    ["src/widget.py"],
+                ],
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "artifact commit"),
+        ):
+            MODULE.validate_generated_history(
+                self.root,
+                base_sha=self.head,
+                remote=remote,
+                expected_paths=["src/widget.py"],
+            )
+
+    def test_rejects_dirty_local_drift_stale_head_and_stale_checks(self):
+        drifted = dict(self.preflight["pr"])
+        drifted["head_sha"] = "9" * 40
+        with self.assertRaisesRegex(MODULE.WorkflowError, "drifted"):
+            MODULE.require_live_pr_snapshot(
+                self.preflight["pr"], drifted, expected_head=self.head
+            )
+        with mock.patch.object(
+            MODULE,
+            "fetch_rollup",
+            return_value=("9" * 40, []),
+        ), self.assertRaisesRegex(MODULE.WorkflowError, "snapshot changed"):
+            MODULE.require_live_check_snapshot(self.preflight)
+
+    def test_result_paths_must_be_outside_repository(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "outside"):
+            MODULE.require_outside_repository(self.root / "result.json", self.root)
+        MODULE.require_outside_repository(self.root.parent / "result.json", self.root)
+
+    def test_recovery_command_preserves_task_identity_inputs(self):
+        command = MODULE.agent_task_recovery_command(
+            target="owner/repo#7",
+            repo_root=self.root,
+            state_path=self.root.parent / "state.json",
+            model="sol",
+        )
+        self.assertIn("agent-task", command)
+        self.assertIn("--resume", command)
+        self.assertIn("--state", command)
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn('"--input-result-file"', source)
+        self.assertIn('"--result-file"', source)
+        self.assertIn('"--policy"', source)
+
+    def test_recovery_rejects_a_failed_result_with_mismatched_identity(self):
+        failed = self.result()
+        failed["status"] = "failure"
+        failed["error"] = {"code": "worker_failed", "message": "transient failure"}
+        self.assertEqual(
+            "task-1",
+            MODULE.validate_recovery_result_identity(
+                failed,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+            ),
+        )
+        failed["pull_request"]["head_sha"] = "9" * 40
+        with self.assertRaisesRegex(MODULE.WorkflowError, "pinned task identity"):
+            MODULE.validate_recovery_result_identity(
+                failed,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+            )
+
+    def test_failed_open_pr_task_is_retained_without_a_replacement_task(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        state_path = self.root / "state.json"
+        preflight = copy.deepcopy(self.preflight)
+        preflight["repository_root"] = str(repo)
+        report = self.report()
+        failed = self.result()
+        failed["status"] = "failure"
+        failed["error"] = {"code": "worker_failed", "message": "transient failure"}
+        helper_commands = []
+
+        def run_helper(command, **kwargs):
+            helper_commands.append(command)
+            result_file = Path(command[command.index("--result-file") + 1])
+            result_file.write_text(json.dumps(failed), encoding="utf-8")
+            return MODULE.subprocess.CompletedProcess(command, 1, "", "")
+
+        arguments = [
+            "agent-task",
+            self.preflight["pr"]["pr_url"],
+            "--repo-root",
+            str(repo),
+            "--state",
+            str(state_path),
+        ]
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
+            mock.patch.object(
+                MODULE, "resolve_target", return_value={"repo_name": "owner/repo", "number": 7}
+            ),
+            mock.patch.object(MODULE, "agent_task_preflight", return_value=preflight),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=self.root / "cloud_task.py"),
+            mock.patch.object(MODULE, "run", side_effect=run_helper),
+            mock.patch.object(MODULE, "local_identity", return_value=preflight["identity"]),
+            mock.patch.object(
+                MODULE, "fetch_committed_text", side_effect=[report, self.receipt()]
+            ),
+            mock.patch.object(MODULE, "validate_generated_history"),
+            mock.patch.object(MODULE, "refuse_test_suppression"),
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
+            mock.patch.object(MODULE, "metadata_for", return_value=preflight["pr"]),
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "transient failure"):
+                MODULE.command_agent_task(MODULE.build_parser().parse_args(arguments))
+            with self.assertRaisesRegex(MODULE.WorkflowError, "transient failure"):
+                MODULE.command_agent_task(
+                    MODULE.build_parser().parse_args([*arguments, "--resume"])
+                )
+
+        self.assertEqual(1, len(helper_commands))
+        state = MODULE.load_state(state_path)
+        self.assertEqual("failed", state["agent_task"]["status"])
+        self.assertFalse(state["agent_task"].get("artifacts_removed", False))
+        self.assertTrue(Path(state["agent_task"]["result_file"]).is_file())
+        emit.assert_not_called()
+
+    def test_managed_fix_publishes_only_the_verified_fix_commit(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        state_path = self.root / "state.json"
+        preflight = copy.deepcopy(self.preflight)
+        preflight["repository_root"] = str(repo)
+        commit = "5" * 40
+        report = self.report(
+            commits=[commit],
+            outcome="fixed",
+            disposition="fixed",
+            changed_paths=["src/widget.py"],
+        )
+        result = self.result([commit])
+        result["report"]["sha256"] = MODULE.sha256_text(report)
+        commands = []
+
+        def run_command(command, **kwargs):
+            commands.append(command)
+            if "--result-file" in command:
+                Path(command[command.index("--result-file") + 1]).write_text(
+                    json.dumps(result), encoding="utf-8"
+                )
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        arguments = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                self.preflight["pr"]["pr_url"],
+                "--repo-root",
+                str(repo),
+                "--state",
+                str(state_path),
+            ]
+        )
+        imported_identity = {"branch": "feature", "head": commit, "status": ""}
+        live_after_push = dict(preflight["pr"], head_sha=commit)
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
+            mock.patch.object(
+                MODULE, "resolve_target", return_value={"repo_name": "owner/repo", "number": 7}
+            ),
+            mock.patch.object(MODULE, "agent_task_preflight", return_value=preflight),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=self.root / "cloud_task.py"),
+            mock.patch.object(MODULE, "run", side_effect=run_command),
+            mock.patch.object(MODULE, "local_identity", return_value=imported_identity),
+            mock.patch.object(
+                MODULE, "fetch_committed_text", side_effect=[report, self.receipt()]
+            ),
+            mock.patch.object(MODULE, "validate_generated_history"),
+            mock.patch.object(MODULE, "refuse_test_suppression"),
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
+            mock.patch.object(
+                MODULE, "metadata_for", side_effect=[preflight["pr"], live_after_push]
+            ),
+            mock.patch.object(MODULE, "remote_head", return_value=self.head),
+            mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
+            mock.patch.object(MODULE, "wait_for_remote_head", return_value=commit),
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(arguments)
+
+        pushes = [
+            command
+            for command in commands
+            if command[:4] == ["git", "-C", str(repo), "push"]
+        ]
+        self.assertEqual(
+            [
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "push",
+                    f"--force-with-lease=refs/heads/feature:{self.head}",
+                    "origin",
+                    f"{commit}:feature",
+                ]
+            ],
+            pushes,
+        )
+        self.assertEqual("published", emit.call_args.args[0]["result"])
+        state = MODULE.load_state(state_path)
+        self.assertEqual(commit, state["agent_task"]["published_head_sha"])
+        self.assertEqual([commit], state["agent_task"]["ordered_commits"])
+
+    def test_managed_fix_recovers_an_uncertain_push_without_pushing_twice(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        state_path = self.root / "state.json"
+        preflight = copy.deepcopy(self.preflight)
+        preflight["repository_root"] = str(repo)
+        commit = "5" * 40
+        report = self.report(
+            commits=[commit],
+            outcome="fixed",
+            disposition="fixed",
+            changed_paths=["src/widget.py"],
+        )
+        result = self.result([commit])
+        result["report"]["sha256"] = MODULE.sha256_text(report)
+        commands = []
+
+        def run_command(command, **kwargs):
+            commands.append(command)
+            if "--result-file" in command:
+                Path(command[command.index("--result-file") + 1]).write_text(
+                    json.dumps(result), encoding="utf-8"
+                )
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        raw_arguments = [
+            "agent-task",
+            self.preflight["pr"]["pr_url"],
+            "--repo-root",
+            str(repo),
+            "--state",
+            str(state_path),
+        ]
+        imported_identity = {"branch": "feature", "head": commit, "status": ""}
+        live_after_push = dict(preflight["pr"], head_sha=commit)
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
+            mock.patch.object(
+                MODULE, "resolve_target", return_value={"repo_name": "owner/repo", "number": 7}
+            ),
+            mock.patch.object(MODULE, "agent_task_preflight", return_value=preflight),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=self.root / "cloud_task.py"),
+            mock.patch.object(MODULE, "run", side_effect=run_command),
+            mock.patch.object(MODULE, "local_identity", return_value=imported_identity),
+            mock.patch.object(
+                MODULE,
+                "fetch_committed_text",
+                side_effect=[report, self.receipt(), report, self.receipt()],
+            ),
+            mock.patch.object(MODULE, "validate_generated_history"),
+            mock.patch.object(MODULE, "refuse_test_suppression"),
+            mock.patch.object(MODULE, "require_live_check_snapshot") as check_snapshot,
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                side_effect=[
+                    preflight["pr"],
+                    MODULE.WorkflowError("PR head lookup failed"),
+                    live_after_push,
+                    live_after_push,
+                ],
+            ),
+            mock.patch.object(MODULE, "remote_head", side_effect=[self.head, commit]),
+            mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
+            mock.patch.object(MODULE, "wait_for_remote_head", return_value=commit),
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "lookup failed"):
+                MODULE.command_agent_task(
+                    MODULE.build_parser().parse_args(raw_arguments)
+                )
+            MODULE.command_agent_task(
+                MODULE.build_parser().parse_args([*raw_arguments, "--resume"])
+            )
+
+        pushes = [
+            command
+            for command in commands
+            if command[:4] == ["git", "-C", str(repo), "push"]
+        ]
+        self.assertEqual(1, len(pushes))
+        self.assertEqual(1, check_snapshot.call_count)
+        self.assertEqual("published", emit.call_args.args[0]["result"])
+        self.assertEqual(
+            commit, MODULE.load_state(state_path)["agent_task"]["published_head_sha"]
+        )
+
+    def test_managed_iterations_share_the_budget_and_stop_at_the_cap(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        state_path = self.root / "state.json"
+        preflights = []
+        reports = []
+        results = []
+        for iteration in range(3):
+            preflight = copy.deepcopy(self.preflight)
+            preflight["repository_root"] = str(repo)
+            preflight["check_snapshot"]["observed_at"] = (
+                f"2026-01-01T00:00:0{iteration}Z"
+            )
+            log = f"AssertionError: attempt {iteration}\n"
+            preflight["check_snapshot"]["failures"][0]["log"] = log
+            preflight["check_snapshot"]["failures"][0]["log_sha256"] = (
+                MODULE.sha256_text(log)
+            )
+            preflight["check_snapshot"]["sha256"] = MODULE.check_snapshot_sha256(
+                preflight["check_snapshot"]
+            )
+            report_payload = json.loads(self.report())
+            report_payload["pull_request"]["check_snapshot_sha256"] = preflight[
+                "check_snapshot"
+            ]["sha256"]
+            report_payload["failures"][0]["log_sha256"] = preflight[
+                "check_snapshot"
+            ]["failures"][0]["log_sha256"]
+            report = json.dumps(report_payload, separators=(",", ":"), sort_keys=True)
+            result = self.result()
+            result["report"]["sha256"] = MODULE.sha256_text(report)
+            preflights.append(preflight)
+            reports.append(report)
+            results.append(result)
+        helper_calls = 0
+
+        def run_helper(command, **kwargs):
+            nonlocal helper_calls
+            result = results[helper_calls]
+            helper_calls += 1
+            Path(command[command.index("--result-file") + 1]).write_text(
+                json.dumps(result), encoding="utf-8"
+            )
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        raw_arguments = [
+            "agent-task",
+            self.preflight["pr"]["pr_url"],
+            "--repo-root",
+            str(repo),
+            "--state",
+            str(state_path),
+            "--max-iterations",
+            "2",
+        ]
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
+            mock.patch.object(
+                MODULE, "resolve_target", return_value={"repo_name": "owner/repo", "number": 7}
+            ),
+            mock.patch.object(MODULE, "agent_task_preflight", side_effect=preflights),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=self.root / "cloud_task.py"),
+            mock.patch.object(MODULE, "run", side_effect=run_helper),
+            mock.patch.object(
+                MODULE, "local_identity", return_value=preflights[0]["identity"]
+            ),
+            mock.patch.object(
+                MODULE,
+                "fetch_committed_text",
+                side_effect=[
+                    reports[0],
+                    self.receipt(),
+                    reports[1],
+                    self.receipt(),
+                ],
+            ),
+            mock.patch.object(MODULE, "validate_generated_history"),
+            mock.patch.object(MODULE, "refuse_test_suppression"),
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
+            mock.patch.object(MODULE, "metadata_for", return_value=preflights[0]["pr"]),
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            for _ in range(3):
+                MODULE.command_agent_task(
+                    MODULE.build_parser().parse_args(raw_arguments)
+                )
+
+        self.assertEqual(2, helper_calls)
+        self.assertEqual("max_iterations_reached", emit.call_args.args[0]["result"])
+        state = MODULE.load_state(state_path)
+        self.assertEqual(2, state["iterations"])
+        self.assertEqual("max_iterations_reached", state["escalation"]["reason"])
+
+    def test_snapshot_identity_ignores_observation_time(self):
+        first = copy.deepcopy(self.preflight["check_snapshot"])
+        second = copy.deepcopy(first)
+        second["observed_at"] = "2026-01-01T00:05:00Z"
+        self.assertEqual(
+            MODULE.check_snapshot_sha256(first),
+            MODULE.check_snapshot_sha256(second),
+        )
+
+    def test_cleanup_removes_only_state_owned_agent_task_artifacts(self):
+        state_path = self.root / "state.json"
+        prompt = self.root / "state--run--agent-task-prompt.txt"
+        result = self.root / "state--run--agent-task-result.json"
+        recovery = self.root / "state--run--agent-task-recovery-1.json"
+        for artifact in (prompt, result, recovery):
+            artifact.write_text("artifact", encoding="utf-8")
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "agent_task": {
+                    "prompt_file": str(prompt),
+                    "result_file": str(result),
+                    "recovery_results": [str(recovery)],
+                },
+            },
+        )
+
+        with mock.patch.object(MODULE, "emit"):
+            MODULE.command_cleanup(SimpleNamespace(state=str(state_path)))
+
+        self.assertFalse(state_path.exists())
+        self.assertTrue(all(not artifact.exists() for artifact in (prompt, result, recovery)))
 
 
 class EscalationCatalogTest(unittest.TestCase):
@@ -1925,6 +2793,15 @@ class AttributeCommandTest(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
+
+    def test_managed_history_rejects_test_suppression_before_live_checks(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        coordinator = source.index("def command_agent_task")
+        history = source.index("validate_generated_history(", coordinator)
+        suppression = source.index("refuse_test_suppression(", history)
+        live = source.index("live = metadata_for(target)", suppression)
+        self.assertLess(history, suppression)
+        self.assertLess(suppression, live)
 
     def state_with(self, baseline, conclusion=None):
         return write_state(
@@ -5620,6 +6497,47 @@ class NativeStackCoordinatorTest(unittest.TestCase):
         self.assertEqual("accepted_push_not_propagated", action["reason"])
         self.assertEqual("pending-push", action["checkpoint_id"])
         self.assertEqual("lower2", action["expected_head"])
+
+    def test_interrupted_member_surfaces_its_managed_task_recovery(self):
+        stack = native_stack()
+        started = self.start(stack)
+        self.next(stack)
+        directory = self.root / "resume-agent-task"
+        directory.mkdir()
+        member_state = write_state(
+            directory,
+            pr={
+                "number": 5,
+                "title": "PR 5",
+                "pr_url": "https://github.com/owner/repo/pull/5",
+                "repo_name": "owner/repo",
+                "head_sha": "lower1",
+            },
+            run={
+                "stack_guard": {
+                    "state": str(self.stack_state),
+                    "run_id": started["run_id"],
+                    "member": 5,
+                    "member_head_sha": "lower1",
+                }
+            },
+            agent_task={
+                "status": "failed",
+                "recovery_command": "python ci_fix_loop.py agent-task --resume",
+            },
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "read_native_stack", return_value=stack),
+            mock.patch.object(
+                MODULE, "stack_member_state_path", return_value=member_state
+            ),
+        ):
+            action = call("stack-next", "--state", str(self.stack_state))
+
+        self.assertEqual("resume_agent-task", action["result"])
+        self.assertEqual("agent_task_failed", action["reason"])
+        self.assertEqual(str(member_state), action["member_state"])
 
     def test_landed_pending_push_is_finalized_and_propagated_after_a_crash(self):
         stack = native_stack()

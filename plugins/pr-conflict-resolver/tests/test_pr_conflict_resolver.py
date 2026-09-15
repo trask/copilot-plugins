@@ -265,7 +265,9 @@ def completed(returncode=0, stdout="", stderr=""):
     )
 
 
-class AgentInstructionsTest(unittest.TestCase):
+class LegacyAgentInstructionsAssertions(unittest.TestCase):
+    __test__ = False
+
     def setUp(self):
         self.instructions = AGENT.read_text(encoding="utf-8")
 
@@ -762,6 +764,385 @@ class AgentInstructionsTest(unittest.TestCase):
                 self.assertIn(category, self.instructions)
         self.assertIn("belongs in chat only", self.instructions)
         self.assertIn("Silence is the normal outcome", self.instructions)
+
+
+class ManagedConflictCoordinatorTest(unittest.TestCase):
+    def setUp(self):
+        self.instructions = AGENT.read_text(encoding="utf-8")
+
+    def request(self, strategy="merge"):
+        value = {
+            "schema": MODULE.CONFLICT_REQUEST_SCHEMA,
+            "request_id": "request-1",
+            "request_sha256": "1" * 64,
+            "model": "gpt-5.6-sol",
+            "policy": MODULE.CONFLICT_POLICY_IDENTITY,
+            "repository": "owner/repo",
+            "pull_request": {
+                "number": 7,
+                "url": "https://github.com/owner/repo/pull/7",
+                "head_repository": "owner/repo",
+                "head_ref": "feature",
+                "head_sha": "b" * 40,
+                "base_repository": "owner/repo",
+                "base_ref": "main",
+                "base_sha": "a" * 40,
+            },
+            "merge_base": "a" * 40,
+            "strategy": strategy,
+            "allowed_paths": ["app.py"],
+            "iteration": {"id": "iteration-1", "number": 1, "budget": 3},
+            "guards": {
+                "merge_methods": {
+                    "merge_commit": True,
+                    "rebase_merge": True,
+                    "squash_merge": True,
+                },
+                "frozen_conflict": True,
+                "already_satisfied": False,
+            },
+            "head_commits": [],
+            "native_stack": None,
+        }
+        value["request_sha256"] = MODULE.request_digest(value)
+        return value
+
+    def success_result(self, request):
+        return {
+            "schema": MODULE.CONFLICT_RESULT_SCHEMA,
+            "status": "success",
+            "error": None,
+            "model": request["model"],
+            "policy": MODULE.CONFLICT_POLICY_IDENTITY,
+            "repository": request["repository"],
+            "task": {
+                "id": "task-1",
+                "url": "https://github.com/owner/repo/tasks/task-1",
+                "state": "completed",
+                "base_ref": request["pull_request"]["head_sha"],
+                "base_sha": request["pull_request"]["head_sha"],
+            },
+            "mode": "conflict_with_report",
+            "strategy": request["strategy"],
+            "request": {
+                "id": request["request_id"],
+                "sha256": request["request_sha256"],
+            },
+            "pull_request": request["pull_request"],
+            "generated": {
+                "artifact": {
+                    "branch": "artifact",
+                    "head_sha": "d" * 40,
+                    "report": {
+                        "path": (
+                            ".github/agent-task-conflict-reports/request-1.md"
+                        ),
+                        "commit": "d" * 40,
+                        "sha256": "2" * 64,
+                    },
+                    "receipt": {
+                        "path": (
+                            ".github/agent-task-conflict-receipts/request-1.json"
+                        ),
+                        "commit": "d" * 40,
+                    },
+                },
+                "code_refs": [
+                    {
+                        "role": "code",
+                        "pr_number": 7,
+                        "repository": "owner/repo",
+                        "ref": "generated",
+                        "old_sha": "b" * 40,
+                        "new_sha": "c" * 40,
+                        "base_ref": "main",
+                        "base_sha": "a" * 40,
+                        "lease_sha": "b" * 40,
+                        "commits": ["c" * 40],
+                    }
+                ],
+            },
+            "application": {"status": "quarantined_refs"},
+            "validation": {
+                "complete": True,
+                "outcomes": [
+                    {
+                        "command": "python -m unittest",
+                        "status": "passed",
+                        "detail": "all tests passed",
+                    }
+                ],
+            },
+        }
+
+    def test_pins_the_independent_helper_policy_and_schemas(self):
+        self.assertEqual(
+            MODULE.REQUIRED_CONFIG_COMMIT,
+            "fa29f3db620bcf2b17797f548ee9a149c696029f",
+        )
+        self.assertEqual(
+            MODULE.REQUIRED_CONFLICT_TASK_SHA256,
+            "3f9807c392bb31dc3ddcfe74d367b620f417dffc00b1904c78415da43c8b9ad9",
+        )
+        self.assertEqual(
+            MODULE.CONFLICT_POLICY_SHA256,
+            "7fcb65dff47f5dc76f790f999de202e28692c5207dba7d3ff007145a327e6c67",
+        )
+        self.assertEqual(
+            MODULE.CONFLICT_REQUEST_SCHEMA["id"],
+            "github.copilot.agent-task-conflict-request",
+        )
+        self.assertEqual(
+            MODULE.CONFLICT_RESULT_SCHEMA["id"],
+            "github.copilot.agent-task-conflict-result",
+        )
+        self.assertEqual(
+            MODULE.CONFLICT_RECEIPT_SCHEMA["id"],
+            "github.copilot.agent-task-conflict-receipt",
+        )
+
+    def test_request_digest_is_canonical_and_ignores_its_own_field(self):
+        request = self.request()
+        digest = request["request_sha256"]
+        reordered = dict(reversed(list(request.items())))
+        reordered["request_sha256"] = "f" * 64
+        self.assertEqual(MODULE.request_digest(reordered), digest)
+
+    def test_agent_task_parser_preserves_strategy_budget_and_pipeline_identity(self):
+        parsed = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--strategy",
+                "rebase",
+                "--model",
+                "terra",
+                "--max-iterations",
+                "4",
+                "--pipeline-run",
+                "run-1",
+                "--pipeline-iteration",
+                "2",
+                "--pipeline-max-iterations",
+                "5",
+                "--whole-stack",
+            ]
+        )
+        self.assertIs(parsed.function, MODULE.command_agent_task)
+        self.assertEqual(parsed.strategy, "rebase")
+        self.assertEqual(parsed.model, "terra")
+        self.assertEqual(parsed.max_iterations, 4)
+        self.assertEqual(
+            (
+                parsed.pipeline_run,
+                parsed.pipeline_iteration,
+                parsed.pipeline_max_iterations,
+            ),
+            ("run-1", 2, 5),
+        )
+        self.assertTrue(parsed.whole_stack)
+
+    def test_discovers_only_the_exact_managed_conflict_helper(self):
+        home = temporary_directory(self)
+        helper = home / MODULE.CONFLICT_TASK_RELATIVE_PATH
+        helper.parent.mkdir(parents=True)
+        helper.write_text("helper", encoding="utf-8")
+        manifest = {
+            "version": MODULE.CONFIG_MANIFEST_VERSION,
+            "source": {
+                "path": "C:/source",
+                "commit": MODULE.REQUIRED_CONFIG_COMMIT,
+                "dirty": False,
+            },
+            "entries": [MODULE.CONFLICT_TASK_MANAGED_ENTRY],
+            "contents": {
+                MODULE.CONFLICT_TASK_MANAGED_ENTRY: {
+                    "scripts/cloud_conflict_task.py": (
+                        MODULE.REQUIRED_CONFLICT_TASK_SHA256
+                    )
+                }
+            },
+        }
+        (home / MODULE.CONFIG_MANIFEST_NAME).write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        with (
+            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
+            mock.patch.object(
+                MODULE,
+                "sha256_file",
+                return_value=MODULE.REQUIRED_CONFLICT_TASK_SHA256,
+            ),
+        ):
+            self.assertEqual(MODULE.discover_conflict_task(), helper.resolve())
+
+    def test_rejects_malformed_or_failed_validation(self):
+        bad_values = [
+            [],
+            [{"command": "test", "status": "failed", "detail": "bad"}],
+            [{"command": "", "status": "passed", "detail": "ok"}],
+            [
+                {
+                    "command": "test",
+                    "status": "passed",
+                    "detail": "token=super-secret-value",
+                }
+            ],
+        ]
+        for value in bad_values:
+            with self.subTest(value=value), self.assertRaises(MODULE.WorkflowError):
+                MODULE.validate_passed_validations(value)
+
+    def test_success_result_requires_exact_request_task_and_validation_identity(self):
+        request = self.request()
+        result = self.success_result(request)
+        refs, artifact, validations = MODULE.validate_conflict_result_identity(
+            result, request
+        )
+        self.assertEqual(refs, result["generated"]["code_refs"])
+        self.assertEqual(artifact, result["generated"]["artifact"])
+        self.assertEqual(validations, result["validation"]["outcomes"])
+        for field, value in (
+            ("model", "gpt-5.6-terra"),
+            ("strategy", "rebase"),
+            ("repository", "other/repo"),
+        ):
+            changed = self.success_result(request)
+            changed[field] = value
+            with self.subTest(field=field), self.assertRaises(MODULE.WorkflowError):
+                MODULE.validate_conflict_result_identity(changed, request)
+
+    def test_failure_result_is_not_success_shaped(self):
+        request = self.request()
+        result = self.success_result(request)
+        result["status"] = "interrupted"
+        result["error"] = {"code": "interrupted", "message": "stopped"}
+        with self.assertRaisesRegex(MODULE.WorkflowError, "interrupted"):
+            MODULE.validate_conflict_result_identity(result, request)
+
+    def test_merge_publication_uses_the_explicit_head_refspec(self):
+        request = self.request("merge")
+        refs = self.success_result(request)["generated"]["code_refs"]
+        with mock.patch.object(MODULE, "find_remote", return_value="origin"):
+            command = MODULE.conflict_push_command(Path("repo"), request, refs)
+        self.assertEqual(
+            command[-2:],
+            ["origin", f"{'c' * 40}:refs/heads/feature"],
+        )
+        self.assertIn(
+            f"--force-with-lease=refs/heads/feature:{'b' * 40}",
+            command,
+        )
+
+    def test_merge_range_rejects_changes_outside_the_closed_request(self):
+        with (
+            mock.patch.object(
+                MODULE,
+                "commit_parents",
+                return_value=["b" * 40, "a" * 40],
+            ),
+            mock.patch.object(
+                MODULE,
+                "conflict_diff_paths",
+                return_value=["unrelated.py"],
+            ),
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "undeclared paths"):
+                MODULE.verify_merge_range(
+                    Path("repo"),
+                    "b" * 40,
+                    "a" * 40,
+                    "c" * 40,
+                    ["c" * 40],
+                    {"app.py"},
+                )
+
+    def test_rebase_publication_uses_the_exact_lease(self):
+        request = self.request("rebase")
+        refs = self.success_result(request)["generated"]["code_refs"]
+        with mock.patch.object(MODULE, "find_remote", return_value="origin"):
+            command = MODULE.conflict_push_command(Path("repo"), request, refs)
+        self.assertIn(
+            f"--force-with-lease=refs/heads/feature:{'b' * 40}",
+            command,
+        )
+
+    def test_native_stack_publication_is_atomic_with_one_lease_per_branch(self):
+        request = self.request("native-stack")
+        request["native_stack"] = {
+            "trunk": {"ref": "main", "sha": "a" * 40},
+            "members": [
+                {
+                    "pr_number": 6,
+                    "head_ref": "one",
+                },
+                {
+                    "pr_number": 7,
+                    "head_ref": "two",
+                },
+            ],
+            "outside_dependents": [],
+        }
+        refs = [
+            {
+                "role": "member:6",
+                "pr_number": 6,
+                "new_sha": "c" * 40,
+                "lease_sha": "b" * 40,
+            },
+            {
+                "role": "member:7",
+                "pr_number": 7,
+                "new_sha": "e" * 40,
+                "lease_sha": "d" * 40,
+            },
+        ]
+        with mock.patch.object(MODULE, "find_remote", return_value="origin"):
+            command = MODULE.conflict_push_command(Path("repo"), request, refs)
+        self.assertIn("--atomic", command)
+        self.assertEqual(
+            [item for item in command if item.startswith("--force-with-lease")],
+            [
+                f"--force-with-lease=refs/heads/one:{'b' * 40}",
+                f"--force-with-lease=refs/heads/two:{'d' * 40}",
+            ],
+        )
+        self.assertEqual(
+            command[-2:],
+            [
+                f"{'c' * 40}:refs/heads/one",
+                f"{'e' * 40}:refs/heads/two",
+            ],
+        )
+
+    def test_quarantine_names_cannot_escape_the_request_namespace(self):
+        self.assertEqual(
+            MODULE.quarantine_ref("request-1", "member:42"),
+            "refs/cloud-conflict-tasks/request-1/member-42",
+        )
+
+    def test_agent_contract_forbids_local_and_replacement_execution(self):
+        self.assertIn("thin control-plane coordinator", self.instructions)
+        self.assertIn("Never import managed helper internals", self.instructions)
+        self.assertIn("Never call Agent Tasks APIs directly", self.instructions)
+        self.assertIn("Never scrape helper stdout", self.instructions)
+        self.assertIn("Do not run the legacy", self.instructions)
+        self.assertIn("--input-result-file", self.instructions)
+        self.assertIn("resumes only the same task", self.instructions)
+        self.assertIn("Publication recovery never invokes cloud", self.instructions)
+
+    def test_agent_contract_pins_all_three_strategies_and_artifact_separation(self):
+        self.assertIn("<merge|rebase|native-stack>", self.instructions)
+        self.assertIn("[frozen head, frozen base]", self.instructions)
+        self.assertIn("exact `--force-with-lease`", self.instructions)
+        self.assertIn("one atomic push", self.instructions)
+        self.assertIn("Artifact commits never reach user branches", self.instructions)
+
+    def test_every_production_subprocess_path_uses_windows_no_window(self):
+        script = SCRIPT.read_text(encoding="utf-8")
+        self.assertEqual(script.count("subprocess.run("), 2)
+        self.assertIn("**windows_no_window_options()", script)
+        self.assertIn("hashlib.sha256(report_bytes).hexdigest()", script)
 
 
 class TargetParsingTest(unittest.TestCase):

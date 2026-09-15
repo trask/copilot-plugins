@@ -1,7 +1,9 @@
 import argparse
+from contextlib import ExitStack
 import importlib.util
 import ast
 import json
+import os
 from pathlib import Path
 import re
 from types import SimpleNamespace
@@ -11,11 +13,8 @@ from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "copilot_review_loop.py"
-AGENT = (
-    Path(__file__).parents[1]
-    / "agents"
-    / "copilot-review-loop.agent.md"
-)
+AGENT = Path(__file__).parents[1] / "agents" / "copilot-review-loop.agent.md"
+PLUGIN = Path(__file__).parents[1] / "plugin.json"
 SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -39,9 +38,7 @@ class WindowsSubprocessTest(unittest.TestCase):
         ):
             MODULE.run(["git"])
 
-        self.assertEqual(
-            subprocess_run.call_args.kwargs["creationflags"], 0x08000000
-        )
+        self.assertEqual(subprocess_run.call_args.kwargs["creationflags"], 0x08000000)
 
     def test_run_leaves_non_windows_process_options_unchanged(self):
         completed = MODULE.subprocess.CompletedProcess(["git"], 0, "", "")
@@ -81,7 +78,10 @@ def recorded_results() -> set[str]:
     tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     found: set[str] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "watcher_result":
+        if (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "watcher_result"
+        ):
             for argument in node.args:
                 if not isinstance(argument, ast.Dict):
                     continue
@@ -110,6 +110,8 @@ def recorded_results() -> set[str]:
 
 
 LOCAL_VALIDATION_HEADING = "### Local Validation Before A Push"
+
+
 def _agent_section(text, heading):
     """Return the body of one Markdown section, stopping at the next peer heading."""
     lines = text.split("\n")
@@ -125,7 +127,7 @@ def _agent_section(text, heading):
     return "\n".join(body)
 
 
-class AgentInstructionsTest(unittest.TestCase):
+class LegacyAgentInstructions:
     def setUp(self):
         self.instructions = AGENT.read_text(encoding="utf-8")
 
@@ -159,7 +161,8 @@ class AgentInstructionsTest(unittest.TestCase):
         """
         self.assertIn("`last_helper_activity`", AGENT.read_text(encoding="utf-8"))
         self.assertIn(
-            "the moment this helper last wrote its state", AGENT.read_text(encoding="utf-8")
+            "the moment this helper last wrote its state",
+            AGENT.read_text(encoding="utf-8"),
         )
         self.assertIn("not proof the stage is alive", AGENT.read_text(encoding="utf-8"))
         self.assertIn(
@@ -310,9 +313,7 @@ class AgentInstructionsTest(unittest.TestCase):
             instructions,
         )
         self.assertIn("Do not ask to be run again in that outcome.", instructions)
-        self.assertIn(
-            "never let it read like an ordinary uneventful run", instructions
-        )
+        self.assertIn("never let it read like an ordinary uneventful run", instructions)
 
     def test_a_user_stopped_watch_is_not_reported_as_needing_a_person(self):
         """The user is already present, so those outcomes stay ordinary stop conditions."""
@@ -327,9 +328,7 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_documents_the_stage_outcome_vocabulary(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn(
-            "`status` also reports `stage_outcome`", instructions
-        )
+        self.assertIn("`status` also reports `stage_outcome`", instructions)
         self.assertIn(
             "`cleared`, `skipped`, `no_progress`, `escalated`, or `carried`",
             instructions,
@@ -339,9 +338,7 @@ class AgentInstructionsTest(unittest.TestCase):
             "alone says that",
             instructions,
         )
-        self.assertIn(
-            "do not set, quote, or work around either one", instructions
-        )
+        self.assertIn("do not set, quote, or work around either one", instructions)
         self.assertIn(
             "the field is left out entirely when there is no state or no recorded "
             "ending",
@@ -360,9 +357,7 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_documents_marketplace_helper_paths(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn(
-            "${COPILOT_HOME:-${USERPROFILE//\\\\//}/.copilot}", instructions
-        )
+        self.assertIn("${COPILOT_HOME:-${USERPROFILE//\\\\//}/.copilot}", instructions)
         self.assertIn(
             "installed-plugins/trask-plugins/copilot-review-loop",
             instructions,
@@ -462,7 +457,9 @@ class AgentInstructionsTest(unittest.TestCase):
             "--summary <summary> --reply-file <path>`",
             instructions,
         )
-        self.assertIn("either `--commit <sha>` or the no-code `--rationale <text>`", instructions)
+        self.assertIn(
+            "either `--commit <sha>` or the no-code `--rationale <text>`", instructions
+        )
         self.assertIn(
             "`skip --state <path> --batch <id> --comments <ids...> --rationale <text>`",
             instructions,
@@ -559,9 +556,7 @@ class AgentInstructionsTest(unittest.TestCase):
             "iteration`",
             instructions,
         )
-        self.assertIn(
-            "`preflight --completed-run-iterations <n>`", instructions
-        )
+        self.assertIn("`preflight --completed-run-iterations <n>`", instructions)
         self.assertIn(
             "a stored iteration from an earlier invocation never uses up the current "
             "invocation's five-iteration budget",
@@ -600,7 +595,9 @@ class AgentInstructionsTest(unittest.TestCase):
             "escape sequence",
             instructions,
         )
-        self.assertIn("read the message back with `git log -1 --pretty=%B`", instructions)
+        self.assertIn(
+            "read the message back with `git log -1 --pretty=%B`", instructions
+        )
 
     def test_documents_suppressed_comment_behavior(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -628,12 +625,8 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_closes_every_run_with_a_categorized_retrospective(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn(
-            "## Copilot Review Loop Agent Retrospective", instructions
-        )
-        self.assertIn(
-            "**Copilot Review Loop Agent Retrospective**", instructions
-        )
+        self.assertIn("## Copilot Review Loop Agent Retrospective", instructions)
+        self.assertIn("**Copilot Review Loop Agent Retrospective**", instructions)
         self.assertIn(
             "Silence is the normal outcome, and a run that went smoothly reports "
             "nothing",
@@ -653,15 +646,15 @@ class AgentInstructionsTest(unittest.TestCase):
             "- **Repository**:",
         ):
             self.assertIn(category, instructions)
-        self.assertIn(
-            "Report only friction you actually hit in this run", instructions
-        )
+        self.assertIn("Report only friction you actually hit in this run", instructions)
         self.assertIn(
             "The **Copilot Review Loop Agent Retrospective** is the only content "
             "allowed after the `**Outcome:**` line",
             instructions,
         )
-        self.assertIn("The retrospective is advice, and it belongs in chat only", instructions)
+        self.assertIn(
+            "The retrospective is advice, and it belongs in chat only", instructions
+        )
         self.assertIn(
             "never turn it into a thread reply, a commit, or any other change to GitHub",
             instructions,
@@ -681,9 +674,7 @@ class AgentInstructionsTest(unittest.TestCase):
     def test_sends_the_terminal_response_as_the_last_message(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn(
-            "The terminal response is the run's last message", instructions
-        )
+        self.assertIn("The terminal response is the run's last message", instructions)
         self.assertIn(
             "send it in a message that calls no tool, and never follow it with a "
             "recap or a second summary",
@@ -694,9 +685,7 @@ class AgentInstructionsTest(unittest.TestCase):
             "run",
             instructions,
         )
-        self.assertIn(
-            "Finish every tool call the run needs", instructions
-        )
+        self.assertIn("Finish every tool call the run needs", instructions)
         self.assertIn(
             "then send the whole thing in one message that calls no tool", instructions
         )
@@ -908,6 +897,759 @@ class AgentInstructionsTest(unittest.TestCase):
         self.assertNotIn("omit to use the current branch's PR", self.instructions)
 
 
+class AgentTaskCoordinatorTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temporary.name).resolve()
+        self.addCleanup(self.temporary.cleanup)
+        self.repo_root = self.directory / "repo"
+        self.repo_root.mkdir()
+        self.head = "1" * 40
+        self.base = "2" * 40
+        self.artifact = "3" * 40
+        self.fix = "5" * 40
+        self.validation = [
+            {
+                "command": "python -m unittest tests.test_feature",
+                "status": "passed",
+                "detail": "Focused tests passed.",
+            }
+        ]
+        self.comment = {
+            "id": 17,
+            "source": "thread",
+            "thread_id": "PRRT_thread",
+            "review_id": 29,
+            "url": "https://github.com/owner/repo/pull/7#discussion_r17",
+            "author": "copilot-pull-request-reviewer[bot]",
+            "author_bot_id": "BOT_1",
+            "path": "src/app.py",
+            "position": 4,
+            "original_position": 4,
+            "line": 7,
+            "original_line": 7,
+            "body": "Handle the empty value.",
+            "status": "pending",
+            "batch": None,
+            "commit": None,
+            "rationale": None,
+            "summary": None,
+            "reply_id": None,
+            "resolved": False,
+        }
+        self.preflight = {
+            "repository_root": str(self.repo_root),
+            "identity": {"branch": "feature", "head": self.head, "status": ""},
+            "pr": {
+                "pr_node_id": "PR_7",
+                "owner": "owner",
+                "repo": "repo",
+                "number": 7,
+                "repo_name": "owner/repo",
+                "pr_url": "https://github.com/owner/repo/pull/7",
+                "url": "https://github.com/owner/repo/pull/7",
+                "title": "Current title",
+                "body": "Current body",
+                "state": "OPEN",
+                "is_draft": False,
+                "upstream_owner": "owner",
+                "upstream_repo": "repo",
+                "head_owner": "owner",
+                "head_repo": "repo",
+                "head_repository": "owner/repo",
+                "head_branch": "feature",
+                "head_sha": self.head,
+                "base_branch": "main",
+                "base_sha": self.base,
+                "cross_repository": False,
+            },
+            "viewer": {
+                "login": "viewer",
+                "repository_role": "write",
+                "permissions": {
+                    "admin": False,
+                    "maintain": False,
+                    "push": True,
+                    "triage": True,
+                    "pull": True,
+                },
+            },
+            "comments": [self.comment],
+            "comment_identities": [MODULE.comment_identity(self.comment)],
+            "skipped_authors": [],
+            "head_review_clean": False,
+            "head_review_id": 29,
+            "copilot_bot_id": "BOT_1",
+        }
+
+    def result(self, commits=None):
+        commits = [] if commits is None else commits
+        final_head = commits[-1] if commits else self.head
+        return {
+            "schema": MODULE.AGENT_TASK_RESULT_SCHEMA,
+            "status": "success",
+            "mode": "apply_with_report",
+            "repository": {"name_with_owner": "owner/repo"},
+            "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
+            "requested_model": "gpt-5.6-sol",
+            "policy": {
+                "id": "marketplace-agent-worker",
+                "version": 1,
+                "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
+            },
+            "task": {
+                "id": "task-1",
+                "url": "https://github.com/owner/repo/agent-tasks/task-1",
+                "state": "completed",
+                "base_ref": "feature",
+                "base_sha": self.head,
+            },
+            "generated": {
+                "branch": "copilot/agent-task",
+                "head_sha": self.artifact,
+                "commits": commits,
+            },
+            "application": {
+                "status": "applied" if commits else "no_changes",
+                "final_local_head": final_head,
+            },
+            "report": {
+                "path": ".github/agent-task-reports/request-1.md",
+                "commit": self.artifact,
+                "sha256": "4" * 64,
+            },
+            "worker_receipt": {
+                "path": ".github/agent-task-receipts/request-1.json",
+                "commit": self.artifact,
+            },
+            "validation": {"complete": True, "outcomes": self.validation},
+            "error": None,
+        }
+
+    def remote(self, commits=None):
+        return MODULE.validate_success_result(
+            self.result(commits),
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+        )
+
+    def receipt(self):
+        return json.dumps(
+            {
+                "schema": MODULE.AGENT_TASK_RECEIPT_SCHEMA,
+                "request_id": "request-1",
+                "policy": {
+                    "id": "marketplace-agent-worker",
+                    "version": 1,
+                    "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
+                },
+                "mode": "apply_with_report",
+                "repository": "owner/repo",
+                "pull_request_head_sha": self.head,
+                "validation_complete": True,
+                "validation": self.validation,
+            }
+        )
+
+    def report(self, commits=None):
+        commits = [] if commits is None else commits
+        identity = self.preflight["comment_identities"][0]
+        fixed = bool(commits)
+        return json.dumps(
+            {
+                "schema": MODULE.COPILOT_REVIEW_REPORT_SCHEMA,
+                "request_id": "request-1",
+                "repository": "owner/repo",
+                "pull_request": {
+                    "number": 7,
+                    "head_sha": self.head,
+                    "base_sha": self.base,
+                    "title_sha256": MODULE.sha256_text("Current title"),
+                    "body_sha256": MODULE.sha256_text("Current body"),
+                },
+                "outcome": "addressed" if fixed else "no_changes",
+                "fix_commits": commits,
+                "comments": [
+                    {
+                        **identity,
+                        "disposition": "fixed" if fixed else "no_change",
+                        "reason": "The focused test confirms the correct behavior.",
+                        "commit": commits[0] if fixed else None,
+                        "reply": "Fixed and covered by the focused test."
+                        if fixed
+                        else "The current behavior already handles this case.",
+                        "changed_paths": ["src/app.py"] if fixed else [],
+                    }
+                ],
+                "validation": self.validation,
+            }
+        )
+
+    def test_agent_definition_is_thin_and_version_is_bumped(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+        self.assertIn("agent-task <target>", instructions)
+        self.assertIn("marketplace-agent-worker@1", instructions)
+        self.assertIn("Never use Cloud Sandboxes", instructions)
+        self.assertIn("does not support `--input-result-file`", instructions)
+        self.assertNotIn("tools: [read", instructions)
+        self.assertNotIn("tools: [edit", instructions)
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.0")
+
+    def test_prompt_is_self_contained_versioned_and_treats_inputs_as_untrusted(self):
+        prompt = MODULE.build_worker_prompt(
+            self.preflight,
+            remaining_iterations=4,
+            prior_history=[],
+        )
+        self.assertIn("worker prompt version 1", prompt)
+        self.assertIn('"remaining_iteration_budget": 4', prompt)
+        self.assertIn('"thread_id": "PRRT_thread"', prompt)
+        self.assertIn("untrusted data", prompt)
+        self.assertIn("local-execution fallback", prompt)
+        MODULE.require_no_credentials(prompt, source="prompt")
+
+    def test_discovers_only_the_pinned_helper_and_policy(self):
+        self.assertEqual(
+            MODULE.REQUIRED_CONFIG_COMMIT,
+            "e67d61da91c514eeea12179997aa4f35d3d737da",
+        )
+        self.assertEqual(
+            MODULE.REQUIRED_CLOUD_TASK_SHA256,
+            "fa57bff76e2e2854d1bd73ea77a761e9e14ebcd89b89a7d90e91c6d28c73ff5f",
+        )
+        self.assertEqual(
+            MODULE.AGENT_TASK_POLICY_SHA256,
+            "c87e380b050a2af8c275eb2413893304ca7b7ff28bd1ae074a07ae5e66c40189",
+        )
+        home = self.directory / ".copilot"
+        helper = home / MODULE.CLOUD_TASK_RELATIVE_PATH
+        helper.parent.mkdir(parents=True)
+        helper.write_text("# helper\n", encoding="utf-8")
+        manifest = {
+            "version": 3,
+            "source": {
+                "path": str(self.directory),
+                "commit": MODULE.REQUIRED_CONFIG_COMMIT,
+                "dirty": False,
+            },
+            "entries": [MODULE.CLOUD_TASK_MANAGED_ENTRY],
+            "contents": {
+                MODULE.CLOUD_TASK_MANAGED_ENTRY: {
+                    "scripts/cloud_task.py": MODULE.REQUIRED_CLOUD_TASK_SHA256
+                }
+            },
+        }
+        (home / MODULE.CONFIG_MANIFEST_NAME).write_text(json.dumps(manifest))
+        with (
+            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
+            mock.patch.object(
+                MODULE, "sha256_file", return_value=MODULE.REQUIRED_CLOUD_TASK_SHA256
+            ),
+        ):
+            self.assertEqual(MODULE.discover_cloud_task(), helper.resolve())
+        manifest["source"]["commit"] = "0" * 40
+        (home / MODULE.CONFIG_MANIFEST_NAME).write_text(json.dumps(manifest))
+        with (
+            mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}),
+            self.assertRaisesRegex(MODULE.WorkflowError, "missing or too old"),
+        ):
+            MODULE.discover_cloud_task()
+
+    def test_validates_success_and_no_op_receipts(self):
+        remote = self.remote()
+        MODULE.validate_worker_receipt(
+            self.receipt(),
+            request_id="request-1",
+            preflight=self.preflight,
+            validation=self.validation,
+        )
+        report = MODULE.validate_copilot_review_report(
+            self.report(),
+            request_id="request-1",
+            preflight=self.preflight,
+            remote=remote,
+            paths_by_commit={},
+        )
+        self.assertEqual(report["outcome"], "no_changes")
+
+    def test_validates_fix_paths_commits_and_order(self):
+        remote = self.remote([self.fix])
+        report = MODULE.validate_copilot_review_report(
+            self.report([self.fix]),
+            request_id="request-1",
+            preflight=self.preflight,
+            remote=remote,
+            paths_by_commit={self.fix: ["src/app.py"]},
+        )
+        self.assertEqual(report["fix_commits"], [self.fix])
+        with self.assertRaisesRegex(MODULE.WorkflowError, "unexpected paths"):
+            MODULE.validate_copilot_review_report(
+                self.report([self.fix]),
+                request_id="request-1",
+                preflight=self.preflight,
+                remote=remote,
+                paths_by_commit={self.fix: ["src/other.py"]},
+            )
+
+    def test_rejects_malformed_mismatched_and_credential_artifacts(self):
+        bad = self.result()
+        bad["policy"]["sha256"] = "0" * 64
+        with self.assertRaises(MODULE.WorkflowError):
+            MODULE.validate_success_result(
+                bad,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+            )
+        incomplete = self.result()
+        incomplete["validation"] = {"complete": False, "outcomes": []}
+        with self.assertRaisesRegex(MODULE.WorkflowError, "validation"):
+            MODULE.validate_success_result(
+                incomplete,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+            )
+        report = json.loads(self.report())
+        report["comments"][0]["thread_id"] = "PRRT_stale"
+        with self.assertRaisesRegex(MODULE.WorkflowError, "mismatched comment"):
+            MODULE.validate_copilot_review_report(
+                json.dumps(report),
+                request_id="request-1",
+                preflight=self.preflight,
+                remote=self.remote(),
+                paths_by_commit={},
+            )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "credentials"):
+            MODULE.require_no_credentials(
+                "Authorization: Bearer github_pat_abcdefghijklmnop",
+                source="artifact",
+            )
+
+    def test_rejects_stale_head_threads_and_local_drift(self):
+        live = dict(self.preflight["pr"])
+        live["head_sha"] = "9" * 40
+        with self.assertRaisesRegex(MODULE.WorkflowError, "drifted"):
+            MODULE.require_live_pr_snapshot(
+                self.preflight["pr"], live, expected_head=self.head
+            )
+        with (
+            mock.patch.object(MODULE, "fetch_copilot_threads", return_value=([], [])),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
+            self.assertRaisesRegex(MODULE.WorkflowError, "identity drifted"),
+        ):
+            MODULE.require_live_comments(self.preflight)
+
+    def test_reply_recovery_rejects_new_unresolved_copilot_threads(self):
+        def thread(comment: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "id": comment["thread_id"],
+                "isResolved": False,
+                "comments": {
+                    "nodes": [
+                        {
+                            "databaseId": comment["id"],
+                            "url": comment["url"],
+                            "body": comment["body"],
+                            "path": comment["path"],
+                            "position": comment["position"],
+                            "originalPosition": comment["original_position"],
+                            "line": comment["line"],
+                            "originalLine": comment["original_line"],
+                            "author": {
+                                "login": comment["author"],
+                                "id": comment["author_bot_id"],
+                            },
+                            "pullRequestReview": {
+                                "databaseId": comment["review_id"]
+                            },
+                        }
+                    ]
+                },
+            }
+
+        added = {
+            **self.comment,
+            "id": 18,
+            "thread_id": "PRRT_added",
+            "url": "https://github.com/owner/repo/pull/7#discussion_r18",
+            "body": "Handle the second case.",
+        }
+        with (
+            mock.patch.object(
+                MODULE,
+                "fetch_copilot_threads",
+                return_value=([thread(self.comment), thread(added)], []),
+            ),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
+            self.assertRaisesRegex(MODULE.WorkflowError, "identity drifted"),
+        ):
+            MODULE.require_live_comments(self.preflight, allow_resolved=True)
+
+    def test_rejects_merge_artifacts_and_unexpected_history(self):
+        remote = self.remote()
+        with (
+            mock.patch.object(
+                MODULE,
+                "git",
+                side_effect=[self.artifact, f"{self.artifact} {self.head} {'9' * 40}"],
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "merge"),
+        ):
+            MODULE.validate_generated_history(
+                self.repo_root, base_sha=self.head, remote=remote
+            )
+        with (
+            mock.patch.object(MODULE, "git", return_value=""),
+            self.assertRaisesRegex(MODULE.WorkflowError, "unexpected"),
+        ):
+            MODULE.validate_generated_history(
+                self.repo_root, base_sha=self.head, remote=remote
+            )
+
+    def test_recovery_command_and_paths_stay_outside_repository(self):
+        outside = self.directory / "state" / "result.json"
+        outside.parent.mkdir()
+        MODULE.require_outside_repository(outside, self.repo_root)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "outside"):
+            MODULE.require_outside_repository(
+                self.repo_root / "result.json", self.repo_root
+            )
+        command = MODULE.agent_task_recovery_command(
+            target=self.preflight["pr"]["pr_url"],
+            repo_root=self.repo_root,
+            state_path=outside,
+            model="sol",
+        )
+        self.assertIn('"--resume"', command)
+
+    def test_cleanup_removes_retained_external_task_artifacts(self):
+        state_path = self.directory / "cleanup-state.json"
+        prompt = self.directory / "prompt.txt"
+        result = self.directory / "result.json"
+        prompt.write_text("prompt", encoding="utf-8")
+        result.write_text("result", encoding="utf-8")
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "created_at": MODULE.utc_now(),
+                "repo_root": str(self.repo_root),
+                "monitoring": {"status": "completed"},
+                "agent_task": {
+                    "prompt_file": str(prompt),
+                    "result_file": str(result),
+                    "recovery_files": [str(prompt), str(result)],
+                },
+            },
+        )
+        with mock.patch.object(MODULE, "emit"):
+            MODULE.command_cleanup(SimpleNamespace(state=str(state_path)))
+        self.assertFalse(state_path.exists())
+        self.assertFalse(prompt.exists())
+        self.assertFalse(result.exists())
+
+    def test_resume_invocation_reuses_the_retained_result(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn('"--input-result-file"', source)
+        self.assertIn("an unfinished Agent Task already owns this state", source)
+        parser = MODULE.build_parser()
+        parsed = parser.parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--state",
+                str(self.directory / "s"),
+                "--resume",
+            ]
+        )
+        self.assertTrue(parsed.resume)
+
+    def test_windows_run_bytes_hides_console_processes(self):
+        completed = MODULE.subprocess.CompletedProcess(["git"], 0, b"", b"")
+        with (
+            mock.patch.object(MODULE, "IS_WINDOWS", True),
+            mock.patch.object(
+                MODULE.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True
+            ),
+            mock.patch.object(
+                MODULE.subprocess, "run", return_value=completed
+            ) as subprocess_run,
+        ):
+            MODULE.run_bytes(["git"])
+        self.assertEqual(subprocess_run.call_args.kwargs["creationflags"], 0x08000000)
+
+    def test_budget_supports_multiple_iterations_and_stops_at_cap(self):
+        state = {"iterations": 0, "budget_scope": "standalone"}
+        MODULE.charge_iteration(state)
+        MODULE.charge_iteration(state)
+        self.assertEqual(state["iterations"], 2)
+        self.assertIsNone(MODULE.exhausted_budget(2, 2, 5, None))
+        self.assertEqual(MODULE.exhausted_budget(5, 5, 5, None), "iteration")
+        pipeline = {"run": "flight", "iteration": 1, "baseline": 0, "run_baseline": 0}
+        self.assertEqual(MODULE.absolute_iteration_cap(pipeline, 5, 3), 15)
+
+    def test_clean_no_op_wins_at_cap_but_comments_do_not_start_another_task(self):
+        clean_path = self.directory / "clean-at-cap.json"
+        capped_path = self.directory / "comments-at-cap.json"
+        for path in (clean_path, capped_path):
+            MODULE.save_state(
+                path,
+                {
+                    "version": MODULE.STATE_VERSION,
+                    "created_at": MODULE.utc_now(),
+                    "iterations": 5,
+                    "history": [],
+                },
+            )
+        clean = {
+            **self.preflight,
+            "comments": [],
+            "comment_identities": [],
+            "head_review_clean": True,
+        }
+        emitted = []
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "agent_task_preflight", return_value=clean),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.command_agent_task(self.arguments(clean_path, max_iterations=5))
+        self.assertEqual(emitted[-1]["result"], "no_unresolved_comments")
+        discover.assert_not_called()
+
+        emitted.clear()
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=self.preflight
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.command_agent_task(self.arguments(capped_path, max_iterations=5))
+        self.assertEqual(emitted[-1]["result"], "max_iterations_reached")
+        discover.assert_not_called()
+
+    def arguments(self, state_path, *, resume=False, max_iterations=5):
+        return SimpleNamespace(
+            target="owner/repo#7",
+            repo_root=str(self.repo_root),
+            state=str(state_path),
+            resume=resume,
+            model="sol",
+            max_iterations=max_iterations,
+            pipeline_run=None,
+            pipeline_iteration=None,
+            pipeline_max_iterations=None,
+            watch_interval=0.01,
+            cancellation_grace=0.01,
+        )
+
+    def test_no_op_task_still_replies_resolves_and_requests_review(self):
+        state_path = self.directory / "state.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        report = self.report()
+        result = self.result()
+        result["report"]["sha256"] = MODULE.sha256_text(report)
+        commands = []
+        emitted = []
+
+        def run(command, **kwargs):
+            commands.append(command)
+            output = Path(command[command.index("--result-file") + 1])
+            output.write_text(json.dumps(result), encoding="utf-8")
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=self.preflight
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "run", side_effect=run),
+            mock.patch.object(
+                MODULE, "local_identity", return_value=self.preflight["identity"]
+            ),
+            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
+            mock.patch.object(
+                MODULE, "fetch_committed_text", side_effect=[report, self.receipt()]
+            ),
+            mock.patch.object(
+                MODULE, "metadata_for", return_value=self.preflight["pr"]
+            ),
+            mock.patch.object(MODULE, "remote_head", return_value=self.head),
+            mock.patch.object(MODULE, "wait_for_remote_head", return_value=self.head),
+            mock.patch.object(
+                MODULE, "require_live_comments", return_value=[self.comment]
+            ),
+            mock.patch.object(
+                MODULE, "post_missing_replies", return_value={17: 71}
+            ) as replies,
+            mock.patch.object(MODULE, "resolve_threads") as resolve,
+            mock.patch.object(
+                MODULE, "request_copilot", return_value={"status": "requested"}
+            ),
+            mock.patch.object(
+                MODULE, "verify_publish", return_value={"head_matches": True}
+            ),
+            mock.patch.object(MODULE, "continue_after_review_request") as continuation,
+            mock.patch.object(MODULE, "emit", emitted.append),
+            mock.patch.object(MODULE.secrets, "token_hex", return_value="run-1"),
+        ):
+            MODULE.command_agent_task(self.arguments(state_path))
+
+        self.assertIn("--apply-with-report", commands[0])
+        self.assertNotIn("custom_agent", commands[0])
+        replies.assert_called_once()
+        resolve.assert_called_once()
+        continuation.assert_called_once()
+        self.assertEqual(emitted[-1]["result"], "nothing_to_publish")
+        state = MODULE.load_state(state_path)
+        self.assertEqual(state["iterations"], 1)
+        self.assertEqual(state["agent_task"]["status"], "completed")
+        self.assertTrue(state["agent_task"]["artifacts_removed"])
+
+    def test_task_error_keeps_artifacts_without_redispatching(self):
+        state_path = self.directory / "resume-state.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        failure = self.result()
+        failure["status"] = "failed"
+        failure["error"] = {"code": "interrupted", "message": "Worker interrupted."}
+        commands = []
+
+        def fail_run(command, **kwargs):
+            commands.append(command)
+            output = Path(command[command.index("--result-file") + 1])
+            output.write_text(json.dumps(failure), encoding="utf-8")
+            return MODULE.subprocess.CompletedProcess(command, 1, "", "interrupted")
+
+        common = (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=self.preflight
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(
+                MODULE, "local_identity", return_value=self.preflight["identity"]
+            ),
+            mock.patch.object(MODULE.secrets, "token_hex", return_value="run-1"),
+        )
+        with ExitStack() as stack:
+            for patcher in common:
+                stack.enter_context(patcher)
+            stack.enter_context(mock.patch.object(MODULE, "run", side_effect=fail_run))
+            stack.enter_context(
+                self.assertRaisesRegex(MODULE.WorkflowError, "interrupted")
+            )
+            MODULE.command_agent_task(self.arguments(state_path))
+
+        failed_state = MODULE.load_state(state_path)
+        self.assertEqual(failed_state["agent_task"]["status"], "failed")
+        self.assertEqual(failed_state["agent_task"]["task"]["id"], "task-1")
+        self.assertTrue(
+            all(
+                Path(path).is_file()
+                for path in failed_state["agent_task"]["recovery_files"]
+            )
+        )
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE, "local_identity", return_value=self.preflight["identity"]
+            ),
+            mock.patch.object(MODULE, "run") as resumed_run,
+            self.assertRaisesRegex(MODULE.WorkflowError, "Worker interrupted"),
+        ):
+            MODULE.command_agent_task(self.arguments(state_path, resume=True))
+
+        resumed_run.assert_not_called()
+
+    def test_fresh_review_comments_start_the_next_managed_iteration(self):
+        state_path = self.directory / "watch-state.json"
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "created_at": MODULE.utc_now(),
+                "iterations": 1,
+                "pr": self.preflight["pr"],
+                "monitoring": {
+                    "status": "requested",
+                    "result": None,
+                },
+            },
+        )
+
+        def complete_watch(_args):
+            state = MODULE.load_state(state_path)
+            state["monitoring"] = {
+                "status": "completed",
+                "result": {"result": MODULE.WATCHER_REVIEW_COMMENTS},
+            }
+            MODULE.save_state(state_path, state)
+
+        arguments = self.arguments(state_path, resume=True)
+        with (
+            mock.patch.object(MODULE, "command_watch", side_effect=complete_watch),
+            mock.patch.object(MODULE, "wait_for_fresh_copilot_state") as fresh,
+            mock.patch.object(MODULE, "command_agent_task") as next_iteration,
+        ):
+            MODULE.continue_after_review_request(arguments, state_path)
+        fresh.assert_called_once()
+        next_arguments = next_iteration.call_args.args[0]
+        self.assertFalse(next_arguments.resume)
+        self.assertEqual(next_arguments.max_iterations, 5)
+
+    def test_publication_checks_comments_before_and_after_push(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        coordinator = source.index("def command_agent_task")
+        before_push = source.index("require_live_comments(", coordinator)
+        push = source.index(
+            "f\"HEAD:{pr['head_branch']}\"",
+            before_push,
+        )
+        after_push = source.index("require_live_comments(", push)
+        reply = source.index("post_missing_replies(state, handled)", after_push)
+        resolve = source.index("resolve_threads(handled)", reply)
+        self.assertLess(before_push, push)
+        self.assertLess(push, after_push)
+        self.assertLess(after_push, reply)
+        self.assertLess(reply, resolve)
+
+
 class ParseTargetTest(unittest.TestCase):
     def test_ignores_a_pasted_review_fragment(self):
         target = MODULE.parse_target(
@@ -930,7 +1672,9 @@ class ParseTargetTest(unittest.TestCase):
         self.assertEqual(target["number"], 19233)
 
     def test_parses_short_pr_target(self):
-        target = MODULE.parse_target("open-telemetry/opentelemetry-java-instrumentation#19233")
+        target = MODULE.parse_target(
+            "open-telemetry/opentelemetry-java-instrumentation#19233"
+        )
 
         self.assertEqual(target["owner"], "open-telemetry")
         self.assertEqual(target["number"], 19233)
@@ -942,10 +1686,13 @@ class ParseTargetTest(unittest.TestCase):
     def test_resolve_target_falls_back_to_the_current_pr(self):
         target = MODULE.parse_target("https://github.com/open-telemetry/repo/pull/42")
 
-        with mock.patch.object(MODULE, "current_pr_target", return_value=target) as current:
+        with mock.patch.object(
+            MODULE, "current_pr_target", return_value=target
+        ) as current:
             self.assertEqual(MODULE.resolve_target(None, Path("repo")), target)
             self.assertEqual(
-                MODULE.resolve_target("open-telemetry/repo#43", Path("repo"))["number"], 43
+                MODULE.resolve_target("open-telemetry/repo#43", Path("repo"))["number"],
+                43,
             )
 
         current.assert_called_once_with(Path("repo"))
@@ -961,9 +1708,7 @@ class CliPathTest(unittest.TestCase):
     def test_resolve_repo_root_uses_converted_path(self):
         completed = mock.Mock(stdout="C:/src/repo\n")
         with (
-            mock.patch.object(
-                MODULE, "cli_path", return_value=Path(r"C:\src\repo")
-            ),
+            mock.patch.object(MODULE, "cli_path", return_value=Path(r"C:\src\repo")),
             mock.patch.object(MODULE, "run", return_value=completed) as run,
         ):
             MODULE.resolve_repo_root("/c/src/repo")
@@ -987,10 +1732,9 @@ class MetadataTest(unittest.TestCase):
             "baseRefOid": "frozen",
         }
 
-        with mock.patch.object(
-            MODULE, "gh_json", return_value=metadata
-        ) as gh_json, mock.patch.object(
-            MODULE, "base_ref_tip", return_value="live-tip"
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value=metadata) as gh_json,
+            mock.patch.object(MODULE, "base_ref_tip", return_value="live-tip"),
         ):
             result = MODULE.metadata_for(target)
 
@@ -1012,11 +1756,10 @@ class MetadataTest(unittest.TestCase):
             "baseRefOid": "frozen",
         }
 
-        with mock.patch.object(
-            MODULE, "gh_json", return_value=metadata
-        ), mock.patch.object(
-            MODULE, "base_ref_tip", return_value="live-tip"
-        ) as tip:
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value=metadata),
+            mock.patch.object(MODULE, "base_ref_tip", return_value="live-tip") as tip,
+        ):
             result = MODULE.metadata_for(target)
 
         self.assertEqual("live-tip", result["base_sha"])
@@ -1038,7 +1781,9 @@ class MetadataTest(unittest.TestCase):
 
         with (
             mock.patch.object(MODULE, "gh_json", return_value=metadata),
-            self.assertRaisesRegex(MODULE.WorkflowError, "head repository is unavailable"),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "head repository is unavailable"
+            ),
         ):
             MODULE.metadata_for(target)
 
@@ -1102,9 +1847,7 @@ class CurrentPrStatusTest(unittest.TestCase):
 
         with (
             mock.patch.object(MODULE, "git", return_value="topic"),
-            mock.patch.object(
-                MODULE, "configured_upstream", return_value=upstream
-            ),
+            mock.patch.object(MODULE, "configured_upstream", return_value=upstream),
             mock.patch.object(
                 MODULE, "simple_current_pr_target", return_value=target
             ) as simple,
@@ -1144,9 +1887,7 @@ class CurrentPrStatusTest(unittest.TestCase):
                 "remote",
                 "get-url",
                 "fork",
-            ): mock.Mock(
-                returncode=0, stdout="git@github.com:trask/repo.git\n"
-            ),
+            ): mock.Mock(returncode=0, stdout="git@github.com:trask/repo.git\n"),
         }
 
         def fake_run(command, **_kwargs):
@@ -1177,9 +1918,7 @@ class CurrentPrStatusTest(unittest.TestCase):
             mock.patch.object(
                 MODULE, "git", return_value="trask-grpc-metadata-selectors"
             ),
-            mock.patch.object(
-                MODULE, "configured_upstream", return_value=upstream
-            ),
+            mock.patch.object(MODULE, "configured_upstream", return_value=upstream),
             mock.patch.object(MODULE, "simple_current_pr_target") as simple,
             mock.patch.object(
                 MODULE, "exact_upstream_pr_targets", return_value=[target]
@@ -1204,15 +1943,11 @@ class CurrentPrStatusTest(unittest.TestCase):
 
         with (
             mock.patch.object(MODULE, "git", return_value="local-topic"),
-            mock.patch.object(
-                MODULE, "configured_upstream", return_value=upstream
-            ),
+            mock.patch.object(MODULE, "configured_upstream", return_value=upstream),
             mock.patch.object(
                 MODULE, "exact_upstream_pr_targets", return_value=targets
             ),
-            self.assertRaisesRegex(
-                MODULE.WorkflowError, "multiple open pull requests"
-            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "multiple open pull requests"),
         ):
             MODULE.current_pr_target(Path("repo"))
 
@@ -1225,9 +1960,7 @@ class CurrentPrStatusTest(unittest.TestCase):
 
         with (
             mock.patch.object(MODULE, "git", return_value="local-topic"),
-            mock.patch.object(
-                MODULE, "configured_upstream", return_value=upstream
-            ),
+            mock.patch.object(MODULE, "configured_upstream", return_value=upstream),
             mock.patch.object(MODULE, "exact_upstream_pr_targets", return_value=[]),
             self.assertRaisesRegex(MODULE.WorkflowError, "no open pull request"),
         ):
@@ -1237,9 +1970,7 @@ class CurrentPrStatusTest(unittest.TestCase):
         with (
             mock.patch.object(MODULE, "git", return_value="topic"),
             mock.patch.object(MODULE, "configured_upstream", return_value=None),
-            mock.patch.object(
-                MODULE, "simple_current_pr_target", return_value=None
-            ),
+            mock.patch.object(MODULE, "simple_current_pr_target", return_value=None),
             self.assertRaisesRegex(MODULE.WorkflowError, "no configured upstream"),
         ):
             MODULE.current_pr_target(Path("repo"))
@@ -1496,9 +2227,7 @@ class QueueSelectionTest(unittest.TestCase):
             "id": "thread-5",
             "isResolved": True,
             "comments": {
-                "nodes": [
-                    {"databaseId": 50, "author": {"login": "settled-reviewer"}}
-                ]
+                "nodes": [{"databaseId": 50, "author": {"login": "settled-reviewer"}}]
             },
         }
         anonymous_thread = {
@@ -1541,9 +2270,7 @@ class QueueSelectionTest(unittest.TestCase):
         review = {"id": 103}
 
         self.assertTrue(
-            MODULE.review_has_inline_findings(
-                review, [self.resolved_copilot_thread]
-            )
+            MODULE.review_has_inline_findings(review, [self.resolved_copilot_thread])
         )
 
 
@@ -1677,7 +2404,9 @@ return value;
                 comment["id"] for comment in second_parse
             )
         )
-        self.assertTrue(all(comment["source"] == "suppressed" for comment in first_parse))
+        self.assertTrue(
+            all(comment["source"] == "suppressed" for comment in first_parse)
+        )
         self.assertTrue(all(comment["thread_id"] is None for comment in first_parse))
 
     def test_latest_copilot_review_uses_highest_review_id(self):
@@ -1880,9 +2609,7 @@ class RemoteParsingTest(unittest.TestCase):
             ) as remote_head,
             mock.patch.object(MODULE.time, "sleep") as sleep,
         ):
-            result = MODULE.wait_for_remote_head(
-                "owner", "repo", "branch", "new-head"
-            )
+            result = MODULE.wait_for_remote_head("owner", "repo", "branch", "new-head")
 
         self.assertEqual(result, "new-head")
         self.assertEqual(remote_head.call_count, 3)
@@ -1896,12 +2623,12 @@ class RemoteParsingTest(unittest.TestCase):
 
     def test_stops_waiting_after_the_remote_ref_retry_budget(self):
         with (
-            mock.patch.object(MODULE, "remote_head", return_value="old-head") as remote_head,
+            mock.patch.object(
+                MODULE, "remote_head", return_value="old-head"
+            ) as remote_head,
             mock.patch.object(MODULE.time, "sleep") as sleep,
         ):
-            result = MODULE.wait_for_remote_head(
-                "owner", "repo", "branch", "new-head"
-            )
+            result = MODULE.wait_for_remote_head("owner", "repo", "branch", "new-head")
 
         self.assertEqual(result, "old-head")
         self.assertEqual(
@@ -2067,9 +2794,7 @@ class ReplyPublishingTest(unittest.TestCase):
 
         with (
             mock.patch.object(MODULE, "fetch_review_comments", return_value=[]),
-            mock.patch.object(
-                MODULE, "gh_json", side_effect=fake_gh_json
-            ) as gh_json,
+            mock.patch.object(MODULE, "gh_json", side_effect=fake_gh_json) as gh_json,
             mock.patch.object(MODULE, "graphql") as graphql,
         ):
             reply_ids = MODULE.post_missing_replies(state, comments)
@@ -2079,7 +2804,9 @@ class ReplyPublishingTest(unittest.TestCase):
         self.assertEqual(comments[1]["reply_id"], 21)
         # A single bundled review is never created for the replies.
         graphql.assert_not_called()
-        posts = [call for call in gh_json.call_args_list if call.args[0] != ["api", "user"]]
+        posts = [
+            call for call in gh_json.call_args_list if call.args[0] != ["api", "user"]
+        ]
         self.assertEqual(
             [call.args[0] for call in posts],
             [
@@ -2690,9 +3417,7 @@ class VerifyPublishTest(unittest.TestCase):
             payload = MODULE.wait_for_pr_head(dict(self.STATE), "abc123")
 
         self.assertEqual(payload["head"]["sha"], "old-head")
-        self.assertEqual(
-            gh_json.call_count, len(MODULE.PR_HEAD_LAG_RETRY_DELAYS) + 1
-        )
+        self.assertEqual(gh_json.call_count, len(MODULE.PR_HEAD_LAG_RETRY_DELAYS) + 1)
         self.assertEqual(sleep.call_count, len(MODULE.PR_HEAD_LAG_RETRY_DELAYS))
 
 
@@ -2825,7 +3550,9 @@ class FirstCopilotReviewTest(unittest.TestCase):
         state = {"pr": dict(self.PR)}
 
         with (
-            mock.patch.object(MODULE, "lookup_copilot_bot", side_effect=[None, "BOT_1"]),
+            mock.patch.object(
+                MODULE, "lookup_copilot_bot", side_effect=[None, "BOT_1"]
+            ),
             mock.patch.object(MODULE, "gh_version", return_value=(2, 88, 0)),
             mock.patch.object(
                 MODULE, "run", return_value=SimpleNamespace(returncode=0)
@@ -2857,7 +3584,9 @@ class FirstCopilotReviewTest(unittest.TestCase):
                 MODULE, "lookup_copilot_bot", side_effect=[None, None, "BOT_1"]
             ),
             mock.patch.object(MODULE, "gh_version", return_value=(2, 88, 0)),
-            mock.patch.object(MODULE, "run", return_value=SimpleNamespace(returncode=0)),
+            mock.patch.object(
+                MODULE, "run", return_value=SimpleNamespace(returncode=0)
+            ),
             mock.patch.object(MODULE.time, "sleep") as sleep,
         ):
             bot_id = MODULE.request_first_copilot_review(dict(self.PR))
@@ -2875,7 +3604,9 @@ class FirstCopilotReviewTest(unittest.TestCase):
         with (
             mock.patch.object(MODULE, "lookup_copilot_bot", return_value=None),
             mock.patch.object(MODULE, "gh_version", return_value=(2, 88, 0)),
-            mock.patch.object(MODULE, "run", return_value=SimpleNamespace(returncode=0)),
+            mock.patch.object(
+                MODULE, "run", return_value=SimpleNamespace(returncode=0)
+            ),
             mock.patch.object(MODULE.time, "sleep") as sleep,
             self.assertRaisesRegex(
                 MODULE.WorkflowError, "still lists no Copilot reviewer"
@@ -2893,7 +3624,9 @@ class FirstCopilotReviewTest(unittest.TestCase):
                 MODULE,
                 "run",
                 return_value=SimpleNamespace(
-                    returncode=1, stderr="HTTP 422: Reviews may only be requested\n", stdout=""
+                    returncode=1,
+                    stderr="HTTP 422: Reviews may only be requested\n",
+                    stdout="",
                 ),
             ),
             self.assertRaisesRegex(
@@ -2915,9 +3648,7 @@ class FirstCopilotReviewTest(unittest.TestCase):
             },
         }
         order: list[str] = []
-        stamps = iter(
-            [f"2026-05-01T12:00:{second:02d}Z" for second in range(30)]
-        )
+        stamps = iter([f"2026-05-01T12:00:{second:02d}Z" for second in range(30)])
 
         def stamp():
             order.append("utc_now")
@@ -3074,7 +3805,10 @@ class CleanAtHeadShaTest(unittest.TestCase):
         # overrode the live agent and discarded its unpushed fix commit.
         self.assertEqual(saved["last_result"], "ready")
         self.assertIsNone(MODULE.stage_outcome(saved))
-    def run_preflight(self, *, threads=None, reviews=None, prior_clean_at_head_sha=None):
+
+    def run_preflight(
+        self, *, threads=None, reviews=None, prior_clean_at_head_sha=None
+    ):
         metadata = {"head_branch": "branch", "head_sha": "head"}
 
         def fake_git(repo_root, *arguments):
@@ -3164,7 +3898,11 @@ class CleanAtHeadShaTest(unittest.TestCase):
                 "cancel_requested": False,
             },
         }
-        review = {"id": 101, "html_url": "https://example.test/review/101", "body": body}
+        review = {
+            "id": 101,
+            "html_url": "https://example.test/review/101",
+            "body": body,
+        }
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
@@ -3177,9 +3915,7 @@ class CleanAtHeadShaTest(unittest.TestCase):
                 ),
                 mock.patch.object(MODULE, "fetch_reviews", return_value=[review]),
                 mock.patch.object(MODULE, "matching_review", return_value=review),
-                mock.patch.object(
-                    MODULE, "gh_paginated", return_value=review_comments
-                ),
+                mock.patch.object(MODULE, "gh_paginated", return_value=review_comments),
                 mock.patch.object(MODULE, "emit") as emit,
             ):
                 MODULE.command_watch(args)
@@ -3368,7 +4104,9 @@ class StageOutcomeTest(unittest.TestCase):
     PIPELINE_VOCABULARY = ("cleared", "skipped", "no_progress", "escalated", "carried")
 
     def test_a_clearance_is_read_off_the_marker_and_never_decided_again(self):
-        self.assertEqual(MODULE.stage_outcome({"clean_at_head_sha": "abc123"}), "cleared")
+        self.assertEqual(
+            MODULE.stage_outcome({"clean_at_head_sha": "abc123"}), "cleared"
+        )
 
     def test_no_result_can_clear_a_run_the_marker_did_not_clear(self):
         """`stage_outcome` must never become a second, softer route to green.
@@ -3516,9 +4254,7 @@ class StageOutcomeTest(unittest.TestCase):
     def test_the_watcher_records_the_result_the_outcome_is_read_from(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
-            MODULE.save_state(
-                path, {"version": MODULE.STATE_VERSION, "monitoring": {}}
-            )
+            MODULE.save_state(path, {"version": MODULE.STATE_VERSION, "monitoring": {}})
             state = MODULE.load_state(path)
             MODULE.watcher_result(state, {"result": "request_cancelled"})
             MODULE.save_state(path, state)
@@ -3765,9 +4501,7 @@ class CopilotReviewTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             MODULE.save_state(path, state)
-            args = SimpleNamespace(
-                state=str(path), interval=0, cancellation_grace=0
-            )
+            args = SimpleNamespace(state=str(path), interval=0, cancellation_grace=0)
             with (
                 mock.patch.object(
                     MODULE, "gh_json", return_value={"head": {"sha": "abc123"}}
@@ -3784,7 +4518,6 @@ class CopilotReviewTest(unittest.TestCase):
         self.assertEqual(payload["result"], "request_cancelled")
         self.assertIsNone(payload.get("clean_at_head_sha"))
         self.assertIsNone(recorded)
-
 
     def test_watch_treats_suppressed_only_review_as_comments(self):
         state = {
@@ -3817,9 +4550,7 @@ class CopilotReviewTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             MODULE.save_state(path, state)
-            args = SimpleNamespace(
-                state=str(path), interval=0, cancellation_grace=0
-            )
+            args = SimpleNamespace(state=str(path), interval=0, cancellation_grace=0)
 
             with (
                 mock.patch.object(
@@ -3849,9 +4580,7 @@ class CopilotReviewTest(unittest.TestCase):
 
         self.assertEqual(result, "cancelled_locally")
         self.assertEqual(state["monitoring"]["status"], "completed")
-        self.assertEqual(
-            state["monitoring"]["result"], {"result": "cancelled_locally"}
-        )
+        self.assertEqual(state["monitoring"]["result"], {"result": "cancelled_locally"})
 
     def test_stale_watcher_cancellation_completes_locally(self):
         state = {
@@ -3867,9 +4596,7 @@ class CopilotReviewTest(unittest.TestCase):
 
         self.assertEqual(result, "cancelled_locally")
         self.assertEqual(state["monitoring"]["status"], "completed")
-        self.assertEqual(
-            state["monitoring"]["result"], {"result": "cancelled_locally"}
-        )
+        self.assertEqual(state["monitoring"]["result"], {"result": "cancelled_locally"})
 
     def test_live_watcher_cancellation_waits_for_watcher(self):
         state = {
@@ -3957,9 +4684,7 @@ class CopilotReviewTest(unittest.TestCase):
             args = SimpleNamespace(state=str(path), interval=0.25)
 
             with (
-                mock.patch.object(
-                    MODULE, "load_state", side_effect=[state, completed]
-                ),
+                mock.patch.object(MODULE, "load_state", side_effect=[state, completed]),
                 mock.patch.object(MODULE, "process_is_running", return_value=True),
                 mock.patch.object(MODULE.time, "sleep") as sleep,
                 mock.patch.object(MODULE, "emit") as emit,
@@ -4001,9 +4726,7 @@ class CopilotReviewTest(unittest.TestCase):
 
         sleep.assert_not_called()
         self.assertEqual(saved["monitoring"]["status"], "completed")
-        self.assertEqual(
-            saved["monitoring"]["result"], {"result": "cancelled_locally"}
-        )
+        self.assertEqual(saved["monitoring"]["result"], {"result": "cancelled_locally"})
         emit.assert_called_once_with(
             {
                 "result": "watcher_completed",
@@ -4062,7 +4785,9 @@ class CopilotReviewTest(unittest.TestCase):
             with (
                 mock.patch.object(MODULE, "require_tools"),
                 mock.patch.object(MODULE, "process_is_running", return_value=False),
-                mock.patch.object(MODULE, "resolve_repo_root", return_value=Path(directory)),
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=Path(directory)
+                ),
                 mock.patch.object(MODULE, "git", side_effect=fake_git),
                 mock.patch.object(MODULE, "metadata_for", return_value=metadata),
                 mock.patch.object(MODULE, "run"),
@@ -4075,9 +4800,7 @@ class CopilotReviewTest(unittest.TestCase):
             saved = MODULE.load_state(path)
 
         self.assertEqual(saved["monitoring"]["status"], "completed")
-        self.assertEqual(
-            saved["monitoring"]["result"], {"result": "cancelled_locally"}
-        )
+        self.assertEqual(saved["monitoring"]["result"], {"result": "cancelled_locally"})
         self.assertEqual(saved["queue"]["id"], "pr-1")
 
 
@@ -4127,7 +4850,9 @@ class PreflightTargetTest(unittest.TestCase):
 
             with (
                 mock.patch.object(MODULE, "require_tools"),
-                mock.patch.object(MODULE, "resolve_repo_root", return_value=Path(directory)),
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=Path(directory)
+                ),
                 mock.patch.object(MODULE, "git", side_effect=fake_git),
                 mock.patch.object(MODULE, "metadata_for", return_value=metadata),
                 mock.patch.object(
@@ -4168,7 +4893,9 @@ class PreflightTargetTest(unittest.TestCase):
 
             with (
                 mock.patch.object(MODULE, "require_tools"),
-                mock.patch.object(MODULE, "resolve_repo_root", return_value=Path(directory)),
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=Path(directory)
+                ),
                 mock.patch.object(
                     MODULE, "current_pr_target", return_value=target
                 ) as current_pr_target,
@@ -4334,7 +5061,9 @@ class PreflightTargetTest(unittest.TestCase):
 
             with (
                 mock.patch.object(MODULE, "require_tools"),
-                mock.patch.object(MODULE, "resolve_repo_root", return_value=Path(directory)),
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=Path(directory)
+                ),
                 mock.patch.object(MODULE, "git", side_effect=fake_git),
                 mock.patch.object(MODULE, "metadata_for", return_value=metadata),
                 mock.patch.object(MODULE, "run"),
@@ -4349,9 +5078,7 @@ class PreflightTargetTest(unittest.TestCase):
                             "submitted_at": "2026-08-09T12:00:00Z",
                             "state": "COMMENTED",
                             "body": "No comments.",
-                            "user": {
-                                "login": "copilot-pull-request-reviewer[bot]"
-                            },
+                            "user": {"login": "copilot-pull-request-reviewer[bot]"},
                         }
                     ],
                 ),
@@ -4500,7 +5227,9 @@ class PreflightTargetTest(unittest.TestCase):
 
             with (
                 mock.patch.object(MODULE, "require_tools"),
-                mock.patch.object(MODULE, "resolve_repo_root", return_value=Path(directory)),
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=Path(directory)
+                ),
                 mock.patch.object(MODULE, "git", side_effect=fake_git),
                 mock.patch.object(MODULE, "metadata_for", return_value=metadata),
                 mock.patch.object(MODULE, "run"),
@@ -4529,11 +5258,15 @@ class PipelineBudgetTest(unittest.TestCase):
         self.assertIsNone(self.scope({"iterations": 3}, pipeline_run=None))
         self.assertIsNone(self.scope({"iterations": 3}, pipeline_run=""))
         self.assertIsNone(
-            self.scope({"iterations": 3}, pipeline_iteration=2, pipeline_max_iterations=4)
+            self.scope(
+                {"iterations": 3}, pipeline_iteration=2, pipeline_max_iterations=4
+            )
         )
 
     def test_a_run_this_stage_has_not_seen_starts_a_fresh_budget(self):
-        scope = self.scope({"iterations": 7}, pipeline_run="run-a", pipeline_iteration=1)
+        scope = self.scope(
+            {"iterations": 7}, pipeline_run="run-a", pipeline_iteration=1
+        )
 
         self.assertEqual(scope["baseline"], 7)
 
@@ -4650,9 +5383,7 @@ class PipelineBudgetTest(unittest.TestCase):
             state,
             MODULE.pipeline_scope(
                 state,
-                SimpleNamespace(
-                    pipeline_run="pipeline-run", pipeline_iteration=1
-                ),
+                SimpleNamespace(pipeline_run="pipeline-run", pipeline_iteration=1),
             ),
         )
 
@@ -4674,9 +5405,7 @@ class PipelineBudgetTest(unittest.TestCase):
             state,
             MODULE.pipeline_scope(
                 state,
-                SimpleNamespace(
-                    pipeline_run="pipeline-run", pipeline_iteration=1
-                ),
+                SimpleNamespace(pipeline_run="pipeline-run", pipeline_iteration=1),
             ),
         )
 
@@ -4851,7 +5580,9 @@ class DerivedCeilingTest(unittest.TestCase):
                 self.assertEqual(9, scope["baseline"])
                 self.assertEqual(9, scope["run_baseline"])
                 self.assertIsNone(
-                    MODULE.exhausted_budget(*MODULE.budget_spent(state, scope, 0), 5, 10)
+                    MODULE.exhausted_budget(
+                        *MODULE.budget_spent(state, scope, 0), 5, 10
+                    )
                 )
 
     def test_a_standalone_invocation_still_counts_what_the_agent_counts(self):
@@ -4861,9 +5592,7 @@ class DerivedCeilingTest(unittest.TestCase):
         its caller, and nothing here changes it.
         """
         self.assertEqual((3, 3), MODULE.budget_spent({"iterations": 40}, None, 3))
-        self.assertEqual(
-            "iteration", MODULE.exhausted_budget(5, 5, 5, None)
-        )
+        self.assertEqual("iteration", MODULE.exhausted_budget(5, 5, 5, None))
         self.assertIsNone(MODULE.exhausted_budget(4, 4, 5, None))
 
     def test_a_spent_stage_budget_is_never_a_permanent_refusal(self):
@@ -4974,6 +5703,7 @@ class DetachedHeadTargetTest(unittest.TestCase):
             "pass the pull request explicitly as a URL or owner/repo#number",
             message,
         )
+
 
 class PreflightHelpTest(unittest.TestCase):
     """`--help` is read by a caller building a call, not one recovering from it.
