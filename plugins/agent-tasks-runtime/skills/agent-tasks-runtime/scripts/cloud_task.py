@@ -48,6 +48,7 @@ PR_CONTEXT_MARKER = "----- /cloud source pull request -----"
 POLICY_MARKER = "----- marketplace agent worker policy -----"
 RESULT_SCHEMA_ID = "github.copilot.agent-task-result"
 RESULT_SCHEMA_VERSION = 1
+REPORT_RESULT_SCHEMA_VERSION = 2
 MARKETPLACE_POLICY_ID = "marketplace-agent-worker"
 MARKETPLACE_POLICY_VERSION = 4
 MARKETPLACE_POLICY_SPEC = {
@@ -80,6 +81,36 @@ MARKETPLACE_POLICY_HASH = hashlib.sha256(
 ).hexdigest()
 MARKETPLACE_POLICY_SELECTOR = (
     f"{MARKETPLACE_POLICY_ID}@{MARKETPLACE_POLICY_VERSION}"
+)
+MARKETPLACE_REPORT_POLICY_ID = "marketplace-agent-report-worker"
+MARKETPLACE_REPORT_POLICY_VERSION = 1
+MARKETPLACE_REPORT_POLICY_SPEC = {
+    "id": MARKETPLACE_REPORT_POLICY_ID,
+    "version": MARKETPLACE_REPORT_POLICY_VERSION,
+    "execution_backend": "github-agent-tasks-rest",
+    "authentication": "local-gh-api",
+    "custom_agent": False,
+    "local_fallback": False,
+    "mode": "report",
+    "require_exact_task_identity": True,
+    "require_unchanged_pr_head": True,
+    "require_unchanged_local_identity": True,
+    "require_linear_generated_history": True,
+    "require_expected_paths_only": True,
+    "human_report": "nonempty-utf8-markdown",
+    "worker_validation": False,
+    "dispatcher_structural_attestation": True,
+}
+MARKETPLACE_REPORT_POLICY_HASH = hashlib.sha256(
+    json.dumps(
+        MARKETPLACE_REPORT_POLICY_SPEC,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+).hexdigest()
+MARKETPLACE_REPORT_POLICY_SELECTOR = (
+    f"{MARKETPLACE_REPORT_POLICY_ID}@{MARKETPLACE_REPORT_POLICY_VERSION}"
 )
 FIX_COMMIT_CORRELATION_FIELD = "Finding"
 
@@ -212,6 +243,7 @@ class LocalIdentity:
 
 @dataclass
 class ResultEnvelope:
+    schema_version: int = RESULT_SCHEMA_VERSION
     mode: str = "unknown"
     requested_model: str | None = None
     repository: str | None = None
@@ -235,6 +267,7 @@ class ResultEnvelope:
     receipt_sha256: str | None = None
     validation_complete: bool = False
     validation_outcomes: list[dict[str, str]] | None = None
+    structural_complete: bool = False
     status: str = "error"
     error_code: str | None = None
     error_message: str | None = None
@@ -252,10 +285,10 @@ class ResultEnvelope:
                 "head_ref": self.pull_request.head_ref,
                 "head_sha": self.pull_request.head_sha,
             }
-        return {
+        common = {
             "schema": {
                 "id": RESULT_SCHEMA_ID,
-                "version": RESULT_SCHEMA_VERSION,
+                "version": self.schema_version,
             },
             "status": self.status,
             "mode": self.mode,
@@ -292,7 +325,14 @@ class ResultEnvelope:
                 if self.report_path is not None
                 else None
             ),
-            "worker_receipt": (
+        }
+        if self.schema_version == REPORT_RESULT_SCHEMA_VERSION:
+            common["attestation"] = {
+                "kind": "dispatcher_structural",
+                "structural_complete": self.structural_complete,
+            }
+        else:
+            common["worker_receipt"] = (
                 {
                     "path": self.receipt_path,
                     "commit": self.receipt_commit,
@@ -300,20 +340,20 @@ class ResultEnvelope:
                 }
                 if self.receipt_path is not None
                 else None
-            ),
-            "validation": {
+            )
+            common["validation"] = {
                 "complete": self.validation_complete,
                 "outcomes": self.validation_outcomes or [],
-            },
-            "error": (
+            }
+        common["error"] = (
                 {
                     "code": self.error_code,
                     "message": self.error_message,
                 }
                 if self.error_code is not None
                 else None
-            ),
-        }
+            )
+        return common
 
 
 @dataclass
@@ -560,10 +600,34 @@ def parse_args(args: Sequence[str]) -> Options:
             "--policy requires --result-file",
             "result_file_required",
         )
-    if policy is not None and policy != MARKETPLACE_POLICY_SELECTOR:
+    known_policies = {
+        MARKETPLACE_POLICY_SELECTOR,
+        MARKETPLACE_REPORT_POLICY_SELECTOR,
+    }
+    if policy is not None and policy not in known_policies:
         raise CloudError(
-            f"unknown policy {policy!r}; expected {MARKETPLACE_POLICY_SELECTOR}",
+            f"unknown policy {policy!r}; expected one of "
+            f"{', '.join(sorted(known_policies))}",
             "policy_unknown",
+        )
+    if policy == MARKETPLACE_REPORT_POLICY_SELECTOR and (
+        not report
+        or pull_request is None
+        or prompt_file is None
+        or dispatch_only
+        or monitor_only
+        or apply_with_report
+        or resume_apply_with_report
+        or task_id is not None
+        or worker_receipt is not None
+        or input_result_file is not None
+        or allow_merged_pr
+    ):
+        raise CloudError(
+            f"{MARKETPLACE_REPORT_POLICY_SELECTOR} requires --report, --pr, "
+            "--prompt-file, and --result-file and does not support recovery or "
+            "validation-receipt options",
+            "policy_rejected",
         )
     if allow_merged_pr and (
         policy != MARKETPLACE_POLICY_SELECTOR
@@ -612,7 +676,7 @@ def parse_args(args: Sequence[str]) -> Options:
             "--result-file must differ from --input-result-file",
             "result_file_invalid",
         )
-    if policy is not None and monitor_only:
+    if policy == MARKETPLACE_POLICY_SELECTOR and monitor_only:
         if task_id is None:
             raise CloudError(
                 f"{MARKETPLACE_POLICY_SELECTOR} monitor-only mode requires --task-id",
@@ -1242,6 +1306,12 @@ def validate_interrupted_apply_task(
 def policy_metadata(options: Options) -> dict[str, object] | None:
     if options.policy is None:
         return None
+    if options.policy == MARKETPLACE_REPORT_POLICY_SELECTOR:
+        return {
+            "id": MARKETPLACE_REPORT_POLICY_ID,
+            "version": MARKETPLACE_REPORT_POLICY_VERSION,
+            "sha256": MARKETPLACE_REPORT_POLICY_HASH,
+        }
     return {
         "id": MARKETPLACE_POLICY_ID,
         "version": MARKETPLACE_POLICY_VERSION,
@@ -1271,9 +1341,12 @@ def validate_policy_before_post(
     root: Path,
     result_path: Path,
 ) -> None:
-    if options.policy != MARKETPLACE_POLICY_SELECTOR:
+    if options.policy not in {
+        MARKETPLACE_POLICY_SELECTOR,
+        MARKETPLACE_REPORT_POLICY_SELECTOR,
+    }:
         raise CloudError(
-            f"{MARKETPLACE_POLICY_SELECTOR} is required",
+            "a supported marketplace policy is required",
             "policy_required",
         )
     resolved_root = root.resolve()
@@ -1585,6 +1658,29 @@ def build_policy_prompt(
         "line, unique among the generated fix commits. Keep the report as nonempty "
         "UTF-8 Markdown for humans. The dispatcher derives and records generated "
         "fix commit order; do not echo commit SHAs for dispatcher attestation.\n"
+        f"{POLICY_MARKER}"
+    )
+
+
+def build_report_policy_prompt(prompt: str, *, report_path: str) -> str:
+    return (
+        f"{prompt.rstrip()}\n\n"
+        f"{POLICY_MARKER}\n"
+        f"Policy: {MARKETPLACE_REPORT_POLICY_SELECTOR}\n"
+        f"Policy SHA-256: {MARKETPLACE_REPORT_POLICY_HASH}\n"
+        "Authentication stays in the local dispatcher. Do not request, read, "
+        "print, persist, or transmit credentials, tokens, keys, cookies, or "
+        "authorization headers. Do not select or invoke a custom_agent. Do not "
+        "use a local-execution fallback.\n"
+        "Create exactly one final single-parent artifact commit based directly "
+        "on the task base. Its only changed path must be "
+        f"`{report_path}`. Write the complete report directly to that path as "
+        "nonempty UTF-8 Markdown. Do not create, stage, or commit validation, "
+        "alternate report, or scratch artifact paths, and do not add commits "
+        "afterward. The dispatcher independently verifies task and source "
+        "identity, live head, ancestry, linear history, the exact path, and the "
+        "report digest. It records structural completion only and does not "
+        "claim that the worker performed validation.\n"
         f"{POLICY_MARKER}"
     )
 
@@ -2945,10 +3041,10 @@ def task_payload(
         prompt = options.prompt
     if pull_request is not None:
         prompt = build_pr_prompt(prompt, pull_request)
-    if options.policy is not None:
+    if options.policy == MARKETPLACE_POLICY_SELECTOR:
         if request_id is None or worker_receipt is None or repository is None:
             raise AssertionError(
-                "policy mode did not allocate worker validation metadata"
+                "validation policy mode did not allocate worker metadata"
             )
         prompt = build_policy_prompt(
             prompt,
@@ -2958,6 +3054,10 @@ def task_payload(
             repository=repository,
             pull_request=pull_request,
         )
+    elif options.policy == MARKETPLACE_REPORT_POLICY_SELECTOR:
+        if report_path is None:
+            raise AssertionError("report policy mode did not allocate a report path")
+        prompt = build_report_policy_prompt(prompt, report_path=report_path)
     payload: dict[str, object] = {
         "prompt": prompt,
         "model": options.model,
@@ -3242,6 +3342,11 @@ def execute(
     git = GitRepository(runner, path_exists)
     api = ApiClient(runner, sleep, wall_clock)
     if result is not None:
+        result.schema_version = (
+            REPORT_RESULT_SCHEMA_VERSION
+            if options.policy == MARKETPLACE_REPORT_POLICY_SELECTOR
+            else RESULT_SCHEMA_VERSION
+        )
         result.mode = mode_name(options)
         result.requested_model = options.model
         result.policy = policy_metadata(options)
@@ -3380,7 +3485,7 @@ def execute(
         options.worker_receipt
         if options.worker_receipt is not None
         else receipt_path(request_id)
-        if options.policy is not None
+        if options.policy == MARKETPLACE_POLICY_SELECTOR
         else None
     )
     if receipt is not None:
@@ -3389,7 +3494,7 @@ def execute(
     if options.policy is not None:
         validate_policy_before_post(options, root, options.result_file)
         policy_identity = git.identity(root)
-        if result is not None:
+        if result is not None and receipt is not None:
             result.receipt_path = receipt
     if options.task_id is not None:
         initial = get_task(api, repository, options.task_id)
@@ -3493,8 +3598,12 @@ def execute(
     worker_history: WorkerHistory | None = None
     policy_report: str | None = None
     if options.policy is not None:
-        if policy_identity is None or receipt is None:
+        if policy_identity is None:
             raise AssertionError("policy mode did not record local identity")
+        if options.policy == MARKETPLACE_POLICY_SELECTOR and receipt is None:
+            raise AssertionError("validation policy did not allocate a receipt")
+        if options.policy == MARKETPLACE_REPORT_POLICY_SELECTOR and report_path is None:
+            raise AssertionError("report policy did not allocate a report path")
         validate_policy_before_mutation(
             git,
             policy_identity,
@@ -3526,8 +3635,15 @@ def execute(
         if result is not None:
             result.generated_head = generated_head
             result.cloud_commits = list(all_commits)
-        expected_paths = [receipt]
-        if report_path is not None:
+        expected_paths = (
+            [report_path]
+            if options.policy == MARKETPLACE_REPORT_POLICY_SELECTOR
+            else [receipt]
+        )
+        if (
+            options.policy == MARKETPLACE_POLICY_SELECTOR
+            and report_path is not None
+        ):
             expected_paths.append(report_path)
         worker_history = git.worker_history(
             root,
@@ -3556,12 +3672,17 @@ def execute(
                 "before its report receipt",
                 "unexpected_commits",
             )
-        outcomes, validation_digest = fetch_worker_receipt(
-            api,
-            repository,
-            receipt,
-            refs.head,
-        )
+        outcomes: list[dict[str, str]] = []
+        validation_digest: str | None = None
+        if options.policy == MARKETPLACE_POLICY_SELECTOR:
+            if receipt is None:
+                raise AssertionError("validation policy lost its receipt path")
+            outcomes, validation_digest = fetch_worker_receipt(
+                api,
+                repository,
+                receipt,
+                refs.head,
+            )
         if report_path is not None:
             try:
                 policy_report = fetch_report(
@@ -3580,6 +3701,8 @@ def execute(
             else None
         )
         if options.allow_merged_pr and options.prior_result is not None:
+            if receipt is None or validation_digest is None:
+                raise AssertionError("historical resume lost validation metadata")
             if report_path is None or report_digest is None:
                 raise AssertionError("historical resume did not retrieve its report")
             validate_prior_generated_result(
@@ -3596,9 +3719,12 @@ def execute(
                 validation_outcomes=outcomes,
             )
         if result is not None:
-            result.validation_complete = True
-            result.validation_outcomes = outcomes
-            result.receipt_sha256 = validation_digest
+            if options.policy == MARKETPLACE_REPORT_POLICY_SELECTOR:
+                result.structural_complete = True
+            else:
+                result.validation_complete = True
+                result.validation_outcomes = outcomes
+                result.receipt_sha256 = validation_digest
             if report_path is not None and policy_report is not None:
                 result.report_sha256 = report_digest
 
@@ -3852,6 +3978,13 @@ def main(
             "id": MARKETPLACE_POLICY_ID,
             "version": MARKETPLACE_POLICY_VERSION,
             "sha256": MARKETPLACE_POLICY_HASH,
+        }
+    elif MARKETPLACE_REPORT_POLICY_SELECTOR in args:
+        result.schema_version = REPORT_RESULT_SCHEMA_VERSION
+        result.policy = {
+            "id": MARKETPLACE_REPORT_POLICY_ID,
+            "version": MARKETPLACE_REPORT_POLICY_VERSION,
+            "sha256": MARKETPLACE_REPORT_POLICY_HASH,
         }
     progress = Progress()
     try:

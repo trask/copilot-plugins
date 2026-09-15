@@ -1105,7 +1105,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.10", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.11", json.loads(PLUGIN.read_text())["version"])
 
     def test_prompt_pins_snapshot_allowance_model_policy_and_worker_boundary(self):
         prompt = MODULE.build_worker_prompt(

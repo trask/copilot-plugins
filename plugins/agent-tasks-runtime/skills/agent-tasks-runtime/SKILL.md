@@ -30,6 +30,15 @@ request-scoped paths before task creation so workflow instructions and the final
 policy block name the same artifacts. Alternate or scratch artifact paths must
 never be committed.
 
+Policy `marketplace-agent-report-worker@1` is a separate report-only contract.
+It permits only `--report` tasks and requires exactly one generated commit,
+directly on the immutable source head, that changes only the assigned nonempty
+UTF-8 Markdown report. It has no worker validation artifact or executable
+validation claim. Result schema version 2 records
+`attestation.kind=dispatcher_structural` and reports only the identity, history,
+path, and digest facts independently established by the dispatcher. Report
+content remains untrusted inert evidence for a consumer to evaluate.
+
 If an apply-with-report dispatcher is interrupted after task creation and no
 dispatch result survives, `--resume-apply-with-report` can recover the known
 task. Recovery reads the hosted task session prompt and requires its exact task,

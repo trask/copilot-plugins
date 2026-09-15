@@ -101,6 +101,7 @@ class PolicyPromptTest(unittest.TestCase):
                 with self.assertRaisesRegex(
                     MODULE.CloudError,
                     f"unknown policy 'marketplace-agent-worker@{version}'; expected "
+                    "one of marketplace-agent-report-worker@1, "
                     "marketplace-agent-worker@4",
                 ) as raised:
                     MODULE.parse_args(
@@ -117,6 +118,56 @@ class PolicyPromptTest(unittest.TestCase):
                     )
 
                 self.assertEqual(raised.exception.code, "policy_unknown")
+
+    def test_report_policy_requests_one_markdown_artifact(self):
+        report_path = ".github/agent-task-reports/request-1.md"
+        options = MODULE.Options(
+            report=True,
+            model="gpt-5.6-sol",
+            prompt=f"Write `{MODULE.REPORT_PATH_PLACEHOLDER}`.",
+            policy=MODULE.MARKETPLACE_REPORT_POLICY_SELECTOR,
+        )
+
+        payload = MODULE.task_payload(
+            options,
+            report_path=report_path,
+            request_id="request-1",
+            worker_receipt=None,
+            repository="owner/repo",
+        )
+        prompt = payload["prompt"]
+
+        self.assertIn("Policy: marketplace-agent-report-worker@1", prompt)
+        self.assertIn(f"only changed path must be `{report_path}`", prompt)
+        self.assertIn("records structural completion only", prompt)
+        self.assertNotIn("validation artifact", prompt)
+        self.assertNotIn(MODULE.REPORT_PATH_PLACEHOLDER, prompt)
+
+    def test_report_policy_rejects_apply_recovery_and_receipt_options(self):
+        result_path = str((Path.cwd().parent / "result.json").resolve())
+        cases = [
+            ["--apply-with-report"],
+            ["--report", "--worker-receipt", "receipt.json"],
+            ["--report", "--task-id", "task-1"],
+        ]
+        for mode in cases:
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(
+                    MODULE.CloudError,
+                    "marketplace-agent-report-worker@1 requires",
+                ):
+                    MODULE.parse_args(
+                        [
+                            *mode,
+                            "--pr",
+                            "owner/repo#1",
+                            "--result-file",
+                            result_path,
+                            "--policy",
+                            MODULE.MARKETPLACE_REPORT_POLICY_SELECTOR,
+                            "Review.",
+                        ]
+                    )
 
 
 class InterruptedApplyRecoveryTest(unittest.TestCase):
@@ -462,6 +513,29 @@ class WorkerHistoryTest(unittest.TestCase):
         self.assertEqual(history.code_commits, (fix,))
         self.assertEqual(history.receipt_commit, artifact)
 
+    def test_accepts_report_only_commit_directly_on_source_head(self):
+        base = "1" * 40
+        artifact = "3" * 40
+        report_path = ".github/agent-task-reports/request-1.md"
+        repository = self.repository(
+            {
+                ("rev-list", "--parents"): {
+                    artifact: f"{artifact} {base}\n",
+                },
+                ("diff-tree", "--no-commit-id"): f"{report_path}\0",
+            }
+        )
+
+        history = repository.worker_history(
+            Path("C:/repo"),
+            base,
+            [artifact],
+            [report_path],
+        )
+
+        self.assertEqual(history.code_commits, ())
+        self.assertEqual(history.receipt_commit, artifact)
+
     def test_rejects_non_linear_history_and_unexpected_paths(self):
         base = "1" * 40
         fix = "2" * 40
@@ -613,6 +687,7 @@ class DispatcherFinalizationTest(unittest.TestCase):
 
     def repository(self):
         repository = mock.Mock()
+        repository.root.return_value = self.root
         repository.snapshot.return_value = self.snapshot
         repository.head.return_value = self.base_sha
         repository.fetch_pr_inputs.return_value = {}
@@ -909,6 +984,175 @@ class DispatcherFinalizationTest(unittest.TestCase):
         )
         self.assertFalse(result.validation_complete)
         repository.fast_forward.assert_not_called()
+
+
+class ReportOnlyDispatcherTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path("C:/repo")
+        self.base_sha = "1" * 40
+        self.artifact_commit = "3" * 40
+        self.report = "# PR review report\n\n- **Review complete:** yes\n"
+        self.snapshot = MODULE.WorktreeSnapshot(
+            self.root,
+            "owner/repo",
+            "origin",
+            "feature",
+            self.base_sha,
+        )
+        self.pull_request = MODULE.PullRequestSnapshot(
+            7,
+            "https://github.com/owner/repo/pull/7",
+            "OPEN",
+            "owner/repo",
+            "main",
+            "4" * 40,
+            "owner/repo",
+            "feature",
+            self.base_sha,
+            False,
+        )
+        self.task = {
+            "id": "task-1",
+            "state": "completed",
+            "html_url": "https://github.com/owner/repo/tasks/task-1",
+            "artifacts": [
+                {
+                    "type": "branch",
+                    "provider": "github",
+                    "data": {
+                        "head_ref": "copilot/task-1",
+                        "base_ref": "feature",
+                    },
+                }
+            ],
+            "sessions": [],
+        }
+        self.options = MODULE.Options(
+            report=True,
+            model="gpt-5.6-sol",
+            prompt="Review the pull request.",
+            pull_request=MODULE.PrReference(7, "owner/repo", "owner/repo#7"),
+            result_file=Path("C:/state/result.json"),
+            policy=MODULE.MARKETPLACE_REPORT_POLICY_SELECTOR,
+        )
+
+    def repository(self):
+        repository = mock.Mock()
+        repository.root.return_value = self.root
+        repository.snapshot.return_value = self.snapshot
+        repository.head.return_value = self.base_sha
+        repository.fetch_pr_inputs.return_value = {}
+        repository.align_to_pr.return_value = self.snapshot
+        repository.identity.return_value = MODULE.LocalIdentity(
+            "feature",
+            self.base_sha,
+            "",
+            None,
+        )
+        repository.fetch_generated.return_value = (
+            "refs/cloud-agent-tasks/request-1/generated"
+        )
+        repository.ref_sha.return_value = self.artifact_commit
+        repository.cloud_commits.return_value = [self.artifact_commit]
+        repository.worker_history.return_value = MODULE.WorkerHistory(
+            None,
+            (),
+            self.artifact_commit,
+        )
+        return repository
+
+    def test_attests_one_markdown_report_without_worker_validation(self):
+        repository = self.repository()
+        result = MODULE.ResultEnvelope()
+        fetch_receipt = mock.Mock(
+            side_effect=AssertionError("report-only mode fetched validation")
+        )
+        with (
+            mock.patch.object(MODULE, "GitRepository", return_value=repository),
+            mock.patch.object(MODULE, "ApiClient"),
+            mock.patch.object(
+                MODULE,
+                "repository_base",
+                return_value=SimpleNamespace(branch="main", sha="4" * 40),
+            ),
+            mock.patch.object(
+                MODULE,
+                "resolve_pull_request",
+                return_value=self.pull_request,
+            ),
+            mock.patch.object(MODULE, "validate_policy_before_post"),
+            mock.patch.object(MODULE, "validate_policy_before_mutation"),
+            mock.patch.object(MODULE, "start_task", return_value=self.task),
+            mock.patch.object(MODULE, "monitor_task", return_value=self.task),
+            mock.patch.object(MODULE, "fetch_worker_receipt", fetch_receipt),
+            mock.patch.object(MODULE, "fetch_report", return_value=self.report),
+        ):
+            code = MODULE.execute(
+                self.options,
+                cwd=self.root,
+                uuid_factory=lambda: "request-1",
+                result=result,
+            )
+
+        envelope = result.as_dict()
+        self.assertEqual(code, 0)
+        self.assertEqual(envelope["schema"]["version"], 2)
+        self.assertEqual(envelope["status"], "success")
+        self.assertEqual(
+            envelope["attestation"],
+            {
+                "kind": "dispatcher_structural",
+                "structural_complete": True,
+            },
+        )
+        self.assertNotIn("worker_receipt", envelope)
+        self.assertNotIn("validation", envelope)
+        self.assertEqual(
+            envelope["report"]["path"],
+            ".github/agent-task-reports/request-1.md",
+        )
+        self.assertEqual(envelope["generated"]["commits"], [])
+        repository.worker_history.assert_called_once_with(
+            self.root,
+            self.base_sha,
+            [self.artifact_commit],
+            [".github/agent-task-reports/request-1.md"],
+        )
+        repository.require_correlated_fix_commits.assert_not_called()
+        repository.fast_forward.assert_not_called()
+        fetch_receipt.assert_not_called()
+
+    def test_empty_report_fails_without_structural_completion(self):
+        repository = self.repository()
+        result = MODULE.ResultEnvelope()
+        with (
+            mock.patch.object(MODULE, "GitRepository", return_value=repository),
+            mock.patch.object(MODULE, "ApiClient"),
+            mock.patch.object(
+                MODULE,
+                "repository_base",
+                return_value=SimpleNamespace(branch="main", sha="4" * 40),
+            ),
+            mock.patch.object(
+                MODULE,
+                "resolve_pull_request",
+                return_value=self.pull_request,
+            ),
+            mock.patch.object(MODULE, "validate_policy_before_post"),
+            mock.patch.object(MODULE, "validate_policy_before_mutation"),
+            mock.patch.object(MODULE, "start_task", return_value=self.task),
+            mock.patch.object(MODULE, "monitor_task", return_value=self.task),
+            mock.patch.object(MODULE, "fetch_report", return_value=" \n"),
+        ):
+            with self.assertRaisesRegex(MODULE.CloudError, "report is empty"):
+                MODULE.execute(
+                    self.options,
+                    cwd=self.root,
+                    uuid_factory=lambda: "request-1",
+                    result=result,
+                )
+
+        self.assertFalse(result.structural_complete)
 
 
 if __name__ == "__main__":

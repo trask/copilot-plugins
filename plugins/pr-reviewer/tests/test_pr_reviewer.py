@@ -1075,14 +1075,6 @@ class ManagedCoordinatorTest(unittest.TestCase):
             "cross_repository": False,
         }
         self.identity = {"head": "4" * 40, "status": ""}
-        self.validation = [
-            {
-                "command": command,
-                "status": "passed",
-                "detail": "complete",
-            }
-            for command in MODULE.REQUIRED_VALIDATION_COMMANDS
-        ]
 
     def result(self, **overrides):
         request_id = "request-1"
@@ -1116,62 +1108,48 @@ class ManagedCoordinatorTest(unittest.TestCase):
                 "commit": generated_head,
                 "sha256": "5" * 64,
             },
-            "worker_receipt": {
-                "path": f".github/agent-task-validations/{request_id}.json",
-                "commit": generated_head,
-                "sha256": MODULE.sha256_text(json.dumps(self.validation)),
+            "attestation": {
+                "kind": "dispatcher_structural",
+                "structural_complete": True,
             },
-            "validation": {"complete": True, "outcomes": self.validation},
             "error": None,
         }
         value.update(overrides)
         return value
 
-    def report(self, candidates=None):
-        return {
-            "schema": MODULE.CANDIDATE_REPORT_SCHEMA,
-            "request_id": "request-1",
-            "repository": self.pr["repo_name"],
-            "pull_request": {
-                "number": self.pr["number"],
-                "head_sha": self.pr["head_sha"],
-                "base_sha": self.pr["base"]["sha"],
-                "requested_model": "gpt-5.6-sol",
-                "policy": MODULE.AGENT_TASK_POLICY_IDENTITY,
-            },
-            "review_complete": True,
-            "changed_files": ["src/one.py", "docs/two.md"],
-            "candidates": candidates or [],
+    def report(self, *, candidate=False, **fields):
+        metadata = {
+            "Repository": self.pr["repo_name"],
+            "Pull request": f"#{self.pr['number']}",
+            "Head SHA": self.pr["head_sha"],
+            "Base SHA": self.pr["base"]["sha"],
+            "Review complete": "yes",
+            "Changed files reviewed": "2",
         }
-
-    def candidate(self, **overrides):
-        value = {
-            "candidate_id": "candidate-1",
-            "path": "src/one.py",
-            "anchor": {
-                "side": "RIGHT",
-                "start_line": None,
-                "start_side": None,
-                "line": 2,
-            },
-            "severity": "blocking",
-            "title": "Wrong result",
-            "explanation": "The changed branch returns the wrong result.",
-            "evidence": ["The changed line reaches the failing branch."],
-            "confidence": 0.98,
-            "probes": [
-                {
-                    "command": "python isolated_probe.py",
-                    "status": "passed",
-                    "outcome": "The probe returned the wrong value.",
-                }
-            ],
-        }
-        value.update(overrides)
-        return value
-
-    def receipt(self):
-        return json.dumps(self.validation)
+        metadata.update(fields)
+        lines = ["# PR review report", ""]
+        lines.extend(f"- **{label}:** `{value}`" for label, value in metadata.items())
+        if not candidate:
+            lines.extend(["", "## No findings", ""])
+        else:
+            lines.extend(
+                [
+                    "",
+                    "## Candidate findings",
+                    "",
+                    "### [blocking] Wrong result",
+                    "",
+                    "- **File:** `src/one.py`",
+                    "- **Anchor:** `RIGHT:2`",
+                    "- **Confidence:** `0.98`",
+                    "",
+                    "The changed branch returns the wrong result.",
+                    "",
+                    "Evidence: the changed line reaches the failing branch.",
+                    "",
+                ]
+            )
+        return "\n".join(lines)
 
     def test_worker_prompt_requires_artifact_commit_for_no_findings(self):
         prompt = MODULE.build_worker_prompt(
@@ -1181,36 +1159,29 @@ class ManagedCoordinatorTest(unittest.TestCase):
             ["src/one.py", "docs/two.md"],
         )
 
-        self.assertEqual(MODULE.WORKER_PROMPT_VERSION, 4)
+        self.assertEqual(MODULE.WORKER_PROMPT_VERSION, 5)
         self.assertIn(
-            "Completing the review always requires repository artifacts on the "
-            "generated task branch.",
+            "Write exactly one human-readable Markdown report",
             prompt,
         )
         self.assertIn(
             "create the exact final commit required by the marketplace policy footer",
             prompt,
         )
-        self.assertIn("even when the candidates array is empty", prompt)
+        self.assertIn("even when there are no findings", prompt)
         self.assertIn(
-            "A chat response without the committed artifacts is a failed task",
+            "A chat response without that committed report is a failed task",
             prompt,
         )
         self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
-        self.assertIn("`{{MARKETPLACE_VALIDATION_PATH}}`", prompt)
-        self.assertIn("Do not choose alternate artifact names", prompt)
-        self.assertIn('"command": "full-diff-reviewed"', prompt)
-        self.assertIn('"command": "changed-files-covered"', prompt)
-        self.assertIn('"command": "candidates-evidenced"', prompt)
-        self.assertIn('"command": "probes-isolated"', prompt)
-        self.assertNotIn('"validations":', prompt)
-        self.assertNotIn('"name": "full-diff-reviewed"', prompt)
+        self.assertNotIn("{{MARKETPLACE_VALIDATION_PATH}}", prompt)
+        self.assertNotIn('"command": "full-diff-reviewed"', prompt)
+        self.assertNotIn('"changed_files":', prompt)
+        self.assertNotIn('"candidates":', prompt)
         self.assertNotIn("candidate-report.json", prompt)
         self.assertNotIn("worker-validation.json", prompt)
-        self.assertIn(
-            "These artifacts are the only repository changes you may make",
-            prompt,
-        )
+        self.assertIn("- **Review complete:** yes", prompt)
+        self.assertIn("## Candidate findings", prompt)
 
     def test_validates_success_and_no_findings_reports(self):
         result = self.result()
@@ -1221,11 +1192,10 @@ class ManagedCoordinatorTest(unittest.TestCase):
             identity=self.identity,
         )
         report = MODULE.validate_candidate_report(
-            json.dumps(self.report()),
-            request_id=remote["request_id"],
+            self.report(),
             pr=self.pr,
-            requested_model="gpt-5.6-sol",
             anchors=MODULE.parse_unified_diff(DIFF),
+            changed_paths=["src/one.py", "docs/two.md"],
         )
 
         self.assertEqual(report["candidates"], [])
@@ -1233,79 +1203,48 @@ class ManagedCoordinatorTest(unittest.TestCase):
 
     def test_validates_candidate_schema_and_changed_anchor(self):
         report = MODULE.validate_candidate_report(
-            json.dumps(self.report([self.candidate()])),
-            request_id="request-1",
+            self.report(candidate=True),
             pr=self.pr,
-            requested_model="gpt-5.6-sol",
             anchors=MODULE.parse_unified_diff(DIFF),
+            changed_paths=["src/one.py", "docs/two.md"],
         )
 
-        self.assertEqual(report["candidates"][0]["candidate_id"], "candidate-1")
+        self.assertEqual(report["candidates"][0]["candidate_id"], "candidate-001")
         excerpt = MODULE.extract_diff_excerpt(DIFF, "src/one.py", "RIGHT", 2)
         self.assertIn("+++ b/src/one.py", excerpt)
         self.assertIn("+new four", excerpt)
         self.assertNotIn("@@ -20,2 +21,2 @@", excerpt)
 
-        stale = self.candidate()
-        stale["anchor"]["line"] = 999
+        stale = self.report(candidate=True).replace("RIGHT:2", "RIGHT:999")
         with self.assertRaisesRegex(MODULE.WorkflowError, "not a changed RIGHT line"):
             MODULE.validate_candidate_report(
-                json.dumps(self.report([stale])),
-                request_id="request-1",
+                stale,
                 pr=self.pr,
-                requested_model="gpt-5.6-sol",
                 anchors=MODULE.parse_unified_diff(DIFF),
-            )
-
-    def test_rejects_orphaned_and_opposite_candidate_start_sides(self):
-        orphaned = self.candidate()
-        orphaned["anchor"]["start_side"] = "RIGHT"
-        opposite = self.candidate()
-        opposite["anchor"].update(
-            {"start_line": 2, "start_side": "LEFT", "line": 4}
-        )
-
-        with self.assertRaisesRegex(
-            MODULE.WorkflowError, "provide start_line and start_side together"
-        ):
-            MODULE.validate_candidate_report(
-                json.dumps(self.report([orphaned])),
-                request_id="request-1",
-                pr=self.pr,
-                requested_model="gpt-5.6-sol",
-                anchors=MODULE.parse_unified_diff(DIFF),
-            )
-        with self.assertRaisesRegex(MODULE.WorkflowError, "same diff side"):
-            MODULE.validate_candidate_report(
-                json.dumps(self.report([opposite])),
-                request_id="request-1",
-                pr=self.pr,
-                requested_model="gpt-5.6-sol",
-                anchors=MODULE.parse_unified_diff(DIFF),
+                changed_paths=["src/one.py", "docs/two.md"],
             )
 
     def test_rejects_malformed_candidates_and_credentials(self):
-        malformed = self.candidate()
-        malformed["evidence"] = []
-        with self.assertRaisesRegex(MODULE.WorkflowError, "candidate 0 is malformed"):
+        malformed = self.report(candidate=True).replace(
+            "- **Anchor:** `RIGHT:2`\n", ""
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "no reconstructable"):
             MODULE.validate_candidate_report(
-                json.dumps(self.report([malformed])),
-                request_id="request-1",
+                malformed,
                 pr=self.pr,
-                requested_model="gpt-5.6-sol",
                 anchors=MODULE.parse_unified_diff(DIFF),
+                changed_paths=["src/one.py", "docs/two.md"],
             )
 
-        credential = self.candidate(
-            evidence=["token=github_pat_" + "a" * 20]
+        credential = self.report(candidate=True) + (
+            "\ntoken=github_pat_" + "a" * 20
         )
         with self.assertRaisesRegex(MODULE.WorkflowError, "credentials"):
             MODULE.validate_candidate_report(
-                json.dumps(self.report([credential])),
-                request_id="request-1",
+                credential,
                 pr=self.pr,
-                requested_model="gpt-5.6-sol",
                 anchors=MODULE.parse_unified_diff(DIFF),
+                changed_paths=["src/one.py", "docs/two.md"],
             )
 
     def test_rejects_wrong_policy_repo_pr_head_and_model(self):
@@ -1325,7 +1264,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
                         identity=self.identity,
                     )
 
-    def test_rejects_malformed_results_tasks_and_incomplete_validation(self):
+    def test_rejects_malformed_results_tasks_and_incomplete_attestation(self):
         with tempfile.TemporaryDirectory() as directory:
             result_path = Path(directory) / "result.json"
             result_path.write_text('{"schema":', encoding="utf-8")
@@ -1340,7 +1279,12 @@ class ManagedCoordinatorTest(unittest.TestCase):
                 requested_model="gpt-5.6-sol",
                 identity=self.identity,
             )
-        incomplete = self.result(validation={"complete": False, "outcomes": []})
+        incomplete = self.result(
+            attestation={
+                "kind": "dispatcher_structural",
+                "structural_complete": False,
+            }
+        )
         with self.assertRaisesRegex(MODULE.WorkflowError, "malformed task|identity"):
             MODULE.validate_success_result(
                 incomplete,
@@ -1349,17 +1293,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
                 identity=self.identity,
             )
 
-    def test_rejects_wrong_receipt_and_unexpected_commits(self):
-        wrong_receipt = json.loads(self.receipt())
-        wrong_receipt[0]["unexpected"] = "other"
-        with self.assertRaisesRegex(MODULE.WorkflowError, "does not match"):
-            MODULE.validate_worker_receipt(
-                json.dumps(wrong_receipt),
-                request_id="request-1",
-                pr=self.pr,
-                validation=self.validation,
-            )
-
+    def test_rejects_unexpected_report_commit_paths(self):
         remote = MODULE.validate_success_result(
             self.result(),
             pr=self.pr,
@@ -1371,7 +1305,6 @@ class ManagedCoordinatorTest(unittest.TestCase):
             "parents": [{"sha": self.pr["head_sha"]}],
             "files": [
                 {"filename": remote["report_path"]},
-                {"filename": remote["receipt_path"]},
                 {"filename": "unexpected.txt"},
             ],
         }
@@ -1394,7 +1327,6 @@ class ManagedCoordinatorTest(unittest.TestCase):
             **remote,
             "generated_head": fixture["generated_commit"],
             "report_path": fixture["assigned_paths"][0],
-            "receipt_path": fixture["assigned_paths"][1],
         }
         failed_commit = {
             "sha": fixture["generated_commit"],
@@ -1408,7 +1340,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.WorkflowError, "exactly one"):
                 MODULE.validate_report_commit(production_pr, production_remote)
 
-    def test_rejects_wrong_task_and_report_identity(self):
+    def test_rejects_wrong_task_and_markdown_identity(self):
         wrong_task = self.result()
         wrong_task["task"]["base_sha"] = "9" * 40
         with self.assertRaisesRegex(MODULE.WorkflowError, "malformed task"):
@@ -1419,80 +1351,133 @@ class ManagedCoordinatorTest(unittest.TestCase):
                 identity=self.identity,
             )
 
-        wrong_report = self.report()
-        wrong_report["request_id"] = "other"
-        with self.assertRaisesRegex(MODULE.WorkflowError, "identity"):
+        wrong_report = self.report().replace("owner/repo", "other/repo")
+        with self.assertRaisesRegex(MODULE.WorkflowError, "Repository"):
             MODULE.validate_candidate_report(
-                json.dumps(wrong_report),
-                request_id="request-1",
+                wrong_report,
                 pr=self.pr,
-                requested_model="gpt-5.6-sol",
                 anchors=MODULE.parse_unified_diff(DIFF),
+                changed_paths=["src/one.py", "docs/two.md"],
             )
 
-    def test_rejects_legacy_report_validation_field(self):
-        report = self.report()
-        report["validations"] = [
-            {
-                "name": "full-diff-reviewed",
-                "status": "passed",
-                "evidence": "complete",
-            }
-        ]
-        with self.assertRaisesRegex(MODULE.WorkflowError, "fields are malformed"):
+    def test_rejects_ambiguous_markdown_candidate_sections(self):
+        report = self.report(candidate=True) + "\n## No findings\n"
+        with self.assertRaisesRegex(MODULE.WorkflowError, "ambiguous"):
             MODULE.validate_candidate_report(
-                json.dumps(report),
-                request_id="request-1",
+                report,
                 pr=self.pr,
-                requested_model="gpt-5.6-sol",
                 anchors=MODULE.parse_unified_diff(DIFF),
+                changed_paths=["src/one.py", "docs/two.md"],
             )
 
-    def test_rejects_production_blended_validation_and_wrong_commands(self):
-        blended = json.loads(
+    def test_candidate_section_stops_at_the_next_report_section(self):
+        report = self.report(candidate=True) + (
+            "\n## Discovery notes\n\nThis is not candidate evidence.\n"
+        )
+
+        candidates = MODULE.parse_markdown_candidates(
+            report,
+            anchors=MODULE.parse_unified_diff(DIFF),
+            changed_paths=["src/one.py", "docs/two.md"],
+        )
+
+        self.assertNotIn("Discovery notes", candidates[0]["report_excerpt"])
+
+    def test_rejects_candidate_anchor_ambiguous_between_diff_sides(self):
+        report = self.report(candidate=True).replace("RIGHT:2", "2")
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "ambiguous"):
+            MODULE.parse_markdown_candidates(
+                report,
+                anchors=MODULE.parse_unified_diff(DIFF),
+                changed_paths=["src/one.py", "docs/two.md"],
+            )
+
+    def test_rejects_candidate_without_concrete_evidence(self):
+        report = self.report(candidate=True).replace(
+            "The changed branch returns the wrong result.\n\n"
+            "Evidence: the changed line reaches the failing branch.",
+            "",
+        )
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "concrete Markdown evidence"):
+            MODULE.parse_markdown_candidates(
+                report,
+                anchors=MODULE.parse_unified_diff(DIFF),
+                changed_paths=["src/one.py", "docs/two.md"],
+            )
+
+    def test_rejects_duplicate_candidate_fields(self):
+        report = self.report(candidate=True).replace(
+            "- **Anchor:** `RIGHT:2`",
+            "- **Anchor:** `RIGHT:2`\n- **Anchor:** `LEFT:2`",
+        )
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "duplicate Anchor"):
+            MODULE.parse_markdown_candidates(
+                report,
+                anchors=MODULE.parse_unified_diff(DIFF),
+                changed_paths=["src/one.py", "docs/two.md"],
+            )
+
+    def test_rejects_oversized_report_and_candidate_fanout(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "1 MiB"):
+            MODULE.parse_markdown_candidates(
+                "x" * (MODULE.MAX_REPORT_BYTES + 1),
+                anchors=MODULE.parse_unified_diff(DIFF),
+                changed_paths=["src/one.py", "docs/two.md"],
+            )
+
+        candidate_section = self.report(candidate=True).split(
+            "## Candidate findings\n\n",
+            1,
+        )[1]
+        report = "## Candidate findings\n\n" + (
+            candidate_section * (MODULE.MAX_CANDIDATES + 1)
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "candidate limit"):
+            MODULE.parse_markdown_candidates(
+                report,
+                anchors=MODULE.parse_unified_diff(DIFF),
+                changed_paths=["src/one.py", "docs/two.md"],
+            )
+
+    def test_extracts_candidate_from_task_47_markdown_fixture(self):
+        report = (
             (
                 Path(__file__).parent
                 / "fixtures"
-                / "task-6b7483ce-blended-validation.json"
+                / "task-47d8715a-candidate-report.md"
             ).read_text(encoding="utf-8")
         )
-        with self.assertRaisesRegex(
-            MODULE.WorkflowError,
-            "incomplete or malformed",
-        ):
-            MODULE.validate_validation_outcomes(blended)
+        path = (
+            "instrumentation/grpc-1.6/testing/src/main/java/"
+            "io/opentelemetry/instrumentation/grpc/v1_6/AbstractGrpcTest.java"
+        )
+        anchors = {path: {"RIGHT": {1754: 1}, "LEFT": {}}}
 
-        wrong_commands = [
-            {
-                "command": f"other-{index}",
-                "status": "passed",
-                "detail": "complete",
-            }
-            for index, _ in enumerate(MODULE.REQUIRED_VALIDATION_COMMANDS)
-        ]
-        with self.assertRaisesRegex(
-            MODULE.WorkflowError,
-            "unexpected command identifiers",
-        ):
-            MODULE.validate_validation_outcomes(wrong_commands)
-
-    def test_accepts_single_generic_validation_fixture(self):
-        validation = json.loads(
-            (
-                Path(__file__).parent
-                / "fixtures"
-                / "pr-reviewer-generic-validation.json"
-            ).read_text(encoding="utf-8")
+        candidates = MODULE.parse_markdown_candidates(
+            report,
+            anchors=anchors,
+            changed_paths=[path],
         )
 
-        self.assertEqual(
-            MODULE.validate_validation_outcomes(validation),
-            validation,
-        )
-        self.assertEqual(
-            [outcome["command"] for outcome in validation],
-            MODULE.REQUIRED_VALIDATION_COMMANDS,
-        )
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["path"], path)
+        self.assertEqual(candidates[0]["anchor"]["line"], 1754)
+        self.assertEqual(candidates[0]["anchor"]["side"], "RIGHT")
+        with self.assertRaisesRegex(MODULE.WorkflowError, "Repository"):
+            MODULE.validate_candidate_report(
+                report,
+                pr={
+                    **self.pr,
+                    "repo_name": "open-telemetry/opentelemetry-java-instrumentation",
+                    "number": 20130,
+                    "head_sha": "fc375c2363c743c1f63370b1ac85f55f973e3943",
+                },
+                anchors=anchors,
+                changed_paths=[path],
+            )
 
     def test_task_failure_is_deterministic(self):
         error = MODULE.task_failure_from_result(
@@ -1504,7 +1489,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
         self.assertEqual(str(error), "Agent Task failed [task_failed]: worker stopped")
 
     def test_check_invokes_managed_helper_once_and_cleans_transient_files(self):
-        report_text = json.dumps(self.report())
+        report_text = self.report()
         result = self.result()
         result["report"]["sha256"] = MODULE.sha256_text(report_text)
         with tempfile.TemporaryDirectory() as directory:
@@ -1569,7 +1554,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
                 mock.patch.object(
                     MODULE,
                     "fetch_committed_text",
-                    side_effect=[report_text, self.receipt()],
+                    return_value=report_text,
                 ),
                 mock.patch.object(MODULE, "ensure_snapshot_unchanged"),
                 mock.patch.object(MODULE, "emit") as emit,
@@ -1598,14 +1583,18 @@ class ManagedCoordinatorTest(unittest.TestCase):
                     "--result-file",
                     str(state_path.with_name("run--result.json")),
                     "--policy",
-                    "marketplace-agent-worker@4",
+                    "marketplace-agent-report-worker@1",
                 ],
             )
             self.assertFalse(state_path.with_name("run--prompt.txt").exists())
             self.assertFalse(state_path.with_name("run--result.json").exists())
-            self.assertFalse(state_path.with_name("run--report.json").exists())
-            self.assertFalse(state_path.with_name("run--receipt.json").exists())
+            self.assertTrue(state_path.with_name("run--report.md").exists())
+            self.assertEqual(
+                state_path.with_name("run--report.md").read_text(encoding="utf-8"),
+                report_text,
+            )
             self.assertEqual(emit.call_args.args[0]["candidate_count"], 0)
+            self.assertEqual(emit.call_args.args[0]["report_markdown"], report_text)
             saved = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["agent_task"]["status"], "validated")
             self.assertEqual(saved["mutation"]["status"], "not_attempted")
@@ -1671,7 +1660,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
             self.assertNotIn("authoritative_diff", saved)
             self.assertNotIn("context", saved)
 
-    def test_receiptless_completed_task_returns_recovery_details(self):
+    def test_reportless_completed_task_returns_recovery_details(self):
         failure = self.result(
             status="error",
             generated={
@@ -1680,15 +1669,13 @@ class ManagedCoordinatorTest(unittest.TestCase):
                 "commits": [],
             },
             report=None,
-            worker_receipt={
-                "path": ".github/agent-task-validations/request-1.json",
-                "commit": None,
-                "sha256": None,
+            attestation={
+                "kind": "dispatcher_structural",
+                "structural_complete": False,
             },
-            validation={"complete": False, "outcomes": []},
             error={
                 "code": "malformed_history",
-                "message": "the generated branch did not contain a worker validation commit",
+                "message": "the generated branch did not contain a report commit",
             },
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -1739,7 +1726,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
                 mock.patch.object(MODULE, "run", side_effect=invoke),
             ):
                 with self.assertRaisesRegex(
-                    MODULE.WorkflowError, "worker validation commit"
+                    MODULE.WorkflowError, "report commit"
                 ) as raised:
                     MODULE.command_check(
                         SimpleNamespace(
@@ -1759,10 +1746,6 @@ class ManagedCoordinatorTest(unittest.TestCase):
             self.assertEqual(details["generated_branch"], "copilot/task-1")
             self.assertIsNone(details["generated_head"])
             self.assertEqual(details["ordered_commits"], [])
-            self.assertEqual(
-                details["receipt_path"],
-                ".github/agent-task-validations/request-1.json",
-            )
             self.assertIsNone(details["report_path"])
             self.assertEqual(
                 details["recovery_files"],

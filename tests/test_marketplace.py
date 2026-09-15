@@ -22,7 +22,7 @@ ORDINARY_AGENT_TASK_PLUGINS = {
     "copilot-review-loop": "copilot_review_loop.py",
 }
 ORDINARY_HELPER_SHA256 = (
-    "03c52056c706845e870741ec6e325714bc9a8a75c33e8e0271683a1af240b662"
+    "7ce431e21d53bf0680d0a0bb37cdff8acb8983189a651a492b940551bd1e5485"
 )
 RUNTIME_PLUGIN = "agent-tasks-runtime"
 RUNTIME_SKILL = ROOT / "plugins" / RUNTIME_PLUGIN / "skills" / RUNTIME_PLUGIN
