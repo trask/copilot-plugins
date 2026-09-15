@@ -1560,6 +1560,142 @@ class ManagedCoordinatorTest(unittest.TestCase):
             self.assertNotIn("authoritative_diff", saved)
             self.assertNotIn("context", saved)
 
+    def test_receiptless_completed_task_returns_recovery_details(self):
+        failure = self.result(
+            status="error",
+            generated={
+                "branch": "copilot/task-1",
+                "head_sha": None,
+                "commits": [],
+            },
+            report=None,
+            worker_receipt={
+                "path": ".github/agent-task-receipts/request-1.json",
+                "commit": None,
+            },
+            validation={"complete": False, "outcomes": []},
+            error={
+                "code": "malformed_history",
+                "message": "the generated branch did not contain a worker receipt commit",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_root = root / "repo"
+            repo_root.mkdir()
+            state_path = root / "state" / "run.json"
+            helper = root / "managed" / "cloud_task.py"
+            helper.parent.mkdir()
+            helper.write_text("helper", encoding="utf-8")
+
+            def invoke(command, **kwargs):
+                result_path = Path(command[command.index("--result-file") + 1])
+                result_path.write_text(json.dumps(failure), encoding="utf-8")
+                return MODULE.subprocess.CompletedProcess(command, 2, "", "")
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "preflight",
+                    return_value=(
+                        self.pr,
+                        "viewer",
+                        MODULE.parse_unified_diff(DIFF),
+                        None,
+                        None,
+                        [],
+                        [],
+                        DIFF,
+                    ),
+                ),
+                mock.patch.object(MODULE, "fetch_review_threads", return_value=[]),
+                mock.patch.object(
+                    MODULE,
+                    "fetch_changed_paths",
+                    return_value=["src/one.py", "docs/two.md"],
+                ),
+                mock.patch.object(MODULE, "ensure_head_unchanged"),
+                mock.patch.object(MODULE, "ensure_snapshot_unchanged"),
+                mock.patch.object(
+                    MODULE,
+                    "resolve_viewer_permissions",
+                    return_value={"login": "viewer"},
+                ),
+                mock.patch.object(MODULE, "local_identity", return_value=self.identity),
+                mock.patch.object(MODULE, "state_path_for", return_value=state_path),
+                mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+                mock.patch.object(MODULE, "run", side_effect=invoke),
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError, "worker receipt commit"
+                ) as raised:
+                    MODULE.command_check(
+                        SimpleNamespace(
+                            target=self.pr["pr_url"],
+                            model="sol",
+                            repo_root=str(repo_root),
+                        )
+                    )
+
+            details = raised.exception.details
+            self.assertEqual(details["state"], str(state_path))
+            self.assertEqual(details["task_id"], "task-1")
+            self.assertEqual(
+                details["task_url"],
+                "https://github.com/owner/repo/agent-tasks/1",
+            )
+            self.assertEqual(details["generated_branch"], "copilot/task-1")
+            self.assertIsNone(details["generated_head"])
+            self.assertEqual(details["ordered_commits"], [])
+            self.assertEqual(
+                details["receipt_path"],
+                ".github/agent-task-receipts/request-1.json",
+            )
+            self.assertIsNone(details["report_path"])
+            self.assertEqual(
+                details["recovery_files"],
+                [
+                    str(state_path),
+                    str(state_path.with_name("run--prompt.txt")),
+                    str(state_path.with_name("run--result.json")),
+                ],
+            )
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["mutation"]["status"], "not_attempted")
+            self.assertEqual(saved["agent_task"]["task"]["id"], "task-1")
+            self.assertEqual(
+                saved["agent_task"]["generated"]["branch"], "copilot/task-1"
+            )
+
+    def test_main_emits_workflow_error_details(self):
+        error = MODULE.WorkflowError(
+            "worker failed",
+            details={
+                "state": "C:/state/run.json",
+                "recovery_files": ["C:/state/run.json"],
+            },
+        )
+        args = SimpleNamespace(function=mock.Mock(side_effect=error))
+        parser = mock.Mock()
+        parser.parse_args.return_value = args
+
+        with (
+            mock.patch.object(MODULE.shutil, "which", return_value="gh"),
+            mock.patch.object(MODULE, "build_parser", return_value=parser),
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            self.assertEqual(MODULE.main(), 1)
+
+        self.assertEqual(
+            emit.call_args.args[0],
+            {
+                "result": "error",
+                "error": "worker failed",
+                "state": "C:/state/run.json",
+                "recovery_files": ["C:/state/run.json"],
+            },
+        )
+
     def test_cleanup_failure_names_every_retained_artifact(self):
         with tempfile.TemporaryDirectory() as directory:
             first = Path(directory) / "prompt.txt"

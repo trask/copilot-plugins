@@ -87,7 +87,9 @@ EXPECTED_REPORT_VALIDATIONS = [
 
 
 class WorkflowError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.details = details or {}
 
 
 def windows_no_window_options() -> dict[str, int]:
@@ -2256,6 +2258,40 @@ def command_check(args: argparse.Namespace) -> None:
                 str(path) for path in [state_path, *artifacts] if path.exists()
             ],
         }
+        if isinstance(error, WorkflowError):
+            task = (
+                state["agent_task"].get("task")
+                if isinstance(state["agent_task"].get("task"), dict)
+                else {}
+            )
+            generated = (
+                state["agent_task"].get("generated")
+                if isinstance(state["agent_task"].get("generated"), dict)
+                else {}
+            )
+            receipt = (
+                state["agent_task"].get("worker_receipt")
+                if isinstance(state["agent_task"].get("worker_receipt"), dict)
+                else {}
+            )
+            report = (
+                state["agent_task"].get("report")
+                if isinstance(state["agent_task"].get("report"), dict)
+                else {}
+            )
+            error.details.update(
+                {
+                    "state": str(state_path),
+                    "task_id": task.get("id"),
+                    "task_url": task.get("url"),
+                    "generated_branch": generated.get("branch"),
+                    "generated_head": generated.get("head_sha"),
+                    "ordered_commits": generated.get("commits"),
+                    "receipt_path": receipt.get("path"),
+                    "report_path": report.get("path"),
+                    "recovery_files": state["agent_task"]["recovery_files"],
+                }
+            )
         save_run_state(state_path, state)
 
     try:
@@ -2303,6 +2339,13 @@ def command_check(args: argparse.Namespace) -> None:
         validate_result_identity(
             result, pr=pr, requested_model=requested_model, identity=identity
         )
+        state["agent_task"] = {
+            **state["agent_task"],
+            "task": result.get("task"),
+            "generated": result.get("generated"),
+            "report": result.get("report"),
+            "worker_receipt": result.get("worker_receipt"),
+        }
         if process.returncode != 0 or result.get("status") != "success":
             raise task_failure_from_result(result)
         remote = validate_success_result(
@@ -2555,7 +2598,10 @@ def main() -> int:
         args.function(args)
         return 0
     except WorkflowError as error:
-        emit({"result": "error", "error": str(error)}, stream=sys.stderr)
+        emit(
+            {"result": "error", "error": str(error), **error.details},
+            stream=sys.stderr,
+        )
         return 1
 
 
