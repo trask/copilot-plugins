@@ -57,7 +57,42 @@ class PolicyPromptTest(unittest.TestCase):
         self.assertIn("`Finding: <identifier>`", prompt)
         self.assertIn("nonempty UTF-8 Markdown for humans", prompt)
         self.assertIn("dispatcher derives and records generated fix commit order", prompt)
+        self.assertIn("Do not create, stage, or commit alternate", prompt)
         self.assertNotIn("top-level `fix_commits` array", prompt)
+
+    def test_renders_dynamic_artifact_paths_into_workflow_prompt(self):
+        report_path = ".github/agent-task-reports/request-1.md"
+        validation_path = ".github/agent-task-validations/request-1.json"
+        options = MODULE.Options(
+            report=True,
+            model="gpt-5.6-sol",
+            prompt=(
+                "Write the candidate report directly to "
+                f"`{MODULE.REPORT_PATH_PLACEHOLDER}` and validation directly to "
+                f"`{MODULE.VALIDATION_PATH_PLACEHOLDER}`. Do not use alternate names."
+            ),
+            policy=MODULE.MARKETPLACE_POLICY_SELECTOR,
+        )
+
+        payload = MODULE.task_payload(
+            options,
+            report_path=report_path,
+            request_id="request-1",
+            worker_receipt=validation_path,
+            repository="owner/repo",
+        )
+        prompt = payload["prompt"]
+
+        self.assertIn(f"candidate report directly to `{report_path}`", prompt)
+        self.assertIn(f"validation directly to `{validation_path}`", prompt)
+        self.assertNotIn(MODULE.REPORT_PATH_PLACEHOLDER, prompt)
+        self.assertNotIn(MODULE.VALIDATION_PATH_PLACEHOLDER, prompt)
+        self.assertNotIn("candidate-report.json", prompt)
+        self.assertNotIn("worker-validation.json", prompt)
+        self.assertIn(
+            json.dumps([report_path, validation_path]),
+            prompt,
+        )
 
     def test_older_policies_are_explicitly_rejected(self):
         result_path = str((Path.cwd().parent / "result.json").resolve())
@@ -452,7 +487,9 @@ class WorkerHistoryTest(unittest.TestCase):
                 ("rev-list", "--parents"): {
                     artifact: f"{artifact} {fix}\n",
                 },
-                ("diff-tree", "--no-commit-id"): "untrusted-script.py\0",
+                ("diff-tree", "--no-commit-id"): (
+                    "candidate-report.json\0worker-validation.json\0"
+                ),
             }
         )
         with self.assertRaisesRegex(MODULE.CloudError, "unexpected paths"):

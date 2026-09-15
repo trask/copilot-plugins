@@ -725,7 +725,7 @@ class LegacyAgentInstructions:
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.42")
+        self.assertEqual(plugin["version"], "1.0.43")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -880,7 +880,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.42")
+        self.assertEqual(plugin["version"], "1.0.43")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1042,6 +1042,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         prompt = MODULE.build_worker_prompt(preflight)
         with self.assertRaisesRegex(MODULE.WorkflowError, "credentials"):
             MODULE.require_no_credentials(prompt, source="Agent Task prompt")
+
+    def test_prompt_uses_dispatcher_assigned_artifact_paths(self):
+        prompt = MODULE.build_worker_prompt(agent_task_preflight())
+
+        self.assertIn("worker prompt version 2", prompt)
+        self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
+        self.assertIn("`{{MARKETPLACE_VALIDATION_PATH}}`", prompt)
+        self.assertIn("Do not choose alternate artifact names", prompt)
 
     def test_success_uses_atomic_result_not_stdout_and_cleans_artifacts(self):
         report_content = self.proposal_report()

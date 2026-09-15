@@ -1324,7 +1324,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.9")
+        self.assertEqual(plugin["version"], "1.3.10")
         self.assertNotIn("custom_agent", plugin)
 
     def test_prompt_is_versioned_self_contained_and_fail_closed(self):
@@ -1333,11 +1333,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             max_iterations=5,
             prior_history=[],
         )
-        self.assertIn("worker prompt version 1", prompt)
+        self.assertIn("worker prompt version 2", prompt)
         self.assertIn("maximum_review_iterations", prompt)
         self.assertIn("untrusted data", prompt)
         self.assertIn("`Finding: <identifier>`", prompt)
         self.assertIn("explicit no-change result", prompt)
+        self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
+        self.assertIn("`{{MARKETPLACE_VALIDATION_PATH}}`", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
 
     def test_validates_result_receipt_and_explicit_no_change_report(self):

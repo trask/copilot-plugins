@@ -1105,7 +1105,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.9", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.10", json.loads(PLUGIN.read_text())["version"])
 
     def test_prompt_pins_snapshot_allowance_model_policy_and_worker_boundary(self):
         prompt = MODULE.build_worker_prompt(
@@ -1120,6 +1120,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn('"iteration_allowance": 1', prompt)
         self.assertIn("Never select a marketplace `custom_agent`", prompt)
         self.assertIn("use Cloud Sandboxes", prompt)
+        self.assertIn("worker prompt version 2", prompt)
+        self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
+        self.assertIn("`{{MARKETPLACE_VALIDATION_PATH}}`", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
 
     def test_failed_log_download_is_scoped_to_the_exact_job(self):

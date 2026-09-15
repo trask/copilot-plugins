@@ -1078,7 +1078,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("does not support `--input-result-file`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.9")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.10")
 
     def test_prompt_is_self_contained_versioned_and_treats_inputs_as_untrusted(self):
         prompt = MODULE.build_worker_prompt(
@@ -1086,11 +1086,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             remaining_iterations=4,
             prior_history=[],
         )
-        self.assertIn("worker prompt version 1", prompt)
+        self.assertIn("worker prompt version 2", prompt)
         self.assertIn('"remaining_iteration_budget": 4', prompt)
         self.assertIn('"thread_id": "PRRT_thread"', prompt)
         self.assertIn("untrusted data", prompt)
         self.assertIn("local-execution fallback", prompt)
+        self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
+        self.assertIn("`{{MARKETPLACE_VALIDATION_PATH}}`", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
 
     def test_validates_success_and_no_op_receipts(self):

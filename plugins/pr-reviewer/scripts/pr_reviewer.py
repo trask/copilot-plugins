@@ -40,7 +40,7 @@ COPILOT_LOGINS = {
 }
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "fde33df61ebdb6d004ca939710e59cc4a5088dc25d270afac442516c1c2aaeb8"
+    "03c52056c706845e870741ec6e325714bc9a8a75c33e8e0271683a1af240b662"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -59,7 +59,7 @@ CANDIDATE_REPORT_SCHEMA = {
     "id": "github.copilot.pr-review-candidates",
     "version": 1,
 }
-WORKER_PROMPT_VERSION = 2
+WORKER_PROMPT_VERSION = 3
 STATE_VERSION = 1
 MODEL_ALIASES = {
     "luna": "gpt-5.6-luna",
@@ -1669,9 +1669,12 @@ def build_worker_prompt(
         "applicable repository instructions, existing review threads and comments, "
         "linked work, and focused surrounding context. Perform complete full-diff "
         "discovery, including a holistic simplification check. Completing the review "
-        "always requires repository artifacts on the generated task branch. Before "
-        "finishing, write the candidate report and worker validation artifact, then create the "
-        "exact final commit required by the marketplace policy footer. Do this even "
+        "always requires repository artifacts on the generated task branch. Write the "
+        "candidate report directly to `{{MARKETPLACE_REPORT_PATH}}` and the strict "
+        "validation array directly to `{{MARKETPLACE_VALIDATION_PATH}}`; the dispatcher "
+        "replaces both placeholders with exact paths before task creation. Do not choose "
+        "alternate artifact names, and do not commit scratch files. Then create the exact "
+        "final commit required by the marketplace policy footer. Do this even "
         "when the candidates array is empty. A chat response without the committed "
         "artifacts is a failed task. These artifacts are the only repository changes "
         "you may make. Do not modify the pull request or its source branch. Use focused "

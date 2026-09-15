@@ -75,7 +75,7 @@ VALIDATION_SOURCE_NAMES = {
     "tox.ini",
 }
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "fde33df61ebdb6d004ca939710e59cc4a5088dc25d270afac442516c1c2aaeb8"
+    "03c52056c706845e870741ec6e325714bc9a8a75c33e8e0271683a1af240b662"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -92,7 +92,7 @@ SELF_REVIEW_REPORT_SCHEMA = {
     "id": "github.copilot.self-review-loop-report",
     "version": 1,
 }
-WORKER_PROMPT_VERSION = 1
+WORKER_PROMPT_VERSION = 2
 MODEL_ALIASES = {
     "luna": "gpt-5.6-luna",
     "terra": "gpt-5.6-terra",
@@ -1351,7 +1351,11 @@ def build_worker_prompt(
         "code change is needed, create no fix commit: the final "
         "report-and-validation commit is the explicit no-change result and must say the "
         "pull request was cleared. The managed apply-with-report contract supplies the "
-        "final artifact paths and commit rules.\n\n"
+        "final artifact paths and commit rules. Write the report directly to "
+        "`{{MARKETPLACE_REPORT_PATH}}` and the strict validation array directly to "
+        "`{{MARKETPLACE_VALIDATION_PATH}}`; the dispatcher replaces both placeholders "
+        "before task creation. Do not choose alternate artifact names or commit scratch "
+        "files.\n\n"
         "Review the live title and description against the final diff. Propose a "
         "replacement only when either is inaccurate or misses an important user-facing "
         "change. Do not mutate GitHub metadata; the local coordinator owns authenticated "

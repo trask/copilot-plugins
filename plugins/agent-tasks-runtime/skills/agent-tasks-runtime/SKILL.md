@@ -24,6 +24,12 @@ ordered fix commits from validated Git history and writes that provenance,
 trusted identity, artifact digests, and completion state only to the result file
 outside the target repository.
 
+Consumer prompts may use `{{MARKETPLACE_REPORT_PATH}}` and
+`{{MARKETPLACE_VALIDATION_PATH}}`. The dispatcher replaces them with the exact
+request-scoped paths before task creation so workflow instructions and the final
+policy block name the same artifacts. Alternate or scratch artifact paths must
+never be committed.
+
 If an apply-with-report dispatcher is interrupted after task creation and no
 dispatch result survives, `--resume-apply-with-report` can recover the known
 task. Recovery reads the hosted task session prompt and requires its exact task,

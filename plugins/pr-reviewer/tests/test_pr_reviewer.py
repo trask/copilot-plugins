@@ -1180,7 +1180,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
             ["src/one.py", "docs/two.md"],
         )
 
-        self.assertEqual(MODULE.WORKER_PROMPT_VERSION, 2)
+        self.assertEqual(MODULE.WORKER_PROMPT_VERSION, 3)
         self.assertIn(
             "Completing the review always requires repository artifacts on the "
             "generated task branch.",
@@ -1195,6 +1195,11 @@ class ManagedCoordinatorTest(unittest.TestCase):
             "A chat response without the committed artifacts is a failed task",
             prompt,
         )
+        self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
+        self.assertIn("`{{MARKETPLACE_VALIDATION_PATH}}`", prompt)
+        self.assertIn("Do not choose alternate artifact names", prompt)
+        self.assertNotIn("candidate-report.json", prompt)
+        self.assertNotIn("worker-validation.json", prompt)
         self.assertIn(
             "These artifacts are the only repository changes you may make",
             prompt,
@@ -1366,6 +1371,35 @@ class ManagedCoordinatorTest(unittest.TestCase):
         with mock.patch.object(MODULE, "gh_json", return_value=commit):
             with self.assertRaisesRegex(MODULE.WorkflowError, "exactly one"):
                 MODULE.validate_report_commit(self.pr, remote)
+
+        fixture = json.loads(
+            (
+                Path(__file__).parent
+                / "fixtures"
+                / "task-92e6f838-artifact-path-failure.json"
+            ).read_text(encoding="utf-8")
+        )
+        production_pr = {
+            **self.pr,
+            "head_sha": fixture["source_head"],
+        }
+        production_remote = {
+            **remote,
+            "generated_head": fixture["generated_commit"],
+            "report_path": fixture["assigned_paths"][0],
+            "receipt_path": fixture["assigned_paths"][1],
+        }
+        failed_commit = {
+            "sha": fixture["generated_commit"],
+            "parents": [{"sha": fixture["source_head"]}],
+            "files": [
+                {"filename": path}
+                for path in fixture["produced_paths"]
+            ],
+        }
+        with mock.patch.object(MODULE, "gh_json", return_value=failed_commit):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "exactly one"):
+                MODULE.validate_report_commit(production_pr, production_remote)
 
     def test_rejects_wrong_task_and_report_identity(self):
         wrong_task = self.result()

@@ -184,7 +184,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pins_shared_helper_and_policy_integrity(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "fde33df61ebdb6d004ca939710e59cc4a5088dc25d270afac442516c1c2aaeb8",
+            "03c52056c706845e870741ec6e325714bc9a8a75c33e8e0271683a1af240b662",
         )
         self.assertEqual(
             MODULE.AGENT_TASK_POLICY_SHA256,
@@ -199,7 +199,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             pipeline=PIPELINE,
         )
         for text in (
-            "worker prompt version 1",
+            "worker prompt version 2",
             "untrusted data",
             "Never request, read, print, persist, or transmit credentials",
             "Do not select a custom_agent",
@@ -208,6 +208,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "Run at most 5 audit iterations",
             "single-parent fix commit",
             "max_iterations_reached",
+            "`{{MARKETPLACE_REPORT_PATH}}`",
+            "`{{MARKETPLACE_VALIDATION_PATH}}`",
         ):
             self.assertIn(text, prompt)
         self.assertFalse(MODULE.contains_credentials(prompt))

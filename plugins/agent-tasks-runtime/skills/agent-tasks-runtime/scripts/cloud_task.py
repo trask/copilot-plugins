@@ -40,6 +40,8 @@ KNOWN_STATES = ACTIVE_STATES | SUCCESS_STATES | ERROR_STATES | BLOCKED_STATES
 SHA_PATTERN = re.compile(r"\A[0-9a-fA-F]{40}\Z")
 REPORT_DIRECTORY = ".github/agent-task-reports"
 VALIDATION_DIRECTORY = ".github/agent-task-validations"
+REPORT_PATH_PLACEHOLDER = "{{MARKETPLACE_REPORT_PATH}}"
+VALIDATION_PATH_PLACEHOLDER = "{{MARKETPLACE_VALIDATION_PATH}}"
 REPORT_MARKER = "----- /cloud report instructions -----"
 APPLY_WITH_REPORT_MARKER = "----- /cloud apply-with-report instructions -----"
 PR_CONTEXT_MARKER = "----- /cloud source pull request -----"
@@ -1575,7 +1577,10 @@ def build_policy_prompt(
         "Create exactly one final single-parent artifact commit whose changed "
         f"paths are exactly {json.dumps(expected_paths)}. Put code changes in "
         "preceding linear commits, make no preceding commit in report mode, and "
-        "do not add commits afterward. In apply-with-report mode, every fix commit "
+        "do not add commits afterward. Write the final workflow report and validation "
+        "directly to the assigned paths above. Do not create, stage, or commit alternate "
+        "report, validation, or scratch artifact paths; remove any working files before "
+        "the final commit. In apply-with-report mode, every fix commit "
         "must have a concise normal message with one nonempty `Finding: <identifier>` "
         "line, unique among the generated fix commits. Keep the report as nonempty "
         "UTF-8 Markdown for humans. The dispatcher derives and records generated "
@@ -2836,6 +2841,28 @@ def build_report_prompt(prompt: str, report_path: str) -> str:
     )
 
 
+def render_artifact_paths(
+    prompt: str,
+    *,
+    report_path: str,
+    worker_receipt: str | None,
+) -> str:
+    rendered = prompt.replace(REPORT_PATH_PLACEHOLDER, report_path)
+    if VALIDATION_PATH_PLACEHOLDER in rendered:
+        if worker_receipt is None:
+            raise CloudError(
+                "the workflow prompt requires a validation path outside policy mode",
+                "policy_required",
+            )
+        rendered = rendered.replace(VALIDATION_PATH_PLACEHOLDER, worker_receipt)
+    if REPORT_PATH_PLACEHOLDER in rendered or VALIDATION_PATH_PLACEHOLDER in rendered:
+        raise CloudError(
+            "the workflow prompt contains an unresolved artifact path placeholder",
+            "malformed_report",
+        )
+    return rendered
+
+
 def build_apply_with_report_prompt(
     prompt: str,
     report_path: str,
@@ -2894,12 +2921,23 @@ def task_payload(
     repository: str | None = None,
 ) -> dict[str, object]:
     if options.report and report_path is not None:
-        prompt = build_report_prompt(options.prompt, report_path)
+        prompt = build_report_prompt(
+            render_artifact_paths(
+                options.prompt,
+                report_path=report_path,
+                worker_receipt=worker_receipt,
+            ),
+            report_path,
+        )
     elif options.apply_with_report:
         if report_path is None:
             raise AssertionError("apply-with-report mode did not allocate a report path")
         prompt = build_apply_with_report_prompt(
-            options.prompt,
+            render_artifact_paths(
+                options.prompt,
+                report_path=report_path,
+                worker_receipt=worker_receipt,
+            ),
             report_path,
             worker_receipt if options.policy is not None else None,
         )

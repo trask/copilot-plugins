@@ -45,7 +45,7 @@ GITHUB_PR_DIFF = "github_pr_diff"
 CUMULATIVE_GIT_DIFF = "cumulative_git_diff"
 BARE_TARGET_PATTERN = re.compile(r"^#?(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "fde33df61ebdb6d004ca939710e59cc4a5088dc25d270afac442516c1c2aaeb8"
+    "03c52056c706845e870741ec6e325714bc9a8a75c33e8e0271683a1af240b662"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -62,7 +62,7 @@ AUDIT_REPORT_SCHEMA = {
     "id": "github.copilot.historical-pr-audit-report",
     "version": 1,
 }
-WORKER_PROMPT_VERSION = 1
+WORKER_PROMPT_VERSION = 2
 MODEL_ALIASES = {
     "luna": "gpt-5.6-luna",
     "terra": "gpt-5.6-terra",
@@ -2518,7 +2518,11 @@ def build_worker_prompt(
         f"reached. Run at most {max_iterations} audit iterations. Carry earlier "
         "candidate decisions forward so a dropped, addressed, or no-code finding is "
         "not raised again. A clean first pass creates no fix commit. Do not invent a "
-        "change to avoid a no-change result.\n\n"
+        "change to avoid a no-change result. Write the report directly to "
+        "`{{MARKETPLACE_REPORT_PATH}}` and the strict validation array directly to "
+        "`{{MARKETPLACE_VALIDATION_PATH}}`; the dispatcher replaces both placeholders "
+        "before task creation. Do not choose alternate artifact names or commit scratch "
+        "files.\n\n"
         "Write the final report as one UTF-8 JSON object with no Markdown fence and no "
         "text before or after it. Use exactly the keys and nesting in this shape. "
         "Record fix commits in oldest-to-newest order and list the exact changed paths "
