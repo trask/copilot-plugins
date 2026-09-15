@@ -24,6 +24,8 @@ ORDINARY_AGENT_TASK_PLUGINS = {
 ORDINARY_HELPER_SHA256 = (
     "fa57bff76e2e2854d1bd73ea77a761e9e14ebcd89b89a7d90e91c6d28c73ff5f"
 )
+RUNTIME_PLUGIN = "agent-tasks-runtime"
+RUNTIME_SKILL = ROOT / "plugins" / RUNTIME_PLUGIN / "skills" / RUNTIME_PLUGIN
 CONFLICT_HELPER_SHA256 = (
     "3f9807c392bb31dc3ddcfe74d367b620f417dffc00b1904c78415da43c8b9ad9"
 )
@@ -34,9 +36,10 @@ class MarketplaceTest(unittest.TestCase):
         marketplace = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
 
         self.assertEqual("trask-plugins", marketplace["name"])
-        self.assertEqual(8, len(marketplace["plugins"]))
+        self.assertEqual(9, len(marketplace["plugins"]))
         self.assertEqual(
             {
+                "agent-tasks-runtime",
                 "ci-fix-loop",
                 "pr-conflict-resolver",
                 "copilot-review-loop",
@@ -57,8 +60,23 @@ class MarketplaceTest(unittest.TestCase):
 
             self.assertEqual(entry["name"], manifest["name"])
             self.assertEqual(entry["version"], manifest["version"])
-            self.assertTrue((plugin_root / manifest["agents"]).is_dir())
-            self.assertTrue(list((plugin_root / manifest["agents"]).glob("*.agent.md")))
+            if entry["name"] == RUNTIME_PLUGIN:
+                self.assertEqual(
+                    manifest["$schema"],
+                    "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+                )
+                self.assertNotIn("agents", manifest)
+                self.assertFalse((plugin_root / "agents").exists())
+                skill = plugin_root / "skills" / RUNTIME_PLUGIN / "SKILL.md"
+                self.assertTrue(skill.is_file())
+                instructions = skill.read_text(encoding="utf-8")
+                self.assertTrue(instructions.startswith("---\n"))
+                self.assertIn(f"\nname: {RUNTIME_PLUGIN}\n", instructions)
+            else:
+                self.assertTrue((plugin_root / manifest["agents"]).is_dir())
+                self.assertTrue(
+                    list((plugin_root / manifest["agents"]).glob("*.agent.md"))
+                )
 
     def test_all_agents_require_explicit_invocation(self):
         marketplace = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
@@ -68,7 +86,10 @@ class MarketplaceTest(unittest.TestCase):
             manifest = json.loads(
                 (plugin_root / "plugin.json").read_text(encoding="utf-8")
             )
-            for agent in (plugin_root / manifest["agents"]).glob("*.agent.md"):
+            agents = manifest.get("agents")
+            if not isinstance(agents, str):
+                continue
+            for agent in (plugin_root / agents).glob("*.agent.md"):
                 with self.subTest(agent=agent.relative_to(ROOT)):
                     instructions = agent.read_text(encoding="utf-8")
                     frontmatter = instructions.split("---", 2)[1]
@@ -87,73 +108,42 @@ class MarketplaceTest(unittest.TestCase):
 
     def test_agent_task_helpers_are_complete_marketplace_package_files(self):
         expected = {
-            **{
-                name: ("cloud_task.py", ORDINARY_HELPER_SHA256)
-                for name in ORDINARY_AGENT_TASK_PLUGINS
-            },
+            RUNTIME_PLUGIN: (
+                Path("skills") / RUNTIME_PLUGIN / "scripts" / "cloud_task.py",
+                ORDINARY_HELPER_SHA256,
+            ),
             "pr-conflict-resolver": (
-                "cloud_conflict_task.py",
+                Path("scripts") / "cloud_conflict_task.py",
                 CONFLICT_HELPER_SHA256,
             ),
         }
         marketplace = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
         entries = {entry["name"]: entry for entry in marketplace["plugins"]}
 
-        for name, (helper_name, expected_sha256) in expected.items():
+        for name, (helper_path, expected_sha256) in expected.items():
             with self.subTest(plugin=name):
                 plugin_root = (ROOT / entries[name]["source"]).resolve()
-                helper = plugin_root / "scripts" / helper_name
+                helper = plugin_root / helper_path
                 self.assertTrue(helper.is_file())
                 self.assertFalse(helper.is_symlink())
-                self.assertEqual(
-                    helper.resolve().parent,
-                    (plugin_root / "scripts").resolve(),
-                )
                 self.assertEqual(
                     hashlib.sha256(helper.read_bytes()).hexdigest(),
                     expected_sha256,
                 )
 
-    def test_ordinary_agent_task_helper_copies_are_byte_identical(self):
-        helpers = [
-            ROOT / "plugins" / name / "scripts" / "cloud_task.py"
-            for name in ORDINARY_AGENT_TASK_PLUGINS
-        ]
-        reference = helpers[0].read_bytes()
-
-        self.assertEqual(hashlib.sha256(reference).hexdigest(), ORDINARY_HELPER_SHA256)
-        for helper in helpers[1:]:
-            with self.subTest(helper=helper.relative_to(ROOT)):
-                self.assertEqual(helper.read_bytes(), reference)
+    def test_ordinary_agent_task_helper_has_one_canonical_package_copy(self):
+        helper = RUNTIME_SKILL / "scripts" / "cloud_task.py"
+        self.assertEqual(
+            hashlib.sha256(helper.read_bytes()).hexdigest(), ORDINARY_HELPER_SHA256
+        )
+        for name in ORDINARY_AGENT_TASK_PLUGINS:
+            with self.subTest(plugin=name):
+                self.assertFalse(
+                    (ROOT / "plugins" / name / "scripts" / "cloud_task.py").exists()
+                )
 
     def test_each_agent_task_plugin_isolated_from_private_configuration(self):
-        configurations = [
-            *(
-                (
-                    name,
-                    coordinator,
-                    "cloud_task.py",
-                    "discover_cloud_task",
-                    "REQUIRED_CLOUD_TASK_SHA256",
-                )
-                for name, coordinator in ORDINARY_AGENT_TASK_PLUGINS.items()
-            ),
-            (
-                "pr-conflict-resolver",
-                "pr_conflict_resolver.py",
-                "cloud_conflict_task.py",
-                "discover_conflict_task",
-                "REQUIRED_CONFLICT_TASK_SHA256",
-            ),
-        ]
-
-        for (
-            plugin_name,
-            coordinator_name,
-            helper_name,
-            discovery_name,
-            digest_name,
-        ) in configurations:
+        for plugin_name, coordinator_name in ORDINARY_AGENT_TASK_PLUGINS.items():
             with (
                 self.subTest(plugin=plugin_name),
                 tempfile.TemporaryDirectory() as directory,
@@ -162,7 +152,9 @@ class MarketplaceTest(unittest.TestCase):
                 plugin_root = isolated_root / "plugin"
                 shutil.copytree(ROOT / "plugins" / plugin_name, plugin_root)
                 coordinator = plugin_root / "scripts" / coordinator_name
-                helper = plugin_root / "scripts" / helper_name
+                runtime_skill = isolated_root / "runtime-skill"
+                shutil.copytree(RUNTIME_SKILL, runtime_skill)
+                helper = runtime_skill / "scripts" / "cloud_task.py"
                 private_home = isolated_root / "private-home"
                 private_helper = (
                     private_home
@@ -170,7 +162,7 @@ class MarketplaceTest(unittest.TestCase):
                     / "skills"
                     / "cloud"
                     / "scripts"
-                    / helper_name
+                    / "cloud_task.py"
                 )
                 private_helper.parent.mkdir(parents=True)
                 private_helper.write_text(
@@ -192,18 +184,37 @@ class MarketplaceTest(unittest.TestCase):
                 sys.modules[module_name] = module
                 try:
                     spec.loader.exec_module(module)
-                    with mock.patch.dict(
-                        os.environ,
-                        {
-                            "HOME": str(private_home),
-                            "USERPROFILE": str(private_home),
-                            "COPILOT_HOME": str(private_home / ".copilot"),
-                        },
+                    inventory = json.dumps(
+                        [
+                            {
+                                "name": RUNTIME_PLUGIN,
+                                "source": "plugin",
+                                "path": str(runtime_skill.resolve()),
+                                "enabled": True,
+                            }
+                        ]
+                    )
+                    listed = subprocess.CompletedProcess(
+                        ["copilot", "skill", "list", "--json"], 0, inventory, ""
+                    )
+                    environment = {
+                        "HOME": str(private_home),
+                        "USERPROFILE": str(private_home),
+                        "COPILOT_HOME": str(private_home / ".copilot"),
+                    }
+                    with (
+                        mock.patch.dict(os.environ, environment),
+                        mock.patch.object(module, "run", return_value=listed) as run,
                     ):
-                        discovered = getattr(module, discovery_name)()
+                        discovered = module.discover_cloud_task()
                     self.assertEqual(discovered, helper.resolve())
                     self.assertEqual(
-                        getattr(module, digest_name),
+                        run.call_args.args[0],
+                        ["copilot", "skill", "list", "--json"],
+                    )
+                    self.assertFalse(run.call_args.kwargs["check"])
+                    self.assertEqual(
+                        module.REQUIRED_CLOUD_TASK_SHA256,
                         hashlib.sha256(helper.read_bytes()).hexdigest(),
                     )
 
@@ -223,12 +234,89 @@ class MarketplaceTest(unittest.TestCase):
                     )
 
                     helper.write_bytes(helper.read_bytes() + b"\n# tampered\n")
-                    with self.assertRaisesRegex(
-                        module.WorkflowError, "integrity validation"
+                    with (
+                        mock.patch.dict(os.environ, environment),
+                        mock.patch.object(module, "run", return_value=listed),
+                        self.assertRaisesRegex(
+                            module.WorkflowError, "integrity validation"
+                        ),
                     ):
-                        getattr(module, discovery_name)()
+                        module.discover_cloud_task()
+
+                    missing = subprocess.CompletedProcess(
+                        ["copilot", "skill", "list", "--json"], 0, "[]", ""
+                    )
+                    with (
+                        mock.patch.object(module, "run", return_value=missing),
+                        self.assertRaisesRegex(
+                            module.WorkflowError,
+                            "agent-tasks-runtime@trask-plugins",
+                        ),
+                    ):
+                        module.discover_cloud_task()
+
+                    unavailable = [
+                        {
+                            "name": RUNTIME_PLUGIN,
+                            "source": "plugin",
+                            "path": str(runtime_skill.resolve()),
+                            "enabled": False,
+                        }
+                    ]
+                    duplicate = json.loads(inventory) * 2
+                    for skills in (unavailable, duplicate):
+                        with (
+                            self.subTest(
+                                plugin=plugin_name,
+                                inventory="disabled"
+                                if skills is unavailable
+                                else "duplicate",
+                            ),
+                            mock.patch.object(
+                                module,
+                                "run",
+                                return_value=subprocess.CompletedProcess(
+                                    ["copilot", "skill", "list", "--json"],
+                                    0,
+                                    json.dumps(skills),
+                                    "",
+                                ),
+                            ),
+                            self.assertRaisesRegex(
+                                module.WorkflowError, "uniquely installed and enabled"
+                            ),
+                        ):
+                            module.discover_cloud_task()
                 finally:
                     sys.modules.pop(module_name, None)
+
+    def test_conflict_agent_keeps_its_dedicated_runtime(self):
+        plugin_name = "pr-conflict-resolver"
+        with tempfile.TemporaryDirectory() as directory:
+            plugin_root = Path(directory) / "plugin"
+            shutil.copytree(ROOT / "plugins" / plugin_name, plugin_root)
+            coordinator = plugin_root / "scripts" / "pr_conflict_resolver.py"
+            helper = plugin_root / "scripts" / "cloud_conflict_task.py"
+            module_name = "_isolated_pr_conflict_resolver"
+            spec = importlib.util.spec_from_file_location(module_name, coordinator)
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            try:
+                spec.loader.exec_module(module)
+                self.assertEqual(module.discover_conflict_task(), helper.resolve())
+                self.assertEqual(
+                    module.REQUIRED_CONFLICT_TASK_SHA256,
+                    hashlib.sha256(helper.read_bytes()).hexdigest(),
+                )
+                helper.write_bytes(helper.read_bytes() + b"\n# tampered\n")
+                with self.assertRaisesRegex(
+                    module.WorkflowError, "integrity validation"
+                ):
+                    module.discover_conflict_task()
+            finally:
+                sys.modules.pop(module_name, None)
 
 
 if __name__ == "__main__":

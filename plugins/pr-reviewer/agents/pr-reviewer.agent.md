@@ -35,7 +35,7 @@ Run `python "$helper" check <target> --model <model>` once. Use `python3` on POS
 
 Never run another local repository command. Never read, search, import, build, test, install, execute, hook, generate a probe for, or analyze pull request code locally. Never run repository scripts. Never invoke `gh pr diff` yourself. Never use a local diff, `get_changes_overview`, Cloud Sandboxes, or a local fallback after managed cloud failure. Stop on a helper error and report its recovery files.
 
-The Agent Tasks runtime is bundled with this plugin. The coordinator loads only its adjacent `cloud_task.py`, verifies its pinned SHA-256, and runs it with policy `marketplace-agent-worker@1`. Do not invoke `cloud_task.py` yourself and do not scrape its standard output.
+The coordinator discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies its pinned SHA-256, and runs it with policy `marketplace-agent-worker@1`. Do not invoke `cloud_task.py` yourself and do not scrape its standard output.
 
 ## Fixed independent evaluator
 

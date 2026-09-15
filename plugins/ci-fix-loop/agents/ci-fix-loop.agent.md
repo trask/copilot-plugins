@@ -45,7 +45,7 @@ Use `--model sol` unless the caller selected another supported model. The helper
 
 Every failing-check iteration launches exactly one managed GitHub Agent Task through `agent-task`. The coordinator pins the open pull request, local branch, head, base, authenticated viewer, check rollup, failing logs and their digests, model, policy, and one-iteration allowance before dispatch.
 
-The Agent Tasks runtime is bundled with this plugin. The command loads only the adjacent `cloud_task.py`, verifies its SHA-256 `fa57bff76e2e2854d1bd73ea77a761e9e14ebcd89b89a7d90e91c6d28c73ff5f`, and invokes it with `--result-file`, `--policy marketplace-agent-worker@1`, and absolute prompt and result paths outside the repository. The policy SHA-256 is `c87e380b050a2af8c275eb2413893304ca7b7ff28bd1ae074a07ae5e66c40189`.
+The command discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies its SHA-256 `fa57bff76e2e2854d1bd73ea77a761e9e14ebcd89b89a7d90e91c6d28c73ff5f`, and invokes it with `--result-file`, `--policy marketplace-agent-worker@1`, and absolute prompt and result paths outside the repository. The policy SHA-256 is `c87e380b050a2af8c275eb2413893304ca7b7ff28bd1ae074a07ae5e66c40189`.
 
 Never use Cloud Sandboxes or a local fallback. Never pass `custom_agent`. Never pass credentials. Never read helper stdout as a result. Never run `gh pr diff`, a repository command, a formatter, a build, a test, or a probe.
 

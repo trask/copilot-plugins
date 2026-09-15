@@ -193,7 +193,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read, edit, search", instructions)
         self.assertNotIn("custom_agent:", instructions)
 
-    def test_pins_bundled_helper_and_policy_integrity(self):
+    def test_pins_shared_helper_and_policy_integrity(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
             "fa57bff76e2e2854d1bd73ea77a761e9e14ebcd89b89a7d90e91c6d28c73ff5f",

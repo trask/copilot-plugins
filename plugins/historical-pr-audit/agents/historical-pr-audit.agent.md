@@ -31,7 +31,7 @@ You are a thin local coordinator. The bundled helper captures immutable identity
 - The source pull request is immutable history. Never create or change a pull request, review, comment, issue, label, milestone, title, or description. Never open a pull request from the audit branch.
 - Never run another local repository command. Never read, search, analyze, edit, build, test, install, or execute repository code locally. Never run repository scripts or form findings yourself.
 - Never use Cloud Sandboxes, a marketplace `custom_agent`, a local analysis or execution fallback, or direct Agent Tasks API calls. Stop if the managed helper is missing, stale, unavailable, or rejects the task.
-- The Agent Tasks runtime is bundled with this plugin. The coordinator loads only its adjacent `cloud_task.py`, verifies its pinned SHA-256, and requires policy `marketplace-agent-worker@1`.
+- The coordinator discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies its pinned SHA-256, and requires policy `marketplace-agent-worker@1`.
 - The helper pins the merged pull request's exact base and head SHAs, title, body, branch identities, and local audit-branch identity. It rejects drift before dispatch, import, and publication.
 - The task audits the first pull request diff and each later cumulative diff from the same original base. It carries finding decisions forward and stops after a clean pass or five iterations.
 - A clean first pass creates no fix commit and leaves no remote audit branch. A successful fix run imports only `generated.commits`, never the final report-and-receipt artifact commit, then pushes and verifies `trask-pr-audit-<number>`.

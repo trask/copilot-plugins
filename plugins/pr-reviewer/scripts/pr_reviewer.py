@@ -42,7 +42,9 @@ IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
     "fa57bff76e2e2854d1bd73ea77a761e9e14ebcd89b89a7d90e91c6d28c73ff5f"
 )
-CLOUD_TASK_FILENAME = "cloud_task.py"
+CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
+CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
+CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
 AGENT_TASK_POLICY = "marketplace-agent-worker@1"
 AGENT_TASK_POLICY_IDENTITY = {
     "id": "marketplace-agent-worker",
@@ -131,7 +133,9 @@ def sha256_file(path: Path) -> str:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
     except OSError as error:
-        raise WorkflowError(f"could not read bundled helper {path}: {error}") from error
+        raise WorkflowError(
+            f"could not read Agent Tasks runtime helper {path}: {error}"
+        ) from error
     return digest.hexdigest()
 
 
@@ -188,16 +192,56 @@ def copilot_home() -> Path:
 
 
 def discover_cloud_task() -> Path:
-    helper = Path(__file__).resolve().with_name(CLOUD_TASK_FILENAME)
+    try:
+        process = run(["copilot", "skill", "list", "--json"], check=False)
+    except OSError as error:
+        raise WorkflowError(
+            f"could not discover the shared Agent Tasks runtime: {error}"
+        ) from error
+    if process.returncode != 0:
+        detail = process.stderr.strip() or process.stdout.strip() or "no output"
+        raise WorkflowError(
+            f"could not discover the shared Agent Tasks runtime: {detail}"
+        )
+    skills = parse_strict_json(
+        process.stdout, description="Copilot skill inventory"
+    )
+    if not isinstance(skills, list):
+        raise WorkflowError("Copilot skill inventory is not a JSON array")
+    matches = [
+        skill
+        for skill in skills
+        if isinstance(skill, dict)
+        and skill.get("name") == CLOUD_TASK_SKILL_NAME
+        and skill.get("source") == "plugin"
+        and skill.get("enabled") is True
+    ]
+    if len(matches) != 1:
+        raise WorkflowError(
+            "the shared Agent Tasks runtime skill is not uniquely installed and "
+            f"enabled; run 'copilot plugin install {CLOUD_TASK_INSTALL_SPEC}' or "
+            f"'copilot plugin enable {CLOUD_TASK_SKILL_NAME}', then restart Copilot"
+        )
+    skill_path = matches[0].get("path")
+    if not isinstance(skill_path, str) or not Path(skill_path).is_absolute():
+        raise WorkflowError(
+            "the shared Agent Tasks runtime skill has no absolute installation path"
+        )
+    skill_root = Path(skill_path)
+    scripts = skill_root / CLOUD_TASK_RELATIVE_PATH.parent
+    helper = skill_root / CLOUD_TASK_RELATIVE_PATH
     if (
-        helper.is_symlink()
+        skill_root.is_symlink()
+        or scripts.is_symlink()
+        or helper.is_symlink()
         or not helper.is_file()
         or sha256_file(helper) != REQUIRED_CLOUD_TASK_SHA256
     ):
         raise WorkflowError(
-            "the bundled Agent Tasks helper is missing or failed integrity validation"
+            "the shared Agent Tasks runtime helper is missing or failed integrity "
+            f"validation; update {CLOUD_TASK_INSTALL_SPEC} and this plugin together"
         )
-    return helper
+    return helper.resolve()
 
 
 def atomic_write_text(path: Path, value: str) -> None:

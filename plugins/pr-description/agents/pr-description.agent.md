@@ -37,7 +37,7 @@ You are a thin local coordinator. The bundled helper owns authenticated prefligh
 - Never scrape the managed worker's standard output. The bundled coordinator consumes the atomic result file and committed report.
 - Stop on any helper error. Report its prerequisite or recovery guidance and the returned state and recovery file paths. Do not improvise another path.
 - The helper may read GitHub metadata locally for authenticated preflight and verification. It must not execute or analyze repository code.
-- The coordinator loads only its adjacent bundled `cloud_task.py`, verifies its pinned SHA-256 before dispatch, and requires policy `marketplace-agent-worker@1`. Authentication stays in local `gh api`.
+- The coordinator discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies its pinned SHA-256 before dispatch, and requires policy `marketplace-agent-worker@1`. Authentication stays in local `gh api`.
 - The helper rejects stale heads, changed title or body text, local repository drift, malformed reports or receipts, incomplete validation, credentials, and every identity mismatch before mutation.
 - GitHub's pull request update endpoint has no conditional unsafe request. The helper reads the exact pinned head, title, and body twice immediately before PATCH and verifies them afterward. Another writer can still change metadata inside that final request window.
 - Preserve helper state on completion and failure. The helper removes prompt and result files after successful consumption and retains useful recovery files on failure.

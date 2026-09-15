@@ -13,6 +13,7 @@ copilot plugin marketplace add trask/copilot-plugins
 Then install any of the plugins:
 
 ```bash
+copilot plugin install agent-tasks-runtime@trask-plugins
 copilot plugin install pr-reviewer@trask-plugins
 copilot plugin install copilot-review-loop@trask-plugins
 copilot plugin install self-review-loop@trask-plugins
@@ -25,7 +26,21 @@ copilot plugin install historical-pr-audit@trask-plugins
 
 Restart Copilot after you install or update a plugin.
 
+`pr-reviewer`, `copilot-review-loop`, `self-review-loop`, `pr-description`,
+`ci-fix-loop`, and `historical-pr-audit` require
+`agent-tasks-runtime@trask-plugins`. The runtime contains no custom agents and
+does not add anything to the agent list. PR Conflict Resolver keeps its
+specialized conflict runtime inside its own plugin and does not require the
+shared runtime.
+
 ## Plugins
+
+### Agent Tasks Runtime
+
+Provides the shared, hash-verified `cloud_task.py` used by six Agent Tasks
+agents. The plugin exposes no custom agent; consumer coordinators locate its
+internal skill through Copilot's skill inventory and fail closed when the
+runtime is missing, disabled, or incompatible.
 
 ### PR Reviewer
 
@@ -35,9 +50,9 @@ task's committed report and receipt, then checks each candidate with a separate
 Claude evaluator before it creates and verifies one pending review.
 
 Run this agent with GPT-5.6 Sol at high reasoning effort. It checks each finding
-with a separate Claude Sonnet 5 evaluator. The plugin bundles and verifies its
-Agent Tasks runtime and uses policy `marketplace-agent-worker@1`. It never uses
-Cloud Sandboxes or a local-analysis fallback.
+with a separate Claude Sonnet 5 evaluator. The plugin verifies the shared Agent
+Tasks runtime and uses policy `marketplace-agent-worker@1`. It never uses Cloud
+Sandboxes or a local-analysis fallback.
 
 ### Copilot Review Loop
 
@@ -46,8 +61,8 @@ yet. It groups comments that share one cause into one commit, pushes the fixes,
 and asks Copilot to review again when the current head has no clean review. It
 repeats until the review is clean or it reaches a stop condition.
 
-The plugin bundles and verifies its Agent Tasks runtime. Authentication stays
-in local `gh api`; repository analysis and execution stay in GitHub Agent Tasks.
+The plugin verifies the shared Agent Tasks runtime. Authentication stays in
+local `gh api`; repository analysis and execution stay in GitHub Agent Tasks.
 
 ### Self Review Loop
 
@@ -57,10 +72,10 @@ builds. The local coordinator validates the task's commit history, report,
 receipt, and live branch identity before it imports and pushes the fix commits.
 A clean review leaves the branch unchanged.
 
-The plugin bundles and verifies `cloud_task.py`, then runs it with policy
-`marketplace-agent-worker@1`. The backend is GitHub Agent Tasks through local
-`gh api`; there is no Cloud Sandbox, custom agent, local repository analysis,
-or local execution fallback.
+The plugin locates and verifies the shared `cloud_task.py`, then runs it with
+policy `marketplace-agent-worker@1`. The backend is GitHub Agent Tasks through
+local `gh api`; there is no Cloud Sandbox, custom agent, local repository
+analysis, or local execution fallback.
 
 ### PR Description
 
@@ -70,9 +85,10 @@ request and permission context, validates the task's committed report and
 receipt, then keeps ideal text or applies the proposed replacement through
 GitHub's authenticated API.
 
-The plugin bundles and verifies `cloud_task.py`, then runs it with policy
-`marketplace-agent-worker@1`. The backend is GitHub Agent Tasks through local
-`gh api`; there is no Cloud Sandbox, custom agent, or local-analysis fallback.
+The plugin locates and verifies the shared `cloud_task.py`, then runs it with
+policy `marketplace-agent-worker@1`. The backend is GitHub Agent Tasks through
+local `gh api`; there is no Cloud Sandbox, custom agent, or local-analysis
+fallback.
 
 ### PR Pipeline
 
@@ -128,9 +144,8 @@ each fixed head through its descendants before their checks run. It does not run
 the review, description, or other PR Pipeline stages. A pull request outside a
 native stack keeps the single-PR behavior.
 
-The plugin bundles and verifies its Agent Tasks runtime. Authentication stays
-in local `gh api`; CI diagnosis, edits, and validation stay in GitHub Agent
-Tasks.
+The plugin verifies the shared Agent Tasks runtime. Authentication stays in
+local `gh api`; CI diagnosis, edits, and validation stay in GitHub Agent Tasks.
 
 Each member gets five charged iterations. A PR Pipeline run keeps its existing
 five charged iterations per outer pass and absolute ten across two passes. Every
@@ -154,10 +169,10 @@ directly applicable precedent as a finding worth raising.
 The merged pull request never changes. The audit branch is the only thing this
 agent pushes, and a first pass that finds nothing pushes no branch at all.
 
-The plugin bundles and verifies `cloud_task.py`, then runs it with policy
-`marketplace-agent-worker@1`. The backend is GitHub Agent Tasks through local
-`gh api`; there is no Cloud Sandbox, custom agent, local repository analysis,
-or local execution fallback.
+The plugin locates and verifies the shared `cloud_task.py`, then runs it with
+policy `marketplace-agent-worker@1`. The backend is GitHub Agent Tasks through
+local `gh api`; there is no Cloud Sandbox, custom agent, local repository
+analysis, or local execution fallback.
 
 ### Optional PR Flight State Sharing
 
@@ -183,6 +198,7 @@ that is where friction shows most clearly.
 
 ```bash
 copilot plugin marketplace update trask-plugins
+copilot plugin update agent-tasks-runtime
 copilot plugin update pr-reviewer
 copilot plugin update copilot-review-loop
 copilot plugin update self-review-loop
