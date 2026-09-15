@@ -35,6 +35,8 @@ Use `--whole-stack` when the caller requests whole-native-stack conflict handlin
 
 When a pipeline supplies `pipeline-run`, `pipeline-iteration`, and `pipeline-max-iterations`, pass all three unchanged. Never invent or refresh the pipeline position.
 
+Without pipeline position, the helper allows three managed attempts per state file by default. Use `--max-iterations <count>` to set a different budget. Attempts recorded by the retained deterministic recovery commands do not consume the managed budget.
+
 ## Managed conflict boundary
 
 The helper performs a trusted local preflight without executing repository code. It freezes the exact open pull request, branch, head, base, merge base, merge settings, strategy, allowed conflict and companion paths, complete old commit identities, iteration, budget, local identity, and dependency guards. A native-stack request also freezes every member in order, its trunk, direct base, unique range, lease, expected parent, and every outside dependent.
@@ -64,7 +66,7 @@ Follow the JSON result exactly:
 - `published`: stop. Report the strategy, old head, new head, mergeability, and every native-stack head when present.
 - `mergeable`: stop with `Outcome: already mergeable.`
 - `recovery_required`: stop with `Outcome: recovery required.` Include the task ID, error, recovery command, and recovery files.
-- `max_iterations_reached`: stop with `Outcome: escalated.` The caller must supply a new budget or invocation.
+- `max_iterations_reached`: stop with `Outcome: escalated.` Report that no Agent Task started, the completed managed iteration count, the refused iteration, the budget, and the exact `retry_command`. That command keeps the existing state and raises the budget enough for the refused iteration. Do not add `--resume`; there is no unfinished managed task to resume.
 - `error`: stop and report the exact error. Never work around a failed guard.
 
 One run dispatches at most one managed conflict task. Do not run the legacy `attempt`, `resolved`, `continue`, `stack-rebase`, `stack-continue`, `stack-format`, `stack-validation-fix`, or `stack-publish` commands. They are retained only for deterministic recovery of states created by older plugin versions.

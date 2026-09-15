@@ -6821,6 +6821,73 @@ def request_digest(request: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(normalized).encode("utf-8")).hexdigest()
 
 
+def managed_attempt_count(state: dict[str, Any] | None) -> int:
+    if state is None:
+        return 0
+    recorded = state.get("managed_attempts")
+    if recorded is not None:
+        if (
+            not isinstance(recorded, int)
+            or isinstance(recorded, bool)
+            or recorded < 0
+        ):
+            raise WorkflowError("managed conflict attempt count is malformed")
+        return recorded
+    if not isinstance(state.get("agent_task"), dict):
+        return 0
+    total = state.get("attempts", 0)
+    history = state.get("history", [])
+    if (
+        not isinstance(total, int)
+        or isinstance(total, bool)
+        or total < 0
+        or not isinstance(history, list)
+        or len(history) > total
+    ):
+        raise WorkflowError("managed conflict attempt history is malformed")
+    return max(1, total - len(history))
+
+
+def managed_retry_command(
+    args: argparse.Namespace,
+    *,
+    repo_root: Path,
+    target: dict[str, Any],
+    state_path: Path,
+    next_budget: int,
+) -> str:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "agent-task",
+        target["pr_url"],
+        "--repo-root",
+        str(repo_root),
+        "--state",
+        str(state_path),
+        "--strategy",
+        args.strategy,
+        "--model",
+        args.model,
+    ]
+    if args.whole_stack:
+        command.append("--whole-stack")
+    if args.pipeline_run is not None:
+        command.extend(
+            [
+                "--pipeline-run",
+                args.pipeline_run,
+                "--pipeline-iteration",
+                str(args.pipeline_iteration),
+                "--pipeline-max-iterations",
+                str(next_budget),
+            ]
+        )
+    else:
+        command.extend(["--max-iterations", str(next_budget)])
+    return " ".join(json.dumps(part) for part in command)
+
+
 def contains_credentials(value: str) -> bool:
     patterns = (
         r"(?i)\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}\b",
@@ -7953,6 +8020,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     "an unfinished managed conflict task owns this state; use --resume"
                 )
         prior_attempts = int(existing.get("attempts", 0)) if existing else 0
+        prior_managed_attempts = managed_attempt_count(existing)
         pipeline_values = (
             args.pipeline_run,
             args.pipeline_iteration,
@@ -7965,7 +8033,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         iteration_number = (
             args.pipeline_iteration
             if args.pipeline_iteration is not None
-            else prior_attempts + 1
+            else prior_managed_attempts + 1
         )
         iteration_budget = (
             args.pipeline_max_iterations
@@ -7977,6 +8045,17 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 {
                     "result": "max_iterations_reached",
                     "state": str(state_path),
+                    "task_id": None,
+                    "completed_managed_iterations": prior_managed_attempts,
+                    "attempted_iteration": iteration_number,
+                    "iteration_budget": iteration_budget,
+                    "retry_command": managed_retry_command(
+                        args,
+                        repo_root=repo_root,
+                        target=target,
+                        state_path=state_path,
+                        next_budget=iteration_number,
+                    ),
                     "stage_outcome": "escalated",
                 }
             )
@@ -8005,6 +8084,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "history": [],
                 "escalation": None,
             }
+            state["managed_attempts"] = prior_managed_attempts
             state["last_result"] = "mergeable"
             state["pr"] = preflight["pr"]
             save_state(state_path, state)
@@ -8039,6 +8119,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "escalation": None,
         }
         state["attempts"] = prior_attempts + 1
+        state["managed_attempts"] = prior_managed_attempts + 1
         state["repo_root"] = str(repo_root)
         state["pr"] = preflight["pr"]
         state["agent_task"] = {

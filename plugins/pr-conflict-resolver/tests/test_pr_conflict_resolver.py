@@ -938,6 +938,123 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         )
         self.assertTrue(parsed.whole_stack)
 
+    def test_legacy_attempts_do_not_consume_the_managed_budget(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "attempts": 4,
+                    "history": [{"id": f"legacy-{number}"} for number in range(4)],
+                    "escalation": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+            ]
+        )
+        target = MODULE.parse_target("owner/repo#7")
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(
+                MODULE,
+                "conflict_preflight",
+                return_value={
+                    "already_mergeable": True,
+                    "pr": {"head_sha": "b" * 40},
+                    "strategy": "merge",
+                },
+            ) as preflight,
+            mock.patch.object(MODULE, "emit"),
+        ):
+            MODULE.command_agent_task(args)
+
+        self.assertEqual(1, preflight.call_args.kwargs["iteration_number"])
+        self.assertEqual(3, preflight.call_args.kwargs["iteration_budget"])
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(4, saved["attempts"])
+        self.assertEqual(0, saved["managed_attempts"])
+
+    def test_managed_counter_migrates_state_that_already_ran_managed_tasks(self):
+        self.assertEqual(
+            2,
+            MODULE.managed_attempt_count(
+                {
+                    "attempts": 6,
+                    "history": [{"id": f"legacy-{number}"} for number in range(4)],
+                    "agent_task": {"status": "completed"},
+                }
+            ),
+        )
+
+    def test_budget_exhaustion_reports_an_exact_state_preserving_retry(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        state = {
+            "version": 1,
+            "attempts": 7,
+            "managed_attempts": 3,
+            "history": [{"id": f"legacy-{number}"} for number in range(4)],
+            "agent_task": {"status": "completed"},
+            "escalation": None,
+        }
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+                "--strategy",
+                "rebase",
+                "--model",
+                "terra",
+            ]
+        )
+        target = MODULE.parse_target("owner/repo#7")
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(MODULE, "conflict_preflight") as preflight,
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(args)
+
+        payload = emitted(emit)
+        self.assertEqual("max_iterations_reached", payload["result"])
+        self.assertIsNone(payload["task_id"])
+        self.assertEqual(3, payload["completed_managed_iterations"])
+        self.assertEqual(4, payload["attempted_iteration"])
+        self.assertEqual(3, payload["iteration_budget"])
+        self.assertIn('"--state" ' + json.dumps(str(state_path)), payload["retry_command"])
+        self.assertIn('"--max-iterations" "4"', payload["retry_command"])
+        self.assertNotIn("--resume", payload["retry_command"])
+        self.assertEqual(state, json.loads(state_path.read_text(encoding="utf-8")))
+        preflight.assert_not_called()
+
+    def test_agent_contract_documents_the_default_and_budget_retry(self):
+        self.assertIn("three managed attempts per state file by default", self.instructions)
+        self.assertIn("`--max-iterations <count>`", self.instructions)
+        self.assertIn("Attempts recorded by the retained deterministic", self.instructions)
+        self.assertIn("the exact `retry_command`", self.instructions)
+        self.assertIn("there is no unfinished managed task to resume", self.instructions)
+
     def test_rejects_malformed_or_failed_validation(self):
         bad_values = [
             [],
