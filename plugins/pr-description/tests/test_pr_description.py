@@ -137,7 +137,7 @@ def agent_task_result(preflight=None, **overrides):
         "requested_model": "gpt-5.6-sol",
         "policy": {
             "id": "marketplace-agent-worker",
-            "version": 2,
+            "version": 3,
             "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
         },
         "task": {
@@ -725,7 +725,7 @@ class LegacyAgentInstructions:
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.39")
+        self.assertEqual(plugin["version"], "1.0.40")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -880,7 +880,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.39")
+        self.assertEqual(plugin["version"], "1.0.40")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):

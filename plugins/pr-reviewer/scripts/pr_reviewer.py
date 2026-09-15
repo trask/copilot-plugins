@@ -48,7 +48,7 @@ CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
 AGENT_TASK_POLICY = "marketplace-agent-worker@3"
 AGENT_TASK_POLICY_IDENTITY = {
     "id": "marketplace-agent-worker",
-    "version": 2,
+    "version": 3,
     "sha256": "d39e81ee05237481ad5360d217dd6cfbe88de6b89c9d8b7b5f8cbb8bbf7a3703",
 }
 AGENT_TASK_RESULT_SCHEMA = {

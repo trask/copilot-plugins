@@ -1230,7 +1230,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "requested_model": "gpt-5.6-sol",
             "policy": {
                 "id": "marketplace-agent-worker",
-                "version": 2,
+                "version": 3,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -1325,7 +1325,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.6")
+        self.assertEqual(plugin["version"], "1.3.7")
         self.assertNotIn("custom_agent", plugin)
 
     def test_prompt_is_versioned_self_contained_and_fail_closed(self):

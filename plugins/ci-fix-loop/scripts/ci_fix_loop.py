@@ -4544,7 +4544,7 @@ def build_worker_prompt(
         "requested_model": requested_model,
         "policy": {
             "id": "marketplace-agent-worker",
-            "version": 2,
+            "version": 3,
             "sha256": AGENT_TASK_POLICY_SHA256,
         },
         "iteration_allowance": iteration_allowance,
@@ -4708,7 +4708,7 @@ def validate_recovery_result_identity(
     pr = preflight["pr"]
     expected_policy = {
         "id": "marketplace-agent-worker",
-        "version": 2,
+        "version": 3,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     task = result.get("task")
@@ -4752,7 +4752,7 @@ def validate_success_result(
 ) -> dict[str, Any]:
     expected_policy = {
         "id": "marketplace-agent-worker",
-        "version": 2,
+        "version": 3,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     if (

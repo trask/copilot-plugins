@@ -57,7 +57,7 @@ def result(commits=None):
         "requested_model": "gpt-5.6-sol",
         "policy": {
             "id": "marketplace-agent-worker",
-            "version": 2,
+            "version": 3,
             "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
         },
         "task": {
