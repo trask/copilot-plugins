@@ -22,6 +22,9 @@ COMPACT_V3_REPORT = (
 FORWARD_CLEAN_V3_REPORT = (
     Path(__file__).parent / "fixtures" / "forward-clean-v3-report.md"
 )
+CCA_DISABLED_V4_RESULT = (
+    Path(__file__).parent / "fixtures" / "cca-disabled-v4-agent-task-result.json"
+)
 SPEC = importlib.util.spec_from_file_location("self_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -1303,6 +1306,191 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
         self.assertEqual("api_failure", error["code"])
 
+    def test_exact_v4_taskless_failure_is_trusted_only_for_migration(self):
+        result = MODULE.load_agent_task_result(CCA_DISABLED_V4_RESULT)
+        preflight = json.loads(json.dumps(self.preflight))
+        preflight["identity"].update(
+            {
+                "branch": "trask-fix-dashboard-publisher-contention",
+                "head": "14cf2a9a1ee281423501ec0a1b69e9236c5a3816",
+            }
+        )
+        preflight["pr"].update(
+            {
+                "number": 347,
+                "pr_url": "https://github.com/open-telemetry/shared-workflows/pull/347",
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_repository": "open-telemetry/shared-workflows",
+                "head_branch": "trask-fix-dashboard-publisher-contention",
+                "head_sha": "14cf2a9a1ee281423501ec0a1b69e9236c5a3816",
+                "base_branch": "main",
+                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+            }
+        )
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "mismatched identity"):
+            MODULE.validate_task_creation_failure_result(
+                result,
+                preflight=preflight,
+                requested_model="gpt-5.6-sol",
+            )
+        error = MODULE.validate_task_creation_failure_result(
+            result,
+            preflight=preflight,
+            requested_model="gpt-5.6-sol",
+            allow_legacy_policy=True,
+        )
+        self.assertEqual("api_failure", error["code"])
+
+        for field, value in (
+            ("schema", MODULE.AGENT_TASK_RESULT_SCHEMA),
+            ("policy", {**MODULE.LEGACY_AGENT_TASK_POLICY_V4, "version": 5}),
+            (
+                "worker_receipt",
+                {
+                    **result["worker_receipt"],
+                    "commit": "0" * 40,
+                },
+            ),
+        ):
+            malformed = json.loads(json.dumps(result))
+            malformed[field] = value
+            with self.assertRaisesRegex(MODULE.WorkflowError, "mismatched identity"):
+                MODULE.validate_task_creation_failure_result(
+                    malformed,
+                    preflight=preflight,
+                    requested_model="gpt-5.6-sol",
+                    allow_legacy_policy=True,
+                )
+
+    def test_legacy_taskless_state_migrates_once_before_fresh_dispatch(self):
+        state_path = self.directory / "legacy-cca-state.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        prompt_path = self.directory / "legacy-prompt.txt"
+        prompt_path.write_text("retained prompt", encoding="utf-8")
+        result_path = self.directory / "legacy-result.json"
+        result_path.write_bytes(CCA_DISABLED_V4_RESULT.read_bytes())
+        preflight = json.loads(json.dumps(self.preflight))
+        preflight["identity"].update(
+            {
+                "branch": "trask-fix-dashboard-publisher-contention",
+                "head": "14cf2a9a1ee281423501ec0a1b69e9236c5a3816",
+            }
+        )
+        preflight["pr"].update(
+            {
+                "number": 347,
+                "pr_url": "https://github.com/open-telemetry/shared-workflows/pull/347",
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_repository": "open-telemetry/shared-workflows",
+                "head_branch": "trask-fix-dashboard-publisher-contention",
+                "head_sha": "14cf2a9a1ee281423501ec0a1b69e9236c5a3816",
+                "base_branch": "main",
+                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+            }
+        )
+        old_review_id = (
+            "pr-347-agent-task-84cf5be6f27a2a55bdaedca8e5221b16"
+        )
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "created_at": MODULE.utc_now(),
+                "iterations": 0,
+                "next_candidate_id": 1,
+                "history": [],
+                "pr": preflight["pr"],
+                "review": {
+                    "id": old_review_id,
+                    "status": "active",
+                    "iteration": 1,
+                    "head_sha": preflight["identity"]["head"],
+                    "candidates": [],
+                    "batches": [],
+                },
+                "agent_task": {
+                    "run_id": "84cf5be6f27a2a55bdaedca8e5221b16",
+                    "status": "failed",
+                    "model": "gpt-5.6-sol",
+                    "allowed_iterations": 5,
+                    "preflight": preflight,
+                    "prompt_file": str(prompt_path),
+                    "result_file": str(result_path),
+                    "error": "Agent Task result has an unsupported schema or fields",
+                    "recovery_command": "must-not-survive",
+                },
+            },
+        )
+        args = SimpleNamespace(
+            target="open-telemetry/shared-workflows#347",
+            repo_root=str(self.repo_root),
+            state=str(state_path),
+            resume=False,
+            preserve_artifacts=True,
+            model="sol",
+            max_iterations=5,
+            pipeline_run=None,
+            pipeline_iteration=None,
+            pipeline_max_iterations=None,
+        )
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target(args.target),
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=preflight
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE.secrets, "token_hex", return_value="new-owner"),
+            mock.patch.object(
+                MODULE, "run", side_effect=RuntimeError("stop after dispatch")
+            ) as run,
+            self.assertRaisesRegex(RuntimeError, "stop after dispatch"),
+        ):
+            MODULE.command_agent_task(args)
+
+        migrated = MODULE.load_state(state_path)
+        self.assertEqual(1, run.call_count)
+        self.assertEqual(1, len(migrated["managed_task_history"]))
+        old_task = migrated["managed_task_history"][0]
+        self.assertEqual(
+            "84cf5be6f27a2a55bdaedca8e5221b16", old_task["run_id"]
+        )
+        self.assertEqual("not_created", old_task["task_id_status"])
+        self.assertNotIn("recovery_command", old_task)
+        self.assertIn("--preserve-artifacts", old_task["retry_command"])
+        self.assertTrue(prompt_path.is_file())
+        self.assertTrue(result_path.is_file())
+        self.assertEqual(1, len(migrated["managed_review_history"]))
+        old_review = migrated["managed_review_history"][0]
+        self.assertEqual(old_review_id, old_review["id"])
+        self.assertEqual("failed", old_review["status"])
+        self.assertEqual("agent_task_not_created", old_review["failure_reason"])
+        self.assertEqual("new-owner", migrated["agent_task"]["run_id"])
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target(args.target),
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=preflight
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "unfinished Agent Task"),
+        ):
+            MODULE.command_agent_task(args)
+        self.assertEqual(1, len(MODULE.load_state(state_path)["managed_task_history"]))
+
     def remote(self, *, commits=None):
         return MODULE.validate_success_result(
             self.result(commits=commits),
@@ -1357,7 +1545,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.19")
+        self.assertEqual(plugin["version"], "1.3.20")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):

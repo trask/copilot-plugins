@@ -84,6 +84,11 @@ AGENT_TASK_POLICY = "marketplace-agent-apply-report-worker@3"
 AGENT_TASK_POLICY_SHA256 = (
     "7d48868140710139939cabc803a99f2122305e97dedbffa747e5f69903c16af1"
 )
+LEGACY_AGENT_TASK_POLICY_V4 = {
+    "id": "marketplace-agent-worker",
+    "version": 4,
+    "sha256": "04c1f4c1098ef0419f2bd94b8be120e303218588f2804ed79c0d706c8c2915ad",
+}
 LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2 = {
     "id": "marketplace-agent-apply-report-worker",
     "version": 2,
@@ -2844,6 +2849,7 @@ def validate_task_creation_failure_result(
     *,
     preflight: dict[str, Any],
     requested_model: str,
+    allow_legacy_policy: bool = False,
 ) -> dict[str, str]:
     expected_policy = {
         "id": "marketplace-agent-apply-report-worker",
@@ -2860,7 +2866,16 @@ def validate_task_creation_failure_result(
         result.get("status") != "error"
         or result.get("mode") != "apply_with_report"
         or result.get("requested_model") != requested_model
-        or policy not in (expected_policy, LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2)
+        or policy
+        not in (
+            (
+                expected_policy,
+                LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2,
+                LEGACY_AGENT_TASK_POLICY_V4,
+            )
+            if allow_legacy_policy
+            else (expected_policy, LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2)
+        )
         or result.get("repository")
         != {"name_with_owner": preflight["pr"]["repo_name"]}
         or result.get("pull_request") != expected_cloud_pull_request(preflight)
@@ -2874,11 +2889,37 @@ def validate_task_creation_failure_result(
             "final_local_head": preflight["identity"]["head"],
         }
         or result.get("report") is not None
-        or attestation
-        != {
-            "kind": "dispatcher_structural",
-            "structural_complete": False,
-        }
+        or (
+            policy != LEGACY_AGENT_TASK_POLICY_V4
+            and (
+                result.get("schema") != AGENT_TASK_RESULT_SCHEMA
+                or result.get("worker_receipt") is not None
+                or result.get("validation") is not None
+                or attestation
+                != {
+                    "kind": "dispatcher_structural",
+                    "structural_complete": False,
+                }
+            )
+        )
+        or (
+            policy == LEGACY_AGENT_TASK_POLICY_V4
+            and (
+                result.get("schema") != LEGACY_AGENT_TASK_RESULT_SCHEMA
+                or attestation is not None
+                or not isinstance(result.get("worker_receipt"), dict)
+                or set(result["worker_receipt"]) != {"path", "commit", "sha256"}
+                or not isinstance(result["worker_receipt"].get("path"), str)
+                or RECEIPT_PATH_PATTERN.fullmatch(
+                    result["worker_receipt"]["path"]
+                )
+                is None
+                or result["worker_receipt"].get("commit") is not None
+                or result["worker_receipt"].get("sha256") is not None
+                or result.get("validation")
+                != {"complete": False, "outcomes": []}
+            )
+        )
         or not isinstance(error, dict)
         or set(error) != {"code", "message"}
         or not isinstance(error.get("code"), str)
@@ -3730,6 +3771,8 @@ def agent_task_retry_command(
                 str(args.pipeline_max_iterations),
             ]
         )
+    if getattr(args, "preserve_artifacts", False):
+        values.append("--preserve-artifacts")
     return " ".join(json.dumps(value) for value in values)
 
 
@@ -3878,6 +3921,47 @@ def command_agent_task(args: argparse.Namespace) -> None:
         task_state["status"] = "resuming"
         save_state(state_path, state)
     else:
+        active_task = (
+            existing.get("agent_task") if isinstance(existing, dict) else None
+        )
+        if (
+            isinstance(active_task, dict)
+            and active_task.get("status") == "failed"
+            and active_task.get("task_id_status") is None
+            and isinstance(active_task.get("result_file"), str)
+            and Path(active_task["result_file"]).is_file()
+            and isinstance(active_task.get("preflight"), dict)
+        ):
+            prior_result = load_agent_task_result(Path(active_task["result_file"]))
+            prior_task = prior_result.get("task")
+            if not isinstance(prior_task, dict) or prior_task.get("id") is None:
+                failure = validate_task_creation_failure_result(
+                    prior_result,
+                    preflight=active_task["preflight"],
+                    requested_model=requested_model,
+                    allow_legacy_policy=True,
+                )
+                active_task.update(
+                    {
+                        "task": prior_result["task"],
+                        "generated": prior_result["generated"],
+                        "report": prior_result["report"],
+                        "attestation": prior_result.get("attestation"),
+                        "worker_receipt": prior_result.get("worker_receipt"),
+                        "status": "failed",
+                        "task_id": None,
+                        "task_id_status": "not_created",
+                        "error": failure,
+                        "retry_command": agent_task_retry_command(
+                            args,
+                            target=target["pr_url"],
+                            repo_root=repo_root,
+                            state_path=state_path,
+                        ),
+                    }
+                )
+                active_task.pop("recovery_command", None)
+                save_state(state_path, existing)
         preflight = agent_task_preflight(repo_root, target)
         pr = preflight["pr"]
         previous_clean_at_head_sha = None
@@ -3914,6 +3998,23 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 previous_clean_at_head_sha = previous_review.get(
                     "clean_at_head_sha"
                 )
+                if (
+                    isinstance(active_task, dict)
+                    and active_task.get("status") == "failed"
+                    and active_task.get("task_id_status") == "not_created"
+                    and previous_review.get("status") == "active"
+                ):
+                    archived_review = dict(previous_review)
+                    archived_review.update(
+                        {
+                            "status": "failed",
+                            "failure_reason": "agent_task_not_created",
+                            "failed_at": utc_now(),
+                        }
+                    )
+                    state.setdefault("managed_review_history", []).append(
+                        archived_review
+                    )
         max_iterations = args.max_iterations
         if max_iterations < 1:
             raise WorkflowError("--max-iterations must be positive")
