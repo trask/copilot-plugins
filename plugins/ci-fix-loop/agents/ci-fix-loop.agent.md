@@ -53,7 +53,7 @@ The worker owns all repository analysis and execution. It diagnoses the exact ob
 
 The coordinator accepts only the pinned result and policy identities. It treats worker validation commands as inert data, verifies the report and strict remote-validation artifact against dispatcher-owned digests, and independently validates task, repository, pull request, head, base, model, request, ordered history, paths, complete passed validation, credential absence, local identity, live pull request identity, and the unchanged failing-check snapshot. It imports and pushes only fix commits with an exact lease on the frozen head.
 
-If `agent-task` fails, keep its `recovery_command` and `recovery_files`. Run that exact recovery command. It revalidates the retained task identity and result and never launches an unrelated task. The pinned helper does not support `--input-result-file` for open-pull-request apply-with-report tasks, so a failed remote task remains a visible blocker while successful results remain resumable through import and publication. Do not delete recovery artifacts by hand. The coordinator removes them only after it consumes and publishes or records the verified result.
+If `agent-task` fails after creating a task, keep its `recovery_command` and `recovery_files`. Run that exact recovery command. A trusted task-creation failure records `task_id_status=not_created` and a `retry_command` without `--resume`; run it only after fixing the reported prerequisite. The coordinator retains the failed owner before replacement. Active or unknown ownership remains blocked. Do not delete recovery artifacts by hand. The coordinator removes them only after it consumes and publishes or records the verified result.
 
 ## Loop transitions
 

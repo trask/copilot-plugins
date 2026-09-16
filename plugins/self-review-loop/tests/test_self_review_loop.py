@@ -1269,6 +1269,45 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "error": None,
         }
 
+    def test_taskless_api_failure_keeps_its_trusted_error(self):
+        failure = self.result()
+        failure.update(
+            {
+                "status": "error",
+                "task": {
+                    "id": None,
+                    "url": None,
+                    "state": None,
+                    "base_ref": None,
+                    "base_sha": None,
+                },
+                "generated": {"branch": None, "head_sha": None, "commits": []},
+                "application": {
+                    "status": "not_applied",
+                    "final_local_head": self.head,
+                },
+                "report": None,
+                "worker_receipt": {
+                    "path": ".github/agent-task-validations/request-1.json",
+                    "commit": None,
+                    "sha256": None,
+                },
+                "validation": {"complete": False, "outcomes": []},
+                "error": {
+                    "code": "api_failure",
+                    "message": "user or repo does not have CCA enabled",
+                },
+            }
+        )
+
+        error = MODULE.validate_task_creation_failure_result(
+            failure,
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+        )
+
+        self.assertEqual("api_failure", error["code"])
+
     def remote(self, *, commits=None):
         return MODULE.validate_success_result(
             self.result(commits=commits),
@@ -1324,7 +1363,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.11")
+        self.assertEqual(plugin["version"], "1.3.12")
         self.assertNotIn("custom_agent", plugin)
 
     def test_prompt_is_versioned_self_contained_and_fail_closed(self):

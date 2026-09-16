@@ -469,7 +469,19 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     def test_recovery_result_rejects_wrong_identity_and_credentials(self):
         no_task = interrupted_result()
-        no_task["task"]["id"] = None
+        no_task["status"] = "error"
+        no_task["task"] = {
+            "id": None,
+            "url": None,
+            "state": None,
+            "base_ref": None,
+            "base_sha": None,
+        }
+        no_task["worker_receipt"]["sha256"] = None
+        no_task["error"] = {
+            "code": "api_failure",
+            "message": "user or repo does not have CCA enabled",
+        }
         self.assertFalse(
             MODULE.validate_recovery_result_identity(
                 no_task,

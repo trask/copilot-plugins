@@ -36,7 +36,7 @@ You are a thin local coordinator. The bundled helper captures immutable identity
 - The task audits the first pull request diff and each later cumulative diff from the same original base. It carries finding decisions forward and stops after a clean pass or five iterations.
 - A clean first pass creates no fix commit and leaves no remote audit branch. A successful fix run imports only `generated.commits`, never the final report-and-validation artifact commit, then pushes and verifies `trask-pr-audit-<number>`.
 - State, prompt, and result paths stay outside the repository. On failure, report the returned state, recovery files, task URL, generated branch, and recovery command. Do not improvise or delete them.
-- Recovery passes the prior deterministic result through `--input-result-file` and writes a distinct next result. The managed helper resumes the same task, rejects replacement task or artifact identities, and accepts only the pinned source head or the already imported final code commit.
+- Recovery passes a reusable task's prior deterministic result through `--input-result-file` and writes a distinct next result. A trusted task-creation failure has no reusable task, so recovery starts one fresh task after the reported prerequisite is fixed. The helper rejects replacement identities whenever a prior task ID exists and accepts only the pinned source head or the already imported final code commit.
 - The helper removes short-lived prompt and result files only after verified import and publication succeed. It keeps durable state for status and recovery.
 
 The terminal response is the run's last message. Finish every tool call first, send one concise result, and do not follow it with another recap.

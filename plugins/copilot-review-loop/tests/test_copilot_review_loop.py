@@ -16,6 +16,9 @@ from unittest import mock
 SCRIPT = Path(__file__).parents[1] / "scripts" / "copilot_review_loop.py"
 AGENT = Path(__file__).parents[1] / "agents" / "copilot-review-loop.agent.md"
 PLUGIN = Path(__file__).parents[1] / "plugin.json"
+CCA_DISABLED_RESULT = (
+    Path(__file__).parent / "fixtures" / "cca-disabled-agent-task-result.json"
+)
 SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -1032,6 +1035,44 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "error": None,
         }
 
+    def task_creation_failure(self):
+        result = self.result()
+        result.update(
+            {
+                "status": "error",
+                "task": {
+                    "id": None,
+                    "url": None,
+                    "state": None,
+                    "base_ref": None,
+                    "base_sha": None,
+                },
+                "generated": {"branch": None, "head_sha": None, "commits": []},
+                "application": {
+                    "status": "not_applied",
+                    "final_local_head": self.head,
+                },
+                "report": None,
+                "worker_receipt": {
+                    "path": (
+                        ".github/agent-task-validations/"
+                        "430aab69-7593-4fd8-8e99-b0385a5f6a1d.json"
+                    ),
+                    "commit": None,
+                    "sha256": None,
+                },
+                "validation": {"complete": False, "outcomes": []},
+                "error": {
+                    "code": "api_failure",
+                    "message": (
+                        "start Agent Task failed with HTTP 409: user or repo does "
+                        "not have CCA enabled; the request cannot be completed"
+                    ),
+                },
+            }
+        )
+        return result
+
     def remote(self, commits=None):
         return MODULE.validate_success_result(
             self.result(commits),
@@ -1080,10 +1121,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("agent-task <target>", instructions)
         self.assertIn("marketplace-agent-worker@4", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
-        self.assertIn("does not support `--input-result-file`", instructions)
+        self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.12")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.13")
 
     def test_prompt_is_self_contained_versioned_and_treats_inputs_as_untrusted(self):
         prompt = MODULE.build_worker_prompt(
@@ -1669,6 +1710,122 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             MODULE.command_agent_task(self.arguments(state_path, resume=True))
 
         resumed_run.assert_not_called()
+
+    def test_exact_cca_disabled_result_is_a_trusted_task_creation_failure(self):
+        result = MODULE.load_agent_task_result(CCA_DISABLED_RESULT)
+        preflight = {
+            "identity": {
+                "branch": "trask-actions-queue-events",
+                "head": "ba1cdf0d96365a55af87e62c2f476245af685bbb",
+                "status": "",
+            },
+            "pr": {
+                "number": 377,
+                "pr_url": "https://github.com/open-telemetry/shared-workflows/pull/377",
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_repository": "open-telemetry/shared-workflows",
+                "head_branch": "trask-actions-queue-events",
+                "head_sha": "ba1cdf0d96365a55af87e62c2f476245af685bbb",
+                "base_branch": "main",
+                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+            },
+        }
+
+        failure = MODULE.validate_task_creation_failure_result(
+            result,
+            preflight=preflight,
+            requested_model="gpt-5.6-sol",
+        )
+
+        self.assertEqual("api_failure", failure["code"])
+        self.assertIn("CCA enabled", failure["message"])
+        result["application"]["final_local_head"] = "0" * 40
+        with self.assertRaisesRegex(MODULE.WorkflowError, "mismatched identity"):
+            MODULE.validate_task_creation_failure_result(
+                result,
+                preflight=preflight,
+                requested_model="gpt-5.6-sol",
+            )
+
+    def test_task_creation_failure_records_fresh_retry_and_replaces_legacy_state(self):
+        state_path = self.directory / "cca-disabled-state.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        failure = self.task_creation_failure()
+
+        def fail_run(command, **_kwargs):
+            output = Path(command[command.index("--result-file") + 1])
+            output.write_text(json.dumps(failure), encoding="utf-8")
+            return MODULE.subprocess.CompletedProcess(command, 2, "", "HTTP 409")
+
+        common = (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=self.preflight
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(
+                MODULE, "require_live_comments", return_value=[self.comment]
+            ),
+        )
+        with ExitStack() as stack:
+            for patcher in common:
+                stack.enter_context(patcher)
+            stack.enter_context(mock.patch.object(MODULE, "run", side_effect=fail_run))
+            stack.enter_context(
+                mock.patch.object(MODULE.secrets, "token_hex", return_value="run-1")
+            )
+            stack.enter_context(
+                self.assertRaisesRegex(MODULE.WorkflowError, "api_failure")
+            )
+            MODULE.command_agent_task(self.arguments(state_path))
+
+        failed = MODULE.load_state(state_path)
+        task = failed["agent_task"]
+        self.assertEqual("failed", task["status"])
+        self.assertEqual("not_created", task["task_id_status"])
+        self.assertEqual("api_failure", task["error"]["code"])
+        self.assertNotIn("recovery_command", task)
+        self.assertNotIn("--resume", task["retry_command"])
+
+        task.pop("task_id_status")
+        task.pop("retry_command")
+        task["error"] = "Agent Task result has an unsupported schema or fields"
+        task["recovery_command"] = MODULE.agent_task_recovery_command(
+            target=self.preflight["pr"]["pr_url"],
+            repo_root=self.repo_root,
+            state_path=state_path,
+            model="sol",
+        )
+        MODULE.save_state(state_path, failed)
+
+        with ExitStack() as stack:
+            for patcher in common:
+                stack.enter_context(patcher)
+            run = stack.enter_context(
+                mock.patch.object(MODULE, "run", side_effect=fail_run)
+            )
+            stack.enter_context(
+                mock.patch.object(MODULE.secrets, "token_hex", return_value="run-2")
+            )
+            stack.enter_context(
+                self.assertRaisesRegex(MODULE.WorkflowError, "api_failure")
+            )
+            MODULE.command_agent_task(self.arguments(state_path))
+
+        self.assertEqual(1, run.call_count)
+        retried = MODULE.load_state(state_path)
+        self.assertEqual(
+            "run-1", retried["managed_task_history"][0]["run_id"]
+        )
+        self.assertEqual("not_created", retried["agent_task"]["task_id_status"])
+        self.assertEqual("run-2", retried["agent_task"]["run_id"])
 
     def test_fresh_review_comments_start_the_next_managed_iteration(self):
         state_path = self.directory / "watch-state.json"

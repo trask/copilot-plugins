@@ -1024,6 +1024,47 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "error": None,
         }
 
+    def taskless_failure(self):
+        failure = self.result()
+        failure.update(
+            {
+                "status": "error",
+                "task": {
+                    "id": None,
+                    "url": None,
+                    "state": None,
+                    "base_ref": None,
+                    "base_sha": None,
+                },
+                "generated": {"branch": None, "head_sha": None, "commits": []},
+                "application": {
+                    "status": "not_applied",
+                    "final_local_head": self.head,
+                },
+                "report": None,
+                "worker_receipt": {
+                    "path": ".github/agent-task-validations/request-1.json",
+                    "commit": None,
+                    "sha256": None,
+                },
+                "validation": {"complete": False, "outcomes": []},
+                "error": {
+                    "code": "api_failure",
+                    "message": "user or repo does not have CCA enabled",
+                },
+            }
+        )
+        return failure
+
+    def test_taskless_api_failure_keeps_its_trusted_error(self):
+        error = MODULE.validate_task_creation_failure_result(
+            self.taskless_failure(),
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+        )
+
+        self.assertEqual("api_failure", error["code"])
+
     def remote(self, commits=None):
         return MODULE.validate_success_result(
             self.result(commits),
@@ -1110,7 +1151,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.12", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.13", json.loads(PLUGIN.read_text())["version"])
 
     def test_prompt_pins_snapshot_allowance_model_policy_and_worker_boundary(self):
         prompt = MODULE.build_worker_prompt(
@@ -1405,6 +1446,66 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertFalse(state["agent_task"].get("artifacts_removed", False))
         self.assertTrue(Path(state["agent_task"]["result_file"]).is_file())
         emit.assert_not_called()
+
+    def test_taskless_failure_allows_one_fresh_replacement_without_recharging(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        state_path = self.root / "state.json"
+        preflight = copy.deepcopy(self.preflight)
+        preflight["repository_root"] = str(repo)
+        failed = self.taskless_failure()
+        helper_commands = []
+
+        def run_helper(command, **kwargs):
+            helper_commands.append(command)
+            result_file = Path(command[command.index("--result-file") + 1])
+            result_file.write_text(json.dumps(failed), encoding="utf-8")
+            return MODULE.subprocess.CompletedProcess(command, 1, "", "")
+
+        arguments = [
+            "agent-task",
+            self.preflight["pr"]["pr_url"],
+            "--repo-root",
+            str(repo),
+            "--state",
+            str(state_path),
+            "--max-iterations",
+            "1",
+        ]
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value={"repo_name": "owner/repo", "number": 7},
+            ),
+            mock.patch.object(MODULE, "agent_task_preflight", return_value=preflight),
+            mock.patch.object(
+                MODULE,
+                "discover_cloud_task",
+                return_value=self.root / "cloud_task.py",
+            ),
+            mock.patch.object(MODULE, "run", side_effect=run_helper),
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value=preflight["identity"],
+            ),
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
+        ):
+            for _ in range(2):
+                with self.assertRaisesRegex(MODULE.WorkflowError, "CCA enabled"):
+                    MODULE.command_agent_task(
+                        MODULE.build_parser().parse_args(arguments)
+                    )
+
+        self.assertEqual(2, len(helper_commands))
+        self.assertNotIn("--resume", helper_commands[1])
+        state = MODULE.load_state(state_path)
+        self.assertEqual(1, state["iterations"])
+        self.assertEqual("not_created", state["agent_task"]["task_id_status"])
+        self.assertEqual(1, len(state["managed_task_history"]))
 
     def test_managed_fix_publishes_only_the_verified_fix_commit(self):
         repo = self.root / "repo"

@@ -3231,6 +3231,8 @@ def validate_recovery_result_identity(
     task = result.get("task")
     generated = result.get("generated")
     receipt = result.get("worker_receipt")
+    validation = result.get("validation")
+    error = result.get("error")
     if (
         not isinstance(task, dict)
         or set(task) != {"id", "url", "state", "base_ref", "base_sha"}
@@ -3240,12 +3242,31 @@ def validate_recovery_result_identity(
         or set(receipt) != {"path", "commit", "sha256"}
         or not isinstance(receipt.get("path"), str)
         or RECEIPT_PATH_PATTERN.fullmatch(receipt["path"]) is None
-        or not isinstance(receipt.get("sha256"), str)
-        or not re.fullmatch(r"[0-9a-f]{64}", receipt["sha256"])
     ):
         raise WorkflowError("Agent Task recovery result is malformed")
     task_id = task.get("id")
     if task_id is None:
+        if (
+            result.get("status") != "error"
+            or any(task.get(field) is not None for field in task)
+            or generated != {"branch": None, "head_sha": None, "commits": []}
+            or result.get("application")
+            != {
+                "status": "not_applied",
+                "final_local_head": metadata["head_sha"],
+            }
+            or result.get("report") is not None
+            or receipt.get("commit") is not None
+            or receipt.get("sha256") is not None
+            or validation != {"complete": False, "outcomes": []}
+            or not isinstance(error, dict)
+            or set(error) != {"code", "message"}
+            or not isinstance(error.get("code"), str)
+            or not error["code"]
+            or not isinstance(error.get("message"), str)
+            or not error["message"]
+        ):
+            raise WorkflowError("Agent Task creation failure is malformed")
         return False
     if (
         not isinstance(task_id, str)
@@ -3256,6 +3277,8 @@ def validate_recovery_result_identity(
             task.get("url") is not None
             and (not isinstance(task["url"], str) or not task["url"])
         )
+        or not isinstance(receipt.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", receipt["sha256"])
     ):
         raise WorkflowError("Agent Task recovery task identity is malformed")
     return True
@@ -3596,18 +3619,20 @@ def command_agent_task(args: argparse.Namespace) -> None:
             if not prior_result_path.is_file():
                 raise WorkflowError("prior Agent Task result file is missing")
             prior_result = load_agent_task_result(prior_result_path)
-            if not validate_recovery_result_identity(
+            reusable = validate_recovery_result_identity(
                 prior_result,
                 metadata=metadata,
                 requested_model=requested_model,
-            ):
-                raise WorkflowError(
-                    "prior Agent Task result has no reusable task; refusing a replacement"
-                )
-            generated = prior_result["generated"]
-            allowed_heads = {metadata["head_sha"]}
-            if generated.get("commits"):
-                allowed_heads.add(generated["commits"][-1])
+            )
+            if reusable:
+                generated = prior_result["generated"]
+                allowed_heads = {metadata["head_sha"]}
+                if generated.get("commits"):
+                    allowed_heads.add(generated["commits"][-1])
+            else:
+                prior_result_path = None
+                prior_result = None
+                allowed_heads = {metadata["head_sha"]}
         else:
             allowed_heads = {metadata["head_sha"]}
     identity = local_identity(repo_root)
@@ -3707,6 +3732,9 @@ def command_agent_task(args: argparse.Namespace) -> None:
     state = load_state(state_path)
     preserve_agent_task_result(state, result, result_path=result_path)
     state["agent_task"]["reusable_task"] = reusable
+    state["agent_task"]["task_id_status"] = (
+        "known" if reusable else "not_created"
+    )
     save_state(state_path, state)
     if process.returncode != 0 or result.get("status") != "success":
         state["agent_task"]["status"] = "failed"

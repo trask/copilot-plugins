@@ -59,7 +59,7 @@ AGENT_TASK_POLICY_SHA256 = (
 )
 AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
-    "version": 2,
+    "version": 1,
 }
 CI_FIX_REPORT_SCHEMA = {
     "id": "github.copilot.ci-fix-loop-report",
@@ -4707,6 +4707,61 @@ def task_failure_from_result(result: dict[str, Any]) -> WorkflowError:
     return WorkflowError(f"Agent Task failed [{code}]: {message}")
 
 
+def validate_task_creation_failure_result(
+    result: dict[str, Any],
+    *,
+    preflight: dict[str, Any],
+    requested_model: str,
+) -> dict[str, str]:
+    expected_policy = {
+        "id": "marketplace-agent-worker",
+        "version": 4,
+        "sha256": AGENT_TASK_POLICY_SHA256,
+    }
+    task = result.get("task")
+    generated = result.get("generated")
+    application = result.get("application")
+    receipt = result.get("worker_receipt")
+    validation = result.get("validation")
+    error = result.get("error")
+    if (
+        result.get("status") != "error"
+        or result.get("mode") != "apply_with_report"
+        or result.get("requested_model") != requested_model
+        or result.get("policy") != expected_policy
+        or result.get("repository")
+        != {"name_with_owner": preflight["pr"]["repo_name"]}
+        or result.get("pull_request") != expected_cloud_pull_request(preflight)
+        or not isinstance(task, dict)
+        or set(task) != {"id", "url", "state", "base_ref", "base_sha"}
+        or any(task.get(field) is not None for field in task)
+        or generated != {"branch": None, "head_sha": None, "commits": []}
+        or application
+        != {
+            "status": "not_applied",
+            "final_local_head": preflight["identity"]["head"],
+        }
+        or result.get("report") is not None
+        or not isinstance(receipt, dict)
+        or set(receipt) != {"path", "commit", "sha256"}
+        or not isinstance(receipt.get("path"), str)
+        or RECEIPT_PATH_PATTERN.fullmatch(receipt["path"]) is None
+        or receipt.get("commit") is not None
+        or receipt.get("sha256") is not None
+        or validation != {"complete": False, "outcomes": []}
+        or not isinstance(error, dict)
+        or set(error) != {"code", "message"}
+        or not isinstance(error.get("code"), str)
+        or not error["code"]
+        or not isinstance(error.get("message"), str)
+        or not error["message"]
+    ):
+        raise WorkflowError(
+            "Agent Task creation failure has malformed or mismatched identity"
+        )
+    return error
+
+
 def validate_recovery_result_identity(
     result: dict[str, Any],
     *,
@@ -5181,6 +5236,50 @@ def agent_task_recovery_command(
     return " ".join(json.dumps(value) for value in values)
 
 
+def agent_task_retry_command(
+    args: argparse.Namespace,
+    *,
+    target: str,
+    repo_root: Path,
+    state_path: Path,
+) -> str:
+    values = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "agent-task",
+        target,
+        "--repo-root",
+        str(repo_root),
+        "--state",
+        str(state_path),
+        "--model",
+        args.model,
+        "--max-iterations",
+        str(args.max_iterations),
+    ]
+    pipeline = (
+        args.pipeline_run,
+        args.pipeline_iteration,
+        args.pipeline_max_iterations,
+    )
+    if all(value is not None for value in pipeline):
+        values.extend(
+            [
+                "--pipeline-run",
+                str(args.pipeline_run),
+                "--pipeline-iteration",
+                str(args.pipeline_iteration),
+                "--pipeline-max-iterations",
+                str(args.pipeline_max_iterations),
+            ]
+        )
+    elif isinstance(getattr(args, "invocation_run", None), str):
+        values.extend(["--invocation-run", args.invocation_run])
+    if args.stack_state:
+        values.extend(["--stack-state", str(args.stack_state)])
+    return " ".join(json.dumps(value) for value in values)
+
+
 def remove_agent_task_artifacts(
     state_path: Path, state: dict[str, Any], paths: Iterable[Path]
 ) -> None:
@@ -5210,6 +5309,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
     state_path = cli_path(args.state) if args.state else default_state_path(target)
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
+    replacing_not_created_task = False
     if args.resume:
         if existing is None:
             raise WorkflowError(f"recovery state does not exist: {state_path}")
@@ -5278,11 +5378,21 @@ def command_agent_task(args: argparse.Namespace) -> None:
             if isinstance(active_task, dict) and active_task.get("status") not in {
                 "completed",
                 "consumed",
-            }:
+            } and not (
+                active_task.get("status") == "failed"
+                and active_task.get("task_id_status") == "not_created"
+            ):
                 raise WorkflowError(
                     "an unfinished Agent Task already owns this state; use its "
                     "recovery_command"
                 )
+            if (
+                isinstance(active_task, dict)
+                and active_task.get("status") == "failed"
+                and active_task.get("task_id_status") == "not_created"
+            ):
+                replacing_not_created_task = True
+                state.setdefault("managed_task_history", []).append(active_task)
         state["pr"] = pr
         state["repo_root"] = str(repo_root)
         migrate_budget_counters(state)
@@ -5422,7 +5532,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 }
             )
             return
-        if exhausted:
+        if exhausted and not replacing_not_created_task:
             state["escalation"] = {
                 "reason": "max_iterations_reached",
                 "detail": f"the {budget_scope} CI fix budget is exhausted",
@@ -5441,7 +5551,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 }
             )
             return
-        if not charge_iteration(state, state["run"]):
+        if (
+            not charge_iteration(state, state["run"])
+            and not replacing_not_created_task
+        ):
             save_state(state_path, state)
             emit(
                 {
@@ -5548,6 +5661,38 @@ def command_agent_task(args: argparse.Namespace) -> None:
     try:
         result = load_agent_task_result(result_path)
         if result.get("status") != "success":
+            result_task = result.get("task")
+            result_task_id = (
+                result_task.get("id") if isinstance(result_task, dict) else None
+            )
+            if result_task_id is None:
+                failure = validate_task_creation_failure_result(
+                    result,
+                    preflight=preflight,
+                    requested_model=requested_model,
+                )
+                state = load_state(state_path)
+                task_state = state["agent_task"]
+                task_state.update(
+                    {
+                        "task": result["task"],
+                        "generated": result["generated"],
+                        "report": result["report"],
+                        "worker_receipt": result["worker_receipt"],
+                        "status": "failed",
+                        "task_id": None,
+                        "task_id_status": "not_created",
+                        "error": failure,
+                        "retry_command": agent_task_retry_command(
+                            args,
+                            target=pr["pr_url"],
+                            repo_root=repo_root,
+                            state_path=state_path,
+                        ),
+                    }
+                )
+                task_state.pop("recovery_command", None)
+                save_state(state_path, state)
             raise task_failure_from_result(result)
         remote = validate_success_result(
             result,
@@ -5861,7 +6006,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 if imported
                 else "failed"
             )
-            task_state["error"] = str(error)
+            if task_state.get("task_id_status") != "not_created":
+                task_state["error"] = str(error)
             task_state["failed_at"] = utc_now()
             task_state["recovery_files"] = [
                 str(path) for path in (prompt_path, result_path) if path.exists()
@@ -5879,7 +6025,16 @@ def command_agent_task(args: argparse.Namespace) -> None:
                         "receipt_path": task_state.get("receipt_path"),
                         "report_path": task_state.get("report_path"),
                         "recovery_files": task_state["recovery_files"],
-                        "recovery_command": task_state.get("recovery_command"),
+                        "task_id_status": task_state.get("task_id_status"),
+                        **(
+                            {"retry_command": task_state["retry_command"]}
+                            if isinstance(task_state.get("retry_command"), str)
+                            else {
+                                "recovery_command": task_state.get(
+                                    "recovery_command"
+                                )
+                            }
+                        ),
                     }
                 )
         raise
