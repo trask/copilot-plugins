@@ -29,6 +29,12 @@ SPLIT_IDENTITY_CLEAN_V3_REPORT = (
 SPLIT_IDENTITY_CLEAN_V3_RESULT = (
     Path(__file__).parent / "fixtures" / "split-identity-clean-v3-result.json"
 )
+NESTED_IDENTITY_CLEAN_V3_REPORT = (
+    Path(__file__).parent / "fixtures" / "nested-identity-clean-v3-report.md"
+)
+NESTED_IDENTITY_CLEAN_V3_RESULT = (
+    Path(__file__).parent / "fixtures" / "nested-identity-clean-v3-result.json"
+)
 CCA_DISABLED_V4_RESULT = (
     Path(__file__).parent / "fixtures" / "cca-disabled-v4-agent-task-result.json"
 )
@@ -1722,6 +1728,19 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             },
         }
 
+    def nested_identity_preflight(self):
+        preflight = self.split_identity_preflight()
+        preflight["identity"]["head"] = (
+            "f1e7ea3dabd0fab27c6fadc2d257c97ce574e106"
+        )
+        preflight["pr"]["head_sha"] = (
+            "f1e7ea3dabd0fab27c6fadc2d257c97ce574e106"
+        )
+        preflight["pr"]["base_sha"] = (
+            "55fb421179d32aef3b36c7f6503f57193561d14c"
+        )
+        return preflight
+
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
@@ -1732,7 +1751,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.23")
+        self.assertEqual(plugin["version"], "1.3.24")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -1751,11 +1770,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             prior_history=[],
         )
         self.assertIn("human-readable UTF-8 Markdown report", prompt)
-        self.assertIn("worker prompt version 5", prompt)
+        self.assertIn("worker prompt version 6", prompt)
         self.assertIn("do not omit the repository", prompt)
         self.assertIn("including both head and base refs", prompt)
         self.assertIn("Never put `head`, `base`, or `fix_commits`", prompt)
         self.assertIn("never encode `pull_request` as an integer", prompt)
+        self.assertIn("Do not nest `head`, `base`, or `fix_commits`", prompt)
         self.assertIn("maximum_review_iterations", prompt)
         self.assertIn("untrusted data", prompt)
         self.assertIn("Map every fix commit to its findings in the report", prompt)
@@ -1975,6 +1995,119 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         unexpected = json.loads(json.dumps(parsed))
         unexpected["outcome"] = "cleared"
         malformed.append(unexpected)
+        for candidate in malformed:
+            with self.subTest(candidate=candidate), self.assertRaises(
+                MODULE.WorkflowError
+            ):
+                MODULE.validate_self_review_report(
+                    f"```json\n{json.dumps(candidate)}\n```",
+                    **common,
+                )
+
+        for remote_override, paths in (
+            ({**remote, "requires_apply": False}, {}),
+            (
+                {
+                    **remote,
+                    "commits": ["5" * 40],
+                    "final_local_head": "5" * 40,
+                },
+                {"5" * 40: ["src/app.py"]},
+            ),
+        ):
+            with self.assertRaises(MODULE.WorkflowError):
+                MODULE.validate_self_review_report(
+                    content,
+                    **{
+                        **common,
+                        "remote": remote_override,
+                        "paths_by_commit": paths,
+                    },
+                )
+
+    def test_exact_nested_identity_clean_report_recovers_retained_task(self):
+        preflight = self.nested_identity_preflight()
+        content = NESTED_IDENTITY_CLEAN_V3_REPORT.read_text(encoding="utf-8")
+        result_content = NESTED_IDENTITY_CLEAN_V3_RESULT.read_text(encoding="utf-8")
+        self.assertEqual(
+            "72de579ffc46a1879ac682b1adefc9e567bb0c3f52d87afd416b380b140d4b1b",
+            MODULE.sha256_text(content),
+        )
+        self.assertEqual(
+            "edb6f05f9fb7dfd3c17a74dc823d348f7f4dad1b1ec5e21e2777805ac9ae9cdd",
+            MODULE.sha256_text(result_content),
+        )
+        result = json.loads(result_content)
+        remote = MODULE.validate_success_result(
+            result,
+            preflight=preflight,
+            requested_model="gpt-5.6-sol",
+        )
+        common = {
+            "request_id": remote["request_id"],
+            "preflight": preflight,
+            "remote": remote,
+            "max_iterations": 5,
+            "paths_by_commit": {},
+        }
+
+        normalized = MODULE.validate_self_review_report(content, **common)
+
+        self.assertEqual("cleared", normalized["outcome"])
+        self.assertEqual(1, normalized["iterations_used"])
+        self.assertEqual([], normalized["findings"])
+        self.assertEqual(
+            {
+                "decision": "keep",
+                "title": preflight["pr"]["title"],
+                "body": preflight["pr"]["body"],
+                "reason": (
+                    "The nested-identity clean report preserved the pinned "
+                    "title and body."
+                ),
+            },
+            normalized["pull_request_metadata"],
+        )
+
+        parsed = MODULE.parse_markdown_report(content, description="test report")
+        malformed = []
+        for field, value in (
+            ("findings", [{"id": "untrusted"}]),
+            ("repository", {"owner": "someone-else", "name": "shared-workflows"}),
+        ):
+            candidate = copy.deepcopy(parsed)
+            candidate[field] = value
+            malformed.append(candidate)
+        for parent, field, value in (
+            ("pull_request", "number", True),
+            ("pull_request", "number", 348),
+            ("iteration", "number", True),
+            ("iteration", "number", 0),
+            ("iteration", "number", 6),
+            ("iteration", "result", "fixed"),
+            ("metadata", "title", "Different title"),
+            ("metadata", "body", "Different body"),
+        ):
+            candidate = copy.deepcopy(parsed)
+            candidate[parent][field] = value
+            malformed.append(candidate)
+        for parent, nested, field, value in (
+            ("pull_request", "head", "repository", "someone-else/repo"),
+            ("pull_request", "head", "ref", "different-branch"),
+            ("pull_request", "head", "sha", "0" * 40),
+            ("pull_request", "base", "repository", "someone-else/repo"),
+            ("pull_request", "base", "ref", "release"),
+            ("pull_request", "base", "sha", "0" * 40),
+        ):
+            candidate = copy.deepcopy(parsed)
+            candidate[parent][nested][field] = value
+            malformed.append(candidate)
+        unexpected_fix = copy.deepcopy(parsed)
+        unexpected_fix["pull_request"]["fix_commits"] = ["5" * 40]
+        malformed.append(unexpected_fix)
+        unexpected_key = copy.deepcopy(parsed)
+        unexpected_key["fix_commits"] = []
+        malformed.append(unexpected_key)
         for candidate in malformed:
             with self.subTest(candidate=candidate), self.assertRaises(
                 MODULE.WorkflowError
@@ -3032,6 +3165,136 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             task["pull_request_metadata"],
             task["preparation"]["pull_request_metadata"],
         )
+        self.assertEqual(3, len(task["preserved_artifacts"]))
+        self.assertIn("--apply-prepared", task["apply_command"])
+        self.assertNotIn('"--resume"', task["apply_command"])
+        self.assertEqual("validated_pending_import", emitted[-1]["result"])
+
+    def test_nested_identity_clean_resume_prepares_retained_owner_without_mutation(self):
+        state_path = self.directory / "nested-identity-clean-resume.json"
+        prompt_path = self.directory / "retained-prompt.txt"
+        result_path = self.directory / "retained-result.json"
+        prompt_path.write_bytes(b"retained prompt")
+        result_content = NESTED_IDENTITY_CLEAN_V3_RESULT.read_text(encoding="utf-8")
+        result_path.write_bytes(result_content.encode("utf-8"))
+        report = NESTED_IDENTITY_CLEAN_V3_REPORT.read_text(encoding="utf-8")
+        preflight = self.nested_identity_preflight()
+        result = json.loads(result_content)
+        owner = "56a4283da65a3bfeb9a274d693b8c3a7"
+        MODULE.save_state(
+            state_path,
+            {
+                "version": 1,
+                "created_at": "2026-09-16T14:02:51Z",
+                "updated_at": "2026-09-16T14:09:17Z",
+                "iterations": 0,
+                "next_candidate_id": 1,
+                "history": [],
+                "managed_task_history": [
+                    {"run_id": "legacy-owner"},
+                    {"run_id": "archived-owner", "status": "archived_stale"},
+                ],
+                "managed_review_history": [
+                    {"id": "legacy-review"},
+                    {"id": "archived-review", "status": "stale"},
+                ],
+                "repo_root": str(self.repo_root),
+                "pr": preflight["pr"],
+                "review": {
+                    "id": f"pr-347-agent-task-{owner}",
+                    "status": "active",
+                    "iteration": 1,
+                    "head_sha": preflight["pr"]["head_sha"],
+                    "candidates": [],
+                    "batches": [],
+                },
+                "agent_task": {
+                    "status": "failed",
+                    "run_id": owner,
+                    "model": "gpt-5.6-sol",
+                    "policy": MODULE.AGENT_TASK_POLICY,
+                    "allowed_iterations": 5,
+                    "preflight": preflight,
+                    "prompt_file": str(prompt_path),
+                    "result_file": str(result_path),
+                    "task": result["task"],
+                    "generated": result["generated"],
+                    "report": result["report"],
+                    "attestation": result["attestation"],
+                    "worker_receipt": None,
+                    "clear_shared_state_on_apply": False,
+                    "error": "Self Review Loop report is malformed or has stale identity",
+                },
+            },
+        )
+        arguments = SimpleNamespace(
+            target="open-telemetry/shared-workflows#347",
+            repo_root=str(self.repo_root),
+            state=str(state_path),
+            resume=True,
+            prepare_only=True,
+            apply_prepared=False,
+            preserve_artifacts=True,
+            model="sol",
+            max_iterations=5,
+            pipeline_run=None,
+            pipeline_iteration=None,
+            pipeline_max_iterations=None,
+        )
+        emitted = []
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target(arguments.target),
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "run") as run,
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value=preflight["identity"],
+            ),
+            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(MODULE, "metadata_for", return_value=preflight["pr"]),
+            mock.patch.object(MODULE, "apply_verified_import") as apply_import,
+            mock.patch.object(MODULE, "update_pr_metadata") as update_metadata,
+            mock.patch.object(MODULE, "publish_shared_state") as publish_shared,
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        discover.assert_not_called()
+        run.assert_not_called()
+        apply_import.assert_not_called()
+        update_metadata.assert_not_called()
+        publish_shared.assert_not_called()
+        prepared = MODULE.load_state(state_path)
+        task = prepared["agent_task"]
+        self.assertEqual("validated_pending_import", task["status"])
+        self.assertEqual(1, task["resume_attempts"])
+        self.assertEqual(owner, task["run_id"])
+        self.assertEqual(result["task"]["id"], task["task_id"])
+        self.assertEqual(result["generated"]["branch"], task["generated_branch"])
+        self.assertEqual(result["generated"]["head_sha"], task["generated_head"])
+        self.assertEqual([], task["ordered_commits"])
+        self.assertEqual([], task["paths_by_commit"])
+        self.assertEqual([], task["findings"])
+        self.assertEqual(
+            "edb6f05f9fb7dfd3c17a74dc823d348f7f4dad1b1ec5e21e2777805ac9ae9cdd",
+            task["result_sha256"],
+        )
+        self.assertEqual(result["report"]["sha256"], task["report_sha256"])
+        self.assertEqual("keep", task["pull_request_metadata"]["decision"])
+        self.assertEqual(
+            "The nested-identity clean report preserved the pinned title and body.",
+            task["pull_request_metadata"]["reason"],
+        )
+        self.assertEqual(2, len(prepared["managed_task_history"]))
+        self.assertEqual(2, len(prepared["managed_review_history"]))
         self.assertEqual(3, len(task["preserved_artifacts"]))
         self.assertIn("--apply-prepared", task["apply_command"])
         self.assertNotIn('"--resume"', task["apply_command"])
