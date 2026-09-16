@@ -23,6 +23,12 @@ MARKETPLACE = ROOT.parents[1] / ".github" / "plugin" / "marketplace.json"
 FORWARD_COMPACT_KEEP_REPORT = (
     Path(__file__).parent / "fixtures" / "forward-compact-keep-report.md"
 )
+FORWARD_IDENTITY_KEEP_REPORT = (
+    Path(__file__).parent / "fixtures" / "forward-identity-keep-report.md"
+)
+FORWARD_IDENTITY_RESULT = (
+    Path(__file__).parent / "fixtures" / "forward-identity-347-result.json"
+)
 SPEC = importlib.util.spec_from_file_location("pr_description", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -708,7 +714,7 @@ class LegacyAgentInstructions:
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.51")
+        self.assertEqual(plugin["version"], "1.0.52")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -874,6 +880,68 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             },
         }
 
+    def forward_identity_preflight(self):
+        body = (
+            "Prevents concurrent dashboard state updates from starving a "
+            "publisher. State writers respect the repository publisher lease, "
+            "while `--force-with-lease` handles races that begin before the "
+            "lease commit.\n\nDirect workflows wait for the publisher. Queue "
+            "workers return every claim for a busy repository and retry after "
+            "five minutes without using the processing-failure budget. Targeted "
+            "updates and head-SHA claim resolution check the lease before GitHub "
+            "API or Copilot work.\n\nFixes #341"
+        )
+        preflight = agent_task_preflight()
+        preflight["repository_root"] = str(self.repo_root)
+        preflight["pr"].update(
+            {
+                "number": 347,
+                "owner": "open-telemetry",
+                "repo": "shared-workflows",
+                "repo_name": "open-telemetry/shared-workflows",
+                "pr_url": (
+                    "https://github.com/open-telemetry/"
+                    "shared-workflows/pull/347"
+                ),
+                "url": (
+                    "https://github.com/open-telemetry/"
+                    "shared-workflows/pull/347"
+                ),
+                "title": "Prevent dashboard publisher starvation",
+                "body": body,
+                "head_sha": "f1e7ea3dabd0fab27c6fadc2d257c97ce574e106",
+                "head": {
+                    "repository": "open-telemetry/shared-workflows",
+                    "ref": "trask-fix-dashboard-publisher-contention",
+                    "sha": "f1e7ea3dabd0fab27c6fadc2d257c97ce574e106",
+                },
+                "base": {
+                    "repository": "open-telemetry/shared-workflows",
+                    "ref": "main",
+                    "sha": "55fb421179d32aef3b36c7f6503f57193561d14c",
+                },
+            }
+        )
+        return preflight
+
+    def forward_identity_changed_files(self):
+        return [
+            ".github/scripts/pull-request-dashboard/RATIONALE.md",
+            ".github/scripts/pull-request-dashboard/WEBHOOK_SETUP.md",
+            ".github/scripts/pull-request-dashboard/dashboard.py",
+            ".github/scripts/pull-request-dashboard/netlify.toml",
+            (
+                ".github/scripts/pull-request-dashboard/netlify/lib/"
+                "dashboard-queue.mjs"
+            ),
+            ".github/scripts/pull-request-dashboard/process_queue_batch.py",
+            ".github/scripts/pull-request-dashboard/state_branch.py",
+            ".github/scripts/pull-request-dashboard/test_dashboard.py",
+            ".github/scripts/pull-request-dashboard/test_dashboard_queue.mjs",
+            ".github/scripts/pull-request-dashboard/test_process_queue_batch.py",
+            ".github/scripts/pull-request-dashboard/test_state_branch.py",
+        ]
+
     def command_patches(self, result, report_content, receipt_content):
         helper = self.directory / "cloud_task.py"
         helper.write_text("# helper\n", encoding="utf-8")
@@ -972,7 +1040,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.51")
+        self.assertEqual(plugin["version"], "1.0.52")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1123,6 +1191,78 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         malformed.append(extra_key)
         common = {
             "request_id": "29e06f06-0610-4e6a-a158-3adb494a64f3",
+            "preflight": preflight,
+            "changed_files": changed_files,
+            "proposal_count": 0,
+        }
+        for candidate in malformed:
+            with self.subTest(candidate=candidate), self.assertRaises(
+                MODULE.WorkflowError
+            ):
+                MODULE.validate_proposal_report(
+                    f"```json\n{json.dumps(candidate)}\n```",
+                    **common,
+                )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "stale identity"):
+            MODULE.validate_proposal_report(
+                content,
+                **{**common, "proposal_count": 1},
+            )
+
+    def test_exact_forward_identity_keep_report_recovers_no_proposal(self):
+        preflight = self.forward_identity_preflight()
+        changed_files = self.forward_identity_changed_files()
+        content = FORWARD_IDENTITY_KEEP_REPORT.read_text(encoding="utf-8")
+        self.assertEqual(3314, len(content.encode("utf-8")))
+        self.assertEqual(
+            "96a4feadc52d1807849640bd0258ef5043e7fb11e4a6bcd35a80a8c5ad233599",
+            MODULE.sha256_text(content),
+        )
+
+        report = MODULE.validate_proposal_report(
+            content,
+            request_id="0f8ff903-0ab7-4426-a7f6-6365d543be19",
+            preflight=preflight,
+            changed_files=changed_files,
+            proposal_count=0,
+        )
+
+        self.assertEqual("keep", report["decision"])
+        self.assertEqual(preflight["pr"]["title"], report["proposal"]["title"])
+        self.assertEqual(
+            changed_files,
+            [item["path"] for item in report["evidence"]["changed_files"]],
+        )
+        parsed = MODULE.parse_markdown_report(content, description="test report")
+        malformed = []
+        replace = json.loads(json.dumps(parsed))
+        replace["decision"] = "replace"
+        malformed.append(replace)
+        wrong_request = json.loads(json.dumps(parsed))
+        wrong_request["identity"]["request"] = "other-request"
+        malformed.append(wrong_request)
+        wrong_head = json.loads(json.dumps(parsed))
+        wrong_head["identity"]["head"]["sha"] = "0" * 40
+        malformed.append(wrong_head)
+        wrong_base = json.loads(json.dumps(parsed))
+        wrong_base["identity"]["base"]["branch"] = "other"
+        malformed.append(wrong_base)
+        changed_title = json.loads(json.dumps(parsed))
+        changed_title["proposal"]["title"] = "Different title"
+        malformed.append(changed_title)
+        missing_evidence = json.loads(json.dumps(parsed))
+        missing_evidence["evidence"].pop("body_basis")
+        malformed.append(missing_evidence)
+        duplicate_path = json.loads(json.dumps(parsed))
+        duplicate_path["evidence"]["changed_files"][-1] = duplicate_path[
+            "evidence"
+        ]["changed_files"][0]
+        malformed.append(duplicate_path)
+        extra_key = json.loads(json.dumps(parsed))
+        extra_key["schema"] = MODULE.PR_DESCRIPTION_PROPOSAL_SCHEMA
+        malformed.append(extra_key)
+        common = {
+            "request_id": "0f8ff903-0ab7-4426-a7f6-6365d543be19",
             "preflight": preflight,
             "changed_files": changed_files,
             "proposal_count": 0,
@@ -1375,6 +1515,143 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertTrue(prompt.is_file())
         self.assertTrue(result_path.is_file())
         self.assertEqual("validated", emitted[-1]["result"])
+        self.assertEqual("keep", emitted[-1]["decision"])
+
+    def test_exact_forward_identity_resume_prepares_same_task_without_mutation(self):
+        preflight = self.forward_identity_preflight()
+        changed_files = self.forward_identity_changed_files()
+        identity = {
+            "branch": preflight["pr"]["head"]["ref"],
+            "head": preflight["pr"]["head_sha"],
+            "status": "",
+        }
+        report_content = FORWARD_IDENTITY_KEEP_REPORT.read_text(encoding="utf-8")
+        result_content = FORWARD_IDENTITY_RESULT.read_text(encoding="utf-8")
+        self.assertEqual(1559, len(result_content.encode("utf-8")))
+        self.assertEqual(
+            "9b5d48b6ae22a3d777944b1f2a351471072451350c2f8b6a30503cb9defdae0a",
+            MODULE.sha256_text(result_content),
+        )
+        path = self.directory / "retained-347.json"
+        index = self.directory / "open-telemetry--shared-workflows--347.json"
+        prompt = self.directory / "retained-347-prompt.txt"
+        result_path = self.directory / "retained-347-result.json"
+        prompt.write_text("retained prompt\n", encoding="utf-8", newline="\n")
+        result_path.write_text(
+            result_content,
+            encoding="utf-8",
+            newline="\n",
+        )
+        state = {
+            "version": 2,
+            "kind": "run",
+            "created_at": "2026-09-16T15:51:14.555874Z",
+            "updated_at": "2026-09-16T15:54:35.532067Z",
+            "run_id": "a451854ed84967697462c5d67e1c9a49",
+            "repo_root": str(self.repo_root),
+            "pr": preflight["pr"],
+            "viewer": preflight["viewer"],
+            "proposal_count": 0,
+            "pinned_at": "2026-09-16T15:51:14.555896Z",
+            "index_path": str(index),
+            "agent_task": {
+                "status": "failed",
+                "model": "gpt-5.6-sol",
+                "policy": "marketplace-agent-report-worker@1",
+                "helper": str(self.directory / "cloud_task.py"),
+                "preflight": {**preflight, "identity": identity},
+                "prompt_file": str(prompt),
+                "result_file": str(result_path),
+                "recovery_files": [str(prompt), str(result_path)],
+                "started_at": "2026-09-16T15:51:18.222214Z",
+                "failed_at": "2026-09-16T15:54:35.531789Z",
+                "error": (
+                    "Agent Task proposal report has unexpected or missing fields"
+                ),
+            },
+        }
+        MODULE.save_state(path, state)
+        emitted = []
+        arguments = SimpleNamespace(
+            target="open-telemetry/shared-workflows#347",
+            repo_root=str(self.repo_root),
+            state=str(path),
+            resume=True,
+            preserve_artifacts=True,
+            prepare_only=True,
+            apply_prepared=False,
+            model="sol",
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target(
+                    "open-telemetry/shared-workflows#347"
+                ),
+            ),
+            mock.patch.object(MODULE, "refresh_run_index"),
+            mock.patch.object(MODULE, "local_identity", return_value=identity),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "run") as helper_run,
+            mock.patch.object(
+                MODULE,
+                "fetch_committed_text",
+                return_value=report_content,
+            ),
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                return_value=preflight["pr"],
+            ),
+            mock.patch.object(
+                MODULE,
+                "pull_request_file_paths",
+                return_value=changed_files,
+            ),
+            mock.patch.object(MODULE, "validate_no_change") as validate,
+            mock.patch.object(MODULE, "apply_proposal") as apply,
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        discover.assert_not_called()
+        helper_run.assert_not_called()
+        validate.assert_not_called()
+        apply.assert_not_called()
+        prepared = MODULE.load_run_state(path)
+        task = prepared["agent_task"]
+        self.assertEqual("validated_pending_apply", task["status"])
+        self.assertEqual(1, task["resume_attempts"])
+        self.assertEqual(
+            "3ac80148-5f36-4877-98f3-c1d592419d52",
+            task["task"]["id"],
+        )
+        self.assertEqual(
+            "a40ee2f7f3bab296554bc2678403c7f20bc6b3a4",
+            task["generated"]["head_sha"],
+        )
+        self.assertEqual(
+            "9b5d48b6ae22a3d777944b1f2a351471072451350c2f8b6a30503cb9defdae0a",
+            task["result_sha256"],
+        )
+        self.assertEqual(3, len(task["preserved_artifacts"]))
+        report_artifact = next(
+            item
+            for item in task["preserved_artifacts"]
+            if item["path"] == task["report"]["path"]
+        )
+        self.assertEqual(3314, report_artifact["size"])
+        self.assertEqual(
+            "96a4feadc52d1807849640bd0258ef5043e7fb11e4a6bcd35a80a8c5ad233599",
+            report_artifact["sha256"],
+        )
+        self.assertNotIn("proposal", prepared)
+        self.assertNotIn("validation", prepared)
+        self.assertNotIn("validated_head_sha", prepared)
+        self.assertEqual("validated_pending_apply", emitted[-1]["result"])
         self.assertEqual("keep", emitted[-1]["decision"])
 
     def test_archives_exact_legacy_taskless_runs_once_and_preserves_artifacts(self):

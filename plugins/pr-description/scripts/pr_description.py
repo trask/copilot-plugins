@@ -1774,8 +1774,22 @@ def validate_proposal_report(
         "evidence",
         "proposal",
     }
+    forward_identity_keep = isinstance(report, dict) and set(report) == {
+        "decision",
+        "evidence",
+        "proposal",
+        "identity",
+    }
     if forward_keep:
         report = normalize_forward_keep_proposal_report(
+            report,
+            request_id=request_id,
+            preflight=preflight,
+            changed_files=changed_files,
+            proposal_count=proposal_count,
+        )
+    elif forward_identity_keep:
+        report = normalize_forward_identity_keep_proposal_report(
             report,
             request_id=request_id,
             preflight=preflight,
@@ -1933,6 +1947,91 @@ def normalize_forward_keep_proposal_report(
                 for path in evidence["changed_files"]
             ],
             "title_basis": evidence["title_basis"],
+            "body_basis": evidence["body_basis"],
+        },
+    }
+
+
+def normalize_forward_identity_keep_proposal_report(
+    report: dict[str, Any],
+    *,
+    request_id: str,
+    preflight: dict[str, Any],
+    changed_files: list[str],
+    proposal_count: int | None,
+) -> dict[str, Any]:
+    pr = preflight["pr"]
+    evidence = report.get("evidence")
+    proposal = report.get("proposal")
+    identity = report.get("identity")
+    if (
+        proposal_count != 0
+        or report.get("decision") != "keep"
+        or proposal != {"title": pr["title"], "body": pr["body"]}
+        or identity
+        != {
+            "request": request_id,
+            "repository": pr["repo_name"],
+            "pull_request": pr["number"],
+            "head": {
+                "repository": pr["head"]["repository"],
+                "branch": pr["head"]["ref"],
+                "sha": pr["head_sha"],
+            },
+            "base": {
+                "repository": pr["base"]["repository"],
+                "branch": pr["base"]["ref"],
+            },
+            "title": pr["title"],
+            "body": pr["body"],
+        }
+        or not isinstance(evidence, dict)
+        or set(evidence) != {"body_basis", "changed_files"}
+        or not isinstance(evidence.get("body_basis"), str)
+        or not 1 <= len(evidence["body_basis"].strip()) <= 4000
+        or "\r" in evidence["body_basis"]
+        or not isinstance(evidence.get("changed_files"), list)
+        or any(
+            not isinstance(path, str)
+            or not path
+            or Path(path).is_absolute()
+            or ".." in Path(path).parts
+            for path in evidence.get("changed_files", [])
+        )
+        or len(evidence["changed_files"]) != len(set(evidence["changed_files"]))
+        or set(evidence["changed_files"]) != set(changed_files)
+    ):
+        raise WorkflowError(
+            "Agent Task identity keep report is malformed or has stale identity"
+        )
+    return {
+        "schema": LEGACY_PR_DESCRIPTION_PROPOSAL_SCHEMA,
+        "request_id": request_id,
+        "repository": pr["repo_name"],
+        "pull_request": {
+            "number": pr["number"],
+            "head_sha": pr["head_sha"],
+            "current_title_sha256": sha256_text(pr["title"]),
+            "current_body_sha256": sha256_text(pr["body"]),
+        },
+        "decision": "keep",
+        "proposal": {
+            "title": pr["title"],
+            "body": pr["body"],
+        },
+        "evidence": {
+            "changed_files": [
+                {
+                    "path": path,
+                    "detail": (
+                        "The identity keep report included this exact changed path."
+                    ),
+                }
+                for path in evidence["changed_files"]
+            ],
+            "title_basis": (
+                "The signed keep decision preserved the exact pinned title."
+            ),
             "body_basis": evidence["body_basis"],
         },
     }
