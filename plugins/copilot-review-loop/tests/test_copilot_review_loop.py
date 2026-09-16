@@ -1182,7 +1182,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.22")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.23")
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1583,10 +1583,23 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
             self.assertTrue(prompt.is_file())
             self.assertTrue(result.is_file())
+            expected_manifest = [
+                {
+                    "path": str(prompt),
+                    "sha256": MODULE.sha256_file(prompt),
+                    "size": prompt.stat().st_size,
+                },
+                {
+                    "path": str(result),
+                    "sha256": MODULE.sha256_file(result),
+                    "size": result.stat().st_size,
+                },
+            ]
         self.assertFalse(task_state["artifacts_removed"])
         self.assertTrue(task_state["artifacts_preserved"])
         self.assertEqual(task_state["prompt_file"], "prompt.txt")
         self.assertEqual(task_state["result_file"], "result.json")
+        self.assertEqual(expected_manifest, task_state["preserved_artifacts"])
         self.assertNotIn("recovery_command", task_state)
 
     def test_compact_v3_report_rejects_any_available_identity_drift(self):
@@ -1874,7 +1887,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         ):
             MODULE.require_live_comments(self.preflight, allow_resolved=True)
 
-    def test_post_publish_inventory_accepts_only_exact_outdated_resolved_comment(self):
+    def test_post_publish_inventory_accepts_exact_resolved_line_shift(self):
         thread = {
             "id": self.comment["thread_id"],
             "isResolved": True,
@@ -1887,7 +1900,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                         "path": self.comment["path"],
                         "position": None,
                         "originalPosition": self.comment["original_position"],
-                        "line": None,
+                        "line": 9,
                         "originalLine": self.comment["original_line"],
                         "author": {
                             "login": self.comment["author"],
@@ -1910,7 +1923,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 self.preflight, allow_resolved=True
             )
         self.assertEqual(selected[0]["id"], self.comment["id"])
-        self.assertIsNone(selected[0]["line"])
+        self.assertEqual(9, selected[0]["line"])
         self.assertTrue(selected[0]["resolved"])
 
         thread["comments"]["nodes"][0]["body"] = "Changed review body"
@@ -1932,7 +1945,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
             self.assertRaisesRegex(MODULE.WorkflowError, "identity drifted"),
         ):
-            MODULE.require_live_comments(self.preflight, allow_resolved=True)
+            MODULE.require_live_comments(self.preflight, allow_resolved=False)
 
     def test_rejects_merge_artifacts_and_unexpected_history(self):
         remote = self.remote()
@@ -2306,6 +2319,150 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(completed["agent_task"]["status"], "completed")
         self.assertEqual(completed["pr"]["head_sha"], self.fix)
         self.assertNotIn("error", completed["agent_task"])
+
+    def test_post_publish_resume_accepts_line_shift_and_preserves_artifacts(self):
+        state_path = self.directory / "post-publish-state.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        report = self.report([self.fix])
+        result = self.result([self.fix])
+        result["report"]["sha256"] = MODULE.sha256_text(report)
+        local_head = self.head
+        remote_head = self.head
+        helper_launches = 0
+        pushes = 0
+        live_comment_reads = 0
+
+        def run(command, **_kwargs):
+            nonlocal helper_launches, local_head, pushes, remote_head
+            if "--result-file" in command:
+                helper_launches += 1
+                output = Path(command[command.index("--result-file") + 1])
+                output.write_text(json.dumps(result), encoding="utf-8")
+            elif "merge" in command:
+                local_head = self.fix
+            elif "push" in command:
+                pushes += 1
+                remote_head = self.fix
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        def live_comments(_preflight, *, allow_resolved=False):
+            nonlocal live_comment_reads
+            live_comment_reads += 1
+            if live_comment_reads <= 2:
+                return [self.comment]
+            if live_comment_reads == 3:
+                raise MODULE.WorkflowError("post-push position not reconciled")
+            self.assertTrue(allow_resolved)
+            return [{**self.comment, "line": 9, "resolved": True}]
+
+        def arguments(*, resume):
+            args = self.arguments(state_path, resume=resume)
+            args.preserve_artifacts = True
+            return args
+
+        replies = mock.Mock(return_value={17: 71})
+        resolve = mock.Mock()
+        request = mock.Mock(return_value={"status": "requested"})
+        common_patches = (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=self.preflight
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "run", side_effect=run),
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                side_effect=lambda _root: {
+                    "branch": "feature",
+                    "head": local_head,
+                    "status": "",
+                },
+            ),
+            mock.patch.object(
+                MODULE,
+                "validate_generated_history",
+                return_value={self.fix: ["src/app.py"]},
+            ),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                side_effect=lambda _target: {
+                    **self.preflight["pr"],
+                    "head_sha": remote_head,
+                },
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_live_pr_snapshot",
+                side_effect=lambda _target, pr, expected_head: {
+                    **pr,
+                    "head_sha": expected_head,
+                },
+            ),
+            mock.patch.object(
+                MODULE, "remote_head", side_effect=lambda *_args: remote_head
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_remote_head",
+                side_effect=lambda *_args: remote_head,
+            ),
+            mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
+            mock.patch.object(
+                MODULE, "require_live_comments", side_effect=live_comments
+            ),
+            mock.patch.object(
+                MODULE, "post_missing_replies", new=replies
+            ),
+            mock.patch.object(MODULE, "resolve_threads", new=resolve),
+            mock.patch.object(MODULE, "request_copilot", new=request),
+            mock.patch.object(
+                MODULE, "verify_publish", return_value={"head_matches": True}
+            ),
+            mock.patch.object(MODULE, "continue_after_review_request"),
+            mock.patch.object(MODULE, "emit"),
+            mock.patch.object(MODULE.secrets, "token_hex", return_value="run-1"),
+        )
+        with ExitStack() as stack:
+            for patcher in common_patches:
+                stack.enter_context(patcher)
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "post-push position not reconciled"
+            ):
+                MODULE.command_agent_task(arguments(resume=False))
+
+        failed = MODULE.load_state(state_path)
+        failed_task = failed["agent_task"]
+        self.assertEqual("failed_after_publication", failed_task["status"])
+        self.assertEqual(self.fix, failed_task["published_head_sha"])
+        self.assertTrue(failed_task["artifacts_preserved"])
+        self.assertFalse(failed_task["artifacts_removed"])
+        self.assertEqual(2, len(failed_task["preserved_artifacts"]))
+
+        with ExitStack() as stack:
+            for patcher in common_patches:
+                stack.enter_context(patcher)
+            MODULE.command_agent_task(arguments(resume=True))
+
+        self.assertEqual(1, helper_launches)
+        self.assertEqual(1, pushes)
+        replies.assert_called_once()
+        resolve.assert_called_once()
+        request.assert_called_once()
+        completed = MODULE.load_state(state_path)
+        self.assertEqual("completed", completed["agent_task"]["status"])
+        self.assertTrue(completed["agent_task"]["artifacts_preserved"])
+        self.assertFalse(completed["agent_task"]["artifacts_removed"])
+        self.assertEqual(self.fix, completed["pr"]["head_sha"])
 
     def test_malformed_report_does_not_import_verified_commits(self):
         state_path = self.directory / "malformed-report-state.json"
@@ -4144,6 +4301,10 @@ class ReplyPublishingTest(unittest.TestCase):
             if arguments == ["api", "user"]:
                 return {"login": "trask"}
             comment_id = int(arguments[-1].split("/")[-2])
+            if comment_id == 4021507189:
+                self.assertTrue(
+                    state["thread_mutations"][str(comment_id)]["resolved"]
+                )
             reply = {
                 "id": 9000 + comment_id,
                 "in_reply_to_id": comment_id,

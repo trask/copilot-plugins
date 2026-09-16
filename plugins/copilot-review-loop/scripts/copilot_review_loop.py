@@ -2079,9 +2079,12 @@ def post_missing_replies(
                 "thread_id": comment["thread_id"],
                 "reply_body_sha256": sha256_text(expected_body),
                 "reply_id": None,
-                "resolved": False,
+                "resolved": bool(comment.get("resolved")),
                 "planned_at": utc_now(),
             }
+        elif comment.get("resolved") and checkpoint.get("resolved") is False:
+            checkpoint["resolved"] = True
+            checkpoint["updated_at"] = utc_now()
     if state_path is not None:
         save_state(state_path, state)
 
@@ -3958,7 +3961,16 @@ def require_live_comments(
             != expected_comment.get("author_bot_id")
             or (
                 live_line != expected_line
-                and not (allow_resolved and live_line is None)
+                and not (
+                    allow_resolved
+                    and (
+                        live_line is None
+                        or (
+                            isinstance(live_line, int)
+                            and not isinstance(live_line, bool)
+                        )
+                    )
+                )
             )
         ):
             raise WorkflowError(
@@ -4604,8 +4616,7 @@ def finalize_agent_task_artifacts(
     preserve: bool,
 ) -> None:
     if preserve:
-        task_state["artifacts_removed"] = False
-        task_state["artifacts_preserved"] = True
+        checkpoint_preserved_agent_task_artifacts(task_state, cleanup_paths)
         task_state.pop("recovery_command", None)
         task_state.pop("recovery_files", None)
         return
@@ -4627,6 +4638,28 @@ def finalize_agent_task_artifacts(
     task_state.pop("pending_result_file", None)
     task_state.pop("recovery_command", None)
     task_state.pop("recovery_files", None)
+
+
+def checkpoint_preserved_agent_task_artifacts(
+    task_state: dict[str, Any],
+    artifact_paths: set[Path],
+) -> None:
+    artifacts = sorted(artifact_paths, key=lambda path: str(path))
+    missing = [str(path) for path in artifacts if not path.is_file()]
+    if missing:
+        raise WorkflowError(
+            "preserved Agent Task artifacts are missing: " + ", ".join(missing)
+        )
+    task_state["artifacts_removed"] = False
+    task_state["artifacts_preserved"] = True
+    task_state["preserved_artifacts"] = [
+        {
+            "path": str(path),
+            "sha256": sha256_file(path),
+            "size": path.stat().st_size,
+        }
+        for path in artifacts
+    ]
 
 
 def command_agent_task(args: argparse.Namespace) -> None:
@@ -5350,6 +5383,15 @@ def command_agent_task(args: argparse.Namespace) -> None:
             expected_head=published_head,
         )
         state["pr"] = final_live
+        cleanup_paths = {prompt_path, result_path}
+        if input_result_path is not None:
+            cleanup_paths.add(input_result_path)
+        if bool(getattr(args, "preserve_artifacts", False)):
+            checkpoint_preserved_agent_task_artifacts(
+                task_state,
+                cleanup_paths,
+            )
+            save_state(state_path, state)
         live_comments = require_live_comments(
             preflight,
             allow_resolved=(
@@ -5417,9 +5459,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
         for field in ("error", "failed_at", "recovery_files"):
             task_state.pop(field, None)
         save_state(state_path, state)
-        cleanup_paths = {prompt_path, result_path}
-        if input_result_path is not None:
-            cleanup_paths.add(input_result_path)
         finalize_agent_task_artifacts(
             task_state,
             cleanup_paths,
