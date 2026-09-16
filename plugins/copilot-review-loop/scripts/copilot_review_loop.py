@@ -5213,6 +5213,11 @@ def validate_preserved_agent_task_artifacts(
             )
 
 
+def clear_agent_task_failure(task_state: dict[str, Any]) -> None:
+    for field in ("error", "failed_at", "recovery_files"):
+        task_state.pop(field, None)
+
+
 def command_agent_task(args: argparse.Namespace) -> None:
     prepare_only = bool(getattr(args, "prepare_only", False))
     apply_prepared = bool(getattr(args, "apply_prepared", False))
@@ -5982,6 +5987,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             }
             task_state["apply_command"] = apply_command
             task_state["recovery_command"] = apply_command
+            clear_agent_task_failure(task_state)
             save_state(state_path, state)
             emit(
                 {
@@ -6183,8 +6189,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         task_state["completed_at"] = utc_now()
         task_state["artifacts_removed"] = False
         task_state.pop("apply_command", None)
-        for field in ("error", "failed_at", "recovery_files"):
-            task_state.pop(field, None)
+        clear_agent_task_failure(task_state)
         save_state(state_path, state)
         finalize_agent_task_artifacts(
             task_state,

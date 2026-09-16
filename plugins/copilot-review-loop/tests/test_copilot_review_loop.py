@@ -1204,7 +1204,26 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.30")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.31")
+
+    def test_successful_retained_preparation_clears_prior_failure(self):
+        task = {
+            "status": "validated_pending_import",
+            "error": "stale validation failure",
+            "failed_at": "2026-09-16T17:45:33Z",
+            "recovery_files": ["prompt.txt", "result.json"],
+            "result_file": "result.json",
+        }
+
+        MODULE.clear_agent_task_failure(task)
+
+        self.assertEqual(
+            {
+                "status": "validated_pending_import",
+                "result_file": "result.json",
+            },
+            task,
+        )
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
