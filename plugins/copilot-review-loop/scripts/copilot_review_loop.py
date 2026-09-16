@@ -3202,6 +3202,74 @@ def validate_terminal_structural_failure_result(
     return error
 
 
+def validate_terminal_no_artifact_result(
+    result: dict[str, Any],
+    *,
+    preflight: dict[str, Any],
+    requested_model: str,
+) -> dict[str, str]:
+    task = result.get("task")
+    generated = result.get("generated")
+    application = result.get("application")
+    report = result.get("report")
+    attestation = result.get("attestation")
+    error = result.get("error")
+    pr = preflight["pr"]
+    expected_policy = {
+        "id": "marketplace-agent-apply-report-worker",
+        "version": 3,
+        "sha256": AGENT_TASK_POLICY_SHA256,
+    }
+    expected_base_ref = pr["head_sha"] if pr["cross_repository"] else pr["head_branch"]
+    task_id = task.get("id") if isinstance(task, dict) else None
+    if (
+        result.get("schema") != AGENT_TASK_RESULT_SCHEMA
+        or result.get("status") != "error"
+        or result.get("mode") != "apply_with_report"
+        or result.get("requested_model") != requested_model
+        or result.get("policy") != expected_policy
+        or result.get("repository") != {"name_with_owner": pr["repo_name"]}
+        or result.get("pull_request") != expected_cloud_pull_request(preflight)
+        or not isinstance(task, dict)
+        or set(task) != {"id", "url", "state", "base_ref", "base_sha"}
+        or not isinstance(task_id, str)
+        or not task_id
+        or task.get("url")
+        != f"https://github.com/{pr['repo_name']}/tasks/{task_id}"
+        or task.get("state") != "completed"
+        or task.get("base_ref") != expected_base_ref
+        or task.get("base_sha") != pr["head_sha"]
+        or not isinstance(generated, dict)
+        or set(generated) != {"branch", "head_sha", "commits"}
+        or not isinstance(generated.get("branch"), str)
+        or not generated["branch"]
+        or generated.get("head_sha") != pr["head_sha"]
+        or generated.get("commits") != []
+        or application
+        != {"status": "not_applied", "final_local_head": pr["head_sha"]}
+        or not isinstance(report, dict)
+        or set(report) != {"path", "commit", "sha256"}
+        or not isinstance(report.get("path"), str)
+        or REPORT_PATH_PATTERN.fullmatch(report["path"]) is None
+        or report.get("commit") is not None
+        or report.get("sha256") is not None
+        or attestation
+        != {"kind": "dispatcher_structural", "structural_complete": False}
+        or not isinstance(error, dict)
+        or error
+        != {
+            "code": "malformed_history",
+            "message": (
+                "the generated branch did not contain a worker validation commit"
+            ),
+        }
+    ):
+        raise WorkflowError(
+            "terminal no-artifact Agent Task failure has malformed identity"
+        )
+    return error
+
+
 def validate_success_result(
     result: dict[str, Any],
     *,
@@ -5681,6 +5749,42 @@ def command_agent_task(args: argparse.Namespace) -> None:
             elif (
                 prior_task.get("state") == "completed"
                 and prior_result.get("policy")
+                == {
+                    "id": "marketplace-agent-apply-report-worker",
+                    "version": 3,
+                    "sha256": AGENT_TASK_POLICY_SHA256,
+                }
+                and isinstance(prior_result.get("error"), dict)
+                and prior_result["error"].get("code") == "malformed_history"
+            ):
+                failure = validate_terminal_no_artifact_result(
+                    prior_result,
+                    preflight=active["preflight"],
+                    requested_model=requested_model,
+                )
+                active.update(
+                    {
+                        "task": prior_result["task"],
+                        "generated": prior_result["generated"],
+                        "report": prior_result["report"],
+                        "attestation": prior_result["attestation"],
+                        "status": "failed",
+                        "task_id": prior_task["id"],
+                        "task_id_status": "terminal_unusable",
+                        "error": failure,
+                        "retry_command": agent_task_retry_command(
+                            args,
+                            target=target["pr_url"],
+                            repo_root=repo_root,
+                            state_path=state_path,
+                        ),
+                    }
+                )
+                active.pop("recovery_command", None)
+                save_state(state_path, existing)
+            elif (
+                prior_task.get("state") == "completed"
+                and prior_result.get("policy")
                 == LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V1
                 and isinstance(prior_result.get("error"), dict)
                 and prior_result["error"].get("code") == "malformed_history"
@@ -6077,6 +6181,39 @@ def command_agent_task(args: argparse.Namespace) -> None:
                         "status": "failed",
                         "task_id": None,
                         "task_id_status": "not_created",
+                        "error": failure,
+                        "retry_command": agent_task_retry_command(
+                            args,
+                            target=pr["pr_url"],
+                            repo_root=repo_root,
+                            state_path=state_path,
+                        ),
+                    }
+                )
+                task_state.pop("recovery_command", None)
+                save_state(state_path, state)
+            elif (
+                isinstance(result_task, dict)
+                and result_task.get("state") == "completed"
+                and result.get("policy")
+                == {
+                    "id": "marketplace-agent-apply-report-worker",
+                    "version": 3,
+                    "sha256": AGENT_TASK_POLICY_SHA256,
+                }
+                and isinstance(result.get("error"), dict)
+                and result["error"].get("code") == "malformed_history"
+            ):
+                failure = validate_terminal_no_artifact_result(
+                    result,
+                    preflight=preflight,
+                    requested_model=requested_model,
+                )
+                task_state.update(
+                    {
+                        "status": "failed",
+                        "task_id": result_task_id,
+                        "task_id_status": "terminal_unusable",
                         "error": failure,
                         "retry_command": agent_task_retry_command(
                             args,

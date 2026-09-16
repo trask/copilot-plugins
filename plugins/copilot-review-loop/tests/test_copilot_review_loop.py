@@ -89,6 +89,21 @@ SUPPRESSED_COLLAPSED_383_SECOND_RESULT = (
     / "fixtures"
     / "suppressed-collapsed-383-second-agent-task-result.json"
 )
+NO_ARTIFACT_383_RESULT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "no-artifact-383-agent-task-result.json"
+)
+NO_ARTIFACT_20074_RESULT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "no-artifact-20074-agent-task-result.json"
+)
+LEGACY_VALIDATION_20050_RESULT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "legacy-validation-20050-agent-task-result.json"
+)
 SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -1112,6 +1127,42 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "error": None,
         }
 
+    def preflight_for_result(self, result):
+        preflight = copy.deepcopy(self.preflight)
+        pull_request = result["pull_request"]
+        owner, repo = result["repository"]["name_with_owner"].split("/", 1)
+        head_owner, head_repo = pull_request["head_repository"].split("/", 1)
+        preflight["identity"].update(
+            {
+                "branch": pull_request["head_ref"],
+                "head": pull_request["head_sha"],
+            }
+        )
+        preflight["pr"].update(
+            {
+                "owner": owner,
+                "repo": repo,
+                "number": pull_request["number"],
+                "repo_name": result["repository"]["name_with_owner"],
+                "pr_url": pull_request["url"],
+                "url": pull_request["url"],
+                "upstream_owner": owner,
+                "upstream_repo": repo,
+                "head_owner": head_owner,
+                "head_repo": head_repo,
+                "head_repository": pull_request["head_repository"],
+                "head_branch": pull_request["head_ref"],
+                "head_sha": pull_request["head_sha"],
+                "base_branch": pull_request["base_ref"],
+                "base_sha": pull_request["base_sha"],
+                "cross_repository": (
+                    pull_request["head_repository"]
+                    != pull_request["base_repository"]
+                ),
+            }
+        )
+        return preflight
+
     def task_creation_failure(self):
         result = self.result()
         result.update(
@@ -1222,7 +1273,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.35")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.36")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -3845,6 +3896,176 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 preflight=preflight,
                 requested_model="gpt-5.6-sol",
             )
+
+    def test_exact_completed_no_artifact_results_are_terminal(self):
+        for result_path in (NO_ARTIFACT_383_RESULT, NO_ARTIFACT_20074_RESULT):
+            result = MODULE.load_agent_task_result(result_path)
+            preflight = self.preflight_for_result(result)
+            with self.subTest(task_id=result["task"]["id"]):
+                failure = MODULE.validate_terminal_no_artifact_result(
+                    result,
+                    preflight=preflight,
+                    requested_model="gpt-5.6-sol",
+                )
+                self.assertEqual("malformed_history", failure["code"])
+                self.assertEqual([], result["generated"]["commits"])
+                self.assertIsNone(result["report"]["commit"])
+
+        malformed = MODULE.load_agent_task_result(NO_ARTIFACT_383_RESULT)
+        malformed["generated"]["head_sha"] = "f" * 40
+        with self.assertRaisesRegex(MODULE.WorkflowError, "malformed identity"):
+            MODULE.validate_terminal_no_artifact_result(
+                malformed,
+                preflight=self.preflight_for_result(
+                    MODULE.load_agent_task_result(NO_ARTIFACT_383_RESULT)
+                ),
+                requested_model="gpt-5.6-sol",
+            )
+
+    def test_exact_20050_legacy_validation_result_is_terminal(self):
+        result = MODULE.load_agent_task_result(LEGACY_VALIDATION_20050_RESULT)
+        failure = MODULE.validate_terminal_validation_failure_result(
+            result,
+            preflight=self.preflight_for_result(result),
+            requested_model="gpt-5.6-sol",
+            allow_legacy_policy=True,
+        )
+
+        self.assertEqual("validation_incomplete", failure["code"])
+        self.assertEqual(
+            MODULE.LEGACY_AGENT_TASK_POLICY_V4,
+            result["policy"],
+        )
+
+    def test_new_completed_no_artifact_failure_records_fresh_retry(self):
+        state_path = self.directory / "no-artifact-state.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        result = MODULE.load_agent_task_result(NO_ARTIFACT_383_RESULT)
+        preflight = self.preflight_for_result(result)
+
+        def fail_run(command, **_kwargs):
+            output = Path(command[command.index("--result-file") + 1])
+            output.write_text(json.dumps(result), encoding="utf-8")
+            return MODULE.subprocess.CompletedProcess(command, 1, "", "")
+
+        arguments = self.arguments(state_path)
+        arguments.target = "open-telemetry/shared-workflows#383"
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target(arguments.target),
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_stable_review_preflight",
+                return_value=preflight,
+            ),
+            mock.patch.object(
+                MODULE,
+                "require_live_comments",
+                return_value=preflight["comments"],
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "run", side_effect=fail_run),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "did not contain a worker validation commit",
+            ),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        failed = MODULE.load_state(state_path)["agent_task"]
+        self.assertEqual("terminal_unusable", failed["task_id_status"])
+        self.assertEqual(result["task"]["id"], failed["task_id"])
+        self.assertNotIn("recovery_command", failed)
+        self.assertNotIn("--resume", failed["retry_command"])
+
+    def test_retained_no_artifact_owner_is_archived_before_one_replacement(self):
+        state_path = self.directory / "retained-no-artifact-state.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        prompt = self.directory / "retained-prompt.txt"
+        prompt.write_text("retained prompt\n", encoding="utf-8")
+        result = MODULE.load_agent_task_result(NO_ARTIFACT_383_RESULT)
+        preflight = self.preflight_for_result(result)
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "created_at": MODULE.utc_now(),
+                "iterations": 0,
+                "history": [],
+                "pr": preflight["pr"],
+                "agent_task": {
+                    "run_id": "0c1559094e313d4340dc05cd67660b0f",
+                    "status": "failed",
+                    "model": "gpt-5.6-sol",
+                    "remaining_iterations": 5,
+                    "resume_attempts": 1,
+                    "preflight": preflight,
+                    "prompt_file": str(prompt),
+                    "result_file": str(NO_ARTIFACT_383_RESULT),
+                    "recovery_command": "must-not-survive",
+                },
+            },
+        )
+        arguments = self.arguments(state_path)
+        arguments.target = "open-telemetry/shared-workflows#383"
+        arguments.prepare_only = True
+        arguments.preserve_artifacts = True
+        commands = []
+
+        def stop_after_dispatch(command, **_kwargs):
+            commands.append(command)
+            raise RuntimeError("stop after dispatch")
+
+        patches = (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target(arguments.target),
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_stable_review_preflight",
+                return_value=preflight,
+            ),
+            mock.patch.object(
+                MODULE,
+                "require_live_comments",
+                return_value=preflight["comments"],
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE.secrets, "token_hex", return_value="new-owner"),
+            mock.patch.object(MODULE, "run", side_effect=stop_after_dispatch),
+        )
+        with ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            with self.assertRaisesRegex(RuntimeError, "stop after dispatch"):
+                MODULE.command_agent_task(arguments)
+
+        restarted = MODULE.load_state(state_path)
+        self.assertEqual(1, len(restarted["managed_task_history"]))
+        previous = restarted["managed_task_history"][0]
+        self.assertEqual("terminal_unusable", previous["task_id_status"])
+        self.assertNotIn("recovery_command", previous)
+        self.assertNotIn("--resume", previous["retry_command"])
+        self.assertEqual("new-owner", restarted["agent_task"]["run_id"])
+        self.assertEqual(1, len(commands))
+
+        with ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            with self.assertRaisesRegex(MODULE.WorkflowError, "unfinished Agent Task"):
+                MODULE.command_agent_task(arguments)
+        self.assertEqual(1, len(commands))
 
     def test_exact_v1_missing_trailer_replacement_is_fresh_and_deduplicated(self):
         state_path = self.directory / "missing-trailer-state.json"
