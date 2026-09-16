@@ -1204,7 +1204,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.31")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.32")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -2808,6 +2808,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         apply_args = self.arguments(state_path)
         apply_args.apply_prepared = True
         apply_args.preserve_artifacts = True
+        apply_args.request_review_only = True
         apply_import = mock.Mock(return_value=True)
         replies = mock.Mock(return_value={17: 71})
         resolve = mock.Mock()
@@ -2863,7 +2864,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             mock.patch.object(
                 MODULE, "verify_publish", return_value={"head_matches": True}
             ),
-            mock.patch.object(MODULE, "continue_after_review_request"),
+            mock.patch.object(
+                MODULE, "continue_after_review_request"
+            ) as continuation,
             mock.patch.object(MODULE, "emit"),
         ):
             MODULE.command_agent_task(apply_args)
@@ -2874,6 +2877,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         replies.assert_called_once()
         resolve.assert_called_once()
         request.assert_called_once()
+        self.assertTrue(continuation.call_args.args[0].request_review_only)
         completed = MODULE.load_state(state_path)
         self.assertEqual("completed", completed["agent_task"]["status"])
         self.assertTrue(completed["agent_task"]["artifacts_preserved"])
@@ -3956,7 +3960,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     def test_review_only_rejects_other_recovery_modes(self):
         state_path = self.directory / "review-only-invalid.json"
-        for field in ("resume", "prepare_only", "apply_prepared"):
+        for field in ("resume", "prepare_only"):
             arguments = self.arguments(state_path)
             arguments.request_review_only = True
             setattr(arguments, field, True)

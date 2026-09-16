@@ -5227,10 +5227,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
         raise WorkflowError(
             "--apply-prepared cannot be combined with --resume or --prepare-only"
         )
-    if request_review_only and (args.resume or prepare_only or apply_prepared):
+    if request_review_only and (args.resume or prepare_only):
         raise WorkflowError(
             "--request-review-only cannot be combined with --resume, "
-            "--prepare-only, or --apply-prepared"
+            "or --prepare-only"
         )
     if prepare_only and not preserve_artifacts:
         raise WorkflowError("--prepare-only requires --preserve-artifacts")

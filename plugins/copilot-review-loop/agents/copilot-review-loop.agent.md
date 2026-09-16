@@ -39,6 +39,8 @@ When the user requires a separate mutation authorization, run `agent-task` with 
 
 When authorization covers only one fresh Copilot review request, run `agent-task` with `--request-review-only`. The coordinator deduplicates an existing request, monitors it with the normal bounded watcher, records current-head clearance when the review is clean, and otherwise persists and returns the exact new bot comments and identities. It never launches a managed task in this mode. Preparing or applying fixes requires a separate invocation and authorization.
 
+When apply authorization also covers exactly one subsequent review request, combine `--apply-prepared` with `--request-review-only`. The coordinator imports, publishes, replies to and resolves only the prepared threads, then monitors one review without dispatching another task.
+
 If the bounded wait expires, the saved monitor remains requested. A later hash-gated recovery resumes that request instead of asking GitHub for another review.
 
 When a later review produces new findings, the coordinator archives the completed owner before starting the separately authorized preparation task.
