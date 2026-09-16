@@ -1,0 +1,10 @@
+{
+  "__typename": "CheckRun",
+  "completedAt": "2026-09-16T07:30:04Z",
+  "conclusion": "FAILURE",
+  "detailsUrl": "https://github.com/open-telemetry/shared-workflows/runs/104705281292",
+  "name": "zizmor",
+  "startedAt": "2026-09-16T07:30:01Z",
+  "status": "COMPLETED",
+  "workflowName": ""
+}

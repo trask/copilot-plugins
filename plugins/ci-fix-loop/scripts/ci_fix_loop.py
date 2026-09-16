@@ -2708,7 +2708,11 @@ def parse_run_reference(url: Any) -> dict[str, int] | None:
 def check_run_reference(check: dict[str, Any]) -> dict[str, int] | None:
     if check.get("kind") != "check_run":
         return None
-    return parse_run_reference(check.get("url"))
+    reference = parse_run_reference(check.get("url"))
+    if reference is None or "run_id" in reference:
+        return reference
+    workflow = check.get("workflow")
+    return reference if isinstance(workflow, str) and workflow.strip() else None
 
 
 def resolve_run_id(pr: dict[str, Any], reference: dict[str, int]) -> int:

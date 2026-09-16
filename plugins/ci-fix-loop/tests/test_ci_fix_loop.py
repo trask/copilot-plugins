@@ -17,6 +17,9 @@ from unittest import mock
 SCRIPT = Path(__file__).parents[1] / "scripts" / "ci_fix_loop.py"
 AGENT = Path(__file__).parents[1] / "agents" / "ci-fix-loop.agent.md"
 PLUGIN = Path(__file__).parents[1] / "plugin.json"
+EXTERNAL_ZIZMOR_CHECK = (
+    Path(__file__).parent / "fixtures" / "external-zizmor-check-run.json"
+)
 SPEC = importlib.util.spec_from_file_location("ci_fix_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -1117,7 +1120,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.20", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.21", json.loads(PLUGIN.read_text())["version"])
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1173,6 +1176,17 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         with mock.patch.object(MODULE, "resolve_run_id") as resolve:
             content = MODULE.fetch_failed_check_log(self.preflight["pr"], check)
 
+        self.assertEqual("", content)
+        resolve.assert_not_called()
+
+    def test_external_check_run_page_never_resolves_an_actions_job(self):
+        node = json.loads(EXTERNAL_ZIZMOR_CHECK.read_text(encoding="utf-8"))
+        check = MODULE.normalize_rollup([node])[0]
+        with mock.patch.object(MODULE, "resolve_run_id") as resolve:
+            content = MODULE.fetch_failed_check_log(self.preflight["pr"], check)
+
+        self.assertEqual("check_run", check["kind"])
+        self.assertIsNone(check["workflow"])
         self.assertEqual("", content)
         resolve.assert_not_called()
 
@@ -3276,6 +3290,23 @@ class RunReferenceTest(unittest.TestCase):
     def test_reads_a_legacy_job_url(self):
         reference = MODULE.parse_run_reference("https://github.com/o/r/runs/99")
         self.assertEqual({"job_id": 99}, reference)
+
+    def test_legacy_job_lookup_requires_check_run_workflow_provenance(self):
+        url = "https://github.com/o/r/runs/99"
+        self.assertEqual(
+            {"job_id": 99},
+            MODULE.check_run_reference(
+                {"kind": "check_run", "workflow": "CI", "url": url}
+            ),
+        )
+        for check in (
+            {"workflow": "CI", "url": url},
+            {"kind": "check_run", "workflow": None, "url": url},
+            {"kind": "check_run", "workflow": "", "url": url},
+            {"kind": "status", "workflow": "CI", "url": url},
+        ):
+            with self.subTest(check=check):
+                self.assertIsNone(MODULE.check_run_reference(check))
 
     def test_an_external_url_has_no_run(self):
         self.assertIsNone(MODULE.parse_run_reference("https://ci.example.com/build/1"))
