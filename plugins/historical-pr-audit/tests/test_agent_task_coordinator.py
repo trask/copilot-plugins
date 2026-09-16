@@ -56,7 +56,7 @@ def result(commits=None):
         "requested_model": "gpt-5.6-sol",
         "policy": {
             "id": "marketplace-agent-apply-report-worker",
-            "version": 2,
+            "version": 3,
             "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
         },
         "task": {
@@ -72,8 +72,8 @@ def result(commits=None):
             "commits": commits,
         },
         "application": {
-            "status": "applied" if commits else "no_changes",
-            "final_local_head": commits[-1] if commits else METADATA["head_sha"],
+            "status": "not_applied",
+            "final_local_head": METADATA["head_sha"],
         },
         "report": {
             "path": ".github/agent-task-reports/request-1.md",
@@ -177,11 +177,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pins_shared_helper_and_policy_integrity(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "1200143af74493935e8655e993a7de9187357e770b3f540051a3fbde5658d9d4",
+            "ce12f19bd6dd547945e319b2db612533090daa1782f4c3def8ff62cd85cf3c6a",
         )
         self.assertEqual(
             MODULE.AGENT_TASK_POLICY_SHA256,
-            "411a9ba9a0931d40c685c6233639b15c31e0d6daa4b29706527424016367cad2",
+            "7d48868140710139939cabc803a99f2122305e97dedbffa747e5f69903c16af1",
         )
 
     def test_prompt_is_versioned_untrusted_and_remote_only(self):
@@ -244,7 +244,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "--result-file",
             str(first_result),
             "--policy",
-            "marketplace-agent-apply-report-worker@2",
+            "marketplace-agent-apply-report-worker@3",
         ]
         self.assertEqual(
             MODULE.agent_task_command(
@@ -378,6 +378,24 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     metadata=METADATA,
                     requested_model="gpt-5.6-sol",
                 )
+
+    def test_accepts_strict_legacy_v2_success_without_a_second_import(self):
+        commit = "6" * 40
+        legacy = result([commit])
+        legacy["policy"] = MODULE.LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2
+        legacy["application"] = {
+            "status": "applied",
+            "final_local_head": commit,
+        }
+
+        remote = MODULE.validate_success_result(
+            legacy,
+            metadata=METADATA,
+            requested_model="gpt-5.6-sol",
+        )
+
+        self.assertFalse(remote["requires_apply"])
+        self.assertEqual(remote["final_local_head"], commit)
 
     def test_report_binds_body_history_paths_and_pipeline(self):
         validated = MODULE.validate_audit_report(
@@ -584,7 +602,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             responses = [
                 (130, first),
                 (0, success),
-                (0, success),
             ]
 
             def execute(
@@ -669,15 +686,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 self.assertEqual(failed["agent_task"]["task"]["id"], "task-1")
                 MODULE.command_agent_task(args)
 
-            self.assertEqual(len(command_calls), 3)
+            self.assertEqual(len(command_calls), 2)
             first_path, first_prior = command_calls[0]
             second_path, second_prior = command_calls[1]
-            third_path, third_prior = command_calls[2]
             self.assertIsNone(first_prior)
             self.assertEqual(second_prior, first_path)
             self.assertNotEqual(second_path, first_path)
-            self.assertEqual(third_prior, second_path)
-            self.assertNotEqual(third_path, second_path)
 
     def test_publication_failure_keeps_artifacts_for_idempotent_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -729,11 +743,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertFalse(prompt.exists())
             self.assertFalse(result_path.exists())
 
-    def test_import_rejects_merge_unexpected_paths_and_bad_body(self):
+    def test_import_rejects_merge_and_unexpected_paths(self):
         commit = "6" * 40
-        valid_body = "Fix historical finding\n\nFinding: finding-1\n"
 
-        def run_case(parents, paths, body, identity=None):
+        def run_case(parents, paths):
             def fake_git(_repo, *arguments):
                 if arguments[:3] == ("rev-list", "--reverse", "--topo-order"):
                     return commit
@@ -741,23 +754,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     return parents
                 if arguments[0] == "diff-tree":
                     return paths
-                if arguments[:3] == ("show", "-s", "--format=%B"):
-                    return body
                 raise AssertionError(arguments)
 
-            with (
-                mock.patch.object(
-                    MODULE,
-                    "local_identity",
-                    return_value=identity
-                    or {
-                        "branch": "trask-pr-audit-7",
-                        "head": commit,
-                        "status": "",
-                    },
-                ),
-                mock.patch.object(MODULE, "git", side_effect=fake_git),
-            ):
+            with mock.patch.object(MODULE, "git", side_effect=fake_git):
                 MODULE.validate_imported_commits(
                     Path("."),
                     base_sha=METADATA["head_sha"],
@@ -773,41 +772,15 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     },
                 )
 
-        run_case(f"{commit} {METADATA['head_sha']}", "app.py", valid_body)
+        run_case(f"{commit} {METADATA['head_sha']}", "app.py")
         invalid = (
-            (
-                f"{commit} {METADATA['head_sha']} {'7' * 40}",
-                "app.py",
-                valid_body,
-                None,
-            ),
-            (f"{commit} {METADATA['head_sha']}", "other.py", valid_body, None),
-            (f"{commit} {METADATA['head_sha']}", "app.py", "Fix app", None),
-            (
-                f"{commit} {METADATA['head_sha']}",
-                "app.py",
-                valid_body,
-                {
-                    "branch": "trask-pr-audit-7",
-                    "head": commit,
-                    "status": " M app.py",
-                },
-            ),
-            (
-                f"{commit} {METADATA['head_sha']}",
-                "app.py",
-                valid_body,
-                {
-                    "branch": "trask-pr-audit-7",
-                    "head": "8" * 40,
-                    "status": "",
-                },
-            ),
+            (f"{commit} {METADATA['head_sha']} {'7' * 40}", "app.py"),
+            (f"{commit} {METADATA['head_sha']}", "other.py"),
         )
-        for parents, paths, body, identity in invalid:
+        for parents, paths in invalid:
             with self.subTest(parents=parents, paths=paths):
                 with self.assertRaises(MODULE.WorkflowError):
-                    run_case(parents, paths, body, identity)
+                    run_case(parents, paths)
 
 
 if __name__ == "__main__":

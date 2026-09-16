@@ -42,6 +42,7 @@ class WindowsSubprocessTest(unittest.TestCase):
             MODULE.run(["git"])
 
         self.assertEqual(run.call_args.kwargs["creationflags"], 0x08000000)
+        self.assertEqual(run.call_args.kwargs["env"]["PYTHONIOENCODING"], "utf-8")
 
     def test_run_bytes_hides_windows_console_processes(self):
         completed = MODULE.subprocess.CompletedProcess(["git"], 0, b"", b"")
@@ -1219,7 +1220,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def result(self, *, commits=None):
         commits = [] if commits is None else commits
         request_id = "request-1"
-        final_head = commits[-1] if commits else self.head
         return {
             "schema": MODULE.AGENT_TASK_RESULT_SCHEMA,
             "status": "success",
@@ -1229,7 +1229,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "requested_model": "gpt-5.6-sol",
             "policy": {
                 "id": "marketplace-agent-apply-report-worker",
-                "version": 2,
+                "version": 3,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -1245,8 +1245,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "commits": commits,
             },
             "application": {
-                "status": "applied" if commits else "no_changes",
-                "final_local_head": final_head,
+                "status": "not_applied",
+                "final_local_head": self.head,
             },
             "report": {
                 "path": f".github/agent-task-reports/{request_id}.md",
@@ -1344,14 +1344,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-apply-report-worker@2", instructions)
+        self.assertIn("marketplace-agent-apply-report-worker@3", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("marketplace `custom_agent`", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.15")
+        self.assertEqual(plugin["version"], "1.3.16")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -1373,7 +1373,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("worker prompt version 2", prompt)
         self.assertIn("maximum_review_iterations", prompt)
         self.assertIn("untrusted data", prompt)
-        self.assertIn("`Finding: <identifier>`", prompt)
+        self.assertIn("Map every fix commit to its findings in the report", prompt)
+        self.assertNotIn("`Finding: <identifier>`", prompt)
         self.assertIn("explicit no-change result", prompt)
         self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
         self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
@@ -1480,7 +1481,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 remote=remote,
             )
 
-    def test_rejects_uncorrelated_fix_commits_and_unexpected_history(self):
+    def test_accepts_trailerless_fix_commits_and_rejects_unexpected_history(self):
         fix = "5" * 40
         remote = self.remote(commits=[fix])
         with (
@@ -1511,7 +1512,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     ["src/app.py"],
                 ],
             ),
-            self.assertRaisesRegex(MODULE.WorkflowError, "finding correlation"),
         ):
             MODULE.validate_generated_history(
                 self.repo_root,

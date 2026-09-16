@@ -48,15 +48,20 @@ PROPAGATION_CONTAINMENT_RETRY_DELAYS = (1, 2, 4)
 EMPTY_RERUN_COMMIT_MESSAGE = "ci: rerun checks"
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "1200143af74493935e8655e993a7de9187357e770b3f540051a3fbde5658d9d4"
+    "ce12f19bd6dd547945e319b2db612533090daa1782f4c3def8ff62cd85cf3c6a"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
 CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
-AGENT_TASK_POLICY = "marketplace-agent-apply-report-worker@2"
+AGENT_TASK_POLICY = "marketplace-agent-apply-report-worker@3"
 AGENT_TASK_POLICY_SHA256 = (
-    "411a9ba9a0931d40c685c6233639b15c31e0d6daa4b29706527424016367cad2"
+    "7d48868140710139939cabc803a99f2122305e97dedbffa747e5f69903c16af1"
 )
+LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2 = {
+    "id": "marketplace-agent-apply-report-worker",
+    "version": 2,
+    "sha256": "411a9ba9a0931d40c685c6233639b15c31e0d6daa4b29706527424016367cad2",
+}
 AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
     "version": 2,
@@ -83,7 +88,6 @@ REPORT_PATH_PATTERN = re.compile(
 RECEIPT_PATH_PATTERN = re.compile(
     r"^\.github/agent-task-validations/(?P<request_id>[A-Za-z0-9][A-Za-z0-9._-]*)\.json$"
 )
-FIX_COMMIT_CORRELATION_FIELD = "Finding"
 PR_URL_PATTERN = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
     r"/?(?:#\S*)?$"
@@ -327,6 +331,7 @@ def windows_no_window_options() -> dict[str, int]:
 
 def subprocess_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
     environment = {**os.environ, **(extra or {})}
+    environment["PYTHONIOENCODING"] = "utf-8"
     try:
         count = int(environment.get("GIT_CONFIG_COUNT", "0"))
     except ValueError as error:
@@ -4571,7 +4576,7 @@ def build_worker_prompt(
         "requested_model": requested_model,
         "policy": {
             "id": "marketplace-agent-apply-report-worker",
-            "version": 2,
+            "version": 3,
             "sha256": AGENT_TASK_POLICY_SHA256,
         },
         "iteration_allowance": iteration_allowance,
@@ -4618,8 +4623,8 @@ def build_worker_prompt(
         "Make the smallest complete fix, format it, and run every focused validation "
         "relevant to each observed failure. Describe validation commands and outcomes "
         "in the report for audit, but treat final GitHub checks as authoritative. Put "
-        "each independent fix in a linear single-parent commit. Give every fix commit a "
-        "concise normal message with one nonempty `Finding: <identifier>` line. Do not "
+        "each independent fix in a linear single-parent commit and map it to its "
+        "failures in the report. Do not "
         "change the report path in a fix commit. Create no "
         "fix commit for a flake, pre-existing failure, unfixable failure, or no-op.\n\n"
         "The managed apply-with-report contract creates the final report "
@@ -4710,9 +4715,10 @@ def validate_task_creation_failure_result(
 ) -> dict[str, str]:
     expected_policy = {
         "id": "marketplace-agent-apply-report-worker",
-        "version": 2,
+        "version": 3,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
+    policy = result.get("policy")
     task = result.get("task")
     generated = result.get("generated")
     application = result.get("application")
@@ -4722,7 +4728,7 @@ def validate_task_creation_failure_result(
         result.get("status") != "error"
         or result.get("mode") != "apply_with_report"
         or result.get("requested_model") != requested_model
-        or result.get("policy") != expected_policy
+        or policy not in (expected_policy, LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2)
         or result.get("repository")
         != {"name_with_owner": preflight["pr"]["repo_name"]}
         or result.get("pull_request") != expected_cloud_pull_request(preflight)
@@ -4763,7 +4769,7 @@ def validate_recovery_result_identity(
     pr = preflight["pr"]
     expected_policy = {
         "id": "marketplace-agent-apply-report-worker",
-        "version": 2,
+        "version": 3,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     task = result.get("task")
@@ -4839,15 +4845,17 @@ def validate_success_result(
 ) -> dict[str, Any]:
     expected_policy = {
         "id": "marketplace-agent-apply-report-worker",
-        "version": 2,
+        "version": 3,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
+    policy = result.get("policy")
+    legacy_applied = policy == LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2
     if (
         result.get("status") != "success"
         or result.get("error") is not None
         or result.get("mode") != "apply_with_report"
         or result.get("requested_model") != requested_model
-        or result.get("policy") != expected_policy
+        or policy not in (expected_policy, LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2)
         or result.get("repository")
         != {"name_with_owner": preflight["pr"]["repo_name"]}
         or result.get("pull_request") != expected_cloud_pull_request(preflight)
@@ -4907,16 +4915,23 @@ def validate_success_result(
     )
     commits = generated["commits"]
     expected_local_head = commits[-1] if commits else pr["head_sha"]
+    expected_application = (
+        {
+            "status": "applied" if commits else "no_changes",
+            "final_local_head": expected_local_head,
+        }
+        if legacy_applied
+        else {
+            "status": "not_applied",
+            "final_local_head": pr["head_sha"],
+        }
+    )
     if (
         report_match is None
         or report.get("commit") != generated["head_sha"]
         or not isinstance(report.get("sha256"), str)
         or not re.fullmatch(r"[0-9a-f]{64}", report["sha256"])
-        or application
-        != {
-            "status": "applied" if commits else "no_changes",
-            "final_local_head": expected_local_head,
-        }
+        or application != expected_application
     ):
         raise WorkflowError(
             "Agent Task application, report, or structural attestation is malformed"
@@ -4929,6 +4944,7 @@ def validate_success_result(
         "generated_head": generated["head_sha"],
         "commits": commits,
         "final_local_head": expected_local_head,
+        "requires_apply": not legacy_applied,
         "report_path": report["path"],
         "report_sha256": report["sha256"],
         "structural_attestation": True,
@@ -5135,18 +5151,60 @@ def validate_generated_history(
         if any(path.startswith(reserved) for path in paths):
             raise WorkflowError(f"fix commit {commit} changed an Agent Task artifact")
         changed.update(paths)
-        message = git(repo_root, "show", "-s", "--format=%B", commit)
-        if (
-            re.search(
-                rf"(?m)^{FIX_COMMIT_CORRELATION_FIELD}:[ \t]*\S", message
-            )
-            is None
-        ):
-            raise WorkflowError(
-                f"fix commit {commit} does not contain a finding correlation"
-            )
     if sorted(changed) != expected_paths:
         raise WorkflowError("fix commits changed unexpected or unreported paths")
+
+
+def apply_verified_import(
+    repo_root: Path,
+    *,
+    result_path: Path,
+    result_sha256: str,
+    report_content: str,
+    preflight: dict[str, Any],
+    remote: dict[str, Any],
+) -> bool:
+    if sha256_file(result_path) != result_sha256:
+        raise WorkflowError("Agent Task result changed after report validation")
+    if sha256_text(report_content) != remote["report_sha256"]:
+        raise WorkflowError("Agent Task report changed after report validation")
+    identity = local_identity(repo_root)
+    expected_branch = preflight["identity"]["branch"]
+    source_head = preflight["pr"]["head_sha"]
+    final_head = remote["final_local_head"]
+    if identity["branch"] != expected_branch or identity["status"]:
+        raise WorkflowError(
+            "local repository identity drifted before verified import"
+        )
+    if identity["head"] == final_head:
+        return False
+    if not remote["requires_apply"]:
+        raise WorkflowError(
+            "legacy Agent Task result claims an import that is not present locally"
+        )
+    if identity["head"] != source_head:
+        raise WorkflowError(
+            "local HEAD is neither the pinned source nor verified final commit"
+        )
+    if remote["commits"]:
+        run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "merge",
+                "--ff-only",
+                final_head,
+            ]
+        )
+    final_identity = local_identity(repo_root)
+    if (
+        final_identity["branch"] != expected_branch
+        or final_identity["status"]
+        or final_identity["head"] != final_head
+    ):
+        raise WorkflowError("verified Agent Task import did not reach the expected HEAD")
+    return bool(remote["commits"])
 
 
 def require_live_pr_snapshot(
@@ -5720,6 +5778,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             raise
     try:
         result = load_agent_task_result(result_path)
+        result_sha256 = sha256_file(result_path)
         if result.get("status") != "success":
             result_task = result.get("task")
             result_task_id = (
@@ -5790,13 +5849,18 @@ def command_agent_task(args: argparse.Namespace) -> None:
         )
         save_state(state_path, state)
         identity = local_identity(repo_root)
+        allowed_local_heads = (
+            {pr["head_sha"], remote["final_local_head"]}
+            if remote["requires_apply"]
+            else {remote["final_local_head"]}
+        )
         if (
             identity["branch"] != preflight["identity"]["branch"]
             or identity["status"]
-            or identity["head"] != remote["final_local_head"]
+            or identity["head"] not in allowed_local_heads
         ):
             raise WorkflowError(
-                "local repository identity drifted outside the verified Agent Task import"
+                "local repository identity drifted before report validation"
             )
         report_content = fetch_committed_text(
             pr["repo_name"],
@@ -5829,7 +5893,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         require_live_pr_snapshot(pr, live, expected_head=live["head_sha"])
         task_state.update(
             {
-                "status": "validated",
+                "status": "validated_pending_import",
                 "task_id": remote["task_id"],
                 "task_url": remote["task_url"],
                 "generated_branch": remote["generated_branch"],
@@ -5837,9 +5901,22 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "ordered_commits": remote["commits"],
                 "report_path": remote["report_path"],
                 "structural_attestation": True,
+                "result_sha256": result_sha256,
                 "validated_at": utc_now(),
             }
         )
+        save_state(state_path, state)
+        imported = apply_verified_import(
+            repo_root,
+            result_path=result_path,
+            result_sha256=result_sha256,
+            report_content=report_content,
+            preflight=preflight,
+            remote=remote,
+        )
+        task_state["status"] = "validated"
+        task_state["imported"] = imported
+        task_state["imported_head_sha"] = remote["final_local_head"]
         save_state(state_path, state)
 
         published_head = task_state.get("published_head_sha")

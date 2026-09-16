@@ -108,14 +108,14 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "1200143af74493935e8655e993a7de9187357e770b3f540051a3fbde5658d9d4"
+    "ce12f19bd6dd547945e319b2db612533090daa1782f4c3def8ff62cd85cf3c6a"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
 CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
-AGENT_TASK_POLICY = "marketplace-agent-apply-report-worker@2"
+AGENT_TASK_POLICY = "marketplace-agent-apply-report-worker@3"
 AGENT_TASK_POLICY_SHA256 = (
-    "411a9ba9a0931d40c685c6233639b15c31e0d6daa4b29706527424016367cad2"
+    "7d48868140710139939cabc803a99f2122305e97dedbffa747e5f69903c16af1"
 )
 LEGACY_AGENT_TASK_POLICY_V4 = {
     "id": "marketplace-agent-worker",
@@ -131,6 +131,11 @@ LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V1 = {
     "id": "marketplace-agent-apply-report-worker",
     "version": 1,
     "sha256": "ea61b3edb7eb56b262d80eccb3b6a7e20a2167d5ca4381db66b7663bca33dd78",
+}
+LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2 = {
+    "id": "marketplace-agent-apply-report-worker",
+    "version": 2,
+    "sha256": "411a9ba9a0931d40c685c6233639b15c31e0d6daa4b29706527424016367cad2",
 }
 AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
@@ -174,6 +179,7 @@ def windows_no_window_options() -> dict[str, int]:
 
 def subprocess_environment() -> dict[str, str]:
     environment = dict(os.environ)
+    environment["PYTHONIOENCODING"] = "utf-8"
     try:
         count = int(environment.get("GIT_CONFIG_COUNT", "0"))
     except ValueError as error:
@@ -2741,7 +2747,7 @@ def validate_structural_recovery_result(
         or result.get("policy")
         != {
             "id": "marketplace-agent-apply-report-worker",
-            "version": 2,
+            "version": 3,
             "sha256": AGENT_TASK_POLICY_SHA256,
         }
         or result.get("repository") != {"name_with_owner": pr["repo_name"]}
@@ -2822,7 +2828,7 @@ def validate_task_creation_failure_result(
 ) -> dict[str, str]:
     expected_policy = {
         "id": "marketplace-agent-apply-report-worker",
-        "version": 2,
+        "version": 3,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     task = result.get("task")
@@ -3079,15 +3085,17 @@ def validate_success_result(
 ) -> dict[str, Any]:
     expected_policy = {
         "id": "marketplace-agent-apply-report-worker",
-        "version": 2,
+        "version": 3,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
+    policy = result.get("policy")
+    legacy_applied = policy == LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2
     if (
         result.get("status") != "success"
         or result.get("error") is not None
         or result.get("mode") != "apply_with_report"
         or result.get("requested_model") != requested_model
-        or result.get("policy") != expected_policy
+        or policy not in (expected_policy, LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2)
         or result.get("repository") != {"name_with_owner": preflight["pr"]["repo_name"]}
         or result.get("pull_request") != expected_cloud_pull_request(preflight)
     ):
@@ -3156,16 +3164,23 @@ def validate_success_result(
     )
     commits = generated["commits"]
     expected_local_head = commits[-1] if commits else pr["head_sha"]
+    expected_application = (
+        {
+            "status": "applied" if commits else "no_changes",
+            "final_local_head": expected_local_head,
+        }
+        if legacy_applied
+        else {
+            "status": "not_applied",
+            "final_local_head": pr["head_sha"],
+        }
+    )
     if (
         report_match is None
         or report.get("commit") != generated["head_sha"]
         or not isinstance(report.get("sha256"), str)
         or not re.fullmatch(r"[0-9a-f]{64}", report["sha256"])
-        or application
-        != {
-            "status": "applied" if commits else "no_changes",
-            "final_local_head": expected_local_head,
-        }
+        or application != expected_application
     ):
         raise WorkflowError(
             "Agent Task application, report, or structural attestation is malformed"
@@ -3178,6 +3193,7 @@ def validate_success_result(
         "generated_head": generated["head_sha"],
         "commits": commits,
         "final_local_head": expected_local_head,
+        "requires_apply": not legacy_applied,
         "report_path": report["path"],
         "report_sha256": report["sha256"],
         "structural_attestation": True,
@@ -3276,6 +3292,58 @@ def validate_generated_history(
     return paths_by_commit
 
 
+def apply_verified_import(
+    repo_root: Path,
+    *,
+    result_path: Path,
+    result_sha256: str,
+    report_content: str,
+    preflight: dict[str, Any],
+    remote: dict[str, Any],
+) -> bool:
+    if sha256_file(result_path) != result_sha256:
+        raise WorkflowError("Agent Task result changed after report validation")
+    if sha256_text(report_content) != remote["report_sha256"]:
+        raise WorkflowError("Agent Task report changed after report validation")
+    identity = local_identity(repo_root)
+    expected_branch = preflight["identity"]["branch"]
+    source_head = preflight["pr"]["head_sha"]
+    final_head = remote["final_local_head"]
+    if identity["branch"] != expected_branch or identity["status"]:
+        raise WorkflowError(
+            "local repository identity drifted before verified import"
+        )
+    if identity["head"] == final_head:
+        return False
+    if not remote["requires_apply"]:
+        raise WorkflowError(
+            "legacy Agent Task result claims an import that is not present locally"
+        )
+    if identity["head"] != source_head:
+        raise WorkflowError(
+            "local HEAD is neither the pinned source nor verified final commit"
+        )
+    if remote["commits"]:
+        run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "merge",
+                "--ff-only",
+                final_head,
+            ]
+        )
+    final_identity = local_identity(repo_root)
+    if (
+        final_identity["branch"] != expected_branch
+        or final_identity["status"]
+        or final_identity["head"] != final_head
+    ):
+        raise WorkflowError("verified Agent Task import did not reach the expected HEAD")
+    return bool(remote["commits"])
+
+
 def validate_copilot_review_report(
     content: str,
     *,
@@ -3286,6 +3354,19 @@ def validate_copilot_review_report(
 ) -> dict[str, Any]:
     require_no_credentials(content, source="Copilot Review Loop report")
     report = parse_markdown_report(content, description="Copilot Review Loop report")
+    if isinstance(report, dict) and set(report) == {
+        "comments",
+        "fix_commits",
+        "head_sha",
+        "pr_number",
+    }:
+        report = normalize_path_correlated_review_report(
+            report,
+            request_id=request_id,
+            preflight=preflight,
+            remote=remote,
+            paths_by_commit=paths_by_commit,
+        )
     expected_keys = {
         "schema",
         "request_id",
@@ -3367,6 +3448,147 @@ def validate_copilot_review_report(
     if bool(remote["commits"]) != (report["outcome"] == "addressed"):
         raise WorkflowError("report outcome does not match its fix commits")
     return report
+
+
+def normalize_path_correlated_review_report(
+    report: dict[str, Any],
+    *,
+    request_id: str,
+    preflight: dict[str, Any],
+    remote: dict[str, Any],
+    paths_by_commit: dict[str, list[str]],
+) -> dict[str, Any]:
+    pr = preflight["pr"]
+    comments = report.get("comments")
+    fix_commits = report.get("fix_commits")
+    if (
+        report.get("head_sha") != pr["head_sha"]
+        or report.get("pr_number") != pr["number"]
+        or not isinstance(comments, list)
+        or len(comments) != len(preflight["comment_identities"])
+        or not isinstance(fix_commits, list)
+        or len(fix_commits) != len(remote["commits"])
+    ):
+        raise WorkflowError(
+            "Copilot Review Loop path-correlated report has stale identity"
+        )
+    commit_paths: dict[str, list[str]] = {}
+    for expected_commit, item in zip(remote["commits"], fix_commits):
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"sha", "changed_paths"}
+            or item.get("sha") != expected_commit
+            or item.get("changed_paths") != paths_by_commit.get(expected_commit)
+        ):
+            raise WorkflowError(
+                "Copilot Review Loop path-correlated report has malformed fix commits"
+            )
+        commit_paths[expected_commit] = item["changed_paths"]
+    normalized_comments: list[dict[str, Any]] = []
+    accounted_commits: list[str] = []
+    expected_item_keys = {
+        "body_sha256",
+        "changed_paths",
+        "comment_id",
+        "disposition",
+        "line",
+        "original_line",
+        "original_start_line",
+        "path",
+        "review_id",
+        "source",
+        "start_line",
+        "thread_id",
+        "url",
+    }
+    for expected, item in zip(preflight["comment_identities"], comments):
+        if (
+            not isinstance(item, dict)
+            or set(item) != expected_item_keys
+            or item.get("source") != "copilot-pull-request-reviewer"
+            or {
+                **{
+                    key: item.get(key)
+                    for key in expected
+                    if key not in {"id", "source"}
+                },
+                "id": item.get("comment_id"),
+                "source": "thread",
+            }
+            != expected
+            or item.get("disposition") not in {"fixed", "no_change"}
+            or not isinstance(item.get("changed_paths"), list)
+        ):
+            raise WorkflowError(
+                "Copilot Review Loop path-correlated report has a mismatched comment"
+            )
+        paths = item["changed_paths"]
+        if any(
+            not isinstance(path, str)
+            or not path
+            or Path(path).is_absolute()
+            or ".." in Path(path).parts
+            for path in paths
+        ) or len(paths) != len(set(paths)):
+            raise WorkflowError(
+                "Copilot Review Loop path-correlated report has invalid paths"
+            )
+        if item["disposition"] == "fixed":
+            matches = [
+                commit
+                for commit, expected_paths in commit_paths.items()
+                if expected_paths == paths
+            ]
+            if len(matches) != 1:
+                raise WorkflowError(
+                    "Copilot Review Loop path-correlated report has ambiguous "
+                    "finding-to-commit mapping"
+                )
+            commit = matches[0]
+            if commit not in accounted_commits:
+                accounted_commits.append(commit)
+            reason = (
+                "The managed task mapped this finding to the verified changed "
+                f"paths in commit {commit}."
+            )
+            reply = "The fix was verified against the reported changed paths."
+        else:
+            if paths:
+                raise WorkflowError(
+                    "Copilot Review Loop no-change finding has changed paths"
+                )
+            commit = None
+            reason = "The managed task reported that this finding needs no code change."
+            reply = "No code change was needed."
+        normalized_comments.append(
+            {
+                **expected,
+                "disposition": item["disposition"],
+                "reason": reason,
+                "commit": commit,
+                "reply": reply,
+                "changed_paths": paths,
+            }
+        )
+    if accounted_commits != remote["commits"]:
+        raise WorkflowError(
+            "Copilot Review Loop path-correlated report does not account for "
+            "every fix commit"
+        )
+    return {
+        "schema": COPILOT_REVIEW_REPORT_SCHEMA,
+        "request_id": request_id,
+        "repository": pr["repo_name"],
+        "pull_request": {
+            "number": pr["number"],
+            "head_sha": pr["head_sha"],
+            "base_sha": pr["base_sha"],
+            "title_sha256": sha256_text(pr["title"]),
+            "body_sha256": sha256_text(pr["body"]),
+        },
+        "outcome": "addressed" if remote["commits"] else "no_changes",
+        "comments": normalized_comments,
+    }
 
 
 def require_live_pr_snapshot(
@@ -4550,6 +4772,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 )
             result = load_agent_task_result(result_path)
         task_state["result_file"] = str(result_path)
+        result_sha256 = sha256_file(result_path)
         task_state.pop("pending_result_file", None)
         task_state.update(
             {
@@ -4636,13 +4859,18 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "Agent Task recovery returned a replacement task or generated branch"
             )
         identity = local_identity(repo_root)
+        allowed_local_heads = (
+            {pr["head_sha"], remote["final_local_head"]}
+            if remote["requires_apply"]
+            else {remote["final_local_head"]}
+        )
         if (
             identity["branch"] != preflight["identity"]["branch"]
             or identity["status"]
-            or identity["head"] != remote["final_local_head"]
+            or identity["head"] not in allowed_local_heads
         ):
             raise WorkflowError(
-                "local repository identity drifted outside the verified Agent Task import"
+                "local repository identity drifted before report validation"
             )
         paths_by_commit = validate_generated_history(
             repo_root, base_sha=pr["head_sha"], remote=remote
@@ -4664,7 +4892,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         )
         task_state.update(
             {
-                "status": "validated",
+                "status": "validated_pending_import",
                 "task_id": remote["task_id"],
                 "task_url": remote["task_url"],
                 "generated_branch": remote["generated_branch"],
@@ -4673,9 +4901,22 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "report_path": remote["report_path"],
                 "structural_attestation": True,
                 "comments": report["comments"],
+                "result_sha256": result_sha256,
                 "validated_at": utc_now(),
             }
         )
+        save_state(state_path, state)
+        imported = apply_verified_import(
+            repo_root,
+            result_path=result_path,
+            result_sha256=result_sha256,
+            report_content=report_content,
+            preflight=preflight,
+            remote=remote,
+        )
+        task_state["status"] = "validated"
+        task_state["imported"] = imported
+        task_state["imported_head_sha"] = remote["final_local_head"]
         save_state(state_path, state)
 
         published_head = task_state.get("published_head_sha")

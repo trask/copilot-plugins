@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -34,6 +35,14 @@ MISSING_FINDING_TRAILER_RESULT = (
     / "fixtures"
     / "missing-finding-trailer-agent-task-result.json"
 )
+APPLIED_PATH_CORRELATED_V2_RESULT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "applied-path-correlated-v2-agent-task-result.json"
+)
+PATH_CORRELATED_V2_REPORT = (
+    Path(__file__).parent / "fixtures" / "path-correlated-v2-report.md"
+)
 SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -59,6 +68,7 @@ class WindowsSubprocessTest(unittest.TestCase):
 
         self.assertEqual(subprocess_run.call_args.kwargs["creationflags"], 0x08000000)
         environment = subprocess_run.call_args.kwargs["env"]
+        self.assertEqual(environment["PYTHONIOENCODING"], "utf-8")
         index = int(environment["GIT_CONFIG_COUNT"]) - 1
         self.assertEqual(environment[f"GIT_CONFIG_KEY_{index}"], "core.hooksPath")
         self.assertEqual(environment[f"GIT_CONFIG_VALUE_{index}"], os.devnull)
@@ -74,6 +84,16 @@ class WindowsSubprocessTest(unittest.TestCase):
             MODULE.run(["git"])
 
         self.assertNotIn("creationflags", subprocess_run.call_args.kwargs)
+
+    def test_python_child_uses_utf8_for_non_ascii_output(self):
+        process = MODULE.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.write('\\u2014')",
+            ]
+        )
+        self.assertEqual(process.stdout, "\N{EM DASH}")
 
 
 def _literal_strings(node: ast.AST) -> set[str]:
@@ -1006,7 +1026,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     def result(self, commits=None):
         commits = [] if commits is None else commits
-        final_head = commits[-1] if commits else self.head
         return {
             "schema": MODULE.AGENT_TASK_RESULT_SCHEMA,
             "status": "success",
@@ -1016,7 +1035,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "requested_model": "gpt-5.6-sol",
             "policy": {
                 "id": "marketplace-agent-apply-report-worker",
-                "version": 2,
+                "version": 3,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -1032,8 +1051,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "commits": commits,
             },
             "application": {
-                "status": "applied" if commits else "no_changes",
-                "final_local_head": final_head,
+                "status": "not_applied",
+                "final_local_head": self.head,
             },
             "report": {
                 "path": ".github/agent-task-reports/request-1.md",
@@ -1152,12 +1171,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_thin_and_version_is_bumped(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-apply-report-worker@2", instructions)
+        self.assertIn("marketplace-agent-apply-report-worker@3", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.16")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.17")
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1355,6 +1374,108 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                         remote=remote,
                         paths_by_commit={self.fix: ["src/app.py"]},
                     )
+
+    def test_exact_v2_path_correlated_report_recovers_applied_local_commits(self):
+        result = MODULE.load_agent_task_result(APPLIED_PATH_CORRELATED_V2_RESULT)
+        preflight = copy.deepcopy(self.preflight)
+        preflight["identity"].update(
+            {
+                "branch": "trask-actions-queue-events",
+                "head": "ba1cdf0d96365a55af87e62c2f476245af685bbb",
+            }
+        )
+        preflight["pr"].update(
+            {
+                "number": 377,
+                "pr_url": "https://github.com/open-telemetry/shared-workflows/pull/377",
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_repository": "open-telemetry/shared-workflows",
+                "head_branch": "trask-actions-queue-events",
+                "head_sha": "ba1cdf0d96365a55af87e62c2f476245af685bbb",
+                "base_branch": "main",
+                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+            }
+        )
+        preflight["comment_identities"] = [
+            {
+                "body_sha256": "fee0fb038a1fb5ce774f8c3673dccfd9730ffade85b058dc2987857ec948f59e",
+                "id": 4021507173,
+                "line": 490,
+                "original_line": 496,
+                "path": ".github/scripts/github-actions-queue/collect.py",
+                "review_id": 5217340671,
+                "source": "thread",
+                "thread_id": "PRRT_kwDOTENyc86iv3hz",
+                "url": "https://github.com/open-telemetry/shared-workflows/pull/377#discussion_r4021507173",
+            },
+            {
+                "body_sha256": "10a523a78d2852ee85db99e6cfd04c487df06a2154c1ce3a57f27d5d6a81351c",
+                "id": 4021507189,
+                "line": 55,
+                "original_line": 55,
+                "path": ".github/workflows/github-actions-queue-collector.yml",
+                "review_id": 5217340671,
+                "source": "thread",
+                "thread_id": "PRRT_kwDOTENyc86iv3iA",
+                "url": "https://github.com/open-telemetry/shared-workflows/pull/377#discussion_r4021507189",
+            },
+        ]
+        remote = MODULE.validate_success_result(
+            result,
+            preflight=preflight,
+            requested_model="gpt-5.6-sol",
+        )
+        paths_by_commit = {
+            "571bade3904ff473283e6b9da95853e712fe6c8a": [
+                ".github/scripts/github-actions-queue/collect.py",
+                ".github/scripts/github-actions-queue/test_collect.py",
+            ],
+            "c546c4902433040a05262cb22fa5587ae829de62": [
+                ".github/workflows/github-actions-queue-collector.yml",
+            ],
+        }
+        report_content = PATH_CORRELATED_V2_REPORT.read_text(encoding="utf-8")
+
+        report = MODULE.validate_copilot_review_report(
+            report_content,
+            request_id=remote["request_id"],
+            preflight=preflight,
+            remote=remote,
+            paths_by_commit=paths_by_commit,
+        )
+
+        self.assertFalse(remote["requires_apply"])
+        self.assertEqual(
+            [item["commit"] for item in report["comments"]],
+            remote["commits"],
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value={
+                    "branch": "trask-actions-queue-events",
+                    "head": remote["final_local_head"],
+                    "status": "",
+                },
+            ),
+            mock.patch.object(MODULE, "run") as run,
+            mock.patch.object(
+                MODULE,
+                "sha256_file",
+                return_value="result-digest",
+            ),
+        ):
+            imported = MODULE.apply_verified_import(
+                self.repo_root,
+                result_path=APPLIED_PATH_CORRELATED_V2_RESULT,
+                result_sha256="result-digest",
+                report_content=report_content,
+                preflight=preflight,
+                remote=remote,
+            )
+        self.assertFalse(imported)
+        run.assert_not_called()
 
     def test_rejects_malformed_mismatched_and_credential_artifacts(self):
         bad = self.result()
@@ -1697,6 +1818,56 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "task-1",
         )
 
+    def test_malformed_report_does_not_import_verified_commits(self):
+        state_path = self.directory / "malformed-report-state.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        report_value = json.loads(self.report([self.fix]))
+        report_value["request_id"] = "stale-request"
+        report = json.dumps(report_value)
+        result = self.result([self.fix])
+        result["report"]["sha256"] = MODULE.sha256_text(report)
+        commands = []
+
+        def run(command, **_kwargs):
+            commands.append(command)
+            output = Path(command[command.index("--result-file") + 1])
+            output.write_text(json.dumps(result), encoding="utf-8")
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=self.preflight
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "run", side_effect=run),
+            mock.patch.object(
+                MODULE, "local_identity", return_value=self.preflight["identity"]
+            ),
+            mock.patch.object(
+                MODULE,
+                "validate_generated_history",
+                return_value={self.fix: ["src/app.py"]},
+            ),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(
+                MODULE, "require_live_comments", return_value=[self.comment]
+            ),
+            mock.patch.object(MODULE.secrets, "token_hex", return_value="run-1"),
+            self.assertRaisesRegex(MODULE.WorkflowError, "malformed or has stale"),
+        ):
+            MODULE.command_agent_task(self.arguments(state_path))
+
+        self.assertEqual(1, len(commands))
+        self.assertEqual(self.preflight["identity"]["head"], self.head)
+
     def test_task_error_resumes_the_same_task_without_a_replacement(self):
         state_path = self.directory / "resume-state.json"
         helper = self.directory / "cloud_task.py"
@@ -2025,7 +2196,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--resume", previous["retry_command"])
         self.assertEqual("new-owner", restarted["agent_task"]["run_id"])
         self.assertIn(
-            "marketplace-agent-apply-report-worker@2",
+            "marketplace-agent-apply-report-worker@3",
             commands[0],
         )
         self.assertNotIn("--resume-apply-with-report", commands[0])

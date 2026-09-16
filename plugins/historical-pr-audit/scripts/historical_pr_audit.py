@@ -45,15 +45,20 @@ GITHUB_PR_DIFF = "github_pr_diff"
 CUMULATIVE_GIT_DIFF = "cumulative_git_diff"
 BARE_TARGET_PATTERN = re.compile(r"^#?(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "1200143af74493935e8655e993a7de9187357e770b3f540051a3fbde5658d9d4"
+    "ce12f19bd6dd547945e319b2db612533090daa1782f4c3def8ff62cd85cf3c6a"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
 CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
-AGENT_TASK_POLICY = "marketplace-agent-apply-report-worker@2"
+AGENT_TASK_POLICY = "marketplace-agent-apply-report-worker@3"
 AGENT_TASK_POLICY_SHA256 = (
-    "411a9ba9a0931d40c685c6233639b15c31e0d6daa4b29706527424016367cad2"
+    "7d48868140710139939cabc803a99f2122305e97dedbffa747e5f69903c16af1"
 )
+LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2 = {
+    "id": "marketplace-agent-apply-report-worker",
+    "version": 2,
+    "sha256": "411a9ba9a0931d40c685c6233639b15c31e0d6daa4b29706527424016367cad2",
+}
 AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
     "version": 2,
@@ -80,7 +85,6 @@ REPORT_PATH_PATTERN = re.compile(
 RECEIPT_PATH_PATTERN = re.compile(
     r"^\.github/agent-task-validations/(?P<request_id>[A-Za-z0-9][A-Za-z0-9._-]*)\.json$"
 )
-FIX_COMMIT_CORRELATION_FIELD = "Finding"
 
 # Five commit identities travel through this workflow and none of them is
 # interchangeable with another:
@@ -117,6 +121,12 @@ def windows_no_window_options() -> dict[str, int]:
     return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
 
 
+def subprocess_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    environment["PYTHONIOENCODING"] = "utf-8"
+    return environment
+
+
 def run(
     command: list[str],
     *,
@@ -133,6 +143,7 @@ def run(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        env=subprocess_environment(),
         **windows_no_window_options(),
     )
     if check and process.returncode != 0:
@@ -2525,8 +2536,8 @@ def build_worker_prompt(
         "outside the merged pull request's scope.\n\n"
         "For each accepted root cause, edit the historical tree, add or update focused "
         "tests, run formatting and complete focused validation, and create one linear "
-        "single-parent fix commit. Never create a merge commit. Give every fix commit "
-        "a concise normal message with one nonempty `Finding: <identifier>` line. Group "
+        "single-parent fix commit. Never create a merge commit. Map every fix commit "
+        "to its findings in the report. Group "
         "findings that share one cause and keep unrelated causes in separate commits. A failed, "
         "skipped, or incomplete validation stops the task without a successful result.\n\n"
         "Repeat the audit against the cumulative diff from the pinned original base "
@@ -2675,9 +2686,11 @@ def validate_success_result(
 ) -> dict[str, Any]:
     expected_policy = {
         "id": "marketplace-agent-apply-report-worker",
-        "version": 2,
+        "version": 3,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
+    policy = result.get("policy")
+    legacy_applied = policy == LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2
     task = result.get("task")
     generated = result.get("generated")
     application = result.get("application")
@@ -2688,7 +2701,7 @@ def validate_success_result(
         or result.get("error") is not None
         or result.get("mode") != "apply_with_report"
         or result.get("requested_model") != requested_model
-        or result.get("policy") != expected_policy
+        or policy not in (expected_policy, LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2)
         or result.get("repository") != {"name_with_owner": metadata["repo_name"]}
         or result.get("pull_request") != expected_result_pull_request(metadata)
         or not isinstance(task, dict)
@@ -2711,7 +2724,12 @@ def validate_success_result(
         or not isinstance(generated.get("commits"), list)
         or not isinstance(application, dict)
         or set(application) != {"status", "final_local_head"}
-        or application.get("status") not in {"applied", "no_changes"}
+        or application.get("status")
+        not in (
+            {"applied", "no_changes"}
+            if legacy_applied
+            else {"not_applied"}
+        )
         or not isinstance(report, dict)
         or set(report) != {"path", "commit", "sha256"}
         or attestation
@@ -2732,14 +2750,24 @@ def validate_success_result(
         if isinstance(report.get("path"), str)
         else None
     )
+    expected_local_head = commits[-1] if commits else metadata["head_sha"]
+    expected_application = (
+        {
+            "status": "applied" if commits else "no_changes",
+            "final_local_head": expected_local_head,
+        }
+        if legacy_applied
+        else {
+            "status": "not_applied",
+            "final_local_head": metadata["head_sha"],
+        }
+    )
     if (
         report_match is None
         or report.get("commit") != generated["head_sha"]
         or not isinstance(report.get("sha256"), str)
         or not re.fullmatch(r"[0-9a-f]{64}", report["sha256"])
-        or application.get("final_local_head")
-        != (commits[-1] if commits else metadata["head_sha"])
-        or (application["status"] == "no_changes") != (not commits)
+        or application != expected_application
     ):
         raise WorkflowError("Agent Task artifact or application identity is malformed")
     return {
@@ -2748,7 +2776,8 @@ def validate_success_result(
         "generated_branch": generated["branch"],
         "generated_head": generated["head_sha"],
         "commits": commits,
-        "final_local_head": application["final_local_head"],
+        "final_local_head": expected_local_head,
+        "requires_apply": not legacy_applied,
         "report": report,
         "structural_attestation": True,
     }
@@ -2947,17 +2976,17 @@ def validate_imported_commits(
     commits: list[str],
     report: dict[str, Any],
 ) -> None:
-    expected_head = commits[-1] if commits else base_sha
-    identity = local_identity(repo_root)
-    if identity["head"] != expected_head or identity["status"]:
-        raise WorkflowError("local repository drifted from the verified Agent Task import")
     actual = [
         line
         for line in git(
-            repo_root, "rev-list", "--reverse", "--topo-order", f"{base_sha}..HEAD"
+            repo_root,
+            "rev-list",
+            "--reverse",
+            "--topo-order",
+            f"{base_sha}..{commits[-1]}",
         ).splitlines()
         if line
-    ]
+    ] if commits else []
     if actual != commits:
         raise WorkflowError("imported history does not match generated.commits")
     by_sha = {entry["sha"]: entry for entry in report["commits"]}
@@ -2979,17 +3008,55 @@ def validate_imported_commits(
         ]
         if sorted(paths) != sorted(by_sha[commit]["paths"]):
             raise WorkflowError(f"generated commit {commit} changed unexpected paths")
-        body = git(repo_root, "show", "-s", "--format=%B", commit)
-        require_no_credentials(body, source=f"generated commit {commit} body")
-        if (
-            re.search(
-                rf"(?m)^{FIX_COMMIT_CORRELATION_FIELD}:[ \t]+\S", body
-            )
-            is None
-        ):
-            raise WorkflowError(
-                f"generated commit {commit} does not contain a finding correlation"
-            )
+
+
+def apply_verified_import(
+    repo_root: Path,
+    *,
+    expected_branch: str,
+    source_head: str,
+    result_path: Path,
+    result_sha256: str,
+    report_content: str,
+    remote: dict[str, Any],
+) -> bool:
+    if sha256_file(result_path) != result_sha256:
+        raise WorkflowError("Agent Task result changed after report validation")
+    if sha256_text(report_content) != remote["report"]["sha256"]:
+        raise WorkflowError("Agent Task report changed after report validation")
+    identity = local_identity(repo_root)
+    final_head = remote["final_local_head"]
+    if identity["branch"] != expected_branch or identity["status"]:
+        raise WorkflowError("local audit branch drifted before verified import")
+    if identity["head"] == final_head:
+        return False
+    if not remote["requires_apply"]:
+        raise WorkflowError(
+            "legacy Agent Task result claims an import that is not present locally"
+        )
+    if identity["head"] != source_head:
+        raise WorkflowError(
+            "local audit HEAD is neither the pinned source nor verified final commit"
+        )
+    if remote["commits"]:
+        run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "merge",
+                "--ff-only",
+                final_head,
+            ]
+        )
+    final_identity = local_identity(repo_root)
+    if (
+        final_identity["branch"] != expected_branch
+        or final_identity["status"]
+        or final_identity["head"] != final_head
+    ):
+        raise WorkflowError("verified Agent Task import did not reach the expected HEAD")
+    return bool(remote["commits"])
 
 
 def publish_agent_task_result(
@@ -3178,7 +3245,7 @@ def validate_recovery_result_identity(
 ) -> bool:
     expected_policy = {
         "id": "marketplace-agent-apply-report-worker",
-        "version": 2,
+        "version": 3,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     if (
@@ -3562,6 +3629,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
     }
     prior_result_path: Path | None = None
     prior_result: dict[str, Any] | None = None
+    reuse_success = False
     if state["agent_task"]["status"] in {"failed", "running", "ready"}:
         previous_value = state["agent_task"].get("result_file")
         if state["agent_task"]["status"] in {"failed", "running"}:
@@ -3573,11 +3641,20 @@ def command_agent_task(args: argparse.Namespace) -> None:
             if not prior_result_path.is_file():
                 raise WorkflowError("prior Agent Task result file is missing")
             prior_result = load_agent_task_result(prior_result_path)
-            reusable = validate_recovery_result_identity(
-                prior_result,
-                metadata=metadata,
-                requested_model=requested_model,
-            )
+            if prior_result.get("status") == "success":
+                validate_success_result(
+                    prior_result,
+                    metadata=metadata,
+                    requested_model=requested_model,
+                )
+                reusable = True
+                reuse_success = True
+            else:
+                reusable = validate_recovery_result_identity(
+                    prior_result,
+                    metadata=metadata,
+                    requested_model=requested_model,
+                )
             if reusable:
                 generated = prior_result["generated"]
                 allowed_heads = {metadata["head_sha"]}
@@ -3599,50 +3676,57 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "local audit branch is dirty or drifted from the recoverable task identity"
         )
 
-    attempt = int(state["agent_task"].get("attempt", 0)) + 1
-    result_path = agent_task_artifacts(state_path, attempt)["result"].resolve()
-    require_outside_repository(result_path, repo_root)
-    if result_path.exists():
-        raise WorkflowError(f"refusing to overwrite Agent Task result: {result_path}")
-    state["agent_task"].update(
-        {
-            "status": "running",
-            "attempt": attempt,
-            "result_file": str(result_path),
-            "prior_result_file": (
-                str(prior_result_path) if prior_result_path is not None else None
-            ),
-            "started_at": utc_now(),
-        }
-    )
-    state["agent_task"].setdefault("result_files", []).append(str(result_path))
-    save_state(state_path, state)
+    if reuse_success:
+        assert prior_result_path is not None and prior_result is not None
+        result_path = prior_result_path
+        process = subprocess.CompletedProcess([], 0, "", "")
+        state["agent_task"]["status"] = "running"
+        save_state(state_path, state)
+    else:
+        attempt = int(state["agent_task"].get("attempt", 0)) + 1
+        result_path = agent_task_artifacts(state_path, attempt)["result"].resolve()
+        require_outside_repository(result_path, repo_root)
+        if result_path.exists():
+            raise WorkflowError(f"refusing to overwrite Agent Task result: {result_path}")
+        state["agent_task"].update(
+            {
+                "status": "running",
+                "attempt": attempt,
+                "result_file": str(result_path),
+                "prior_result_file": (
+                    str(prior_result_path) if prior_result_path is not None else None
+                ),
+                "started_at": utc_now(),
+            }
+        )
+        state["agent_task"].setdefault("result_files", []).append(str(result_path))
+        save_state(state_path, state)
 
-    try:
-        process = execute_managed_agent_task(
-            helper,
-            repo_root=repo_root,
-            metadata=metadata,
-            model_alias=args.model,
-            prompt_path=prompt_path.resolve(),
-            result_path=result_path,
-            prior_result_path=prior_result_path,
-        )
-    except BaseException as error:
-        failed = record_missing_agent_task_result(
-            state_path,
-            message=f"managed helper could not start: {error}",
-        )
-        if isinstance(error, WorkflowError):
-            error.details.setdefault("state", str(state_path))
-            error.details.setdefault(
-                "recovery_files",
-                [
-                    str(prompt_path),
-                    *(failed["agent_task"].get("result_files") or []),
-                ],
+        try:
+            process = execute_managed_agent_task(
+                helper,
+                repo_root=repo_root,
+                metadata=metadata,
+                model_alias=args.model,
+                prompt_path=prompt_path.resolve(),
+                result_path=result_path,
+                prior_result_path=prior_result_path,
             )
-        raise
+        except BaseException as error:
+            failed = record_missing_agent_task_result(
+                state_path,
+                message=f"managed helper could not start: {error}",
+            )
+            if isinstance(error, WorkflowError):
+                error.details.setdefault("state", str(state_path))
+                error.details.setdefault(
+                    "recovery_files",
+                    [
+                        str(prompt_path),
+                        *(failed["agent_task"].get("result_files") or []),
+                    ],
+                )
+            raise
     if not result_path.is_file():
         message = (
             f"managed helper exited {process.returncode} without an atomic result file"
@@ -3659,11 +3743,19 @@ def command_agent_task(args: argparse.Namespace) -> None:
     result: dict[str, Any] | None = None
     try:
         result = load_agent_task_result(result_path)
-        reusable = validate_recovery_result_identity(
-            result,
-            metadata=metadata,
-            requested_model=requested_model,
-        )
+        if result.get("status") == "success":
+            validate_success_result(
+                result,
+                metadata=metadata,
+                requested_model=requested_model,
+            )
+            reusable = True
+        else:
+            reusable = validate_recovery_result_identity(
+                result,
+                metadata=metadata,
+                requested_model=requested_model,
+            )
         if prior_result is not None:
             require_same_agent_task(prior_result, result)
     except BaseException as error:
@@ -3720,6 +3812,21 @@ def command_agent_task(args: argparse.Namespace) -> None:
             metadata=metadata,
             requested_model=requested_model,
         )
+        result_sha256 = sha256_file(result_path)
+        identity = local_identity(repo_root)
+        allowed_local_heads = (
+            {metadata["head_sha"], remote["final_local_head"]}
+            if remote["requires_apply"]
+            else {remote["final_local_head"]}
+        )
+        if (
+            identity["branch"] != audit_branch
+            or identity["status"]
+            or identity["head"] not in allowed_local_heads
+        ):
+            raise WorkflowError(
+                "local audit branch drifted before report validation"
+            )
         report_content = fetch_committed_text(
             metadata["repo_name"],
             remote["report"]["path"],
@@ -3746,7 +3853,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         live = merged_metadata_for(target)
         if not same_snapshot(metadata, live):
             raise WorkflowError(
-                "merged pull request identity, title, or body changed after Agent Task import"
+                "merged pull request identity, title, or body changed before verified import"
             )
         current = load_state(state_path)
         if (
@@ -3757,11 +3864,25 @@ def command_agent_task(args: argparse.Namespace) -> None:
         remote["report_data"] = report
         current["agent_task"].update(
             {
-                "status": "validated",
+                "status": "validated_pending_import",
                 "validated": remote,
+                "result_sha256": result_sha256,
                 "validated_at": utc_now(),
             }
         )
+        save_state(state_path, current)
+        imported = apply_verified_import(
+            repo_root,
+            expected_branch=audit_branch,
+            source_head=metadata["head_sha"],
+            result_path=result_path,
+            result_sha256=result_sha256,
+            report_content=report_content,
+            remote=remote,
+        )
+        current["agent_task"]["status"] = "validated"
+        current["agent_task"]["imported"] = imported
+        current["agent_task"]["imported_head_sha"] = remote["final_local_head"]
         save_state(state_path, current)
         envelope = finish_agent_task(
             repo_root=repo_root,

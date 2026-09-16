@@ -146,10 +146,10 @@ MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR = (
     f"{MARKETPLACE_APPLY_REPORT_POLICY_ID}@"
     f"{MARKETPLACE_APPLY_REPORT_POLICY_V1_VERSION}"
 )
-MARKETPLACE_APPLY_REPORT_POLICY_VERSION = 2
-MARKETPLACE_APPLY_REPORT_POLICY_SPEC = {
+MARKETPLACE_APPLY_REPORT_POLICY_V2_VERSION = 2
+MARKETPLACE_APPLY_REPORT_POLICY_V2_SPEC = {
     "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
-    "version": MARKETPLACE_APPLY_REPORT_POLICY_VERSION,
+    "version": MARKETPLACE_APPLY_REPORT_POLICY_V2_VERSION,
     "execution_backend": "github-agent-tasks-rest",
     "authentication": "local-gh-api",
     "custom_agent": False,
@@ -166,6 +166,24 @@ MARKETPLACE_APPLY_REPORT_POLICY_SPEC = {
     "dispatcher_generated_commit_order": True,
     "dispatcher_structural_attestation": True,
 }
+MARKETPLACE_APPLY_REPORT_POLICY_V2_HASH = hashlib.sha256(
+    json.dumps(
+        MARKETPLACE_APPLY_REPORT_POLICY_V2_SPEC,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+).hexdigest()
+MARKETPLACE_APPLY_REPORT_POLICY_V2_SELECTOR = (
+    f"{MARKETPLACE_APPLY_REPORT_POLICY_ID}@"
+    f"{MARKETPLACE_APPLY_REPORT_POLICY_V2_VERSION}"
+)
+MARKETPLACE_APPLY_REPORT_POLICY_VERSION = 3
+MARKETPLACE_APPLY_REPORT_POLICY_SPEC = {
+    **MARKETPLACE_APPLY_REPORT_POLICY_V2_SPEC,
+    "version": MARKETPLACE_APPLY_REPORT_POLICY_VERSION,
+    "application": "consumer-after-report-validation",
+}
 MARKETPLACE_APPLY_REPORT_POLICY_HASH = hashlib.sha256(
     json.dumps(
         MARKETPLACE_APPLY_REPORT_POLICY_SPEC,
@@ -180,6 +198,7 @@ MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR = (
 )
 MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS = {
     MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR,
+    MARKETPLACE_APPLY_REPORT_POLICY_V2_SELECTOR,
     MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
 }
 FIX_COMMIT_CORRELATION_FIELD = "Finding"
@@ -706,7 +725,11 @@ def parse_args(args: Sequence[str]) -> Options:
             "policy_unknown",
         )
     if (
-        policy == MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR
+        policy
+        in {
+            MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR,
+            MARKETPLACE_APPLY_REPORT_POLICY_V2_SELECTOR,
+        }
         and not resume_apply_with_report
     ):
         raise CloudError(
@@ -1062,11 +1085,37 @@ def read_apply_result(
     policy: str | None,
 ) -> dict[str, object]:
     if policy in MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS:
-        return read_structural_apply_result(path)
+        return read_structural_apply_result(path, policy=policy)
     return read_legacy_apply_result(path)
 
 
-def read_structural_apply_result(path: Path) -> dict[str, object]:
+def structural_policy_metadata(policy: str) -> dict[str, object]:
+    if policy == MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR:
+        version = MARKETPLACE_APPLY_REPORT_POLICY_V1_VERSION
+        digest = MARKETPLACE_APPLY_REPORT_POLICY_V1_HASH
+    elif policy == MARKETPLACE_APPLY_REPORT_POLICY_V2_SELECTOR:
+        version = MARKETPLACE_APPLY_REPORT_POLICY_V2_VERSION
+        digest = MARKETPLACE_APPLY_REPORT_POLICY_V2_HASH
+    elif policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+        version = MARKETPLACE_APPLY_REPORT_POLICY_VERSION
+        digest = MARKETPLACE_APPLY_REPORT_POLICY_HASH
+    else:
+        raise CloudError(
+            f"unsupported structural apply policy {policy!r}",
+            "policy_rejected",
+        )
+    return {
+        "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
+        "version": version,
+        "sha256": digest,
+    }
+
+
+def read_structural_apply_result(
+    path: Path,
+    *,
+    policy: str = MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+) -> dict[str, object]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -1102,12 +1151,7 @@ def read_structural_apply_result(path: Path) -> dict[str, object]:
             "version": REPORT_RESULT_SCHEMA_VERSION,
         }
         or data.get("mode") != "apply_with_report"
-        or data.get("policy")
-        != {
-            "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
-            "version": MARKETPLACE_APPLY_REPORT_POLICY_VERSION,
-            "sha256": MARKETPLACE_APPLY_REPORT_POLICY_HASH,
-        }
+        or data.get("policy") != structural_policy_metadata(policy)
     ):
         raise CloudError(
             "prior result has an unsupported schema, mode, or policy",
@@ -1255,8 +1299,20 @@ def read_structural_apply_result(path: Path) -> dict[str, object]:
         )
     if status == "success":
         code_commits = generated["commits"]
+        two_phase = policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
         expected_local_head = (
-            code_commits[-1] if code_commits else pull_request["head_sha"]
+            pull_request["head_sha"]
+            if two_phase
+            else code_commits[-1]
+            if code_commits
+            else pull_request["head_sha"]
+        )
+        expected_application = (
+            "not_applied"
+            if two_phase
+            else "applied"
+            if code_commits
+            else "no_changes"
         )
         if (
             error is not None
@@ -1269,8 +1325,7 @@ def read_structural_apply_result(path: Path) -> dict[str, object]:
             or report is None
             or report.get("commit") != generated.get("head_sha")
             or report.get("sha256") is None
-            or application.get("status")
-            != ("applied" if code_commits else "no_changes")
+            or application.get("status") != expected_application
             or application.get("final_local_head") != expected_local_head
             or attestation.get("structural_complete") is not True
         ):
@@ -1698,18 +1753,8 @@ def policy_metadata(options: Options) -> dict[str, object] | None:
             "version": MARKETPLACE_REPORT_POLICY_VERSION,
             "sha256": MARKETPLACE_REPORT_POLICY_HASH,
         }
-    if options.policy == MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR:
-        return {
-            "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
-            "version": MARKETPLACE_APPLY_REPORT_POLICY_V1_VERSION,
-            "sha256": MARKETPLACE_APPLY_REPORT_POLICY_V1_HASH,
-        }
-    if options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
-        return {
-            "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
-            "version": MARKETPLACE_APPLY_REPORT_POLICY_VERSION,
-            "sha256": MARKETPLACE_APPLY_REPORT_POLICY_HASH,
-        }
+    if options.policy in MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS:
+        return structural_policy_metadata(options.policy)
     return {
         "id": MARKETPLACE_POLICY_ID,
         "version": MARKETPLACE_POLICY_VERSION,
@@ -2161,8 +2206,11 @@ def build_apply_report_policy_prompt(
             "Every code commit must have a concise normal message with one nonempty "
             "`Finding: <identifier>` line, unique among the generated code commits. "
         )
-    elif policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
-        policy_hash = MARKETPLACE_APPLY_REPORT_POLICY_HASH
+    elif policy in {
+        MARKETPLACE_APPLY_REPORT_POLICY_V2_SELECTOR,
+        MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+    }:
+        policy_hash = str(structural_policy_metadata(policy)["sha256"])
         correlation = (
             "Do not add machine-readable correlation trailers to commit messages. "
             "Record finding-to-commit and changed-path correlation only in the "
@@ -4344,7 +4392,10 @@ def execute(
             report = policy_report
             if report is None:
                 raise AssertionError("policy mode did not retrieve its report")
-            if options.policy != MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+            if options.policy in {
+                MARKETPLACE_POLICY_SELECTOR,
+                MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR,
+            }:
                 git.require_correlated_fix_commits(
                     snapshot.root, history.code_commits
                 )
@@ -4390,6 +4441,18 @@ def execute(
                 f"{', '.join(history.code_commits) or 'none'}",
                 error.code,
             ) from None
+        if options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+            print(
+                f"Validated {len(history.code_commits)} fix commit(s) and report "
+                f"commit {history.report_commit} without modifying "
+                f"{snapshot.branch}.",
+                file=stderr,
+            )
+            if result is not None:
+                result.application_status = "not_applied"
+                result.final_local_head = snapshot.head
+                result.status = "success"
+            return 0
         already_applied = (
             options.allow_merged_pr
             and snapshot.head == history.code_head
@@ -4546,6 +4609,13 @@ def main(
             "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
             "version": MARKETPLACE_APPLY_REPORT_POLICY_VERSION,
             "sha256": MARKETPLACE_APPLY_REPORT_POLICY_HASH,
+        }
+    elif MARKETPLACE_APPLY_REPORT_POLICY_V2_SELECTOR in args:
+        result.schema_version = REPORT_RESULT_SCHEMA_VERSION
+        result.policy = {
+            "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
+            "version": MARKETPLACE_APPLY_REPORT_POLICY_V2_VERSION,
+            "sha256": MARKETPLACE_APPLY_REPORT_POLICY_V2_HASH,
         }
     elif MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR in args:
         result.schema_version = REPORT_RESULT_SCHEMA_VERSION

@@ -40,7 +40,7 @@ COPILOT_LOGINS = {
 }
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "1200143af74493935e8655e993a7de9187357e770b3f540051a3fbde5658d9d4"
+    "ce12f19bd6dd547945e319b2db612533090daa1782f4c3def8ff62cd85cf3c6a"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -90,6 +90,12 @@ def windows_no_window_options() -> dict[str, int]:
     return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
 
 
+def subprocess_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    environment["PYTHONIOENCODING"] = "utf-8"
+    return environment
+
+
 def run(
     command: list[str],
     *,
@@ -104,6 +110,7 @@ def run(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        env=subprocess_environment(),
         **windows_no_window_options(),
     )
     if check and process.returncode != 0:

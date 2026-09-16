@@ -36,6 +36,9 @@ class WindowsSubprocessTest(unittest.TestCase):
         self.assertEqual(
             subprocess_run.call_args.kwargs["creationflags"], 0x08000000
         )
+        self.assertEqual(
+            subprocess_run.call_args.kwargs["env"]["PYTHONIOENCODING"], "utf-8"
+        )
 
     def test_run_leaves_non_windows_process_options_unchanged(self):
         completed = MODULE.subprocess.CompletedProcess(["gh"], 0, "", "")

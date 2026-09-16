@@ -104,6 +104,7 @@ class PolicyPromptTest(unittest.TestCase):
                     f"unknown policy 'marketplace-agent-worker@{version}'; expected "
                     "one of marketplace-agent-apply-report-worker@1, "
                     "marketplace-agent-apply-report-worker@2, "
+                    "marketplace-agent-apply-report-worker@3, "
                     "marketplace-agent-report-worker@1, "
                     "marketplace-agent-worker@5",
                 ) as raised:
@@ -122,23 +123,31 @@ class PolicyPromptTest(unittest.TestCase):
 
                 self.assertEqual(raised.exception.code, "policy_unknown")
 
-    def test_structural_v1_cannot_start_a_new_task(self):
+    def test_historical_structural_policies_cannot_start_a_new_task(self):
         result_path = str((Path.cwd().parent / "result.json").resolve())
 
-        with self.assertRaisesRegex(MODULE.CloudError, "available only for task recovery"):
-            MODULE.parse_args(
-                [
-                    "--apply-with-report",
-                    "--pr",
-                    "owner/repo#1",
-                    "--prompt-file",
-                    str(SCRIPT),
-                    "--result-file",
-                    result_path,
-                    "--policy",
-                    MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR,
-                ]
-            )
+        for policy in (
+            MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR,
+            MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V2_SELECTOR,
+        ):
+            with self.subTest(policy=policy):
+                with self.assertRaisesRegex(
+                    MODULE.CloudError,
+                    "available only for task recovery",
+                ):
+                    MODULE.parse_args(
+                        [
+                            "--apply-with-report",
+                            "--pr",
+                            "owner/repo#1",
+                            "--prompt-file",
+                            str(SCRIPT),
+                            "--result-file",
+                            result_path,
+                            "--policy",
+                            policy,
+                        ]
+                    )
 
     def test_report_policy_requests_one_markdown_artifact(self):
         report_path = ".github/agent-task-reports/request-1.md"
@@ -225,7 +234,7 @@ class PolicyPromptTest(unittest.TestCase):
         prompt = payload["prompt"]
 
         self.assertIn(
-            "Policy: marketplace-agent-apply-report-worker@2",
+            "Policy: marketplace-agent-apply-report-worker@3",
             prompt,
         )
         self.assertIn("zero or more linear commits", prompt)
@@ -1022,6 +1031,8 @@ class DispatcherFinalizationTest(unittest.TestCase):
         self.assertTrue(result.structural_complete)
         self.assertFalse(result.validation_complete)
         self.assertIsNone(result.receipt_path)
+        self.assertEqual(result.application_status, "not_applied")
+        self.assertEqual(result.final_local_head, self.base_sha)
         self.assertEqual(result.report_commit, self.artifact_commit)
         self.last_report_fetch.assert_called_once_with(
             mock.ANY,
@@ -1036,6 +1047,7 @@ class DispatcherFinalizationTest(unittest.TestCase):
             [".github/agent-task-reports/request-1.md"],
         )
         repository.require_correlated_fix_commits.assert_not_called()
+        repository.fast_forward.assert_not_called()
         envelope = result.as_dict()
         self.assertNotIn("worker_receipt", envelope)
         self.assertNotIn("validation", envelope)
@@ -1066,6 +1078,25 @@ class DispatcherFinalizationTest(unittest.TestCase):
             self.root,
             (self.code_commit,),
         )
+
+    def test_structural_v2_keeps_prevalidation_application_behavior(self):
+        repository = self.repository()
+        options = MODULE.Options(
+            report=False,
+            model="gpt-5.6-sol",
+            prompt="Review the pull request.",
+            pull_request=MODULE.PrReference(7, "owner/repo", "owner/repo#7"),
+            apply_with_report=True,
+            result_file=Path("C:/state/result.json"),
+            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V2_SELECTOR,
+            prompt_file=Path("C:/state/prompt.txt"),
+        )
+
+        _, result, _, _ = self.execute(repository, options=options)
+
+        self.assertEqual(result.application_status, "applied")
+        repository.require_correlated_fix_commits.assert_not_called()
+        repository.fast_forward.assert_called_once()
 
     def test_empty_markdown_report_fails_closed(self):
         repository = self.repository()

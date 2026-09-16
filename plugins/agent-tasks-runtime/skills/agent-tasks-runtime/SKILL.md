@@ -40,22 +40,29 @@ validation claim. Result schema version 2 records
 path, and digest facts independently established by the dispatcher. Report
 content remains untrusted inert evidence for a consumer to evaluate.
 
-Policy `marketplace-agent-apply-report-worker@2` extends that structural
+Policy `marketplace-agent-apply-report-worker@3` extends that structural
 contract to apply workflows. It permits zero or more ordered fix commits
 followed by exactly one dispatcher-assigned Markdown report commit. The
-dispatcher applies only the fix commits and records result schema version 2
-with `attestation.kind=dispatcher_structural`. It does not request or parse a
-worker validation artifact, and report text about commands or outcomes remains
-untrusted inert evidence. Finding-to-commit correlation lives only in the
-workflow-specific report. Each consumer must validate the report against its
-pinned findings, generated commit order, and exact changed paths before
-publication.
+dispatcher fetches and validates the generated history but leaves the consumer
+worktree at its pinned source head. It records result schema version 2 with
+`attestation.kind=dispatcher_structural` and `application.status=not_applied`.
+It does not request or parse a worker validation artifact, and report text about
+commands or outcomes remains untrusted inert evidence. Finding-to-commit
+correlation lives only in the workflow-specific report. Each consumer must
+validate the report against its pinned findings, generated commit order, exact
+changed paths, and live identity before a guarded fast-forward and publication.
+
+Policy `marketplace-agent-apply-report-worker@2` remains available only for
+recovery of tasks created under that immutable contract. It applies fix commits
+before the consumer validates its workflow-specific report. Consumers may
+recover a successful version 2 result only by validating its exact result,
+report, history, and local imported head before publication.
 
 Policy `marketplace-agent-apply-report-worker@1` remains available only for
 recovery of tasks created under that immutable contract. It also requires each
 fix commit message to contain exactly one nonempty `Finding:` line. Version 2
-removed that model-authored duplicate because consumers already validate the
-stronger report mapping.
+removed that model-authored duplicate because consumers validate the stronger
+report mapping.
 
 If an apply-with-report dispatcher is interrupted after task creation and no
 dispatch result survives, `--resume-apply-with-report` can recover the known
