@@ -6289,9 +6289,14 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 and isinstance(result.get("error"), dict)
                 and result["error"].get("code") == "malformed_history"
             ):
-                failure = validate_terminal_no_artifact_result(
+                terminal_preflight = terminal_result_preflight(
                     result,
                     preflight=preflight,
+                    repo_root=repo_root,
+                )
+                failure = validate_terminal_no_artifact_result(
+                    result,
+                    preflight=terminal_preflight,
                     requested_model=requested_model,
                 )
                 task_state.update(

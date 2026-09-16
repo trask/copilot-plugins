@@ -39,7 +39,7 @@ The worker report contains decision records keyed by coordinator-generated SHA-2
 
 When a completed managed task has an immutable terminal result that cannot gain required validation or report artifacts on resume, the coordinator marks that exact owner `terminal_unusable`, removes its resume command, preserves its artifacts, and offers only a fresh non-resume retry. A replacement preparation archives the terminal owner before one new dispatch, and an active replacement prevents duplicates.
 
-If that retained result records an older base revision, the coordinator requires the task-time base to be a Git ancestor of the retained preflight base. Every other frozen pull request field must still match exactly. A rewritten or unrelated base remains a hard failure.
+If a terminal result records an older base revision, the coordinator requires the task-time base to be a Git ancestor of the frozen preflight base. Every other frozen pull request field must still match exactly. A rewritten or unrelated base remains a hard failure.
 
 When the user requires a separate mutation authorization, run `agent-task` with `--prepare-only --preserve-artifacts`. This dispatches and validates one managed result, records the exact ordered commits, changed paths, report identity, and comment, thread, and review IDs, then stops before local import or pull request mutation. Report that result and stop. After authorization, run only the returned `apply_command`; `--apply-prepared` revalidates and consumes the checkpoint without launching another managed task.
 

@@ -1273,7 +1273,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.37")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.38")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -4010,6 +4010,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         helper.write_text("# helper\n", encoding="utf-8")
         result = MODULE.load_agent_task_result(NO_ARTIFACT_383_RESULT)
         preflight = self.preflight_for_result(result)
+        task_base = preflight["pr"]["base_sha"]
+        preflight["pr"]["base_sha"] = "f" * 40
 
         def fail_run(command, **_kwargs):
             output = Path(command[command.index("--result-file") + 1])
@@ -4018,6 +4020,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
         arguments = self.arguments(state_path)
         arguments.target = "open-telemetry/shared-workflows#383"
+        ancestry = mock.Mock(return_value=True)
         with (
             mock.patch.object(MODULE, "require_tools"),
             mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
@@ -4037,6 +4040,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 return_value=preflight["comments"],
             ),
             mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "base_revision_is_ancestor", ancestry),
             mock.patch.object(MODULE, "run", side_effect=fail_run),
             self.assertRaisesRegex(
                 MODULE.WorkflowError,
@@ -4050,6 +4054,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(result["task"]["id"], failed["task_id"])
         self.assertNotIn("recovery_command", failed)
         self.assertNotIn("--resume", failed["retry_command"])
+        ancestry.assert_called_once_with(
+            self.repo_root,
+            task_base,
+            "f" * 40,
+        )
 
     def test_retained_no_artifact_owner_is_archived_before_one_replacement(self):
         state_path = self.directory / "retained-no-artifact-state.json"
