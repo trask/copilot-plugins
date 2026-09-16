@@ -1351,7 +1351,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.16")
+        self.assertEqual(plugin["version"], "1.3.17")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -1433,6 +1433,39 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 live,
                 expected_head=self.head,
             )
+
+    def test_waits_for_its_own_published_head_but_rejects_other_drift(self):
+        fix = "5" * 40
+        final = {**self.preflight["pr"], "head_sha": fix}
+        with (
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                side_effect=[self.preflight["pr"], final],
+            ) as metadata,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            actual = MODULE.wait_for_live_pr_snapshot(
+                MODULE.parse_target("owner/repo#7"),
+                self.preflight["pr"],
+                expected_head=fix,
+            )
+        self.assertEqual(actual["head_sha"], fix)
+        self.assertEqual(metadata.call_count, 2)
+        sleep.assert_called_once()
+
+        drifted = {**self.preflight["pr"], "body": "Changed elsewhere"}
+        with (
+            mock.patch.object(MODULE, "metadata_for", return_value=drifted),
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+            self.assertRaisesRegex(MODULE.WorkflowError, "drifted"),
+        ):
+            MODULE.wait_for_live_pr_snapshot(
+                MODULE.parse_target("owner/repo#7"),
+                self.preflight["pr"],
+                expected_head=fix,
+            )
+        sleep.assert_not_called()
 
     def test_rejects_receipt_only_non_clear_outcome(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "explicitly be cleared"):

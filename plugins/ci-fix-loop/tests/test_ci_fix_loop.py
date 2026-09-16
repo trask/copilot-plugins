@@ -1116,7 +1116,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.17", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.18", json.loads(PLUGIN.read_text())["version"])
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1305,6 +1305,39 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             return_value=("9" * 40, []),
         ), self.assertRaisesRegex(MODULE.WorkflowError, "snapshot changed"):
             MODULE.require_live_check_snapshot(self.preflight)
+
+    def test_waits_for_its_own_published_head_but_rejects_other_drift(self):
+        fix = "5" * 40
+        final = {**self.preflight["pr"], "head_sha": fix}
+        with (
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                side_effect=[self.preflight["pr"], final],
+            ) as metadata,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            actual = MODULE.wait_for_live_pr_snapshot(
+                MODULE.parse_target("owner/repo#7"),
+                self.preflight["pr"],
+                expected_head=fix,
+            )
+        self.assertEqual(actual["head_sha"], fix)
+        self.assertEqual(metadata.call_count, 2)
+        sleep.assert_called_once()
+
+        drifted = {**self.preflight["pr"], "base_sha": "9" * 40}
+        with (
+            mock.patch.object(MODULE, "metadata_for", return_value=drifted),
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+            self.assertRaisesRegex(MODULE.WorkflowError, "drifted"),
+        ):
+            MODULE.wait_for_live_pr_snapshot(
+                MODULE.parse_target("owner/repo#7"),
+                self.preflight["pr"],
+                expected_head=fix,
+            )
+        sleep.assert_not_called()
 
     def test_result_paths_must_be_outside_repository(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "outside"):

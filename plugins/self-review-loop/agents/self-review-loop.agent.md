@@ -46,6 +46,7 @@ The bundled coordinator is the sole authoritative local entry point. It discover
 - The coordinator rejects merge commits, unexpected paths or history, malformed or stale reports, structural attestation or identity failures, pull request metadata drift, credentials, local drift, and live head, base, title, or body drift. Never work around a rejection.
 - A report-only structural result with no fix commits is the explicit successful no-change outcome. Do not push or manufacture a commit.
 - State and recovery artifacts remain durable until verified import and authenticated publication both succeed. Cleanup happens only after successful consumption.
+- After the head ref reaches the verified final commit, the coordinator checkpoints that exact remote head before waiting for pull request metadata to catch up. Recovery reuses the checkpoint and never republishes the same commits.
 - The helper may publish verified fix commits to the pull request's existing head repository and branch and may correct an inaccurate title or description proposed by the worker. It never posts review comments or submits a review.
 
 The terminal response is the run's last message. Finish every tool call first, send the complete result once, and do not follow it with a recap.

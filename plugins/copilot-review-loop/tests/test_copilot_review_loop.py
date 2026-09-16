@@ -1176,7 +1176,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.17")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.18")
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1524,6 +1524,38 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         ):
             MODULE.require_live_comments(self.preflight)
 
+    def test_waits_for_its_own_published_head_but_rejects_other_drift(self):
+        final = {**self.preflight["pr"], "head_sha": self.fix}
+        with (
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                side_effect=[self.preflight["pr"], final],
+            ) as metadata,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            actual = MODULE.wait_for_live_pr_snapshot(
+                MODULE.parse_target("owner/repo#7"),
+                self.preflight["pr"],
+                expected_head=self.fix,
+            )
+        self.assertEqual(actual["head_sha"], self.fix)
+        self.assertEqual(metadata.call_count, 2)
+        sleep.assert_called_once()
+
+        drifted = {**self.preflight["pr"], "title": "Changed elsewhere"}
+        with (
+            mock.patch.object(MODULE, "metadata_for", return_value=drifted),
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+            self.assertRaisesRegex(MODULE.WorkflowError, "drifted"),
+        ):
+            MODULE.wait_for_live_pr_snapshot(
+                MODULE.parse_target("owner/repo#7"),
+                self.preflight["pr"],
+                expected_head=self.fix,
+            )
+        sleep.assert_not_called()
+
     def test_reply_recovery_rejects_new_unresolved_copilot_threads(self):
         def thread(comment: dict[str, Any]) -> dict[str, Any]:
             return {
@@ -1817,6 +1849,117 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             state["coordinator"]["processed_snapshots"][0]["task_id"],
             "task-1",
         )
+
+    def test_post_push_metadata_lag_resumes_without_another_task_or_push(self):
+        state_path = self.directory / "post-push-state.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        report = self.report([self.fix])
+        result = self.result([self.fix])
+        result["report"]["sha256"] = MODULE.sha256_text(report)
+        local_head = self.head
+        remote_head = self.head
+        helper_launches = 0
+        pushes = 0
+        metadata_reads = 0
+
+        def run(command, **_kwargs):
+            nonlocal helper_launches, local_head, pushes, remote_head
+            if "--result-file" in command:
+                helper_launches += 1
+                output = Path(command[command.index("--result-file") + 1])
+                output.write_text(json.dumps(result), encoding="utf-8")
+            elif "merge" in command:
+                local_head = self.fix
+            elif "push" in command:
+                pushes += 1
+                remote_head = self.fix
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        def identity(_repo_root):
+            return {"branch": "feature", "head": local_head, "status": ""}
+
+        def metadata(_target):
+            nonlocal metadata_reads
+            metadata_reads += 1
+            if metadata_reads == 1:
+                return self.preflight["pr"]
+            if metadata_reads == 2:
+                raise MODULE.WorkflowError("PR metadata lookup interrupted")
+            return {**self.preflight["pr"], "head_sha": self.fix}
+
+        common_patches = (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=self.preflight
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "run", side_effect=run),
+            mock.patch.object(MODULE, "local_identity", side_effect=identity),
+            mock.patch.object(
+                MODULE,
+                "validate_generated_history",
+                return_value={self.fix: ["src/app.py"]},
+            ),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(MODULE, "metadata_for", side_effect=metadata),
+            mock.patch.object(
+                MODULE, "remote_head", side_effect=lambda *_args: remote_head
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_remote_head",
+                side_effect=lambda *_args: remote_head,
+            ),
+            mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
+            mock.patch.object(
+                MODULE, "require_live_comments", return_value=[self.comment]
+            ),
+            mock.patch.object(MODULE, "post_missing_replies", return_value={17: 71}),
+            mock.patch.object(MODULE, "resolve_threads"),
+            mock.patch.object(
+                MODULE, "request_copilot", return_value={"status": "requested"}
+            ),
+            mock.patch.object(
+                MODULE, "verify_publish", return_value={"head_matches": True}
+            ),
+            mock.patch.object(MODULE, "continue_after_review_request"),
+            mock.patch.object(MODULE, "emit"),
+            mock.patch.object(MODULE.secrets, "token_hex", return_value="run-1"),
+        )
+        with ExitStack() as stack:
+            for patcher in common_patches:
+                stack.enter_context(patcher)
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "metadata lookup interrupted"
+            ):
+                MODULE.command_agent_task(self.arguments(state_path))
+
+        failed = MODULE.load_state(state_path)
+        self.assertEqual(
+            failed["agent_task"]["confirmed_remote_head_sha"],
+            self.fix,
+        )
+        self.assertIsNone(failed["agent_task"].get("published_head_sha"))
+        self.assertEqual(failed["agent_task"]["status"], "failed_after_publication")
+
+        with ExitStack() as stack:
+            for patcher in common_patches:
+                stack.enter_context(patcher)
+            MODULE.command_agent_task(self.arguments(state_path, resume=True))
+
+        self.assertEqual(helper_launches, 1)
+        self.assertEqual(pushes, 1)
+        completed = MODULE.load_state(state_path)
+        self.assertEqual(completed["agent_task"]["status"], "completed")
+        self.assertEqual(completed["pr"]["head_sha"], self.fix)
+        self.assertNotIn("error", completed["agent_task"])
 
     def test_malformed_report_does_not_import_verified_commits(self):
         state_path = self.directory / "malformed-report-state.json"

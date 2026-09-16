@@ -3618,6 +3618,29 @@ def require_live_pr_snapshot(
         )
 
 
+def wait_for_live_pr_snapshot(
+    target: dict[str, Any],
+    expected: dict[str, Any],
+    *,
+    expected_head: str,
+) -> dict[str, Any]:
+    actual = metadata_for(target)
+    for delay in PR_HEAD_LAG_RETRY_DELAYS:
+        if actual.get("head_sha") == expected_head:
+            break
+        if actual.get("head_sha") != expected.get("head_sha"):
+            require_live_pr_snapshot(expected, actual, expected_head=expected_head)
+        require_live_pr_snapshot(
+            expected,
+            actual,
+            expected_head=expected["head_sha"],
+        )
+        time.sleep(delay)
+        actual = metadata_for(target)
+    require_live_pr_snapshot(expected, actual, expected_head=expected_head)
+    return actual
+
+
 def require_live_comments(
     preflight: dict[str, Any], *, allow_resolved: bool = False
 ) -> list[dict[str, Any]]:
@@ -4919,6 +4942,16 @@ def command_agent_task(args: argparse.Namespace) -> None:
         task_state["imported_head_sha"] = remote["final_local_head"]
         save_state(state_path, state)
 
+        if task_state.get("confirmed_remote_head_sha") not in {
+            None,
+            remote["final_local_head"],
+        } or task_state.get("publication_source_head_sha") not in {
+            None,
+            pr["head_sha"],
+        }:
+            raise WorkflowError(
+                "publication checkpoint does not match the verified task identity"
+            )
         published_head = task_state.get("published_head_sha")
         if published_head is None:
             live = metadata_for(target)
@@ -4969,17 +5002,33 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 raise WorkflowError(
                     "published head does not match the verified imported head"
                 )
-            final_live = metadata_for(target)
-            require_live_pr_snapshot(
-                pr, final_live, expected_head=remote["final_local_head"]
-            )
             published_head = remote["final_local_head"]
+            task_state["confirmed_remote_head_sha"] = published_head
+            task_state["publication_source_head_sha"] = pr["head_sha"]
+            task_state["status"] = "published_pending_verification"
+            save_state(state_path, state)
+            final_live = wait_for_live_pr_snapshot(
+                target,
+                pr,
+                expected_head=published_head,
+            )
             task_state["published_head_sha"] = published_head
             task_state["status"] = "published"
             save_state(state_path, state)
 
-        final_live = metadata_for(target)
-        require_live_pr_snapshot(pr, final_live, expected_head=published_head)
+        if published_head != pr["head_sha"]:
+            confirmed_head = remote_head(
+                pr["head_owner"], pr["head_repo"], pr["head_branch"]
+            )
+            if confirmed_head != published_head:
+                raise WorkflowError(
+                    "published pull request head moved before finalization"
+                )
+        final_live = wait_for_live_pr_snapshot(
+            target,
+            pr,
+            expected_head=published_head,
+        )
         state["pr"] = final_live
         live_comments = require_live_comments(
             preflight,
@@ -5034,6 +5083,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
         task_state["status"] = "completed"
         task_state["completed_at"] = utc_now()
         task_state["artifacts_removed"] = False
+        for field in ("error", "failed_at", "recovery_files"):
+            task_state.pop(field, None)
         save_state(state_path, state)
         cleanup_errors = []
         cleanup_paths = {prompt_path, result_path}
@@ -5085,6 +5136,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             current_task["status"] = (
                 "failed_after_publication"
                 if current_task.get("published_head_sha")
+                or current_task.get("confirmed_remote_head_sha")
                 else "failed"
             )
             if current_task.get("task_id_status") not in {

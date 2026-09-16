@@ -3276,6 +3276,29 @@ def require_live_pr_snapshot(
         )
 
 
+def wait_for_live_pr_snapshot(
+    target: dict[str, Any],
+    expected: dict[str, Any],
+    *,
+    expected_head: str,
+) -> dict[str, Any]:
+    actual = metadata_for(target)
+    for delay in REMOTE_REF_LAG_RETRY_DELAYS:
+        if actual.get("head_sha") == expected_head:
+            break
+        if actual.get("head_sha") != expected.get("head_sha"):
+            require_live_pr_snapshot(expected, actual, expected_head=expected_head)
+        require_live_pr_snapshot(
+            expected,
+            actual,
+            expected_head=expected["head_sha"],
+        )
+        time.sleep(delay)
+        actual = metadata_for(target)
+    require_live_pr_snapshot(expected, actual, expected_head=expected_head)
+    return actual
+
+
 def update_pr_metadata(
     state_path: Path,
     *,
@@ -3909,6 +3932,16 @@ def command_agent_task(args: argparse.Namespace) -> None:
         current["agent_task"]["imported"] = imported
         current["agent_task"]["imported_head_sha"] = remote["final_local_head"]
         save_state(state_path, current)
+        if current["agent_task"].get("confirmed_remote_head_sha") not in {
+            None,
+            remote["final_local_head"],
+        } or current["agent_task"].get("publication_source_head_sha") not in {
+            None,
+            pr["head_sha"],
+        }:
+            raise WorkflowError(
+                "publication checkpoint does not match the verified task identity"
+            )
         published_head = current["agent_task"].get("published_head_sha")
         if published_head is None:
             live = metadata_for(target)
@@ -3957,18 +3990,29 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     raise WorkflowError(
                         "published head does not match the verified imported head"
                     )
-                final_live = metadata_for(target)
-                require_live_pr_snapshot(
-                    pr,
-                    final_live,
-                    expected_head=remote["final_local_head"],
-                )
                 published_head = remote["final_local_head"]
+                current["agent_task"]["confirmed_remote_head_sha"] = published_head
+                current["agent_task"]["publication_source_head_sha"] = pr["head_sha"]
+                current["agent_task"]["status"] = "published_pending_verification"
+                save_state(state_path, current)
+                wait_for_live_pr_snapshot(
+                    target,
+                    pr,
+                    expected_head=published_head,
+                )
             else:
                 published_head = pr["head_sha"]
             current["agent_task"]["published_head_sha"] = published_head
             current["agent_task"]["status"] = "published"
             save_state(state_path, current)
+        if published_head != pr["head_sha"]:
+            confirmed_head = remote_head(
+                pr["head_owner"], pr["head_repo"], pr["head_branch"]
+            )
+            if confirmed_head != published_head:
+                raise WorkflowError(
+                    "published pull request head moved before finalization"
+                )
         metadata_result = report["pull_request_metadata"]
         if metadata_result["decision"] == "replace":
             metadata_snapshot = {**pr, "head_sha": published_head}
@@ -3980,10 +4024,9 @@ def command_agent_task(args: argparse.Namespace) -> None:
             )
             current["pr"] = {**pr, **verified}
         else:
-            final_live = metadata_for(target)
-            require_live_pr_snapshot(
-                {**pr, "head_sha": published_head},
-                final_live,
+            final_live = wait_for_live_pr_snapshot(
+                target,
+                pr,
                 expected_head=published_head,
             )
             current["pr"] = {**pr, **final_live}
@@ -4018,6 +4061,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
         current["agent_task"]["status"] = "completed"
         current["agent_task"]["completed_at"] = utc_now()
         current["agent_task"]["artifacts_removed"] = False
+        for field in ("error", "failed_at", "recovery_files"):
+            current["agent_task"].pop(field, None)
         save_state(state_path, current)
         if report["outcome"] == "cleared":
             publish_shared_state(
@@ -4077,6 +4122,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             task_state["status"] = (
                 "failed_after_publication"
                 if task_state.get("published_head_sha")
+                or task_state.get("confirmed_remote_head_sha")
                 else "failed_after_import"
                 if imported
                 else "failed"

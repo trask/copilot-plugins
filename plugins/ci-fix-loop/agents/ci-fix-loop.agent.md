@@ -55,6 +55,8 @@ The coordinator accepts only the pinned result and policy identities. It treats 
 
 If `agent-task` fails after creating a task, keep its `recovery_command` and `recovery_files`. Run that exact recovery command. A trusted task-creation failure records `task_id_status=not_created` and a `retry_command` without `--resume`; run it only after fixing the reported prerequisite. The coordinator retains the failed owner before replacement. Active or unknown ownership remains blocked. Do not delete recovery artifacts by hand. The coordinator removes them only after it consumes and publishes or records the verified result.
 
+After the head ref reaches the verified final commit, the coordinator checkpoints that exact remote head before waiting for pull request metadata to catch up. Recovery reuses the checkpoint and never republishes the same commits.
+
 ## Loop transitions
 
 Follow the `result` exactly:
