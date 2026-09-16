@@ -179,6 +179,10 @@ class WorkflowError(RuntimeError):
         self.details = details or {}
 
 
+class TerminalAgentTaskReportError(WorkflowError):
+    pass
+
+
 def windows_no_window_options() -> dict[str, int]:
     if not IS_WINDOWS:
         return {}
@@ -5218,6 +5222,114 @@ def clear_agent_task_failure(task_state: dict[str, Any]) -> None:
         task_state.pop(field, None)
 
 
+def validate_agent_task_report(
+    *,
+    repo_root: Path,
+    preflight: dict[str, Any],
+    remote: dict[str, Any],
+) -> tuple[dict[str, Any], str, dict[str, list[str]]]:
+    paths_by_commit = validate_generated_history(
+        repo_root,
+        base_sha=preflight["pr"]["head_sha"],
+        remote=remote,
+    )
+    report_content = fetch_committed_text(
+        preflight["pr"]["repo_name"],
+        remote["report_path"],
+        remote["generated_head"],
+        description="Copilot Review Loop report",
+    )
+    if sha256_text(report_content) != remote["report_sha256"]:
+        raise TerminalAgentTaskReportError(
+            "Copilot Review Loop report digest does not match"
+        )
+    try:
+        report = validate_copilot_review_report(
+            report_content,
+            request_id=remote["request_id"],
+            preflight=preflight,
+            remote=remote,
+            paths_by_commit=paths_by_commit,
+        )
+    except WorkflowError as error:
+        raise TerminalAgentTaskReportError(str(error)) from error
+    return report, report_content, paths_by_commit
+
+
+def retained_terminal_report_error(
+    result: dict[str, Any],
+    *,
+    task_state: dict[str, Any],
+    repo_root: Path,
+    requested_model: str,
+) -> str | None:
+    task = result.get("task")
+    preflight = task_state.get("preflight")
+    if (
+        result.get("status") != "success"
+        or not isinstance(task, dict)
+        or task.get("state") != "completed"
+        or not isinstance(preflight, dict)
+    ):
+        return None
+    remote = validate_success_result(
+        result,
+        preflight=preflight,
+        requested_model=requested_model,
+    )
+    identity = local_identity(repo_root)
+    allowed_heads = (
+        {preflight["pr"]["head_sha"], remote["final_local_head"]}
+        if remote["requires_apply"]
+        else {remote["final_local_head"]}
+    )
+    if (
+        identity["branch"] != preflight["identity"]["branch"]
+        or identity["status"]
+        or identity["head"] not in allowed_heads
+    ):
+        raise WorkflowError(
+            "local repository identity drifted before retained report validation"
+        )
+    try:
+        validate_agent_task_report(
+            repo_root=repo_root,
+            preflight=preflight,
+            remote=remote,
+        )
+    except TerminalAgentTaskReportError as error:
+        return str(error)
+    return None
+
+
+def mark_terminal_unusable_report(
+    task_state: dict[str, Any],
+    *,
+    error: str,
+    args: argparse.Namespace,
+    target: str,
+    repo_root: Path,
+    state_path: Path,
+) -> None:
+    task = task_state.get("task")
+    task_id = task.get("id") if isinstance(task, dict) else task_state.get("task_id")
+    task_state.update(
+        {
+            "status": "failed",
+            "task_id": task_id,
+            "task_id_status": "terminal_unusable",
+            "error": error,
+            "retry_command": agent_task_retry_command(
+                args,
+                target=target,
+                repo_root=repo_root,
+                state_path=state_path,
+            ),
+        }
+    )
+    task_state.pop("recovery_command", None)
+
+
 def command_agent_task(args: argparse.Namespace) -> None:
     prepare_only = bool(getattr(args, "prepare_only", False))
     apply_prepared = bool(getattr(args, "apply_prepared", False))
@@ -5459,6 +5571,23 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 )
                 active.pop("recovery_command", None)
                 save_state(state_path, existing)
+            elif prior_task.get("state") == "completed":
+                report_error = retained_terminal_report_error(
+                    prior_result,
+                    task_state=active,
+                    repo_root=repo_root,
+                    requested_model=requested_model,
+                )
+                if report_error is not None:
+                    mark_terminal_unusable_report(
+                        active,
+                        error=report_error,
+                        args=args,
+                        target=target["pr_url"],
+                        repo_root=repo_root,
+                        state_path=state_path,
+                    )
+                    save_state(state_path, existing)
         if isinstance(active, dict) and active.get("status") not in {
             "completed",
             "consumed",
@@ -5881,23 +6010,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
             raise WorkflowError(
                 "local repository identity drifted before report validation"
             )
-        paths_by_commit = validate_generated_history(
-            repo_root, base_sha=pr["head_sha"], remote=remote
-        )
-        report_content = fetch_committed_text(
-            pr["repo_name"],
-            remote["report_path"],
-            remote["generated_head"],
-            description="Copilot Review Loop report",
-        )
-        if sha256_text(report_content) != remote["report_sha256"]:
-            raise WorkflowError("Copilot Review Loop report digest does not match")
-        report = validate_copilot_review_report(
-            report_content,
-            request_id=remote["request_id"],
+        report, report_content, paths_by_commit = validate_agent_task_report(
+            repo_root=repo_root,
             preflight=preflight,
             remote=remote,
-            paths_by_commit=paths_by_commit,
         )
         paths_checkpoint = [
             {"commit": commit, "paths": paths_by_commit[commit]}
@@ -6229,7 +6345,16 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 or current_task.get("confirmed_remote_head_sha")
                 else "failed"
             )
-            if current_task.get("task_id_status") not in {
+            if isinstance(error, TerminalAgentTaskReportError):
+                mark_terminal_unusable_report(
+                    current_task,
+                    error=str(error),
+                    args=args,
+                    target=target["pr_url"],
+                    repo_root=repo_root,
+                    state_path=state_path,
+                )
+            elif current_task.get("task_id_status") not in {
                 "not_created",
                 "terminal_unusable",
             }:

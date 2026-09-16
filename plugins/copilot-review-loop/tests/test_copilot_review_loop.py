@@ -71,6 +71,14 @@ FLAT_IDENTITY_347_RESULT = (
     / "fixtures"
     / "flat-identity-347-agent-task-result.json"
 )
+SUPPRESSED_COLLAPSED_383_REPORT = (
+    Path(__file__).parent / "fixtures" / "suppressed-collapsed-383-report.md"
+)
+SUPPRESSED_COLLAPSED_383_RESULT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "suppressed-collapsed-383-agent-task-result.json"
+)
 SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -1204,7 +1212,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.33")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.34")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -2646,6 +2654,74 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "task-1",
         )
 
+    def test_new_terminal_report_failure_records_fresh_retry(self):
+        state_path = self.directory / "terminal-report-state.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        report = "Report\n\n```json\n{\"comments\": []}\n```\n"
+        result = self.result()
+        result["report"]["sha256"] = MODULE.sha256_text(report)
+
+        def run(command, **_kwargs):
+            output = Path(command[command.index("--result-file") + 1])
+            output.write_text(json.dumps(result), encoding="utf-8")
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_stable_review_preflight",
+                return_value=self.preflight,
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "run", side_effect=run),
+            mock.patch.object(
+                MODULE, "local_identity", return_value=self.preflight["identity"]
+            ),
+            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(
+                MODULE, "require_live_comments", return_value=[self.comment]
+            ),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "report has stale identity"
+            ),
+        ):
+            MODULE.command_agent_task(self.arguments(state_path))
+
+        failed = MODULE.load_state(state_path)["agent_task"]
+        self.assertEqual("failed", failed["status"])
+        self.assertEqual("terminal_unusable", failed["task_id_status"])
+        self.assertEqual("task-1", failed["task_id"])
+        self.assertNotIn("recovery_command", failed)
+        self.assertNotIn("--resume", failed["retry_command"])
+
+    def test_retained_valid_success_report_remains_recoverable(self):
+        report = self.report()
+        result = self.result()
+        result["report"]["sha256"] = MODULE.sha256_text(report)
+        with (
+            mock.patch.object(
+                MODULE, "local_identity", return_value=self.preflight["identity"]
+            ),
+            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+        ):
+            error = MODULE.retained_terminal_report_error(
+                result,
+                task_state={"preflight": self.preflight},
+                repo_root=self.repo_root,
+                requested_model="gpt-5.6-sol",
+            )
+        self.assertIsNone(error)
+
     def test_legacy_failure_prepares_without_mutation_then_applies_once(self):
         state_path = self.directory / "prepared-state.json"
         helper = self.directory / "cloud_task.py"
@@ -3577,6 +3653,186 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 stack.enter_context(patcher)
             with self.assertRaisesRegex(MODULE.WorkflowError, "unfinished Agent Task"):
                 MODULE.command_agent_task(args)
+        self.assertEqual(1, len(commands))
+
+    def test_exact_383_terminal_report_replacement_is_fresh_and_deduplicated(self):
+        state_path = self.directory / "collapsed-suppressed-state.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        prompt = self.directory / "retained-prompt.txt"
+        prompt.write_text("retained prompt\n", encoding="utf-8")
+        result = json.loads(
+            SUPPRESSED_COLLAPSED_383_RESULT.read_text(encoding="utf-8")
+        )
+        report = SUPPRESSED_COLLAPSED_383_REPORT.read_text(encoding="utf-8")
+        preflight = copy.deepcopy(self.preflight)
+        preflight["identity"] = {
+            "branch": "trask-lock-free-dashboard-publisher",
+            "head": "19852bf67b646585381f3ea5cfe798ca46b8bc0f",
+            "status": "",
+        }
+        preflight["pr"].update(
+            {
+                "number": 383,
+                "pr_url": "https://github.com/open-telemetry/shared-workflows/pull/383",
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_repository": "open-telemetry/shared-workflows",
+                "head_branch": "trask-lock-free-dashboard-publisher",
+                "head_sha": "19852bf67b646585381f3ea5cfe798ca46b8bc0f",
+                "base_branch": "main",
+                "base_sha": "55fb421179d32aef3b36c7f6503f57193561d14c",
+            }
+        )
+        identities = [
+            {
+                "author": "copilot-pull-request-reviewer[bot]",
+                "body_sha256": (
+                    "ef35af361d8d647e848018190cc9748b0c0d2942b80da5fd86dc5a175c87db00"
+                ),
+                "id": -5225525187000,
+                "line": 242,
+                "original_line": 242,
+                "path": ".github/scripts/pull-request-dashboard/state_branch.py",
+                "review_id": 5225525187,
+                "source": "suppressed",
+                "thread_id": None,
+                "url": (
+                    "https://github.com/open-telemetry/shared-workflows/"
+                    "pull/383#pullrequestreview-5225525187"
+                ),
+            },
+            {
+                "author": "copilot-pull-request-reviewer[bot]",
+                "body_sha256": (
+                    "9518a33cbf1c7ea443c9126306fe5a91a6727f325305cf4fe33073ef445ab24c"
+                ),
+                "id": -5225525187001,
+                "line": 254,
+                "original_line": 254,
+                "path": ".github/scripts/pull-request-dashboard/state_branch.py",
+                "review_id": 5225525187,
+                "source": "suppressed",
+                "thread_id": None,
+                "url": (
+                    "https://github.com/open-telemetry/shared-workflows/"
+                    "pull/383#pullrequestreview-5225525187"
+                ),
+            },
+        ]
+        preflight["comment_identities"] = identities
+        preflight["comments"] = [
+            {
+                **identity,
+                "author_bot_id": "BOT_kgDOCnlnWA",
+                "body": f"finding {index}",
+                "resolved": False,
+                "status": "pending",
+            }
+            for index, identity in enumerate(identities)
+        ]
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "created_at": MODULE.utc_now(),
+                "iterations": 0,
+                "history": [],
+                "pr": preflight["pr"],
+                "queue": {
+                    "id": "pr-383",
+                    "status": "active",
+                    "comments": preflight["comments"],
+                    "batches": [],
+                },
+                "agent_task": {
+                    "run_id": "b2c84c17a9223fb18aab6d3e01180c9d",
+                    "status": "failed",
+                    "model": "gpt-5.6-sol",
+                    "remaining_iterations": 5,
+                    "preflight": preflight,
+                    "prompt_file": str(prompt),
+                    "result_file": str(SUPPRESSED_COLLAPSED_383_RESULT),
+                    "task": result["task"],
+                    "generated": result["generated"],
+                    "report": result["report"],
+                    "error": (
+                        "Copilot Review Loop forward repository report "
+                        "has stale identity"
+                    ),
+                    "recovery_command": "must-not-survive",
+                },
+            },
+        )
+        arguments = self.arguments(state_path)
+        arguments.target = "open-telemetry/shared-workflows#383"
+        arguments.prepare_only = True
+        arguments.preserve_artifacts = True
+        commands = []
+
+        def stop_after_dispatch(command, **_kwargs):
+            commands.append(command)
+            raise RuntimeError("stop after dispatch")
+
+        common = (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target(arguments.target),
+            ),
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value=preflight["identity"],
+            ),
+            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(
+                MODULE,
+                "wait_for_stable_review_preflight",
+                return_value=preflight,
+            ),
+            mock.patch.object(
+                MODULE,
+                "require_live_comments",
+                return_value=preflight["comments"],
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE.secrets, "token_hex", return_value="new-owner"),
+            mock.patch.object(MODULE, "run", side_effect=stop_after_dispatch),
+        )
+        with ExitStack() as stack:
+            for patcher in common:
+                stack.enter_context(patcher)
+            with self.assertRaisesRegex(RuntimeError, "stop after dispatch"):
+                MODULE.command_agent_task(arguments)
+
+        restarted = MODULE.load_state(state_path)
+        self.assertEqual(1, len(restarted["managed_task_history"]))
+        previous = restarted["managed_task_history"][0]
+        self.assertEqual(
+            "b2c84c17a9223fb18aab6d3e01180c9d", previous["run_id"]
+        )
+        self.assertEqual("terminal_unusable", previous["task_id_status"])
+        self.assertEqual(
+            "Copilot Review Loop forward repository report has stale identity",
+            previous["error"],
+        )
+        self.assertNotIn("recovery_command", previous)
+        self.assertNotIn("--resume", previous["retry_command"])
+        self.assertIn("--prepare-only", previous["retry_command"])
+        self.assertIn("--preserve-artifacts", previous["retry_command"])
+        self.assertEqual("new-owner", restarted["agent_task"]["run_id"])
+        self.assertEqual(1, len(commands))
+        self.assertIn("marketplace-agent-apply-report-worker@3", commands[0])
+        self.assertNotIn("--resume-apply-with-report", commands[0])
+
+        with ExitStack() as stack:
+            for patcher in common:
+                stack.enter_context(patcher)
+            with self.assertRaisesRegex(MODULE.WorkflowError, "unfinished Agent Task"):
+                MODULE.command_agent_task(arguments)
         self.assertEqual(1, len(commands))
 
     def test_completed_owner_is_archived_before_a_new_findings_task(self):
