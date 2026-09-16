@@ -22,6 +22,12 @@ COMPACT_V3_REPORT = (
 FORWARD_CLEAN_V3_REPORT = (
     Path(__file__).parent / "fixtures" / "forward-clean-v3-report.md"
 )
+SPLIT_IDENTITY_CLEAN_V3_REPORT = (
+    Path(__file__).parent / "fixtures" / "split-identity-clean-v3-report.md"
+)
+SPLIT_IDENTITY_CLEAN_V3_RESULT = (
+    Path(__file__).parent / "fixtures" / "split-identity-clean-v3-result.json"
+)
 CCA_DISABLED_V4_RESULT = (
     Path(__file__).parent / "fixtures" / "cca-disabled-v4-agent-task-result.json"
 )
@@ -1674,6 +1680,47 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             pipeline_max_iterations=None,
         )
 
+    def split_identity_preflight(self):
+        return {
+            **self.preflight,
+            "identity": {
+                "branch": "trask-fix-dashboard-publisher-contention",
+                "head": "8c15ae92f010174cc4b0877582dc3e889396550d",
+                "status": "",
+            },
+            "pr": {
+                **self.preflight["pr"],
+                "number": 347,
+                "repo_name": "open-telemetry/shared-workflows",
+                "pr_url": (
+                    "https://github.com/open-telemetry/shared-workflows/pull/347"
+                ),
+                "title": "Prevent dashboard publisher starvation",
+                "body": (
+                    "Prevents concurrent dashboard state updates from starving a "
+                    "publisher. State writers respect the repository publisher lease, "
+                    "while `--force-with-lease` handles races that begin before the "
+                    "lease commit.\n\n"
+                    "Direct workflows wait for the publisher. Queue workers return "
+                    "every claim for a busy repository and retry after five minutes "
+                    "without using the processing-failure budget. Targeted updates and "
+                    "head-SHA claim resolution check the lease before GitHub API or "
+                    "Copilot work.\n\n"
+                    "Fixes #341"
+                ),
+                "head_owner": "open-telemetry",
+                "head_repo": "shared-workflows",
+                "head_repository": "open-telemetry/shared-workflows",
+                "head_branch": "trask-fix-dashboard-publisher-contention",
+                "head_sha": "8c15ae92f010174cc4b0877582dc3e889396550d",
+                "base_branch": "main",
+                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+                "upstream_owner": "open-telemetry",
+                "upstream_repo": "shared-workflows",
+                "is_draft": True,
+            },
+        }
+
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
@@ -1684,7 +1731,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.21")
+        self.assertEqual(plugin["version"], "1.3.22")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -1703,9 +1750,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             prior_history=[],
         )
         self.assertIn("human-readable UTF-8 Markdown report", prompt)
-        self.assertIn("worker prompt version 4", prompt)
+        self.assertIn("worker prompt version 5", prompt)
         self.assertIn("do not omit the repository", prompt)
         self.assertIn("including both head and base refs", prompt)
+        self.assertIn("Never put `head`, `base`, or `fix_commits`", prompt)
+        self.assertIn("never encode `pull_request` as an integer", prompt)
         self.assertIn("maximum_review_iterations", prompt)
         self.assertIn("untrusted data", prompt)
         self.assertIn("Map every fix commit to its findings in the report", prompt)
@@ -1849,6 +1898,110 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 MODULE.validate_self_review_report(
                     content,
                     **{**common, "remote": remote, "paths_by_commit": paths},
+                )
+
+    def test_exact_split_identity_clean_report_recovers_retained_task(self):
+        preflight = self.split_identity_preflight()
+        content = SPLIT_IDENTITY_CLEAN_V3_REPORT.read_text(encoding="utf-8")
+        result_content = SPLIT_IDENTITY_CLEAN_V3_RESULT.read_text(encoding="utf-8")
+        self.assertEqual(
+            "4a46331daad8efb5dd5ef281666102d86e938f3a185b03835db5fc0326241afd",
+            MODULE.sha256_text(content),
+        )
+        self.assertEqual(
+            "33a5b20b5b4272adbc551518604186e6c9c807ce316ee3485a4157ae63c73a5e",
+            MODULE.sha256_text(result_content),
+        )
+        result = json.loads(result_content)
+        remote = MODULE.validate_success_result(
+            result,
+            preflight=preflight,
+            requested_model="gpt-5.6-sol",
+        )
+        common = {
+            "request_id": remote["request_id"],
+            "preflight": preflight,
+            "remote": remote,
+            "max_iterations": 5,
+            "paths_by_commit": {},
+        }
+
+        normalized = MODULE.validate_self_review_report(content, **common)
+
+        self.assertEqual("cleared", normalized["outcome"])
+        self.assertEqual(1, normalized["iterations_used"])
+        self.assertEqual([], normalized["findings"])
+        self.assertEqual(
+            {
+                "decision": "keep",
+                "title": preflight["pr"]["title"],
+                "body": preflight["pr"]["body"],
+                "reason": (
+                    "The split-identity clean report preserved the pinned "
+                    "title and body."
+                ),
+            },
+            normalized["pull_request_metadata"],
+        )
+
+        parsed = MODULE.parse_markdown_report(content, description="test report")
+        malformed = []
+        for field, value in (
+            ("repository", "someone-else/repository"),
+            ("pull_request", True),
+            ("pull_request", 348),
+            ("findings", [{"id": "untrusted"}]),
+            ("fix_commits", ["5" * 40]),
+        ):
+            candidate = json.loads(json.dumps(parsed))
+            candidate[field] = value
+            malformed.append(candidate)
+        for parent, field, value in (
+            ("head", "ref", "different-branch"),
+            ("head", "sha", "0" * 40),
+            ("base", "ref", "release"),
+            ("base", "sha", "0" * 40),
+            ("iteration", "number", True),
+            ("iteration", "number", 0),
+            ("iteration", "number", 6),
+            ("iteration", "status", "fixed"),
+            ("metadata", "title", "Different title"),
+            ("metadata", "body", "Different body"),
+        ):
+            candidate = json.loads(json.dumps(parsed))
+            candidate[parent][field] = value
+            malformed.append(candidate)
+        unexpected = json.loads(json.dumps(parsed))
+        unexpected["outcome"] = "cleared"
+        malformed.append(unexpected)
+        for candidate in malformed:
+            with self.subTest(candidate=candidate), self.assertRaises(
+                MODULE.WorkflowError
+            ):
+                MODULE.validate_self_review_report(
+                    f"```json\n{json.dumps(candidate)}\n```",
+                    **common,
+                )
+
+        for remote_override, paths in (
+            ({**remote, "requires_apply": False}, {}),
+            (
+                {
+                    **remote,
+                    "commits": ["5" * 40],
+                    "final_local_head": "5" * 40,
+                },
+                {"5" * 40: ["src/app.py"]},
+            ),
+        ):
+            with self.assertRaises(MODULE.WorkflowError):
+                MODULE.validate_self_review_report(
+                    content,
+                    **{
+                        **common,
+                        "remote": remote_override,
+                        "paths_by_commit": paths,
+                    },
                 )
 
     def test_exact_compact_v3_report_recovers_with_verified_history(self):
@@ -2728,6 +2881,139 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertTrue(result_path.is_file())
         self.assertEqual("nothing_to_publish", emitted[-1]["result"])
         self.assertEqual("cleared", emitted[-1]["stage_outcome"])
+
+    def test_split_identity_clean_resume_prepares_retained_owner_without_mutation(self):
+        state_path = self.directory / "split-identity-clean-resume.json"
+        prompt_path = self.directory / "retained-prompt.txt"
+        result_path = self.directory / "retained-result.json"
+        prompt_path.write_bytes(b"retained prompt")
+        result_content = SPLIT_IDENTITY_CLEAN_V3_RESULT.read_text(encoding="utf-8")
+        result_path.write_bytes(result_content.encode("utf-8"))
+        report = SPLIT_IDENTITY_CLEAN_V3_REPORT.read_text(encoding="utf-8")
+        preflight = self.split_identity_preflight()
+        result = json.loads(result_content)
+        MODULE.save_state(
+            state_path,
+            {
+                "version": 1,
+                "created_at": "2026-09-16T13:19:10Z",
+                "updated_at": "2026-09-16T13:25:39Z",
+                "iterations": 0,
+                "next_candidate_id": 1,
+                "history": [],
+                "repo_root": str(self.repo_root),
+                "pr": preflight["pr"],
+                "review": {
+                    "id": (
+                        "pr-347-agent-task-"
+                        "9d697bac9a648c8e9bff516986aedcc2"
+                    ),
+                    "status": "active",
+                    "iteration": 1,
+                    "head_sha": preflight["pr"]["head_sha"],
+                    "candidates": [],
+                    "batches": [],
+                },
+                "agent_task": {
+                    "status": "failed",
+                    "run_id": "9d697bac9a648c8e9bff516986aedcc2",
+                    "model": "gpt-5.6-sol",
+                    "policy": MODULE.AGENT_TASK_POLICY,
+                    "allowed_iterations": 5,
+                    "preflight": preflight,
+                    "prompt_file": str(prompt_path),
+                    "result_file": str(result_path),
+                    "task": result["task"],
+                    "generated": result["generated"],
+                    "report": result["report"],
+                    "attestation": result["attestation"],
+                    "worker_receipt": None,
+                    "clear_shared_state_on_apply": False,
+                    "error": "Self Review Loop report is malformed or has stale identity",
+                },
+            },
+        )
+        arguments = SimpleNamespace(
+            target="open-telemetry/shared-workflows#347",
+            repo_root=str(self.repo_root),
+            state=str(state_path),
+            resume=True,
+            prepare_only=True,
+            apply_prepared=False,
+            preserve_artifacts=True,
+            model="sol",
+            max_iterations=5,
+            pipeline_run=None,
+            pipeline_iteration=None,
+            pipeline_max_iterations=None,
+        )
+        emitted = []
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target(arguments.target),
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "run") as run,
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value=preflight["identity"],
+            ),
+            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(MODULE, "metadata_for", return_value=preflight["pr"]),
+            mock.patch.object(MODULE, "apply_verified_import") as apply_import,
+            mock.patch.object(MODULE, "update_pr_metadata") as update_metadata,
+            mock.patch.object(MODULE, "publish_shared_state") as publish_shared,
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        discover.assert_not_called()
+        run.assert_not_called()
+        apply_import.assert_not_called()
+        update_metadata.assert_not_called()
+        publish_shared.assert_not_called()
+        prepared = MODULE.load_state(state_path)
+        task = prepared["agent_task"]
+        self.assertEqual("validated_pending_import", task["status"])
+        self.assertEqual(1, task["resume_attempts"])
+        self.assertEqual(result["task"]["id"], task["task_id"])
+        self.assertEqual(result["task"]["url"], task["task_url"])
+        self.assertEqual(result["generated"]["branch"], task["generated_branch"])
+        self.assertEqual(result["generated"]["head_sha"], task["generated_head"])
+        self.assertEqual([], task["ordered_commits"])
+        self.assertEqual([], task["paths_by_commit"])
+        self.assertEqual([], task["findings"])
+        self.assertEqual(
+            "33a5b20b5b4272adbc551518604186e6c9c807ce316ee3485a4157ae63c73a5e",
+            task["result_sha256"],
+        )
+        self.assertEqual(result["report"]["sha256"], task["report_sha256"])
+        self.assertEqual(
+            {
+                "decision": "keep",
+                "title": preflight["pr"]["title"],
+                "body": preflight["pr"]["body"],
+                "reason": (
+                    "The split-identity clean report preserved the pinned "
+                    "title and body."
+                ),
+            },
+            task["pull_request_metadata"],
+        )
+        self.assertEqual(
+            task["pull_request_metadata"],
+            task["preparation"]["pull_request_metadata"],
+        )
+        self.assertEqual(3, len(task["preserved_artifacts"]))
+        self.assertIn("--apply-prepared", task["apply_command"])
+        self.assertNotIn('"--resume"', task["apply_command"])
+        self.assertEqual("validated_pending_import", emitted[-1]["result"])
 
     def test_recovery_accepts_a_push_that_already_reached_the_verified_head(self):
         state_path = self.directory / "push-recovery-state.json"
