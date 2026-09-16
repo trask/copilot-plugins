@@ -5434,7 +5434,12 @@ def require_live_check_snapshot(preflight: dict[str, Any]) -> None:
 
 
 def agent_task_recovery_command(
-    *, target: str, repo_root: Path, state_path: Path, model: str
+    *,
+    target: str,
+    repo_root: Path,
+    state_path: Path,
+    model: str,
+    preserve_artifacts: bool = False,
 ) -> str:
     values = [
         sys.executable,
@@ -5449,6 +5454,8 @@ def agent_task_recovery_command(
         model,
         "--resume",
     ]
+    if preserve_artifacts:
+        values.append("--preserve-artifacts")
     return " ".join(json.dumps(value) for value in values)
 
 
@@ -5496,11 +5503,38 @@ def agent_task_retry_command(
     return " ".join(json.dumps(value) for value in values)
 
 
-def remove_agent_task_artifacts(
-    state_path: Path, state: dict[str, Any], paths: Iterable[Path]
+def finalize_agent_task_artifacts(
+    state_path: Path,
+    state: dict[str, Any],
+    paths: Iterable[Path],
+    *,
+    preserve: bool,
 ) -> None:
+    artifacts = list(dict.fromkeys(paths))
+    task = state["agent_task"]
+    if preserve:
+        missing = [str(path) for path in artifacts if not path.is_file()]
+        if missing:
+            raise WorkflowError(
+                "publication succeeded, but preserved Agent Task artifacts are "
+                f"missing: {', '.join(missing)}"
+            )
+        task["artifacts_removed"] = False
+        task["artifacts_preserved"] = True
+        task["preserved_artifacts"] = [
+            {
+                "path": str(path),
+                "sha256": sha256_file(path),
+                "size": path.stat().st_size,
+            }
+            for path in artifacts
+        ]
+        task.pop("recovery_command", None)
+        task.pop("recovery_files", None)
+        save_state(state_path, state)
+        return
     errors = []
-    for path in paths:
+    for path in artifacts:
         try:
             path.unlink(missing_ok=True)
         except OSError as error:
@@ -5510,10 +5544,13 @@ def remove_agent_task_artifacts(
             "publication succeeded, but Agent Task artifact cleanup failed: "
             + "; ".join(errors)
         )
-    task = state["agent_task"]
     task["artifacts_removed"] = True
+    task.pop("artifacts_preserved", None)
+    task.pop("preserved_artifacts", None)
     task.pop("prompt_file", None)
     task.pop("result_file", None)
+    task.pop("prior_result_files", None)
+    task.pop("recovery_results", None)
     task.pop("recovery_command", None)
     save_state(state_path, state)
 
@@ -5808,6 +5845,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             repo_root=repo_root,
             state_path=state_path,
             model=args.model,
+            preserve_artifacts=bool(getattr(args, "preserve_artifacts", False)),
         )
         state["agent_task"] = {
             "status": "preparing",
@@ -6312,14 +6350,20 @@ def command_agent_task(args: argparse.Namespace) -> None:
             result_path,
             *(
                 Path(path)
+                for path in task_state.get("prior_result_files") or []
+                if isinstance(path, str) and path
+            ),
+            *(
+                Path(path)
                 for path in task_state.get("recovery_results") or []
                 if isinstance(path, str) and path
             ),
         ]
-        remove_agent_task_artifacts(
+        finalize_agent_task_artifacts(
             state_path,
             state,
             dict.fromkeys(cleanup_paths),
+            preserve=bool(getattr(args, "preserve_artifacts", False)),
         )
         result_name = {
             "fixed": "published",
@@ -8533,6 +8577,7 @@ def command_cleanup(args: argparse.Namespace) -> None:
         candidates = [
             task.get("prompt_file"),
             task.get("result_file"),
+            *(task.get("prior_result_files") or []),
             *(task.get("recovery_results") or []),
             *(task.get("recovery_files") or []),
         ]
@@ -8599,6 +8644,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         action="store_true",
         help="continue the same task import or retry it with --input-result-file",
+    )
+    agent_task.add_argument(
+        "--preserve-artifacts",
+        action="store_true",
+        help="retain immutable Agent Task prompt and result files after completion",
     )
     agent_task.set_defaults(function=command_agent_task)
 

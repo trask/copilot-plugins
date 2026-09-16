@@ -1168,7 +1168,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.22", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.23", json.loads(PLUGIN.read_text())["version"])
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1561,6 +1561,84 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn('"--input-result-file"', source)
         self.assertIn('"--result-file"', source)
         self.assertIn('"--policy"', source)
+
+    def test_preserve_artifacts_keeps_exact_files_and_records_manifest(self):
+        state_path = self.root / "state.json"
+        prompt = self.root / "prompt.txt"
+        result = self.root / "result.json"
+        prior_result = self.root / "prior-result.json"
+        prompt.write_bytes(b"exact prompt bytes\n")
+        result.write_bytes(b'{"status":"success"}\n')
+        prior_result.write_bytes(b'{"status":"error"}\n')
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "agent_task": {
+                "prompt_file": str(prompt),
+                "result_file": str(result),
+                "prior_result_files": [str(prior_result)],
+                "recovery_command": "resume",
+                "recovery_files": [str(prompt), str(result)],
+            }
+        }
+
+        MODULE.finalize_agent_task_artifacts(
+            state_path,
+            state,
+            [prompt, result, prior_result],
+            preserve=True,
+        )
+
+        stored = MODULE.load_state(state_path)["agent_task"]
+        self.assertEqual(b"exact prompt bytes\n", prompt.read_bytes())
+        self.assertEqual(b'{"status":"success"}\n', result.read_bytes())
+        self.assertEqual(b'{"status":"error"}\n', prior_result.read_bytes())
+        self.assertFalse(stored["artifacts_removed"])
+        self.assertTrue(stored["artifacts_preserved"])
+        self.assertEqual(str(prompt), stored["prompt_file"])
+        self.assertEqual(str(result), stored["result_file"])
+        self.assertEqual(
+            [
+                {
+                    "path": str(prompt),
+                    "sha256": MODULE.sha256_file(prompt),
+                    "size": prompt.stat().st_size,
+                },
+                {
+                    "path": str(result),
+                    "sha256": MODULE.sha256_file(result),
+                    "size": result.stat().st_size,
+                },
+                {
+                    "path": str(prior_result),
+                    "sha256": MODULE.sha256_file(prior_result),
+                    "size": prior_result.stat().st_size,
+                },
+            ],
+            stored["preserved_artifacts"],
+        )
+        self.assertNotIn("recovery_command", stored)
+        self.assertNotIn("recovery_files", stored)
+
+    def test_recovery_command_can_preserve_artifacts(self):
+        command = MODULE.agent_task_recovery_command(
+            target="owner/repo#7",
+            repo_root=self.root,
+            state_path=self.root.parent / "state.json",
+            model="sol",
+            preserve_artifacts=True,
+        )
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--resume",
+                "--preserve-artifacts",
+            ]
+        )
+
+        self.assertIn('"--resume"', command)
+        self.assertIn('"--preserve-artifacts"', command)
+        self.assertTrue(args.preserve_artifacts)
 
     def test_recovery_rejects_a_failed_result_with_mismatched_identity(self):
         failed = self.result()
