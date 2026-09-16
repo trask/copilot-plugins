@@ -20,6 +20,9 @@ SCRIPT = ROOT / "scripts" / "pr_description.py"
 AGENT = ROOT / "agents" / "pr-description.agent.md"
 PLUGIN = ROOT / "plugin.json"
 MARKETPLACE = ROOT.parents[1] / ".github" / "plugin" / "marketplace.json"
+FORWARD_COMPACT_KEEP_REPORT = (
+    Path(__file__).parent / "fixtures" / "forward-compact-keep-report.md"
+)
 SPEC = importlib.util.spec_from_file_location("pr_description", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -705,7 +708,7 @@ class LegacyAgentInstructions:
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.49")
+        self.assertEqual(plugin["version"], "1.0.50")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -740,6 +743,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "pull_request": {
                 "number": 7,
                 "head_sha": pr["head_sha"],
+                "base_sha": pr["base"]["sha"],
+                "head_ref": pr["head"]["ref"],
+                "base_ref": pr["base"]["ref"],
                 "current_title_sha256": MODULE.sha256_text(pr["title"]),
                 "current_body_sha256": MODULE.sha256_text(pr["body"]),
             },
@@ -868,7 +874,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.49")
+        self.assertEqual(plugin["version"], "1.0.50")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -934,6 +940,108 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             changed_files=["src/app.py"],
         )
         self.assertEqual(proposal["decision"], "keep")
+
+    def test_exact_forward_compact_keep_report_recovers_no_proposal(self):
+        body = (
+            "Collect per-job GitHub Actions timing data hourly across active public "
+            "OpenTelemetry repositories and store immutable gzip-compressed JSON "
+            "Lines on the orphan `otelbot/github-actions-queue-data` branch.\n\n"
+            "- Use the read-only `OpenTelemetry Actions Telemetry` GitHub App and "
+            "keep the built-in workflow token limited to writing the data branch.\n"
+            "- Checkpoint repository progress, revisit unfinished runs, and retain "
+            "failed job lookups for retry.\n"
+            "- Preserve matrix jobs, attempts, fork runs, runner metadata, and direct "
+            "job links in the raw dataset.\n"
+            "- Split searches around GitHub's 1,000-run API limit and checkpoint "
+            "cleanly if the App exhausts its REST quota."
+        )
+        preflight = {
+            **self.preflight,
+            "pr": {
+                **self.preflight["pr"],
+                "number": 377,
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_sha": "8f66336f18bbb637f105548ec82e1de7a4f611a0",
+                "head": {
+                    "repository": "open-telemetry/shared-workflows",
+                    "ref": "trask-actions-queue-events",
+                    "sha": "8f66336f18bbb637f105548ec82e1de7a4f611a0",
+                },
+                "base": {
+                    "repository": "open-telemetry/shared-workflows",
+                    "ref": "main",
+                    "sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+                },
+                "title": "Collect organization-wide GitHub Actions queue data",
+                "body": body,
+            },
+        }
+        changed_files = [
+            ".github/CODEOWNERS",
+            ".github/scripts/github-actions-queue/.gitignore",
+            ".github/scripts/github-actions-queue/DATA_BRANCH_README.md",
+            ".github/scripts/github-actions-queue/collect.py",
+            ".github/scripts/github-actions-queue/test_collect.py",
+            ".github/workflows/github-actions-queue-collector.yml",
+            ".github/workflows/github-actions-queue-test.yml",
+            "README.md",
+            "github-actions-queue/README.md",
+        ]
+        content = FORWARD_COMPACT_KEEP_REPORT.read_text(encoding="utf-8")
+        self.assertEqual(
+            "158602d68ef4e698946ae6abace2d23defc75e3490c67e1dac30e300ab3ff1aa",
+            MODULE.sha256_text(content),
+        )
+
+        report = MODULE.validate_proposal_report(
+            content,
+            request_id="29e06f06-0610-4e6a-a158-3adb494a64f3",
+            preflight=preflight,
+            changed_files=changed_files,
+            proposal_count=0,
+        )
+
+        self.assertEqual("keep", report["decision"])
+        self.assertEqual(preflight["pr"]["title"], report["proposal"]["title"])
+        parsed = MODULE.parse_markdown_report(content, description="test report")
+        malformed = []
+        replace = json.loads(json.dumps(parsed))
+        replace["decision"] = "replace"
+        malformed.append(replace)
+        wrong_head = json.loads(json.dumps(parsed))
+        wrong_head["evidence"]["head_sha"] = "0" * 40
+        malformed.append(wrong_head)
+        changed_title = json.loads(json.dumps(parsed))
+        changed_title["proposal"]["title"] = "Different title"
+        malformed.append(changed_title)
+        missing_evidence = json.loads(json.dumps(parsed))
+        missing_evidence["evidence"].pop("body_basis")
+        malformed.append(missing_evidence)
+        wrong_files = json.loads(json.dumps(parsed))
+        wrong_files["evidence"]["changed_files"] = changed_files[:-1]
+        malformed.append(wrong_files)
+        extra_key = json.loads(json.dumps(parsed))
+        extra_key["repository"] = preflight["pr"]["repo_name"]
+        malformed.append(extra_key)
+        common = {
+            "request_id": "29e06f06-0610-4e6a-a158-3adb494a64f3",
+            "preflight": preflight,
+            "changed_files": changed_files,
+            "proposal_count": 0,
+        }
+        for candidate in malformed:
+            with self.subTest(candidate=candidate), self.assertRaises(
+                MODULE.WorkflowError
+            ):
+                MODULE.validate_proposal_report(
+                    f"```json\n{json.dumps(candidate)}\n```",
+                    **common,
+                )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "stale identity"):
+            MODULE.validate_proposal_report(
+                content,
+                **{**common, "proposal_count": 1},
+            )
 
     def test_rejects_policy_repository_pr_head_and_task_mismatches(self):
         mutations = {
@@ -1022,7 +1130,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_prompt_uses_dispatcher_assigned_artifact_paths(self):
         prompt = MODULE.build_worker_prompt(agent_task_preflight())
 
-        self.assertIn("worker prompt version 2", prompt)
+        self.assertIn("worker prompt version 3", prompt)
+        self.assertIn("with its request, repository, pull request, head, base", prompt)
         self.assertIn("human-readable UTF-8 Markdown report", prompt)
         self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
         self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
@@ -1055,6 +1164,120 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             list(self.directory.glob("*--agent-task-*")),
             [],
         )
+
+    def test_compact_keep_resume_reuses_task_without_github_mutation(self):
+        path = self.directory / "owner--repo--7--retained.json"
+        index = self.directory / "owner--repo--7.json"
+        prompt = self.directory / "retained-prompt.txt"
+        result_path = self.directory / "retained-result.json"
+        prompt.write_text("retained prompt", encoding="utf-8")
+        report_payload = {
+            "decision": "keep",
+            "evidence": {
+                "body_basis": "The current body covers the changed behavior.",
+                "changed_files": ["src/app.py"],
+                "head_sha": self.preflight["pr"]["head_sha"],
+                "title_basis": "The current title names the changed behavior.",
+            },
+            "proposal": {
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+            },
+        }
+        report_content = f"```json\n{json.dumps(report_payload)}\n```"
+        result = self.result(report_content)
+        result_path.write_text(json.dumps(result), encoding="utf-8")
+        state = {
+            "version": 2,
+            "kind": "run",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "run_id": "run-1",
+            "repo_root": str(self.repo_root),
+            "pr": self.preflight["pr"],
+            "viewer": self.preflight["viewer"],
+            "proposal_count": 0,
+            "pinned_at": "2026-01-01T00:00:00Z",
+            "index_path": str(index),
+            "agent_task": {
+                "status": "failed",
+                "model": "gpt-5.6-sol",
+                "policy": "marketplace-agent-report-worker@1",
+                "prompt_file": str(prompt),
+                "result_file": str(result_path),
+                "error": "report mismatch",
+            },
+        }
+        MODULE.save_state(path, state)
+        emitted = []
+
+        def validated_no_change(state_path, current, **_kwargs):
+            current["validated_head_sha"] = self.preflight["pr"]["head_sha"]
+            current["validation"] = {
+                "mode": "no_change",
+                "head_sha": self.preflight["pr"]["head_sha"],
+            }
+            MODULE.save_state(state_path, current)
+            return {
+                "result": "validated",
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+                "validated_head_sha": self.preflight["pr"]["head_sha"],
+            }
+
+        arguments = SimpleNamespace(
+            target="owner/repo#7",
+            repo_root=str(self.repo_root),
+            state=str(path),
+            resume=True,
+            preserve_artifacts=True,
+            model="sol",
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "refresh_run_index"),
+            mock.patch.object(MODULE, "local_identity", return_value=self.identity),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "run") as run,
+            mock.patch.object(
+                MODULE, "fetch_committed_text", return_value=report_content
+            ),
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                return_value=pr_metadata(
+                    head_sha=self.preflight["pr"]["head_sha"]
+                ),
+            ),
+            mock.patch.object(
+                MODULE, "pull_request_file_paths", return_value=["src/app.py"]
+            ),
+            mock.patch.object(
+                MODULE, "validate_no_change", side_effect=validated_no_change
+            ),
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        discover.assert_not_called()
+        run.assert_not_called()
+        completed = MODULE.load_run_state(path)
+        self.assertEqual("completed", completed["agent_task"]["status"])
+        self.assertEqual(1, completed["agent_task"]["resume_attempts"])
+        self.assertEqual(
+            self.preflight["pr"]["head_sha"], completed["validated_head_sha"]
+        )
+        self.assertEqual(3, len(completed["agent_task"]["preserved_artifacts"]))
+        self.assertTrue(prompt.is_file())
+        self.assertTrue(result_path.is_file())
+        self.assertEqual("validated", emitted[-1]["result"])
+        self.assertEqual("keep", emitted[-1]["decision"])
 
     def test_task_failure_keeps_recovery_artifacts_and_never_mutates(self):
         report_content = self.proposal_report()
