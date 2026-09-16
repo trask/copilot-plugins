@@ -104,23 +104,9 @@ STAGE_LABELS = {
     STAGE_CI: "CI remediation",
     STAGE_DESCRIPTION: "description validation",
 }
-ACTIVE_TASK_STATES = frozenset(
-    {
-        "preparing",
-        "dispatching",
-        "running",
-        "resuming",
-        "validated",
-        "publishing",
-        "published",
-    }
-)
-RECOVERY_TASK_STATES = frozenset(
-    {"failed", "failed_after_mutation", "failed_after_publication", "interrupted"}
-)
-UNAVAILABLE_STATUS_REASONS = frozenset(
-    {"status_timeout", "status_failed", "invalid_status_json", "status_not_ready"}
-)
+ACTIVE_TASK_STATES = common.ACTIVE_TASK_STATES
+RECOVERY_TASK_STATES = common.RECOVERY_TASK_STATES
+UNAVAILABLE_STATUS_REASONS = common.UNAVAILABLE_STATUS_REASONS
 
 
 def run_slug(target: dict[str, Any]) -> str:
@@ -219,6 +205,16 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
         else:
             reason = payload.get("stage_reason") or payload.get("outcome")
             outcome = f"not clear: {reason}" if reason else "not clear"
+            if reason == "clearance_is_for_an_older_head":
+                recorded = payload.get("clear_at_head_sha")
+                live = payload.get("ended_head_sha")
+                if recorded and live:
+                    outcome += f" (recorded {recorded[:8]}, live {live[:8]})"
+            elif reason == "clearance_is_for_an_older_base":
+                recorded = payload.get("clear_at_base_sha")
+                live = payload.get("inspected_base_sha")
+                if recorded and live:
+                    outcome += f" (recorded {recorded[:8]}, live {live[:8]})"
         update = {
             "message": f"{prefix}{label} {outcome}{scope}.",
             "next_action": "Inspect and run the next stage.",
@@ -407,12 +403,15 @@ def stage_command(
     run_id: str,
     sweep: int,
 ) -> list[str]:
+    arguments = pipeline_arguments(entry, run_id, sweep)
+    if entry["stage"] == STAGE_CONFLICT:
+        arguments.extend(["--state", str(stage_state_path(entry, target))])
     return common.stage_command(
         entry,
         target,
         model=model,
         effort=effort,
-        arguments=pipeline_arguments(entry, run_id, sweep),
+        arguments=arguments,
     )
 
 
@@ -517,45 +516,7 @@ def blocked_result(
     return payload
 
 
-def stage_blocker(
-    stage_result: dict[str, Any], *, after_launch: bool
-) -> tuple[str, str] | None:
-    reason = stage_result.get("reason")
-    if reason in UNAVAILABLE_STATUS_REASONS:
-        return (
-            "stage_status_unavailable",
-            stage_result.get("detail")
-            or f"{stage_result['stage']} status could not be read: {reason}",
-        )
-    if after_launch and reason == "no_state":
-        return (
-            "stage_did_not_record_state",
-            (
-                f"{stage_result['stage']} returned without recording a stage state; "
-                "clearance cannot be verified"
-            ),
-        )
-
-    status = stage_result.get("status")
-    task = status.get("agent_task") if isinstance(status, dict) else None
-    task_state = task.get("status") if isinstance(task, dict) else None
-    if task_state in ACTIVE_TASK_STATES:
-        return (
-            "stage_still_active",
-            (
-                f"{stage_result['stage']} still records Agent Task state "
-                f"{task_state}; a replacement must not be started"
-            ),
-        )
-    if task_state in RECOVERY_TASK_STATES:
-        detail = task.get("error")
-        if not isinstance(detail, str) or not detail:
-            detail = (
-                f"{stage_result['stage']} records Agent Task state {task_state}; "
-                "use its retained recovery details"
-            )
-        return "stage_recovery_required", detail
-    return None
+stage_blocker = common.stage_blocker
 
 
 def run_pipeline(
@@ -780,6 +741,9 @@ def run_pipeline(
                         "outcome": stage_result["outcome"],
                         "clear": stage_result["clear"],
                         "stage_reason": stage_result["reason"],
+                        "clear_at_head_sha": stage_result.get("clear_at_head_sha"),
+                        "clear_at_base_sha": stage_result.get("clear_at_base_sha"),
+                        "inspected_base_sha": current_pr["base_sha"],
                         "status": stage_result["status"],
                         "retained_commits": retained_commits,
                     }
@@ -816,6 +780,9 @@ def run_pipeline(
                     "outcome": after["outcome"],
                     "clear": after["clear"],
                     "stage_reason": after["reason"],
+                    "clear_at_head_sha": after.get("clear_at_head_sha"),
+                    "clear_at_base_sha": after.get("clear_at_base_sha"),
+                    "inspected_base_sha": current_pr["base_sha"],
                     "status": after["status"],
                 }
             )

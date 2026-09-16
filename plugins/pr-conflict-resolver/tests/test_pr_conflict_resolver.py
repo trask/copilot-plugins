@@ -1048,6 +1048,78 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual(state, json.loads(state_path.read_text(encoding="utf-8")))
         preflight.assert_not_called()
 
+    def test_task_creation_failure_persists_structured_terminal_state(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+            ]
+        )
+        target = MODULE.parse_target("owner/repo#7")
+        pr = {
+            **target,
+            "head_sha": "b" * 40,
+            "base_sha": "a" * 40,
+        }
+        preflight = {
+            "already_mergeable": False,
+            "pr": pr,
+            "strategy": "merge",
+            "request": self.request(),
+            "repository_root": str(directory),
+        }
+
+        def write_empty_result(command, **_kwargs):
+            result_path = Path(command[command.index("--result-file") + 1])
+            result_path.write_text("{}", encoding="utf-8")
+            return completed(2, stderr="HTTP 409")
+
+        failed_result = {
+            "status": "error",
+            "task": None,
+            "error": {
+                "code": "api_error",
+                "message": "HTTP 409: Copilot coding agent is unavailable",
+            },
+        }
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(MODULE, "conflict_preflight", return_value=preflight),
+            mock.patch.object(MODULE, "build_conflict_prompt", return_value="prompt"),
+            mock.patch.object(
+                MODULE, "discover_conflict_task", return_value=directory / "helper.py"
+            ),
+            mock.patch.object(MODULE, "run", side_effect=write_empty_result),
+            mock.patch.object(
+                MODULE, "load_conflict_result", return_value=failed_result
+            ),
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(args)
+
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        task = state["agent_task"]
+        self.assertEqual("failed", task["status"])
+        self.assertIsNone(task["task_id"])
+        self.assertEqual("not_created", task["task_id_status"])
+        self.assertEqual(failed_result["error"], task["error"])
+        payload = emitted(emit)
+        self.assertEqual("task_creation_failed", payload["result"])
+        self.assertIsNone(payload["task_id"])
+        self.assertEqual("not_created", payload["task_id_status"])
+        self.assertEqual(failed_result["error"], payload["error"])
+        self.assertNotIn("recovery_command", payload)
+        self.assertIn("--state", payload["retry_command"])
+
     def test_agent_contract_documents_the_default_and_budget_retry(self):
         self.assertIn("three managed attempts per state file by default", self.instructions)
         self.assertIn("`--max-iterations <count>`", self.instructions)

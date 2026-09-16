@@ -1409,11 +1409,89 @@ STAGE_STATUS_FIELDS = (
     "verdicts",
 )
 
+ACTIVE_TASK_STATES = frozenset(
+    {
+        "preparing",
+        "dispatching",
+        "running",
+        "resuming",
+        "validated",
+        "publishing",
+        "published",
+    }
+)
+RECOVERY_TASK_STATES = frozenset(
+    {"failed", "failed_after_mutation", "failed_after_publication", "interrupted"}
+)
+UNAVAILABLE_STATUS_REASONS = frozenset(
+    {"status_timeout", "status_failed", "invalid_status_json", "status_not_ready"}
+)
+
 
 def stage_status_summary(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
     return {key: payload[key] for key in STAGE_STATUS_FIELDS if key in payload}
+
+
+def stage_blocker(
+    stage_result: dict[str, Any], *, after_launch: bool
+) -> tuple[str, str] | None:
+    reason = stage_result.get("reason")
+    state_path = stage_result.get("status_state")
+    state_suffix = (
+        f" Expected state path: {state_path}."
+        if isinstance(state_path, str) and state_path
+        else ""
+    )
+    if reason in UNAVAILABLE_STATUS_REASONS:
+        return (
+            "stage_status_unavailable",
+            (
+                stage_result.get("detail")
+                or f"{stage_result['stage']} status could not be read: {reason}"
+            )
+            + state_suffix,
+        )
+    if after_launch and reason == "no_state":
+        return (
+            "stage_did_not_record_state",
+            (
+                f"{stage_result['stage']} returned without recording a stage state "
+                f"at the expected path; clearance cannot be verified.{state_suffix}"
+            ),
+        )
+    status = stage_result.get("status")
+    task = status.get("agent_task") if isinstance(status, dict) else None
+    task_state = task.get("status") if isinstance(task, dict) else None
+    task_id = None
+    if isinstance(task, dict):
+        task_id = task.get("task_id") or task.get("id")
+    task_identity = f" for task {task_id}" if task_id else ""
+    if task_state in ACTIVE_TASK_STATES:
+        return (
+            "stage_still_active",
+            (
+                f"{stage_result['stage']} still records Agent Task state "
+                f"{task_state}{task_identity}; a replacement must not be started"
+            ),
+        )
+    if task_state in RECOVERY_TASK_STATES:
+        detail = task.get("error")
+        if isinstance(detail, dict):
+            code = detail.get("code")
+            message = detail.get("message")
+            detail = ": ".join(
+                str(value) for value in (code, message) if value
+            )
+        if not isinstance(detail, str) or not detail:
+            detail = (
+                f"{stage_result['stage']} records Agent Task state "
+                f"{task_state}{task_identity}; "
+                "use its retained recovery details"
+            )
+        return "stage_recovery_required", detail
+    return None
 
 
 def inspect_stage(

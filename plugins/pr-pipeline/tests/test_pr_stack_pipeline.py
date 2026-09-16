@@ -384,6 +384,7 @@ class StackFixture(unittest.TestCase):
         self.worker_progress_map: dict[int, dict] = {}
         self.propagated: list[tuple[int, str]] = []
         self.contains_pairs: set[tuple[str, str]] | None = None
+        self.inspect_sequences: dict[tuple[int, str], list[dict]] = {}
 
     def next_nonce(self) -> str:
         self.nonce_count += 1
@@ -395,7 +396,7 @@ class StackFixture(unittest.TestCase):
     def inspect(self, entry, target, head_sha, base_sha=None):
         clear = (target["number"], entry["stage"]) in self.clear
         completed = (target["number"], entry["stage"]) in self.completed
-        return {
+        result = {
             "stage": entry["stage"],
             "clear": clear,
             "clear_at_head_sha": head_sha if clear else None,
@@ -412,6 +413,10 @@ class StackFixture(unittest.TestCase):
                 }
             },
         }
+        sequence = self.inspect_sequences.get((target["number"], entry["stage"]))
+        if sequence:
+            result.update(sequence.pop(0))
+        return result
 
     def checkpoints(self, repository, number):
         return self.checkpoint_map.get(number, [])
@@ -573,6 +578,98 @@ class StackRunTest(StackFixture):
 
         for number in (11, 12, 13):
             self.assertNotIn(number, active_at_finish[number])
+
+    def test_active_agent_task_blocks_launch_and_restart_without_duplicates(self):
+        self.stack = stack(members=(11,))
+        active = {
+            "reason": "not_cleared",
+            "status": {
+                "agent_task": {
+                    "status": "running",
+                    "task_id": "task-1",
+                }
+            },
+        }
+        self.inspect_sequences[(11, MODULE.STAGE_CONFLICT)] = [active, active]
+
+        first = self.pipeline(kickoff([11]))
+        first_result = first.execute()
+        second = self.pipeline(kickoff([11]))
+        second_result = second.execute()
+
+        self.assertEqual("stage_still_active", first_result["reason"])
+        self.assertEqual("stage_still_active", second_result["reason"])
+        self.assertIn("task-1", first_result["detail"])
+        self.assertEqual([], [call for call in self.launcher.calls if call[0] == "start"])
+
+    def test_post_exit_active_agent_task_blocks_the_pipeline(self):
+        self.stack = stack(members=(11,))
+        self.inspect_sequences[(11, MODULE.STAGE_COPILOT_REVIEW)] = [
+            {},
+            {
+                "reason": "not_cleared",
+                "status": {
+                    "agent_task": {
+                        "status": "running",
+                        "task_id": "task-1",
+                    }
+                },
+            },
+        ]
+        pipeline = self.pipeline(kickoff([11]))
+
+        result = pipeline.run_parallel_phase(
+            MODULE.STAGE_COPILOT_REVIEW, 1, self.stack["members"]
+        )
+
+        self.assertEqual("stage_still_active", result["stopped"]["reason"])
+        self.assertEqual("blocked", self.events_named("worker_finished")[0]["status"])
+
+    def test_description_without_outcome_has_a_specific_blocking_reason(self):
+        self.stack = stack(members=(11,))
+        self.inspect_sequences[(11, MODULE.STAGE_DESCRIPTION)] = [
+            {},
+            {
+                "outcome": None,
+                "reason": "not_cleared",
+                "status": {"validation": None, "agent_task": {"status": "completed"}},
+            },
+        ]
+        pipeline = self.pipeline(kickoff([11]))
+
+        result = pipeline.run_parallel_phase(
+            MODULE.STAGE_DESCRIPTION, 1, self.stack["members"]
+        )
+
+        self.assertEqual(
+            "description_did_not_record_outcome", result["stopped"]["reason"]
+        )
+
+    def test_stale_clearance_is_collected_but_not_reported_complete(self):
+        self.stack = stack(members=(11,))
+        old_head = "9" * 40
+        self.inspect_sequences[(11, MODULE.STAGE_COPILOT_REVIEW)] = [
+            {},
+            {
+                "clear": False,
+                "clear_at_head_sha": old_head,
+                "outcome": "cleared",
+                "reason": "clearance_is_for_an_older_head",
+            },
+        ]
+        pipeline = self.pipeline(kickoff([11]))
+
+        result = pipeline.run_parallel_phase(
+            MODULE.STAGE_COPILOT_REVIEW, 1, self.stack["members"]
+        )
+
+        completion = result["completions"][0]
+        self.assertFalse(completion["clear"])
+        self.assertEqual("clearance_is_for_an_older_head", completion["reason"])
+        self.assertIsNone(result["stopped"])
+        phase = self.events_named("phase_finished")[0]
+        self.assertFalse(phase["clear"])
+        self.assertEqual(["clearance_is_for_an_older_head"], phase["reasons"])
 
     def test_parallel_worker_progress_is_polled_and_coalesced_for_every_worker(self):
         self.launcher = FakeLauncher(alive_polls=2)
@@ -876,6 +973,18 @@ class StackRunTest(StackFixture):
             [12, 13], [call[1] for call in self.launcher.calls if call[0] == "start"]
         )
 
+    def test_all_already_clear_ci_members_report_verified_clearance(self):
+        for member in self.stack["members"]:
+            self.clear.add((member["number"], MODULE.STAGE_CI))
+        pipeline = self.pipeline()
+
+        result = pipeline.run_ci_phase(1, self.stack["members"])
+
+        self.assertTrue(result["clear"])
+        self.assertEqual(0, result["dispatches"])
+        event = self.events_named("phase_finished")[0]
+        self.assertTrue(event["clear"])
+
     def test_ci_workers_carry_the_pipeline_position_with_a_two_pass_budget(self):
         pipeline = self.pipeline()
         member = self.stack["members"][0]
@@ -893,16 +1002,27 @@ class StackRunTest(StackFixture):
             request["arguments"],
         )
 
-    def test_the_conflict_stage_carries_no_pipeline_position(self):
+    def test_the_conflict_stage_carries_only_the_explicit_state_path(self):
         """PR Conflict Resolver integrates once per launch and takes no budget.
 
-        Its helper rejects the flags outright, so sending them would kill every
-        conflict worker at preflight.
+        Its helper rejects pipeline position flags, but an explicit canonical
+        state path keeps the worker and scheduler on the same durable record.
         """
         pipeline = self.pipeline()
         member = self.stack["members"][0]
         request = pipeline.request_for(member, MODULE.STAGE_CONFLICT, 2)
-        self.assertEqual([], request["arguments"])
+        self.assertEqual(
+            [
+                "--state",
+                str(
+                    MODULE.stage_state_path(
+                        MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT],
+                        COMMON.target_for("owner/repo", member["number"]),
+                    )
+                ),
+            ],
+            request["arguments"],
+        )
 
     # Push propagation ---------------------------------------------------
 
@@ -1278,9 +1398,11 @@ class StackRunTest(StackFixture):
 
     def test_second_pass_does_not_relaunch_a_completed_conflict_resolution(self):
         self.completed.add((11, MODULE.STAGE_CONFLICT))
-        self.launcher.on_start = lambda request: self.attempt_ids.__setitem__(
-            (request["number"], request["stage"]), "current-attempt"
-        )
+        def complete_with_current_clearance(request):
+            self.attempt_ids[(request["number"], request["stage"])] = "current-attempt"
+            self.clear.add((request["number"], request["stage"]))
+
+        self.launcher.on_start = complete_with_current_clearance
         pipeline = self.pipeline()
 
         result = pipeline.execute()
@@ -1547,6 +1669,22 @@ class SnapshotTest(StackFixture):
         self.assertEqual("bases_moved_during_snapshot", snapshot["reason"])
         self.assertEqual([12], snapshot["moved"])
 
+    def test_an_unreadable_base_is_unverified_not_stale(self):
+        pipeline = self.pipeline(
+            base_tip=mock.Mock(side_effect=MODULE.WorkflowError("base unavailable"))
+        )
+
+        snapshot = pipeline.final_snapshot()
+
+        self.assertEqual("incomplete", snapshot["result"])
+        self.assertEqual("base_status_unavailable", snapshot["reason"])
+        self.assertTrue(
+            all(
+                stage["identity"] == "unverified"
+                for stage in snapshot["pull_requests"][0]["stages"]
+            )
+        )
+
 
 class StateTest(unittest.TestCase):
     def setUp(self):
@@ -1757,6 +1895,60 @@ class ProgressProtocolTest(StackFixture):
         self.assertIn("starting workers", updates[0]["wait_reason"])
         self.assertTrue(updates[0]["next_action"])
         self.assertIn("failed for #11", updates[1]["message"])
+
+    def test_worker_exit_without_clearance_is_reported_as_result_collected(self):
+        reporter, _ = self.reporter()
+        reporter(
+            {
+                "event": "worker_finished",
+                "stage": MODULE.STAGE_DESCRIPTION,
+                "pull_request_pass": 2,
+                "number": 20073,
+                "returncode": 0,
+                "accepted": True,
+                "clear": False,
+                "reason": "not_cleared",
+                "status": "result_collected",
+                "clear_at_head_sha": "1" * 40,
+                "current_head_sha": "2" * 40,
+            }
+        )
+        reporter(
+            {
+                "event": "phase_finished",
+                "phase": MODULE.STAGE_DESCRIPTION,
+                "pull_request_pass": 2,
+                "numbers": [20073],
+                "clear": False,
+                "reasons": ["not_cleared"],
+            }
+        )
+
+        updates = MODULE.read_progress_log(self.event_log)
+        self.assertIn("result collected", updates[0]["message"])
+        self.assertNotIn("completed", updates[0]["message"])
+        self.assertIn("clearance was not verified", updates[1]["message"])
+        self.assertNotIn(" complete.", updates[1]["message"])
+
+    def test_stale_worker_progress_names_recorded_and_live_revisions(self):
+        reporter, _ = self.reporter()
+        reporter(
+            {
+                "event": "worker_finished",
+                "stage": MODULE.STAGE_COPILOT_REVIEW,
+                "pull_request_pass": 1,
+                "number": 11,
+                "returncode": 0,
+                "accepted": True,
+                "clear": False,
+                "reason": "clearance_is_for_an_older_head",
+                "clear_at_head_sha": "1" * 40,
+                "current_head_sha": "2" * 40,
+            }
+        )
+
+        message = MODULE.read_progress_log(self.event_log)[0]["message"]
+        self.assertIn("recorded 11111111, live 22222222", message)
 
     def test_a_completed_resolver_skip_is_reported_without_a_start_event(self):
         reporter, _ = self.reporter()
@@ -2505,6 +2697,90 @@ class ParserTest(unittest.TestCase):
             [event["event"] for event in events],
         )
         self.assertEqual("complete", events[-1]["result"])
+
+    def test_terminal_result_bounds_the_observed_large_worker_payload(self):
+        build_output = "BUILD OUTPUT\n" * 1800
+        stages = [
+            {
+                "stage": stage,
+                "clear": False,
+                "identity": "stale",
+                "outcome": "cleared",
+                "reason": "clearance_is_for_an_older_head",
+                "clear_at_head_sha": "1" * 40,
+                "status": {"build_output": build_output},
+            }
+            for stage in MODULE.STAGE_NAMES
+        ]
+        payload = {
+            "result": "partial",
+            "reason": "two_passes_finished",
+            "run_id": "run-1",
+            "repository": "owner/repo",
+            "stack_number": 77,
+            "start_pull_request": 11,
+            "selected": [11, 12],
+            "passes": 2,
+            "state_path": str(Path("state.json")),
+            "phases": [
+                {
+                    "phase": MODULE.STAGE_DESCRIPTION,
+                    "mode": MODULE.PHASE_PARALLEL,
+                    "dispatches": 2,
+                    "accepted": [11, 12],
+                    "clear": False,
+                    "reasons": ["not_cleared"],
+                }
+            ]
+            * 10,
+            "snapshot": {
+                "result": "incomplete",
+                "reason": "stages_not_clear",
+                "pull_requests": [
+                    {
+                        "number": number,
+                        "head_sha": str(number) * 40,
+                        "base_sha": "a" * 40,
+                        "uncleared": list(MODULE.STAGE_NAMES),
+                        "stages": stages,
+                    }
+                    for number in (11, 12)
+                ],
+            },
+            "propagations": [
+                {
+                    "number": 11,
+                    "head_sha": "3" * 40,
+                    "result": "published",
+                    "output": build_output,
+                }
+            ],
+        }
+
+        first = MODULE.compact_terminal_result(
+            payload, result_path=Path("result.json")
+        )
+        second = MODULE.compact_terminal_result(
+            payload, result_path=Path("result.json")
+        )
+        encoded = json.dumps(first, sort_keys=True, separators=(",", ":")).encode()
+
+        self.assertEqual(first, second)
+        self.assertLessEqual(len(encoded), MODULE.TERMINAL_RESULT_MAX_BYTES)
+        self.assertNotIn("BUILD OUTPUT", encoded.decode())
+        self.assertEqual(
+            "clearance_is_for_an_older_head",
+            first["snapshot"]["pull_requests"][0]["stages"][0]["reason"],
+        )
+        self.assertEqual("result.json", first["artifacts"]["result"])
+        self.assertEqual(
+            {
+                "number": 11,
+                "head_sha": "3" * 40,
+                "result": "published",
+            },
+            first["propagations"][0],
+        )
 
     def test_an_error_is_a_terminal_json_event(self):
         output = StringIO()

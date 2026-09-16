@@ -65,7 +65,8 @@ Follow the JSON result exactly:
 
 - `published`: stop. Report the strategy, old head, new head, mergeability, and every native-stack head when present.
 - `mergeable`: stop with `Outcome: already mergeable.`
-- `recovery_required`: stop with `Outcome: recovery required.` Include the task ID, error, recovery command, and recovery files.
+- `recovery_required`: stop with `Outcome: recovery required.` Include the task ID status, error, recovery command when present, next action when present, and recovery files. When the task ID status is `unknown`, inspect managed Agent Tasks before starting a replacement.
+- `task_creation_failed`: stop with `Outcome: managed task creation failed.` Include the structured error, retained state path, and exact retry command. A task ID status of `not_created` means the helper received a terminal response without a task ID and the retained state permits that retry.
 - `max_iterations_reached`: stop with `Outcome: escalated.` Report that no Agent Task started, the completed managed iteration count, the refused iteration, the budget, and the exact `retry_command`. That command keeps the existing state and raises the budget enough for the refused iteration. Do not add `--resume`; there is no unfinished managed task to resume.
 - `error`: stop and report the exact error. Never work around a failed guard.
 
@@ -80,6 +81,7 @@ Lead with one outcome:
 - `Outcome: published.`
 - `Outcome: already mergeable.`
 - `Outcome: recovery required.`
+- `Outcome: managed task creation failed.`
 - `Outcome: escalated.`
 
 Name the pull request and final head. For a native stack, list each member and published head in order. Do not post the result to GitHub.

@@ -69,6 +69,10 @@ CONFLICT_PROPAGATE_COMMAND = "descendant-propagate"
 PROGRESS_EVENT = common.PROGRESS_EVENT
 PROGRESS_UPDATE_EVENT = common.PROGRESS_UPDATE_EVENT
 PROGRESS_HEARTBEAT_INTERVAL = common.PROGRESS_HEARTBEAT_INTERVAL
+TERMINAL_RESULT_MAX_BYTES = 8192
+TERMINAL_RESULT_MAX_PULL_REQUESTS = 12
+TERMINAL_RESULT_MAX_PHASES = 10
+TERMINAL_TEXT_MAX_CHARS = 512
 
 STAGE_CONFLICT = common.STAGE_CONFLICT
 STAGE_COPILOT_REVIEW = common.STAGE_COPILOT_REVIEW
@@ -136,6 +140,28 @@ def inspect_stage(
     return common.inspect_stage(
         entry, target, head_sha, base_sha, read_status=read_stage_status
     )
+
+
+def stage_result_summary(stage_result: dict[str, Any]) -> dict[str, Any]:
+    status = stage_result.get("status")
+    task = status.get("agent_task") if isinstance(status, dict) else None
+    return {
+        key: value
+        for key, value in {
+            "stage": stage_result.get("stage"),
+            "clear": stage_result.get("clear"),
+            "clear_at_head_sha": stage_result.get("clear_at_head_sha"),
+            "clear_at_base_sha": stage_result.get("clear_at_base_sha"),
+            "outcome": stage_result.get("outcome"),
+            "reason": stage_result.get("reason"),
+            "status_state": stage_result.get("status_state"),
+            "agent_task": task,
+            "detail": stage_result.get("detail"),
+            "inspected_head_sha": stage_result.get("inspected_head_sha"),
+            "inspected_base_sha": stage_result.get("inspected_base_sha"),
+        }.items()
+        if value is not None
+    }
 
 
 def gh_json(arguments: list[str]) -> Any:
@@ -417,15 +443,36 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
     elif event == "worker_finished":
         returncode = payload.get("returncode")
         accepted = payload.get("accepted")
+        clear = payload.get("clear")
+        reason = payload.get("reason")
+        blocked = payload.get("blocking_reason")
         if returncode not in {None, 0}:
             outcome = f"failed for #{number} with exit code {returncode}"
             next_action = "Finish the stage and preserve the failure in the pipeline result."
         elif not accepted:
             outcome = f"finished for #{number}, but its stale result was ignored"
             next_action = "Continue with evidence for the current pull request head."
-        else:
+        elif blocked:
+            outcome = f"blocked for #{number}: {blocked}"
+            next_action = "Stop without launching a replacement worker."
+        elif clear:
             outcome = f"completed for #{number}"
             next_action = "Collect any remaining worker results."
+        else:
+            outcome = f"result collected for #{number}, clearance is not current"
+            if reason:
+                outcome += f": {reason}"
+            if reason == "clearance_is_for_an_older_head":
+                recorded = payload.get("clear_at_head_sha")
+                live = payload.get("current_head_sha")
+                if recorded and live:
+                    outcome += f" (recorded {recorded[:8]}, live {live[:8]})"
+            elif reason == "clearance_is_for_an_older_base":
+                recorded = payload.get("clear_at_base_sha")
+                live = payload.get("current_base_sha")
+                if recorded and live:
+                    outcome += f" (recorded {recorded[:8]}, live {live[:8]})"
+            next_action = "Preserve the reason and continue the bounded pass."
         update = {
             "message": f"{prefix}{label} {outcome}.",
             "next_action": next_action,
@@ -487,8 +534,10 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
         stopped = payload.get("stopped")
         blocked = payload.get("blocked")
         action = payload.get("action")
+        clear = payload.get("clear")
+        reasons = payload.get("reasons") or []
         if action == "completed_this_run":
-            outcome = "not run again because it already completed in this pipeline"
+            outcome = "not run again because current clearance was already verified"
             next_action = "Continue with the next stage."
         elif stopped:
             outcome = "failed"
@@ -496,9 +545,14 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
         elif blocked:
             outcome = f"blocked: {blocked.get('reason', 'unknown reason')}"
             next_action = "Continue to the snapshot or next bounded pass."
-        else:
+        elif clear:
             outcome = "complete"
             next_action = "Revalidate the stack, then start the next stage."
+        else:
+            outcome = "results collected; current clearance was not verified"
+            if reasons:
+                outcome += f": {', '.join(reasons)}"
+            next_action = "Continue the bounded pass with the recorded stage reasons."
         update = {
             "message": f"{prefix}{label} {outcome}.",
             "next_action": next_action,
@@ -1723,6 +1777,8 @@ class StackPipeline:
             MAX_PASSES,
             accepts=common.stage_accepts_pipeline_position,
         )
+        if stage == STAGE_CONFLICT:
+            arguments.extend(["--state", str(stage_state_path(entry, target))])
         return {
             "number": member["number"],
             "stage": stage,
@@ -1730,6 +1786,7 @@ class StackPipeline:
             "pass": pass_number,
             "nonce": self.nonces(),
             "head_sha": member["head_sha"],
+            "base_sha": self.base_sha_for(member),
             "arguments": arguments,
             "prompt": worker_prompt(target, arguments, scope=scope),
         }
@@ -1737,6 +1794,54 @@ class StackPipeline:
     def dispatch(
         self, requests: list[dict[str, Any]], phase: str, pass_number: int
     ) -> dict[str, Any]:
+        for request in requests:
+            entry = STAGE_BY_NAME[request["stage"]]
+            if entry.get("base_marker") is not None and request.get("base_sha") is None:
+                stopped = {
+                    "step": "stage_status",
+                    "number": request["number"],
+                    "stage": request["stage"],
+                    "reason": "base_status_unavailable",
+                    "detail": "the live base revision could not be read before launch",
+                }
+                self.emit(
+                    "worker_launch_stopped",
+                    number=request["number"],
+                    stage=request["stage"],
+                    pull_request_pass=pass_number,
+                    step=stopped["step"],
+                    reason=stopped["reason"],
+                    status="blocked",
+                )
+                return {"workers": [], "stopped": stopped}
+            stage_result = self.clearance(
+                request["number"],
+                request["stage"],
+                request["head_sha"],
+                request.get("base_sha"),
+            )
+            blocker = common.stage_blocker(stage_result, after_launch=False)
+            if blocker is None:
+                continue
+            reason, detail = blocker
+            stopped = {
+                "step": "stage_status",
+                "number": request["number"],
+                "stage": request["stage"],
+                "reason": reason,
+                "detail": detail,
+                "stage_result": stage_result_summary(stage_result),
+            }
+            self.emit(
+                "worker_launch_stopped",
+                number=request["number"],
+                stage=request["stage"],
+                pull_request_pass=pass_number,
+                step=stopped["step"],
+                reason=reason,
+                status="blocked",
+            )
+            return {"workers": [], "stopped": stopped}
         self.state["phase"] = phase
         self.state["dispatch"] = {
             "phase": phase,
@@ -1838,6 +1943,29 @@ class StackPipeline:
             expected_head_sha=expected_head,
         )
         self.remove_active_worker(worker)
+        stage_result = self.current_stage_result(request)
+        blocker = common.stage_blocker(stage_result, after_launch=True)
+        if blocker is None and stage_result.get("control_reason") == "topology_changed":
+            blocker = ("topology_changed", stage_result["detail"])
+        if (
+            blocker is None
+            and request["stage"] == STAGE_DESCRIPTION
+            and stage_result.get("outcome") is None
+        ):
+            blocker = (
+                "description_did_not_record_outcome",
+                (
+                    "pr-description returned without recording a validation outcome; "
+                    "clearance cannot be verified"
+                ),
+            )
+        completion["stage_result"] = stage_result_summary(stage_result)
+        completion["clear"] = bool(stage_result.get("clear"))
+        completion["reason"] = stage_result.get("reason")
+        completion["current_head_sha"] = stage_result.get("inspected_head_sha")
+        completion["current_base_sha"] = stage_result.get("inspected_base_sha")
+        if blocker is not None:
+            completion["blocking_reason"], completion["blocking_detail"] = blocker
         self.emit(
             "worker_finished",
             number=completion["number"],
@@ -1845,8 +1973,75 @@ class StackPipeline:
             pull_request_pass=request["pass"],
             returncode=completion.get("returncode"),
             accepted=completion["accepted"],
+            clear=completion["clear"],
+            reason=completion.get("reason"),
+            blocking_reason=completion.get("blocking_reason"),
+            clear_at_head_sha=completion["stage_result"].get("clear_at_head_sha"),
+            clear_at_base_sha=completion["stage_result"].get("clear_at_base_sha"),
+            current_head_sha=completion.get("current_head_sha"),
+            current_base_sha=completion.get("current_base_sha"),
+            status=(
+                "blocked"
+                if blocker is not None
+                else "clearance_verified"
+                if completion["clear"]
+                else "result_collected"
+            ),
         )
         return completion
+
+    def current_stage_result(self, request: dict[str, Any]) -> dict[str, Any]:
+        current = self.revalidate()
+        if (
+            current["result"] != "ready"
+            or current["fingerprint"] != self.state.get("topology_fingerprint")
+        ):
+            return {
+                "stage": request["stage"],
+                "clear": False,
+                "outcome": None,
+                "reason": "status_not_ready",
+                "detail": "the live stack identity could not be revalidated after the worker exited",
+                "control_reason": "topology_changed",
+                "status_state": str(
+                    stage_state_path(
+                        STAGE_BY_NAME[request["stage"]],
+                        common.target_for(self.repository, request["number"]),
+                    )
+                ),
+                "status": {},
+            }
+        member = next(
+            (
+                entry
+                for entry in current["selected"]
+                if entry["number"] == request["number"]
+            ),
+            None,
+        )
+        if member is None:
+            return {
+                "stage": request["stage"],
+                "clear": False,
+                "outcome": None,
+                "reason": "status_not_ready",
+                "detail": "the pull request is no longer in the selected stack",
+                "control_reason": "topology_changed",
+                "status_state": str(
+                    stage_state_path(
+                        STAGE_BY_NAME[request["stage"]],
+                        common.target_for(self.repository, request["number"]),
+                    )
+                ),
+                "status": {},
+            }
+        head_sha = member["head_sha"]
+        base_sha = self.base_sha_for(member)
+        return {
+            **self.clearance(request["number"], request["stage"], head_sha, base_sha),
+            "inspected_head_sha": head_sha,
+            "inspected_base_sha": base_sha,
+        }
 
     def collect_parallel_workers(
         self, workers: list[dict[str, Any]], requests: dict[int, dict[str, Any]]
@@ -1916,15 +2111,6 @@ class StackPipeline:
             for member in selected
             if member["number"] == self.kickoff["startPullRequest"]
         )
-        before = self.clearance(
-            clicked["number"],
-            STAGE_CONFLICT,
-            clicked["head_sha"],
-            self.base_sha_for(clicked),
-        )
-        before_attempt_id = (
-            ((before.get("status") or {}).get("attempt") or {}).get("id")
-        )
         scope = (
             f"This pull request is the clicked member of native stack "
             f"{self.kickoff['stackNumber']}. Resolve the stack as a whole; the "
@@ -1952,28 +2138,42 @@ class StackPipeline:
                     "accepted": completion["accepted"],
                     "returncode": completion.get("returncode"),
                     "dispatched_head_sha": completion["head_sha"],
+                    "current_head_sha": completion.get("current_head_sha"),
+                    "current_base_sha": completion.get("current_base_sha"),
+                    "clear": completion.get("clear"),
+                    "outcome": completion.get("stage_result", {}).get("outcome"),
+                    "reason": completion.get("reason"),
                 },
             )
-        after = self.clearance(
-            clicked["number"],
-            STAGE_CONFLICT,
-            clicked["head_sha"],
-            self.base_sha_for(clicked),
-        )
-        after_attempt_id = (
-            ((after.get("status") or {}).get("attempt") or {}).get("id")
+        stopped = launched["stopped"] or next(
+            (
+                {
+                    "step": "stage_status",
+                    "number": completion["number"],
+                    "stage": completion["stage"],
+                    "reason": completion["blocking_reason"],
+                    "detail": completion["blocking_detail"],
+                    "stage_result": completion["stage_result"],
+                }
+                for completion in completions
+                if completion.get("blocking_reason")
+            ),
+            None,
         )
         result = {
             "phase": STAGE_CONFLICT,
             "mode": PHASE_STACK_DISPATCH,
-            "dispatches": 1,
+            "dispatches": len(launched["workers"]),
             "completions": completions,
-            "stopped": launched["stopped"],
+            "stopped": stopped,
             "completed": (
                 any(completion.get("accepted") for completion in completions)
-                and after.get("outcome") == "completed"
-                and bool(after_attempt_id)
-                and after_attempt_id != before_attempt_id
+                and all(
+                    completion.get("accepted")
+                    and completion.get("returncode") in {None, 0}
+                    and completion.get("clear")
+                    for completion in completions
+                )
             ),
         }
         self.emit(
@@ -2015,14 +2215,34 @@ class StackPipeline:
                     "accepted": completion["accepted"],
                     "returncode": completion.get("returncode"),
                     "dispatched_head_sha": completion["head_sha"],
+                    "current_head_sha": completion.get("current_head_sha"),
+                    "current_base_sha": completion.get("current_base_sha"),
+                    "clear": completion.get("clear"),
+                    "outcome": completion.get("stage_result", {}).get("outcome"),
+                    "reason": completion.get("reason"),
                 },
             )
+        stopped = launched["stopped"] or next(
+            (
+                {
+                    "step": "stage_status",
+                    "number": completion["number"],
+                    "stage": completion["stage"],
+                    "reason": completion["blocking_reason"],
+                    "detail": completion["blocking_detail"],
+                    "stage_result": completion["stage_result"],
+                }
+                for completion in completions
+                if completion.get("blocking_reason")
+            ),
+            None,
+        )
         result = {
             "phase": phase,
             "mode": PHASE_PARALLEL,
-            "dispatches": len(requests),
+            "dispatches": len(launched["workers"]),
             "completions": completions,
-            "stopped": launched["stopped"],
+            "stopped": stopped,
         }
         self.emit(
             "phase_finished",
@@ -2214,6 +2434,7 @@ class StackPipeline:
         completions: list[dict[str, Any]] = []
         gates: list[dict[str, Any]] = []
         propagations: list[dict[str, Any]] = []
+        verified_clear: set[int] = set()
         blocked: dict[str, Any] | None = None
         stopped: dict[str, Any] | None = None
         current_selected = selected
@@ -2360,6 +2581,7 @@ class StackPipeline:
                     "green": True,
                     "head_sha": member["head_sha"],
                 }
+                verified_clear.add(member["number"])
                 continue
             launched = self.dispatch([request], STAGE_CI, pass_number)
             if launched["stopped"] is not None:
@@ -2370,6 +2592,16 @@ class StackPipeline:
             propagations.extend(monitored["propagations"])
             completion = monitored["completion"]
             completions.append(completion)
+            if completion.get("blocking_reason"):
+                stopped = {
+                    "step": "stage_status",
+                    "number": completion["number"],
+                    "stage": completion["stage"],
+                    "reason": completion["blocking_reason"],
+                    "detail": completion["blocking_detail"],
+                    "stage_result": completion["stage_result"],
+                }
+                break
             failed_propagations = [
                 outcome
                 for outcome in monitored["propagations"]
@@ -2400,7 +2632,11 @@ class StackPipeline:
                 member["head_sha"],
                 base_sha,
             )
-            green = bool(after["clear"]) and completion["accepted"]
+            green = (
+                bool(after["clear"])
+                and completion["accepted"]
+                and completion.get("returncode") in {None, 0}
+            )
             self.record_stage(
                 member["number"],
                 STAGE_CI,
@@ -2410,6 +2646,10 @@ class StackPipeline:
                     "returncode": completion.get("returncode"),
                     "clear": after["clear"],
                     "clear_at_head_sha": after.get("clear_at_head_sha"),
+                    "current_head_sha": completion.get("current_head_sha"),
+                    "current_base_sha": completion.get("current_base_sha"),
+                    "outcome": completion.get("stage_result", {}).get("outcome"),
+                    "reason": completion.get("reason"),
                 },
             )
             previous = member
@@ -2417,6 +2657,8 @@ class StackPipeline:
                 "green": green,
                 "head_sha": after.get("clear_at_head_sha") or member["head_sha"],
             }
+            if green:
+                verified_clear.add(member["number"])
             if stopped is not None:
                 break
         result = {
@@ -2428,6 +2670,13 @@ class StackPipeline:
             "blocked": blocked,
             "propagations": propagations,
             "stopped": stopped,
+            "clear": (
+                blocked is None
+                and stopped is None
+                and all(
+                    member["number"] in verified_clear for member in current_selected
+                )
+            ),
         }
         self.emit(
             "phase_finished",
@@ -2454,10 +2703,58 @@ class StackPipeline:
         for member in opening["selected"]:
             base_sha = self.base_sha_for(member)
             target = common.target_for(self.repository, member["number"])
+            if base_sha is None:
+                stages = [
+                    {
+                        "stage": entry["stage"],
+                        "clear": False,
+                        "clear_at_head_sha": None,
+                        "clear_at_base_sha": None,
+                        "outcome": None,
+                        "reason": "base_status_unavailable",
+                        "identity": "unverified",
+                        "installed": stage_script_path(entry).is_file(),
+                        "status_state": str(stage_state_path(entry, target)),
+                        "status": {},
+                        "inspected_head_sha": member["head_sha"],
+                        "inspected_base_sha": None,
+                    }
+                    for entry in STAGES
+                ]
+                pull_requests.append(
+                    {
+                        "number": member["number"],
+                        "head_sha": member["head_sha"],
+                        "base_sha": None,
+                        "is_draft": member.get("is_draft"),
+                        "stages": stages,
+                        "uncleared": list(STAGE_NAMES),
+                    }
+                )
+                return {
+                    "result": "incomplete",
+                    "reason": "base_status_unavailable",
+                    "fingerprint": opening["fingerprint"],
+                    "pull_requests": pull_requests,
+                }
             stages = [
                 self.inspect(entry, target, member["head_sha"], base_sha)
                 for entry in STAGES
             ]
+            for stage in stages:
+                stage["identity"] = (
+                    "current"
+                    if stage["clear"]
+                    else "stale"
+                    if stage.get("reason")
+                    in {
+                        "clearance_is_for_an_older_head",
+                        "clearance_is_for_an_older_base",
+                    }
+                    else "unverified"
+                )
+                stage["inspected_head_sha"] = member["head_sha"]
+                stage["inspected_base_sha"] = base_sha
             pull_requests.append(
                 {
                     "number": member["number"],
@@ -2778,6 +3075,7 @@ class StackPipeline:
                             "completions": [],
                             "stopped": None,
                             "action": "completed_this_run",
+                            "clear": True,
                         }
                         self.emit(
                             "phase_finished",
@@ -2801,10 +3099,20 @@ class StackPipeline:
                 self.completed_phases.append(outcome)
                 self.check_cancellation()
                 if outcome.get("stopped") is not None:
+                    stopped = outcome["stopped"]
+                    if stopped.get("step") == "stage_status":
+                        return self.finish(
+                            "blocked",
+                            reason=stopped["reason"],
+                            detail=stopped.get("detail"),
+                            passes=completed_passes,
+                            phases=phases,
+                            snapshot=snapshot,
+                        )
                     return self.finish(
                         "stopped",
                         reason="worker_launch_stopped",
-                        detail=json.dumps(outcome["stopped"], sort_keys=True),
+                        detail=json.dumps(stopped, sort_keys=True),
                         passes=completed_passes,
                         phases=phases,
                         snapshot=snapshot,
@@ -2856,27 +3164,224 @@ class StackPipeline:
 
 
 def summarize_phase(phase: dict[str, Any]) -> dict[str, Any]:
+    completions = phase.get("completions", [])
+    accepted = [
+        completion["number"]
+        for completion in completions
+        if completion.get("accepted")
+    ]
+    reasons = sorted(
+        {
+            str(completion.get("reason") or "not_cleared")
+            for completion in completions
+            if completion.get("accepted") and not completion.get("clear")
+        }
+    )
     summary = {
         "phase": phase["phase"],
         "mode": phase["mode"],
         "dispatches": phase.get("dispatches", 0),
-        "accepted": [
-            completion["number"]
-            for completion in phase.get("completions", [])
-            if completion.get("accepted")
-        ],
+        "accepted": accepted,
         "ignored": [
             completion["number"]
-            for completion in phase.get("completions", [])
+            for completion in completions
             if not completion.get("accepted")
         ],
         "stopped": phase.get("stopped"),
+        "clear": (
+            phase["clear"]
+            if isinstance(phase.get("clear"), bool)
+            else bool(accepted)
+            and len(accepted) == len(completions)
+            and all(
+                completion.get("returncode") in {None, 0}
+                and completion.get("clear")
+                for completion in completions
+            )
+        ),
     }
+    if reasons:
+        summary["reasons"] = reasons
     if phase.get("blocked") is not None:
         summary["blocked"] = phase["blocked"]
     if phase.get("action") is not None:
         summary["action"] = phase["action"]
     return summary
+
+
+def clipped_text(value: Any, limit: int = TERMINAL_TEXT_MAX_CHARS) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3] + "..."
+
+
+def compact_terminal_result(
+    payload: dict[str, Any], *, result_path: Path | str | None = None
+) -> dict[str, Any]:
+    snapshot = payload.get("snapshot")
+    snapshot_requests = (
+        snapshot.get("pull_requests", []) if isinstance(snapshot, dict) else []
+    )
+    compact_requests = []
+    for pull_request in snapshot_requests[:TERMINAL_RESULT_MAX_PULL_REQUESTS]:
+        stages = []
+        for stage in pull_request.get("stages", [])[: len(STAGES)]:
+            stages.append(
+                {
+                    key: value
+                    for key, value in {
+                        "stage": stage.get("stage"),
+                        "clear": stage.get("clear"),
+                        "identity": stage.get("identity"),
+                        "outcome": stage.get("outcome"),
+                        "reason": stage.get("reason"),
+                        "clear_at_head_sha": stage.get("clear_at_head_sha"),
+                        "clear_at_base_sha": stage.get("clear_at_base_sha"),
+                    }.items()
+                    if value is not None
+                }
+            )
+        compact_requests.append(
+            {
+                key: value
+                for key, value in {
+                    "number": pull_request.get("number"),
+                    "head_sha": pull_request.get("head_sha"),
+                    "base_sha": pull_request.get("base_sha"),
+                    "uncleared": pull_request.get("uncleared"),
+                    "stages": stages,
+                }.items()
+                if value is not None
+            }
+        )
+
+    def limited(values: Any) -> list[Any]:
+        return list(values[:TERMINAL_RESULT_MAX_PULL_REQUESTS]) if isinstance(values, list) else []
+
+    phases = []
+    for phase in payload.get("phases", [])[:TERMINAL_RESULT_MAX_PHASES]:
+        stopped = phase.get("stopped")
+        compact_stopped = (
+            {
+                key: stopped.get(key)
+                for key in ("step", "number", "stage", "reason")
+                if stopped.get(key) is not None
+            }
+            if isinstance(stopped, dict)
+            else None
+        )
+        phases.append(
+            {
+                key: value
+                for key, value in {
+                    "phase": phase.get("phase"),
+                    "mode": phase.get("mode"),
+                    "dispatches": phase.get("dispatches"),
+                    "accepted": limited(phase.get("accepted")),
+                    "ignored": limited(phase.get("ignored")),
+                    "clear": phase.get("clear"),
+                    "reasons": [
+                        clipped_text(reason, 128) for reason in limited(phase.get("reasons"))
+                    ],
+                    "stopped": compact_stopped,
+                    "action": phase.get("action"),
+                }.items()
+                if value not in (None, [], {})
+            }
+        )
+
+    propagations_source = payload.get("propagations", [])
+    propagations = [
+        {
+            key: clipped_text(value, 128) if isinstance(value, str) else value
+            for key, value in {
+                "number": propagation.get("number"),
+                "head_sha": propagation.get("head_sha"),
+                "result": propagation.get("result"),
+                "reason": propagation.get("reason"),
+                "trigger": propagation.get("trigger"),
+            }.items()
+            if value is not None
+        }
+        for propagation in limited(propagations_source)
+        if isinstance(propagation, dict)
+    ]
+    artifacts = {
+        key: clipped_text(value)
+        for key, value in {
+            "result": str(result_path) if result_path is not None else None,
+            "state": payload.get("state_path"),
+        }.items()
+        if value is not None
+    }
+    compact = {
+        key: value
+        for key, value in {
+            "result": payload.get("result"),
+            "reason": payload.get("reason"),
+            "detail": clipped_text(payload.get("detail")),
+            "run_id": payload.get("run_id"),
+            "repository": payload.get("repository"),
+            "stack_number": payload.get("stack_number"),
+            "start_pull_request": payload.get("start_pull_request"),
+            "selected": limited(payload.get("selected")),
+            "selected_omitted": (
+                len(payload["selected"]) - len(limited(payload["selected"]))
+                if isinstance(payload.get("selected"), list)
+                and len(payload["selected"]) > TERMINAL_RESULT_MAX_PULL_REQUESTS
+                else None
+            ),
+            "passes": payload.get("passes"),
+            "session_title": clipped_text(payload.get("session_title")),
+            "phases": phases,
+            "propagations": propagations,
+            "propagations_omitted": (
+                len(propagations_source) - len(propagations)
+                if isinstance(propagations_source, list)
+                and len(propagations_source) > len(propagations)
+                else None
+            ),
+            "snapshot": (
+                {
+                    "result": snapshot.get("result"),
+                    "reason": snapshot.get("reason"),
+                    "pull_requests": compact_requests,
+                    **(
+                        {
+                            "pull_requests_omitted": len(snapshot_requests)
+                            - len(compact_requests)
+                        }
+                        if len(snapshot_requests) > len(compact_requests)
+                        else {}
+                    ),
+                }
+                if isinstance(snapshot, dict)
+                else None
+            ),
+            "artifacts": artifacts,
+        }.items()
+        if value not in (None, [], {})
+    }
+
+    def size() -> int:
+        return len(
+            json.dumps(compact, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+
+    while compact_requests and size() > TERMINAL_RESULT_MAX_BYTES:
+        compact_requests.pop()
+        compact["snapshot"]["pull_requests_omitted"] = (
+            len(snapshot_requests) - len(compact_requests)
+        )
+    if size() > TERMINAL_RESULT_MAX_BYTES:
+        compact.pop("phases", None)
+        compact["terminal_detail_omitted"] = True
+    if size() > TERMINAL_RESULT_MAX_BYTES:
+        compact.pop("snapshot", None)
+        compact["terminal_detail_omitted"] = True
+    return compact
 
 
 def load_kickoff(args: argparse.Namespace) -> dict[str, Any]:
@@ -3141,7 +3646,14 @@ def command_run(args: argparse.Namespace) -> None:
         report=reporter,
     )
     result = pipeline.execute()
-    reporter({"event": "stack_pipeline_finished", **result})
+    reporter(
+        {
+            "event": "stack_pipeline_finished",
+            **compact_terminal_result(
+                result, result_path=getattr(pipeline, "result_path", None)
+            ),
+        }
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

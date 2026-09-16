@@ -561,6 +561,20 @@ class StageContractTest(unittest.TestCase):
         self.assertFalse(MODULE.stage_accepts_pipeline_position(entry))
         self.assertEqual([], MODULE.pipeline_arguments(entry, "run-1", 2))
 
+    def test_conflict_stage_receives_the_canonical_state_path_explicitly(self):
+        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT]
+        expected = MODULE.stage_state_path(entry, target())
+        command = MODULE.stage_command(
+            entry,
+            target(),
+            model=MODULE.stage_models(None)[MODULE.STAGE_CONFLICT],
+            effort="high",
+            run_id="run-1",
+            sweep=1,
+        )
+
+        self.assertIn(f"--state {expected}", command[2])
+
     def test_ci_live_progress_reads_the_action_and_pending_checks(self):
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / "ci.json"
@@ -892,10 +906,12 @@ class SweepTest(unittest.TestCase):
                 "status": {
                     "agent_task": {
                         "status": "failed",
-                        "error": (
-                            "start Agent Task failed with HTTP 409: "
-                            "user or repo does not have CCA enabled"
-                        ),
+                        "error": {
+                            "code": "agent_task_http_409",
+                            "message": (
+                                "user or repo does not have Copilot coding agent enabled"
+                            ),
+                        },
                         "recovery_command": "python review.py agent-task --resume",
                         "recovery_files": ["prompt.txt", "result.json"],
                     },
@@ -913,7 +929,7 @@ class SweepTest(unittest.TestCase):
         self.assertEqual("blocked", result["result"])
         self.assertEqual("stage_recovery_required", result["reason"])
         self.assertEqual(MODULE.STAGE_COPILOT_REVIEW, result["stage"])
-        self.assertIn("HTTP 409", result["detail"])
+        self.assertIn("agent_task_http_409", result["detail"])
         self.assertEqual(
             [(MODULE.STAGE_COPILOT_REVIEW, 1)],
             self.launched,
@@ -967,6 +983,7 @@ class SweepTest(unittest.TestCase):
 
         self.assertEqual("blocked", result["result"])
         self.assertEqual("stage_did_not_record_state", result["reason"])
+        self.assertIn("Expected state path: state.json.", result["detail"])
         self.assertEqual([(MODULE.STAGE_CONFLICT, 1)], self.launched)
 
     def test_unreadable_stage_status_blocks_before_launch(self):
@@ -980,7 +997,10 @@ class SweepTest(unittest.TestCase):
 
         self.assertEqual("blocked", result["result"])
         self.assertEqual("stage_status_unavailable", result["reason"])
-        self.assertEqual("status command timed out", result["detail"])
+        self.assertEqual(
+            "status command timed out Expected state path: state.json.",
+            result["detail"],
+        )
         self.assertEqual([], self.launched)
 
     def test_head_change_runs_a_second_sweep_for_stale_stages(self):
@@ -1614,6 +1634,29 @@ class ProgressProtocolTest(unittest.TestCase):
         update = MODULE.common.read_progress_log(self.event_log)[0]
         self.assertIn("diagnosing 1 known failure", update["message"])
         self.assertIn("diagnosing a known CI failure", update["wait_reason"])
+
+    def test_stale_base_progress_names_recorded_and_live_revisions(self):
+        reporter = MODULE.ProgressReporter(
+            target=target(),
+            event_log=self.event_log,
+            output=lambda _payload: None,
+            wall_time=lambda: 1000.0,
+        )
+        reporter(
+            {
+                "event": "stage_finished",
+                "stage": MODULE.STAGE_CONFLICT,
+                "sweep": 1,
+                "action": "launched",
+                "clear": False,
+                "stage_reason": "clearance_is_for_an_older_base",
+                "clear_at_base_sha": "1" * 40,
+                "inspected_base_sha": "2" * 40,
+            }
+        )
+
+        message = MODULE.common.read_progress_log(self.event_log)[0]["message"]
+        self.assertIn("recorded 11111111, live 22222222", message)
 
     def test_scheduler_command_carries_the_monitor_handle_and_options(self):
         args = MODULE.build_parser().parse_args(

@@ -7980,6 +7980,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
     require_external_path(state_path, repo_root)
     model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
+    iteration_budget = args.pipeline_max_iterations or args.max_iterations
+    replaced_task: dict[str, Any] | None = None
     if args.resume:
         if existing is None or not isinstance(existing.get("agent_task"), dict):
             raise WorkflowError("recovery state has no managed conflict task")
@@ -8017,10 +8019,20 @@ def command_agent_task(args: argparse.Namespace) -> None:
             if (
                 isinstance(active, dict)
                 and active.get("status") not in {"completed", "consumed"}
+                and not (
+                    active.get("status") == "failed"
+                    and active.get("task_id_status") == "not_created"
+                )
             ):
                 raise WorkflowError(
                     "an unfinished managed conflict task owns this state; use --resume"
                 )
+            if (
+                isinstance(active, dict)
+                and active.get("status") == "failed"
+                and active.get("task_id_status") == "not_created"
+            ):
+                replaced_task = active
         prior_attempts = int(existing.get("attempts", 0)) if existing else 0
         prior_managed_attempts = managed_attempt_count(existing)
         pipeline_values = (
@@ -8124,6 +8136,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
         state["managed_attempts"] = prior_managed_attempts + 1
         state["repo_root"] = str(repo_root)
         state["pr"] = preflight["pr"]
+        if replaced_task is not None:
+            state.setdefault("managed_task_history", []).append(replaced_task)
         state["agent_task"] = {
             "run_id": run_id,
             "status": "dispatching",
@@ -8169,40 +8183,157 @@ def command_agent_task(args: argparse.Namespace) -> None:
     task["helper_command"] = command
     task["status"] = "running"
     save_state(state_path, state)
-    process = run(command, cwd=repo_root, check=False)
-    if not result_path.is_file():
-        task["status"] = "interrupted"
+    try:
+        process = run(command, cwd=repo_root, check=False)
+    except OSError as error:
+        if args.resume:
+            prior_result = task.get("result")
+            prior_task = (
+                prior_result.get("task")
+                if isinstance(prior_result, dict)
+                else None
+            )
+            task_id = prior_task.get("id") if isinstance(prior_task, dict) else None
+            task["status"] = "interrupted"
+            task["task_id"] = task_id
+            task["task_id_status"] = "known" if task_id else "unknown"
+            task["error"] = {
+                "code": "managed_task_resume_launch_failed",
+                "message": str(error),
+            }
+            save_state(state_path, state)
+            emit(
+                {
+                    "result": "recovery_required",
+                    "state": str(state_path),
+                    "task_id": task_id,
+                    "task_id_status": task["task_id_status"],
+                    "error": task["error"],
+                    "recovery_files": task["recovery_files"],
+                    "next_action": "Retry the retained recovery command.",
+                    "stage_outcome": "escalated",
+                }
+            )
+            return
+        task["status"] = "failed"
+        task["task_id"] = None
+        task["task_id_status"] = "not_created"
+        task["error"] = {
+            "code": "managed_task_launch_failed",
+            "message": str(error),
+        }
         save_state(state_path, state)
-        raise WorkflowError("managed conflict helper returned no result file")
-    result = load_conflict_result(result_path)
-    task["result"] = result
-    task["result_file"] = str(result_path)
-    if process.returncode != 0 or result.get("status") != "success":
+        emit(
+            {
+                "result": "task_creation_failed",
+                "state": str(state_path),
+                "task_id": None,
+                "task_id_status": task["task_id_status"],
+                "error": task["error"],
+                "recovery_files": task["recovery_files"],
+                "retry_command": managed_retry_command(
+                    args,
+                    repo_root=repo_root,
+                    target=target,
+                    state_path=state_path,
+                    next_budget=iteration_budget,
+                ),
+                "stage_outcome": "escalated",
+            }
+        )
+        return
+    except WorkflowError as error:
         task["status"] = "interrupted"
+        task["task_id"] = None
+        task["task_id_status"] = "unknown"
+        task["error"] = {
+            "code": "managed_task_launch_interrupted",
+            "message": str(error),
+        }
         save_state(state_path, state)
-        error = result.get("error")
-        code = error.get("code") if isinstance(error, dict) else "unknown"
-        message = error.get("message") if isinstance(error, dict) else "no detail"
         emit(
             {
                 "result": "recovery_required",
                 "state": str(state_path),
-                "task_id": (
-                    result.get("task", {}).get("id")
-                    if isinstance(result.get("task"), dict)
-                    else None
-                ),
-                "error": {"code": code, "message": message},
-                "recovery_command": (
-                    f"{json.dumps(sys.executable)} {json.dumps(str(Path(__file__).resolve()))} "
-                    f"agent-task {json.dumps(preflight['pr']['pr_url'])} --repo-root "
-                    f"{json.dumps(str(repo_root))} --state {json.dumps(str(state_path))} "
-                    f"--model {args.model} --resume"
-                ),
+                "task_id": None,
+                "task_id_status": task["task_id_status"],
+                "error": task["error"],
                 "recovery_files": task["recovery_files"],
+                "next_action": (
+                    "Inspect managed Agent Tasks for this pull request before "
+                    "starting any replacement."
+                ),
                 "stage_outcome": "escalated",
             }
         )
+        return
+    if not result_path.is_file():
+        task["status"] = "interrupted"
+        task["task_id"] = None
+        task["task_id_status"] = "unknown"
+        task["error"] = {
+            "code": "managed_task_result_missing",
+            "message": "managed conflict helper returned no result file",
+        }
+        save_state(state_path, state)
+        emit(
+            {
+                "result": "recovery_required",
+                "state": str(state_path),
+                "task_id": None,
+                "task_id_status": task["task_id_status"],
+                "error": task["error"],
+                "recovery_files": task["recovery_files"],
+                "next_action": (
+                    "Inspect managed Agent Tasks for this pull request before "
+                    "starting any replacement."
+                ),
+                "stage_outcome": "escalated",
+            }
+        )
+        return
+    result = load_conflict_result(result_path)
+    task["result"] = result
+    task["result_file"] = str(result_path)
+    if process.returncode != 0 or result.get("status") != "success":
+        error = result.get("error")
+        code = error.get("code") if isinstance(error, dict) else "unknown"
+        message = error.get("message") if isinstance(error, dict) else "no detail"
+        task_id = (
+            result.get("task", {}).get("id")
+            if isinstance(result.get("task"), dict)
+            else None
+        )
+        task["status"] = "interrupted" if task_id else "failed"
+        task["task_id"] = task_id
+        task["task_id_status"] = "known" if task_id else "not_created"
+        task["error"] = {"code": code, "message": message}
+        save_state(state_path, state)
+        payload = {
+            "result": "recovery_required" if task_id else "task_creation_failed",
+            "state": str(state_path),
+            "task_id": task_id,
+            "task_id_status": task["task_id_status"],
+            "error": task["error"],
+            "recovery_files": task["recovery_files"],
+            "stage_outcome": "escalated",
+        }
+        if task_id:
+            payload["recovery_command"] = (
+                f"{json.dumps(sys.executable)} {json.dumps(str(Path(__file__).resolve()))} "
+                f"agent-task {json.dumps(preflight['pr']['pr_url'])} --repo-root "
+                f"{json.dumps(str(repo_root))} --state {json.dumps(str(state_path))} "
+                f"--model {args.model} --resume"
+            )
+        else:
+            payload["retry_command"] = managed_retry_command(
+                args,
+                repo_root=repo_root,
+                target=target,
+                state_path=state_path,
+                next_budget=iteration_budget,
+            )
+        emit(payload)
         return
     code_refs, artifact, validations = validate_conflict_result_identity(
         result, preflight["request"]

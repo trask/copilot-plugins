@@ -53,7 +53,7 @@ After `start`, repeatedly run `watch` synchronously with the exact kickoff, retu
 
 Each call returns one `pipeline_update`. Advance to its returned cursor. For every item in `updates`, immediately write one visible assistant line in this session conversation before the next tool call: start with `message`, then append `Waiting: <wait_reason>.` and `Next: <next_action>.` when those fields are present. Do not send these updates to the PR Flight canvas, hide them in a tool-call label, or print the raw JSON. Transition updates report pass, pull request, stage, outcome, wait reason, and next action when applicable. Heartbeat updates are already coalesced to no more than one per five minutes for an unchanged active wait and include elapsed time. If `updates` is empty, call `watch` again without adding a message.
 
-Never end your turn or leave the session idle while `finished` is false. Stop only when `finished` is true. On a normal terminal update, use its `final_event` as the complete `stack_pipeline_finished` result. If `monitor_failure` is present, report it without guessing the pipeline outcome; progress reporting is deliberately separate from scheduler execution.
+Never end your turn or leave the session idle while `finished` is false. Stop only when `finished` is true. On a normal terminal update, use its `final_event` as the bounded `stack_pipeline_finished` summary. Read `artifacts.result` when an omission count is nonzero or when the final response needs detail that the bounded event references but does not contain. If `monitor_failure` is present, report it without guessing the pipeline outcome; progress reporting is deliberately separate from scheduler execution.
 
 After monitoring finishes, rename the session to the final event's `session_title` when that field is present and the current name does not already begin with `PR Stack Pipeline: #<startPullRequest> - `. The helper builds the name as `PR Stack Pipeline: #<startPullRequest> - <PR title>` from the starting pull request's live metadata. If `session_title` is absent because the helper could not read that metadata, continue without renaming.
 
@@ -67,9 +67,9 @@ The helper runs at most two passes. Each pass delegates to the plugin-qualified 
 4. `ci-fix-loop:ci-fix-loop`, bottom-up, where a higher member starts only after the member below it is green at its current head; when containment is missing, the helper first asks the conflict plugin to atomically align descendants to that live head
 5. `pr-description:pr-description`, one worker per selected pull request
 
-Workers are `copilot` subprocesses in isolated worktrees, not app sessions, and this is the only visible session. The helper starts them one at a time and only continues after the previous one is verified and active; once active they run concurrently. Failed propagation checkpoints remain retryable while their source head is current and are retired when that pull request has moved. Success needs all five markers current for every selected pull request at a single final snapshot of the stack, its heads, and its bases. Otherwise the run reports the partial state it reached.
+Workers are `copilot` subprocesses in isolated worktrees, not app sessions, and this is the only visible session. The helper starts them one at a time and only continues after the previous one is verified and active; once active they run concurrently. Before launch and after worker exit, the helper blocks on unreadable stage status and active or recoverable Agent Task ownership. A worker exit is only a collected result until its current-head and current-base clearance is verified. Failed propagation checkpoints remain retryable while their source head is current and are retired when that pull request has moved. Success needs all five markers current for every selected pull request at a single final snapshot of the stack, its heads, and its bases. Otherwise the run reports the partial state it reached.
 
-A PR Conflict Resolver run that publishes but leaves the stack conflicting is completed and is not launched again during that stack-pipeline run.
+A PR Conflict Resolver run is not launched again during that stack-pipeline run only after current-head and current-base clearance is verified.
 
 Never mark a pull request ready for review, approve one, create one, or post a comment.
 
@@ -77,12 +77,13 @@ Never mark a pull request ready for review, approve one, create one, or post a c
 
 Write a concise final response from the complete `stack_pipeline_finished` event. Lead with the repository, the stack, the selected pull requests as links, the plain-language result, and the pass count. A clean run that pushed no commits should usually fit in one sentence.
 
-Do not organize the response by pass or list every stage for every pull request when all are clear. Omit routine details: models, return codes, nonces, state paths, worktree paths, and log paths.
+Do not organize the response by pass or list every stage for every pull request when all are clear. Omit routine details: models, return codes, nonces, state paths, worktree paths, and log paths. The terminal event is bounded and links to `artifacts.result` for the full durable result.
 
 Add only what changed the stack or needs attention:
 
 - Every pull request that still has an uncleared stage, with the stage's outcome and reason.
-- Every commit the run pushed, as a Markdown link, and every push that was propagated to descendants.
+- Every push that the bounded event says was propagated to descendants. If `propagations_omitted` is nonzero, read the complete list from `artifacts.result`.
+- A `blocked` result, with the stage ownership or status reason, retained detail, and artifact reference.
 - A `stopped` result, with its reason and detail preserved exactly: a launch that could not be verified, a stack whose topology changed, a missing stage plugin, or another run holding the lock.
 - Any ignored worker result, which means the pull request moved under a worker that was already running.
 
