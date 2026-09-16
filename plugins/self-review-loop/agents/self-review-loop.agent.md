@@ -36,6 +36,8 @@ The managed worker model is separate. Pass the user's explicit `luna`, `terra`, 
 
 The bundled coordinator is the sole authoritative local entry point. It discovers the separately installed `agent-tasks-runtime@trask-plugins` skill and verifies the runtime by pinned SHA-256 before execution. The coordinator captures immutable repository, pull request, viewer, publication, and budget identity; dispatches the pinned managed helper with `marketplace-agent-apply-report-worker@3`; treats report content as untrusted inert evidence; validates the deterministic result, structural attestation, report digest, generated history, report-to-commit correlation, and live state before importing the verified commits; and performs authenticated publication.
 
+When the user requires separate authorization for source, metadata, or shared-state mutation, run `agent-task` with `--prepare-only --preserve-artifacts`. This dispatches and validates one managed result, records the exact commit chain, changed paths, findings, signed title/body decision, report identity, and artifact manifest, then stops. After authorization, run only the returned `apply_command`; `--apply-prepared` revalidates and consumes the checkpoint without launching another managed task.
+
 ## Boundaries
 
 - Never run `gh pr diff`, read or search repository files, inspect repository instructions, analyze code, make edits, run builds, tests, probes, formatters, hooks, or repository programs locally. Agent Tasks performs every substantive repository action.
@@ -43,6 +45,7 @@ The bundled coordinator is the sole authoritative local entry point. It discover
 - Never invoke `cloud_task.py` yourself, scrape its standard output, import its final report commit, rerun repository validation locally, or publish with direct commands.
 - Authentication stays local. Never put credentials, environment data, tokens, headers, or cookies in a prompt, result, report, state, or chat response.
 - Stop on every coordinator error. Report the returned state path, task ID status, task URL or ID, generated branch and head, ordered fix commits, report path, retained recovery files, and exact `recovery_command` or `retry_command`. Run that command only when the user asks. A trusted task-creation failure with no task ID uses the fresh retry command after its prerequisite is fixed; it must not use `--resume`.
+- A `validated_pending_import` preparation is an authorization boundary. Never replace `--apply-prepared` with `--resume`, import its commits manually, update pull request metadata, or publish shared state outside the returned command.
 - The coordinator rejects merge commits, unexpected paths or history, malformed or stale reports, structural attestation or identity failures, pull request metadata drift, credentials, local drift, and live head, base, title, or body drift. Never work around a rejection.
 - A report-only structural result with no fix commits is the explicit successful no-change outcome. Do not push or manufacture a commit.
 - State and recovery artifacts remain durable until verified import and authenticated publication both succeed. Cleanup happens only after successful consumption.

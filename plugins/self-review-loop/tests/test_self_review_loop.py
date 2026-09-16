@@ -1428,6 +1428,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             repo_root=str(self.repo_root),
             state=str(state_path),
             resume=False,
+            prepare_only=True,
+            apply_prepared=False,
             preserve_artifacts=True,
             model="sol",
             max_iterations=5,
@@ -1435,6 +1437,50 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             pipeline_iteration=None,
             pipeline_max_iterations=None,
         )
+        report = json.dumps(
+            {
+                "schema": MODULE.LEGACY_SELF_REVIEW_REPORT_SCHEMA,
+                "request_id": "request-1",
+                "repository": "open-telemetry/shared-workflows",
+                "pull_request": {
+                    "number": 347,
+                    "head_sha": preflight["pr"]["head_sha"],
+                    "base_sha": preflight["pr"]["base_sha"],
+                    "title_sha256": MODULE.sha256_text(preflight["pr"]["title"]),
+                    "body_sha256": MODULE.sha256_text(preflight["pr"]["body"]),
+                },
+                "outcome": "cleared",
+                "iterations_used": 1,
+                "findings": [],
+                "pull_request_metadata": {
+                    "decision": "keep",
+                    "title": preflight["pr"]["title"],
+                    "body": preflight["pr"]["body"],
+                    "reason": "The current metadata covers the final diff.",
+                },
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        replacement = self.result()
+        replacement["repository"] = {
+            "name_with_owner": "open-telemetry/shared-workflows"
+        }
+        replacement["pull_request"] = MODULE.expected_cloud_pull_request(preflight)
+        replacement["task"].update(
+            {
+                "url": "https://github.com/open-telemetry/shared-workflows/agent-tasks/task-1",
+                "base_ref": preflight["pr"]["head_branch"],
+                "base_sha": preflight["pr"]["head_sha"],
+            }
+        )
+        replacement["application"]["final_local_head"] = preflight["pr"]["head_sha"]
+        replacement["report"]["sha256"] = MODULE.sha256_text(report)
+
+        def prepare_run(command, **_kwargs):
+            output = Path(command[command.index("--result-file") + 1])
+            output.write_text(json.dumps(replacement), encoding="utf-8")
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
 
         with (
             mock.patch.object(MODULE, "require_tools"),
@@ -1449,15 +1495,26 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ),
             mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
             mock.patch.object(MODULE.secrets, "token_hex", return_value="new-owner"),
+            mock.patch.object(MODULE, "run", side_effect=prepare_run) as run,
             mock.patch.object(
-                MODULE, "run", side_effect=RuntimeError("stop after dispatch")
-            ) as run,
-            self.assertRaisesRegex(RuntimeError, "stop after dispatch"),
+                MODULE,
+                "local_identity",
+                return_value=preflight["identity"],
+            ),
+            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(MODULE, "metadata_for", return_value=preflight["pr"]),
+            mock.patch.object(MODULE, "apply_verified_import") as apply_import,
+            mock.patch.object(MODULE, "update_pr_metadata") as update_metadata,
+            mock.patch.object(MODULE, "publish_shared_state") as publish_shared,
+            mock.patch.object(MODULE, "emit"),
         ):
             MODULE.command_agent_task(args)
 
         migrated = MODULE.load_state(state_path)
         self.assertEqual(1, run.call_count)
+        apply_import.assert_not_called()
+        update_metadata.assert_not_called()
         self.assertEqual(1, len(migrated["managed_task_history"]))
         old_task = migrated["managed_task_history"][0]
         self.assertEqual(
@@ -1466,6 +1523,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual("not_created", old_task["task_id_status"])
         self.assertNotIn("recovery_command", old_task)
         self.assertIn("--preserve-artifacts", old_task["retry_command"])
+        self.assertIn("--prepare-only", old_task["retry_command"])
         self.assertTrue(prompt_path.is_file())
         self.assertTrue(result_path.is_file())
         self.assertEqual(1, len(migrated["managed_review_history"]))
@@ -1474,6 +1532,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual("failed", old_review["status"])
         self.assertEqual("agent_task_not_created", old_review["failure_reason"])
         self.assertEqual("new-owner", migrated["agent_task"]["run_id"])
+        self.assertEqual(
+            "validated_pending_import", migrated["agent_task"]["status"]
+        )
+        self.assertIn("--apply-prepared", migrated["agent_task"]["recovery_command"])
+        self.assertEqual(3, len(migrated["agent_task"]["preserved_artifacts"]))
+        publish_shared.assert_not_called()
 
         with (
             mock.patch.object(MODULE, "require_tools"),
@@ -1491,6 +1555,57 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             MODULE.command_agent_task(args)
         self.assertEqual(1, len(MODULE.load_state(state_path)["managed_task_history"]))
 
+        apply_args = SimpleNamespace(**vars(args))
+        apply_args.prepare_only = False
+        apply_args.apply_prepared = True
+        apply_import = mock.Mock(return_value=False)
+        publish_shared = mock.Mock()
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target(args.target),
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "run") as apply_run,
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value=preflight["identity"],
+            ),
+            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(MODULE, "metadata_for", return_value=preflight["pr"]),
+            mock.patch.object(
+                MODULE, "apply_verified_import", new=apply_import
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_live_pr_snapshot",
+                return_value=preflight["pr"],
+            ),
+            mock.patch.object(MODULE, "update_pr_metadata") as update_metadata,
+            mock.patch.object(MODULE, "publish_shared_state", new=publish_shared),
+            mock.patch.object(MODULE, "emit"),
+        ):
+            MODULE.command_agent_task(apply_args)
+
+        discover.assert_not_called()
+        apply_run.assert_not_called()
+        apply_import.assert_called_once()
+        update_metadata.assert_not_called()
+        self.assertEqual(
+            [preflight["pr"]["head_sha"]],
+            [call.kwargs["value"] for call in publish_shared.call_args_list],
+        )
+        completed = MODULE.load_state(state_path)
+        self.assertEqual("completed", completed["agent_task"]["status"])
+        self.assertEqual(
+            preflight["pr"]["head_sha"], completed["review"]["clean_at_head_sha"]
+        )
+
     def remote(self, *, commits=None):
         return MODULE.validate_success_result(
             self.result(commits=commits),
@@ -1505,7 +1620,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             sort_keys=True,
         )
 
-    def report(self, *, commits=None, outcome="cleared", findings=None):
+    def report(
+        self,
+        *,
+        commits=None,
+        outcome="cleared",
+        findings=None,
+        metadata=None,
+    ):
         commits = [] if commits is None else commits
         findings = [] if findings is None else findings
         pr = self.preflight["pr"]
@@ -1524,7 +1646,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "outcome": outcome,
                 "iterations_used": 1,
                 "findings": findings,
-                "pull_request_metadata": {
+                "pull_request_metadata": metadata
+                or {
                     "decision": "keep",
                     "title": pr["title"],
                     "body": pr["body"],
@@ -1533,6 +1656,22 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             },
             separators=(",", ":"),
             sort_keys=True,
+        )
+
+    def arguments(self, state_path, *, resume=False):
+        return SimpleNamespace(
+            target="owner/repo#7",
+            repo_root=str(self.repo_root),
+            state=str(state_path),
+            resume=resume,
+            prepare_only=False,
+            apply_prepared=False,
+            preserve_artifacts=False,
+            model="sol",
+            max_iterations=5,
+            pipeline_run=None,
+            pipeline_iteration=None,
+            pipeline_max_iterations=None,
         )
 
     def test_agent_definition_is_a_thin_managed_coordinator(self):
@@ -1545,7 +1684,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.20")
+        self.assertEqual(plugin["version"], "1.3.21")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -2061,7 +2200,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "local_identity",
                 return_value=self.preflight["identity"],
             ),
-            mock.patch.object(MODULE, "validate_generated_history"),
+            mock.patch.object(
+                MODULE,
+                "validate_generated_history",
+                return_value={},
+            ),
             mock.patch.object(
                 MODULE,
                 "fetch_committed_text",
@@ -2100,6 +2243,363 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             [call.kwargs["value"] for call in publish_shared_state.call_args_list],
             [None, self.head],
         )
+
+    def test_prepare_only_records_fix_and_metadata_before_authorized_apply(self):
+        state_path = self.directory / "prepared-fix.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        fix = "5" * 40
+        finding = {
+            "id": "finding-1",
+            "title": "Fix the bug",
+            "path": "src/app.py",
+            "line": 7,
+            "side": "RIGHT",
+            "body": "The changed branch returns the wrong value.",
+            "disposition": "fixed",
+            "reason": "The focused test demonstrates the failure.",
+            "commit": fix,
+        }
+        metadata = {
+            "decision": "replace",
+            "title": "Accurate title",
+            "body": "Accurate body",
+            "reason": "The final diff changes the public behavior.",
+        }
+        report = self.report(
+            commits=[fix],
+            findings=[finding],
+            metadata=metadata,
+        )
+        result = self.result(commits=[fix])
+        result["report"]["sha256"] = MODULE.sha256_text(report)
+        helper_launches = 0
+
+        def prepare_run(command, **_kwargs):
+            nonlocal helper_launches
+            helper_launches += 1
+            output = Path(command[command.index("--result-file") + 1])
+            output.write_text(json.dumps(result), encoding="utf-8")
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        prepare_args = self.arguments(state_path)
+        prepare_args.prepare_only = True
+        prepare_args.preserve_artifacts = True
+        apply_import = mock.Mock()
+        metadata_update = mock.Mock()
+        publish_shared = mock.Mock()
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=self.preflight
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "run", side_effect=prepare_run),
+            mock.patch.object(
+                MODULE, "local_identity", return_value=self.preflight["identity"]
+            ),
+            mock.patch.object(
+                MODULE,
+                "validate_generated_history",
+                return_value={fix: ["src/app.py"]},
+            ),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(
+                MODULE, "metadata_for", return_value=self.preflight["pr"]
+            ),
+            mock.patch.object(MODULE, "apply_verified_import", new=apply_import),
+            mock.patch.object(MODULE, "update_pr_metadata", new=metadata_update),
+            mock.patch.object(MODULE, "publish_shared_state", new=publish_shared),
+            mock.patch.object(MODULE, "emit") as emit,
+            mock.patch.object(
+                MODULE.secrets,
+                "token_hex",
+                side_effect=["invocation-1", "run-1"],
+            ),
+        ):
+            MODULE.command_agent_task(prepare_args)
+
+        self.assertEqual(1, helper_launches)
+        apply_import.assert_not_called()
+        metadata_update.assert_not_called()
+        publish_shared.assert_not_called()
+        prepared = MODULE.load_state(state_path)
+        task = prepared["agent_task"]
+        self.assertEqual("validated_pending_import", task["status"])
+        self.assertEqual(metadata, task["preparation"]["pull_request_metadata"])
+        self.assertEqual([fix], task["preparation"]["ordered_commits"])
+        self.assertEqual(
+            [{"commit": fix, "paths": ["src/app.py"]}],
+            task["preparation"]["paths_by_commit"],
+        )
+        self.assertTrue(task["preparation"]["clear_shared_state_on_apply"])
+        self.assertEqual(3, len(task["preserved_artifacts"]))
+        self.assertIn("--apply-prepared", task["apply_command"])
+        self.assertNotIn('"--resume"', task["apply_command"])
+        self.assertEqual(
+            "validated_pending_import", emit.call_args.args[0]["result"]
+        )
+
+        plain_resume = self.arguments(state_path, resume=True)
+        plain_resume.preserve_artifacts = True
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "requires --apply-prepared"
+            ),
+        ):
+            MODULE.command_agent_task(plain_resume)
+
+        retained_result = Path(task["result_file"])
+        retained_bytes = retained_result.read_bytes()
+        retained_result.write_bytes(retained_bytes + b" ")
+        drifted_apply = self.arguments(state_path)
+        drifted_apply.apply_prepared = True
+        drifted_apply.preserve_artifacts = True
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "artifact identity drifted"),
+        ):
+            MODULE.command_agent_task(drifted_apply)
+        retained_result.write_bytes(retained_bytes)
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=self.preflight
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task") as duplicate,
+            self.assertRaisesRegex(MODULE.WorkflowError, "unfinished Agent Task"),
+        ):
+            MODULE.command_agent_task(prepare_args)
+        duplicate.assert_not_called()
+
+        apply_args = self.arguments(state_path)
+        apply_args.apply_prepared = True
+        apply_args.preserve_artifacts = True
+        apply_import = mock.Mock(return_value=True)
+        metadata_update = mock.Mock(
+            return_value={
+                **self.preflight["pr"],
+                "head_sha": fix,
+                "title": metadata["title"],
+                "body": metadata["body"],
+            }
+        )
+        publish_shared = mock.Mock()
+        pushed = []
+
+        def apply_run(command, **_kwargs):
+            pushed.append(command)
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "run", side_effect=apply_run),
+            mock.patch.object(
+                MODULE, "local_identity", return_value=self.preflight["identity"]
+            ),
+            mock.patch.object(
+                MODULE,
+                "validate_generated_history",
+                return_value={fix: ["src/app.py"]},
+            ),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(
+                MODULE, "metadata_for", return_value=self.preflight["pr"]
+            ),
+            mock.patch.object(MODULE, "apply_verified_import", new=apply_import),
+            mock.patch.object(
+                MODULE, "remote_head", side_effect=[self.head, fix]
+            ),
+            mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
+            mock.patch.object(MODULE, "wait_for_remote_head", return_value=fix),
+            mock.patch.object(MODULE, "wait_for_live_pr_snapshot"),
+            mock.patch.object(MODULE, "update_pr_metadata", new=metadata_update),
+            mock.patch.object(MODULE, "publish_shared_state", new=publish_shared),
+            mock.patch.object(MODULE, "emit"),
+        ):
+            MODULE.command_agent_task(apply_args)
+
+        discover.assert_not_called()
+        apply_import.assert_called_once()
+        self.assertEqual(1, len(pushed))
+        self.assertIn("push", pushed[0])
+        metadata_update.assert_called_once()
+        self.assertEqual(
+            [None, fix],
+            [call.kwargs["value"] for call in publish_shared.call_args_list],
+        )
+        completed = MODULE.load_state(state_path)
+        self.assertEqual("completed", completed["agent_task"]["status"])
+        self.assertEqual(metadata["title"], completed["pr"]["title"])
+        self.assertEqual(metadata["body"], completed["pr"]["body"])
+        self.assertTrue(completed["agent_task"]["artifacts_preserved"])
+        self.assertNotIn("apply_command", completed["agent_task"])
+
+        missing_preservation = self.arguments(state_path)
+        missing_preservation.apply_prepared = True
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "--apply-prepared requires --preserve-artifacts"
+        ):
+            MODULE.command_agent_task(missing_preservation)
+        consumed = self.arguments(state_path)
+        consumed.apply_prepared = True
+        consumed.preserve_artifacts = True
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "already consumed"),
+        ):
+            MODULE.command_agent_task(consumed)
+
+    def test_prepare_only_records_clean_keep_result_before_authorized_apply(self):
+        state_path = self.directory / "prepared-clean.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        report = self.report()
+        result = self.result()
+        result["report"]["sha256"] = MODULE.sha256_text(report)
+
+        def prepare_run(command, **_kwargs):
+            output = Path(command[command.index("--result-file") + 1])
+            output.write_text(json.dumps(result), encoding="utf-8")
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        prepare_args = self.arguments(state_path)
+        prepare_args.prepare_only = True
+        prepare_args.preserve_artifacts = True
+        publish_shared = mock.Mock()
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=self.preflight
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "run", side_effect=prepare_run),
+            mock.patch.object(
+                MODULE, "local_identity", return_value=self.preflight["identity"]
+            ),
+            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(
+                MODULE, "metadata_for", return_value=self.preflight["pr"]
+            ),
+            mock.patch.object(MODULE, "apply_verified_import") as apply_import,
+            mock.patch.object(MODULE, "update_pr_metadata") as metadata_update,
+            mock.patch.object(MODULE, "publish_shared_state", new=publish_shared),
+            mock.patch.object(MODULE, "emit"),
+            mock.patch.object(
+                MODULE.secrets,
+                "token_hex",
+                side_effect=["invocation-1", "run-1"],
+            ),
+        ):
+            MODULE.command_agent_task(prepare_args)
+
+        apply_import.assert_not_called()
+        metadata_update.assert_not_called()
+        publish_shared.assert_not_called()
+        prepared = MODULE.load_state(state_path)
+        self.assertEqual(
+            self.head, prepared["agent_task"]["preparation"]["final_head_sha"]
+        )
+        self.assertEqual([], prepared["agent_task"]["preparation"]["ordered_commits"])
+        self.assertEqual([], prepared["agent_task"]["preparation"]["findings"])
+        self.assertEqual(
+            "keep",
+            prepared["agent_task"]["preparation"]["pull_request_metadata"]["decision"],
+        )
+
+        apply_args = self.arguments(state_path)
+        apply_args.apply_prepared = True
+        apply_args.preserve_artifacts = True
+        publish_shared = mock.Mock()
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "run") as run,
+            mock.patch.object(
+                MODULE, "local_identity", return_value=self.preflight["identity"]
+            ),
+            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(
+                MODULE, "metadata_for", return_value=self.preflight["pr"]
+            ),
+            mock.patch.object(
+                MODULE, "apply_verified_import", return_value=False
+            ) as apply_import,
+            mock.patch.object(
+                MODULE,
+                "wait_for_live_pr_snapshot",
+                return_value=self.preflight["pr"],
+            ),
+            mock.patch.object(MODULE, "update_pr_metadata") as metadata_update,
+            mock.patch.object(MODULE, "publish_shared_state", new=publish_shared),
+            mock.patch.object(MODULE, "emit"),
+        ):
+            MODULE.command_agent_task(apply_args)
+
+        discover.assert_not_called()
+        run.assert_not_called()
+        apply_import.assert_called_once()
+        metadata_update.assert_not_called()
+        self.assertEqual(
+            [None, self.head],
+            [call.kwargs["value"] for call in publish_shared.call_args_list],
+        )
+        completed = MODULE.load_state(state_path)
+        self.assertEqual("completed", completed["agent_task"]["status"])
+        self.assertEqual(self.head, completed["review"]["clean_at_head_sha"])
 
     def test_forward_clean_resume_reuses_task_and_preserves_all_artifacts(self):
         state_path = self.directory / "forward-clean-resume.json"
@@ -2289,7 +2789,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     "head": fix,
                 },
             ),
-            mock.patch.object(MODULE, "validate_generated_history"),
+            mock.patch.object(
+                MODULE,
+                "validate_generated_history",
+                return_value={fix: ["src/app.py"]},
+            ),
             mock.patch.object(
                 MODULE,
                 "fetch_committed_text",

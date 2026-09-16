@@ -3717,6 +3717,9 @@ def agent_task_recovery_command(
     repo_root: Path,
     state_path: Path,
     model: str,
+    prepare_only: bool = False,
+    preserve_artifacts: bool = False,
+    apply_prepared: bool = False,
 ) -> str:
     values = [
         sys.executable,
@@ -3729,8 +3732,12 @@ def agent_task_recovery_command(
         str(state_path),
         "--model",
         model,
-        "--resume",
     ]
+    values.append("--apply-prepared" if apply_prepared else "--resume")
+    if prepare_only:
+        values.append("--prepare-only")
+    if preserve_artifacts:
+        values.append("--preserve-artifacts")
     return " ".join(json.dumps(value) for value in values)
 
 
@@ -3773,6 +3780,8 @@ def agent_task_retry_command(
         )
     if getattr(args, "preserve_artifacts", False):
         values.append("--preserve-artifacts")
+    if getattr(args, "prepare_only", False):
+        values.append("--prepare-only")
     return " ".join(json.dumps(value) for value in values)
 
 
@@ -3844,13 +3853,126 @@ def finalize_agent_task_artifacts(
     task_state.pop("recovery_files", None)
 
 
+def validate_preserved_agent_task_artifacts(
+    task_state: dict[str, Any],
+    repo_root: Path,
+    *,
+    report_content: str | None = None,
+) -> None:
+    manifest = task_state.get("preserved_artifacts")
+    prompt = task_state.get("prompt_file")
+    result = task_state.get("result_file")
+    report = task_state.get("report")
+    if (
+        task_state.get("artifacts_preserved") is not True
+        or not isinstance(manifest, list)
+        or len(manifest) != 3
+        or not isinstance(prompt, str)
+        or not isinstance(result, str)
+        or not isinstance(report, dict)
+    ):
+        raise WorkflowError("prepared Agent Task has no complete artifact manifest")
+    local_paths = {prompt, result}
+    seen_local: set[str] = set()
+    seen_report = False
+    for artifact in manifest:
+        if not isinstance(artifact, dict):
+            raise WorkflowError("prepared Agent Task artifact manifest is malformed")
+        path_value = artifact.get("path")
+        digest = artifact.get("sha256")
+        size = artifact.get("size")
+        if (
+            not isinstance(path_value, str)
+            or not path_value
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+        ):
+            raise WorkflowError("prepared Agent Task artifact identity is malformed")
+        if set(artifact) == {"path", "sha256", "size"}:
+            if path_value not in local_paths or path_value in seen_local:
+                raise WorkflowError(
+                    "prepared Agent Task local artifact manifest is malformed"
+                )
+            path = Path(path_value)
+            require_outside_repository(path, repo_root)
+            if (
+                not path.is_file()
+                or path.stat().st_size != size
+                or sha256_file(path) != digest
+            ):
+                raise WorkflowError(
+                    f"prepared Agent Task artifact identity drifted: {path}"
+                )
+            seen_local.add(path_value)
+        elif set(artifact) == {"path", "commit", "sha256", "size"}:
+            if (
+                seen_report
+                or artifact.get("path") != report.get("path")
+                or artifact.get("commit") != report.get("commit")
+                or artifact.get("sha256") != report.get("sha256")
+                or (
+                    report_content is not None
+                    and (
+                        size != len(report_content.encode("utf-8"))
+                        or digest != sha256_text(report_content)
+                    )
+                )
+            ):
+                raise WorkflowError(
+                    "prepared Agent Task report artifact identity drifted"
+                )
+            seen_report = True
+        else:
+            raise WorkflowError("prepared Agent Task artifact manifest is malformed")
+    if seen_local != local_paths or not seen_report:
+        raise WorkflowError("prepared Agent Task artifact manifest is incomplete")
+
+
 def command_agent_task(args: argparse.Namespace) -> None:
+    prepare_only = bool(getattr(args, "prepare_only", False))
+    apply_prepared = bool(getattr(args, "apply_prepared", False))
+    preserve_artifacts = bool(getattr(args, "preserve_artifacts", False))
+    if apply_prepared and (args.resume or prepare_only):
+        raise WorkflowError(
+            "--apply-prepared cannot be combined with --resume or --prepare-only"
+        )
+    if prepare_only and not preserve_artifacts:
+        raise WorkflowError("--prepare-only requires --preserve-artifacts")
+    if apply_prepared and not preserve_artifacts:
+        raise WorkflowError("--apply-prepared requires --preserve-artifacts")
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
     target = resolve_target(args.target, repo_root)
     state_path = cli_path(args.state) if args.state else default_state_path(target)
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
+    if apply_prepared:
+        prepared_task = (
+            existing.get("agent_task") if isinstance(existing, dict) else None
+        )
+        if (
+            not isinstance(prepared_task, dict)
+            or not isinstance(prepared_task.get("prepared_at"), str)
+            or not prepared_task["prepared_at"]
+            or not isinstance(prepared_task.get("preparation"), dict)
+        ):
+            raise WorkflowError(
+                "state has no validated preparation awaiting authorized apply"
+            )
+        validate_preserved_agent_task_artifacts(prepared_task, repo_root)
+        args.resume = True
+    elif (
+        args.resume
+        and isinstance(existing, dict)
+        and isinstance(existing.get("agent_task"), dict)
+        and existing["agent_task"].get("prepared_at") is not None
+    ):
+        raise WorkflowError(
+            "validated preparation requires --apply-prepared after authorization"
+        )
     input_result_path: Path | None = None
     resume_identity: dict[str, str | None] | None = None
     resumed_task_id: str | None = None
@@ -3862,6 +3984,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
         task_state = existing.get("agent_task")
         if not isinstance(task_state, dict):
             raise WorkflowError("recovery state has no Agent Task")
+        if task_state.get("status") in {"completed", "consumed"}:
+            raise WorkflowError("Agent Task recovery state was already consumed")
         preflight = task_state.get("preflight")
         if (
             not isinstance(preflight, dict)
@@ -4087,6 +4211,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
             repo_root=repo_root,
             state_path=state_path,
             model=args.model,
+            prepare_only=prepare_only,
+            preserve_artifacts=preserve_artifacts,
+        )
+        clear_shared_state_on_apply = (
+            existing is None or previous_clean_at_head_sha is not None
         )
         state["review"] = {
             "id": f"pr-{pr['number']}-agent-task-{run_id}",
@@ -4106,10 +4235,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "prompt_file": str(prompt_path),
             "result_file": str(result_path),
             "recovery_command": recovery,
+            "clear_shared_state_on_apply": clear_shared_state_on_apply,
             "started_at": utc_now(),
         }
         save_state(state_path, state)
-        if existing is None or previous_clean_at_head_sha is not None:
+        if clear_shared_state_on_apply and not prepare_only:
             publish_shared_state(
                 pr,
                 section="self_review",
@@ -4117,6 +4247,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 value=None,
                 updated_at=state["updated_at"],
             )
+            state["agent_task"]["shared_state_cleared"] = True
+            save_state(state_path, state)
         try:
             helper = discover_cloud_task()
             prompt = build_worker_prompt(
@@ -4365,6 +4497,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             max_iterations=allowed_iterations,
             paths_by_commit=paths_by_commit,
         )
+        metadata_result = report["pull_request_metadata"]
         live_before_import = metadata_for(target)
         if live_before_import["head_sha"] not in {
             pr["head_sha"],
@@ -4373,12 +4506,78 @@ def command_agent_task(args: argparse.Namespace) -> None:
             raise WorkflowError(
                 "pull request head moved before verified import"
             )
-        require_live_pr_snapshot(
-            pr,
-            live_before_import,
-            expected_head=live_before_import["head_sha"],
-        )
+        try:
+            require_live_pr_snapshot(
+                pr,
+                live_before_import,
+                expected_head=live_before_import["head_sha"],
+            )
+        except WorkflowError:
+            if metadata_result["decision"] != "replace":
+                raise
+            require_live_pr_snapshot(
+                {
+                    **pr,
+                    "title": metadata_result["title"],
+                    "body": metadata_result["body"],
+                },
+                live_before_import,
+                expected_head=live_before_import["head_sha"],
+            )
         current = load_state(state_path)
+        task_state = current["agent_task"]
+        paths_checkpoint = [
+            {"commit": commit, "paths": paths_by_commit[commit]}
+            for commit in remote["commits"]
+        ]
+        expected_preparation = {
+            "source_head_sha": pr["head_sha"],
+            "final_head_sha": remote["final_local_head"],
+            "generated_head_sha": remote["generated_head"],
+            "ordered_commits": remote["commits"],
+            "paths_by_commit": paths_checkpoint,
+            "report_path": remote["report_path"],
+            "report_sha256": remote["report_sha256"],
+            "result_sha256": result_sha256,
+            "outcome": report["outcome"],
+            "iterations_used": report["iterations_used"],
+            "findings": report["findings"],
+            "pull_request_metadata": metadata_result,
+            "clear_shared_state_on_apply": bool(
+                task_state.get("clear_shared_state_on_apply")
+            ),
+        }
+        if apply_prepared:
+            validate_preserved_agent_task_artifacts(
+                task_state,
+                repo_root,
+                report_content=report_content,
+            )
+            prepared_fields = {
+                "task_id": remote["task_id"],
+                "generated_branch": remote["generated_branch"],
+                "generated_head": remote["generated_head"],
+                "ordered_commits": remote["commits"],
+                "report_path": remote["report_path"],
+                "report_sha256": remote["report_sha256"],
+                "result_sha256": result_sha256,
+                "paths_by_commit": paths_checkpoint,
+                "findings": report["findings"],
+                "pull_request_metadata": metadata_result,
+                "outcome": report["outcome"],
+                "iterations_used": report["iterations_used"],
+                "preparation": expected_preparation,
+                "clear_shared_state_on_apply": expected_preparation[
+                    "clear_shared_state_on_apply"
+                ],
+            }
+            if any(
+                task_state.get(field) != value
+                for field, value in prepared_fields.items()
+            ):
+                raise WorkflowError(
+                    "validated preparation drifted from retained Agent Task result"
+                )
         current["agent_task"].update(
             {
                 "status": "validated_pending_import",
@@ -4388,12 +4587,75 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "generated_head": remote["generated_head"],
                 "ordered_commits": remote["commits"],
                 "report_path": remote["report_path"],
+                "report_sha256": remote["report_sha256"],
                 "structural_attestation": True,
                 "result_sha256": result_sha256,
+                "paths_by_commit": paths_checkpoint,
+                "findings": report["findings"],
+                "pull_request_metadata": metadata_result,
+                "outcome": report["outcome"],
+                "iterations_used": report["iterations_used"],
                 "validated_at": utc_now(),
             }
         )
+        if prepare_only:
+            finalize_agent_task_artifacts(
+                task_state,
+                {prompt_path, result_path},
+                preserve=True,
+                report_content=report_content,
+            )
+            apply_command = agent_task_recovery_command(
+                target=pr["pr_url"],
+                repo_root=repo_root,
+                state_path=state_path,
+                model=args.model,
+                preserve_artifacts=True,
+                apply_prepared=True,
+            )
+            task_state["prepared_at"] = utc_now()
+            task_state["preparation"] = expected_preparation
+            task_state["apply_command"] = apply_command
+            task_state["recovery_command"] = apply_command
+            save_state(state_path, current)
+            emit(
+                {
+                    "result": "validated_pending_import",
+                    "state": str(state_path),
+                    "pr": pr["pr_url"],
+                    "source_head_sha": pr["head_sha"],
+                    "final_head_sha": remote["final_local_head"],
+                    "generated_branch": remote["generated_branch"],
+                    "generated_head_sha": remote["generated_head"],
+                    "ordered_commits": remote["commits"],
+                    "paths_by_commit": paths_checkpoint,
+                    "report": {
+                        "path": remote["report_path"],
+                        "sha256": remote["report_sha256"],
+                    },
+                    "outcome": report["outcome"],
+                    "iterations_used": report["iterations_used"],
+                    "findings": report["findings"],
+                    "metadata": metadata_result,
+                    "preserved_artifacts": task_state["preserved_artifacts"],
+                    "apply_command": apply_command,
+                }
+            )
+            return
         save_state(state_path, current)
+        if (
+            task_state.get("clear_shared_state_on_apply")
+            and not task_state.get("shared_state_cleared")
+        ):
+            publish_shared_state(
+                pr,
+                section="self_review",
+                field="clean_at_head_sha",
+                value=None,
+                updated_at=current["updated_at"],
+            )
+            task_state["shared_state_cleared"] = True
+            save_state(state_path, current)
         imported = apply_verified_import(
             repo_root,
             result_path=result_path,
@@ -4487,7 +4749,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 raise WorkflowError(
                     "published pull request head moved before finalization"
                 )
-        metadata_result = report["pull_request_metadata"]
         if metadata_result["decision"] == "replace":
             metadata_snapshot = {**pr, "head_sha": published_head}
             verified = update_pr_metadata(
@@ -4535,6 +4796,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         current["agent_task"]["status"] = "completed"
         current["agent_task"]["completed_at"] = utc_now()
         current["agent_task"]["artifacts_removed"] = False
+        current["agent_task"].pop("apply_command", None)
         for field in ("error", "failed_at", "recovery_files"):
             current["agent_task"].pop(field, None)
         save_state(state_path, current)
@@ -4837,6 +5099,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--preserve-artifacts",
         action="store_true",
         help="retain the managed prompt and result after successful publication",
+    )
+    agent_task.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help=(
+            "validate and preserve one managed result, then stop before local "
+            "import or pull request mutation"
+        ),
+    )
+    agent_task.add_argument(
+        "--apply-prepared",
+        action="store_true",
+        help=(
+            "apply and finalize one validated preparation without launching "
+            "another managed task"
+        ),
     )
     agent_task.set_defaults(function=command_agent_task)
 
