@@ -20,6 +20,9 @@ PLUGIN = Path(__file__).parents[1] / "plugin.json"
 EXTERNAL_ZIZMOR_CHECK = (
     Path(__file__).parent / "fixtures" / "external-zizmor-check-run.json"
 )
+COMPACT_ZIZMOR_REPORT = (
+    Path(__file__).parent / "fixtures" / "compact-zizmor-v3-report.md"
+)
 SPEC = importlib.util.spec_from_file_location("ci_fix_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -1092,7 +1095,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                         "log_sha256": failure["log_sha256"],
                         "disposition": disposition,
                         "reason": "The focused test proves the result.",
-                        "commit": commits[0] if disposition == "fixed" else None,
+                        "commits": commits if disposition == "fixed" else [],
                     }
                 ],
                 "changed_paths": [] if changed_paths is None else changed_paths,
@@ -1110,6 +1113,51 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             iteration_allowance=1,
         )
 
+    def compact_report_context(self):
+        commits = [
+            "de6179d8f0edcd9c94bc995f24fc1735fbbce896",
+            "4076ad1e7b825752d99231ba1634ad0067c6d83b",
+        ]
+        report_path = (
+            ".github/agent-task-reports/"
+            "c4dfa59b-96ac-4892-a204-be9365130b47.md"
+        )
+        preflight = copy.deepcopy(self.preflight)
+        preflight["pr"].update(
+            {
+                "repo_name": "open-telemetry/shared-workflows",
+                "number": 377,
+                "head_sha": "a56a1b77a015d4928625e2f0d708f00fe7f924c8",
+                "base_sha": "ad5b9918d6ec0000000000000000000000000000",
+            }
+        )
+        preflight["check_snapshot"] = {
+            "sha256": (
+                "d22740f4a724bf8c3339449924cb9463363493b797a68f708a0266d6cf9f43e7"
+            ),
+            "failures": [
+                {
+                    "key": "check:zizmor",
+                    "name": "zizmor",
+                    "kind": "check_run",
+                    "workflow": None,
+                    "url": (
+                        "https://github.com/open-telemetry/shared-workflows/"
+                        "runs/104705281292"
+                    ),
+                    "log": "",
+                    "log_sha256": MODULE.sha256_text(""),
+                    "baseline_verdict": "pull_request",
+                }
+            ],
+        }
+        remote = {
+            "requires_apply": True,
+            "commits": commits,
+            "report_path": report_path,
+        }
+        return preflight, remote
+
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
@@ -1120,7 +1168,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.21", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.22", json.loads(PLUGIN.read_text())["version"])
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1145,7 +1193,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn('"iteration_allowance": 1', prompt)
         self.assertIn("Never select a marketplace `custom_agent`", prompt)
         self.assertIn("use Cloud Sandboxes", prompt)
-        self.assertIn("worker prompt version 2", prompt)
+        self.assertIn("worker prompt version 3", prompt)
+        self.assertIn("Never replace a check key with a numeric database ID", prompt)
         self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
         self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
@@ -1206,7 +1255,132 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             ),
             commits=[commit],
         )
-        self.assertNotIn("fix_commits", report)
+        self.assertEqual([commit], report["failures"][0]["fix_commits"])
+
+    def test_accepts_multiple_ordered_commits_for_one_failure(self):
+        commits = ["5" * 40, "6" * 40]
+        report = self.validate_report(
+            self.report(
+                commits=commits,
+                outcome="fixed",
+                disposition="fixed",
+                changed_paths=["src/widget.py"],
+            ),
+            commits=commits,
+        )
+
+        self.assertEqual(commits, report["failures"][0]["fix_commits"])
+        self.assertEqual(commits[-1], report["failures"][0]["commit"])
+
+    def test_accepts_legacy_v2_report_for_retained_task_recovery(self):
+        commit = "5" * 40
+        payload = json.loads(
+            self.report(
+                commits=[commit],
+                outcome="fixed",
+                disposition="fixed",
+                changed_paths=["src/widget.py"],
+            )
+        )
+        payload["schema"] = MODULE.LEGACY_CI_FIX_REPORT_SCHEMA
+        payload["failures"][0]["commit"] = payload["failures"][0].pop("commits")[0]
+
+        report = self.validate_report(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True),
+            commits=[commit],
+        )
+
+        self.assertEqual(MODULE.CI_FIX_REPORT_SCHEMA, report["schema"])
+        self.assertEqual([commit], report["failures"][0]["fix_commits"])
+
+    def test_accepts_exact_policy_v3_compact_external_check_report(self):
+        preflight, remote = self.compact_report_context()
+        content = COMPACT_ZIZMOR_REPORT.read_text(encoding="utf-8")
+        self.assertEqual(
+            "567458e272999e0f3021b2746484d441d0b12de1f4998732773bf88bbc35888e",
+            MODULE.sha256_text(content),
+        )
+
+        report = MODULE.validate_ci_fix_report(
+            content,
+            request_id="request-1",
+            preflight=preflight,
+            remote=remote,
+            iteration_allowance=1,
+        )
+
+        failure = report["failures"][0]
+        self.assertEqual("check:zizmor", failure["key"])
+        self.assertEqual(MODULE.sha256_text(""), failure["log_sha256"])
+        self.assertEqual(remote["commits"], failure["fix_commits"])
+        self.assertEqual(remote["commits"][-1], failure["commit"])
+        self.assertEqual(
+            [".github/workflows/github-actions-queue-collector.yml"],
+            report["changed_paths"],
+        )
+
+    def test_rejects_compact_external_check_report_identity_drift(self):
+        preflight, remote = self.compact_report_context()
+        original = MODULE.parse_markdown_report(
+            COMPACT_ZIZMOR_REPORT.read_text(encoding="utf-8"),
+            description="test report",
+        )
+        cases = {}
+        wrong_id = copy.deepcopy(original)
+        wrong_id["failing_checks"][0]["key"] = "104705281293"
+        cases["numeric ID"] = (wrong_id, preflight, remote)
+        wrong_name = copy.deepcopy(original)
+        wrong_name["failing_checks"][0]["name"] = "other"
+        cases["name"] = (wrong_name, preflight, remote)
+        wrong_commits = copy.deepcopy(original)
+        wrong_commits["ordered_commits"].reverse()
+        cases["commit order"] = (wrong_commits, preflight, remote)
+        wrong_fix_commits = copy.deepcopy(original)
+        wrong_fix_commits["failing_checks"][0]["fix_commits"].reverse()
+        cases["fix commit order"] = (wrong_fix_commits, preflight, remote)
+        missing_report = copy.deepcopy(original)
+        missing_report["changed_paths"].remove(remote["report_path"])
+        cases["missing report path"] = (missing_report, preflight, remote)
+        duplicate_report = copy.deepcopy(original)
+        duplicate_report["changed_paths"].append(remote["report_path"])
+        cases["duplicate report path"] = (duplicate_report, preflight, remote)
+        extra_failure = copy.deepcopy(original)
+        extra_failure["failing_checks"].append(
+            copy.deepcopy(extra_failure["failing_checks"][0])
+        )
+        cases["extra failure"] = (extra_failure, preflight, remote)
+        extra_key = copy.deepcopy(original)
+        extra_key["unexpected"] = True
+        cases["extra top-level key"] = (extra_key, preflight, remote)
+        wrong_repo = copy.deepcopy(preflight)
+        wrong_repo["check_snapshot"]["failures"][0]["url"] = (
+            "https://github.com/other/repository/runs/104705281292"
+        )
+        cases["repository"] = (original, wrong_repo, remote)
+        nonempty_log = copy.deepcopy(preflight)
+        nonempty_log["check_snapshot"]["failures"][0]["log"] = "failure"
+        nonempty_log["check_snapshot"]["failures"][0]["log_sha256"] = (
+            MODULE.sha256_text("failure")
+        )
+        cases["nonempty log"] = (original, nonempty_log, remote)
+        applied = copy.deepcopy(remote)
+        applied["requires_apply"] = False
+        cases["non-policy-v3 result"] = (original, preflight, applied)
+
+        for name, (payload, case_preflight, case_remote) in cases.items():
+            content = (
+                "# CI Fix Loop Report\n\n```json\n"
+                + json.dumps(payload, separators=(",", ":"), sort_keys=True)
+                + "\n```\n"
+            )
+            with self.subTest(name=name), self.assertRaises(MODULE.WorkflowError):
+                MODULE.validate_ci_fix_report(
+                    content,
+                    request_id="request-1",
+                    preflight=case_preflight,
+                    remote=case_remote,
+                    iteration_allowance=1,
+                )
 
     def test_accepts_rerun_preexisting_and_unfixable_outcomes(self):
         for outcome, disposition in (
