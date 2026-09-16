@@ -1390,6 +1390,7 @@ STAGE_STATUS_FIELDS = (
     "agent_task",
     "attempt",
     "counts",
+    "coordinator",
     "escalation",
     "iterations",
     "last_helper_activity",
@@ -1491,6 +1492,21 @@ def stage_blocker(
                 "use its retained recovery details"
             )
         return "stage_recovery_required", detail
+    coordinator = status.get("coordinator") if isinstance(status, dict) else None
+    escalation = status.get("escalation") if isinstance(status, dict) else None
+    if (
+        isinstance(coordinator, dict)
+        and coordinator.get("status") == "blocked"
+        and isinstance(escalation, dict)
+        and escalation.get("reason") == "coordinator_error"
+    ):
+        detail = escalation.get("detail") or coordinator.get("detail")
+        return (
+            "stage_coordinator_error",
+            detail
+            if isinstance(detail, str) and detail
+            else f"{stage_result['stage']} local coordinator failed",
+        )
     return None
 
 

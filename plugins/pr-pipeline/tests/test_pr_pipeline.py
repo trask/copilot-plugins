@@ -1020,6 +1020,43 @@ class SweepTest(unittest.TestCase):
         )
         self.assertEqual([], self.launched)
 
+    def test_pre_identity_ci_coordinator_error_blocks_with_exact_detail(self):
+        for stage in (
+            MODULE.STAGE_CONFLICT,
+            MODULE.STAGE_COPILOT_REVIEW,
+            MODULE.STAGE_SELF_REVIEW,
+        ):
+            self.clear_at[stage] = HEAD
+        self.clear_base_at = BASE
+        original = self.inspect
+        detail = (
+            "gh api repos/open-telemetry/shared-workflows/actions/jobs/"
+            "104705281292 failed (1): gh: Not Found (HTTP 404)"
+        )
+
+        def blocked_ci(entry, *args):
+            if entry["stage"] != MODULE.STAGE_CI:
+                return original(entry, *args)
+            return {
+                **uncleared_stage(entry["stage"], None),
+                "status": {
+                    "coordinator": {"status": "blocked", "detail": detail},
+                    "escalation": {
+                        "reason": "coordinator_error",
+                        "detail": detail,
+                    },
+                },
+            }
+
+        MODULE.inspect_stage.side_effect = blocked_ci
+        result = self.execute()
+
+        self.assertEqual("blocked", result["result"])
+        self.assertEqual("stage_coordinator_error", result["reason"])
+        self.assertEqual(MODULE.STAGE_CI, result["stage"])
+        self.assertEqual(detail, result["detail"])
+        self.assertEqual([], self.launched)
+
     def test_head_change_runs_a_second_sweep_for_stale_stages(self):
         first_sweep_calls = 0
 

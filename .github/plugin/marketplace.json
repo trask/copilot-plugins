@@ -41,7 +41,7 @@
     {
       "name": "pr-pipeline",
       "description": "Drive one pull request or a selected native-stack suffix through conflict resolution, review, CI fixing, and description validation.",
-      "version": "1.5.10",
+      "version": "1.5.11",
       "source": "./plugins/pr-pipeline"
     },
     {
@@ -53,7 +53,7 @@
     {
       "name": "ci-fix-loop",
       "description": "Fix continuous integration failures on one pull request or bottom-up through a native stack, propagating each fix through its descendants.",
-      "version": "1.6.19",
+      "version": "1.6.20",
       "source": "./plugins/ci-fix-loop"
     },
     {

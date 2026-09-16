@@ -919,6 +919,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.artifact = "3" * 40
         failure = {
             "key": "check:CI/test",
+            "kind": "check_run",
             "name": "test",
             "workflow": "CI",
             "url": "https://github.com/owner/repo/actions/runs/1/job/2",
@@ -1116,7 +1117,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.19", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.20", json.loads(PLUGIN.read_text())["version"])
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1160,6 +1161,20 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertEqual("focused failure log\n", content)
         self.assertIn("--job", run.call_args.args[0])
         self.assertIn("2", run.call_args.args[0])
+
+    def test_external_status_context_never_resolves_an_actions_job(self):
+        check = {
+            "kind": "status",
+            "name": "zizmor",
+            "url": "https://github.com/owner/repo/runs/104705281292",
+            "description": "zizmor found an issue",
+            "state": "FAILURE",
+        }
+        with mock.patch.object(MODULE, "resolve_run_id") as resolve:
+            content = MODULE.fetch_failed_check_log(self.preflight["pr"], check)
+
+        self.assertEqual("", content)
+        resolve.assert_not_called()
 
     def test_accepts_noop_and_complete_relevant_validation(self):
         remote = self.remote()
@@ -1950,6 +1965,97 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             MODULE.load_state(state_path)["coordinator"]["status"],
             "blocked",
         )
+
+    def test_check_detail_failure_retains_pinned_identity(self):
+        state_path = self.root / "coordinator.json"
+        pr = {
+            **self.preflight["pr"],
+            "upstream_owner": "owner",
+            "upstream_repo": "repo",
+            "is_fork": False,
+        }
+        external = {
+            "key": "status:zizmor",
+            "kind": "status",
+            "name": "zizmor",
+            "workflow": None,
+            "status": None,
+            "conclusion": None,
+            "state": "FAILURE",
+            "class": "failed",
+            "url": "https://github.com/owner/repo/runs/104705281292",
+            "workflow_run_id": None,
+            "started_at": "2026-09-16T07:55:00Z",
+            "completed_at": None,
+            "description": "zizmor found an issue",
+        }
+        passed = {
+            **external,
+            "key": "check:CodeQL/analyze",
+            "kind": "check_run",
+            "name": "analyze",
+            "state": None,
+            "class": "passed",
+            "conclusion": "SUCCESS",
+            "url": "https://github.com/owner/repo/actions/runs/1/job/2",
+            "description": None,
+        }
+        repository = {
+            "permissions": {
+                "admin": False,
+                "maintain": False,
+                "push": True,
+                "triage": True,
+                "pull": True,
+            },
+            "role_name": "write",
+        }
+        identity = self.preflight["identity"]
+        with (
+            mock.patch.object(MODULE, "git", return_value=""),
+            mock.patch.object(MODULE, "metadata_for", return_value=pr),
+            mock.patch.object(MODULE, "checkout_pr"),
+            mock.patch.object(MODULE, "local_identity", return_value=identity),
+            mock.patch.object(MODULE, "require_fork_head"),
+            mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
+            mock.patch.object(
+                MODULE, "gh_json", side_effect=[repository, {"login": "viewer"}]
+            ),
+            mock.patch.object(
+                MODULE, "fetch_rollup", return_value=(self.head, [passed, external])
+            ),
+            mock.patch.object(
+                MODULE,
+                "decide",
+                return_value={
+                    "decision": "failures",
+                    "reason": "checks_failed",
+                    "checks": [external["key"]],
+                    "pending_checks": [],
+                    "detail": "zizmor failed",
+                },
+            ),
+            mock.patch.object(MODULE, "baseline_conclusions", return_value={}),
+            mock.patch.object(
+                MODULE,
+                "fetch_failed_check_log",
+                side_effect=MODULE.WorkflowError("check detail lookup failed"),
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "check detail lookup failed"),
+        ):
+            MODULE.agent_task_preflight(
+                self.root,
+                {"repo_name": "owner/repo", "number": 7},
+                state_path=state_path,
+            )
+
+        state = MODULE.load_state(state_path)
+        self.assertEqual("owner/repo", state["pr"]["repo_name"])
+        self.assertEqual(self.head, state["pr"]["head_sha"])
+        self.assertEqual(self.base, state["pr"]["base_sha"])
+        self.assertEqual(str(self.root), state["repo_root"])
+        self.assertEqual(identity, state["preflight_identity"])
+        self.assertEqual("preflighting", state["coordinator"]["status"])
 
     def test_local_coordinator_resumes_waiting_and_dispatches_each_new_snapshot_once(self):
         first = copy.deepcopy(self.preflight)
@@ -4888,6 +4994,61 @@ class StatusCommandTest(unittest.TestCase):
         self.assertEqual({"check:a": "pr_caused"}, payload["verdicts"])
         self.assertEqual(1, payload["counts"]["passed"])
         self.assertTrue(Path(payload["status_path"]).is_file())
+
+    def test_reports_a_pre_identity_blocked_envelope(self):
+        path = self.root / "blocked.json"
+        MODULE.save_state(
+            path,
+            {
+                "version": 1,
+                "created_at": "2026-09-16T07:55:40Z",
+                "iterations": 0,
+                "history": [],
+                "reruns": {},
+                "coordinator": {
+                    "status": "blocked",
+                    "detail": (
+                        "gh api repos/owner/repo/actions/jobs/104705281292 "
+                        "failed (1): gh: Not Found (HTTP 404)"
+                    ),
+                    "observed_at": "2026-09-16T07:55:40Z",
+                },
+                "escalation": {
+                    "reason": "coordinator_error",
+                    "detail": (
+                        "gh api repos/owner/repo/actions/jobs/104705281292 "
+                        "failed (1): gh: Not Found (HTTP 404)"
+                    ),
+                    "checks": [],
+                    "head_sha": None,
+                    "next_action": MODULE.ESCALATION_ACTIONS["coordinator_error"],
+                    "recorded_at": "2026-09-16T07:55:40Z",
+                },
+            },
+        )
+
+        payload = call("status", "--state", str(path))
+
+        self.assertEqual("ready", payload["result"])
+        self.assertIsNone(payload["pr"])
+        self.assertEqual("blocked", payload["coordinator"]["status"])
+        self.assertEqual("escalated", payload["stage_outcome"])
+
+    def test_rejects_an_incomplete_state_that_is_not_blocked(self):
+        path = self.root / "incomplete.json"
+        MODULE.save_state(
+            path,
+            {
+                "version": 1,
+                "created_at": "2026-09-16T07:55:40Z",
+                "iterations": 0,
+            },
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "not a valid pre-identity blocked envelope"
+        ):
+            MODULE.command_status(SimpleNamespace(current=False, state=str(path)))
 
     def test_status_reports_when_the_helper_last_wrote_its_state(self):
         """The only signal a reader has for telling working from wedged.

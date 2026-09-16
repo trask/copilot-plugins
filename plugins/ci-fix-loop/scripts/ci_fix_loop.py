@@ -2705,6 +2705,12 @@ def parse_run_reference(url: Any) -> dict[str, int] | None:
     return None
 
 
+def check_run_reference(check: dict[str, Any]) -> dict[str, int] | None:
+    if check.get("kind") != "check_run":
+        return None
+    return parse_run_reference(check.get("url"))
+
+
 def resolve_run_id(pr: dict[str, Any], reference: dict[str, int]) -> int:
     if "run_id" in reference:
         return reference["run_id"]
@@ -3281,7 +3287,7 @@ def command_wait_for_auto_retry(args: argparse.Namespace) -> None:
     )
     if check is None:
         raise WorkflowError(f"check {args.check} is not in this iteration's snapshot")
-    reference = parse_run_reference(check.get("url"))
+    reference = check_run_reference(check)
     if reference is None:
         emit(
             {
@@ -3478,7 +3484,7 @@ def command_rerun(args: argparse.Namespace) -> None:
     )
     if check is None:
         raise WorkflowError(f"check {args.check} is not in this iteration's snapshot")
-    reference = parse_run_reference(check.get("url"))
+    reference = check_run_reference(check)
     if reference is None:
         state["escalation"] = {
             "reason": "no_rerun_support",
@@ -4404,7 +4410,7 @@ def check_rollup_identity(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def fetch_failed_check_log(pr: dict[str, Any], check: dict[str, Any]) -> str:
-    reference = parse_run_reference(check.get("url"))
+    reference = check_run_reference(check)
     if reference is None:
         return ""
     run_id = resolve_run_id(pr, reference)
@@ -4437,6 +4443,7 @@ def agent_task_preflight(
     target: dict[str, Any],
     *,
     stack_state: Path | None = None,
+    state_path: Path | None = None,
 ) -> dict[str, Any]:
     dirty = git(repo_root, "status", "--porcelain=v1")
     if dirty:
@@ -4471,6 +4478,8 @@ def agent_task_preflight(
             f"branch mismatch: local {identity['branch']!r}, "
             f"PR head {pr['head_branch']!r}"
         )
+    if state_path is not None:
+        record_coordinator_identity(state_path, repo_root, pr, identity)
     require_fork_head(pr)
     find_push_remote(repo_root, pr["head_owner"], pr["head_repo"])
     repository = gh_json(["api", f"repos/{pr['repo_name']}"])
@@ -4522,9 +4531,11 @@ def agent_task_preflight(
         failures.append(
             {
                 "key": key,
+                "kind": check["kind"],
                 "name": check["name"],
                 "workflow": check.get("workflow"),
                 "url": check.get("url"),
+                "description": check.get("description"),
                 "conclusion": check.get("conclusion") or check.get("state"),
                 "baseline_conclusion": baseline.get(check["name"]),
                 "baseline_verdict": baseline_verdict(baseline.get(check["name"])),
@@ -5426,6 +5437,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             repo_root,
             target,
             stack_state=cli_path(args.stack_state) if args.stack_state else None,
+            state_path=state_path,
         )
         if supplied_preflight is not None:
             require_live_check_snapshot(preflight)
@@ -6277,6 +6289,42 @@ def coordinator_file_state(path: Path) -> dict[str, Any]:
     }
 
 
+def record_coordinator_identity(
+    path: Path,
+    repo_root: Path,
+    pr: dict[str, Any],
+    identity: dict[str, str],
+) -> None:
+    state = coordinator_file_state(path)
+    active_task = state.get("agent_task")
+    if (
+        isinstance(active_task, dict)
+        and active_task.get("status") not in {"completed", "consumed"}
+        and not (
+            active_task.get("status") == "failed"
+            and active_task.get("task_id_status") == "not_created"
+        )
+    ):
+        raise WorkflowError(
+            "an unfinished Agent Task already owns this state; use its "
+            "recovery_command"
+        )
+    state["repo_root"] = str(repo_root)
+    state["pr"] = pr
+    coordinator = state.setdefault("coordinator", {})
+    coordinator.update(
+        {
+            "status": "preflighting",
+            "head_sha": pr["head_sha"],
+            "base_sha": pr["base_sha"],
+            "detail": "reading the current-head CI check set",
+            "observed_at": utc_now(),
+        }
+    )
+    state["preflight_identity"] = identity
+    save_state(path, state)
+
+
 def update_coordinator_state(
     path: Path,
     *,
@@ -6354,6 +6402,7 @@ def wait_for_stable_ci_preflight(
                 stack_state=(
                     cli_path(args.stack_state) if args.stack_state else None
                 ),
+                state_path=state_path,
             )
         except WorkflowError as error:
             if not is_rate_limit_error(error):
@@ -6407,6 +6456,7 @@ def wait_for_stable_ci_preflight(
                     stack_state=(
                         cli_path(args.stack_state) if args.stack_state else None
                     ),
+                    state_path=state_path,
                 )
                 if confirmation["check_snapshot"]["sha256"] != identity:
                     stable_identity = None
@@ -8157,8 +8207,58 @@ def work_progress(state: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def status_pr(state: dict[str, Any]) -> dict[str, Any] | None:
+    pr = state.get("pr")
+    if isinstance(pr, dict):
+        required = (
+            "number",
+            "title",
+            "pr_url",
+            "repo_name",
+            "head_branch",
+            "base_branch",
+        )
+        if all(pr.get(key) is not None for key in required):
+            return pr
+        raise WorkflowError("CI Fix Loop state has incomplete pull request identity")
+    coordinator = state.get("coordinator")
+    escalation = state.get("escalation")
+    if (
+        state.get("version") == STATE_VERSION
+        and not isinstance(state.get("iterations"), bool)
+        and isinstance(state.get("iterations"), int)
+        and isinstance(state.get("history"), list)
+        and isinstance(state.get("reruns"), dict)
+        and isinstance(coordinator, dict)
+        and coordinator.get("status") == "blocked"
+        and isinstance(coordinator.get("detail"), str)
+        and coordinator["detail"]
+        and isinstance(coordinator.get("observed_at"), str)
+        and coordinator["observed_at"]
+        and isinstance(escalation, dict)
+        and isinstance(escalation.get("reason"), str)
+        and escalation["reason"]
+        and isinstance(escalation.get("detail"), str)
+        and escalation["detail"]
+        and isinstance(escalation.get("checks"), list)
+        and isinstance(escalation.get("next_action"), str)
+        and escalation["next_action"]
+        and isinstance(escalation.get("recorded_at"), str)
+        and escalation["recorded_at"]
+        and (
+            escalation.get("head_sha") is None
+            or isinstance(escalation.get("head_sha"), str)
+        )
+    ):
+        return None
+    raise WorkflowError(
+        "CI Fix Loop state has no pull request identity and is not a valid "
+        "pre-identity blocked envelope"
+    )
+
+
 def status_payload(state: dict[str, Any], path: Path) -> dict[str, Any]:
-    pr = state["pr"]
+    pr = status_pr(state)
     run_state = state.get("run") or {}
     return {
         "result": "ready",
@@ -8179,6 +8279,7 @@ def status_payload(state: dict[str, Any], path: Path) -> dict[str, Any]:
         "invocation_budget": state.get("invocation_budget"),
         "budget_scope": state.get("budget_scope", "lifetime"),
         "accepted_pushes": state.get("accepted_pushes") or [],
+        "coordinator": state.get("coordinator"),
         "progress": work_progress(state),
         "last_helper_activity": last_helper_activity(state),
     }
@@ -8211,7 +8312,7 @@ def command_status(args: argparse.Namespace) -> None:
     payload = status_payload(state, path)
     status_path = status_path_for(path)
     write_result_file(status_path, payload, "status")
-    pr = state["pr"]
+    pr = status_pr(state)
     run_state = state.get("run") or {}
     checks = run_state.get("checks") or []
     decision = run_state.get("decision") or {}
@@ -8220,14 +8321,18 @@ def command_status(args: argparse.Namespace) -> None:
             "result": "ready",
             "state": str(path),
             "status_path": str(status_path),
-            "pr": {
-                "number": pr["number"],
-                "title": pr["title"],
-                "pr_url": pr["pr_url"],
-                "repo_name": pr["repo_name"],
-                "head_branch": pr["head_branch"],
-                "base_branch": pr["base_branch"],
-            },
+            "pr": (
+                {
+                    "number": pr["number"],
+                    "title": pr["title"],
+                    "pr_url": pr["pr_url"],
+                    "repo_name": pr["repo_name"],
+                    "head_branch": pr["head_branch"],
+                    "base_branch": pr["base_branch"],
+                }
+                if pr is not None
+                else None
+            ),
             "run": {
                 "id": run_state.get("id"),
                 "status": run_state.get("status"),
@@ -8244,6 +8349,7 @@ def command_status(args: argparse.Namespace) -> None:
             "clean_at_head_sha": state.get("clean_at_head_sha"),
             "skip_note": state.get("skip_note"),
             "escalation": state.get("escalation"),
+            "coordinator": state.get("coordinator"),
             "auto_retries": state.get("auto_retries") or {},
             "local_validation": state.get("local_validation") or [],
             "verdicts": {
