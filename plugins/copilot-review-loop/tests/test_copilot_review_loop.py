@@ -1204,7 +1204,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.32")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.33")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -3809,7 +3809,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertFalse(next_arguments.resume)
         self.assertEqual(next_arguments.max_iterations, 5)
 
-    def test_review_only_monitor_persists_findings_without_managed_task(self):
+    def test_post_apply_review_only_monitor_persists_findings_without_managed_task(
+        self,
+    ):
         state_path = self.directory / "review-only-watch-state.json"
         MODULE.save_state(
             state_path,
@@ -3840,6 +3842,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
         arguments = self.arguments(state_path)
         arguments.request_review_only = True
+        arguments.apply_prepared = True
         emitted = []
         with (
             mock.patch.object(MODULE, "command_watch", side_effect=complete_watch),

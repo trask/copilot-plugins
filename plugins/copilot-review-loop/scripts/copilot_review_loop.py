@@ -5058,18 +5058,6 @@ def continue_after_review_request(
     result = watcher.get("result")
     if result == WATCHER_REVIEW_COMMENTS:
         wait_for_fresh_copilot_state(state, watcher)
-        if getattr(args, "apply_prepared", False):
-            emit(
-                {
-                    "result": "review_comments_pending_preparation",
-                    "state": str(state_path),
-                    "head_sha": state["pr"]["head_sha"],
-                    "iterations": state["iterations"],
-                    "comment_ids": watcher.get("comment_ids") or [],
-                    "review_id": watcher.get("review_id"),
-                }
-            )
-            return
         if getattr(args, "request_review_only", False):
             repo_root = Path(state["repo_root"])
             target = parse_target(state["pr"]["pr_url"])
@@ -5098,6 +5086,18 @@ def continue_after_review_request(
                     "review_id": watcher.get("review_id"),
                     "comments": preflight["comments"],
                     "comment_identities": preflight["comment_identities"],
+                }
+            )
+            return
+        if getattr(args, "apply_prepared", False):
+            emit(
+                {
+                    "result": "review_comments_pending_preparation",
+                    "state": str(state_path),
+                    "head_sha": state["pr"]["head_sha"],
+                    "iterations": state["iterations"],
+                    "comment_ids": watcher.get("comment_ids") or [],
+                    "review_id": watcher.get("review_id"),
                 }
             )
             return
