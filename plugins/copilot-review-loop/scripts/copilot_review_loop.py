@@ -3123,6 +3123,81 @@ def validate_terminal_validation_failure_result(
     return error
 
 
+def base_revision_is_ancestor(
+    repo_root: Path, ancestor: str, descendant: str
+) -> bool:
+    process = run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ],
+        check=False,
+    )
+    if process.returncode == 0:
+        return True
+    if process.returncode == 1:
+        return False
+    detail = process.stderr.strip() or process.stdout.strip() or "no output"
+    raise WorkflowError(
+        "could not validate retained Agent Task base ancestry: " + detail
+    )
+
+
+def terminal_result_preflight(
+    result: dict[str, Any],
+    *,
+    preflight: dict[str, Any],
+    repo_root: Path,
+    is_ancestor: Callable[[Path, str, str], bool] | None = None,
+) -> dict[str, Any]:
+    if is_ancestor is None:
+        is_ancestor = base_revision_is_ancestor
+    stored_root = preflight.get("repository_root")
+    expected_pull_request = expected_cloud_pull_request(preflight)
+    result_pull_request = result.get("pull_request")
+    if (
+        not isinstance(stored_root, str)
+        or Path(stored_root).resolve() != repo_root.resolve()
+        or not isinstance(result_pull_request, dict)
+        or set(result_pull_request) != set(expected_pull_request)
+        or any(
+            result_pull_request.get(field) != value
+            for field, value in expected_pull_request.items()
+            if field != "base_sha"
+        )
+    ):
+        raise WorkflowError(
+            "retained Agent Task result does not match the frozen pull request"
+        )
+    task_base = result_pull_request.get("base_sha")
+    retained_base = expected_pull_request["base_sha"]
+    if (
+        not isinstance(task_base, str)
+        or SHA_PATTERN.fullmatch(task_base) is None
+        or not isinstance(retained_base, str)
+        or SHA_PATTERN.fullmatch(retained_base) is None
+        or (
+            task_base != retained_base
+            and not is_ancestor(repo_root, task_base, retained_base)
+        )
+    ):
+        raise WorkflowError(
+            "retained Agent Task base is not an ancestor of the current frozen base"
+        )
+    return {
+        **preflight,
+        "pr": {
+            **preflight["pr"],
+            "base_sha": task_base,
+        },
+    }
+
+
 def validate_terminal_structural_failure_result(
     result: dict[str, Any],
     *,
@@ -5720,9 +5795,14 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 and isinstance(prior_result.get("error"), dict)
                 and prior_result["error"].get("code") == "validation_incomplete"
             ):
-                failure = validate_terminal_validation_failure_result(
+                terminal_preflight = terminal_result_preflight(
                     prior_result,
                     preflight=active["preflight"],
+                    repo_root=repo_root,
+                )
+                failure = validate_terminal_validation_failure_result(
+                    prior_result,
+                    preflight=terminal_preflight,
                     requested_model=requested_model,
                     allow_legacy_policy=True,
                 )
@@ -5757,9 +5837,14 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 and isinstance(prior_result.get("error"), dict)
                 and prior_result["error"].get("code") == "malformed_history"
             ):
-                failure = validate_terminal_no_artifact_result(
+                terminal_preflight = terminal_result_preflight(
                     prior_result,
                     preflight=active["preflight"],
+                    repo_root=repo_root,
+                )
+                failure = validate_terminal_no_artifact_result(
+                    prior_result,
+                    preflight=terminal_preflight,
                     requested_model=requested_model,
                 )
                 active.update(

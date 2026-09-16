@@ -1273,7 +1273,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.36")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.37")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -3937,6 +3937,73 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             result["policy"],
         )
 
+    def test_exact_retained_terminal_results_accept_only_forward_base_ancestry(self):
+        cases = (
+            (
+                NO_ARTIFACT_20074_RESULT,
+                "2515ed4055bb1802c7d21d7a01882b92b6d5c675",
+                MODULE.validate_terminal_no_artifact_result,
+                {},
+            ),
+            (
+                LEGACY_VALIDATION_20050_RESULT,
+                "74090e90d391511a317984deb88c063ddd3ae02d",
+                MODULE.validate_terminal_validation_failure_result,
+                {"allow_legacy_policy": True},
+            ),
+        )
+        for result_path, retained_base, validator, options in cases:
+            result = MODULE.load_agent_task_result(result_path)
+            preflight = self.preflight_for_result(result)
+            task_base = preflight["pr"]["base_sha"]
+            preflight["pr"]["base_sha"] = retained_base
+            is_ancestor = mock.Mock(return_value=True)
+
+            terminal_preflight = MODULE.terminal_result_preflight(
+                result,
+                preflight=preflight,
+                repo_root=self.repo_root,
+                is_ancestor=is_ancestor,
+            )
+            failure = validator(
+                result,
+                preflight=terminal_preflight,
+                requested_model="gpt-5.6-sol",
+                **options,
+            )
+
+            with self.subTest(task_id=result["task"]["id"]):
+                self.assertEqual(result["error"]["code"], failure["code"])
+                self.assertEqual(task_base, terminal_preflight["pr"]["base_sha"])
+                self.assertEqual(retained_base, preflight["pr"]["base_sha"])
+                is_ancestor.assert_called_once_with(
+                    self.repo_root,
+                    task_base,
+                    retained_base,
+                )
+
+        result = MODULE.load_agent_task_result(NO_ARTIFACT_20074_RESULT)
+        preflight = self.preflight_for_result(result)
+        preflight["pr"]["base_sha"] = "f" * 40
+        with self.assertRaisesRegex(MODULE.WorkflowError, "not an ancestor"):
+            MODULE.terminal_result_preflight(
+                result,
+                preflight=preflight,
+                repo_root=self.repo_root,
+                is_ancestor=lambda _root, _ancestor, _descendant: False,
+            )
+
+        mismatched = MODULE.load_agent_task_result(NO_ARTIFACT_20074_RESULT)
+        mismatched["pull_request"]["head_sha"] = "f" * 40
+        with self.assertRaisesRegex(MODULE.WorkflowError, "does not match"):
+            MODULE.terminal_result_preflight(
+                mismatched,
+                preflight=self.preflight_for_result(
+                    MODULE.load_agent_task_result(NO_ARTIFACT_20074_RESULT)
+                ),
+                repo_root=self.repo_root,
+            )
+
     def test_new_completed_no_artifact_failure_records_fresh_retry(self):
         state_path = self.directory / "no-artifact-state.json"
         helper = self.directory / "cloud_task.py"
@@ -3992,6 +4059,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         prompt.write_text("retained prompt\n", encoding="utf-8")
         result = MODULE.load_agent_task_result(NO_ARTIFACT_383_RESULT)
         preflight = self.preflight_for_result(result)
+        preflight["pr"]["base_sha"] = "f" * 40
         MODULE.save_state(
             state_path,
             {
@@ -4023,6 +4091,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             commands.append(command)
             raise RuntimeError("stop after dispatch")
 
+        ancestry = mock.Mock(return_value=True)
         patches = (
             mock.patch.object(MODULE, "require_tools"),
             mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
@@ -4042,6 +4111,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 return_value=preflight["comments"],
             ),
             mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "base_revision_is_ancestor", ancestry),
             mock.patch.object(MODULE.secrets, "token_hex", return_value="new-owner"),
             mock.patch.object(MODULE, "run", side_effect=stop_after_dispatch),
         )
@@ -4059,6 +4129,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--resume", previous["retry_command"])
         self.assertEqual("new-owner", restarted["agent_task"]["run_id"])
         self.assertEqual(1, len(commands))
+        ancestry.assert_called_once_with(
+            self.repo_root,
+            result["pull_request"]["base_sha"],
+            "f" * 40,
+        )
 
         with ExitStack() as stack:
             for patcher in patches:
