@@ -29,6 +29,11 @@ MALFORMED_V5_VALIDATION_RESULT = (
     / "fixtures"
     / "malformed-v5-validation-agent-task-result.json"
 )
+MISSING_FINDING_TRAILER_RESULT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "missing-finding-trailer-agent-task-result.json"
+)
 SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -1011,7 +1016,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "requested_model": "gpt-5.6-sol",
             "policy": {
                 "id": "marketplace-agent-apply-report-worker",
-                "version": 1,
+                "version": 2,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -1147,12 +1152,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_thin_and_version_is_bumped(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-apply-report-worker@1", instructions)
+        self.assertIn("marketplace-agent-apply-report-worker@2", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.15")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.16")
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1329,6 +1334,27 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 remote=remote,
                 paths_by_commit={self.fix: ["src/other.py"]},
             )
+
+    def test_rejects_missing_unknown_or_ambiguous_report_commit_mapping(self):
+        remote = self.remote([self.fix])
+        report = json.loads(self.report([self.fix]))
+        cases = [
+            (None, "fixed comment does not name"),
+            ("9" * 40, "fixed comment does not name"),
+            ([self.fix, "9" * 40], "fixed comment does not name"),
+        ]
+        for commit, message in cases:
+            malformed = copy.deepcopy(report)
+            malformed["comments"][0]["commit"] = commit
+            with self.subTest(commit=commit):
+                with self.assertRaisesRegex(MODULE.WorkflowError, message):
+                    MODULE.validate_copilot_review_report(
+                        json.dumps(malformed),
+                        request_id="request-1",
+                        preflight=self.preflight,
+                        remote=remote,
+                        paths_by_commit={self.fix: ["src/app.py"]},
+                    )
 
     def test_rejects_malformed_mismatched_and_credential_artifacts(self):
         bad = self.result()
@@ -1866,6 +1892,150 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 preflight=preflight,
                 requested_model="gpt-5.6-sol",
             )
+
+    def test_exact_v1_missing_trailer_failure_is_terminal(self):
+        result = MODULE.load_agent_task_result(MISSING_FINDING_TRAILER_RESULT)
+        preflight = copy.deepcopy(self.preflight)
+        preflight["identity"].update(
+            {
+                "branch": "trask-actions-queue-events",
+                "head": "ba1cdf0d96365a55af87e62c2f476245af685bbb",
+            }
+        )
+        preflight["pr"].update(
+            {
+                "number": 377,
+                "pr_url": "https://github.com/open-telemetry/shared-workflows/pull/377",
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_repository": "open-telemetry/shared-workflows",
+                "head_branch": "trask-actions-queue-events",
+                "head_sha": "ba1cdf0d96365a55af87e62c2f476245af685bbb",
+                "base_branch": "main",
+                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+            }
+        )
+
+        failure = MODULE.validate_terminal_structural_failure_result(
+            result,
+            preflight=preflight,
+            requested_model="gpt-5.6-sol",
+        )
+
+        self.assertEqual("malformed_history", failure["code"])
+        self.assertIn("Finding: correlation", failure["message"])
+        result["policy"]["version"] = 2
+        with self.assertRaisesRegex(MODULE.WorkflowError, "mismatched policy"):
+            MODULE.validate_terminal_structural_failure_result(
+                result,
+                preflight=preflight,
+                requested_model="gpt-5.6-sol",
+            )
+        result = MODULE.load_agent_task_result(MISSING_FINDING_TRAILER_RESULT)
+        result["error"]["message"] = "generated history is not linear"
+        with self.assertRaisesRegex(MODULE.WorkflowError, "unexpected error detail"):
+            MODULE.validate_terminal_structural_failure_result(
+                result,
+                preflight=preflight,
+                requested_model="gpt-5.6-sol",
+            )
+
+    def test_exact_v1_missing_trailer_replacement_is_fresh_and_deduplicated(self):
+        state_path = self.directory / "missing-trailer-state.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        preflight = copy.deepcopy(self.preflight)
+        preflight["identity"].update(
+            {
+                "branch": "trask-actions-queue-events",
+                "head": "ba1cdf0d96365a55af87e62c2f476245af685bbb",
+            }
+        )
+        preflight["pr"].update(
+            {
+                "number": 377,
+                "pr_url": "https://github.com/open-telemetry/shared-workflows/pull/377",
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_repository": "open-telemetry/shared-workflows",
+                "head_branch": "trask-actions-queue-events",
+                "head_sha": "ba1cdf0d96365a55af87e62c2f476245af685bbb",
+                "base_branch": "main",
+                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+            }
+        )
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "created_at": MODULE.utc_now(),
+                "iterations": 0,
+                "history": [],
+                "pr": preflight["pr"],
+                "agent_task": {
+                    "run_id": "c664074dfb178b907e5676f64dc39c69",
+                    "status": "failed",
+                    "model": "gpt-5.6-sol",
+                    "task_id": "bbaa0bb2-84b6-4993-8dba-c8fa9e6f1a75",
+                    "preflight": preflight,
+                    "result_file": str(MISSING_FINDING_TRAILER_RESULT),
+                    "recovery_command": "must-not-survive",
+                },
+            },
+        )
+        args = self.arguments(state_path)
+        args.target = "open-telemetry/shared-workflows#377"
+        commands = []
+
+        def stop_after_dispatch(command, **_kwargs):
+            commands.append(command)
+            raise RuntimeError("stop after dispatch")
+
+        common = (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target(args.target),
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_stable_review_preflight",
+                return_value=preflight,
+            ),
+            mock.patch.object(
+                MODULE,
+                "require_live_comments",
+                return_value=preflight["comments"],
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE.secrets, "token_hex", return_value="new-owner"),
+            mock.patch.object(MODULE, "run", side_effect=stop_after_dispatch),
+        )
+        with ExitStack() as stack:
+            for patcher in common:
+                stack.enter_context(patcher)
+            with self.assertRaisesRegex(RuntimeError, "stop after dispatch"):
+                MODULE.command_agent_task(args)
+
+        restarted = MODULE.load_state(state_path)
+        self.assertEqual(1, len(restarted["managed_task_history"]))
+        previous = restarted["managed_task_history"][0]
+        self.assertEqual("terminal_unusable", previous["task_id_status"])
+        self.assertNotIn("recovery_command", previous)
+        self.assertNotIn("--resume", previous["retry_command"])
+        self.assertEqual("new-owner", restarted["agent_task"]["run_id"])
+        self.assertIn(
+            "marketplace-agent-apply-report-worker@2",
+            commands[0],
+        )
+        self.assertNotIn("--resume-apply-with-report", commands[0])
+
+        with ExitStack() as stack:
+            for patcher in common:
+                stack.enter_context(patcher)
+            with self.assertRaisesRegex(MODULE.WorkflowError, "unfinished Agent Task"):
+                MODULE.command_agent_task(args)
+        self.assertEqual(1, len(commands))
 
     def test_task_creation_failure_records_fresh_retry_and_replaces_legacy_state(self):
         state_path = self.directory / "cca-disabled-state.json"

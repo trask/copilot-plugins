@@ -45,7 +45,7 @@ Use `--model sol` unless the caller selected another supported model. The helper
 
 The local `loop` process owns check polling, bounded exponential backoff with jitter, stabilization, debounce, reruns, deduplication, iteration budgets, and restart state. It waits until the current-head check set is terminal and unchanged before dispatch. Every new stable failing snapshot launches exactly one managed GitHub Agent Task through the internal `agent-task` primitive. The coordinator pins the open pull request, local branch, head, base, authenticated viewer, complete check rollup, failing logs and their digests, model, policy, and an allowance of exactly one iteration before dispatch.
 
-The command discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies its pinned SHA-256, and invokes it with `--result-file`, `--policy marketplace-agent-apply-report-worker@1`, and absolute prompt and result paths outside the repository.
+The command discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies its pinned SHA-256, and invokes it with `--result-file`, `--policy marketplace-agent-apply-report-worker@2`, and absolute prompt and result paths outside the repository.
 
 Never use Cloud Sandboxes or a local fallback. Never pass `custom_agent`. Never pass credentials. Never read helper stdout as a result. Never run `gh pr diff`, a repository command, a formatter, a build, a test, or a probe.
 

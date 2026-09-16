@@ -108,14 +108,14 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "83e51637411640c4022130e448face835e21a552c558e7bd8dccc952283708f2"
+    "1200143af74493935e8655e993a7de9187357e770b3f540051a3fbde5658d9d4"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
 CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
-AGENT_TASK_POLICY = "marketplace-agent-apply-report-worker@1"
+AGENT_TASK_POLICY = "marketplace-agent-apply-report-worker@2"
 AGENT_TASK_POLICY_SHA256 = (
-    "ea61b3edb7eb56b262d80eccb3b6a7e20a2167d5ca4381db66b7663bca33dd78"
+    "411a9ba9a0931d40c685c6233639b15c31e0d6daa4b29706527424016367cad2"
 )
 LEGACY_AGENT_TASK_POLICY_V4 = {
     "id": "marketplace-agent-worker",
@@ -126,6 +126,11 @@ LEGACY_AGENT_TASK_POLICY_V5 = {
     "id": "marketplace-agent-worker",
     "version": 5,
     "sha256": "a9a1592c15abb39c077c5af0e23b46b7b0e3fc3d747e02f41975813130b0c096",
+}
+LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V1 = {
+    "id": "marketplace-agent-apply-report-worker",
+    "version": 1,
+    "sha256": "ea61b3edb7eb56b262d80eccb3b6a7e20a2167d5ca4381db66b7663bca33dd78",
 }
 AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
@@ -2736,7 +2741,7 @@ def validate_structural_recovery_result(
         or result.get("policy")
         != {
             "id": "marketplace-agent-apply-report-worker",
-            "version": 1,
+            "version": 2,
             "sha256": AGENT_TASK_POLICY_SHA256,
         }
         or result.get("repository") != {"name_with_owner": pr["repo_name"]}
@@ -2817,7 +2822,7 @@ def validate_task_creation_failure_result(
 ) -> dict[str, str]:
     expected_policy = {
         "id": "marketplace-agent-apply-report-worker",
-        "version": 1,
+        "version": 2,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     task = result.get("task")
@@ -2987,6 +2992,85 @@ def validate_terminal_validation_failure_result(
     return error
 
 
+def validate_terminal_structural_failure_result(
+    result: dict[str, Any],
+    *,
+    preflight: dict[str, Any],
+    requested_model: str,
+) -> dict[str, str]:
+    task = result.get("task")
+    generated = result.get("generated")
+    application = result.get("application")
+    report = result.get("report")
+    attestation = result.get("attestation")
+    error = result.get("error")
+    pr = preflight["pr"]
+    if result.get("policy") != LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V1:
+        raise WorkflowError(
+            "terminal structural Agent Task failure has mismatched policy"
+        )
+    if (
+        result.get("schema") != AGENT_TASK_RESULT_SCHEMA
+        or result.get("status") != "error"
+        or result.get("mode") != "apply_with_report"
+        or result.get("requested_model") != requested_model
+        or result.get("repository") != {"name_with_owner": pr["repo_name"]}
+        or result.get("pull_request") != expected_cloud_pull_request(preflight)
+        or not isinstance(task, dict)
+        or set(task) != {"id", "url", "state", "base_ref", "base_sha"}
+        or not isinstance(task.get("id"), str)
+        or not task["id"]
+        or task.get("state") != "completed"
+        or task.get("base_ref") != pr["head_branch"]
+        or task.get("base_sha") != pr["head_sha"]
+        or not isinstance(generated, dict)
+        or set(generated) != {"branch", "head_sha", "commits"}
+        or not isinstance(generated.get("branch"), str)
+        or not generated["branch"]
+        or not isinstance(generated.get("head_sha"), str)
+        or SHA_PATTERN.fullmatch(generated["head_sha"]) is None
+        or not isinstance(generated.get("commits"), list)
+        or not generated["commits"]
+        or any(
+            not isinstance(commit, str) or SHA_PATTERN.fullmatch(commit) is None
+            for commit in generated["commits"]
+        )
+        or len(set(generated["commits"])) != len(generated["commits"])
+        or application
+        != {"status": "not_applied", "final_local_head": pr["head_sha"]}
+        or not isinstance(report, dict)
+        or set(report) != {"path", "commit", "sha256"}
+        or not isinstance(report.get("path"), str)
+        or REPORT_PATH_PATTERN.fullmatch(report["path"]) is None
+        or report.get("commit") != generated["head_sha"]
+        or not isinstance(report.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", report["sha256"]) is None
+        or attestation
+        != {"kind": "dispatcher_structural", "structural_complete": True}
+        or not isinstance(error, dict)
+        or set(error) != {"code", "message"}
+        or error.get("code") != "malformed_history"
+        or not isinstance(error.get("message"), str)
+        or not error["message"]
+    ):
+        raise WorkflowError(
+            "terminal structural Agent Task failure has malformed identity"
+        )
+    message_match = re.fullmatch(
+        r"fix commit ([0-9a-f]{40}) must contain exactly one nonempty "
+        r"Finding: correlation",
+        error["message"],
+    )
+    if (
+        message_match is None
+        or message_match.group(1) not in generated["commits"]
+    ):
+        raise WorkflowError(
+            "terminal structural Agent Task failure has unexpected error detail"
+        )
+    return error
+
+
 def validate_success_result(
     result: dict[str, Any],
     *,
@@ -2995,7 +3079,7 @@ def validate_success_result(
 ) -> dict[str, Any]:
     expected_policy = {
         "id": "marketplace-agent-apply-report-worker",
-        "version": 1,
+        "version": 2,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     if (
@@ -4137,6 +4221,38 @@ def command_agent_task(args: argparse.Namespace) -> None:
                         "generated": prior_result["generated"],
                         "report": prior_result["report"],
                         "worker_receipt": prior_result.get("worker_receipt"),
+                        "status": "failed",
+                        "task_id": prior_task["id"],
+                        "task_id_status": "terminal_unusable",
+                        "error": failure,
+                        "retry_command": agent_task_retry_command(
+                            args,
+                            target=target["pr_url"],
+                            repo_root=repo_root,
+                            state_path=state_path,
+                        ),
+                    }
+                )
+                active.pop("recovery_command", None)
+                save_state(state_path, existing)
+            elif (
+                prior_task.get("state") == "completed"
+                and prior_result.get("policy")
+                == LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V1
+                and isinstance(prior_result.get("error"), dict)
+                and prior_result["error"].get("code") == "malformed_history"
+            ):
+                failure = validate_terminal_structural_failure_result(
+                    prior_result,
+                    preflight=active["preflight"],
+                    requested_model=requested_model,
+                )
+                active.update(
+                    {
+                        "task": prior_result["task"],
+                        "generated": prior_result["generated"],
+                        "report": prior_result["report"],
+                        "attestation": prior_result["attestation"],
                         "status": "failed",
                         "task_id": prior_task["id"],
                         "task_id_status": "terminal_unusable",

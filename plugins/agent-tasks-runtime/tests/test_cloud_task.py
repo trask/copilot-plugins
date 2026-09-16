@@ -103,6 +103,7 @@ class PolicyPromptTest(unittest.TestCase):
                     MODULE.CloudError,
                     f"unknown policy 'marketplace-agent-worker@{version}'; expected "
                     "one of marketplace-agent-apply-report-worker@1, "
+                    "marketplace-agent-apply-report-worker@2, "
                     "marketplace-agent-report-worker@1, "
                     "marketplace-agent-worker@5",
                 ) as raised:
@@ -120,6 +121,24 @@ class PolicyPromptTest(unittest.TestCase):
                     )
 
                 self.assertEqual(raised.exception.code, "policy_unknown")
+
+    def test_structural_v1_cannot_start_a_new_task(self):
+        result_path = str((Path.cwd().parent / "result.json").resolve())
+
+        with self.assertRaisesRegex(MODULE.CloudError, "available only for task recovery"):
+            MODULE.parse_args(
+                [
+                    "--apply-with-report",
+                    "--pr",
+                    "owner/repo#1",
+                    "--prompt-file",
+                    str(SCRIPT),
+                    "--result-file",
+                    result_path,
+                    "--policy",
+                    MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR,
+                ]
+            )
 
     def test_report_policy_requests_one_markdown_artifact(self):
         report_path = ".github/agent-task-reports/request-1.md"
@@ -206,10 +225,12 @@ class PolicyPromptTest(unittest.TestCase):
         prompt = payload["prompt"]
 
         self.assertIn(
-            "Policy: marketplace-agent-apply-report-worker@1",
+            "Policy: marketplace-agent-apply-report-worker@2",
             prompt,
         )
         self.assertIn("zero or more linear commits", prompt)
+        self.assertIn("Record finding-to-commit and changed-path correlation only", prompt)
+        self.assertNotIn("`Finding: <identifier>`", prompt)
         self.assertIn("exactly one final single-parent report commit", prompt)
         self.assertIn(f"only changed path must be `{report_path}`", prompt)
         self.assertIn("untrusted inert evidence", prompt)
@@ -349,6 +370,36 @@ class InterruptedApplyRecoveryTest(unittest.TestCase):
             worker_receipt=None,
             policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
         )
+
+    def test_structural_v1_recovery_cannot_cross_policy_versions(self):
+        prompt = MODULE.build_apply_report_policy_prompt(
+            MODULE.build_pr_prompt(
+                MODULE.build_apply_with_report_prompt(
+                    "Review the pull request.",
+                    self.report_path,
+                    None,
+                ),
+                self.pull_request,
+            ),
+            report_path=self.report_path,
+            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR,
+        )
+        task = self.mutated_task(prompt=prompt)
+
+        self.validate(
+            task,
+            worker_receipt=None,
+            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR,
+        )
+        with self.assertRaisesRegex(
+            MODULE.CloudError,
+            "does not prove the original apply-with-report policy",
+        ):
+            self.validate(
+                task,
+                worker_receipt=None,
+                policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+            )
 
     def test_parse_requires_complete_recovery_identity(self):
         result_path = str((Path.cwd().parent / "result.json").resolve())
@@ -984,6 +1035,7 @@ class DispatcherFinalizationTest(unittest.TestCase):
             [self.code_commit, self.artifact_commit],
             [".github/agent-task-reports/request-1.md"],
         )
+        repository.require_correlated_fix_commits.assert_not_called()
         envelope = result.as_dict()
         self.assertNotIn("worker_receipt", envelope)
         self.assertNotIn("validation", envelope)
@@ -993,6 +1045,26 @@ class DispatcherFinalizationTest(unittest.TestCase):
                 "kind": "dispatcher_structural",
                 "structural_complete": True,
             },
+        )
+
+    def test_structural_v1_keeps_commit_trailer_correlation(self):
+        repository = self.repository()
+        options = MODULE.Options(
+            report=False,
+            model="gpt-5.6-sol",
+            prompt="Review the pull request.",
+            pull_request=MODULE.PrReference(7, "owner/repo", "owner/repo#7"),
+            apply_with_report=True,
+            result_file=Path("C:/state/result.json"),
+            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR,
+            prompt_file=Path("C:/state/prompt.txt"),
+        )
+
+        self.execute(repository, options=options)
+
+        repository.require_correlated_fix_commits.assert_called_once_with(
+            self.root,
+            (self.code_commit,),
         )
 
     def test_empty_markdown_report_fails_closed(self):

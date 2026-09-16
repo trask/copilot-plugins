@@ -45,14 +45,14 @@ GITHUB_PR_DIFF = "github_pr_diff"
 CUMULATIVE_GIT_DIFF = "cumulative_git_diff"
 BARE_TARGET_PATTERN = re.compile(r"^#?(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "83e51637411640c4022130e448face835e21a552c558e7bd8dccc952283708f2"
+    "1200143af74493935e8655e993a7de9187357e770b3f540051a3fbde5658d9d4"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
 CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
-AGENT_TASK_POLICY = "marketplace-agent-apply-report-worker@1"
+AGENT_TASK_POLICY = "marketplace-agent-apply-report-worker@2"
 AGENT_TASK_POLICY_SHA256 = (
-    "ea61b3edb7eb56b262d80eccb3b6a7e20a2167d5ca4381db66b7663bca33dd78"
+    "411a9ba9a0931d40c685c6233639b15c31e0d6daa4b29706527424016367cad2"
 )
 AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
@@ -2675,7 +2675,7 @@ def validate_success_result(
 ) -> dict[str, Any]:
     expected_policy = {
         "id": "marketplace-agent-apply-report-worker",
-        "version": 1,
+        "version": 2,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     task = result.get("task")
@@ -3178,7 +3178,7 @@ def validate_recovery_result_identity(
 ) -> bool:
     expected_policy = {
         "id": "marketplace-agent-apply-report-worker",
-        "version": 1,
+        "version": 2,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     if (

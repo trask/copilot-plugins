@@ -114,7 +114,39 @@ MARKETPLACE_REPORT_POLICY_SELECTOR = (
     f"{MARKETPLACE_REPORT_POLICY_ID}@{MARKETPLACE_REPORT_POLICY_VERSION}"
 )
 MARKETPLACE_APPLY_REPORT_POLICY_ID = "marketplace-agent-apply-report-worker"
-MARKETPLACE_APPLY_REPORT_POLICY_VERSION = 1
+MARKETPLACE_APPLY_REPORT_POLICY_V1_VERSION = 1
+MARKETPLACE_APPLY_REPORT_POLICY_V1_SPEC = {
+    "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
+    "version": MARKETPLACE_APPLY_REPORT_POLICY_V1_VERSION,
+    "execution_backend": "github-agent-tasks-rest",
+    "authentication": "local-gh-api",
+    "custom_agent": False,
+    "local_fallback": False,
+    "mode": "apply_with_report",
+    "require_exact_task_identity": True,
+    "require_unchanged_pr_head": True,
+    "require_unchanged_local_identity": True,
+    "require_linear_generated_history": True,
+    "require_expected_paths_only": True,
+    "require_fix_commit_correlation": True,
+    "human_report": "nonempty-utf8-markdown",
+    "worker_validation": False,
+    "dispatcher_generated_commit_order": True,
+    "dispatcher_structural_attestation": True,
+}
+MARKETPLACE_APPLY_REPORT_POLICY_V1_HASH = hashlib.sha256(
+    json.dumps(
+        MARKETPLACE_APPLY_REPORT_POLICY_V1_SPEC,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+).hexdigest()
+MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR = (
+    f"{MARKETPLACE_APPLY_REPORT_POLICY_ID}@"
+    f"{MARKETPLACE_APPLY_REPORT_POLICY_V1_VERSION}"
+)
+MARKETPLACE_APPLY_REPORT_POLICY_VERSION = 2
 MARKETPLACE_APPLY_REPORT_POLICY_SPEC = {
     "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
     "version": MARKETPLACE_APPLY_REPORT_POLICY_VERSION,
@@ -128,7 +160,7 @@ MARKETPLACE_APPLY_REPORT_POLICY_SPEC = {
     "require_unchanged_local_identity": True,
     "require_linear_generated_history": True,
     "require_expected_paths_only": True,
-    "require_fix_commit_correlation": True,
+    "fix_commit_correlation": "consumer-validated-report",
     "human_report": "nonempty-utf8-markdown",
     "worker_validation": False,
     "dispatcher_generated_commit_order": True,
@@ -146,6 +178,10 @@ MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR = (
     f"{MARKETPLACE_APPLY_REPORT_POLICY_ID}@"
     f"{MARKETPLACE_APPLY_REPORT_POLICY_VERSION}"
 )
+MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS = {
+    MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR,
+    MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+}
 FIX_COMMIT_CORRELATION_FIELD = "Finding"
 
 
@@ -659,7 +695,7 @@ def parse_args(args: Sequence[str]) -> Options:
             "result_file_required",
         )
     known_policies = {
-        MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+        *MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
         MARKETPLACE_POLICY_SELECTOR,
         MARKETPLACE_REPORT_POLICY_SELECTOR,
     }
@@ -668,6 +704,14 @@ def parse_args(args: Sequence[str]) -> Options:
             f"unknown policy {policy!r}; expected one of "
             f"{', '.join(sorted(known_policies))}",
             "policy_unknown",
+        )
+    if (
+        policy == MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR
+        and not resume_apply_with_report
+    ):
+        raise CloudError(
+            f"{policy} is immutable and available only for task recovery",
+            "policy_rejected",
         )
     if policy == MARKETPLACE_REPORT_POLICY_SELECTOR and (
         not report
@@ -688,7 +732,7 @@ def parse_args(args: Sequence[str]) -> Options:
             "validation-receipt options",
             "policy_rejected",
         )
-    if policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR and (
+    if policy in MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS and (
         not apply_with_report
         or pull_request is None
         or (prompt_file is None and not resume_apply_with_report)
@@ -697,16 +741,13 @@ def parse_args(args: Sequence[str]) -> Options:
         or monitor_only
     ):
         raise CloudError(
-            f"{MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR} requires "
+            f"{policy} requires "
             "--apply-with-report, --pr, --prompt-file, and --result-file",
             "policy_rejected",
         )
     if allow_merged_pr and (
         policy
-        not in {
-            MARKETPLACE_POLICY_SELECTOR,
-            MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
-        }
+        not in {MARKETPLACE_POLICY_SELECTOR, *MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS}
         or result_file is None
         or prompt_file is None
     ):
@@ -780,14 +821,14 @@ def parse_args(args: Sequence[str]) -> Options:
             pull_request is None
             or task_id is None
             or (
-                policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+                policy in MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS
                 and request_id is None
             )
             or result_file is None
             or policy
             not in {
                 MARKETPLACE_POLICY_SELECTOR,
-                MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+                *MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
             }
             or (
                 policy == MARKETPLACE_POLICY_SELECTOR
@@ -1020,7 +1061,7 @@ def read_apply_result(
     *,
     policy: str | None,
 ) -> dict[str, object]:
-    if policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+    if policy in MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS:
         return read_structural_apply_result(path)
     return read_legacy_apply_result(path)
 
@@ -1607,10 +1648,11 @@ def validate_interrupted_apply_task(
             repository=repository,
             pull_request=pull_request,
         )
-    elif policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+    elif policy in MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS:
         expected_policy_suffix = build_apply_report_policy_prompt(
             "",
             report_path=report_path,
+            policy=policy,
         )
     else:
         raise AssertionError("unsupported interrupted recovery policy")
@@ -1656,6 +1698,12 @@ def policy_metadata(options: Options) -> dict[str, object] | None:
             "version": MARKETPLACE_REPORT_POLICY_VERSION,
             "sha256": MARKETPLACE_REPORT_POLICY_HASH,
         }
+    if options.policy == MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR:
+        return {
+            "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
+            "version": MARKETPLACE_APPLY_REPORT_POLICY_V1_VERSION,
+            "sha256": MARKETPLACE_APPLY_REPORT_POLICY_V1_HASH,
+        }
     if options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
         return {
             "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
@@ -1692,7 +1740,7 @@ def validate_policy_before_post(
     result_path: Path,
 ) -> None:
     if options.policy not in {
-        MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+        *MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
         MARKETPLACE_POLICY_SELECTOR,
         MARKETPLACE_REPORT_POLICY_SELECTOR,
     }:
@@ -2101,20 +2149,40 @@ def build_report_policy_prompt(prompt: str, *, report_path: str) -> str:
     )
 
 
-def build_apply_report_policy_prompt(prompt: str, *, report_path: str) -> str:
+def build_apply_report_policy_prompt(
+    prompt: str,
+    *,
+    report_path: str,
+    policy: str = MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+) -> str:
+    if policy == MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR:
+        policy_hash = MARKETPLACE_APPLY_REPORT_POLICY_V1_HASH
+        correlation = (
+            "Every code commit must have a concise normal message with one nonempty "
+            "`Finding: <identifier>` line, unique among the generated code commits. "
+        )
+    elif policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+        policy_hash = MARKETPLACE_APPLY_REPORT_POLICY_HASH
+        correlation = (
+            "Do not add machine-readable correlation trailers to commit messages. "
+            "Record finding-to-commit and changed-path correlation only in the "
+            "assigned report. The local workflow coordinator validates that mapping "
+            "against the exact request and generated history before publication. "
+        )
+    else:
+        raise CloudError(f"unsupported structural apply policy {policy!r}")
     return (
         f"{prompt.rstrip()}\n\n"
         f"{POLICY_MARKER}\n"
-        f"Policy: {MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR}\n"
-        f"Policy SHA-256: {MARKETPLACE_APPLY_REPORT_POLICY_HASH}\n"
+        f"Policy: {policy}\n"
+        f"Policy SHA-256: {policy_hash}\n"
         "Authentication stays in the local dispatcher. Do not request, read, "
         "print, persist, or transmit credentials, tokens, keys, cookies, or "
         "authorization headers. Do not select or invoke a custom_agent. Do not "
         "use a local-execution fallback.\n"
-        "Put code changes in zero or more linear commits. Every code commit "
-        "must have a concise normal message with one nonempty "
-        "`Finding: <identifier>` line, unique among the generated code "
-        "commits. Then create exactly one final single-parent report commit. "
+        "Put code changes in zero or more linear commits. "
+        f"{correlation}"
+        "Then create exactly one final single-parent report commit. "
         f"Its only changed path must be `{report_path}`. Write the complete "
         "report directly to that path as nonempty UTF-8 Markdown. Do not "
         "create, stage, or commit validation, alternate report, or scratch "
@@ -3501,12 +3569,16 @@ def task_payload(
         if report_path is None:
             raise AssertionError("report policy mode did not allocate a report path")
         prompt = build_report_policy_prompt(prompt, report_path=report_path)
-    elif options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+    elif options.policy in MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS:
         if report_path is None:
             raise AssertionError(
                 "apply-report policy mode did not allocate a report path"
             )
-        prompt = build_apply_report_policy_prompt(prompt, report_path=report_path)
+        prompt = build_apply_report_policy_prompt(
+            prompt,
+            report_path=report_path,
+            policy=options.policy,
+        )
     payload: dict[str, object] = {
         "prompt": prompt,
         "model": options.model,
@@ -3788,7 +3860,7 @@ def execute(
             if options.policy
             in {
                 MARKETPLACE_REPORT_POLICY_SELECTOR,
-                MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+                *MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
             }
             else RESULT_SCHEMA_VERSION
         )
@@ -3829,7 +3901,7 @@ def execute(
     elif options.worker_receipt is not None:
         request_id = Path(options.worker_receipt).stem
     elif (
-        options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+        options.policy in MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS
         and options.prior_result is not None
         and isinstance(options.prior_result.get("report"), dict)
         and isinstance(options.prior_result["report"].get("path"), str)
@@ -3955,7 +4027,7 @@ def execute(
                 and options.policy
                 in {
                     MARKETPLACE_REPORT_POLICY_SELECTOR,
-                    MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+                    *MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
                 }
             ):
                 result.report_path = report_path
@@ -4066,7 +4138,7 @@ def execute(
             options.policy
             in {
                 MARKETPLACE_REPORT_POLICY_SELECTOR,
-                MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+                *MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
             }
             and report_path is None
         ):
@@ -4107,7 +4179,7 @@ def execute(
             if options.policy
             in {
                 MARKETPLACE_REPORT_POLICY_SELECTOR,
-                MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+                *MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
             }
             else [receipt]
         )
@@ -4177,7 +4249,7 @@ def execute(
         if options.allow_merged_pr and options.prior_result is not None:
             if report_path is None or report_digest is None:
                 raise AssertionError("historical resume did not retrieve its report")
-            if options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+            if options.policy in MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS:
                 validate_prior_structural_generated_result(
                     options.prior_result,
                     generated_branch=refs.head,
@@ -4206,7 +4278,7 @@ def execute(
         if result is not None:
             if options.policy in {
                 MARKETPLACE_REPORT_POLICY_SELECTOR,
-                MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+                *MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
             }:
                 result.structural_complete = True
             else:
@@ -4272,9 +4344,10 @@ def execute(
             report = policy_report
             if report is None:
                 raise AssertionError("policy mode did not retrieve its report")
-            git.require_correlated_fix_commits(
-                snapshot.root, history.code_commits
-            )
+            if options.policy != MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+                git.require_correlated_fix_commits(
+                    snapshot.root, history.code_commits
+                )
         else:
             try:
                 history = git.report_history(
@@ -4473,6 +4546,13 @@ def main(
             "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
             "version": MARKETPLACE_APPLY_REPORT_POLICY_VERSION,
             "sha256": MARKETPLACE_APPLY_REPORT_POLICY_HASH,
+        }
+    elif MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR in args:
+        result.schema_version = REPORT_RESULT_SCHEMA_VERSION
+        result.policy = {
+            "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
+            "version": MARKETPLACE_APPLY_REPORT_POLICY_V1_VERSION,
+            "sha256": MARKETPLACE_APPLY_REPORT_POLICY_V1_HASH,
         }
     elif MARKETPLACE_REPORT_POLICY_SELECTOR in args:
         result.schema_version = REPORT_RESULT_SCHEMA_VERSION
