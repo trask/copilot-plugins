@@ -1,4 +1,5 @@
 from contextlib import redirect_stdout
+import copy
 import importlib.util
 from io import StringIO
 import json
@@ -863,12 +864,13 @@ class SweepTest(unittest.TestCase):
             self.inspect(entry, _target, head, base_sha) for entry in MODULE.STAGES
         ]
 
-    def execute(self):
+    def execute(self, *, conflict_strategy="auto"):
         return MODULE.run_pipeline(
             target(),
             self.repo,
             models=MODULE.stage_models(None),
             effort="high",
+            conflict_strategy=conflict_strategy,
             report=self.events.append,
         )
 
@@ -879,6 +881,96 @@ class SweepTest(unittest.TestCase):
         self.assertEqual(
             [(stage, 1) for stage in MODULE.STAGE_NAMES],
             self.launched,
+        )
+
+    def test_explicit_merge_replaces_exact_prior_auto_preflight_failure(self):
+        original = self.inspect
+        inspections = 0
+
+        def retained_failure(entry, *arguments):
+            nonlocal inspections
+            if entry["stage"] == MODULE.STAGE_CONFLICT and inspections == 0:
+                inspections += 1
+                return {
+                    **uncleared_stage(entry["stage"]),
+                    "status": {
+                        "agent_task": {
+                            "status": "failed",
+                            "task_id": None,
+                            "task_id_status": "not_created",
+                            "requested_strategy": "auto",
+                            "error": {
+                                "code": "conflict_preflight_failed",
+                                "message": (
+                                    "repository merge settings and dependent pull "
+                                    "requests leave no supported conflict strategy"
+                                ),
+                            },
+                        }
+                    },
+                }
+            return original(entry, *arguments)
+
+        MODULE.inspect_stage.side_effect = retained_failure
+
+        result = self.execute(conflict_strategy="merge")
+
+        self.assertEqual("complete", result["result"])
+        self.assertEqual(
+            [(stage, 1) for stage in MODULE.STAGE_NAMES],
+            self.launched,
+        )
+
+    def test_retained_preflight_replacement_stays_exact_and_prelaunch_only(self):
+        stage_result = {
+            **uncleared_stage(MODULE.STAGE_CONFLICT),
+            "status": {
+                "agent_task": {
+                    "status": "failed",
+                    "task_id": None,
+                    "task_id_status": "not_created",
+                    "requested_strategy": "auto",
+                    "error": {
+                        "code": "conflict_preflight_failed",
+                        "message": (
+                            "repository merge settings and dependent pull requests "
+                            "leave no supported conflict strategy"
+                        ),
+                    },
+                }
+            },
+        }
+        self.assertIsNone(
+            MODULE.stage_blocker(
+                stage_result,
+                after_launch=False,
+                conflict_strategy="merge",
+            )
+        )
+        for after_launch, strategy in (
+            (True, "merge"),
+            (False, "auto"),
+            (False, "rebase"),
+        ):
+            with self.subTest(after_launch=after_launch, strategy=strategy):
+                self.assertEqual(
+                    "stage_recovery_required",
+                    MODULE.stage_blocker(
+                        stage_result,
+                        after_launch=after_launch,
+                        conflict_strategy=strategy,
+                    )[0],
+                )
+
+        changed = copy.deepcopy(stage_result)
+        changed["status"]["agent_task"]["error"]["message"] += "."
+        self.assertEqual(
+            "stage_recovery_required",
+            MODULE.stage_blocker(
+                changed,
+                after_launch=False,
+                conflict_strategy="merge",
+            )[0],
         )
 
     def test_reports_sweep_and_stage_progress_in_order(self):

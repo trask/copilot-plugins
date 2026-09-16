@@ -1437,7 +1437,10 @@ def stage_status_summary(payload: Any) -> dict[str, Any]:
 
 
 def stage_blocker(
-    stage_result: dict[str, Any], *, after_launch: bool
+    stage_result: dict[str, Any],
+    *,
+    after_launch: bool,
+    conflict_strategy: str = "auto",
 ) -> tuple[str, str] | None:
     reason = stage_result.get("reason")
     state_path = stage_result.get("status_state")
@@ -1479,6 +1482,24 @@ def stage_blocker(
             ),
         )
     if task_state in RECOVERY_TASK_STATES:
+        error = task.get("error") if isinstance(task, dict) else None
+        if (
+            not after_launch
+            and stage_result.get("stage") == STAGE_CONFLICT
+            and conflict_strategy == "merge"
+            and task_state == "failed"
+            and task.get("task_id_status") == "not_created"
+            and task.get("requested_strategy") == "auto"
+            and error
+            == {
+                "code": "conflict_preflight_failed",
+                "message": (
+                    "repository merge settings and dependent pull requests leave "
+                    "no supported conflict strategy"
+                ),
+            }
+        ):
+            return None
         detail = task.get("error")
         if isinstance(detail, dict):
             code = detail.get("code")

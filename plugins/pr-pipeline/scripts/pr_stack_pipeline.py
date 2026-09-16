@@ -1829,7 +1829,11 @@ class StackPipeline:
                 request["head_sha"],
                 request.get("base_sha"),
             )
-            blocker = common.stage_blocker(stage_result, after_launch=False)
+            blocker = common.stage_blocker(
+                stage_result,
+                after_launch=False,
+                conflict_strategy=self.conflict_strategy,
+            )
             if blocker is None:
                 continue
             reason, detail = blocker
@@ -1953,7 +1957,11 @@ class StackPipeline:
         )
         self.remove_active_worker(worker)
         stage_result = self.current_stage_result(request)
-        blocker = common.stage_blocker(stage_result, after_launch=True)
+        blocker = common.stage_blocker(
+            stage_result,
+            after_launch=True,
+            conflict_strategy=self.conflict_strategy,
+        )
         if blocker is None and stage_result.get("control_reason") == "topology_changed":
             blocker = ("topology_changed", stage_result["detail"])
         if (

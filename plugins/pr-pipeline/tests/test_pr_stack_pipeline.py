@@ -1026,6 +1026,35 @@ class StackRunTest(StackFixture):
             request["arguments"],
         )
 
+    def test_explicit_merge_launches_past_exact_prior_auto_preflight_failure(self):
+        pipeline = self.pipeline(conflict_strategy="merge")
+        member = self.stack["members"][0]
+        self.inspect_sequences[(member["number"], MODULE.STAGE_CONFLICT)] = [
+            {
+                "status": {
+                    "agent_task": {
+                        "status": "failed",
+                        "task_id": None,
+                        "task_id_status": "not_created",
+                        "requested_strategy": "auto",
+                        "error": {
+                            "code": "conflict_preflight_failed",
+                            "message": (
+                                "repository merge settings and dependent pull requests "
+                                "leave no supported conflict strategy"
+                            ),
+                        },
+                    }
+                }
+            }
+        ]
+        request = pipeline.request_for(member, MODULE.STAGE_CONFLICT, 1)
+
+        launched = pipeline.dispatch([request], MODULE.STAGE_CONFLICT, 1)
+
+        self.assertIsNone(launched["stopped"])
+        self.assertEqual(1, len(launched["workers"]))
+
     # Push propagation ---------------------------------------------------
 
     def test_an_accepted_push_is_propagated_while_the_worker_runs(self):

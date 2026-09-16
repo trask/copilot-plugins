@@ -35,6 +35,8 @@ Append the user's target exactly as given. Omit it only when the user omitted it
 
 When the user explicitly chooses conflict strategy `merge` or `rebase`, append `--conflict-strategy merge` or `--conflict-strategy rebase` to `start`. Preserve that choice exactly. Otherwise omit the option and let the helper use `auto`.
 
+An explicit `merge` can replace one retained conflict preflight failure only when no Agent Task was created and the old `auto` strategy failed on the obsolete repository-method gate. The resolver preserves that owner in history before the new preflight. Every other recovery state remains a blocker.
+
 Run `start` synchronously exactly once. It returns `pipeline_launched` with a canonical target, `run_id`, and cursor. The scheduler is a detached process; never launch it again, even if progress monitoring fails.
 
 After `start`, repeatedly run `watch` synchronously with the returned canonical target, `run_id`, latest cursor, and `--wait-seconds 300`:

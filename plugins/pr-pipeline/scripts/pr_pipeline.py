@@ -640,7 +640,11 @@ def run_pipeline(
                 runs.append(record)
                 report_event(report, "stage_finished", run_id=run_id, **record)
                 continue
-            blocker = stage_blocker(before, after_launch=False)
+            blocker = stage_blocker(
+                before,
+                after_launch=False,
+                conflict_strategy=conflict_strategy,
+            )
             if blocker is not None:
                 reason, detail = blocker
                 return blocked_result(
@@ -800,7 +804,11 @@ def run_pipeline(
             )
             runs.append(record)
             report_event(report, "stage_finished", run_id=run_id, **record)
-            blocker = stage_blocker(after, after_launch=True)
+            blocker = stage_blocker(
+                after,
+                after_launch=True,
+                conflict_strategy=conflict_strategy,
+            )
             if blocker is not None:
                 reason, detail = blocker
                 return blocked_result(
