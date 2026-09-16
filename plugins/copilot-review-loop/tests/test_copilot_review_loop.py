@@ -79,6 +79,16 @@ SUPPRESSED_COLLAPSED_383_RESULT = (
     / "fixtures"
     / "suppressed-collapsed-383-agent-task-result.json"
 )
+SUPPRESSED_COLLAPSED_383_SECOND_REPORT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "suppressed-collapsed-383-second-report.md"
+)
+SUPPRESSED_COLLAPSED_383_SECOND_RESULT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "suppressed-collapsed-383-second-agent-task-result.json"
+)
 SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -1212,7 +1222,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.34")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.35")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -1249,16 +1259,40 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             prior_history=[],
         )
         self.assertIn("human-readable UTF-8 Markdown report", prompt)
-        self.assertIn("worker prompt version 5", prompt)
-        self.assertIn("do not omit identity fields or rename `commit`", prompt)
+        self.assertIn("worker prompt version 6", prompt)
+        self.assertIn("opaque coordinator-generated values", prompt)
+        self.assertIn("mechanically joins each decision", prompt)
+        self.assertIn("negative ID is intentional", prompt)
         self.assertIn('"iteration_allowance": 1', prompt)
         self.assertIn("Do not sleep, poll, watch", prompt)
         self.assertIn('"thread_id": "PRRT_thread"', prompt)
+        self.assertIn(
+            '"id": "github.copilot.copilot-review-loop-decision-report"',
+            prompt,
+        )
+        self.assertIn(MODULE.decision_report_contract(self.preflight), prompt)
+        self.assertIn(
+            MODULE.decision_finding_key(
+                self.preflight["comment_identities"][0]
+            ),
+            prompt,
+        )
         self.assertIn("untrusted data", prompt)
         self.assertIn("local-execution fallback", prompt)
         self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
         self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
+
+    def test_agent_task_model_gate_accepts_only_explicit_sol(self):
+        parser = MODULE.build_parser()
+        args = parser.parse_args(["agent-task", "--model", "sol"])
+
+        self.assertEqual(args.model, "sol")
+        with (
+            mock.patch.object(sys, "stderr"),
+            self.assertRaises(SystemExit),
+        ):
+            parser.parse_args(["agent-task", "--model", "astra"])
 
     def test_local_coordinator_waits_for_stable_actionable_feedback(self):
         state_path = self.directory / "stable-state.json"
@@ -1393,6 +1427,261 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             paths_by_commit={},
         )
         self.assertEqual(report["outcome"], "no_changes")
+
+    def test_finding_key_covers_every_full_identity_field(self):
+        identity = self.preflight["comment_identities"][0]
+        original = MODULE.decision_finding_key(identity)
+
+        for field, value in identity.items():
+            changed = copy.deepcopy(identity)
+            if value is None:
+                changed[field] = "present"
+            elif isinstance(value, int):
+                changed[field] = value + 1
+            else:
+                changed[field] = f"{value}-changed"
+            with self.subTest(field=field):
+                self.assertNotEqual(
+                    original,
+                    MODULE.decision_finding_key(changed),
+                )
+
+    def test_decision_report_restores_suppressed_identities_by_opaque_key(self):
+        preflight = copy.deepcopy(self.preflight)
+        preflight["pr"].update(
+            {
+                "number": 383,
+                "pr_url": "https://github.com/open-telemetry/shared-workflows/pull/383",
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_repository": "open-telemetry/shared-workflows",
+                "head_branch": "trask-lock-free-dashboard-publisher",
+                "head_sha": "19852bf67b646585381f3ea5cfe798ca46b8bc0f",
+                "base_branch": "main",
+                "base_sha": "55fb421179d32aef3b36c7f6503f57193561d14c",
+            }
+        )
+        identities = [
+            {
+                "id": comment_id,
+                "source": "suppressed",
+                "thread_id": None,
+                "review_id": 5225525187,
+                "url": (
+                    "https://github.com/open-telemetry/shared-workflows/"
+                    "pull/383#pullrequestreview-5225525187"
+                ),
+                "path": ".github/scripts/pull-request-dashboard/state_branch.py",
+                "line": line,
+                "original_line": line,
+                "body_sha256": digest,
+                "author": "copilot-pull-request-reviewer[bot]",
+            }
+            for comment_id, line, digest in (
+                (
+                    -5225525187000,
+                    242,
+                    "ef35af361d8d647e848018190cc9748b0c0d2942b80da5fd86dc5a175c87db00",
+                ),
+                (
+                    -5225525187001,
+                    254,
+                    "9518a33cbf1c7ea443c9126306fe5a91a6727f325305cf4fe33073ef445ab24c",
+                ),
+            )
+        ]
+        preflight["comment_identities"] = identities
+        keys = [MODULE.decision_finding_key(identity) for identity in identities]
+        payload = {
+            "schema": MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
+            "contract_id": MODULE.decision_report_contract(preflight),
+            "decisions": [
+                {
+                    "finding_key": key,
+                    "disposition": "no_change",
+                    "reason": f"Verified finding {index} against the pinned source.",
+                    "commit": None,
+                    "reply": f"The pinned source handles finding {index}.",
+                    "changed_paths": [],
+                }
+                for index, key in reversed(list(enumerate(keys)))
+            ],
+        }
+
+        report = MODULE.validate_copilot_review_report(
+            json.dumps(payload),
+            request_id="request-383",
+            preflight=preflight,
+            remote={"commits": [], "requires_apply": False},
+            paths_by_commit={},
+        )
+
+        self.assertEqual(MODULE.COPILOT_REVIEW_REPORT_SCHEMA, report["schema"])
+        self.assertEqual(
+            identities,
+            [
+                {key: item[key] for key in identity}
+                for item, identity in zip(report["comments"], identities)
+            ],
+        )
+        self.assertEqual(
+            ["The pinned source handles finding 0.", "The pinned source handles finding 1."],
+            [item["reply"] for item in report["comments"]],
+        )
+
+    def test_decision_report_requires_exact_contract_key_set_and_count(self):
+        key = MODULE.decision_finding_key(
+            self.preflight["comment_identities"][0]
+        )
+        decision = {
+            "finding_key": key,
+            "disposition": "no_change",
+            "reason": "Verified against the pinned source.",
+            "commit": None,
+            "reply": "The pinned source already handles this finding.",
+            "changed_paths": [],
+        }
+        payload = {
+            "schema": MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
+            "contract_id": MODULE.decision_report_contract(self.preflight),
+            "decisions": [decision],
+        }
+
+        for field, value, message in (
+            ("contract_id", "wrong", "stale contract"),
+            ("decisions", [], "finding count"),
+            (
+                "decisions",
+                [{**decision, "finding_key": "0" * 64}],
+                "missing or unexpected findings",
+            ),
+        ):
+            malformed = copy.deepcopy(payload)
+            malformed[field] = value
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(MODULE.WorkflowError, message):
+                    MODULE.validate_copilot_review_report(
+                        json.dumps(malformed),
+                        request_id="request-1",
+                        preflight=self.preflight,
+                        remote={"commits": [], "requires_apply": False},
+                        paths_by_commit={},
+                    )
+
+    def test_decision_report_retains_exact_commit_and_path_validation(self):
+        key = MODULE.decision_finding_key(
+            self.preflight["comment_identities"][0]
+        )
+        payload = {
+            "schema": MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
+            "contract_id": MODULE.decision_report_contract(self.preflight),
+            "decisions": [
+                {
+                    "finding_key": key,
+                    "disposition": "fixed",
+                    "reason": "The focused test confirms the corrected behavior.",
+                    "commit": self.fix,
+                    "reply": "Fixed and covered by the focused test.",
+                    "changed_paths": ["src/app.py"],
+                }
+            ],
+        }
+        remote = self.remote([self.fix])
+
+        report = MODULE.validate_copilot_review_report(
+            json.dumps(payload),
+            request_id="request-1",
+            preflight=self.preflight,
+            remote=remote,
+            paths_by_commit={self.fix: ["src/app.py"]},
+        )
+        self.assertEqual(self.fix, report["comments"][0]["commit"])
+
+        payload["decisions"][0]["changed_paths"] = ["src/other.py"]
+        with self.assertRaisesRegex(MODULE.WorkflowError, "unexpected paths"):
+            MODULE.validate_copilot_review_report(
+                json.dumps(payload),
+                request_id="request-1",
+                preflight=self.preflight,
+                remote=remote,
+                paths_by_commit={self.fix: ["src/app.py"]},
+            )
+
+    def test_both_exact_383_malformed_reports_fail_closed(self):
+        preflight = copy.deepcopy(self.preflight)
+        preflight["identity"] = {
+            "branch": "trask-lock-free-dashboard-publisher",
+            "head": "19852bf67b646585381f3ea5cfe798ca46b8bc0f",
+            "status": "",
+        }
+        preflight["pr"].update(
+            {
+                "number": 383,
+                "pr_url": "https://github.com/open-telemetry/shared-workflows/pull/383",
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_repository": "open-telemetry/shared-workflows",
+                "head_branch": "trask-lock-free-dashboard-publisher",
+                "head_sha": "19852bf67b646585381f3ea5cfe798ca46b8bc0f",
+                "base_branch": "main",
+                "base_sha": "55fb421179d32aef3b36c7f6503f57193561d14c",
+            }
+        )
+        preflight["comment_identities"] = [
+            {
+                "id": comment_id,
+                "source": "suppressed",
+                "thread_id": None,
+                "review_id": 5225525187,
+                "url": (
+                    "https://github.com/open-telemetry/shared-workflows/"
+                    "pull/383#pullrequestreview-5225525187"
+                ),
+                "path": ".github/scripts/pull-request-dashboard/state_branch.py",
+                "line": line,
+                "original_line": line,
+                "body_sha256": digest,
+                "author": "copilot-pull-request-reviewer[bot]",
+            }
+            for comment_id, line, digest in (
+                (
+                    -5225525187000,
+                    242,
+                    "ef35af361d8d647e848018190cc9748b0c0d2942b80da5fd86dc5a175c87db00",
+                ),
+                (
+                    -5225525187001,
+                    254,
+                    "9518a33cbf1c7ea443c9126306fe5a91a6727f325305cf4fe33073ef445ab24c",
+                ),
+            )
+        ]
+
+        for result_path, report_path in (
+            (
+                SUPPRESSED_COLLAPSED_383_RESULT,
+                SUPPRESSED_COLLAPSED_383_REPORT,
+            ),
+            (
+                SUPPRESSED_COLLAPSED_383_SECOND_RESULT,
+                SUPPRESSED_COLLAPSED_383_SECOND_REPORT,
+            ),
+        ):
+            result = MODULE.load_agent_task_result(result_path)
+            remote = MODULE.validate_success_result(
+                result,
+                preflight=preflight,
+                requested_model="gpt-5.6-sol",
+            )
+            content = report_path.read_text(encoding="utf-8")
+            self.assertEqual(result["report"]["sha256"], MODULE.sha256_text(content))
+            with self.subTest(task_id=result["task"]["id"]):
+                with self.assertRaises(MODULE.WorkflowError):
+                    MODULE.validate_copilot_review_report(
+                        content,
+                        request_id=remote["request_id"],
+                        preflight=preflight,
+                        remote=remote,
+                        paths_by_commit={},
+                    )
 
     def test_validates_fix_paths_commits_and_order(self):
         remote = self.remote([self.fix])

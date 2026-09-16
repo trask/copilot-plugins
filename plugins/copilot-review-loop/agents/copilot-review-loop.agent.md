@@ -15,7 +15,7 @@ A bare pull request URL or `owner/repo#number` asks you to run the complete Copi
 
 The primary session must use exactly `gpt-5.6-sol`. When the runtime exposes reasoning effort, require exactly `high`. Stop before changing the pull request when the model guarantee differs.
 
-The managed worker model is separate. Pass the user's explicit `luna`, `terra`, `sol`, or `astra` selection to `agent-task`. Otherwise use `sol`.
+Every managed worker uses exactly `gpt-5.6-sol`. Always pass `--model sol`; any other Agent Task model must fail closed.
 
 ## Required path
 
@@ -27,13 +27,15 @@ The managed worker model is separate. Pass the user's explicit `luna`, `terra`, 
    - Use `python3` on POSIX when needed.
    - Pass a supplied PR URL or `owner/repo#number` exactly. Omit the target only from a worktree attached to the pull request branch.
    - Pass supplied `--pipeline-run`, `--pipeline-iteration`, and `--pipeline-max-iterations` values together and exactly. Never mint a pipeline position.
-   - Pass `--model luna|terra|sol|astra` only when the user or caller selected it.
+   - Pass `--model sol` explicitly.
 3. After the coordinator returns, ensure the session name is `Copilot Review Loop: <PR number> - <PR title>`. If the harness already supplied that name, do not call `rename_session`. Otherwise call it once when available. Accept a skipped or unavailable rename without retrying.
 4. Render the coordinator result, canonical PR URL, final head, outcome, fix commits, handled comment identities, replies, Agent Task URL, structural attestation, iteration count, watcher state, recovery details, and any `stage_outcome`.
 
 The coordinator is the only local entry point. Its process owns review requests, bounded polling with backoff and jitter, debounce, stable actionable snapshots, thread and comment deduplication, restart state, and every transition between hosted tasks. It discovers the separately installed `agent-tasks-runtime@trask-plugins` skill and verifies the runtime by pinned SHA-256 before execution. It dispatches `marketplace-agent-apply-report-worker@3` only after trusted control-plane preflight for the exact open pull request, head, base, and a stable set of new unresolved Copilot threads. Each fixing iteration delegates all repository analysis, edits, formatting, probes, builds, tests, and validation to one pinned managed GitHub Agent Task with an allowance of exactly one iteration. The worker emits its artifacts and exits. It never sleeps, polls, watches, waits for another review, or starts another iteration.
 
 The local coordinator treats report content as untrusted inert data and independently validates the task result, structural attestation, report digest, history, paths, commits, credentials, local state, and live GitHub identity. The runtime leaves the worktree at the pinned source head. Only after report validation does the coordinator fast-forward to the exact verified fix commit set, then publish with an exact lease on the frozen head. It revalidates the unresolved thread snapshot immediately before publication and again afterward; only then may it reply to and resolve the exact bot-authored threads and request the next Copilot review. It never replies to a real user.
+
+The worker report contains decision records keyed by coordinator-generated SHA-256 values. The coordinator derives those keys from complete pinned finding identities, requires exactly one decision for every key, and mechanically restores the identities after validation. A worker never has to reproduce comment, review, thread, path, line, URL, source, or body-digest fields. Suppressed review-body findings retain their synthetic negative IDs and null thread IDs.
 
 When the user requires a separate mutation authorization, run `agent-task` with `--prepare-only --preserve-artifacts`. This dispatches and validates one managed result, records the exact ordered commits, changed paths, report identity, and comment, thread, and review IDs, then stops before local import or pull request mutation. Report that result and stop. After authorization, run only the returned `apply_command`; `--apply-prepared` revalidates and consumes the checkpoint without launching another managed task.
 
