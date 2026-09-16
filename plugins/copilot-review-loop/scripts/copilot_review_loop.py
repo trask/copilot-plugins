@@ -2645,7 +2645,15 @@ def command_watch(args: argparse.Namespace) -> None:
                 emit(result)
                 return
             if time.monotonic() >= deadline:
-                result = watcher_result(state, {"result": "timeout"})
+                result = watcher_result(
+                    state,
+                    {"result": "timeout"},
+                    status=(
+                        "requested"
+                        if getattr(args, "resume_on_timeout", False)
+                        else "completed"
+                    ),
+                )
                 save_state(path, state)
                 emit(result)
                 return
@@ -4914,6 +4922,7 @@ def continue_after_review_request(
                 args, "poll_max_interval", DEFAULT_MAX_WATCH_INTERVAL
             ),
             poll_jitter=getattr(args, "poll_jitter", DEFAULT_POLL_JITTER),
+            resume_on_timeout=bool(getattr(args, "request_review_only", False)),
         )
     )
     state = load_state(state_path)

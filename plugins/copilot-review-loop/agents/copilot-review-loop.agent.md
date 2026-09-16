@@ -39,6 +39,8 @@ When the user requires a separate mutation authorization, run `agent-task` with 
 
 When authorization covers only one fresh Copilot review request, run `agent-task` with `--request-review-only`. The coordinator deduplicates an existing request, monitors it with the normal bounded watcher, records current-head clearance when the review is clean, and otherwise persists and returns the exact new bot comments and identities. It never launches a managed task in this mode. Preparing or applying fixes requires a separate invocation and authorization.
 
+If the bounded wait expires, the saved monitor remains requested. A later hash-gated recovery resumes that request instead of asking GitHub for another review.
+
 The stage's `--max-iterations` value remains the per-iteration limit. An outer loop does not raise or lower that; it bounds what the whole run may spend instead. The coordinator records work equivalent to `progress --state <path> --phase addressing_comments` before dispatch and `progress --state <path> --phase validating` while it validates managed artifacts.
 
 ## Boundaries

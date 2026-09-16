@@ -1196,7 +1196,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.27")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.28")
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1308,7 +1308,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(result["comment_identities"][0]["id"], 18)
         self.assertEqual(preflight.call_count, 4)
 
-    def test_restart_resumes_the_existing_review_request_without_a_new_task(self):
+    def test_restart_resumes_a_timed_out_review_request_without_a_new_task(self):
         state_path = self.directory / "requested-state.json"
         MODULE.save_state(
             state_path,
@@ -1321,6 +1321,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     "status": "requested",
                     "head_sha": self.head,
                     "baseline_review_id": 10,
+                    "result": {"result": "timeout"},
                 },
             },
         )
@@ -3716,12 +3717,15 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         arguments.request_review_only = True
         emitted = []
         with (
-            mock.patch.object(MODULE, "command_watch", side_effect=complete_watch),
+            mock.patch.object(
+                MODULE, "command_watch", side_effect=complete_watch
+            ) as watch,
             mock.patch.object(MODULE, "command_agent_task") as next_iteration,
             mock.patch.object(MODULE, "emit", emitted.append),
         ):
             MODULE.continue_after_review_request(arguments, state_path)
 
+        self.assertTrue(watch.call_args.args[0].resume_on_timeout)
         next_iteration.assert_not_called()
         saved = MODULE.load_state(state_path)
         self.assertEqual(self.head, saved["clean_at_head_sha"])
@@ -6762,6 +6766,45 @@ class CopilotReviewTest(unittest.TestCase):
         gh_json.assert_not_called()
         self.assertEqual(saved["monitoring"]["result"], {"result": "timeout"})
         self.assertEqual(emit.call_args_list[-1].args[0], {"result": "timeout"})
+
+    def test_request_only_timeout_keeps_review_request_resumable(self):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "pr": {"upstream_owner": "owner", "upstream_repo": "repo", "number": 7},
+            "monitoring": {
+                "status": "requested",
+                "head_sha": "abc123",
+                "baseline_review_id": 100,
+                "copilot_bot_id": "BOT_1",
+                "request_start": "2026-05-01T12:00:00Z",
+                "cancel_requested": False,
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(path, state)
+            args = SimpleNamespace(
+                state=str(path),
+                interval=0,
+                max_interval=0,
+                timeout=1,
+                poll_jitter=0,
+                cancellation_grace=0,
+                resume_on_timeout=True,
+            )
+            with (
+                mock.patch.object(MODULE.time, "monotonic", side_effect=[0, 2]),
+                mock.patch.object(MODULE, "gh_json") as gh_json,
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_watch(args)
+
+            saved = MODULE.load_state(path)
+
+        gh_json.assert_not_called()
+        self.assertEqual("requested", saved["monitoring"]["status"])
+        self.assertEqual({"result": "timeout"}, saved["monitoring"]["result"])
+        self.assertEqual({"result": "timeout"}, emit.call_args_list[-1].args[0])
 
     def test_watch_retries_rate_limited_review_comments_with_local_backoff(self):
         state = {
