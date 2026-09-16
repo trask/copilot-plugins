@@ -1196,7 +1196,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.28")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.29")
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -3449,6 +3449,66 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.WorkflowError, "unfinished Agent Task"):
                 MODULE.command_agent_task(args)
         self.assertEqual(1, len(commands))
+
+    def test_completed_owner_is_archived_before_a_new_findings_task(self):
+        state_path = self.directory / "completed-owner-state.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        completed = {
+            "run_id": "completed-owner",
+            "status": "completed",
+            "task": {"id": "completed-task"},
+            "published_head_sha": "previous-head",
+        }
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "created_at": MODULE.utc_now(),
+                "iterations": 1,
+                "history": [],
+                "managed_task_history": [{"run_id": "legacy-owner"}],
+                "pr": self.preflight["pr"],
+                "agent_task": completed,
+            },
+        )
+        arguments = self.arguments(state_path)
+
+        def stop_after_dispatch(_command, **_kwargs):
+            raise RuntimeError("stop after dispatch")
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_stable_review_preflight",
+                return_value=self.preflight,
+            ),
+            mock.patch.object(
+                MODULE,
+                "require_live_comments",
+                return_value=self.preflight["comments"],
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE.secrets, "token_hex", return_value="new-owner"),
+            mock.patch.object(MODULE, "run", side_effect=stop_after_dispatch),
+            self.assertRaisesRegex(RuntimeError, "stop after dispatch"),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        restarted = MODULE.load_state(state_path)
+        self.assertEqual(
+            ["legacy-owner", "completed-owner"],
+            [item["run_id"] for item in restarted["managed_task_history"]],
+        )
+        self.assertEqual(completed, restarted["managed_task_history"][1])
+        self.assertEqual("new-owner", restarted["agent_task"]["run_id"])
 
     def test_task_creation_failure_records_fresh_retry_and_replaces_legacy_state(self):
         state_path = self.directory / "cca-disabled-state.json"

@@ -5378,13 +5378,25 @@ def command_agent_task(args: argparse.Namespace) -> None:
             }
         else:
             state = existing
-            if (
+            archive_active = (
                 isinstance(active, dict)
-                and active.get("status") == "failed"
-                and active.get("task_id_status")
-                in {"not_created", "terminal_unusable"}
-            ):
-                state.setdefault("managed_task_history", []).append(active)
+                and (
+                    active.get("status") in {"completed", "consumed"}
+                    or (
+                        active.get("status") == "failed"
+                        and active.get("task_id_status")
+                        in {"not_created", "terminal_unusable"}
+                    )
+                )
+            )
+            if archive_active:
+                history = state.setdefault("managed_task_history", [])
+                run_id = active.get("run_id")
+                if not any(
+                    isinstance(item, dict) and item.get("run_id") == run_id
+                    for item in history
+                ):
+                    history.append(active)
         state["repo_root"] = str(repo_root)
         state["pr"] = pr
         state["queue"] = {

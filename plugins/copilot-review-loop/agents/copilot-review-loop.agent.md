@@ -41,6 +41,8 @@ When authorization covers only one fresh Copilot review request, run `agent-task
 
 If the bounded wait expires, the saved monitor remains requested. A later hash-gated recovery resumes that request instead of asking GitHub for another review.
 
+When a later review produces new findings, the coordinator archives the completed owner before starting the separately authorized preparation task.
+
 The stage's `--max-iterations` value remains the per-iteration limit. An outer loop does not raise or lower that; it bounds what the whole run may spend instead. The coordinator records work equivalent to `progress --state <path> --phase addressing_comments` before dispatch and `progress --state <path> --phase validating` while it validates managed artifacts.
 
 ## Boundaries
