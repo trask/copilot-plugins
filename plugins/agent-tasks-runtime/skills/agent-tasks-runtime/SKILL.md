@@ -12,9 +12,10 @@ Consumer coordinators discover this skill through `copilot skill list --json`,
 pin the exact helper digest, and invoke the helper directly. Do not invoke its
 scripts manually during an agent workflow.
 
-Policy `marketplace-agent-worker@4` keeps executable validation on the hosted
+Policy `marketplace-agent-worker@5` keeps executable validation on the hosted
 Agent Task. The worker's final commit contains the report and a minimal JSON
-validation array; command strings in that array are inert evidence and are
+validation array of exact `command` and `outcome` objects; `outcome` must be
+`passed`. Command strings in that array are inert evidence and are
 never run locally. The dispatcher independently verifies the task, request,
 policy, source pull request, live head, linear history, changed paths, report,
 and validation schema before it applies any fix commit. Fix commits carry only

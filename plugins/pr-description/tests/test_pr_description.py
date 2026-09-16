@@ -137,7 +137,7 @@ def agent_task_result(preflight=None, **overrides):
         "requested_model": "gpt-5.6-sol",
         "policy": {
             "id": "marketplace-agent-worker",
-            "version": 4,
+            "version": 5,
             "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
         },
         "task": {
@@ -169,8 +169,7 @@ def agent_task_result(preflight=None, **overrides):
                     [
                         {
                             "command": "review complete diff",
-                            "status": "passed",
-                            "detail": "All changed files were reviewed.",
+                            "outcome": "passed",
                         }
                     ],
                     separators=(",", ":"),
@@ -180,11 +179,10 @@ def agent_task_result(preflight=None, **overrides):
         },
         "validation": {
             "complete": True,
-            "outcomes": [
+            "outcomes":             [
                 {
                     "command": "review complete diff",
-                    "status": "passed",
-                    "detail": "All changed files were reviewed.",
+                    "outcome": "passed",
                 }
             ],
         },
@@ -725,7 +723,7 @@ class LegacyAgentInstructions:
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.45")
+        self.assertEqual(plugin["version"], "1.0.46")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -743,11 +741,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "head": "4" * 40,
             "status": "",
         }
-        self.validation = [
+        self.validation =         [
             {
                 "command": "review complete diff",
-                "status": "passed",
-                "detail": "All changed files were reviewed.",
+                "outcome": "passed",
             }
         ]
         self.helper_commands = []
@@ -867,7 +864,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("You are a thin local coordinator", instructions)
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-worker@4", instructions)
+        self.assertIn("marketplace-agent-worker@5", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertIn("Never scrape", instructions)
@@ -880,7 +877,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.45")
+        self.assertEqual(plugin["version"], "1.0.46")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1065,7 +1062,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("--report", command)
         self.assertEqual(
             command[command.index("--policy") + 1],
-            "marketplace-agent-worker@4",
+            "marketplace-agent-worker@5",
         )
         self.assertNotIn("--custom-agent", command)
         result_path = Path(command[command.index("--result-file") + 1])

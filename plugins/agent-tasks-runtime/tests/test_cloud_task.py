@@ -36,10 +36,11 @@ class PolicyPromptTest(unittest.TestCase):
             pull_request=SimpleNamespace(head_sha="1" * 40),
         )
 
-        self.assertIn("Policy: marketplace-agent-worker@4", prompt)
+        self.assertIn("Policy: marketplace-agent-worker@5", prompt)
         self.assertIn(f"write `{validation_path}` as a nonempty JSON array", prompt)
-        self.assertIn("exactly `command`, `status`, and `detail`", prompt)
-        self.assertIn("`status` must be `passed`", prompt)
+        self.assertIn("exactly `command` and `outcome`", prompt)
+        self.assertIn('"outcome":"passed"', prompt)
+        self.assertIn("`outcome` must be `passed`", prompt)
         self.assertIn("Do not write request, policy, repository", prompt)
         self.assertIn(
             json.dumps(
@@ -102,7 +103,7 @@ class PolicyPromptTest(unittest.TestCase):
                     MODULE.CloudError,
                     f"unknown policy 'marketplace-agent-worker@{version}'; expected "
                     "one of marketplace-agent-report-worker@1, "
-                    "marketplace-agent-worker@4",
+                    "marketplace-agent-worker@5",
                 ) as raised:
                     MODULE.parse_args(
                         [
@@ -397,8 +398,7 @@ class ValidationArtifactTest(unittest.TestCase):
                 [
                     {
                         "command": command,
-                        "status": "passed",
-                        "detail": "Executed remotely.",
+                        "outcome": "passed",
                     }
                 ]
             )
@@ -412,8 +412,7 @@ class ValidationArtifactTest(unittest.TestCase):
                         [
                             {
                                 "command": command,
-                                "status": "passed",
-                                "detail": "Executed remotely.",
+                                "outcome": "passed",
                             }
                         ]
                     )
@@ -423,6 +422,33 @@ class ValidationArtifactTest(unittest.TestCase):
         )
         run.assert_not_called()
         self.assertFalse(sentinel.exists())
+
+    def test_accepts_production_command_outcome_receipt(self):
+        outcomes, _ = self.fetch(
+            [
+                {
+                    "command": "python3 -m unittest discover -p 'test_*.py'",
+                    "outcome": "passed",
+                },
+                {
+                    "command": "git worktree orphan initialization probe",
+                    "outcome": "passed",
+                },
+                {
+                    "command": "CodeQL (actions, python)",
+                    "outcome": "passed",
+                },
+            ]
+        )
+
+        self.assertEqual(
+            [entry["command"] for entry in outcomes],
+            [
+                "python3 -m unittest discover -p 'test_*.py'",
+                "git worktree orphan initialization probe",
+                "CodeQL (actions, python)",
+            ],
+        )
 
     def test_fails_closed_for_missing_malformed_or_empty_artifact(self):
         cases = [
@@ -437,12 +463,11 @@ class ValidationArtifactTest(unittest.TestCase):
 
     def test_fails_closed_for_failed_skipped_extra_and_legacy_outcomes(self):
         cases = [
-            {"command": "test", "status": "failed", "detail": "failed"},
-            {"command": "test", "status": "skipped", "detail": "skipped"},
+            {"command": "test", "outcome": "failed"},
+            {"command": "test", "outcome": "skipped"},
             {
                 "command": "test",
-                "status": "passed",
-                "detail": "ok",
+                "outcome": "passed",
                 "extra": True,
             },
             {"command": "test", "result": "passed"},
@@ -728,8 +753,7 @@ class DispatcherFinalizationTest(unittest.TestCase):
         outcomes = worker_validation or [
             {
                 "command": "git diff --check",
-                "status": "passed",
-                "detail": "No whitespace errors.",
+                "outcome": "passed",
             }
         ]
         mutation = (

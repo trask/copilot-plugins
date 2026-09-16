@@ -50,7 +50,7 @@ RESULT_SCHEMA_ID = "github.copilot.agent-task-result"
 RESULT_SCHEMA_VERSION = 1
 REPORT_RESULT_SCHEMA_VERSION = 2
 MARKETPLACE_POLICY_ID = "marketplace-agent-worker"
-MARKETPLACE_POLICY_VERSION = 4
+MARKETPLACE_POLICY_VERSION = 5
 MARKETPLACE_POLICY_SPEC = {
     "id": MARKETPLACE_POLICY_ID,
     "version": MARKETPLACE_POLICY_VERSION,
@@ -67,7 +67,8 @@ MARKETPLACE_POLICY_SPEC = {
     "human_report": "nonempty-utf8-markdown",
     "dispatcher_generated_commit_order": True,
     "require_complete_successful_validation": True,
-    "worker_artifact": "remote-validation-array",
+    "worker_artifact": "remote-validation-command-outcome-array",
+    "worker_validation_fields": ["command", "outcome"],
     "dispatcher_attestation": True,
     "worker_identity_echo": False,
 }
@@ -1135,12 +1136,10 @@ def read_apply_result(path: Path) -> dict[str, object]:
         for outcome in outcomes:
             if (
                 not isinstance(outcome, dict)
-                or set(outcome) != {"command", "status", "detail"}
+                or set(outcome) != {"command", "outcome"}
                 or not isinstance(outcome.get("command"), str)
                 or not outcome["command"].strip()
-                or outcome.get("status") != "passed"
-                or not isinstance(outcome.get("detail"), str)
-                or not outcome["detail"].strip()
+                or outcome.get("outcome") != "passed"
             ):
                 raise CloudError(
                     "prior result validation is malformed",
@@ -1643,8 +1642,9 @@ def build_policy_prompt(
         "use a local-execution fallback.\n"
         "Run every required validation on the hosted worker. After validation "
         f"passes, write `{receipt}` as a nonempty JSON array. Every element must "
-        "contain exactly `command`, `status`, and `detail`; all three values must "
-        "be nonempty strings and `status` must be `passed`. Record commands as "
+        "contain exactly `command` and `outcome`; both values must be nonempty "
+        "strings and `outcome` must be `passed`. For example: "
+        '[{"command":"python -m pytest","outcome":"passed"}]. Record commands as '
         "evidence only. Do not write request, policy, repository, pull request, "
         "task, or completion metadata.\n"
         "Create exactly one final single-parent artifact commit whose changed "
@@ -3269,31 +3269,24 @@ def fetch_worker_receipt(
         )
     outcomes: list[dict[str, str]] = []
     for outcome in data:
-        if not isinstance(outcome, dict) or set(outcome) != {
-            "command",
-            "status",
-            "detail",
-        }:
+        if not isinstance(outcome, dict) or set(outcome) != {"command", "outcome"}:
             raise CloudError(
                 "marketplace worker validation outcome is malformed",
                 "validation_incomplete",
             )
         command = outcome.get("command")
-        status = outcome.get("status")
-        detail = outcome.get("detail")
+        result = outcome.get("outcome")
         if (
             not isinstance(command, str)
             or not command.strip()
-            or status != "passed"
-            or not isinstance(detail, str)
-            or not detail.strip()
+            or result != "passed"
         ):
             raise CloudError(
                 "marketplace worker validation contains a failed, skipped, or "
                 "incomplete outcome",
                 "validation_incomplete",
             )
-        if contains_credentials(command) or contains_credentials(detail):
+        if contains_credentials(command):
             raise CloudError(
                 "marketplace worker validation contains credentials",
                 "credentials_rejected",
@@ -3301,8 +3294,7 @@ def fetch_worker_receipt(
         outcomes.append(
             {
                 "command": command,
-                "status": "passed",
-                "detail": detail,
+                "outcome": "passed",
             }
         )
     return outcomes, hashlib.sha256(content.encode("utf-8")).hexdigest()

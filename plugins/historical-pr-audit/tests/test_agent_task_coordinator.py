@@ -19,8 +19,7 @@ SPEC.loader.exec_module(MODULE)
 VALIDATION = [
     {
         "command": "python -m pytest tests/test_app.py",
-        "status": "passed",
-        "detail": "4 passed",
+        "outcome": "passed",
     }
 ]
 PIPELINE = {"run": "run-1", "iteration": "2", "max_iterations": "7"}
@@ -57,7 +56,7 @@ def result(commits=None):
         "requested_model": "gpt-5.6-sol",
         "policy": {
             "id": "marketplace-agent-worker",
-            "version": 4,
+            "version": 5,
             "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
         },
         "task": {
@@ -184,11 +183,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pins_shared_helper_and_policy_integrity(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "7ce431e21d53bf0680d0a0bb37cdff8acb8983189a651a492b940551bd1e5485",
+            "da6d87d46f9e9c231b7536c2a91d2eb3cb9331d32f92627dd37fba198b85f70c",
         )
         self.assertEqual(
             MODULE.AGENT_TASK_POLICY_SHA256,
-            "04c1f4c1098ef0419f2bd94b8be120e303218588f2804ed79c0d706c8c2915ad",
+            "a9a1592c15abb39c077c5af0e23b46b7b0e3fc3d747e02f41975813130b0c096",
         )
 
     def test_prompt_is_versioned_untrusted_and_remote_only(self):
@@ -242,7 +241,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "--result-file",
             str(first_result),
             "--policy",
-            "marketplace-agent-worker@4",
+            "marketplace-agent-worker@5",
         ]
         self.assertEqual(
             MODULE.agent_task_command(

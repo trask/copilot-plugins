@@ -919,8 +919,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.validation = [
             {
                 "command": "python -m unittest tests.test_widget",
-                "status": "passed",
-                "detail": "The failing test passes.",
+                "outcome": "passed",
             }
         ]
         failure = {
@@ -985,7 +984,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "requested_model": "gpt-5.6-sol",
             "policy": {
                 "id": "marketplace-agent-worker",
-                "version": 4,
+                "version": 5,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -1145,13 +1144,13 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
         self.assertIn("loop <target>", instructions)
-        self.assertIn("marketplace-agent-worker@4", instructions)
+        self.assertIn("marketplace-agent-worker@5", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("`custom_agent`", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.13", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.14", json.loads(PLUGIN.read_text())["version"])
 
     def test_prompt_pins_snapshot_allowance_model_policy_and_worker_boundary(self):
         prompt = MODULE.build_worker_prompt(

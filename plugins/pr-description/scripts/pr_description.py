@@ -54,14 +54,14 @@ SHARED_STATE_CONFIG = Path(".copilot/extensions/pr-flight/state-repo.json")
 SHARED_STATE_VERSION = 1
 SHARED_STATE_MAX_ATTEMPTS = 3
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "7ce431e21d53bf0680d0a0bb37cdff8acb8983189a651a492b940551bd1e5485"
+    "da6d87d46f9e9c231b7536c2a91d2eb3cb9331d32f92627dd37fba198b85f70c"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
 CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
-AGENT_TASK_POLICY = "marketplace-agent-worker@4"
+AGENT_TASK_POLICY = "marketplace-agent-worker@5"
 AGENT_TASK_POLICY_SHA256 = (
-    "04c1f4c1098ef0419f2bd94b8be120e303218588f2804ed79c0d706c8c2915ad"
+    "a9a1592c15abb39c077c5af0e23b46b7b0e3fc3d747e02f41975813130b0c096"
 )
 AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
@@ -1538,7 +1538,7 @@ def validate_result_identity(
 ) -> None:
     expected_policy = {
         "id": "marketplace-agent-worker",
-        "version": 4,
+        "version": 5,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     repository = result.get("repository")
@@ -1667,12 +1667,10 @@ def validate_validation_outcomes(value: Any) -> list[dict[str, str]]:
     for outcome in value:
         if (
             not isinstance(outcome, dict)
-            or set(outcome) != {"command", "status", "detail"}
+            or set(outcome) != {"command", "outcome"}
             or not isinstance(outcome.get("command"), str)
             or not outcome["command"].strip()
-            or outcome.get("status") != "passed"
-            or not isinstance(outcome.get("detail"), str)
-            or not outcome["detail"].strip()
+            or outcome.get("outcome") != "passed"
         ):
             raise WorkflowError("Agent Task validation is incomplete or malformed")
         require_no_credentials(

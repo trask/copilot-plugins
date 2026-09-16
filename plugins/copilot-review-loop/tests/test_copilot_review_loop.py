@@ -19,6 +19,11 @@ PLUGIN = Path(__file__).parents[1] / "plugin.json"
 CCA_DISABLED_RESULT = (
     Path(__file__).parent / "fixtures" / "cca-disabled-agent-task-result.json"
 )
+MALFORMED_VALIDATION_RESULT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "malformed-validation-agent-task-result.json"
+)
 SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -919,8 +924,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.validation = [
             {
                 "command": "python -m unittest tests.test_feature",
-                "status": "passed",
-                "detail": "Focused tests passed.",
+                "outcome": "passed",
             }
         ]
         self.comment = {
@@ -1002,7 +1006,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "requested_model": "gpt-5.6-sol",
             "policy": {
                 "id": "marketplace-agent-worker",
-                "version": 4,
+                "version": 5,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -1073,6 +1077,32 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         return result
 
+    def terminal_validation_failure(self):
+        result = self.result()
+        result.update(
+            {
+                "status": "error",
+                "application": {
+                    "status": "not_applied",
+                    "final_local_head": self.head,
+                },
+                "report": {
+                    **result["report"],
+                    "sha256": None,
+                },
+                "worker_receipt": {
+                    **result["worker_receipt"],
+                    "sha256": None,
+                },
+                "validation": {"complete": False, "outcomes": []},
+                "error": {
+                    "code": "validation_incomplete",
+                    "message": "marketplace worker validation outcome is malformed",
+                },
+            }
+        )
+        return result
+
     def remote(self, commits=None):
         return MODULE.validate_success_result(
             self.result(commits),
@@ -1119,12 +1149,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_thin_and_version_is_bumped(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-worker@4", instructions)
+        self.assertIn("marketplace-agent-worker@5", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.13")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.14")
 
     def test_prompt_is_self_contained_versioned_and_treats_inputs_as_untrusted(self):
         prompt = MODULE.build_worker_prompt(
@@ -1735,6 +1765,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             result,
             preflight=preflight,
             requested_model="gpt-5.6-sol",
+            allow_legacy_policy=True,
         )
 
         self.assertEqual("api_failure", failure["code"])
@@ -1742,6 +1773,42 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         result["application"]["final_local_head"] = "0" * 40
         with self.assertRaisesRegex(MODULE.WorkflowError, "mismatched identity"):
             MODULE.validate_task_creation_failure_result(
+                result,
+                preflight=preflight,
+                requested_model="gpt-5.6-sol",
+                allow_legacy_policy=True,
+            )
+
+    def test_exact_v4_validation_failure_is_terminal_but_not_accepted_as_v5(self):
+        result = MODULE.load_agent_task_result(MALFORMED_VALIDATION_RESULT)
+        preflight = {
+            "identity": {
+                "branch": "trask-actions-queue-events",
+                "head": "ba1cdf0d96365a55af87e62c2f476245af685bbb",
+                "status": "",
+            },
+            "pr": {
+                "number": 377,
+                "pr_url": "https://github.com/open-telemetry/shared-workflows/pull/377",
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_repository": "open-telemetry/shared-workflows",
+                "head_branch": "trask-actions-queue-events",
+                "head_sha": "ba1cdf0d96365a55af87e62c2f476245af685bbb",
+                "base_branch": "main",
+                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+            },
+        }
+
+        failure = MODULE.validate_terminal_validation_failure_result(
+            result,
+            preflight=preflight,
+            requested_model="gpt-5.6-sol",
+            allow_legacy_policy=True,
+        )
+
+        self.assertEqual("validation_incomplete", failure["code"])
+        with self.assertRaisesRegex(MODULE.WorkflowError, "mismatched policy"):
+            MODULE.validate_terminal_validation_failure_result(
                 result,
                 preflight=preflight,
                 requested_model="gpt-5.6-sol",
@@ -1825,6 +1892,60 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "run-1", retried["managed_task_history"][0]["run_id"]
         )
         self.assertEqual("not_created", retried["agent_task"]["task_id_status"])
+        self.assertEqual("run-2", retried["agent_task"]["run_id"])
+
+    def test_terminal_validation_failure_allows_one_explicit_replacement(self):
+        state_path = self.directory / "validation-failure-state.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        failure = self.terminal_validation_failure()
+
+        def fail_run(command, **_kwargs):
+            output = Path(command[command.index("--result-file") + 1])
+            output.write_text(json.dumps(failure), encoding="utf-8")
+            return MODULE.subprocess.CompletedProcess(command, 2, "", "invalid receipt")
+
+        common = (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=self.preflight
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(
+                MODULE, "require_live_comments", return_value=[self.comment]
+            ),
+        )
+        for run_id in ("run-1", "run-2"):
+            with ExitStack() as stack:
+                for patcher in common:
+                    stack.enter_context(patcher)
+                run = stack.enter_context(
+                    mock.patch.object(MODULE, "run", side_effect=fail_run)
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        MODULE.secrets, "token_hex", return_value=run_id
+                    )
+                )
+                stack.enter_context(
+                    self.assertRaisesRegex(
+                        MODULE.WorkflowError, "validation_incomplete"
+                    )
+                )
+                MODULE.command_agent_task(self.arguments(state_path))
+            self.assertEqual(1, run.call_count)
+
+        retried = MODULE.load_state(state_path)
+        self.assertEqual("terminal_unusable", retried["agent_task"]["task_id_status"])
+        self.assertNotIn("recovery_command", retried["agent_task"])
+        self.assertNotIn("--resume", retried["agent_task"]["retry_command"])
+        self.assertEqual("task-1", retried["managed_task_history"][0]["task_id"])
         self.assertEqual("run-2", retried["agent_task"]["run_id"])
 
     def test_fresh_review_comments_start_the_next_managed_iteration(self):

@@ -1171,8 +1171,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.validation = [
             {
                 "command": "python -m unittest tests.test_feature",
-                "status": "passed",
-                "detail": "Focused tests passed.",
+                "outcome": "passed",
             }
         ]
         self.preflight = {
@@ -1230,7 +1229,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "requested_model": "gpt-5.6-sol",
             "policy": {
                 "id": "marketplace-agent-worker",
-                "version": 4,
+                "version": 5,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -1356,14 +1355,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-worker@4", instructions)
+        self.assertIn("marketplace-agent-worker@5", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("marketplace `custom_agent`", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.12")
+        self.assertEqual(plugin["version"], "1.3.13")
         self.assertNotIn("custom_agent", plugin)
 
     def test_prompt_is_versioned_self_contained_and_fail_closed(self):

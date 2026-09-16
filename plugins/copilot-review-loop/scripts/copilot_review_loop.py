@@ -108,15 +108,20 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "7ce431e21d53bf0680d0a0bb37cdff8acb8983189a651a492b940551bd1e5485"
+    "da6d87d46f9e9c231b7536c2a91d2eb3cb9331d32f92627dd37fba198b85f70c"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
 CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
-AGENT_TASK_POLICY = "marketplace-agent-worker@4"
+AGENT_TASK_POLICY = "marketplace-agent-worker@5"
 AGENT_TASK_POLICY_SHA256 = (
-    "04c1f4c1098ef0419f2bd94b8be120e303218588f2804ed79c0d706c8c2915ad"
+    "a9a1592c15abb39c077c5af0e23b46b7b0e3fc3d747e02f41975813130b0c096"
 )
+LEGACY_AGENT_TASK_POLICY_V4 = {
+    "id": "marketplace-agent-worker",
+    "version": 4,
+    "sha256": "04c1f4c1098ef0419f2bd94b8be120e303218588f2804ed79c0d706c8c2915ad",
+}
 AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
     "version": 1,
@@ -2680,12 +2685,10 @@ def validate_validation_outcomes(value: Any) -> list[dict[str, str]]:
     for outcome in value:
         if (
             not isinstance(outcome, dict)
-            or set(outcome) != {"command", "status", "detail"}
+            or set(outcome) != {"command", "outcome"}
             or not isinstance(outcome.get("command"), str)
             or not outcome["command"].strip()
-            or outcome.get("status") != "passed"
-            or not isinstance(outcome.get("detail"), str)
-            or not outcome["detail"].strip()
+            or outcome.get("outcome") != "passed"
         ):
             raise WorkflowError("Agent Task validation is incomplete or malformed")
         require_no_credentials(
@@ -2717,10 +2720,11 @@ def validate_task_creation_failure_result(
     *,
     preflight: dict[str, Any],
     requested_model: str,
+    allow_legacy_policy: bool = False,
 ) -> dict[str, str]:
     expected_policy = {
         "id": "marketplace-agent-worker",
-        "version": 4,
+        "version": 5,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     task = result.get("task")
@@ -2733,7 +2737,12 @@ def validate_task_creation_failure_result(
         result.get("status") != "error"
         or result.get("mode") != "apply_with_report"
         or result.get("requested_model") != requested_model
-        or result.get("policy") != expected_policy
+        or result.get("policy")
+        not in (
+            (expected_policy, LEGACY_AGENT_TASK_POLICY_V4)
+            if allow_legacy_policy
+            else (expected_policy,)
+        )
         or result.get("repository")
         != {"name_with_owner": preflight["pr"]["repo_name"]}
         or result.get("pull_request") != expected_cloud_pull_request(preflight)
@@ -2767,6 +2776,101 @@ def validate_task_creation_failure_result(
     return error
 
 
+def validate_terminal_validation_failure_result(
+    result: dict[str, Any],
+    *,
+    preflight: dict[str, Any],
+    requested_model: str,
+    allow_legacy_policy: bool = False,
+) -> dict[str, str]:
+    policy = result.get("policy")
+    expected_policy = {
+        "id": "marketplace-agent-worker",
+        "version": 5,
+        "sha256": AGENT_TASK_POLICY_SHA256,
+    }
+    allowed_policies = (
+        (expected_policy, LEGACY_AGENT_TASK_POLICY_V4)
+        if allow_legacy_policy
+        else (expected_policy,)
+    )
+    if policy not in allowed_policies:
+        raise WorkflowError(
+            "terminal Agent Task failure has mismatched policy identity"
+        )
+    task = result.get("task")
+    generated = result.get("generated")
+    application = result.get("application")
+    report = result.get("report")
+    receipt = result.get("worker_receipt")
+    validation = result.get("validation")
+    error = result.get("error")
+    report_match = (
+        REPORT_PATH_PATTERN.fullmatch(report.get("path"))
+        if isinstance(report, dict) and isinstance(report.get("path"), str)
+        else None
+    )
+    receipt_match = (
+        RECEIPT_PATH_PATTERN.fullmatch(receipt.get("path"))
+        if isinstance(receipt, dict) and isinstance(receipt.get("path"), str)
+        else None
+    )
+    if (
+        result.get("status") != "error"
+        or result.get("mode") != "apply_with_report"
+        or result.get("requested_model") != requested_model
+        or result.get("repository")
+        != {"name_with_owner": preflight["pr"]["repo_name"]}
+        or result.get("pull_request") != expected_cloud_pull_request(preflight)
+        or not isinstance(task, dict)
+        or set(task) != {"id", "url", "state", "base_ref", "base_sha"}
+        or not isinstance(task.get("id"), str)
+        or not task["id"]
+        or not isinstance(task.get("url"), str)
+        or not task["url"]
+        or task.get("state") != "completed"
+        or task.get("base_ref") != preflight["pr"]["head_branch"]
+        or task.get("base_sha") != preflight["identity"]["head"]
+        or not isinstance(generated, dict)
+        or set(generated) != {"branch", "head_sha", "commits"}
+        or not isinstance(generated.get("branch"), str)
+        or not generated["branch"]
+        or not isinstance(generated.get("head_sha"), str)
+        or SHA_PATTERN.fullmatch(generated["head_sha"]) is None
+        or not isinstance(generated.get("commits"), list)
+        or any(
+            not isinstance(commit, str) or SHA_PATTERN.fullmatch(commit) is None
+            for commit in generated["commits"]
+        )
+        or application
+        != {
+            "status": "not_applied",
+            "final_local_head": preflight["identity"]["head"],
+        }
+        or not isinstance(report, dict)
+        or set(report) != {"path", "commit", "sha256"}
+        or report_match is None
+        or report.get("commit") != generated["head_sha"]
+        or report.get("sha256") is not None
+        or not isinstance(receipt, dict)
+        or set(receipt) != {"path", "commit", "sha256"}
+        or receipt_match is None
+        or receipt.get("commit") != generated["head_sha"]
+        or receipt.get("sha256") is not None
+        or report_match.group("request_id") != receipt_match.group("request_id")
+        or validation != {"complete": False, "outcomes": []}
+        or not isinstance(error, dict)
+        or set(error) != {"code", "message"}
+        or error.get("code") != "validation_incomplete"
+        or not isinstance(error.get("message"), str)
+        or not error["message"]
+    ):
+        raise WorkflowError(
+            "terminal Agent Task validation failure is malformed or mismatched"
+        )
+    return error
+
+
 def validate_success_result(
     result: dict[str, Any],
     *,
@@ -2775,7 +2879,7 @@ def validate_success_result(
 ) -> dict[str, Any]:
     expected_policy = {
         "id": "marketplace-agent-worker",
-        "version": 4,
+        "version": 5,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     if (
@@ -3398,8 +3502,7 @@ def build_worker_prompt(
         "validation": [
             {
                 "command": "<exact command or deterministic check>",
-                "status": "passed",
-                "detail": "<concise outcome>",
+                "outcome": "passed",
             }
         ],
     }
@@ -3896,6 +3999,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     prior_result,
                     preflight=active["preflight"],
                     requested_model=requested_model,
+                    allow_legacy_policy=True,
                 )
                 active.update(
                     {
@@ -3917,12 +4021,44 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 )
                 active.pop("recovery_command", None)
                 save_state(state_path, existing)
+            elif (
+                prior_task.get("state") == "completed"
+                and isinstance(prior_result.get("error"), dict)
+                and prior_result["error"].get("code") == "validation_incomplete"
+            ):
+                failure = validate_terminal_validation_failure_result(
+                    prior_result,
+                    preflight=active["preflight"],
+                    requested_model=requested_model,
+                    allow_legacy_policy=True,
+                )
+                active.update(
+                    {
+                        "task": prior_result["task"],
+                        "generated": prior_result["generated"],
+                        "report": prior_result["report"],
+                        "worker_receipt": prior_result["worker_receipt"],
+                        "status": "failed",
+                        "task_id": prior_task["id"],
+                        "task_id_status": "terminal_unusable",
+                        "error": failure,
+                        "retry_command": agent_task_retry_command(
+                            args,
+                            target=target["pr_url"],
+                            repo_root=repo_root,
+                            state_path=state_path,
+                        ),
+                    }
+                )
+                active.pop("recovery_command", None)
+                save_state(state_path, existing)
         if isinstance(active, dict) and active.get("status") not in {
             "completed",
             "consumed",
         } and not (
             active.get("status") == "failed"
-            and active.get("task_id_status") == "not_created"
+            and active.get("task_id_status")
+            in {"not_created", "terminal_unusable"}
         ):
             raise WorkflowError(
                 "an unfinished Agent Task already owns this state; use its "
@@ -3971,7 +4107,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
             if (
                 isinstance(active, dict)
                 and active.get("status") == "failed"
-                and active.get("task_id_status") == "not_created"
+                and active.get("task_id_status")
+                in {"not_created", "terminal_unusable"}
             ):
                 state.setdefault("managed_task_history", []).append(active)
         state["repo_root"] = str(repo_root)
@@ -4157,6 +4294,33 @@ def command_agent_task(args: argparse.Namespace) -> None:
                         "status": "failed",
                         "task_id": None,
                         "task_id_status": "not_created",
+                        "error": failure,
+                        "retry_command": agent_task_retry_command(
+                            args,
+                            target=pr["pr_url"],
+                            repo_root=repo_root,
+                            state_path=state_path,
+                        ),
+                    }
+                )
+                task_state.pop("recovery_command", None)
+                save_state(state_path, state)
+            elif (
+                isinstance(result_task, dict)
+                and result_task.get("state") == "completed"
+                and isinstance(result.get("error"), dict)
+                and result["error"].get("code") == "validation_incomplete"
+            ):
+                failure = validate_terminal_validation_failure_result(
+                    result,
+                    preflight=preflight,
+                    requested_model=requested_model,
+                )
+                task_state.update(
+                    {
+                        "status": "failed",
+                        "task_id": result_task_id,
+                        "task_id_status": "terminal_unusable",
                         "error": failure,
                         "retry_command": agent_task_retry_command(
                             args,
@@ -4410,7 +4574,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 if current_task.get("published_head_sha")
                 else "failed"
             )
-            if current_task.get("task_id_status") != "not_created":
+            if current_task.get("task_id_status") not in {
+                "not_created",
+                "terminal_unusable",
+            }:
                 current_task["error"] = str(error)
             current_task["failed_at"] = utc_now()
             recovery_candidates = {prompt_path, result_path}
