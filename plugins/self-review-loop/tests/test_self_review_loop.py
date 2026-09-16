@@ -19,6 +19,9 @@ PLUGIN = Path(__file__).parents[1] / "plugin.json"
 COMPACT_V3_REPORT = (
     Path(__file__).parent / "fixtures" / "compact-v3-report.md"
 )
+FORWARD_CLEAN_V3_REPORT = (
+    Path(__file__).parent / "fixtures" / "forward-clean-v3-report.md"
+)
 SPEC = importlib.util.spec_from_file_location("self_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -1320,7 +1323,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         pr = self.preflight["pr"]
         return json.dumps(
             {
-                "schema": MODULE.SELF_REVIEW_REPORT_SCHEMA,
+                "schema": MODULE.LEGACY_SELF_REVIEW_REPORT_SCHEMA,
                 "request_id": "request-1",
                 "repository": "owner/repo",
                 "pull_request": {
@@ -1354,7 +1357,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.18")
+        self.assertEqual(plugin["version"], "1.3.19")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -1373,8 +1376,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             prior_history=[],
         )
         self.assertIn("human-readable UTF-8 Markdown report", prompt)
-        self.assertIn("worker prompt version 3", prompt)
+        self.assertIn("worker prompt version 4", prompt)
         self.assertIn("do not omit the repository", prompt)
+        self.assertIn("including both head and base refs", prompt)
         self.assertIn("maximum_review_iterations", prompt)
         self.assertIn("untrusted data", prompt)
         self.assertIn("Map every fix commit to its findings in the report", prompt)
@@ -1395,6 +1399,130 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         self.assertEqual(report["outcome"], "cleared")
         self.assertEqual(remote["commits"], [])
+
+    def test_canonical_report_v2_requires_head_and_base_refs(self):
+        content = json.loads(self.report())
+        content["schema"] = MODULE.SELF_REVIEW_REPORT_SCHEMA
+        content["pull_request"].update(
+            {"head_ref": "feature", "base_ref": "main"}
+        )
+
+        report = MODULE.validate_self_review_report(
+            json.dumps(content),
+            request_id="request-1",
+            preflight=self.preflight,
+            remote=self.remote(),
+            max_iterations=5,
+        )
+
+        self.assertEqual("feature", report["pull_request"]["head_ref"])
+        missing_ref = json.loads(json.dumps(content))
+        missing_ref["pull_request"].pop("base_ref")
+        with self.assertRaisesRegex(MODULE.WorkflowError, "stale identity"):
+            MODULE.validate_self_review_report(
+                json.dumps(missing_ref),
+                request_id="request-1",
+                preflight=self.preflight,
+                remote=self.remote(),
+                max_iterations=5,
+            )
+
+    def test_exact_forward_clean_report_recovers_zero_commit_result(self):
+        preflight = {
+            **self.preflight,
+            "pr": {
+                **self.preflight["pr"],
+                "number": 377,
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_branch": "trask-actions-queue-events",
+                "head_sha": "8f66336f18bbb637f105548ec82e1de7a4f611a0",
+                "base_branch": "main",
+                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+                "title": "Collect organization-wide GitHub Actions queue data",
+                "body": (
+                    "Collect per-job GitHub Actions timing data hourly across active "
+                    "public OpenTelemetry repositories and store immutable "
+                    "gzip-compressed JSON Lines on the orphan "
+                    "`otelbot/github-actions-queue-data` branch.\n\n"
+                    "- Use the read-only `OpenTelemetry Actions Telemetry` GitHub App "
+                    "and keep the built-in workflow token limited to writing the data "
+                    "branch.\n"
+                    "- Checkpoint repository progress, revisit unfinished runs, and "
+                    "retain failed job lookups for retry.\n"
+                    "- Preserve matrix jobs, attempts, fork runs, runner metadata, and "
+                    "direct job links in the raw dataset.\n"
+                    "- Split searches around GitHub's 1,000-run API limit and checkpoint "
+                    "cleanly if the App exhausts its REST quota."
+                ),
+            },
+        }
+        content = FORWARD_CLEAN_V3_REPORT.read_text(encoding="utf-8")
+        self.assertEqual(
+            "93e363771b22e7af8f828adfd4f07d0e6e60fbb3d43375299d67bbca6e4c00d8",
+            MODULE.sha256_text(content),
+        )
+        common = {
+            "request_id": "30010d8a-e6c0-4830-a7ae-4b9916dd3a51",
+            "preflight": preflight,
+            "remote": {"commits": [], "requires_apply": True},
+            "max_iterations": 5,
+            "paths_by_commit": {},
+        }
+
+        report = MODULE.validate_self_review_report(content, **common)
+
+        self.assertEqual("cleared", report["outcome"])
+        self.assertEqual(1, report["iterations_used"])
+        self.assertEqual("dropped", report["findings"][0]["disposition"])
+        self.assertIsNone(report["findings"][0]["commit"])
+
+        parsed = MODULE.parse_markdown_report(content, description="test report")
+        malformed = []
+        wrong_repository = json.loads(json.dumps(parsed))
+        wrong_repository["repository"]["owner"] = "someone-else"
+        malformed.append(wrong_repository)
+        wrong_head = json.loads(json.dumps(parsed))
+        wrong_head["pull_request"]["head_sha"] = "0" * 40
+        malformed.append(wrong_head)
+        wrong_base = json.loads(json.dumps(parsed))
+        wrong_base["pull_request"]["base_branch"] = "release"
+        malformed.append(wrong_base)
+        wrong_title = json.loads(json.dumps(parsed))
+        wrong_title["metadata"]["title"]["current"] = "Changed title"
+        malformed.append(wrong_title)
+        wrong_body = json.loads(json.dumps(parsed))
+        wrong_body["metadata"]["body"]["current"] = "Changed body"
+        malformed.append(wrong_body)
+        wrong_iteration = json.loads(json.dumps(parsed))
+        wrong_iteration["iteration"]["maximum"] = 6
+        malformed.append(wrong_iteration)
+        unexpected_fix = json.loads(json.dumps(parsed))
+        unexpected_fix["fix_commits"] = ["5" * 40]
+        malformed.append(unexpected_fix)
+        fixed_candidate = json.loads(json.dumps(parsed))
+        fixed_candidate["findings"][0]["status"] = "fixed"
+        malformed.append(fixed_candidate)
+        unexpected_key = json.loads(json.dumps(parsed))
+        unexpected_key["status"] = "clean"
+        malformed.append(unexpected_key)
+        for candidate in malformed:
+            with self.subTest(candidate=candidate), self.assertRaises(
+                MODULE.WorkflowError
+            ):
+                MODULE.validate_self_review_report(
+                    f"```json\n{json.dumps(candidate)}\n```",
+                    **common,
+                )
+
+        for remote, paths in (
+            ({"commits": [], "requires_apply": False}, {}),
+            ({"commits": ["5" * 40], "requires_apply": True}, {"5" * 40: ["x"]}),
+        ):
+            with self.assertRaises(MODULE.WorkflowError):
+                MODULE.validate_self_review_report(
+                    content,
+                    **{**common, "remote": remote, "paths_by_commit": paths},
+                )
 
     def test_exact_compact_v3_report_recovers_with_verified_history(self):
         commits = [
@@ -1784,6 +1912,134 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             [call.kwargs["value"] for call in publish_shared_state.call_args_list],
             [None, self.head],
         )
+
+    def test_forward_clean_resume_reuses_task_and_preserves_all_artifacts(self):
+        state_path = self.directory / "forward-clean-resume.json"
+        prompt_path = self.directory / "retained-prompt.txt"
+        result_path = self.directory / "retained-result.json"
+        prompt_path.write_text("retained prompt", encoding="utf-8")
+        report_payload = {
+            "findings": [
+                {
+                    "body": "The candidate does not require a code change.",
+                    "location": {"path": "src/app.py", "line": 7},
+                    "status": "dropped",
+                    "commit": None,
+                }
+            ],
+            "fix_commits": [],
+            "repository": {"owner": "owner", "name": "repo"},
+            "pull_request": {
+                "number": 7,
+                "base_branch": "main",
+                "head_branch": "feature",
+                "head_sha": self.head,
+            },
+            "iteration": {"completed": 1, "maximum": 1, "result": "clean"},
+            "metadata": {
+                "title": {"current": "Current title", "proposed": None},
+                "body": {"current": "Current body", "proposed": None},
+            },
+        }
+        report = f"```json\n{json.dumps(report_payload)}\n```"
+        result = self.result()
+        result["report"]["sha256"] = MODULE.sha256_text(report)
+        result_path.write_text(json.dumps(result), encoding="utf-8")
+        MODULE.save_state(
+            state_path,
+            {
+                "version": 1,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "iterations": 0,
+                "next_candidate_id": 1,
+                "history": [],
+                "repo_root": str(self.repo_root),
+                "pr": self.preflight["pr"],
+                "review": {
+                    "id": "review-1",
+                    "status": "active",
+                    "iteration": 1,
+                    "head_sha": self.head,
+                    "candidates": [],
+                    "batches": [],
+                },
+                "agent_task": {
+                    "status": "failed",
+                    "run_id": "request-1",
+                    "model": "gpt-5.6-sol",
+                    "policy": "marketplace-agent-apply-report-worker@3",
+                    "allowed_iterations": 5,
+                    "preflight": self.preflight,
+                    "prompt_file": str(prompt_path),
+                    "result_file": str(result_path),
+                    "error": "report mismatch",
+                },
+            },
+        )
+        arguments = SimpleNamespace(
+            target="owner/repo#7",
+            repo_root=str(self.repo_root),
+            state=str(state_path),
+            resume=True,
+            preserve_artifacts=True,
+            model="sol",
+            max_iterations=5,
+            pipeline_run=None,
+            pipeline_iteration=None,
+            pipeline_max_iterations=None,
+        )
+        emitted = []
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "run") as run,
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value=self.preflight["identity"],
+            ),
+            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
+            mock.patch.object(
+                MODULE, "fetch_committed_text", return_value=report
+            ),
+            mock.patch.object(
+                MODULE, "metadata_for", return_value=self.preflight["pr"]
+            ),
+            mock.patch.object(MODULE, "resolve_shared_state_repo", return_value=None),
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        discover.assert_not_called()
+        run.assert_not_called()
+        state = MODULE.load_state(state_path)
+        self.assertEqual("completed", state["agent_task"]["status"])
+        self.assertEqual(1, state["agent_task"]["resume_attempts"])
+        self.assertFalse(state["agent_task"]["imported"])
+        self.assertEqual(self.head, state["agent_task"]["published_head_sha"])
+        self.assertEqual("clean", state["review"]["outcome"])
+        self.assertEqual(self.head, state["review"]["clean_at_head_sha"])
+        self.assertTrue(state["agent_task"]["artifacts_preserved"])
+        self.assertEqual(3, len(state["agent_task"]["preserved_artifacts"]))
+        self.assertEqual(
+            result["report"]["sha256"],
+            next(
+                item["sha256"]
+                for item in state["agent_task"]["preserved_artifacts"]
+                if item["path"] == result["report"]["path"]
+            ),
+        )
+        self.assertTrue(prompt_path.is_file())
+        self.assertTrue(result_path.is_file())
+        self.assertEqual("nothing_to_publish", emitted[-1]["result"])
+        self.assertEqual("cleared", emitted[-1]["stage_outcome"])
 
     def test_recovery_accepts_a_push_that_already_reached_the_verified_head(self):
         state_path = self.directory / "push-recovery-state.json"
