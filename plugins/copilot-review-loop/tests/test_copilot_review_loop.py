@@ -55,6 +55,14 @@ FORWARD_COMPACT_V3_REPORT = (
 POSITIONAL_COMPACT_V4_REPORT = (
     Path(__file__).parent / "fixtures" / "positional-compact-v4-report.md"
 )
+FORWARD_REPOSITORY_347_REPORT = (
+    Path(__file__).parent / "fixtures" / "forward-repository-347-report.md"
+)
+FORWARD_REPOSITORY_347_RESULT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "forward-repository-347-agent-task-result.json"
+)
 SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -1188,7 +1196,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.25")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.26")
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1464,6 +1472,127 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(115, report["comments"][0]["original_line"])
         self.assertEqual(commit, report["comments"][0]["commit"])
 
+    def test_exact_347_forward_repository_report_recovers_thread_ids_and_followup(self):
+        primary = "773083f6dc7e86684107ae5adba4b3cb0a2aa22b"
+        followup = "8c15ae92f010174cc4b0877582dc3e889396550d"
+        content = FORWARD_REPOSITORY_347_REPORT.read_text(encoding="utf-8")
+        payload = MODULE.parse_markdown_report(content, description="test report")
+        ids = {
+            "PRRT_kwDOTENyc86io4cl": 4018692884,
+            "PRRT_kwDOTENyc86io4c6": 4018692920,
+            "PRRT_kwDOTENyc86io4dJ": 4018692943,
+            "PRRT_kwDOTENyc86io4dV": 4018692968,
+        }
+        preflight = copy.deepcopy(self.preflight)
+        preflight["pr"].update(
+            {
+                "number": 347,
+                "repo_name": "open-telemetry/shared-workflows",
+                "pr_url": "https://github.com/open-telemetry/shared-workflows/pull/347",
+                "url": "https://github.com/open-telemetry/shared-workflows/pull/347",
+                "head_owner": "open-telemetry",
+                "head_repo": "shared-workflows",
+                "head_repository": "open-telemetry/shared-workflows",
+                "head_branch": "trask-fix-dashboard-publisher-contention",
+                "base_branch": "main",
+                "head_sha": "14cf2a9a1ee281423501ec0a1b69e9236c5a3816",
+                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+            }
+        )
+        preflight["comment_identities"] = [
+            {
+                "id": ids[item["thread_id"]],
+                "author": item["author"],
+                "body_sha256": item["body_sha256"],
+                "line": item["current_line"],
+                "original_line": item["original_line"],
+                "path": item["path"],
+                "review_id": item["review_id"],
+                "side": item["diff_side"],
+                "source": item["source"],
+                "thread_id": item["thread_id"],
+                "url": item["url"],
+            }
+            for item in payload["comments"]
+        ]
+        paths_by_commit = {
+            primary: [
+                ".github/scripts/pull-request-dashboard/netlify/lib/dashboard-queue.mjs",
+                ".github/scripts/pull-request-dashboard/process_queue_batch.py",
+                ".github/scripts/pull-request-dashboard/state_branch.py",
+                ".github/scripts/pull-request-dashboard/test_dashboard_queue.mjs",
+                ".github/scripts/pull-request-dashboard/test_process_queue_batch.py",
+                ".github/scripts/pull-request-dashboard/test_state_branch.py",
+            ],
+            followup: [
+                ".github/scripts/pull-request-dashboard/test_dashboard_queue.mjs"
+            ],
+        }
+        remote = MODULE.validate_success_result(
+            MODULE.load_agent_task_result(FORWARD_REPOSITORY_347_RESULT),
+            preflight=preflight,
+            requested_model="gpt-5.6-sol",
+        )
+        self.assertEqual([primary, followup], remote["commits"])
+        self.assertTrue(remote["requires_apply"])
+        self.assertEqual(
+            "4aa7fa8bf3e84374af5051d448104001481f9078caf87421c8bc7b6ed56b8833",
+            MODULE.sha256_text(content),
+        )
+
+        report = MODULE.validate_copilot_review_report(
+            content,
+            request_id="da11f083-e3a0-405c-ba50-7acfb1e51091",
+            preflight=preflight,
+            remote=remote,
+            paths_by_commit=paths_by_commit,
+        )
+
+        self.assertEqual(list(ids.values()), [item["id"] for item in report["comments"]])
+        self.assertEqual(
+            [primary] * 4,
+            [item["commit"] for item in report["comments"]],
+        )
+        malformed = copy.deepcopy(payload)
+        malformed["pull_request"]["head_sha"] = "9" * 40
+        bad_position = copy.deepcopy(payload)
+        bad_position["comments"][0]["current_line"] += 1
+        missing_field = copy.deepcopy(payload)
+        missing_field["comments"][0].pop("author")
+        duplicate_thread = copy.deepcopy(payload)
+        duplicate_thread["comments"][1]["thread_id"] = duplicate_thread["comments"][0][
+            "thread_id"
+        ]
+        for candidate in (
+            malformed,
+            bad_position,
+            missing_field,
+            duplicate_thread,
+        ):
+            with self.subTest(candidate=candidate), self.assertRaises(
+                MODULE.WorkflowError
+            ):
+                MODULE.validate_copilot_review_report(
+                    f"```json\n{json.dumps(candidate)}\n```",
+                    request_id="da11f083-e3a0-405c-ba50-7acfb1e51091",
+                    preflight=preflight,
+                    remote=remote,
+                    paths_by_commit=paths_by_commit,
+                )
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "supplemental fix commit"
+        ):
+            MODULE.validate_copilot_review_report(
+                content,
+                request_id="da11f083-e3a0-405c-ba50-7acfb1e51091",
+                preflight=preflight,
+                remote=remote,
+                paths_by_commit={
+                    **paths_by_commit,
+                    followup: ["unreported.py"],
+                },
+            )
+
     def test_forward_compact_v3_report_rejects_lost_position_identity(self):
         payload = MODULE.parse_markdown_report(
             FORWARD_COMPACT_V3_REPORT.read_text(encoding="utf-8"),
@@ -1571,6 +1700,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn('"author": "copilot-pull-request-reviewer[bot]"', prompt)
         self.assertIn('"head_ref": "feature"', prompt)
         self.assertIn('"base_ref": "main"', prompt)
+        self.assertIn("squash a correction-only follow-up", prompt)
 
     def test_canonical_report_v3_validates_refs_and_separate_author(self):
         preflight = copy.deepcopy(self.preflight)

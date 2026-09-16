@@ -3466,6 +3466,7 @@ def validate_copilot_review_report(
 ) -> dict[str, Any]:
     require_no_credentials(content, source="Copilot Review Loop report")
     report = parse_markdown_report(content, description="Copilot Review Loop report")
+    supplemental_commits: list[str] = []
     if isinstance(report, dict) and set(report) == {
         "comments",
         "fix_commits",
@@ -3526,6 +3527,17 @@ def validate_copilot_review_report(
             remote=remote,
             commit_key="commit",
             recover_omitted_position=True,
+        )
+    elif isinstance(report, dict) and set(report) == {
+        "comments",
+        "pull_request",
+    }:
+        report, supplemental_commits = normalize_repository_compact_review_report(
+            report,
+            request_id=request_id,
+            preflight=preflight,
+            remote=remote,
+            paths_by_commit=paths_by_commit,
         )
     expected_keys = {
         "schema",
@@ -3609,18 +3621,193 @@ def validate_copilot_review_report(
             raise WorkflowError(
                 "no-change comment must not name a commit or changed path"
             )
-    if accounted_commits != remote["commits"]:
+    if supplemental_commits:
+        if accounted_commits + supplemental_commits != remote["commits"]:
+            raise WorkflowError(
+                "forward repository report does not account for every fix commit"
+            )
+    elif accounted_commits != remote["commits"]:
         raise WorkflowError("report comments do not account for every fix commit")
     declared: dict[str, set[str]] = {commit: set() for commit in remote["commits"]}
     for item in report["comments"]:
         if item["disposition"] == "fixed":
             declared[item["commit"]].update(item["changed_paths"])
     for commit, actual_paths in paths_by_commit.items():
-        if set(actual_paths) != declared.get(commit, set()):
+        actual = set(actual_paths)
+        if commit in supplemental_commits:
+            declared_paths = set().union(*declared.values())
+            if not actual or not actual <= declared_paths:
+                raise WorkflowError(
+                    f"supplemental fix commit {commit} changed unexpected paths"
+                )
+        elif actual != declared.get(commit, set()):
             raise WorkflowError(f"fix commit {commit} changed unexpected paths")
     if bool(remote["commits"]) != (report["outcome"] == "addressed"):
         raise WorkflowError("report outcome does not match its fix commits")
     return report
+
+
+def normalize_repository_compact_review_report(
+    report: dict[str, Any],
+    *,
+    request_id: str,
+    preflight: dict[str, Any],
+    remote: dict[str, Any],
+    paths_by_commit: dict[str, list[str]],
+) -> tuple[dict[str, Any], list[str]]:
+    pr = preflight["pr"]
+    expected_pull_request = {
+        "base_ref": pr["base_branch"],
+        "base_repository": pr["repo_name"],
+        "head_ref": pr["head_branch"],
+        "head_repository": pr["head_repository"],
+        "head_sha": pr["head_sha"],
+        "number": pr["number"],
+        "repository": pr["repo_name"],
+    }
+    comments = report.get("comments")
+    expected_comments = preflight["comment_identities"]
+    item_keys = {
+        "author",
+        "body_sha256",
+        "changed_paths",
+        "commit",
+        "current_line",
+        "diff_side",
+        "disposition",
+        "original_line",
+        "path",
+        "review_id",
+        "source",
+        "thread_id",
+        "url",
+    }
+    if (
+        report.get("pull_request") != expected_pull_request
+        or not isinstance(comments, list)
+        or len(comments) != len(expected_comments)
+        or remote.get("requires_apply") is not True
+    ):
+        raise WorkflowError(
+            "Copilot Review Loop forward repository report has stale identity"
+        )
+    by_thread = {
+        item.get("thread_id"): item
+        for item in comments
+        if isinstance(item, dict) and isinstance(item.get("thread_id"), str)
+    }
+    if len(by_thread) != len(comments):
+        raise WorkflowError(
+            "Copilot Review Loop forward repository report has duplicate threads"
+        )
+    normalized_comments = []
+    for expected in expected_comments:
+        item = by_thread.get(expected.get("thread_id"))
+        if (
+            not isinstance(item, dict)
+            or set(item) != item_keys
+            or item.get("author") != expected.get("author")
+            or item.get("body_sha256") != expected.get("body_sha256")
+            or item.get("current_line") != expected.get("line")
+            or item.get("diff_side") != expected.get("side")
+            or item.get("original_line") != expected.get("original_line")
+            or item.get("path") != expected.get("path")
+            or item.get("review_id") != expected.get("review_id")
+            or item.get("source") != expected.get("source")
+            or item.get("url") != expected.get("url")
+            or item.get("disposition") not in {"fixed", "no_change"}
+            or not isinstance(item.get("changed_paths"), list)
+        ):
+            raise WorkflowError(
+                "Copilot Review Loop forward repository report has a "
+                "mismatched comment"
+            )
+        paths = item["changed_paths"]
+        if any(
+            not isinstance(path, str)
+            or not path
+            or Path(path).is_absolute()
+            or ".." in Path(path).parts
+            for path in paths
+        ) or len(paths) != len(set(paths)):
+            raise WorkflowError(
+                "Copilot Review Loop forward repository report has invalid paths"
+            )
+        if item["disposition"] == "fixed":
+            commit = item.get("commit")
+            if commit not in remote["commits"] or not paths:
+                raise WorkflowError(
+                    "Copilot Review Loop forward repository report has no "
+                    "verified fix commit"
+                )
+            reason = (
+                "The managed task mapped this finding to the verified changed "
+                f"paths in commit {commit}."
+            )
+            reply = "The fix was verified against the reported changed paths."
+        else:
+            if item.get("commit") is not None or paths:
+                raise WorkflowError(
+                    "Copilot Review Loop forward repository no-change finding "
+                    "has a commit or changed path"
+                )
+            commit = None
+            reason = "The managed task reported that this finding needs no code change."
+            reply = "No code change was needed."
+        normalized_comments.append(
+            {
+                **expected,
+                "disposition": item["disposition"],
+                "reason": reason,
+                "commit": commit,
+                "reply": reply,
+                "changed_paths": paths,
+            }
+        )
+    accounted_commits = []
+    for item in normalized_comments:
+        commit = item["commit"]
+        if commit is not None and commit not in accounted_commits:
+            accounted_commits.append(commit)
+    if accounted_commits != remote["commits"][: len(accounted_commits)]:
+        raise WorkflowError(
+            "Copilot Review Loop forward repository report reordered fix commits"
+        )
+    supplemental_commits = remote["commits"][len(accounted_commits) :]
+    if supplemental_commits and not accounted_commits:
+        raise WorkflowError(
+            "Copilot Review Loop forward repository report omitted its primary "
+            "fix commit"
+        )
+    declared_paths = {
+        path
+        for item in normalized_comments
+        if item["disposition"] == "fixed"
+        for path in item["changed_paths"]
+    }
+    for commit in supplemental_commits:
+        actual_paths = set(paths_by_commit.get(commit, []))
+        if not actual_paths or not actual_paths <= declared_paths:
+            raise WorkflowError(
+                f"supplemental fix commit {commit} changed unexpected paths"
+            )
+    return (
+        {
+            "schema": POSITIONAL_COPILOT_REVIEW_REPORT_SCHEMA,
+            "request_id": request_id,
+            "repository": pr["repo_name"],
+            "pull_request": {
+                "number": pr["number"],
+                "head_sha": pr["head_sha"],
+                "base_sha": pr["base_sha"],
+                "title_sha256": sha256_text(pr["title"]),
+                "body_sha256": sha256_text(pr["body"]),
+            },
+            "outcome": "addressed" if remote["commits"] else "no_changes",
+            "comments": normalized_comments,
+        },
+        supplemental_commits,
+    )
 
 
 def normalize_position_compact_review_report(
@@ -4345,7 +4532,8 @@ def build_worker_prompt(
         "Put fixes in linear, single-parent commits before the final report "
         "artifact commit. Create no empty fix commit. The final artifact commit must "
         "contain only the managed report. A no-code result still needs that final "
-        "artifact. List every path changed by each disposition and "
+        "artifact. Before writing the report, squash a correction-only follow-up into "
+        "the fix commit it corrects. List every path changed by each disposition and "
         "account for every fix commit. Do not mutate GitHub review threads, replies, "
         "review requests, pull request metadata, or branches. The local coordinator "
         "owns authenticated publication after it validates your result. Write the report "
