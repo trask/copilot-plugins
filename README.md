@@ -47,12 +47,13 @@ runtime is missing, disabled, or incompatible.
 Uses a managed GitHub Agent Task to inspect the complete pinned pull request
 diff and run focused probes in isolation. The local coordinator validates the
 task's committed report and receipt, then checks each candidate with a separate
-Claude evaluator before it creates and verifies one pending review.
+fixed evaluator before it creates and verifies one pending review.
 
 Run this agent with GPT-5.6 Sol at high reasoning effort. It checks each finding
-with a separate Claude Sonnet 5 evaluator. The plugin verifies the shared Agent
-Tasks runtime and uses policy `marketplace-agent-worker@1`. It never uses Cloud
-Sandboxes or a local-analysis fallback.
+with a separate GPT-5.6 Sol evaluator at max reasoning effort. The evaluator is
+independent of the selected managed worker model. The plugin verifies the shared
+Agent Tasks runtime and uses policy `marketplace-agent-worker@1`. It never uses
+Cloud Sandboxes or a local-analysis fallback.
 
 ### Copilot Review Loop
 

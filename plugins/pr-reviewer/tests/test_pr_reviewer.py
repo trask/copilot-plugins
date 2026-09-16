@@ -89,8 +89,8 @@ class ThinCoordinatorInstructionsTest(unittest.TestCase):
         self.assertIn("`PR Review: <PR number> - <PR title>`", instructions)
         self.assertIn("`python \"$helper\" check <target> --model <model>`", instructions)
         self.assertIn("`check` is the sole authoritative local preflight", instructions)
-        self.assertIn("model exactly `claude-sonnet-5`", instructions)
-        self.assertIn("reasoning effort exactly `high`", instructions)
+        self.assertIn("model exactly `gpt-5.6-sol`", instructions)
+        self.assertIn("reasoning effort exactly `max`", instructions)
         self.assertIn("Never replace it with the selected worker model", instructions)
         self.assertIn("must not call tools, execute code, run probes", instructions)
         self.assertIn("If the runtime cannot guarantee that exact evaluator", instructions)
@@ -120,7 +120,7 @@ class ThinCoordinatorInstructionsTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn(
-            "every fixed Claude evaluator rejects them, report no findings",
+            "every fixed evaluator rejects them, report no findings",
             instructions,
         )
         self.assertIn("Do not serialize a comments file", instructions)
