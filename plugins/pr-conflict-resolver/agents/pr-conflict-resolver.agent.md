@@ -41,7 +41,7 @@ Without pipeline position, the helper allows three managed attempts per state fi
 
 The helper performs a trusted local preflight without executing repository code. It freezes the exact open pull request, branch, head, base, merge base, merge settings, strategy, allowed conflict and companion paths, complete old commit identities, iteration, budget, local identity, and dependency guards. A native-stack request also freezes every member in order, its trunk, direct base, unique range, lease, expected parent, and every outside dependent.
 
-The Agent Tasks runtime is bundled with this plugin. The helper writes the closed `github.copilot.agent-task-conflict-request` version 1 file and a trusted prompt outside the repository. It loads only the adjacent `cloud_conflict_task.py`, verifies SHA-256 `3f9807c392bb31dc3ddcfe74d367b620f417dffc00b1904c78415da43c8b9ad9`, and invokes it once with:
+The helper records `preparing` ownership at the explicit state path before conflict preflight. A preflight error records failed or interrupted ownership with a null task ID and `not_created` status, so a wrapper exit cannot erase the attempted run. The Agent Tasks runtime is bundled with this plugin. The helper writes the closed `github.copilot.agent-task-conflict-request` version 1 file and a trusted prompt outside the repository. It loads only the adjacent `cloud_conflict_task.py`, verifies SHA-256 `3f9807c392bb31dc3ddcfe74d367b620f417dffc00b1904c78415da43c8b9ad9`, and invokes it once with:
 
 ```text
 --conflict-with-report --strategy <merge|rebase|native-stack> --request-file <absolute-path> --prompt-file <absolute-path> --result-file <absolute-path> --policy marketplace-conflict-worker@1 --pr <canonical-url> --model <alias>

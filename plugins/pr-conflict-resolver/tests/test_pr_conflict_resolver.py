@@ -1120,6 +1120,87 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertNotIn("recovery_command", payload)
         self.assertIn("--state", payload["retry_command"])
 
+    def test_preflight_failure_persists_before_task_creation(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+            ]
+        )
+        target = MODULE.parse_target("owner/repo#7")
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(
+                MODULE,
+                "conflict_preflight",
+                side_effect=MODULE.WorkflowError("preflight command exited 1"),
+            ),
+            mock.patch.object(MODULE, "discover_conflict_task") as discover,
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(args)
+
+        discover.assert_not_called()
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        task = state["agent_task"]
+        self.assertEqual("failed", task["status"])
+        self.assertIsNone(task["task_id"])
+        self.assertEqual("not_created", task["task_id_status"])
+        self.assertEqual("conflict_preflight_failed", task["error"]["code"])
+        payload = emitted(emit)
+        self.assertEqual("task_creation_failed", payload["result"])
+        self.assertEqual(str(state_path), payload["state"])
+        self.assertIn("preflight command exited 1", payload["error"]["message"])
+
+        status_args = MODULE.build_parser().parse_args(
+            ["status", "--state", str(state_path)]
+        )
+        with mock.patch.object(MODULE, "emit") as status_emit:
+            MODULE.command_status(status_args)
+        status = emitted(status_emit)
+        self.assertEqual("ready", status["result"])
+        self.assertEqual("failed", status["agent_task"]["status"])
+
+    def test_system_exit_during_preflight_records_interrupted_ownership(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+            ]
+        )
+        target = MODULE.parse_target("owner/repo#7")
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(MODULE, "conflict_preflight", side_effect=SystemExit(2)),
+            self.assertRaises(SystemExit),
+        ):
+            MODULE.command_agent_task(args)
+
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        task = state["agent_task"]
+        self.assertEqual("interrupted", task["status"])
+        self.assertIsNone(task["task_id"])
+        self.assertEqual("not_created", task["task_id_status"])
+        self.assertEqual("conflict_preflight_interrupted", task["error"]["code"])
+
     def test_agent_contract_documents_the_default_and_budget_retry(self):
         self.assertIn("three managed attempts per state file by default", self.instructions)
         self.assertIn("`--max-iterations <count>`", self.instructions)

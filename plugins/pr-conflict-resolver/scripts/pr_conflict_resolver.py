@@ -8080,27 +8080,99 @@ def command_agent_task(args: argparse.Namespace) -> None:
             if args.pipeline_run
             else f"conflict-{run_id}"
         )
-        preflight = conflict_preflight(
-            repo_root,
-            target,
-            requested_strategy=args.strategy,
-            whole_stack=args.whole_stack,
-            iteration_id=iteration_id,
-            iteration_number=iteration_number,
-            iteration_budget=iteration_budget,
-            model=model,
-        )
-        if preflight["already_mergeable"]:
-            state = existing or {
-                "version": STATE_VERSION,
-                "created_at": utc_now(),
-                "attempts": prior_attempts,
-                "history": [],
-                "escalation": None,
+        state = existing or {
+            "version": STATE_VERSION,
+            "created_at": utc_now(),
+            "attempts": prior_attempts,
+            "history": [],
+            "escalation": None,
+        }
+        if replaced_task is not None:
+            state.setdefault("managed_task_history", []).append(replaced_task)
+        state["repo_root"] = str(repo_root)
+        state["pr"] = state.get("pr") or {
+            "number": target["number"],
+            "title": None,
+            "pr_url": target["pr_url"],
+            "repo_name": target["repo_name"],
+            "head_branch": None,
+            "base_branch": None,
+            "head_sha": None,
+        }
+        state["agent_task"] = {
+            "run_id": run_id,
+            "status": "preparing",
+            "task_id": None,
+            "task_id_status": "not_created",
+            "model": model,
+            "policy": CONFLICT_POLICY,
+            "target": target["pr_url"],
+            "requested_strategy": args.strategy,
+            "whole_stack": args.whole_stack,
+            "iteration": {
+                "id": iteration_id,
+                "number": iteration_number,
+                "budget": iteration_budget,
+            },
+        }
+        save_state(state_path, state)
+        try:
+            preflight = conflict_preflight(
+                repo_root,
+                target,
+                requested_strategy=args.strategy,
+                whole_stack=args.whole_stack,
+                iteration_id=iteration_id,
+                iteration_number=iteration_number,
+                iteration_budget=iteration_budget,
+                model=model,
+            )
+        except (WorkflowError, json.JSONDecodeError, OSError) as error:
+            task = state["agent_task"]
+            task["status"] = "failed"
+            task["error"] = {
+                "code": "conflict_preflight_failed",
+                "message": str(error),
             }
+            save_state(state_path, state)
+            emit(
+                {
+                    "result": "task_creation_failed",
+                    "state": str(state_path),
+                    "task_id": None,
+                    "task_id_status": "not_created",
+                    "error": task["error"],
+                    "retry_command": managed_retry_command(
+                        args,
+                        repo_root=repo_root,
+                        target=target,
+                        state_path=state_path,
+                        next_budget=iteration_budget,
+                    ),
+                    "stage_outcome": "escalated",
+                }
+            )
+            return
+        except BaseException as error:
+            task = state["agent_task"]
+            task["status"] = "interrupted"
+            task["error"] = {
+                "code": "conflict_preflight_interrupted",
+                "message": f"{type(error).__name__}: {error}",
+            }
+            save_state(state_path, state)
+            raise
+        if preflight["already_mergeable"]:
             state["managed_attempts"] = prior_managed_attempts
             state["last_result"] = "mergeable"
             state["pr"] = preflight["pr"]
+            state["agent_task"].update(
+                {
+                    "status": "completed",
+                    "task_id_status": "not_needed",
+                    "outcome": "already_mergeable",
+                }
+            )
             save_state(state_path, state)
             emit(
                 {
@@ -8126,18 +8198,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
         prompt = build_conflict_prompt(preflight)
         require_no_credentials(prompt, source="conflict worker prompt")
         atomic_write_text(prompt_path, prompt)
-        state = existing or {
-            "version": STATE_VERSION,
-            "created_at": utc_now(),
-            "history": [],
-            "escalation": None,
-        }
         state["attempts"] = prior_attempts + 1
         state["managed_attempts"] = prior_managed_attempts + 1
         state["repo_root"] = str(repo_root)
         state["pr"] = preflight["pr"]
-        if replaced_task is not None:
-            state.setdefault("managed_task_history", []).append(replaced_task)
         state["agent_task"] = {
             "run_id": run_id,
             "status": "dispatching",
