@@ -7,6 +7,7 @@ import argparse
 import ast
 import base64
 import binascii
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -3700,13 +3701,43 @@ def require_live_pr_snapshot(
         "base_sha",
         "state",
     )
-    if actual.get("head_sha") != expected_head or any(
-        actual.get(field) != expected.get(field) for field in fields
-    ):
-        raise WorkflowError(
-            "live pull request identity, head, base, title, or body drifted from "
-            "the pinned snapshot"
+    mismatches = []
+    if actual.get("head_sha") != expected_head:
+        mismatches.append(
+            snapshot_mismatch_detail(
+                "head_sha", expected_head, actual.get("head_sha")
+            )
         )
+    mismatches.extend(
+        snapshot_mismatch_detail(field, expected.get(field), actual.get(field))
+        for field in fields
+        if actual.get(field) != expected.get(field)
+    )
+    if mismatches:
+        raise WorkflowError(
+            "live pull request snapshot drifted: " + "; ".join(mismatches)
+        )
+
+
+def snapshot_mismatch_detail(field: str, expected: Any, actual: Any) -> str:
+    def identity(value: Any) -> str:
+        if field in {"title", "body"} and isinstance(value, str):
+            encoded = value.encode("utf-8")
+            return json.dumps(
+                {
+                    "type": "str",
+                    "characters": len(value),
+                    "bytes": len(encoded),
+                    "sha256": hashlib.sha256(encoded).hexdigest(),
+                },
+                sort_keys=True,
+            )
+        return json.dumps(
+            {"type": type(value).__name__, "value": value},
+            sort_keys=True,
+        )
+
+    return f"{field} expected={identity(expected)} actual={identity(actual)}"
 
 
 def wait_for_live_pr_snapshot(
@@ -4017,6 +4048,241 @@ def validate_preserved_agent_task_artifacts(
             raise WorkflowError("prepared Agent Task artifact manifest is malformed")
     if seen_local != local_paths or not seen_report:
         raise WorkflowError("prepared Agent Task artifact manifest is incomplete")
+
+
+def require_github_ancestor(repository: str, older: str, newer: str) -> None:
+    if older == newer:
+        return
+    payload = gh_json(
+        ["api", f"repos/{repository}/compare/{older}...{newer}"]
+    )
+    merge_base = (
+        payload.get("merge_base_commit") if isinstance(payload, dict) else None
+    )
+    if (
+        not isinstance(payload, dict)
+        or payload.get("status") != "ahead"
+        or not isinstance(merge_base, dict)
+        or merge_base.get("sha") != older
+    ):
+        raise WorkflowError(
+            f"cannot archive stale owner because {older} is not an ancestor of {newer}"
+        )
+
+
+def command_archive_stale_agent_task(args: argparse.Namespace) -> None:
+    if not args.preserve_artifacts:
+        raise WorkflowError(
+            "archive-stale-agent-task requires --preserve-artifacts"
+        )
+    require_tools()
+    repo_root = resolve_repo_root(args.repo_root)
+    target = resolve_target(args.target, repo_root)
+    state_path = cli_path(args.state) if args.state else default_state_path(target)
+    state = load_state(state_path)
+    task_state = state.get("agent_task")
+    if not isinstance(task_state, dict) or task_state.get("status") != "failed":
+        raise WorkflowError("state has no failed Agent Task owner to archive")
+    run_id = task_state.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise WorkflowError("failed Agent Task owner has no run identity")
+    if any(
+        isinstance(item, dict) and item.get("run_id") == run_id
+        for item in (state.get("managed_task_history") or [])
+    ):
+        raise WorkflowError("failed Agent Task owner was already archived")
+    requested_model = MODEL_ALIASES[args.model]
+    preflight = task_state.get("preflight")
+    if (
+        task_state.get("model") != requested_model
+        or not isinstance(preflight, dict)
+        or not isinstance(preflight.get("pr"), dict)
+        or not isinstance(preflight.get("identity"), dict)
+    ):
+        raise WorkflowError("failed Agent Task owner has invalid pinned identity")
+    allowed_iterations = task_state.get("allowed_iterations")
+    if (
+        isinstance(allowed_iterations, bool)
+        or not isinstance(allowed_iterations, int)
+        or allowed_iterations < 1
+    ):
+        raise WorkflowError("failed Agent Task owner has invalid iteration allowance")
+    prompt_value = task_state.get("prompt_file")
+    result_value = task_state.get("result_file")
+    if not isinstance(prompt_value, str) or not isinstance(result_value, str):
+        raise WorkflowError("failed Agent Task owner has no retained artifacts")
+    prompt_path = Path(prompt_value)
+    result_path = Path(result_value)
+    for artifact in (prompt_path, result_path):
+        require_outside_repository(artifact, repo_root)
+        if not artifact.is_file():
+            raise WorkflowError(f"failed Agent Task artifact is missing: {artifact}")
+    result_sha256 = sha256_file(result_path)
+    result = load_agent_task_result(result_path)
+    remote = validate_success_result(
+        result,
+        preflight=preflight,
+        requested_model=requested_model,
+    )
+    old_pr = preflight["pr"]
+    if (
+        remote["commits"] != []
+        or remote["final_local_head"] != old_pr["head_sha"]
+    ):
+        raise WorkflowError(
+            "only a structurally clean zero-commit Agent Task may be archived as stale"
+        )
+    paths_by_commit = validate_generated_history(
+        repo_root,
+        base_sha=old_pr["head_sha"],
+        remote=remote,
+    )
+    if paths_by_commit != {}:
+        raise WorkflowError("stale clean Agent Task unexpectedly changed source paths")
+    report_content = fetch_committed_text(
+        old_pr["repo_name"],
+        remote["report_path"],
+        remote["generated_head"],
+        description="Self Review Loop report",
+    )
+    if sha256_text(report_content) != remote["report_sha256"]:
+        raise WorkflowError("stale Agent Task report digest does not match its result")
+    report = validate_self_review_report(
+        report_content,
+        request_id=remote["request_id"],
+        preflight=preflight,
+        remote=remote,
+        max_iterations=allowed_iterations,
+        paths_by_commit=paths_by_commit,
+    )
+    if (
+        report["outcome"] != "cleared"
+        or report["findings"] != []
+        or report["pull_request_metadata"]["decision"] != "keep"
+    ):
+        raise WorkflowError(
+            "only an exact clean no-change Agent Task may be archived as stale"
+        )
+    live_preflight = agent_task_preflight(repo_root, target)
+    live_pr = live_preflight["pr"]
+    stable_fields = (
+        "number",
+        "repo_name",
+        "pr_url",
+        "title",
+        "body",
+        "head_owner",
+        "head_repo",
+        "head_branch",
+        "base_branch",
+        "state",
+    )
+    stable_mismatches = [
+        snapshot_mismatch_detail(field, old_pr.get(field), live_pr.get(field))
+        for field in stable_fields
+        if old_pr.get(field) != live_pr.get(field)
+    ]
+    if stable_mismatches:
+        raise WorkflowError(
+            "cannot archive stale Agent Task after unrelated PR drift: "
+            + "; ".join(stable_mismatches)
+        )
+    if (
+        old_pr["head_sha"] == live_pr["head_sha"]
+        and old_pr["base_sha"] == live_pr["base_sha"]
+    ):
+        raise WorkflowError("Agent Task identity is still current and cannot be archived")
+    require_github_ancestor(
+        old_pr["repo_name"], old_pr["base_sha"], live_pr["base_sha"]
+    )
+    require_github_ancestor(
+        old_pr["head_repository"], old_pr["head_sha"], live_pr["head_sha"]
+    )
+    review = state.get("review")
+    expected_review_id = f"pr-{old_pr['number']}-agent-task-{run_id}"
+    if (
+        not isinstance(review, dict)
+        or review.get("id") != expected_review_id
+        or review.get("status") != "active"
+        or review.get("head_sha") != old_pr["head_sha"]
+    ):
+        raise WorkflowError("failed Agent Task review owner is not active and exact")
+    finalize_agent_task_artifacts(
+        task_state,
+        {prompt_path, result_path},
+        preserve=True,
+        report_content=report_content,
+    )
+    archived_at = utc_now()
+    stale_identity = {
+        "pinned_head_sha": old_pr["head_sha"],
+        "pinned_base_sha": old_pr["base_sha"],
+        "live_head_sha": live_pr["head_sha"],
+        "live_base_sha": live_pr["base_sha"],
+    }
+    archived_task = copy.deepcopy(task_state)
+    archived_task.update(
+        {
+            "status": "archived_stale",
+            "archive_reason": "live_head_or_base_advanced",
+            "archived_at": archived_at,
+            "stale_identity": stale_identity,
+            "result_sha256": result_sha256,
+            "report_sha256": remote["report_sha256"],
+            "ordered_commits": [],
+            "paths_by_commit": [],
+            "findings": [],
+            "pull_request_metadata": report["pull_request_metadata"],
+            "outcome": report["outcome"],
+            "iterations_used": report["iterations_used"],
+        }
+    )
+    state.setdefault("managed_task_history", []).append(archived_task)
+    archived_review = copy.deepcopy(review)
+    archived_review.update(
+        {
+            "status": "stale",
+            "failure_reason": "live_head_or_base_advanced",
+            "stale_identity": stale_identity,
+            "archived_at": archived_at,
+        }
+    )
+    state.setdefault("managed_review_history", []).append(archived_review)
+    consumed_task = copy.deepcopy(archived_task)
+    consumed_task["status"] = "consumed"
+    consumed_task["consumed_at"] = archived_at
+    retry_args = argparse.Namespace(
+        model=args.model,
+        max_iterations=args.max_iterations,
+        pipeline_run=None,
+        pipeline_iteration=None,
+        pipeline_max_iterations=None,
+        preserve_artifacts=True,
+        prepare_only=True,
+    )
+    next_command = agent_task_retry_command(
+        retry_args,
+        target=live_pr["pr_url"],
+        repo_root=repo_root,
+        state_path=state_path,
+    )
+    consumed_task["next_command"] = next_command
+    state["agent_task"] = consumed_task
+    state["review"] = archived_review
+    state["pr"] = live_pr
+    state["repo_root"] = str(repo_root)
+    save_state(state_path, state)
+    emit(
+        {
+            "result": "stale_owner_archived",
+            "state": str(state_path),
+            "owner": run_id,
+            "task_id": remote["task_id"],
+            "stale_identity": stale_identity,
+            "preserved_artifacts": archived_task["preserved_artifacts"],
+            "next_command": next_command,
+        }
+    )
 
 
 def command_agent_task(args: argparse.Namespace) -> None:
@@ -5205,6 +5471,40 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     agent_task.set_defaults(function=command_agent_task)
+
+    archive_stale = subparsers.add_parser(
+        "archive-stale-agent-task",
+        help=(
+            "preserve and archive one exact clean Agent Task whose live head or "
+            "base advanced"
+        ),
+    )
+    archive_stale.add_argument(
+        "target",
+        nargs="?",
+        help=(
+            "PR URL or owner/repo#number; omit only from a worktree attached to "
+            "the PR's branch"
+        ),
+    )
+    archive_stale.add_argument("--repo-root")
+    archive_stale.add_argument("--state")
+    archive_stale.add_argument(
+        "--model",
+        choices=sorted(MODEL_ALIASES),
+        default="sol",
+    )
+    archive_stale.add_argument(
+        "--max-iterations",
+        type=int,
+        default=DEFAULT_MAX_ITERATIONS,
+    )
+    archive_stale.add_argument(
+        "--preserve-artifacts",
+        action="store_true",
+        help="retain the stale task prompt, result, and committed report",
+    )
+    archive_stale.set_defaults(function=command_archive_stale_agent_task)
 
     preflight = subparsers.add_parser(
         "preflight",

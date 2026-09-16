@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import copy
 import importlib.util
 import inspect
 import io
@@ -1731,7 +1732,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.22")
+        self.assertEqual(plugin["version"], "1.3.23")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -2183,12 +2184,33 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             )
         live = dict(self.preflight["pr"])
         live["body"] = "changed underneath the task"
-        with self.assertRaisesRegex(MODULE.WorkflowError, "drifted"):
+        with self.assertRaises(MODULE.WorkflowError) as caught:
             MODULE.require_live_pr_snapshot(
                 self.preflight["pr"],
                 live,
                 expected_head=self.head,
             )
+        detail = str(caught.exception)
+        self.assertIn("body expected=", detail)
+        self.assertIn(MODULE.sha256_text(self.preflight["pr"]["body"]), detail)
+        self.assertIn(MODULE.sha256_text(live["body"]), detail)
+        self.assertNotIn(self.preflight["pr"]["body"], detail)
+        self.assertNotIn(live["body"], detail)
+
+        live = dict(self.preflight["pr"])
+        live["base_sha"] = "5" * 40
+        with self.assertRaises(MODULE.WorkflowError) as caught:
+            MODULE.require_live_pr_snapshot(
+                self.preflight["pr"],
+                live,
+                expected_head=self.head,
+            )
+        self.assertEqual(
+            str(caught.exception),
+            "live pull request snapshot drifted: "
+            'base_sha expected={"type": "str", "value": "2222222222222222222222222222222222222222"} '
+            'actual={"type": "str", "value": "5555555555555555555555555555555555555555"}',
+        )
 
     def test_waits_for_its_own_published_head_but_rejects_other_drift(self):
         fix = "5" * 40
@@ -3014,6 +3036,208 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("--apply-prepared", task["apply_command"])
         self.assertNotIn('"--resume"', task["apply_command"])
         self.assertEqual("validated_pending_import", emitted[-1]["result"])
+
+    def test_archives_stale_clean_owner_once_before_fresh_preparation(self):
+        state_path = self.directory / "stale-clean-owner.json"
+        prompt_path = self.directory / "retained-prompt.txt"
+        result_path = self.directory / "retained-result.json"
+        prompt_path.write_bytes(b"retained prompt")
+        result_content = SPLIT_IDENTITY_CLEAN_V3_RESULT.read_text(encoding="utf-8")
+        result_path.write_bytes(result_content.encode("utf-8"))
+        result = json.loads(result_content)
+        report = SPLIT_IDENTITY_CLEAN_V3_REPORT.read_text(encoding="utf-8")
+        preflight = self.split_identity_preflight()
+        owner = "9d697bac9a648c8e9bff516986aedcc2"
+        review_id = f"pr-347-agent-task-{owner}"
+        MODULE.save_state(
+            state_path,
+            {
+                "version": 1,
+                "created_at": "2026-09-16T13:19:10Z",
+                "updated_at": "2026-09-16T13:39:41Z",
+                "iterations": 0,
+                "next_candidate_id": 1,
+                "history": [],
+                "managed_task_history": [{"run_id": "legacy-owner"}],
+                "managed_review_history": [{"id": "legacy-review"}],
+                "repo_root": str(self.repo_root),
+                "pr": preflight["pr"],
+                "review": {
+                    "id": review_id,
+                    "status": "active",
+                    "iteration": 1,
+                    "head_sha": preflight["pr"]["head_sha"],
+                    "candidates": [],
+                    "batches": [],
+                },
+                "agent_task": {
+                    "status": "failed",
+                    "run_id": owner,
+                    "resume_attempts": 1,
+                    "model": "gpt-5.6-sol",
+                    "policy": MODULE.AGENT_TASK_POLICY,
+                    "allowed_iterations": 5,
+                    "preflight": preflight,
+                    "prompt_file": str(prompt_path),
+                    "result_file": str(result_path),
+                    "task": result["task"],
+                    "generated": result["generated"],
+                    "report": result["report"],
+                    "attestation": result["attestation"],
+                    "worker_receipt": None,
+                    "clear_shared_state_on_apply": False,
+                    "error": (
+                        "live pull request snapshot drifted: "
+                        "base_sha expected=old actual=new"
+                    ),
+                },
+            },
+        )
+        live_preflight = copy.deepcopy(preflight)
+        live_preflight["pr"]["base_sha"] = "5" * 40
+        arguments = SimpleNamespace(
+            target="open-telemetry/shared-workflows#347",
+            repo_root=str(self.repo_root),
+            state=str(state_path),
+            model="sol",
+            max_iterations=5,
+            preserve_artifacts=True,
+        )
+        emitted = []
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target(arguments.target),
+            ),
+            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=live_preflight
+            ),
+            mock.patch.object(MODULE, "require_github_ancestor") as ancestor,
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.command_archive_stale_agent_task(arguments)
+
+        ancestor.assert_has_calls(
+            [
+                mock.call(
+                    "open-telemetry/shared-workflows",
+                    preflight["pr"]["base_sha"],
+                    live_preflight["pr"]["base_sha"],
+                ),
+                mock.call(
+                    "open-telemetry/shared-workflows",
+                    preflight["pr"]["head_sha"],
+                    live_preflight["pr"]["head_sha"],
+                ),
+            ]
+        )
+        archived = MODULE.load_state(state_path)
+        self.assertEqual("consumed", archived["agent_task"]["status"])
+        self.assertEqual(owner, archived["agent_task"]["run_id"])
+        self.assertEqual(
+            "live_head_or_base_advanced",
+            archived["agent_task"]["archive_reason"],
+        )
+        self.assertEqual(2, len(archived["managed_task_history"]))
+        stale_task = archived["managed_task_history"][-1]
+        self.assertEqual("archived_stale", stale_task["status"])
+        self.assertIn("base_sha expected=old", stale_task["error"])
+        self.assertEqual(3, len(stale_task["preserved_artifacts"]))
+        self.assertEqual([], stale_task["ordered_commits"])
+        self.assertEqual([], stale_task["paths_by_commit"])
+        self.assertEqual([], stale_task["findings"])
+        self.assertEqual("keep", stale_task["pull_request_metadata"]["decision"])
+        self.assertEqual(2, len(archived["managed_review_history"]))
+        stale_review = archived["managed_review_history"][-1]
+        self.assertEqual(review_id, stale_review["id"])
+        self.assertEqual("stale", stale_review["status"])
+        self.assertEqual(
+            "live_head_or_base_advanced", stale_review["failure_reason"]
+        )
+        self.assertEqual("5" * 40, archived["pr"]["base_sha"])
+        self.assertIn("--prepare-only", archived["agent_task"]["next_command"])
+        self.assertIn("--preserve-artifacts", archived["agent_task"]["next_command"])
+        self.assertNotIn("--resume", archived["agent_task"]["next_command"])
+        self.assertEqual("stale_owner_archived", emitted[-1]["result"])
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target(arguments.target),
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "no failed Agent Task"),
+        ):
+            MODULE.command_archive_stale_agent_task(arguments)
+        self.assertEqual(
+            2, len(MODULE.load_state(state_path)["managed_task_history"])
+        )
+
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        merged_preflight = copy.deepcopy(live_preflight)
+        merged_preflight["identity"]["head"] = "6" * 40
+        merged_preflight["pr"]["head_sha"] = "6" * 40
+        fresh = self.arguments(state_path)
+        fresh.target = arguments.target
+        fresh.prepare_only = True
+        fresh.preserve_artifacts = True
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target(fresh.target),
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=merged_preflight
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value=merged_preflight["identity"],
+            ),
+            mock.patch.object(
+                MODULE.secrets,
+                "token_hex",
+                side_effect=["fresh-invocation", "fresh-owner"],
+            ),
+            mock.patch.object(
+                MODULE, "run", side_effect=RuntimeError("stop after fresh dispatch")
+            ),
+            mock.patch.object(MODULE, "publish_shared_state") as publish_shared,
+            self.assertRaisesRegex(RuntimeError, "stop after fresh dispatch"),
+        ):
+            MODULE.command_agent_task(fresh)
+
+        replaced = MODULE.load_state(state_path)
+        self.assertEqual("fresh-owner", replaced["agent_task"]["run_id"])
+        self.assertEqual(2, len(replaced["managed_task_history"]))
+        self.assertEqual(2, len(replaced["managed_review_history"]))
+        publish_shared.assert_not_called()
+
+    def test_archive_requires_fast_forward_head_and_base_movement(self):
+        with mock.patch.object(
+            MODULE,
+            "gh_json",
+            return_value={
+                "status": "diverged",
+                "merge_base_commit": {"sha": "3" * 40},
+            },
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "not an ancestor"):
+                MODULE.require_github_ancestor(
+                    "owner/repo", "1" * 40, "2" * 40
+                )
 
     def test_recovery_accepts_a_push_that_already_reached_the_verified_head(self):
         state_path = self.directory / "push-recovery-state.json"
