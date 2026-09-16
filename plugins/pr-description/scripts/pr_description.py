@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import copy
 from contextlib import contextmanager
 import datetime as dt
 import errno
@@ -80,6 +81,11 @@ PR_DESCRIPTION_PROPOSAL_SCHEMA = {
     "version": 2,
 }
 WORKER_PROMPT_VERSION = 3
+LEGACY_TASKLESS_POLICY = {
+    "id": "marketplace-agent-worker",
+    "version": 4,
+    "sha256": "04c1f4c1098ef0419f2bd94b8be120e303218588f2804ed79c0d706c8c2915ad",
+}
 MODEL_ALIASES = {
     "luna": "gpt-5.6-luna",
     "terra": "gpt-5.6-terra",
@@ -2296,10 +2302,510 @@ def finalize_agent_task_artifacts(
     task_state.pop("result_file", None)
 
 
+def agent_task_recovery_command(
+    *,
+    target: str,
+    repo_root: Path,
+    state_path: Path,
+    model: str,
+    prepare_only: bool = False,
+    apply_prepared: bool = False,
+    preserve_artifacts: bool = False,
+) -> str:
+    values = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "agent-task",
+        target,
+        "--repo-root",
+        str(repo_root),
+        "--state",
+        str(state_path),
+        "--model",
+        model,
+    ]
+    values.append("--apply-prepared" if apply_prepared else "--resume")
+    if prepare_only:
+        values.append("--prepare-only")
+    if preserve_artifacts:
+        values.append("--preserve-artifacts")
+    return " ".join(json.dumps(value) for value in values)
+
+
+def validate_preserved_agent_task_artifacts(
+    task_state: dict[str, Any], repo_root: Path, *, report_content: str | None = None
+) -> None:
+    manifest = task_state.get("preserved_artifacts")
+    prompt = task_state.get("prompt_file")
+    result = task_state.get("result_file")
+    report = task_state.get("report")
+    if (
+        task_state.get("artifacts_preserved") is not True
+        or not isinstance(manifest, list)
+        or len(manifest) != 3
+        or not isinstance(prompt, str)
+        or not isinstance(result, str)
+        or not isinstance(report, dict)
+    ):
+        raise WorkflowError("prepared Agent Task has no complete artifact manifest")
+    expected_local = {prompt, result}
+    seen_local: set[str] = set()
+    seen_report = False
+    for artifact in manifest:
+        if (
+            not isinstance(artifact, dict)
+            or not isinstance(artifact.get("path"), str)
+            or isinstance(artifact.get("size"), bool)
+            or not isinstance(artifact.get("size"), int)
+            or artifact["size"] < 0
+            or not isinstance(artifact.get("sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"])
+        ):
+            raise WorkflowError("prepared Agent Task artifact manifest is malformed")
+        artifact_path = artifact["path"]
+        if artifact_path in expected_local:
+            if set(artifact) != {"path", "size", "sha256"}:
+                raise WorkflowError(
+                    "prepared Agent Task local artifact manifest is malformed"
+                )
+            path = Path(artifact_path)
+            require_outside_repository(path, repo_root)
+            if (
+                not path.is_file()
+                or path.stat().st_size != artifact["size"]
+                or sha256_file(path) != artifact["sha256"]
+            ):
+                raise WorkflowError("prepared Agent Task artifact identity drifted")
+            seen_local.add(artifact_path)
+        elif artifact_path == report.get("path"):
+            if (
+                set(artifact) != {"path", "commit", "size", "sha256"}
+                or artifact.get("commit") != report.get("commit")
+                or artifact["sha256"] != report.get("sha256")
+            ):
+                raise WorkflowError(
+                    "prepared Agent Task report manifest is malformed"
+                )
+            if report_content is not None and (
+                len(report_content.encode("utf-8")) != artifact["size"]
+                or sha256_text(report_content) != artifact["sha256"]
+            ):
+                raise WorkflowError("prepared Agent Task report identity drifted")
+            seen_report = True
+        else:
+            raise WorkflowError("prepared Agent Task artifact manifest has an extra path")
+    if seen_local != expected_local or not seen_report:
+        raise WorkflowError("prepared Agent Task artifact manifest is incomplete")
+
+
+def proposal_preparation(
+    *,
+    preflight: dict[str, Any],
+    remote: dict[str, Any],
+    report: dict[str, Any],
+    result_sha256: str,
+) -> dict[str, Any]:
+    pr = preflight["pr"]
+    return {
+        "source_head_sha": pr["head_sha"],
+        "base_sha": pr["base"]["sha"],
+        "current_title_sha256": sha256_text(pr["title"]),
+        "current_body_sha256": sha256_text(pr["body"]),
+        "generated_head_sha": remote["generated_head"],
+        "report_path": remote["report_path"],
+        "report_sha256": remote["report_sha256"],
+        "result_sha256": result_sha256,
+        "decision": report["decision"],
+        "proposal": report["proposal"],
+        "evidence": report["evidence"],
+    }
+
+
+def record_agent_task_preparation(
+    path: Path,
+    state: dict[str, Any],
+    *,
+    preflight: dict[str, Any],
+    identity: dict[str, str],
+    result: dict[str, Any],
+    remote: dict[str, Any],
+    report: dict[str, Any],
+    result_sha256: str,
+    artifacts: list[Path],
+    report_content: str,
+    model: str,
+) -> None:
+    task_state = state["agent_task"]
+    preparation = proposal_preparation(
+        preflight=preflight,
+        remote=remote,
+        report=report,
+        result_sha256=result_sha256,
+    )
+    task_state.update(
+        {
+            "status": "validated_pending_apply",
+            "preflight": {**preflight, "identity": identity},
+            "task": result["task"],
+            "generated": result["generated"],
+            "report": result["report"],
+            "attestation": result["attestation"],
+            "decision": report["decision"],
+            "proposal": report["proposal"],
+            "evidence": report["evidence"],
+            "result_sha256": result_sha256,
+            "preparation": preparation,
+            "validated_at": utc_now(),
+        }
+    )
+    finalize_agent_task_artifacts(
+        task_state,
+        artifacts,
+        report_content=report_content,
+        preserve=True,
+    )
+    task_state["prepared_at"] = utc_now()
+    apply_command = agent_task_recovery_command(
+        target=preflight["pr"]["url"],
+        repo_root=Path(preflight["repository_root"]),
+        state_path=path,
+        model=model,
+        apply_prepared=True,
+        preserve_artifacts=True,
+    )
+    task_state["apply_command"] = apply_command
+    task_state["recovery_command"] = apply_command
+    save_state(path, state)
+    refresh_run_index(path, state)
+    emit(
+        {
+            "result": "validated_pending_apply",
+            "state": str(path),
+            "pr": preflight["pr"]["url"],
+            "head_sha": preflight["pr"]["head_sha"],
+            "base_sha": preflight["pr"]["base"]["sha"],
+            "decision": report["decision"],
+            "proposal": report["proposal"],
+            "evidence": report["evidence"],
+            "task": result["task"],
+            "generated": result["generated"],
+            "report": result["report"],
+            "result_sha256": result_sha256,
+            "preserved_artifacts": task_state["preserved_artifacts"],
+            "apply_command": apply_command,
+        }
+    )
+
+
+def validated_action_from_checkpoint(
+    state: dict[str, Any],
+    report: dict[str, Any],
+) -> dict[str, Any] | None:
+    validation = state.get("validation")
+    if not isinstance(validation, dict):
+        return None
+    pr = state["agent_task"]["preflight"]["pr"]
+    proposal = report["proposal"]
+    mode = "no_change" if report["decision"] == "keep" else "applied"
+    if (
+        validation.get("mode") != mode
+        or validation.get("run_id") != state["run_id"]
+        or validation.get("head_sha") != pr["head_sha"]
+        or validation.get("title") != proposal["title"]
+        or validation.get("body") != proposal["body"]
+    ):
+        raise WorkflowError(
+            "prepared Agent Task has a mismatched metadata application checkpoint"
+        )
+    return {
+        "result": "validated" if mode == "no_change" else "applied",
+        "state": "",
+        "head_sha": pr["head_sha"],
+        "title": proposal["title"],
+        "body": proposal["body"],
+        "validated_head_sha": pr["head_sha"],
+        "run_id": state["run_id"],
+    }
+
+
+def stored_prepared_proposal(
+    state: dict[str, Any],
+    report: dict[str, Any],
+) -> dict[str, Any] | None:
+    proposal = state.get("proposal")
+    if proposal is None:
+        return None
+    pr = state["agent_task"]["preflight"]["pr"]
+    if (
+        not isinstance(proposal, dict)
+        or proposal.get("number") != 1
+        or proposal.get("run_id") != state["run_id"]
+        or proposal.get("base")
+        != {
+            "head_sha": pr["head_sha"],
+            "title": pr["title"],
+            "body": pr["body"],
+        }
+        or proposal.get("title") != report["proposal"]["title"]
+        or proposal.get("body") != report["proposal"]["body"]
+        or proposal.get("token") != proposal_token_for(proposal)
+        or proposal_count(state) != 1
+    ):
+        raise WorkflowError("stored prepared metadata proposal drifted")
+    return proposal
+
+
+def record_recovered_prepared_application(
+    path: Path,
+    state: dict[str, Any],
+    *,
+    proposal: dict[str, Any],
+    live: dict[str, Any],
+) -> dict[str, Any]:
+    pr = state["agent_task"]["preflight"]["pr"]
+    state["pr"] = {**state["pr"], **live}
+    state["validated_head_sha"] = pr["head_sha"]
+    state["validation"] = {
+        "mode": "applied",
+        "proposal_number": proposal["number"],
+        "proposal_token": proposal["token"],
+        "run_id": state["run_id"],
+        "head_sha": pr["head_sha"],
+        "title": live["title"],
+        "body": live["body"],
+        "validated_at": utc_now(),
+        "conditional_update": False,
+        "precondition_strategy": "exact_prepared_metadata_after_interruption",
+        "residual_race": RESIDUAL_UPDATE_RACE,
+    }
+    save_state(path, state)
+    refresh_run_index(path, state)
+    return {
+        "result": "applied",
+        "state": str(path),
+        "head_sha": pr["head_sha"],
+        "title": live["title"],
+        "body": live["body"],
+        "validated_head_sha": pr["head_sha"],
+        "run_id": state["run_id"],
+        "proposal_token": proposal["token"],
+        "conditional_update": False,
+        "residual_race": RESIDUAL_UPDATE_RACE,
+    }
+
+
+def apply_prepared_agent_task(args: argparse.Namespace) -> None:
+    if not args.state:
+        raise WorkflowError("--apply-prepared requires the exact run state path")
+    if not args.preserve_artifacts:
+        raise WorkflowError("--apply-prepared requires --preserve-artifacts")
+    require_tools()
+    path = cli_path(args.state)
+    state = load_run_state(path)
+    repo_root = resolve_repo_root(args.repo_root)
+    task_state = state.get("agent_task")
+    if (
+        not isinstance(task_state, dict)
+        or task_state.get("status")
+        not in {
+            "validated_pending_apply",
+            "applying",
+            "failed_after_mutation",
+        }
+        or not isinstance(task_state.get("preparation"), dict)
+        or task_state.get("model") != MODEL_ALIASES[args.model]
+    ):
+        if isinstance(task_state, dict) and task_state.get("status") == "completed":
+            raise WorkflowError("prepared Agent Task was already consumed")
+        raise WorkflowError("state has no matching validated preparation")
+    preflight = task_state.get("preflight")
+    if (
+        not isinstance(preflight, dict)
+        or Path(preflight.get("repository_root", "")).resolve() != repo_root
+        or not isinstance(preflight.get("identity"), dict)
+        or not isinstance(preflight.get("pr"), dict)
+    ):
+        raise WorkflowError("prepared Agent Task has invalid pinned identity")
+    target = resolve_target(args.target, repo_root)
+    if not same_pr(preflight["pr"], target):
+        raise WorkflowError("prepared Agent Task target does not match")
+    prompt_path = Path(task_state.get("prompt_file", ""))
+    result_path = Path(task_state.get("result_file", ""))
+    validate_preserved_agent_task_artifacts(task_state, repo_root)
+    try:
+        identity = local_identity(repo_root)
+        if identity != preflight["identity"]:
+            raise WorkflowError("local repository identity drifted from preparation")
+        result = load_agent_task_result(result_path)
+        result_sha256 = sha256_file(result_path)
+        remote = validate_success_result(
+            result,
+            preflight=preflight,
+            requested_model=MODEL_ALIASES[args.model],
+            identity=identity,
+        )
+        report_content = fetch_committed_text(
+            preflight["pr"]["repo_name"],
+            remote["report_path"],
+            remote["generated_head"],
+            description="proposal report",
+        )
+        if sha256_text(report_content) != remote["report_sha256"]:
+            raise WorkflowError("Agent Task proposal report digest does not match")
+        validate_preserved_agent_task_artifacts(
+            task_state, repo_root, report_content=report_content
+        )
+        changed_files = pull_request_file_paths(preflight)
+        report = validate_proposal_report(
+            report_content,
+            request_id=remote["request_id"],
+            preflight=preflight,
+            changed_files=changed_files,
+            proposal_count=proposal_count(state),
+        )
+        expected = proposal_preparation(
+            preflight=preflight,
+            remote=remote,
+            report=report,
+            result_sha256=result_sha256,
+        )
+        if (
+            task_state.get("preparation") != expected
+            or task_state.get("decision") != report["decision"]
+            or task_state.get("proposal") != report["proposal"]
+            or task_state.get("evidence") != report["evidence"]
+            or task_state.get("result_sha256") != result_sha256
+        ):
+            raise WorkflowError("validated proposal preparation drifted")
+        checkpoint = validated_action_from_checkpoint(state, report)
+        if checkpoint is None:
+            live = metadata_for(target)
+            stored = stored_prepared_proposal(state, report)
+            expected_applied = copy.deepcopy(preflight["pr"])
+            expected_applied["title"] = report["proposal"]["title"]
+            expected_applied["body"] = report["proposal"]["body"]
+            if (
+                task_state["status"] == "applying"
+                and report["decision"] == "replace"
+                and stored is not None
+                and live["head_sha"] == preflight["pr"]["head_sha"]
+                and live["title"] == report["proposal"]["title"]
+                and live["body"] == report["proposal"]["body"]
+            ):
+                require_live_snapshot(
+                    expected_applied,
+                    live,
+                    preflight["pr"]["head_sha"],
+                )
+                action = record_recovered_prepared_application(
+                    path,
+                    state,
+                    proposal=stored,
+                    live=live,
+                )
+            else:
+                require_live_snapshot(
+                    preflight["pr"], live, preflight["pr"]["head_sha"]
+                )
+                task_state["status"] = "applying"
+                save_state(path, state)
+                refresh_run_index(path, state)
+                if report["decision"] == "keep":
+                    action = validate_no_change(
+                        path,
+                        state,
+                        expected_head=preflight["pr"]["head_sha"],
+                        expected_run_id=state["run_id"],
+                    )
+                else:
+                    proposal = stored or store_proposal(
+                        path,
+                        state,
+                        title=report["proposal"]["title"],
+                        body=report["proposal"]["body"],
+                    )
+                    action = apply_proposal(
+                        path,
+                        state,
+                        expected_head=preflight["pr"]["head_sha"],
+                        expected_run_id=state["run_id"],
+                        expected_proposal_token=proposal["token"],
+                    )
+        else:
+            expected_live = copy.deepcopy(preflight["pr"])
+            expected_live["title"] = report["proposal"]["title"]
+            expected_live["body"] = report["proposal"]["body"]
+            require_live_snapshot(
+                expected_live,
+                metadata_for(target),
+                preflight["pr"]["head_sha"],
+            )
+            action = checkpoint
+        completed = load_run_state(path)
+        completed["agent_task"].update(
+            {
+                "status": "completed",
+                "completed_at": utc_now(),
+                "artifacts_removed": False,
+            }
+        )
+        completed["agent_task"].pop("apply_command", None)
+        completed["agent_task"].pop("recovery_command", None)
+        completed["agent_task"].pop("apply_error", None)
+        save_state(path, completed)
+        refresh_run_index(path, completed)
+        finalize_agent_task_artifacts(
+            completed["agent_task"],
+            [prompt_path, result_path],
+            report_content=report_content,
+            preserve=True,
+        )
+        save_state(path, completed)
+        refresh_run_index(path, completed)
+        emit(
+            {
+                "result": action["result"],
+                "state": str(path),
+                "pr": preflight["pr"]["url"],
+                "head_sha": preflight["pr"]["head_sha"],
+                "current": {
+                    "title": preflight["pr"]["title"],
+                    "body": preflight["pr"]["body"],
+                },
+                "decision": report["decision"],
+                "proposal": report["proposal"],
+                "evidence": report["evidence"],
+                "task": result["task"],
+                "attestation": "dispatcher_structural",
+                "title": action["title"],
+                "body": action["body"],
+                "validated_head_sha": action["validated_head_sha"],
+                "preserved_artifacts": completed["agent_task"][
+                    "preserved_artifacts"
+                ],
+            }
+        )
+    except BaseException as error:
+        failed = load_run_state(path)
+        failed_task = failed.get("agent_task")
+        if isinstance(failed_task, dict) and failed_task.get("status") != "completed":
+            if failed.get("validated_head_sha") is not None:
+                failed_task["status"] = "failed_after_mutation"
+            elif failed_task.get("status") != "applying":
+                failed_task["status"] = "validated_pending_apply"
+            failed_task["apply_error"] = str(error)
+            failed_task["failed_at"] = utc_now()
+            save_state(path, failed)
+            refresh_run_index(path, failed)
+        raise
+
+
 def resume_agent_task(args: argparse.Namespace) -> None:
     require_tools()
     if not args.state:
         raise WorkflowError("--resume requires the exact run state path")
+    if getattr(args, "prepare_only", False) and not args.preserve_artifacts:
+        raise WorkflowError("--prepare-only requires --preserve-artifacts")
     path = cli_path(args.state)
     state = load_run_state(path)
     repo_root = resolve_repo_root(args.repo_root)
@@ -2368,6 +2874,22 @@ def resume_agent_task(args: argparse.Namespace) -> None:
             changed_files=changed_files,
             proposal_count=proposal_count(state),
         )
+        if getattr(args, "prepare_only", False):
+            current = load_run_state(path)
+            record_agent_task_preparation(
+                path,
+                current,
+                preflight=preflight,
+                identity=identity,
+                result=result,
+                remote=remote,
+                report=report,
+                result_sha256=result_sha256,
+                artifacts=artifacts,
+                report_content=report_content,
+                model=args.model,
+            )
+            return
         if report["decision"] != "keep":
             raise WorkflowError(
                 "retained recovery supports only a verified no-change decision"
@@ -2449,7 +2971,441 @@ def resume_agent_task(args: argparse.Namespace) -> None:
         raise
 
 
+def require_github_ancestor(repository: str, older: str, newer: str) -> None:
+    payload = gh_json(["api", f"repos/{repository}/compare/{older}...{newer}"])
+    merge_base = payload.get("merge_base_commit") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("status") not in {"ahead", "identical"}
+        or not isinstance(merge_base, dict)
+        or merge_base.get("sha") != older
+    ):
+        raise WorkflowError(
+            f"cannot archive stale taskless run because {older} is not an "
+            f"ancestor of {newer}"
+        )
+
+
+def validate_taskless_legacy_result(
+    result: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    requested_model: str,
+) -> None:
+    pr = state["pr"]
+    null_task = {
+        "id": None,
+        "url": None,
+        "state": None,
+        "base_ref": None,
+        "base_sha": None,
+    }
+    if (
+        result.get("schema") != LEGACY_AGENT_TASK_RESULT_SCHEMA
+        or result.get("status") != "error"
+        or result.get("mode") != "report"
+        or result.get("repository") != {"name_with_owner": pr["repo_name"]}
+        or result.get("pull_request")
+        != {
+            "number": pr["number"],
+            "url": pr["url"],
+            "base_repository": pr["base"]["repository"],
+            "base_ref": pr["base"]["ref"],
+            "base_sha": pr["base"]["sha"],
+            "head_repository": pr["head"]["repository"],
+            "head_ref": pr["head"]["ref"],
+            "head_sha": pr["head_sha"],
+        }
+        or result.get("requested_model") != requested_model
+        or result.get("policy") != LEGACY_TASKLESS_POLICY
+        or result.get("task") != null_task
+        or result.get("generated")
+        != {"branch": None, "head_sha": None, "commits": []}
+        or result.get("application")
+        != {"status": "not_applicable", "final_local_head": pr["head_sha"]}
+        or result.get("report") is not None
+        or result.get("validation") != {"complete": False, "outcomes": []}
+        or result.get("error")
+        != {
+            "code": "api_failure",
+            "message": (
+                "start Agent Task failed with HTTP 409: user or repo does not "
+                "have CCA enabled; the request cannot be completed"
+            ),
+        }
+    ):
+        raise WorkflowError(
+            "legacy taskless Agent Task result has mismatched identity or fields"
+        )
+    receipt = result.get("worker_receipt")
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != {"path", "commit", "sha256"}
+        or receipt.get("commit") is not None
+        or receipt.get("sha256") is not None
+        or not isinstance(receipt.get("path"), str)
+        or RECEIPT_PATH_PATTERN.fullmatch(receipt["path"]) is None
+    ):
+        raise WorkflowError(
+            "legacy taskless Agent Task result has a malformed receipt identity"
+        )
+
+
+def taskless_artifact_manifest(
+    task_state: dict[str, Any], repo_root: Path
+) -> list[dict[str, Any]]:
+    paths = []
+    for field in ("prompt_file", "result_file"):
+        value = task_state.get(field)
+        if not isinstance(value, str):
+            raise WorkflowError("taskless run has no complete retained artifacts")
+        path = Path(value)
+        require_outside_repository(path, repo_root)
+        if not path.is_file():
+            raise WorkflowError(f"taskless retained artifact is missing: {path}")
+        paths.append(path)
+    prompt_content = paths[0].read_text(encoding="utf-8")
+    require_no_credentials(prompt_content, source="legacy Agent Task prompt")
+    return [
+        {
+            "path": str(path),
+            "size": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        for path in sorted(paths, key=lambda item: str(item))
+    ]
+
+
+def stable_pr_fields(pr: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "number": pr.get("number"),
+        "repo_name": pr.get("repo_name"),
+        "url": pr.get("url"),
+        "title": pr.get("title"),
+        "body": pr.get("body"),
+        "is_draft": pr.get("is_draft"),
+        "head_repository": (pr.get("head") or {}).get("repository"),
+        "head_ref": (pr.get("head") or {}).get("ref"),
+        "base_repository": (pr.get("base") or {}).get("repository"),
+        "base_ref": (pr.get("base") or {}).get("ref"),
+    }
+
+
+def fresh_agent_task_command(
+    *,
+    target: str,
+    repo_root: Path,
+    model: str,
+) -> str:
+    values = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "agent-task",
+        target,
+        "--repo-root",
+        str(repo_root),
+        "--model",
+        model,
+        "--prepare-only",
+        "--preserve-artifacts",
+    ]
+    return " ".join(json.dumps(value) for value in values)
+
+
+def command_archive_taskless_runs(args: argparse.Namespace) -> None:
+    if not args.preserve_artifacts:
+        raise WorkflowError("archive-taskless-runs requires --preserve-artifacts")
+    if not args.run_id or len(args.run_id) != len(set(args.run_id)):
+        raise WorkflowError("archive-taskless-runs requires unique --run-id values")
+    require_tools()
+    repo_root = resolve_repo_root(args.repo_root)
+    target = resolve_target(args.target, repo_root)
+    index_path = cli_path(args.state) if args.state else default_state_path(target)
+    index = load_state(index_path)
+    if index.get("kind") != INDEX_KIND or not same_pr(index["pr"], target):
+        raise WorkflowError("taskless migration requires the exact PR state index")
+    summaries = {
+        item.get("run_id"): item
+        for item in index.get("runs", [])
+        if isinstance(item, dict) and isinstance(item.get("run_id"), str)
+    }
+    if set(args.run_id) != set(summaries):
+        raise WorkflowError(
+            "taskless migration run IDs do not exactly match the indexed runs"
+        )
+    live = agent_task_preflight(repo_root, target)
+    marker_identity = {
+        "run_ids": list(args.run_id),
+        "live_head_sha": live["pr"]["head_sha"],
+        "live_base_sha": live["pr"]["base"]["sha"],
+        "live_title_sha256": sha256_text(live["pr"]["title"]),
+        "live_body_sha256": sha256_text(live["pr"]["body"]),
+    }
+    with index_lock(index_path):
+        locked_index = load_state(index_path)
+        locked_run_ids = [
+            item.get("run_id")
+            for item in locked_index.get("runs", [])
+            if isinstance(item, dict)
+        ]
+        if (
+            locked_index.get("kind") != INDEX_KIND
+            or not same_pr(locked_index["pr"], target)
+            or set(locked_run_ids) != set(args.run_id)
+        ):
+            raise WorkflowError("taskless migration index changed before reservation")
+        existing_marker = locked_index.get("taskless_archive")
+        if existing_marker is None:
+            marker = {**marker_identity, "started_at": utc_now()}
+            locked_index["taskless_archive"] = marker
+            save_state(index_path, locked_index)
+        elif (
+            isinstance(existing_marker, dict)
+            and {
+                key: existing_marker.get(key) for key in marker_identity
+            }
+            == marker_identity
+            and isinstance(existing_marker.get("started_at"), str)
+        ):
+            marker = existing_marker
+        else:
+            raise WorkflowError(
+                "another taskless migration reservation already exists"
+            )
+        index = locked_index
+        summaries = {
+            item["run_id"]: item
+            for item in index["runs"]
+            if isinstance(item, dict) and isinstance(item.get("run_id"), str)
+        }
+    requested_model = MODEL_ALIASES[args.model]
+    archived_entries = index.setdefault("archived_taskless_runs", [])
+    if not isinstance(archived_entries, list):
+        raise WorkflowError("taskless archive history is malformed")
+    archived_by_id = {
+        item.get("run_id"): item
+        for item in archived_entries
+        if isinstance(item, dict) and isinstance(item.get("run_id"), str)
+    }
+    output = []
+    for run_id in args.run_id:
+        run_path_value = summaries[run_id].get("state")
+        if not isinstance(run_path_value, str):
+            raise WorkflowError(f"indexed taskless run {run_id} has no state path")
+        run_path = Path(run_path_value)
+        state = load_run_state(run_path)
+        if state["run_id"] != run_id or Path(state.get("index_path", "")) != index_path:
+            raise WorkflowError(f"indexed taskless run {run_id} identity drifted")
+        task_state = state.get("agent_task")
+        if not isinstance(task_state, dict):
+            raise WorkflowError(f"indexed taskless run {run_id} has no Agent Task")
+        manifest = taskless_artifact_manifest(task_state, repo_root)
+        result_path = Path(task_state["result_file"])
+        result = load_agent_task_result(result_path)
+        validate_taskless_legacy_result(
+            result,
+            state=state,
+            requested_model=requested_model,
+        )
+        if stable_pr_fields(state["pr"]) != stable_pr_fields(live["pr"]):
+            raise WorkflowError(
+                f"cannot archive taskless run {run_id} after unrelated PR drift"
+            )
+        old_head = state["pr"]["head_sha"]
+        old_base = state["pr"]["base"]["sha"]
+        new_head = live["pr"]["head_sha"]
+        new_base = live["pr"]["base"]["sha"]
+        if old_head == new_head and old_base == new_base:
+            raise WorkflowError(f"taskless run {run_id} is still current")
+        require_github_ancestor(state["pr"]["head"]["repository"], old_head, new_head)
+        require_github_ancestor(state["pr"]["base"]["repository"], old_base, new_base)
+        result_sha256 = sha256_file(result_path)
+        stale_identity = {
+            "pinned_head_sha": old_head,
+            "pinned_base_sha": old_base,
+            "live_head_sha": new_head,
+            "live_base_sha": new_base,
+        }
+        existing_archive = archived_by_id.get(run_id)
+        if task_state.get("status") == "archived_taskless":
+            expected = {
+                "run_id": run_id,
+                "state": str(run_path),
+                "archive_reason": "agent_task_not_created",
+                "stale_identity": stale_identity,
+                "result_sha256": result_sha256,
+                "preserved_artifacts": manifest,
+                "archived_at": task_state.get("archived_at"),
+            }
+            if (
+                task_state.get("original_status") != "failed"
+                or task_state.get("task_id") is not None
+                or task_state.get("task_id_status") != "not_created"
+                or task_state.get("archive_reason") != "agent_task_not_created"
+                or task_state.get("stale_identity") != stale_identity
+                or task_state.get("result_sha256") != result_sha256
+                or task_state.get("preserved_artifacts") != manifest
+                or task_state.get("artifacts_removed") is not False
+                or task_state.get("artifacts_preserved") is not True
+                or not isinstance(task_state.get("archived_at"), str)
+            ):
+                raise WorkflowError(
+                    f"taskless run {run_id} archive checkpoint drifted"
+                )
+            if existing_archive is None:
+                archived_entries.append(expected)
+                archived_by_id[run_id] = expected
+            elif existing_archive != expected:
+                raise WorkflowError(
+                    f"taskless run {run_id} archive checkpoint drifted"
+                )
+            output.append(expected)
+            continue
+        if (
+            task_state.get("status") != "failed"
+            or task_state.get("error")
+            != (
+                "Agent Task failed [api_failure]: start Agent Task failed with "
+                "HTTP 409: user or repo does not have CCA enabled; the request "
+                "cannot be completed"
+            )
+            or existing_archive is not None
+        ):
+            raise WorkflowError(f"taskless run {run_id} is not archivable")
+        archived_at = utc_now()
+        task_state.update(
+            {
+                "original_status": "failed",
+                "status": "archived_taskless",
+                "task_id": None,
+                "task_id_status": "not_created",
+                "archive_reason": "agent_task_not_created",
+                "archived_at": archived_at,
+                "stale_identity": stale_identity,
+                "result_sha256": result_sha256,
+                "artifacts_removed": False,
+                "artifacts_preserved": True,
+                "preserved_artifacts": manifest,
+            }
+        )
+        task_state.pop("recovery_files", None)
+        save_state(run_path, state)
+        entry = {
+            "run_id": run_id,
+            "state": str(run_path),
+            "archive_reason": "agent_task_not_created",
+            "stale_identity": stale_identity,
+            "result_sha256": result_sha256,
+            "preserved_artifacts": manifest,
+            "archived_at": archived_at,
+        }
+        archived_entries.append(entry)
+        archived_by_id[run_id] = entry
+        summaries[run_id] = run_summary(run_path, state)
+        output.append(entry)
+    with index_lock(index_path):
+        completed_index = load_state(index_path)
+        completed_run_ids = [
+            item.get("run_id")
+            for item in completed_index.get("runs", [])
+            if isinstance(item, dict)
+        ]
+        if (
+            completed_index.get("taskless_archive") != marker
+            or set(completed_run_ids) != set(args.run_id)
+        ):
+            raise WorkflowError("taskless migration reservation drifted")
+        completed_index["runs"] = [
+            summaries[item["run_id"]] for item in completed_index["runs"]
+        ]
+        completed_index["archived_taskless_runs"] = [
+            archived_by_id[item["run_id"]] for item in completed_index["runs"]
+        ]
+        completed_index.pop("taskless_archive")
+        save_state(index_path, completed_index)
+    next_command = fresh_agent_task_command(
+        target=live["pr"]["url"],
+        repo_root=repo_root,
+        model=args.model,
+    )
+    emit(
+        {
+            "result": "taskless_runs_archived",
+            "state": str(index_path),
+            "runs": output,
+            "live": {
+                "head_sha": live["pr"]["head_sha"],
+                "base_sha": live["pr"]["base"]["sha"],
+                "title": live["pr"]["title"],
+                "body": live["pr"]["body"],
+            },
+            "next_command": next_command,
+        }
+    )
+
+
+def require_no_unfinished_index_runs(index_path: Path) -> None:
+    if not index_path.is_file():
+        return
+    index = load_state(index_path)
+    if index.get("kind") != INDEX_KIND:
+        raise WorkflowError("PR Description state index has an unsupported shape")
+    if index.get("taskless_archive") is not None:
+        raise WorkflowError(
+            "a taskless Agent Task migration is active; recover it before fresh "
+            "preparation"
+        )
+    for summary in index.get("runs", []):
+        if not isinstance(summary, dict) or not isinstance(summary.get("state"), str):
+            raise WorkflowError("PR Description state index has a malformed run")
+        run = load_run_state(Path(summary["state"]))
+        task = run.get("agent_task")
+        if not isinstance(task, dict):
+            continue
+        if task.get("status") not in {"completed", "archived_taskless"}:
+            if task.get("status") == "failed" and task.get("task_id") is None:
+                raise WorkflowError(
+                    "an unarchived taskless Agent Task run exists; use "
+                    "archive-taskless-runs before fresh preparation"
+                )
+            raise WorkflowError(
+                "an unfinished PR Description Agent Task exists; recover it "
+                "instead of dispatching another"
+            )
+
+
+def reserve_agent_task_run(
+    index_path: Path,
+    run_path: Path,
+    state: dict[str, Any],
+) -> None:
+    with index_lock(index_path):
+        require_no_unfinished_index_runs(index_path)
+        index, validation_changed = update_run_index_unlocked(
+            index_path, run_path, state
+        )
+    if validation_changed:
+        publish_shared_state(
+            index["pr"],
+            section="description",
+            field="validated_head_sha",
+            value=index.get("validated_head_sha"),
+            updated_at=index["updated_at"],
+        )
+
+
 def command_agent_task(args: argparse.Namespace) -> None:
+    prepare_only = bool(getattr(args, "prepare_only", False))
+    apply_prepared = bool(getattr(args, "apply_prepared", False))
+    if apply_prepared and (args.resume or prepare_only):
+        raise WorkflowError(
+            "--apply-prepared cannot be combined with --resume or --prepare-only"
+        )
+    if prepare_only and not args.preserve_artifacts:
+        raise WorkflowError("--prepare-only requires --preserve-artifacts")
+    if apply_prepared:
+        apply_prepared_agent_task(args)
+        return
     if getattr(args, "resume", False):
         resume_agent_task(args)
         return
@@ -2463,6 +3419,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
     run_id = secrets.token_hex(16)
     index_path = default_state_path(target)
     path = run_state_path(index_path, run_id)
+    requested_model = MODEL_ALIASES[args.model]
     state = {
         "version": STATE_VERSION,
         "kind": RUN_KIND,
@@ -2474,14 +3431,21 @@ def command_agent_task(args: argparse.Namespace) -> None:
         "proposal_count": 0,
         "pinned_at": utc_now(),
         "index_path": str(index_path),
+        "agent_task": {
+            "status": "reserved",
+            "model": requested_model,
+        },
     }
     save_state(path, state)
-    update_run_index(index_path, path, state)
+    try:
+        reserve_agent_task_run(index_path, path, state)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
     artifacts = {
         "prompt": path.with_name(f"{path.stem}--agent-task-prompt.txt"),
         "result": path.with_name(f"{path.stem}--agent-task-result.json"),
     }
-    requested_model = MODEL_ALIASES[args.model]
 
     def record_failure(error: BaseException) -> None:
         current = load_run_state(path)
@@ -2520,6 +3484,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "model": requested_model,
             "policy": AGENT_TASK_POLICY,
             "helper": str(helper),
+            "preflight": {**preflight, "identity": identity},
             "prompt_file": str(artifacts["prompt"]),
             "result_file": str(artifacts["result"]),
             "started_at": utc_now(),
@@ -2588,6 +3553,22 @@ def command_agent_task(args: argparse.Namespace) -> None:
             changed_files=changed_files,
             proposal_count=proposal_count(state),
         )
+        if prepare_only:
+            current = load_run_state(path)
+            record_agent_task_preparation(
+                path,
+                current,
+                preflight=preflight,
+                identity=identity,
+                result=result,
+                remote=remote,
+                report=report,
+                result_sha256=sha256_file(artifacts["result"]),
+                artifacts=list(artifacts.values()),
+                report_content=report_content,
+                model=args.model,
+            )
+            return
         current = load_run_state(path)
         current["agent_task"] = {
             **current["agent_task"],
@@ -2597,6 +3578,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "report": result["report"],
             "attestation": result["attestation"],
             "decision": report["decision"],
+            "result_sha256": sha256_file(artifacts["result"]),
             "validated_at": utc_now(),
         }
         save_state(path, current)
@@ -2868,7 +3850,10 @@ def build_parser() -> argparse.ArgumentParser:
     agent_task.add_argument("--repo-root")
     agent_task.add_argument(
         "--state",
-        help="exact retained run state path; valid only with --resume",
+        help=(
+            "exact retained run state path; valid with --resume or "
+            "--apply-prepared"
+        ),
     )
     agent_task.add_argument(
         "--resume",
@@ -2881,6 +3866,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="retain prompt, result, and committed report identities after success",
     )
     agent_task.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help=(
+            "validate and preserve the managed proposal, then stop before "
+            "title or body mutation"
+        ),
+    )
+    agent_task.add_argument(
+        "--apply-prepared",
+        action="store_true",
+        help=(
+            "apply and finalize one validated proposal without dispatching "
+            "another Agent Task"
+        ),
+    )
+    agent_task.add_argument(
         "--model",
         choices=tuple(MODEL_ALIASES),
         default="sol",
@@ -2889,6 +3890,41 @@ def build_parser() -> argparse.ArgumentParser:
     agent_task.add_argument("--pipeline-iteration", help=argparse.SUPPRESS)
     agent_task.add_argument("--pipeline-max-iterations", help=argparse.SUPPRESS)
     agent_task.set_defaults(function=command_agent_task)
+
+    archive_taskless = subparsers.add_parser(
+        "archive-taskless-runs",
+        help=(
+            "preserve and archive exact failed Agent Task runs where no task "
+            "was created"
+        ),
+    )
+    archive_taskless.add_argument(
+        "target",
+        nargs="?",
+        help=(
+            "PR URL, owner/repo#number, or bare PR number; "
+            "omit to use the current branch's PR"
+        ),
+    )
+    archive_taskless.add_argument("--repo-root")
+    archive_taskless.add_argument("--state")
+    archive_taskless.add_argument(
+        "--run-id",
+        action="append",
+        required=True,
+        help="exact indexed taskless run ID; repeat for every retained run",
+    )
+    archive_taskless.add_argument(
+        "--model",
+        choices=tuple(MODEL_ALIASES),
+        default="sol",
+    )
+    archive_taskless.add_argument(
+        "--preserve-artifacts",
+        action="store_true",
+        help="retain each taskless run's prompt and result",
+    )
+    archive_taskless.set_defaults(function=command_archive_taskless_runs)
 
     propose = subparsers.add_parser("propose", help="store a title and body proposal")
     propose.add_argument("--state", required=True)

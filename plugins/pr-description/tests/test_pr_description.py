@@ -708,7 +708,7 @@ class LegacyAgentInstructions:
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.50")
+        self.assertEqual(plugin["version"], "1.0.51")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -776,6 +776,104 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         value["report"]["sha256"] = MODULE.sha256_text(report_content)
         return value
 
+    def legacy_taskless_result(self, preflight, receipt_id):
+        pr = preflight["pr"]
+        return {
+            "application": {
+                "final_local_head": pr["head_sha"],
+                "status": "not_applicable",
+            },
+            "error": {
+                "code": "api_failure",
+                "message": (
+                    "start Agent Task failed with HTTP 409: user or repo does "
+                    "not have CCA enabled; the request cannot be completed"
+                ),
+            },
+            "generated": {
+                "branch": None,
+                "commits": [],
+                "head_sha": None,
+            },
+            "mode": "report",
+            "policy": {
+                "id": "marketplace-agent-worker",
+                "sha256": MODULE.LEGACY_TASKLESS_POLICY["sha256"],
+                "version": 4,
+            },
+            "pull_request": {
+                "base_ref": pr["base"]["ref"],
+                "base_repository": pr["base"]["repository"],
+                "base_sha": pr["base"]["sha"],
+                "head_ref": pr["head"]["ref"],
+                "head_repository": pr["head"]["repository"],
+                "head_sha": pr["head_sha"],
+                "number": pr["number"],
+                "url": pr["url"],
+            },
+            "report": None,
+            "repository": {"name_with_owner": pr["repo_name"]},
+            "requested_model": "gpt-5.6-sol",
+            "schema": MODULE.LEGACY_AGENT_TASK_RESULT_SCHEMA,
+            "status": "error",
+            "task": {
+                "base_ref": None,
+                "base_sha": None,
+                "id": None,
+                "state": None,
+                "url": None,
+            },
+            "validation": {"complete": False, "outcomes": []},
+            "worker_receipt": {
+                "commit": None,
+                "path": (
+                    ".github/agent-task-validations/"
+                    f"{receipt_id}.json"
+                ),
+                "sha256": None,
+            },
+        }
+
+    def legacy_taskless_state(
+        self,
+        *,
+        run_id,
+        index,
+        preflight,
+        prompt,
+        result,
+        created_at,
+    ):
+        return {
+            "version": 2,
+            "kind": "run",
+            "created_at": created_at,
+            "updated_at": created_at,
+            "run_id": run_id,
+            "repo_root": str(self.repo_root),
+            "pr": preflight["pr"],
+            "viewer": preflight["viewer"],
+            "proposal_count": 0,
+            "pinned_at": created_at,
+            "index_path": str(index),
+            "agent_task": {
+                "status": "failed",
+                "model": "gpt-5.6-sol",
+                "policy": "marketplace-agent-worker@4",
+                "helper": str(self.directory / "cloud_task.py"),
+                "prompt_file": str(prompt),
+                "result_file": str(result),
+                "recovery_files": [str(prompt), str(result)],
+                "started_at": created_at,
+                "failed_at": created_at,
+                "error": (
+                    "Agent Task failed [api_failure]: "
+                    "start Agent Task failed with HTTP 409: user or repo does "
+                    "not have CCA enabled; the request cannot be completed"
+                ),
+            },
+        }
+
     def command_patches(self, result, report_content, receipt_content):
         helper = self.directory / "cloud_task.py"
         helper.write_text("# helper\n", encoding="utf-8")
@@ -810,7 +908,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 MODULE, "agent_task_preflight", return_value=self.preflight
             ),
             mock.patch.object(MODULE, "default_state_path", return_value=index),
-            mock.patch.object(MODULE, "update_run_index"),
+            mock.patch.object(MODULE, "reserve_agent_task_run"),
             mock.patch.object(MODULE, "refresh_run_index"),
             mock.patch.object(MODULE, "local_identity", return_value=self.identity),
             mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
@@ -874,7 +972,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.50")
+        self.assertEqual(plugin["version"], "1.0.51")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1278,6 +1376,563 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertTrue(result_path.is_file())
         self.assertEqual("validated", emitted[-1]["result"])
         self.assertEqual("keep", emitted[-1]["decision"])
+
+    def test_archives_exact_legacy_taskless_runs_once_and_preserves_artifacts(self):
+        index_path = self.directory / "open-telemetry--shared-workflows--347.json"
+        title = "Prevent dashboard publisher starvation"
+        body = (
+            "Prevents concurrent dashboard state updates from starving a "
+            "publisher.\n\nFixes #341"
+        )
+        old_head = "14cf2a9a1ee281423501ec0a1b69e9236c5a3816"
+        old_base = "ad5b9918d6eca8cc999d7034757aee727b2631ea"
+        new_head = "f1e7ea3dabd0fab27c6fadc2d257c97ce574e106"
+        new_base = "55fb421179d32aef3b36c7f6503f57193561d14c"
+        old_preflight = agent_task_preflight()
+        old_preflight["pr"].update(
+            {
+                "number": 347,
+                "owner": "open-telemetry",
+                "repo": "shared-workflows",
+                "repo_name": "open-telemetry/shared-workflows",
+                "pr_url": (
+                    "https://github.com/open-telemetry/"
+                    "shared-workflows/pull/347"
+                ),
+                "url": (
+                    "https://github.com/open-telemetry/"
+                    "shared-workflows/pull/347"
+                ),
+                "title": title,
+                "body": body,
+                "head_sha": old_head,
+                "head": {
+                    "repository": "open-telemetry/shared-workflows",
+                    "ref": "trask-fix-dashboard-publisher-contention",
+                    "sha": old_head,
+                },
+                "base": {
+                    "repository": "open-telemetry/shared-workflows",
+                    "ref": "main",
+                    "sha": old_base,
+                },
+            }
+        )
+        run_ids = [
+            "136176e0cbd19fc030488ef06dc78968",
+            "38b93298d664983dae81a91bf830bccf",
+        ]
+        receipt_ids = [
+            "b7fdbb8a-7848-4a38-a6ba-beac8cbbbbf5",
+            "a4e38cf7-0a53-46d6-b5fe-cc0208f6a5a4",
+        ]
+        summaries = []
+        artifact_hashes = {}
+        for offset, (run_id, receipt_id) in enumerate(
+            zip(run_ids, receipt_ids, strict=True)
+        ):
+            run_path = index_path.with_name(
+                f"open-telemetry--shared-workflows--347--{run_id}.json"
+            )
+            prompt = run_path.with_name(
+                f"{run_path.stem}--agent-task-prompt.txt"
+            )
+            result_path = run_path.with_name(
+                f"{run_path.stem}--agent-task-result.json"
+            )
+            prompt.write_text(
+                "PR Description Agent Tasks worker prompt version 2.\n",
+                encoding="utf-8",
+            )
+            result_path.write_text(
+                json.dumps(
+                    self.legacy_taskless_result(old_preflight, receipt_id),
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            artifact_hashes[run_id] = {
+                str(prompt): MODULE.sha256_file(prompt),
+                str(result_path): MODULE.sha256_file(result_path),
+            }
+            state = self.legacy_taskless_state(
+                run_id=run_id,
+                index=index_path,
+                preflight=old_preflight,
+                prompt=prompt,
+                result=result_path,
+                created_at=f"2026-09-16T00:0{offset}:00Z",
+            )
+            MODULE.save_state(run_path, state)
+            summaries.append(MODULE.run_summary(run_path, state))
+        index = {
+            "version": 2,
+            "kind": "index",
+            "created_at": "2026-09-16T00:00:00Z",
+            "updated_at": "2026-09-16T00:01:00Z",
+            "pr": old_preflight["pr"],
+            "runs": summaries,
+            "latest_run_id": run_ids[-1],
+            "latest_state": summaries[-1]["state"],
+            "current_updated_at": summaries[-1]["updated_at"],
+            "validated_head_sha": None,
+        }
+        MODULE.save_state(index_path, index)
+        live = json.loads(json.dumps(old_preflight["pr"]))
+        live["head_sha"] = new_head
+        live["head"]["sha"] = new_head
+        live["base"]["sha"] = new_base
+        live_preflight = {
+            "repository_root": str(self.repo_root),
+            "pr": live,
+            "viewer": old_preflight["viewer"],
+        }
+        emitted = []
+        arguments = SimpleNamespace(
+            target="open-telemetry/shared-workflows#347",
+            repo_root=str(self.repo_root),
+            state=str(index_path),
+            run_id=run_ids,
+            model="sol",
+            preserve_artifacts=True,
+        )
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target(
+                    "open-telemetry/shared-workflows#347"
+                ),
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=live_preflight
+            ),
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value={
+                    "branch": live["head"]["ref"],
+                    "head": new_head,
+                    "status": "",
+                },
+            ),
+            mock.patch.object(MODULE, "require_github_ancestor") as ancestor,
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.command_archive_taskless_runs(arguments)
+            first_index = MODULE.load_state(index_path)
+            partial_index = json.loads(json.dumps(first_index))
+            partial_index["archived_taskless_runs"] = partial_index[
+                "archived_taskless_runs"
+            ][1:]
+            MODULE.save_state(index_path, partial_index)
+            MODULE.command_archive_taskless_runs(arguments)
+
+        self.assertEqual(8, ancestor.call_count)
+        self.assertEqual("taskless_runs_archived", emitted[-1]["result"])
+        self.assertEqual(run_ids, [item["run_id"] for item in emitted[-1]["runs"]])
+        archived_index = MODULE.load_state(index_path)
+        self.assertEqual(
+            first_index["archived_taskless_runs"],
+            archived_index["archived_taskless_runs"],
+        )
+        self.assertEqual(run_ids, [item["run_id"] for item in archived_index["runs"]])
+        self.assertEqual(run_ids[-1], archived_index["latest_run_id"])
+        for run_id in run_ids:
+            run_path = Path(
+                next(
+                    item["state"]
+                    for item in archived_index["runs"]
+                    if item["run_id"] == run_id
+                )
+            )
+            archived = MODULE.load_run_state(run_path)
+            task = archived["agent_task"]
+            self.assertEqual("archived_taskless", task["status"])
+            self.assertEqual("not_created", task["task_id_status"])
+            self.assertEqual("agent_task_not_created", task["archive_reason"])
+            self.assertEqual(2, len(task["preserved_artifacts"]))
+            for artifact in task["preserved_artifacts"]:
+                self.assertEqual(
+                    artifact_hashes[run_id][artifact["path"]],
+                    artifact["sha256"],
+                )
+                self.assertTrue(Path(artifact["path"]).is_file())
+
+    def test_taskless_migration_requires_the_complete_indexed_owner_set(self):
+        index_path = self.directory / "owner--repo--7.json"
+        index = {
+            "version": 2,
+            "kind": "index",
+            "pr": self.preflight["pr"],
+            "runs": [
+                {"run_id": "first", "state": "first.json"},
+                {"run_id": "second", "state": "second.json"},
+            ],
+        }
+        MODULE.save_state(index_path, index)
+        arguments = SimpleNamespace(
+            target="owner/repo#7",
+            repo_root=str(self.repo_root),
+            state=str(index_path),
+            run_id=["first"],
+            model="sol",
+            preserve_artifacts=True,
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE, "metadata_for", return_value=self.preflight["pr"]
+            ),
+            mock.patch.object(MODULE, "local_identity", return_value=self.identity),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "exactly match the indexed runs"
+            ),
+        ):
+            MODULE.command_archive_taskless_runs(arguments)
+
+    def test_prepare_and_restart_apply_replace_without_duplicate_mutation(self):
+        self.preflight["repository_root"] = str(self.repo_root)
+        report_content = self.proposal_report(
+            decision="replace",
+            title="Better title",
+            body="Better body",
+        )
+        result = self.result(report_content)
+        prepared_identity = {
+            **self.identity,
+            "head": self.preflight["pr"]["head_sha"],
+        }
+        result["application"]["final_local_head"] = prepared_identity["head"]
+        patches, emitted, index = self.command_patches(
+            result, report_content, self.receipt()
+        )
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE, "local_identity", return_value=prepared_identity
+                )
+            )
+            apply = stack.enter_context(mock.patch.object(MODULE, "apply_proposal"))
+            validate = stack.enter_context(
+                mock.patch.object(MODULE, "validate_no_change")
+            )
+            MODULE.command_agent_task(
+                SimpleNamespace(
+                    target="owner/repo#7",
+                    repo_root=None,
+                    model="sol",
+                    state=None,
+                    resume=False,
+                    preserve_artifacts=True,
+                    prepare_only=True,
+                    apply_prepared=False,
+                )
+            )
+
+        path = index.with_name("owner--repo--7--run-1.json")
+        prepared = MODULE.load_run_state(path)
+        apply.assert_not_called()
+        validate.assert_not_called()
+        self.assertEqual("validated_pending_apply", prepared["agent_task"]["status"])
+        self.assertEqual("replace", prepared["agent_task"]["decision"])
+        self.assertEqual(
+            {"title": "Better title", "body": "Better body"},
+            prepared["agent_task"]["preparation"]["proposal"],
+        )
+        self.assertEqual(3, len(prepared["agent_task"]["preserved_artifacts"]))
+        self.assertNotIn("proposal", prepared)
+        self.assertNotIn("validation", prepared)
+        self.assertEqual("validated_pending_apply", emitted[-1]["result"])
+        self.assertEqual(1, len(self.helper_commands))
+
+        apply_calls = []
+
+        def applied(state_path, state, **_kwargs):
+            apply_calls.append(state["agent_task"]["preparation"]["proposal"])
+            raise MODULE.WorkflowError("stop after mutation")
+
+        def apply_once(*, live, fail_after_apply):
+            apply_emitted = []
+            with (
+                mock.patch.object(MODULE, "require_tools"),
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=self.repo_root
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "resolve_target",
+                    return_value=MODULE.parse_target("owner/repo#7"),
+                ),
+                mock.patch.object(MODULE, "refresh_run_index"),
+                mock.patch.object(
+                    MODULE, "local_identity", return_value=prepared_identity
+                ),
+                mock.patch.object(MODULE, "discover_cloud_task") as discover,
+                mock.patch.object(MODULE, "run") as helper_run,
+                mock.patch.object(
+                    MODULE,
+                    "fetch_committed_text",
+                    return_value=report_content,
+                ),
+                mock.patch.object(MODULE, "metadata_for", return_value=live),
+                mock.patch.object(
+                    MODULE, "pull_request_file_paths", return_value=["src/app.py"]
+                ),
+                mock.patch.object(
+                    MODULE, "apply_proposal", side_effect=applied
+                ) as apply_mock,
+                mock.patch.object(MODULE, "validate_no_change") as validate_mock,
+                mock.patch.object(
+                    MODULE,
+                    "emit",
+                    side_effect=apply_emitted.append,
+                ),
+            ):
+                if fail_after_apply:
+                    with self.assertRaisesRegex(
+                        MODULE.WorkflowError, "stop after mutation"
+                    ):
+                        MODULE.command_agent_task(
+                            SimpleNamespace(
+                                target="owner/repo#7",
+                                repo_root=str(self.repo_root),
+                                model="sol",
+                                state=str(path),
+                                resume=False,
+                                preserve_artifacts=True,
+                                prepare_only=False,
+                                apply_prepared=True,
+                            )
+                        )
+                else:
+                    MODULE.command_agent_task(
+                        SimpleNamespace(
+                            target="owner/repo#7",
+                            repo_root=str(self.repo_root),
+                            model="sol",
+                            state=str(path),
+                            resume=False,
+                            preserve_artifacts=True,
+                            prepare_only=False,
+                            apply_prepared=True,
+                        )
+                    )
+            discover.assert_not_called()
+            helper_run.assert_not_called()
+            validate_mock.assert_not_called()
+            return apply_mock.call_count, apply_emitted
+
+        first_calls, _ = apply_once(
+            live=pr_metadata(head_sha=self.preflight["pr"]["head_sha"]),
+            fail_after_apply=True,
+        )
+        self.assertEqual(1, first_calls)
+        failed = MODULE.load_run_state(path)
+        self.assertEqual("applying", failed["agent_task"]["status"])
+        self.assertNotIn("validation", failed)
+
+        applied_live = pr_metadata(
+            head_sha=self.preflight["pr"]["head_sha"],
+            title="Better title",
+            body="Better body",
+        )
+        second_calls, second_emitted = apply_once(
+            live=applied_live,
+            fail_after_apply=False,
+        )
+        self.assertEqual(0, second_calls)
+        self.assertEqual(1, len(apply_calls))
+        completed = MODULE.load_run_state(path)
+        self.assertEqual("completed", completed["agent_task"]["status"])
+        self.assertEqual("applied", second_emitted[-1]["result"])
+
+    def test_prepare_and_apply_keep_without_metadata_mutation(self):
+        self.preflight["repository_root"] = str(self.repo_root)
+        report_content = self.proposal_report()
+        result = self.result(report_content)
+        identity = {**self.identity, "head": self.preflight["pr"]["head_sha"]}
+        result["application"]["final_local_head"] = identity["head"]
+        patches, _, index = self.command_patches(
+            result, report_content, self.receipt()
+        )
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            stack.enter_context(
+                mock.patch.object(MODULE, "local_identity", return_value=identity)
+            )
+            apply = stack.enter_context(mock.patch.object(MODULE, "apply_proposal"))
+            MODULE.command_agent_task(
+                SimpleNamespace(
+                    target="owner/repo#7",
+                    repo_root=None,
+                    model="sol",
+                    state=None,
+                    resume=False,
+                    preserve_artifacts=True,
+                    prepare_only=True,
+                    apply_prepared=False,
+                )
+            )
+        apply.assert_not_called()
+        path = index.with_name("owner--repo--7--run-1.json")
+
+        def validated(state_path, state, **_kwargs):
+            state["validated_head_sha"] = self.preflight["pr"]["head_sha"]
+            state["validation"] = {
+                "mode": "no_change",
+                "run_id": state["run_id"],
+                "head_sha": self.preflight["pr"]["head_sha"],
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+            }
+            MODULE.save_state(state_path, state)
+            return {
+                "result": "validated",
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+                "validated_head_sha": self.preflight["pr"]["head_sha"],
+            }
+
+        emitted = []
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "refresh_run_index"),
+            mock.patch.object(MODULE, "local_identity", return_value=identity),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "run") as helper_run,
+            mock.patch.object(
+                MODULE, "fetch_committed_text", return_value=report_content
+            ),
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                return_value=pr_metadata(
+                    head_sha=self.preflight["pr"]["head_sha"]
+                ),
+            ),
+            mock.patch.object(
+                MODULE, "pull_request_file_paths", return_value=["src/app.py"]
+            ),
+            mock.patch.object(MODULE, "apply_proposal") as apply,
+            mock.patch.object(
+                MODULE, "validate_no_change", side_effect=validated
+            ) as validate,
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.command_agent_task(
+                SimpleNamespace(
+                    target="owner/repo#7",
+                    repo_root=str(self.repo_root),
+                    model="sol",
+                    state=str(path),
+                    resume=False,
+                    preserve_artifacts=True,
+                    prepare_only=False,
+                    apply_prepared=True,
+                )
+            )
+
+        discover.assert_not_called()
+        helper_run.assert_not_called()
+        apply.assert_not_called()
+        validate.assert_called_once()
+        completed = MODULE.load_run_state(path)
+        self.assertEqual("completed", completed["agent_task"]["status"])
+        self.assertEqual("no_change", completed["validation"]["mode"])
+        self.assertEqual("validated", emitted[-1]["result"])
+
+    def test_fresh_dispatch_refuses_active_and_unarchived_taskless_runs(self):
+        index_path = self.directory / "owner--repo--7.json"
+        run_path = self.directory / "owner--repo--7--run-1.json"
+        state = {
+            "version": 2,
+            "kind": "run",
+            "run_id": "run-1",
+            "pr": self.preflight["pr"],
+            "agent_task": {"status": "validated_pending_apply", "task": {"id": "1"}},
+        }
+        MODULE.save_state(run_path, state)
+        MODULE.save_state(
+            index_path,
+            {
+                "version": 2,
+                "kind": "index",
+                "pr": self.preflight["pr"],
+                "runs": [{"run_id": "run-1", "state": str(run_path)}],
+            },
+        )
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "unfinished PR Description Agent Task"
+        ):
+            MODULE.require_no_unfinished_index_runs(index_path)
+
+        state["agent_task"] = {"status": "failed"}
+        MODULE.save_state(run_path, state)
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "unarchived taskless Agent Task run"
+        ):
+            MODULE.require_no_unfinished_index_runs(index_path)
+
+        state["agent_task"] = {"status": "archived_taskless"}
+        MODULE.save_state(run_path, state)
+        MODULE.require_no_unfinished_index_runs(index_path)
+
+        active_index = MODULE.load_state(index_path)
+        active_index["taskless_archive"] = {
+            "run_ids": ["run-1"],
+            "started_at": "2026-01-01T00:00:00Z",
+        }
+        MODULE.save_state(index_path, active_index)
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "taskless Agent Task migration is active"
+        ):
+            MODULE.require_no_unfinished_index_runs(index_path)
+        active_index.pop("taskless_archive")
+        MODULE.save_state(index_path, active_index)
+
+        reserved_path = self.directory / "owner--repo--7--run-2.json"
+        reserved = {
+            "version": 2,
+            "kind": "run",
+            "created_at": "2026-01-01T00:00:00Z",
+            "run_id": "run-2",
+            "pr": self.preflight["pr"],
+            "agent_task": {"status": "reserved", "model": "gpt-5.6-sol"},
+        }
+        MODULE.save_state(reserved_path, reserved)
+        with mock.patch.object(MODULE, "publish_shared_state"):
+            MODULE.reserve_agent_task_run(index_path, reserved_path, reserved)
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "unfinished PR Description Agent Task"
+            ):
+                MODULE.reserve_agent_task_run(
+                    index_path,
+                    self.directory / "owner--repo--7--run-3.json",
+                    {
+                        **reserved,
+                        "run_id": "run-3",
+                    },
+                )
 
     def test_task_failure_keeps_recovery_artifacts_and_never_mutates(self):
         report_content = self.proposal_report()
@@ -3041,6 +3696,43 @@ class ParserShapeTest(unittest.TestCase):
                     "terra",
                 ],
                 "command_agent_task",
+            ),
+            (
+                [
+                    "agent-task",
+                    "owner/repo#7",
+                    "--state",
+                    "state",
+                    "--resume",
+                    "--prepare-only",
+                    "--preserve-artifacts",
+                ],
+                "command_agent_task",
+            ),
+            (
+                [
+                    "agent-task",
+                    "owner/repo#7",
+                    "--state",
+                    "state",
+                    "--apply-prepared",
+                    "--preserve-artifacts",
+                ],
+                "command_agent_task",
+            ),
+            (
+                [
+                    "archive-taskless-runs",
+                    "owner/repo#7",
+                    "--state",
+                    "index",
+                    "--run-id",
+                    "first",
+                    "--run-id",
+                    "second",
+                    "--preserve-artifacts",
+                ],
+                "command_archive_taskless_runs",
             ),
             (
                 ["preflight", "owner/repo#7", "--repo-root", "repo", "--state", "state"],
