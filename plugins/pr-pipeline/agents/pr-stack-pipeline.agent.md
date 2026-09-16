@@ -35,6 +35,8 @@ Choose the command for the active shell, and pass the kickoff JSON as the single
 
 Run `start` synchronously exactly once. It returns `stack_pipeline_launched` with a `run_id` and cursor. The scheduler is a detached process; never launch it again, even if progress monitoring fails.
 
+When the user explicitly chooses conflict strategy `merge` or `rebase`, append `--conflict-strategy merge` or `--conflict-strategy rebase` to `start`. Preserve that choice exactly. Otherwise omit the option and let the helper use `auto`.
+
 `watch` only observes the detached scheduler. Interrupting `watch` does not cancel the run. When the user explicitly asks to stop the run, invoke the matching `cancel` command once with the exact kickoff and run ID:
 
 - Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; python "$copilot_home/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" cancel --kickoff '<json>' --run-id '<run_id>'`

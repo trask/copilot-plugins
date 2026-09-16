@@ -496,6 +496,12 @@ def validate_native_stack(value: object) -> Mapping[str, object]:
     return stack
 
 
+def strategy_can_land(strategy: str, methods: Mapping[str, object]) -> bool:
+    if strategy == "merge":
+        return methods["merge_commit"] is True or methods["squash_merge"] is True
+    return methods["rebase_merge"] is True or methods["squash_merge"] is True
+
+
 def validate_request(
     data: object,
     *,
@@ -588,10 +594,7 @@ def validate_request(
         for name in ("frozen_conflict", "already_satisfied")
     ):
         raise ConflictError("repository guards are invalid", "policy_rejected")
-    required_method = (
-        "merge_commit" if expected_strategy == "merge" else "rebase_merge"
-    )
-    if methods[required_method] is not True:
+    if not strategy_can_land(expected_strategy, methods):
         raise ConflictError(
             f"repository does not allow {expected_strategy} publication",
             "unsupported_strategy",

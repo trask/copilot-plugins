@@ -402,10 +402,18 @@ def stage_command(
     effort: str,
     run_id: str,
     sweep: int,
+    conflict_strategy: str = "auto",
 ) -> list[str]:
     arguments = pipeline_arguments(entry, run_id, sweep)
     if entry["stage"] == STAGE_CONFLICT:
-        arguments.extend(["--state", str(stage_state_path(entry, target))])
+        arguments.extend(
+            [
+                "--state",
+                str(stage_state_path(entry, target)),
+                "--strategy",
+                conflict_strategy,
+            ]
+        )
     return common.stage_command(
         entry,
         target,
@@ -437,6 +445,7 @@ def run_stage(
     effort: str,
     run_id: str,
     sweep: int,
+    conflict_strategy: str = "auto",
     report: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     command = stage_command(
@@ -446,6 +455,7 @@ def run_stage(
         effort=effort,
         run_id=run_id,
         sweep=sweep,
+        conflict_strategy=conflict_strategy,
     )
     log_path = stage_log_path(target, run_id, sweep, entry)
     if entry["stage"] != STAGE_CI:
@@ -526,6 +536,7 @@ def run_pipeline(
     models: dict[str, str],
     effort: str,
     run_id: str | None = None,
+    conflict_strategy: str = "auto",
     report: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     run_id = run_id or uuid.uuid4().hex
@@ -693,6 +704,7 @@ def run_pipeline(
                 effort=effort,
                 run_id=run_id,
                 sweep=sweep,
+                conflict_strategy=conflict_strategy,
                 report=report,
             )
             settled = settle_after_stage(
@@ -897,6 +909,8 @@ def scheduler_command(
         str(event_log),
         "--effort",
         args.effort,
+        "--conflict-strategy",
+        args.conflict_strategy,
     ]
     for override in args.stage_model or []:
         command.extend(["--stage-model", override])
@@ -921,6 +935,7 @@ def command_start(args: argparse.Namespace) -> None:
             "event_log": str(event_log),
             "started_at": utc_now(),
             "started_at_epoch": started_at_epoch,
+            "conflict_strategy": args.conflict_strategy,
         },
     )
     process = common.start_detached(
@@ -939,6 +954,7 @@ def command_start(args: argparse.Namespace) -> None:
                 "event_log": str(event_log),
                 "started_at": utc_now(),
                 "started_at_epoch": started_at_epoch,
+                "conflict_strategy": args.conflict_strategy,
             },
         )
     except OSError:
@@ -951,6 +967,7 @@ def command_start(args: argparse.Namespace) -> None:
             "target": f"{target['owner']}/{target['repo']}#{target['number']}",
             "pid": process.pid,
             "cursor": 0,
+            "conflict_strategy": args.conflict_strategy,
         }
     )
 
@@ -978,6 +995,7 @@ def command_run(args: argparse.Namespace) -> None:
     options = {
         "models": stage_models(args.stage_model, args.effort),
         "effort": args.effort,
+        "conflict_strategy": args.conflict_strategy,
         "report": reporter,
     }
     if args.run_id:
@@ -1006,6 +1024,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="pin one stage's model as <stage>=<model>; repeatable",
     )
     run_command.add_argument("--effort", default=DEFAULT_EFFORT)
+    run_command.add_argument(
+        "--conflict-strategy",
+        choices=common.CONFLICT_STRATEGIES,
+        default="auto",
+    )
     run_command.add_argument("--run-id", help=argparse.SUPPRESS)
     run_command.add_argument("--event-log", help=argparse.SUPPRESS)
     run_command.set_defaults(function=command_run)
@@ -1027,6 +1050,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="pin one stage's model as <stage>=<model>; repeatable",
     )
     start.add_argument("--effort", default=DEFAULT_EFFORT)
+    start.add_argument(
+        "--conflict-strategy",
+        choices=common.CONFLICT_STRATEGIES,
+        default="auto",
+    )
     start.set_defaults(function=command_start)
 
     watch = subparsers.add_parser(

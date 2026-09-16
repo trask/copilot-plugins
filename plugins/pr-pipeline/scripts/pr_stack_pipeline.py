@@ -1569,6 +1569,7 @@ class StackPipeline:
         *,
         models: dict[str, str],
         effort: str,
+        conflict_strategy: str = "auto",
         run_id: str | None = None,
         report: Callable[[dict[str, Any]], None] | None = None,
         launcher: Any | None = None,
@@ -1594,6 +1595,7 @@ class StackPipeline:
         self.repo_root = repo_root
         self.models = models
         self.effort = effort
+        self.conflict_strategy = conflict_strategy
         self.run_id = run_id or uuid.uuid4().hex
         self.report = report
         self.state_path = state_path or state_path_for(kickoff)
@@ -1778,7 +1780,14 @@ class StackPipeline:
             accepts=common.stage_accepts_pipeline_position,
         )
         if stage == STAGE_CONFLICT:
-            arguments.extend(["--state", str(stage_state_path(entry, target))])
+            arguments.extend(
+                [
+                    "--state",
+                    str(stage_state_path(entry, target)),
+                    "--strategy",
+                    self.conflict_strategy,
+                ]
+            )
         return {
             "number": member["number"],
             "stage": stage,
@@ -3424,6 +3433,8 @@ def scheduler_command(
         str(event_log),
         "--effort",
         args.effort,
+        "--conflict-strategy",
+        args.conflict_strategy,
     ]
     for override in args.stage_model or []:
         command.extend(["--stage-model", override])
@@ -3456,6 +3467,7 @@ def command_start(args: argparse.Namespace) -> None:
             "event_log": str(event_log),
             "started_at": utc_now(),
             "started_at_epoch": started_at_epoch,
+            "conflict_strategy": args.conflict_strategy,
         },
     )
     command = scheduler_command(args, kickoff, repo_root, run_id, event_log)
@@ -3475,6 +3487,7 @@ def command_start(args: argparse.Namespace) -> None:
                 "event_log": str(event_log),
                 "started_at": utc_now(),
                 "started_at_epoch": started_at_epoch,
+                "conflict_strategy": args.conflict_strategy,
             },
         )
     except OSError:
@@ -3486,6 +3499,7 @@ def command_start(args: argparse.Namespace) -> None:
             "run_id": run_id,
             "pid": process.pid,
             "cursor": 0,
+            "conflict_strategy": args.conflict_strategy,
         }
     )
 
@@ -3642,6 +3656,7 @@ def command_run(args: argparse.Namespace) -> None:
         repo_root,
         models=common.stage_models(args.stage_model, args.effort),
         effort=args.effort,
+        conflict_strategy=args.conflict_strategy,
         run_id=validate_run_id(args.run_id) if args.run_id else None,
         report=reporter,
     )
@@ -3678,6 +3693,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="pin one stage's model as <stage>=<model>; repeatable",
     )
     run.add_argument("--effort", default=DEFAULT_EFFORT)
+    run.add_argument(
+        "--conflict-strategy",
+        choices=common.CONFLICT_STRATEGIES,
+        default="auto",
+    )
     run.add_argument("--run-id", help=argparse.SUPPRESS)
     run.add_argument("--event-log", help=argparse.SUPPRESS)
     run.set_defaults(function=command_run)
@@ -3701,6 +3721,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="pin one stage's model as <stage>=<model>; repeatable",
     )
     start.add_argument("--effort", default=DEFAULT_EFFORT)
+    start.add_argument(
+        "--conflict-strategy",
+        choices=common.CONFLICT_STRATEGIES,
+        default="auto",
+    )
     start.set_defaults(function=command_start)
 
     watch = subparsers.add_parser(

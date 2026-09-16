@@ -27,6 +27,7 @@ from typing import Any, Callable
 
 DEFAULT_STAGE_MODEL = "gpt-5.6-sol"
 DEFAULT_EFFORT = "high"
+CONFLICT_STRATEGIES = ("auto", "merge", "rebase")
 SELF_REVIEW_MODEL = "gpt-5.6-sol"
 SELF_REVIEW_EFFORT = "high"
 IS_WINDOWS = os.name == "nt"

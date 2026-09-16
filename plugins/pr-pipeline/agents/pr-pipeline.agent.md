@@ -33,6 +33,8 @@ Choose the launch command for the active shell:
 
 Append the user's target exactly as given. Omit it only when the user omitted it.
 
+When the user explicitly chooses conflict strategy `merge` or `rebase`, append `--conflict-strategy merge` or `--conflict-strategy rebase` to `start`. Preserve that choice exactly. Otherwise omit the option and let the helper use `auto`.
+
 Run `start` synchronously exactly once. It returns `pipeline_launched` with a canonical target, `run_id`, and cursor. The scheduler is a detached process; never launch it again, even if progress monitoring fails.
 
 After `start`, repeatedly run `watch` synchronously with the returned canonical target, `run_id`, latest cursor, and `--wait-seconds 300`:

@@ -71,7 +71,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "3f9807c392bb31dc3ddcfe74d367b620f417dffc00b1904c78415da43c8b9ad9"
+    "77abae8c334fd02c13f0e950d0d8c312151fa34adeaf8cea249cd3e80ed27d48"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@1"
@@ -96,10 +96,7 @@ CONFLICT_RECEIPT_SCHEMA = {
     "version": 1,
 }
 MODEL_ALIASES = {
-    "luna": "gpt-5.6-luna",
-    "terra": "gpt-5.6-terra",
     "sol": "gpt-5.6-sol",
-    "astra": "gpt-6-astra",
 }
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -1354,6 +1351,13 @@ def choose_strategy(
         "warnings": [],
         "rewrite_blockers": rewrite_blockers,
     }
+
+
+def merge_history_can_land(merge_methods: dict[str, bool]) -> bool:
+    return bool(
+        merge_methods.get("allow_merge_commit")
+        or merge_methods.get("allow_squash_merge")
+    )
 
 
 def push_safety_blockers(pr: dict[str, Any], relations: dict[str, Any]) -> list[str]:
@@ -7135,7 +7139,7 @@ def conflict_preflight(
         merge_methods=methods,
         relations=relations,
     )
-    if strategy_choice["strategy"] == "merge" and not methods["allow_merge_commit"]:
+    if strategy_choice["strategy"] == "merge" and not merge_history_can_land(methods):
         if requested_strategy == "merge":
             raise WorkflowError(
                 "the repository does not allow the requested merge strategy"

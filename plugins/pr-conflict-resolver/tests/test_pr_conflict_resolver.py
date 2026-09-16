@@ -13,11 +13,17 @@ from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "pr_conflict_resolver.py"
+CLOUD_SCRIPT = Path(__file__).parents[1] / "scripts" / "cloud_conflict_task.py"
 AGENT = Path(__file__).parents[1] / "agents" / "pr-conflict-resolver.agent.md"
 SPEC = importlib.util.spec_from_file_location("pr_conflict_resolver", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+CLOUD_SPEC = importlib.util.spec_from_file_location("cloud_conflict_task", CLOUD_SCRIPT)
+assert CLOUD_SPEC is not None and CLOUD_SPEC.loader is not None
+CLOUD_MODULE = importlib.util.module_from_spec(CLOUD_SPEC)
+sys.modules[CLOUD_SPEC.name] = CLOUD_MODULE
+CLOUD_SPEC.loader.exec_module(CLOUD_MODULE)
 
 
 class WindowsSubprocessTest(unittest.TestCase):
@@ -878,7 +884,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "3f9807c392bb31dc3ddcfe74d367b620f417dffc00b1904c78415da43c8b9ad9",
+            "77abae8c334fd02c13f0e950d0d8c312151fa34adeaf8cea249cd3e80ed27d48",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -912,7 +918,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
                 "--strategy",
                 "rebase",
                 "--model",
-                "terra",
+                "sol",
                 "--max-iterations",
                 "4",
                 "--pipeline-run",
@@ -926,7 +932,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         )
         self.assertIs(parsed.function, MODULE.command_agent_task)
         self.assertEqual(parsed.strategy, "rebase")
-        self.assertEqual(parsed.model, "terra")
+        self.assertEqual(parsed.model, "sol")
         self.assertEqual(parsed.max_iterations, 4)
         self.assertEqual(
             (
@@ -937,6 +943,12 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             ("run-1", 2, 5),
         )
         self.assertTrue(parsed.whole_stack)
+
+    def test_agent_task_parser_rejects_non_sol_models(self):
+        with self.assertRaises(SystemExit):
+            MODULE.build_parser().parse_args(
+                ["agent-task", "owner/repo#7", "--model", "astra"]
+            )
 
     def test_legacy_attempts_do_not_consume_the_managed_budget(self):
         directory = temporary_directory(self)
@@ -1023,7 +1035,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
                 "--strategy",
                 "rebase",
                 "--model",
-                "terra",
+                "sol",
             ]
         )
         target = MODULE.parse_target("owner/repo#7")
@@ -2312,6 +2324,8 @@ class StrategyChoiceTest(unittest.TestCase):
             "allow_rebase_merge": True,
         }
         self.assertEqual("merge", self.choose("auto", merge_methods=methods)["strategy"])
+        self.assertTrue(MODULE.merge_history_can_land(methods))
+        self.assertFalse(MODULE.merge_history_can_land(REBASE_ONLY_MERGE_METHODS))
 
     def test_an_explicit_merge_reports_the_blocker_as_a_warning(self):
         decision = self.choose("merge", merge_methods=REBASE_ONLY_MERGE_METHODS)
@@ -2333,6 +2347,166 @@ class StrategyChoiceTest(unittest.TestCase):
     def test_a_pull_request_below_this_one_does_not_block_a_rewrite(self):
         relations = {"dependents": [], "stacked_on": {"number": 3, "head_branch": "main"}}
         self.assertEqual("rebase", self.choose("rebase", relations=relations)["strategy"])
+
+    def test_exact_squash_only_dependent_preflight_keeps_explicit_merge(self):
+        metadata = pr_metadata(mergeable="CONFLICTING")
+        methods = {
+            "allow_merge_commit": False,
+            "allow_rebase_merge": False,
+            "allow_squash_merge": True,
+        }
+
+        def git_result(_root, *arguments):
+            if arguments == ("rev-parse", "HEAD"):
+                return metadata["head_sha"]
+            if arguments == ("branch", "--show-current"):
+                return metadata["head_branch"]
+            if arguments[0] == "merge-base":
+                return "merge-base"
+            raise AssertionError(arguments)
+
+        with (
+            mock.patch.object(MODULE, "require_clean_worktree"),
+            mock.patch.object(MODULE, "require_no_integration_in_progress"),
+            mock.patch.object(MODULE, "live_mergeability", return_value=metadata),
+            mock.patch.object(MODULE, "checkout_pr_branch"),
+            mock.patch.object(MODULE, "git", side_effect=git_result),
+            mock.patch.object(MODULE, "find_remote", return_value="origin"),
+            mock.patch.object(MODULE, "fetch_preflight_ref"),
+            mock.patch.object(
+                MODULE,
+                "stack_membership",
+                return_value={"default_branch": "main", "stack": None},
+            ),
+            mock.patch.object(
+                MODULE,
+                "stack_relations",
+                return_value={"dependents": [dependent()], "stacked_on": None},
+            ),
+            mock.patch.object(
+                MODULE, "repository_merge_methods", return_value=methods
+            ),
+            mock.patch.object(
+                MODULE, "merge_tree_conflicts", return_value={"src/File.java"}
+            ),
+            mock.patch.object(
+                MODULE,
+                "ordered_commits",
+                side_effect=[[], [metadata["head_sha"]]],
+            ),
+            mock.patch.object(
+                MODULE,
+                "commit_identity",
+                return_value={
+                    "sha": metadata["head_sha"],
+                    "subject": "Change",
+                    "trailers": [],
+                    "patch_sha256": "a" * 64,
+                    "paths": ["src/File.java"],
+                },
+            ),
+        ):
+            preflight = MODULE.conflict_preflight(
+                Path("C:/repo"),
+                MODULE.parse_target("owner/repo#7"),
+                requested_strategy="merge",
+                whole_stack=False,
+                iteration_id="iteration-1",
+                iteration_number=1,
+                iteration_budget=1,
+                model="gpt-5.6-sol",
+            )
+
+        self.assertEqual("merge", preflight["strategy"])
+        self.assertEqual("merge", preflight["strategy_choice"]["strategy"])
+        self.assertEqual("merge", preflight["request"]["strategy"])
+        self.assertEqual(
+            {
+                "merge_commit": False,
+                "rebase_merge": False,
+                "squash_merge": True,
+            },
+            preflight["request"]["guards"]["merge_methods"],
+        )
+
+
+class ManagedRequestStrategyTest(unittest.TestCase):
+    def request(self, methods):
+        request = {
+            "schema": CLOUD_MODULE.REQUEST_SCHEMA,
+            "request_id": "request-1",
+            "request_sha256": "",
+            "model": "gpt-5.6-sol",
+            "policy": CLOUD_MODULE.POLICY,
+            "repository": "owner/repo",
+            "pull_request": {
+                "number": 7,
+                "url": "https://github.com/owner/repo/pull/7",
+                "head_repository": "owner/repo",
+                "head_ref": "feature",
+                "head_sha": "b" * 40,
+                "base_repository": "owner/repo",
+                "base_ref": "main",
+                "base_sha": "a" * 40,
+            },
+            "merge_base": "a" * 40,
+            "strategy": "merge",
+            "allowed_paths": ["app.py"],
+            "iteration": {"id": "iteration-1", "number": 1, "budget": 1},
+            "guards": {
+                "merge_methods": methods,
+                "frozen_conflict": True,
+                "already_satisfied": False,
+            },
+            "head_commits": [
+                {
+                    "sha": "b" * 40,
+                    "subject": "Feature",
+                    "trailers": [],
+                    "patch_sha256": "c" * 64,
+                    "paths": ["app.py"],
+                }
+            ],
+            "native_stack": None,
+        }
+        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
+        return request
+
+    def validate(self, request):
+        return CLOUD_MODULE.validate_request(
+            request,
+            expected_strategy="merge",
+            expected_model="gpt-5.6-sol",
+            expected_pr_url="https://github.com/owner/repo/pull/7",
+        )
+
+    def test_squash_only_repository_accepts_merge_integration_history(self):
+        methods = {
+            "merge_commit": False,
+            "rebase_merge": False,
+            "squash_merge": True,
+        }
+        request = self.request(methods)
+
+        self.assertEqual("merge", self.validate(request)["strategy"])
+        self.assertTrue(CLOUD_MODULE.strategy_can_land("merge", methods))
+        self.assertTrue(CLOUD_MODULE.strategy_can_land("rebase", methods))
+        self.assertTrue(CLOUD_MODULE.strategy_can_land("native-stack", methods))
+
+    def test_rebase_only_repository_rejects_merge_integration_history(self):
+        request = self.request(
+            {
+                "merge_commit": False,
+                "rebase_merge": True,
+                "squash_merge": False,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError,
+            "does not allow merge publication",
+        ):
+            self.validate(request)
 
 
 class PushSafetyTest(unittest.TestCase):

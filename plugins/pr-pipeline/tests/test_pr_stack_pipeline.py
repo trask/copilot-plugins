@@ -1002,13 +1002,13 @@ class StackRunTest(StackFixture):
             request["arguments"],
         )
 
-    def test_the_conflict_stage_carries_only_the_explicit_state_path(self):
+    def test_the_conflict_stage_carries_state_and_strategy(self):
         """PR Conflict Resolver integrates once per launch and takes no budget.
 
         Its helper rejects pipeline position flags, but an explicit canonical
         state path keeps the worker and scheduler on the same durable record.
         """
-        pipeline = self.pipeline()
+        pipeline = self.pipeline(conflict_strategy="merge")
         member = self.stack["members"][0]
         request = pipeline.request_for(member, MODULE.STAGE_CONFLICT, 2)
         self.assertEqual(
@@ -1020,6 +1020,8 @@ class StackRunTest(StackFixture):
                         COMMON.target_for("owner/repo", member["number"]),
                     )
                 ),
+                "--strategy",
+                "merge",
             ],
             request["arguments"],
         )
@@ -2069,6 +2071,8 @@ class ProgressProtocolTest(StackFixture):
                 "ci-fix-loop=claude-sonnet-5",
                 "--effort",
                 "high",
+                "--conflict-strategy",
+                "merge",
             ]
         )
         command = MODULE.scheduler_command(
@@ -2084,6 +2088,9 @@ class ProgressProtocolTest(StackFixture):
         self.assertIn("a" * 32, command)
         self.assertIn("--event-log", command)
         self.assertIn("ci-fix-loop=claude-sonnet-5", command)
+        self.assertEqual(
+            "merge", command[command.index("--conflict-strategy") + 1]
+        )
 
     def test_watch_emits_one_heartbeat_only_after_five_unchanged_minutes(self):
         class Clock:

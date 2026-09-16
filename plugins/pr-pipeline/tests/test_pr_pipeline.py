@@ -588,9 +588,11 @@ class StageContractTest(unittest.TestCase):
             effort="high",
             run_id="run-1",
             sweep=1,
+            conflict_strategy="merge",
         )
 
         self.assertIn(f"--state {expected}", command[2])
+        self.assertIn("--strategy merge", command[2])
 
     def test_ci_live_progress_reads_the_action_and_pending_checks(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -797,7 +799,17 @@ class SweepTest(unittest.TestCase):
         }
 
     def run_stage(
-        self, entry, _target, _repo, *, model, effort, run_id, sweep, report=None
+        self,
+        entry,
+        _target,
+        _repo,
+        *,
+        model,
+        effort,
+        run_id,
+        sweep,
+        conflict_strategy,
+        report=None,
     ):
         self.launched.append((entry["stage"], sweep))
         self.clear_at[entry["stage"]] = self.sync_heads[-1]
@@ -1543,9 +1555,12 @@ class AgentInstructionTest(unittest.TestCase):
 
 class CommandOutputTest(unittest.TestCase):
     def test_run_emits_json_lines_ending_with_pipeline_result(self):
-        def fake_pipeline(_target, _repo, *, models, effort, report):
+        def fake_pipeline(
+            _target, _repo, *, models, effort, conflict_strategy, report
+        ):
             self.assertIsNotNone(models)
             self.assertEqual("high", effort)
+            self.assertEqual("auto", conflict_strategy)
             report({"event": "pipeline_started", "run_id": "run-1"})
             report(
                 {
@@ -1721,6 +1736,8 @@ class ProgressProtocolTest(unittest.TestCase):
                 "ci-fix-loop=claude-sonnet-5",
                 "--effort",
                 "high",
+                "--conflict-strategy",
+                "merge",
             ]
         )
         command = MODULE.scheduler_command(
@@ -1735,9 +1752,18 @@ class ProgressProtocolTest(unittest.TestCase):
         self.assertIn("a" * 32, command)
         self.assertIn("--event-log", command)
         self.assertIn("ci-fix-loop=claude-sonnet-5", command)
+        self.assertIn("--conflict-strategy", command)
+        self.assertIn("merge", command)
 
     def test_start_writes_a_durable_launch_record_before_returning(self):
-        args = MODULE.build_parser().parse_args(["start", "owner/repo#7"])
+        args = MODULE.build_parser().parse_args(
+            [
+                "start",
+                "owner/repo#7",
+                "--conflict-strategy",
+                "merge",
+            ]
+        )
         process = mock.Mock(pid=4321)
         output = StringIO()
         with (
@@ -1761,8 +1787,10 @@ class ProgressProtocolTest(unittest.TestCase):
         event = json.loads(output.getvalue())
         self.assertEqual(4321, launch["pid"])
         self.assertEqual("a" * 32, launch["run_id"])
+        self.assertEqual("merge", launch["conflict_strategy"])
         self.assertEqual("pipeline_launched", event["event"])
         self.assertEqual("owner/repo#7", event["target"])
+        self.assertEqual("merge", event["conflict_strategy"])
 
 
 class ParserTest(unittest.TestCase):
@@ -1786,6 +1814,13 @@ class ParserTest(unittest.TestCase):
         )
         self.assertEqual("owner/repo#7", args.target)
         self.assertEqual(["ci-fix-loop=claude-sonnet-5"], args.stage_model)
+
+    def test_start_accepts_an_explicit_conflict_strategy(self):
+        args = MODULE.build_parser().parse_args(
+            ["start", "owner/repo#7", "--conflict-strategy", "merge"]
+        )
+
+        self.assertEqual("merge", args.conflict_strategy)
 
     def test_watch_accepts_the_canonical_target_cursor_and_bounded_wait(self):
         args = MODULE.build_parser().parse_args(
