@@ -1196,7 +1196,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.26")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.27")
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1338,9 +1338,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "agent_task_preflight") as preflight,
             mock.patch.object(MODULE, "discover_cloud_task") as discover,
         ):
-            MODULE.command_agent_task(self.arguments(state_path))
+            arguments = self.arguments(state_path)
+            arguments.request_review_only = True
+            MODULE.command_agent_task(arguments)
 
         continuation.assert_called_once()
+        self.assertTrue(continuation.call_args.args[0].request_review_only)
         preflight.assert_not_called()
         discover.assert_not_called()
 
@@ -2438,6 +2441,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             cancellation_grace=0.01,
             prepare_only=False,
             apply_prepared=False,
+            request_review_only=False,
             preserve_artifacts=False,
         )
 
@@ -3614,6 +3618,163 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         next_arguments = next_iteration.call_args.args[0]
         self.assertFalse(next_arguments.resume)
         self.assertEqual(next_arguments.max_iterations, 5)
+
+    def test_review_only_monitor_persists_findings_without_managed_task(self):
+        state_path = self.directory / "review-only-watch-state.json"
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "created_at": MODULE.utc_now(),
+                "iterations": 1,
+                "repo_root": str(self.repo_root),
+                "pr": self.preflight["pr"],
+                "monitoring": {
+                    "status": "requested",
+                    "result": None,
+                },
+            },
+        )
+
+        def complete_watch(_args):
+            state = MODULE.load_state(state_path)
+            state["monitoring"] = {
+                "status": "completed",
+                "result": {
+                    "result": MODULE.WATCHER_REVIEW_COMMENTS,
+                    "review_id": 29,
+                    "comment_ids": [self.comment["id"]],
+                },
+            }
+            MODULE.save_state(state_path, state)
+
+        arguments = self.arguments(state_path)
+        arguments.request_review_only = True
+        emitted = []
+        with (
+            mock.patch.object(MODULE, "command_watch", side_effect=complete_watch),
+            mock.patch.object(MODULE, "wait_for_fresh_copilot_state") as fresh,
+            mock.patch.object(
+                MODULE,
+                "wait_for_stable_review_preflight",
+                return_value=self.preflight,
+            ) as stable,
+            mock.patch.object(MODULE, "command_agent_task") as next_iteration,
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.continue_after_review_request(arguments, state_path)
+
+        fresh.assert_called_once()
+        stable.assert_called_once()
+        next_iteration.assert_not_called()
+        saved = MODULE.load_state(state_path)
+        self.assertEqual(
+            "review_comments_pending_preparation", saved["last_result"]
+        )
+        self.assertEqual([self.comment], saved["queue"]["comments"])
+        self.assertEqual(
+            "review_comments_pending_preparation", emitted[-1]["result"]
+        )
+        self.assertEqual(
+            self.preflight["comment_identities"],
+            emitted[-1]["comment_identities"],
+        )
+
+    def test_review_only_clean_result_stops_without_managed_task(self):
+        state_path = self.directory / "review-only-clean-state.json"
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "created_at": MODULE.utc_now(),
+                "iterations": 1,
+                "repo_root": str(self.repo_root),
+                "pr": self.preflight["pr"],
+                "monitoring": {
+                    "status": "requested",
+                    "head_sha": self.head,
+                    "result": None,
+                },
+            },
+        )
+
+        def complete_watch(_args):
+            state = MODULE.load_state(state_path)
+            state["clean_at_head_sha"] = self.head
+            state["monitoring"] = {
+                "status": "completed",
+                "head_sha": self.head,
+                "result": {
+                    "result": MODULE.WATCHER_REVIEW_CLEAN,
+                    "review_id": 29,
+                    "clean_at_head_sha": self.head,
+                },
+            }
+            MODULE.save_state(state_path, state)
+
+        arguments = self.arguments(state_path)
+        arguments.request_review_only = True
+        emitted = []
+        with (
+            mock.patch.object(MODULE, "command_watch", side_effect=complete_watch),
+            mock.patch.object(MODULE, "command_agent_task") as next_iteration,
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.continue_after_review_request(arguments, state_path)
+
+        next_iteration.assert_not_called()
+        saved = MODULE.load_state(state_path)
+        self.assertEqual(self.head, saved["clean_at_head_sha"])
+        self.assertEqual("loop_completed", emitted[-1]["result"])
+        self.assertEqual("cleared", emitted[-1]["stage_outcome"])
+
+    def test_review_only_existing_findings_do_not_request_or_dispatch(self):
+        state_path = self.directory / "review-only-existing-comments.json"
+        arguments = self.arguments(state_path)
+        arguments.request_review_only = True
+        emitted = []
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_stable_review_preflight",
+                return_value=self.preflight,
+            ),
+            mock.patch.object(MODULE, "request_copilot") as request,
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "run") as helper_run,
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        request.assert_not_called()
+        discover.assert_not_called()
+        helper_run.assert_not_called()
+        saved = MODULE.load_state(state_path)
+        self.assertEqual(
+            "review_comments_pending_preparation", saved["last_result"]
+        )
+        self.assertEqual([self.comment], saved["queue"]["comments"])
+        self.assertEqual(
+            "review_comments_pending_preparation", emitted[-1]["result"]
+        )
+
+    def test_review_only_rejects_other_recovery_modes(self):
+        state_path = self.directory / "review-only-invalid.json"
+        for field in ("resume", "prepare_only", "apply_prepared"):
+            arguments = self.arguments(state_path)
+            arguments.request_review_only = True
+            setattr(arguments, field, True)
+            with self.subTest(field=field), self.assertRaisesRegex(
+                MODULE.WorkflowError, "--request-review-only cannot be combined"
+            ):
+                MODULE.command_agent_task(arguments)
 
     def test_publication_checks_comments_before_and_after_push(self):
         source = SCRIPT.read_text(encoding="utf-8")

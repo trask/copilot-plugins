@@ -4933,6 +4933,37 @@ def continue_after_review_request(
                 }
             )
             return
+        if getattr(args, "request_review_only", False):
+            repo_root = Path(state["repo_root"])
+            target = parse_target(state["pr"]["pr_url"])
+            preflight = wait_for_stable_review_preflight(
+                args,
+                repo_root=repo_root,
+                target=target,
+                state_path=state_path,
+            )
+            state = load_state(state_path)
+            state["pr"] = preflight["pr"]
+            state["queue"] = {
+                "id": f"pr-{preflight['pr']['number']}",
+                "status": "active",
+                "comments": preflight["comments"],
+                "batches": [],
+            }
+            state["last_result"] = "review_comments_pending_preparation"
+            save_state(state_path, state)
+            emit(
+                {
+                    "result": "review_comments_pending_preparation",
+                    "state": str(state_path),
+                    "head_sha": state["pr"]["head_sha"],
+                    "iterations": state["iterations"],
+                    "review_id": watcher.get("review_id"),
+                    "comments": preflight["comments"],
+                    "comment_identities": preflight["comment_identities"],
+                }
+            )
+            return
         next_args = argparse.Namespace(**vars(args))
         next_args.resume = False
         command_agent_task(next_args)
@@ -5048,10 +5079,16 @@ def validate_preserved_agent_task_artifacts(
 def command_agent_task(args: argparse.Namespace) -> None:
     prepare_only = bool(getattr(args, "prepare_only", False))
     apply_prepared = bool(getattr(args, "apply_prepared", False))
+    request_review_only = bool(getattr(args, "request_review_only", False))
     preserve_artifacts = bool(getattr(args, "preserve_artifacts", False))
     if apply_prepared and (args.resume or prepare_only):
         raise WorkflowError(
             "--apply-prepared cannot be combined with --resume or --prepare-only"
+        )
+    if request_review_only and (args.resume or prepare_only or apply_prepared):
+        raise WorkflowError(
+            "--request-review-only cannot be combined with --resume, "
+            "--prepare-only, or --apply-prepared"
         )
     if prepare_only and not preserve_artifacts:
         raise WorkflowError("--prepare-only requires --preserve-artifacts")
@@ -5430,6 +5467,21 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 }
             )
             continue_after_review_request(args, state_path)
+            return
+        if request_review_only:
+            state["last_result"] = "review_comments_pending_preparation"
+            save_state(state_path, state)
+            emit(
+                {
+                    "result": "review_comments_pending_preparation",
+                    "state": str(state_path),
+                    "head_sha": pr["head_sha"],
+                    "iterations": state["iterations"],
+                    "review_id": preflight.get("head_review_id"),
+                    "comments": preflight["comments"],
+                    "comment_identities": preflight["comment_identities"],
+                }
+            )
             return
         run_id = secrets.token_hex(16)
         prompt_path = state_path.with_name(
@@ -6177,6 +6229,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "apply and finalize one validated preparation without launching "
             "another managed task"
+        ),
+    )
+    agent_task.add_argument(
+        "--request-review-only",
+        action="store_true",
+        help=(
+            "request and monitor one current-head Copilot review, then stop "
+            "before any managed task dispatch"
         ),
     )
     agent_task.add_argument(
