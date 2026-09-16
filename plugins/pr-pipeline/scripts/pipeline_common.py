@@ -1642,8 +1642,10 @@ def stage_prompt(target: dict[str, Any], arguments: list[str]) -> str:
     position = " ".join(f"{flag.lstrip('-')}: {value}" for flag, value in pairs)
     return (
         f"{name}\n\n{position}\n\n"
-        "Add these arguments to your preflight command, exactly as written, "
-        f"and change nothing else about how you run: {' '.join(arguments)}"
+        "Pass these arguments to the helper command that owns this stage run, "
+        f"exactly as written: {' '.join(arguments)}\n"
+        "This pipeline position replaces standalone invocation scope. Do not pass "
+        "--new-invocation or --invocation-run with it."
     )
 
 

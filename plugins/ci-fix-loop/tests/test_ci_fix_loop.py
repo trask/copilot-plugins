@@ -1116,7 +1116,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.18", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.19", json.loads(PLUGIN.read_text())["version"])
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -2023,6 +2023,141 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         processed = MODULE.load_state(state_path)["coordinator"]["processed_snapshots"]
         self.assertEqual([entry["task_id"] for entry in processed], ["task-1", "task-2"])
+
+    def test_pipeline_owned_external_failure_records_state_and_dedupes_restart(self):
+        repo_root = self.root / "repo"
+        repo_root.mkdir()
+        state_path = self.root / "coordinator.json"
+        preflight = copy.deepcopy(self.preflight)
+        preflight["repository_root"] = str(repo_root)
+        external_key = "status:zizmor"
+        preflight["check_snapshot"].update(
+            {
+                "rollup": [
+                    {
+                        "key": "check:CodeQL/analyze",
+                        "name": "analyze",
+                        "kind": "check_run",
+                        "class": "passed",
+                        "conclusion": "SUCCESS",
+                    },
+                    {
+                        "key": external_key,
+                        "name": "zizmor",
+                        "kind": "status",
+                        "class": "failed",
+                        "state": "FAILURE",
+                        "url": "https://zizmor.example/runs/104705281292",
+                    },
+                ],
+                "decision": {
+                    "decision": "failures",
+                    "reason": "checks_failed",
+                    "checks": [external_key],
+                    "pending_checks": [],
+                    "detail": "zizmor failed",
+                },
+                "failures": [
+                    {
+                        "key": external_key,
+                        "name": "zizmor",
+                        "workflow": None,
+                        "url": "https://zizmor.example/runs/104705281292",
+                        "conclusion": "FAILURE",
+                        "baseline_conclusion": None,
+                        "baseline_verdict": "unknown",
+                        "log": "",
+                        "log_sha256": MODULE.sha256_text(""),
+                    }
+                ],
+            }
+        )
+        preflight["check_snapshot"]["rollup_sha256"] = MODULE.sha256_text(
+            json.dumps(
+                preflight["check_snapshot"]["rollup"],
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        preflight["check_snapshot"]["sha256"] = MODULE.check_snapshot_sha256(
+            preflight["check_snapshot"]
+        )
+        failed = self.result()
+        failed["status"] = "error"
+        failed["task"]["state"] = "in_progress"
+        failed["application"] = {
+            "status": "not_applied",
+            "final_local_head": self.head,
+        }
+        failed["report"]["commit"] = None
+        failed["report"]["sha256"] = None
+        failed["attestation"]["structural_complete"] = False
+        failed["error"] = {"code": "worker_failed", "message": "worker stopped"}
+        helper_commands = []
+
+        def run_helper(command, **kwargs):
+            helper_commands.append(command)
+            Path(command[command.index("--result-file") + 1]).write_text(
+                json.dumps(failed), encoding="utf-8"
+            )
+            return MODULE.subprocess.CompletedProcess(command, 1, "", "")
+
+        args = MODULE.build_parser().parse_args(
+            [
+                "loop",
+                "owner/repo#7",
+                "--repo-root",
+                str(repo_root),
+                "--state",
+                str(state_path),
+                "--new-invocation",
+                "--pipeline-run",
+                "bc204b55bc1240b18bc5193123ceb226",
+                "--pipeline-iteration",
+                "1",
+                "--pipeline-max-iterations",
+                "2",
+            ]
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value={"repo_name": "owner/repo", "number": 7},
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_stable_ci_preflight",
+                return_value=preflight,
+            ),
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
+            mock.patch.object(
+                MODULE,
+                "discover_cloud_task",
+                return_value=self.root / "cloud_task.py",
+            ),
+            mock.patch.object(MODULE, "run", side_effect=run_helper),
+            mock.patch.object(
+                MODULE, "local_identity", return_value=preflight["identity"]
+            ),
+        ):
+            for expected in ("worker stopped", "unfinished Agent Task"):
+                with self.assertRaisesRegex(MODULE.WorkflowError, expected):
+                    MODULE.command_loop(args)
+
+        self.assertEqual(1, len(helper_commands))
+        state = MODULE.load_state(state_path)
+        self.assertEqual("pipeline", state["budget_scope"])
+        self.assertNotIn("invocation_budget", state)
+        self.assertEqual("failed", state["agent_task"]["status"])
+        self.assertEqual("blocked", state["coordinator"]["status"])
+        self.assertEqual("coordinator_error", state["escalation"]["reason"])
+        self.assertEqual(
+            [external_key],
+            state["agent_task"]["preflight"]["check_snapshot"]["decision"]["checks"],
+        )
 
     def test_pending_rerun_transition_recovers_completed_checks_after_restart(self):
         state_path = self.root / "coordinator.json"
@@ -5769,6 +5904,32 @@ class PreflightCommandTest(unittest.TestCase):
         self.assertEqual(
             "github", MODULE.load_state(Path(payload["state"]))["run"]["diff_source"]
         )
+
+    def test_pipeline_position_supersedes_redundant_new_invocation(self):
+        path = self.root / "state.json"
+        with contextlib.ExitStack() as stack:
+            payload = self.preflight(
+                stack,
+                state_path=path,
+                pipeline=[
+                    "--new-invocation",
+                    "--pipeline-run",
+                    "bc204b55bc1240b18bc5193123ceb226",
+                    "--pipeline-iteration",
+                    "1",
+                    "--pipeline-max-iterations",
+                    "2",
+                ],
+            )
+
+        state = MODULE.load_state(path)
+        self.assertEqual("ready", payload["result"])
+        self.assertEqual("pipeline", payload["budget_scope"])
+        self.assertEqual(
+            "bc204b55bc1240b18bc5193123ceb226",
+            state["pipeline_budget"]["run"],
+        )
+        self.assertNotIn("invocation_budget", state)
 
     def test_refuses_a_dirty_worktree(self):
         with contextlib.ExitStack() as stack:

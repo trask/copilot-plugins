@@ -551,6 +551,23 @@ class StageContractTest(unittest.TestCase):
             arguments,
         )
 
+    def test_pipeline_prompt_replaces_standalone_invocation_scope(self):
+        prompt = MODULE.stage_prompt(
+            target(),
+            [
+                "--pipeline-run",
+                "run-1",
+                "--pipeline-iteration",
+                "1",
+                "--pipeline-max-iterations",
+                "2",
+            ],
+        )
+
+        self.assertIn("exactly as written", prompt)
+        self.assertIn("replaces standalone invocation scope", prompt)
+        self.assertIn("Do not pass --new-invocation or --invocation-run", prompt)
+
     def test_the_conflict_stage_no_longer_takes_a_pipeline_position(self):
         """PR Conflict Resolver runs once per launch and has no budget to shrink.
 

@@ -266,6 +266,7 @@ ESCALATION_REASONS = (
     "max_iterations_reached",
     "unfixable_failure",
     "head_changed",
+    "coordinator_error",
 )
 ESCALATION_ACTIONS = {
     "approval_required": (
@@ -309,6 +310,9 @@ ESCALATION_ACTIONS = {
     "head_changed": (
         "Someone pushed to the head branch while this loop ran. Start it again on "
         "the new head."
+    ),
+    "coordinator_error": (
+        "Fix the reported local coordinator error, then start this loop again."
     ),
 }
 
@@ -2447,6 +2451,17 @@ def invocation_scope(
     }
 
 
+def invocation_scope_for_pipeline(
+    state: dict[str, Any],
+    args: argparse.Namespace,
+    pipeline: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Let a complete pipeline position replace a redundant fresh-run flag."""
+    if pipeline is not None and getattr(args, "new_invocation", False):
+        return None
+    return invocation_scope(state, args)
+
+
 def absolute_iteration_cap(
     scope: dict[str, Any] | None, max_iterations: int, pipeline_max_iterations: Any
 ) -> int | None:
@@ -2875,7 +2890,7 @@ def command_preflight(args: argparse.Namespace) -> None:
         state["reruns"] = {}
     max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
     pipeline = pipeline_scope(state, args)
-    invocation = invocation_scope(state, args)
+    invocation = invocation_scope_for_pipeline(state, args, pipeline)
     if pipeline is not None and invocation is not None:
         raise WorkflowError(
             "standalone invocation arguments cannot be combined with pipeline arguments"
@@ -5449,7 +5464,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         state["repo_root"] = str(repo_root)
         migrate_budget_counters(state)
         pipeline = pipeline_scope(state, args)
-        invocation = invocation_scope(state, args)
+        invocation = invocation_scope_for_pipeline(state, args, pipeline)
         if pipeline is not None and invocation is not None:
             raise WorkflowError(
                 "standalone invocation arguments cannot be combined with pipeline arguments"
@@ -6493,6 +6508,31 @@ def record_completed_ci_rerun(state_path: Path, check: str) -> None:
     save_state(state_path, state)
 
 
+def record_coordinator_failure(state_path: Path, error: WorkflowError) -> None:
+    state = coordinator_file_state(state_path)
+    run_state = state.get("run") or {}
+    decision = run_state.get("decision") or {}
+    reason = error.details.get("reason")
+    if reason not in ESCALATION_ACTIONS:
+        reason = "coordinator_error"
+    state["escalation"] = {
+        "reason": reason,
+        "detail": str(error),
+        "checks": list(decision.get("checks") or []),
+        "next_action": ESCALATION_ACTIONS[reason],
+        "head_sha": (
+            run_state.get("head_sha")
+            or (state.get("coordinator") or {}).get("head_sha")
+        ),
+        "recorded_at": utc_now(),
+    }
+    coordinator = state.setdefault("coordinator", {})
+    coordinator["status"] = "blocked"
+    coordinator["detail"] = str(error)
+    coordinator["observed_at"] = utc_now()
+    save_state(state_path, state)
+
+
 def command_loop(args: argparse.Namespace) -> None:
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
@@ -6572,6 +6612,11 @@ def command_loop(args: argparse.Namespace) -> None:
             "local coordinator was cancelled",
             details={"state": str(state_path), "reason": "cancelled"},
         ) from error
+    except WorkflowError as error:
+        record_coordinator_failure(state_path, error)
+        error.details.setdefault("state", str(state_path))
+        error.details.setdefault("reason", "coordinator_error")
+        raise
 
 
 def load_stack_state(path: Path) -> dict[str, Any]:
