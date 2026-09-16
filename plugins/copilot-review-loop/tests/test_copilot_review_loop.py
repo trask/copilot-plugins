@@ -20,6 +20,9 @@ PLUGIN = Path(__file__).parents[1] / "plugin.json"
 CCA_DISABLED_RESULT = (
     Path(__file__).parent / "fixtures" / "cca-disabled-agent-task-result.json"
 )
+CCA_DISABLED_347_RESULT = (
+    Path(__file__).parent / "fixtures" / "cca-disabled-347-agent-task-result.json"
+)
 MALFORMED_VALIDATION_RESULT = (
     Path(__file__).parent
     / "fixtures"
@@ -1185,7 +1188,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.24")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.25")
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -2141,6 +2144,20 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertFalse(prompt.exists())
         self.assertFalse(result.exists())
 
+    def test_prepared_artifact_manifest_rejects_byte_drift(self):
+        artifact = self.directory / "prepared-result.json"
+        artifact.write_text("first", encoding="utf-8")
+        task = {}
+        MODULE.checkpoint_preserved_agent_task_artifacts(task, {artifact})
+
+        MODULE.validate_preserved_agent_task_artifacts(task, self.repo_root)
+        artifact.write_text("second", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "artifact identity drifted"
+        ):
+            MODULE.validate_preserved_agent_task_artifacts(task, self.repo_root)
+
     def test_resume_invocation_reuses_the_retained_result(self):
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertNotIn('"--input-result-file"', source)
@@ -2236,6 +2253,46 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(emitted[-1]["result"], "max_iterations_reached")
         discover.assert_not_called()
 
+    def test_prepare_only_stops_before_requesting_a_missing_review(self):
+        state_path = self.directory / "review-request-pending.json"
+        preflight = {
+            **self.preflight,
+            "comments": [],
+            "comment_identities": [],
+            "head_review_clean": False,
+            "head_review_id": None,
+        }
+        args = self.arguments(state_path)
+        args.prepare_only = True
+        args.preserve_artifacts = True
+        emitted = []
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_stable_review_preflight",
+                return_value=preflight,
+            ),
+            mock.patch.object(MODULE, "remote_head") as remote_head,
+            mock.patch.object(MODULE, "request_copilot") as request,
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.command_agent_task(args)
+
+        self.assertEqual(
+            "review_request_pending_authorization", emitted[-1]["result"]
+        )
+        remote_head.assert_not_called()
+        request.assert_not_called()
+        discover.assert_not_called()
+
     def arguments(self, state_path, *, resume=False, max_iterations=5):
         return SimpleNamespace(
             target="owner/repo#7",
@@ -2249,6 +2306,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             pipeline_max_iterations=None,
             watch_interval=0.01,
             cancellation_grace=0.01,
+            prepare_only=False,
+            apply_prepared=False,
+            preserve_artifacts=False,
         )
 
     def test_no_op_task_still_replies_resolves_and_requests_review(self):
@@ -2325,6 +2385,246 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             state["coordinator"]["processed_snapshots"][0]["task_id"],
             "task-1",
         )
+
+    def test_legacy_failure_prepares_without_mutation_then_applies_once(self):
+        state_path = self.directory / "prepared-state.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        old_prompt = self.directory / "old-prompt.txt"
+        old_prompt.write_text("old prompt", encoding="utf-8")
+        old_result = self.directory / "old-result.json"
+        legacy_failure = self.task_creation_failure()
+        legacy_failure["schema"] = MODULE.LEGACY_AGENT_TASK_RESULT_SCHEMA
+        legacy_failure["policy"] = MODULE.LEGACY_AGENT_TASK_POLICY_V4
+        legacy_failure.pop("attestation")
+        legacy_failure["worker_receipt"] = {
+            "path": ".github/agent-task-validations/legacy-request.json",
+            "commit": None,
+            "sha256": None,
+        }
+        legacy_failure["validation"] = {"complete": False, "outcomes": []}
+        old_result.write_text(json.dumps(legacy_failure), encoding="utf-8")
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "created_at": MODULE.utc_now(),
+                "iterations": 0,
+                "history": [],
+                "pr": self.preflight["pr"],
+                "queue": {
+                    "id": "pr-7",
+                    "status": "active",
+                    "comments": [self.comment],
+                    "batches": [],
+                },
+                "agent_task": {
+                    "run_id": "legacy-owner",
+                    "status": "failed",
+                    "model": "gpt-5.6-sol",
+                    "remaining_iterations": 5,
+                    "preflight": self.preflight,
+                    "prompt_file": str(old_prompt),
+                    "result_file": str(old_result),
+                    "error": "Agent Task result has an unsupported schema or fields",
+                    "recovery_command": "must-not-survive",
+                },
+            },
+        )
+        report = self.report([self.fix])
+        result = self.result([self.fix])
+        result["report"]["sha256"] = MODULE.sha256_text(report)
+        helper_launches = 0
+
+        def prepare_run(command, **_kwargs):
+            nonlocal helper_launches
+            helper_launches += 1
+            output = Path(command[command.index("--result-file") + 1])
+            output.write_text(json.dumps(result), encoding="utf-8")
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        prepare_args = self.arguments(state_path)
+        prepare_args.prepare_only = True
+        prepare_args.preserve_artifacts = True
+        apply_import = mock.Mock()
+        replies = mock.Mock()
+        resolve = mock.Mock()
+        request = mock.Mock()
+        metadata = mock.Mock()
+        remote = mock.Mock()
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_stable_review_preflight",
+                return_value=self.preflight,
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "run", side_effect=prepare_run),
+            mock.patch.object(
+                MODULE, "local_identity", return_value=self.preflight["identity"]
+            ),
+            mock.patch.object(
+                MODULE,
+                "validate_generated_history",
+                return_value={self.fix: ["src/app.py"]},
+            ),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(
+                MODULE, "require_live_comments", return_value=[self.comment]
+            ),
+            mock.patch.object(MODULE, "apply_verified_import", new=apply_import),
+            mock.patch.object(MODULE, "post_missing_replies", new=replies),
+            mock.patch.object(MODULE, "resolve_threads", new=resolve),
+            mock.patch.object(MODULE, "request_copilot", new=request),
+            mock.patch.object(MODULE, "metadata_for", new=metadata),
+            mock.patch.object(MODULE, "remote_head", new=remote),
+            mock.patch.object(MODULE, "emit") as emit,
+            mock.patch.object(MODULE.secrets, "token_hex", return_value="new-owner"),
+        ):
+            MODULE.command_agent_task(prepare_args)
+
+        self.assertEqual(1, helper_launches)
+        apply_import.assert_not_called()
+        replies.assert_not_called()
+        resolve.assert_not_called()
+        request.assert_not_called()
+        metadata.assert_not_called()
+        remote.assert_not_called()
+        prepared = MODULE.load_state(state_path)
+        self.assertEqual("validated_pending_import", prepared["agent_task"]["status"])
+        self.assertTrue(prepared["agent_task"]["artifacts_preserved"])
+        self.assertEqual(
+            [{"commit": self.fix, "paths": ["src/app.py"]}],
+            prepared["agent_task"]["preparation"]["paths_by_commit"],
+        )
+        self.assertEqual([17], prepared["agent_task"]["preparation"]["comment_ids"])
+        self.assertEqual(
+            ["PRRT_thread"], prepared["agent_task"]["preparation"]["thread_ids"]
+        )
+        self.assertEqual([29], prepared["agent_task"]["preparation"]["review_ids"])
+        self.assertIn("--apply-prepared", prepared["agent_task"]["apply_command"])
+        self.assertNotIn('"--resume"', prepared["agent_task"]["apply_command"])
+        self.assertNotIn("--prepare-only", prepared["agent_task"]["apply_command"])
+        self.assertEqual(
+            "validated_pending_import", emit.call_args.args[0]["result"]
+        )
+        self.assertEqual(1, len(prepared["managed_task_history"]))
+        self.assertEqual(
+            "not_created",
+            prepared["managed_task_history"][0]["task_id_status"],
+        )
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task") as duplicate_helper,
+            self.assertRaisesRegex(MODULE.WorkflowError, "unfinished Agent Task"),
+        ):
+            MODULE.command_agent_task(prepare_args)
+        duplicate_helper.assert_not_called()
+
+        remote_head = self.head
+        pushes = 0
+
+        def apply_run(command, **_kwargs):
+            nonlocal pushes, remote_head
+            if "push" in command:
+                pushes += 1
+                remote_head = self.fix
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        apply_args = self.arguments(state_path)
+        apply_args.apply_prepared = True
+        apply_args.preserve_artifacts = True
+        apply_import = mock.Mock(return_value=True)
+        replies = mock.Mock(return_value={17: 71})
+        resolve = mock.Mock()
+        request = mock.Mock(return_value={"status": "requested"})
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "run", side_effect=apply_run),
+            mock.patch.object(
+                MODULE, "local_identity", return_value=self.preflight["identity"]
+            ),
+            mock.patch.object(
+                MODULE,
+                "validate_generated_history",
+                return_value={self.fix: ["src/app.py"]},
+            ),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(MODULE, "apply_verified_import", new=apply_import),
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                return_value=self.preflight["pr"],
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_live_pr_snapshot",
+                side_effect=lambda _target, pr, expected_head: {
+                    **pr,
+                    "head_sha": expected_head,
+                },
+            ),
+            mock.patch.object(
+                MODULE, "remote_head", side_effect=lambda *_args: remote_head
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_remote_head",
+                side_effect=lambda *_args: remote_head,
+            ),
+            mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
+            mock.patch.object(
+                MODULE, "require_live_comments", return_value=[self.comment]
+            ),
+            mock.patch.object(MODULE, "post_missing_replies", new=replies),
+            mock.patch.object(MODULE, "resolve_threads", new=resolve),
+            mock.patch.object(MODULE, "request_copilot", new=request),
+            mock.patch.object(
+                MODULE, "verify_publish", return_value={"head_matches": True}
+            ),
+            mock.patch.object(MODULE, "continue_after_review_request"),
+            mock.patch.object(MODULE, "emit"),
+        ):
+            MODULE.command_agent_task(apply_args)
+
+        discover.assert_not_called()
+        apply_import.assert_called_once()
+        self.assertEqual(1, pushes)
+        replies.assert_called_once()
+        resolve.assert_called_once()
+        request.assert_called_once()
+        completed = MODULE.load_state(state_path)
+        self.assertEqual("completed", completed["agent_task"]["status"])
+        self.assertTrue(completed["agent_task"]["artifacts_preserved"])
+        self.assertNotIn("apply_command", completed["agent_task"])
+
+        missing_preservation = self.arguments(state_path)
+        missing_preservation.apply_prepared = True
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "--apply-prepared requires --preserve-artifacts"
+        ):
+            MODULE.command_agent_task(missing_preservation)
 
     def test_post_push_metadata_lag_resumes_without_another_task_or_push(self):
         state_path = self.directory / "post-push-state.json"
@@ -2770,6 +3070,36 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 requested_model="gpt-5.6-sol",
                 allow_legacy_policy=True,
             )
+
+    def test_exact_347_taskless_failure_is_a_trusted_legacy_owner(self):
+        result = MODULE.load_agent_task_result(CCA_DISABLED_347_RESULT)
+        preflight = {
+            "identity": {
+                "branch": "trask-fix-dashboard-publisher-contention",
+                "head": "14cf2a9a1ee281423501ec0a1b69e9236c5a3816",
+                "status": "",
+            },
+            "pr": {
+                "number": 347,
+                "pr_url": "https://github.com/open-telemetry/shared-workflows/pull/347",
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_repository": "open-telemetry/shared-workflows",
+                "head_branch": "trask-fix-dashboard-publisher-contention",
+                "head_sha": "14cf2a9a1ee281423501ec0a1b69e9236c5a3816",
+                "base_branch": "main",
+                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+            },
+        }
+
+        failure = MODULE.validate_task_creation_failure_result(
+            result,
+            preflight=preflight,
+            requested_model="gpt-5.6-sol",
+            allow_legacy_policy=True,
+        )
+
+        self.assertEqual("api_failure", failure["code"])
+        self.assertIsNone(result["task"]["id"])
 
     def test_exact_v4_validation_failure_is_terminal_but_not_accepted_as_v5(self):
         result = MODULE.load_agent_task_result(MALFORMED_VALIDATION_RESULT)
