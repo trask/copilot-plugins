@@ -16,6 +16,9 @@ from unittest import mock
 SCRIPT = Path(__file__).parents[1] / "scripts" / "self_review_loop.py"
 AGENT = Path(__file__).parents[1] / "agents" / "self-review-loop.agent.md"
 PLUGIN = Path(__file__).parents[1] / "plugin.json"
+COMPACT_V3_REPORT = (
+    Path(__file__).parent / "fixtures" / "compact-v3-report.md"
+)
 SPEC = importlib.util.spec_from_file_location("self_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -1351,7 +1354,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.17")
+        self.assertEqual(plugin["version"], "1.3.18")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -1370,7 +1373,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             prior_history=[],
         )
         self.assertIn("human-readable UTF-8 Markdown report", prompt)
-        self.assertIn("worker prompt version 2", prompt)
+        self.assertIn("worker prompt version 3", prompt)
+        self.assertIn("do not omit the repository", prompt)
         self.assertIn("maximum_review_iterations", prompt)
         self.assertIn("untrusted data", prompt)
         self.assertIn("Map every fix commit to its findings in the report", prompt)
@@ -1391,6 +1395,150 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         self.assertEqual(report["outcome"], "cleared")
         self.assertEqual(remote["commits"], [])
+
+    def test_exact_compact_v3_report_recovers_with_verified_history(self):
+        commits = [
+            "47394f9943af60154f6fce8c72e662e47b8c1703",
+            "a56a1b77a015d4928625e2f0d708f00fe7f924c8",
+        ]
+        preflight = {
+            **self.preflight,
+            "pr": {
+                **self.preflight["pr"],
+                "number": 377,
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_sha": "7f1f402d9f7d5a925367dea4a1e00ad446e9d9a3",
+                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+                "title": "Collect organization-wide GitHub Actions queue data",
+                "body": (
+                    "Collect per-job GitHub Actions timing data hourly across active "
+                    "public OpenTelemetry repositories and store immutable "
+                    "gzip-compressed JSON Lines on the orphan "
+                    "`otelbot/github-actions-queue-data` branch.\n\n"
+                    "- Use the read-only `OpenTelemetry Actions Telemetry` GitHub App "
+                    "and keep the built-in workflow token limited to writing the data "
+                    "branch.\n"
+                    "- Checkpoint repository progress, revisit unfinished runs, and "
+                    "retain failed job lookups for retry.\n"
+                    "- Preserve matrix jobs, attempts, fork runs, runner metadata, and "
+                    "direct job links in the raw dataset.\n"
+                    "- Split searches around GitHub's 1,000-run API limit and checkpoint "
+                    "cleanly if the App exhausts its REST quota."
+                ),
+            },
+        }
+        content = COMPACT_V3_REPORT.read_text(encoding="utf-8")
+        self.assertEqual(
+            MODULE.sha256_text(content),
+            "5fcbb8a135ddfda282d4bca91c2cab61a10c87109d358348ae2292185921a2c2",
+        )
+
+        report = MODULE.validate_self_review_report(
+            content,
+            request_id="97d8a994-f87c-43dd-a981-20fcf49e8de3",
+            preflight=preflight,
+            remote={"commits": commits, "requires_apply": True},
+            max_iterations=5,
+            paths_by_commit={
+                commits[0]: [
+                    ".github/scripts/github-actions-queue/collect.py",
+                    ".github/scripts/github-actions-queue/test_collect.py",
+                ],
+                commits[1]: [
+                    ".github/scripts/github-actions-queue/collect.py",
+                    ".github/scripts/github-actions-queue/test_collect.py",
+                    "github-actions-queue/README.md",
+                ],
+            },
+        )
+
+        self.assertEqual(report["outcome"], "cleared")
+        self.assertEqual(report["iterations_used"], 5)
+        self.assertEqual(
+            [item["commit"] for item in report["findings"][:2]],
+            commits,
+        )
+        self.assertTrue(
+            all(
+                item["path"] is None
+                and item["line"] is None
+                and item["side"] is None
+                for item in report["findings"]
+            )
+        )
+
+    def test_compact_v3_report_rejects_commit_order_and_pr_drift(self):
+        first_commit = "5" * 40
+        commits = [first_commit, "6" * 40]
+        report = {
+            "findings": [
+                {
+                    "body": "Fix the first issue.",
+                    "disposition": "fixed",
+                    "fix_commit": first_commit,
+                },
+                {
+                    "body": "Fix the second issue.",
+                    "disposition": "fixed",
+                    "fix_commit": commits[1],
+                },
+            ],
+            "status": "clean",
+            "fix_commits": commits,
+            "title": self.preflight["pr"]["title"],
+            "body": self.preflight["pr"]["body"],
+        }
+        common = {
+            "request_id": "request-1",
+            "preflight": self.preflight,
+            "remote": {"commits": commits, "requires_apply": True},
+            "max_iterations": 5,
+            "paths_by_commit": {
+                first_commit: ["src/first.py"],
+                commits[1]: ["src/second.py"],
+            },
+        }
+        cases = [
+            {**report, "fix_commits": list(reversed(commits))},
+            {**report, "title": "Changed title"},
+            {
+                **report,
+                "findings": [
+                    {**report["findings"][0], "fix_commit": commits[1]},
+                    report["findings"][1],
+                ],
+            },
+        ]
+        for malformed in cases:
+            with self.subTest(report=malformed), self.assertRaises(MODULE.WorkflowError):
+                MODULE.validate_self_review_report(
+                    json.dumps(malformed),
+                    **common,
+                )
+
+    def test_preserve_artifacts_keeps_self_review_prompt_and_result(self):
+        task_state = {
+            "prompt_file": "prompt.txt",
+            "result_file": "result.json",
+            "recovery_command": "resume",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            prompt = Path(directory) / "prompt.txt"
+            result = Path(directory) / "result.json"
+            prompt.write_text("prompt", encoding="utf-8")
+            result.write_text("result", encoding="utf-8")
+
+            MODULE.finalize_agent_task_artifacts(
+                task_state,
+                {prompt, result},
+                preserve=True,
+            )
+
+            self.assertTrue(prompt.is_file())
+            self.assertTrue(result.is_file())
+        self.assertFalse(task_state["artifacts_removed"])
+        self.assertTrue(task_state["artifacts_preserved"])
+        self.assertNotIn("recovery_command", task_state)
 
     def test_rejects_identity_application_validation_and_credentials(self):
         wrong_policy = self.result()
