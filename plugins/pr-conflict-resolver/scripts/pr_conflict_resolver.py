@@ -6835,7 +6835,8 @@ def managed_attempt_count(state: dict[str, Any] | None) -> int:
         ):
             raise WorkflowError("managed conflict attempt count is malformed")
         return recorded
-    if not isinstance(state.get("agent_task"), dict):
+    task = state.get("agent_task")
+    if not isinstance(task, dict):
         return 0
     total = state.get("attempts", 0)
     history = state.get("history", [])
@@ -6847,6 +6848,8 @@ def managed_attempt_count(state: dict[str, Any] | None) -> int:
         or len(history) > total
     ):
         raise WorkflowError("managed conflict attempt history is malformed")
+    if task.get("task_id_status") == "not_created":
+        return total - len(history)
     return max(1, total - len(history))
 
 
@@ -7109,14 +7112,24 @@ def conflict_preflight(
         f"refs/heads/{metadata['base_branch']}",
         metadata["base_sha"],
     )
-    relations = stack_relations(metadata)
-    methods = repository_merge_methods(metadata["repo_name"])
     detection = stack_membership(metadata)
     stack = detection["stack"]
     if metadata["base_branch"] != detection["default_branch"] and stack is None:
         raise WorkflowError(
             "a non-default pull request base is supported only through a native stack"
         )
+    if metadata["mergeable"] not in {"MERGEABLE", "CONFLICTING"}:
+        raise WorkflowError("GitHub did not return stable pull request mergeability")
+    if metadata["mergeable"] == "MERGEABLE" and not (
+        stack is not None and whole_stack
+    ):
+        return {
+            "already_mergeable": True,
+            "pr": metadata,
+            "strategy": None,
+        }
+    relations = stack_relations(metadata)
+    methods = repository_merge_methods(metadata["repo_name"])
     strategy_choice = choose_strategy(
         requested_strategy,
         merge_methods=methods,
@@ -7142,12 +7155,6 @@ def conflict_preflight(
         if stack is not None and (whole_stack or metadata["mergeable"] == "CONFLICTING")
         else strategy_choice["strategy"]
     )
-    if strategy != "native-stack" and metadata["mergeable"] == "MERGEABLE":
-        return {
-            "already_mergeable": True,
-            "pr": metadata,
-            "strategy": strategy,
-        }
     if metadata["mergeable"] != "CONFLICTING" and strategy != "native-stack":
         raise WorkflowError("GitHub did not return a stable conflicting pull request")
     merge_base = git(repo_root, "merge-base", metadata["head_sha"], metadata["base_sha"])
@@ -8163,9 +8170,31 @@ def command_agent_task(args: argparse.Namespace) -> None:
             save_state(state_path, state)
             raise
         if preflight["already_mergeable"]:
+            archive_attempt(state)
+            attempt_number = int(state.get("attempts", 0)) + 1
+            state["attempts"] = attempt_number
             state["managed_attempts"] = prior_managed_attempts
             state["last_result"] = "mergeable"
             state["pr"] = preflight["pr"]
+            state["escalation"] = None
+            state["attempt"] = {
+                "id": f"pr-{preflight['pr']['number']}-attempt-{attempt_number}",
+                "status": "mergeable",
+                "attempt_number": attempt_number,
+                "strategy": preflight.get("strategy"),
+                "strategy_reason": None,
+                "strategy_warnings": [],
+                "head_sha": preflight["pr"]["head_sha"],
+                "base_sha": preflight["pr"]["base_sha"],
+                "merge_base": None,
+                "mergeable": preflight["pr"].get("mergeable"),
+                "merge_state_status": preflight["pr"].get("merge_state_status"),
+                "started_at": utc_now(),
+                "conflicts": [],
+                "conflict_signature": None,
+                "published_head_sha": None,
+                "mergeable_at_head_sha": preflight["pr"]["head_sha"],
+            }
             state["agent_task"].update(
                 {
                     "status": "completed",

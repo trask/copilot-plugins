@@ -973,7 +973,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
                 "conflict_preflight",
                 return_value={
                     "already_mergeable": True,
-                    "pr": {"head_sha": "b" * 40},
+                    "pr": pr_metadata(mergeable="MERGEABLE"),
                     "strategy": "merge",
                 },
             ) as preflight,
@@ -984,8 +984,9 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual(1, preflight.call_args.kwargs["iteration_number"])
         self.assertEqual(3, preflight.call_args.kwargs["iteration_budget"])
         saved = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(4, saved["attempts"])
+        self.assertEqual(5, saved["attempts"])
         self.assertEqual(0, saved["managed_attempts"])
+        self.assertEqual("head1", saved["attempt"]["mergeable_at_head_sha"])
 
     def test_managed_counter_migrates_state_that_already_ran_managed_tasks(self):
         self.assertEqual(
@@ -1169,6 +1170,206 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         status = emitted(status_emit)
         self.assertEqual("ready", status["result"])
         self.assertEqual("failed", status["agent_task"]["status"])
+
+    def test_mergeable_agent_task_needs_no_repository_strategy(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "created_at": "2026-09-15T00:00:00Z",
+                    "attempts": 0,
+                    "history": [],
+                    "escalation": None,
+                    "agent_task": {
+                        "run_id": "6197e7ca56ded6a0",
+                        "status": "failed",
+                        "task_id": None,
+                        "task_id_status": "not_created",
+                        "error": {
+                            "code": "conflict_preflight_failed",
+                            "message": (
+                                "repository merge settings and dependent pull "
+                                "requests leave no supported conflict strategy"
+                            ),
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+            ]
+        )
+        target = MODULE.parse_target("owner/repo#7")
+        metadata = pr_metadata(mergeable="MERGEABLE")
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(MODULE, "require_clean_worktree"),
+            mock.patch.object(MODULE, "require_no_integration_in_progress"),
+            mock.patch.object(MODULE, "live_mergeability", return_value=metadata),
+            mock.patch.object(MODULE, "checkout_pr_branch"),
+            mock.patch.object(MODULE, "git", side_effect=fake_git()),
+            mock.patch.object(MODULE, "find_remote", return_value="origin"),
+            mock.patch.object(MODULE, "fetch_preflight_ref"),
+            mock.patch.object(
+                MODULE,
+                "stack_membership",
+                return_value={"default_branch": "main", "stack": None},
+            ),
+            mock.patch.object(MODULE, "stack_relations") as relations,
+            mock.patch.object(
+                MODULE,
+                "repository_merge_methods",
+                side_effect=MODULE.WorkflowError("no supported merge methods"),
+            ) as merge_methods,
+            mock.patch.object(MODULE, "discover_conflict_task") as discover,
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(args)
+
+        relations.assert_not_called()
+        merge_methods.assert_not_called()
+        discover.assert_not_called()
+        payload = emitted(emit)
+        self.assertEqual("mergeable", payload["result"])
+        self.assertEqual("cleared", payload["stage_outcome"])
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual("completed", state["agent_task"]["status"])
+        self.assertEqual("not_needed", state["agent_task"]["task_id_status"])
+        self.assertEqual(0, state["managed_attempts"])
+        self.assertEqual(
+            "6197e7ca56ded6a0",
+            state["managed_task_history"][0]["run_id"],
+        )
+        self.assertEqual("mergeable", state["attempt"]["status"])
+        self.assertEqual("head1", state["attempt"]["mergeable_at_head_sha"])
+        self.assertEqual("cleared", MODULE.stage_outcome(state))
+
+    def test_unknown_mergeability_fails_before_repository_strategy(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+            ]
+        )
+        target = MODULE.parse_target("owner/repo#7")
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(MODULE, "require_clean_worktree"),
+            mock.patch.object(MODULE, "require_no_integration_in_progress"),
+            mock.patch.object(
+                MODULE,
+                "live_mergeability",
+                return_value=pr_metadata(mergeable="UNKNOWN"),
+            ),
+            mock.patch.object(MODULE, "checkout_pr_branch"),
+            mock.patch.object(MODULE, "git", side_effect=fake_git()),
+            mock.patch.object(MODULE, "find_remote", return_value="origin"),
+            mock.patch.object(MODULE, "fetch_preflight_ref"),
+            mock.patch.object(
+                MODULE,
+                "stack_membership",
+                return_value={"default_branch": "main", "stack": None},
+            ),
+            mock.patch.object(MODULE, "stack_relations") as relations,
+            mock.patch.object(MODULE, "repository_merge_methods") as merge_methods,
+            mock.patch.object(MODULE, "discover_conflict_task") as discover,
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(args)
+
+        relations.assert_not_called()
+        merge_methods.assert_not_called()
+        discover.assert_not_called()
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual("failed", state["agent_task"]["status"])
+        self.assertEqual("not_created", state["agent_task"]["task_id_status"])
+        self.assertNotIn("attempt", state)
+        payload = emitted(emit)
+        self.assertEqual("task_creation_failed", payload["result"])
+        self.assertIn("stable pull request mergeability", payload["error"]["message"])
+
+    def test_conflicting_agent_task_still_requires_a_supported_strategy(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+            ]
+        )
+        target = MODULE.parse_target("owner/repo#7")
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(MODULE, "require_clean_worktree"),
+            mock.patch.object(MODULE, "require_no_integration_in_progress"),
+            mock.patch.object(
+                MODULE,
+                "live_mergeability",
+                return_value=pr_metadata(mergeable="CONFLICTING"),
+            ),
+            mock.patch.object(MODULE, "checkout_pr_branch"),
+            mock.patch.object(MODULE, "git", side_effect=fake_git()),
+            mock.patch.object(MODULE, "find_remote", return_value="origin"),
+            mock.patch.object(MODULE, "fetch_preflight_ref"),
+            mock.patch.object(
+                MODULE,
+                "stack_membership",
+                return_value={"default_branch": "main", "stack": None},
+            ),
+            mock.patch.object(
+                MODULE, "stack_relations", return_value=dict(NO_RELATIONS)
+            ),
+            mock.patch.object(
+                MODULE,
+                "repository_merge_methods",
+                return_value={
+                    "allow_merge_commit": False,
+                    "allow_squash_merge": False,
+                    "allow_rebase_merge": False,
+                },
+            ),
+            mock.patch.object(MODULE, "discover_conflict_task") as discover,
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(args)
+
+        discover.assert_not_called()
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual("failed", state["agent_task"]["status"])
+        self.assertEqual("not_created", state["agent_task"]["task_id_status"])
+        self.assertNotIn("attempt", state)
+        payload = emitted(emit)
+        self.assertEqual("task_creation_failed", payload["result"])
+        self.assertIn("no supported conflict strategy", payload["error"]["message"])
 
     def test_system_exit_during_preflight_records_interrupted_ownership(self):
         directory = temporary_directory(self)
