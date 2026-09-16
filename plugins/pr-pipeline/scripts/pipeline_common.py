@@ -1387,6 +1387,7 @@ def string_at(payload: dict[str, Any], path: tuple[str, ...]) -> str | None:
 
 
 STAGE_STATUS_FIELDS = (
+    "agent_task",
     "attempt",
     "counts",
     "escalation",
@@ -1450,9 +1451,15 @@ def inspect_stage(
     clear = head_is_clear and base_is_clear and outcome in CLEARING_OUTCOMES
     if clear:
         reason = None
+    elif not status.get("ok"):
+        reason = status.get("reason") or "status_unavailable"
     elif marker and not head_is_clear:
         reason = "clearance_is_for_an_older_head"
-    elif base_marker_path is not None and base_marker != base_sha:
+    elif (
+        base_marker_path is not None
+        and base_marker is not None
+        and base_marker != base_sha
+    ):
         reason = "clearance_is_for_an_older_base"
     else:
         reason = status.get("reason") or outcome or "not_cleared"

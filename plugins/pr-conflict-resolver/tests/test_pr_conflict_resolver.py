@@ -5392,6 +5392,19 @@ class StatusCommandTest(unittest.TestCase):
         )
         self.assertEqual("2026-02-03T04:05:06Z", snapshot["last_helper_activity"])
 
+    def test_status_reports_agent_task_recovery_state(self):
+        agent_task = {
+            "status": "interrupted",
+            "result_file": "result.json",
+            "recovery_files": ["request.json", "result.json"],
+        }
+        payload = self.status(agent_task=agent_task)
+        detail = json.loads(
+            MODULE.status_path_for(self.state_path).read_text(encoding="utf-8")
+        )
+        self.assertEqual(agent_task, payload["agent_task"])
+        self.assertEqual(agent_task, detail["agent_task"])
+
     def test_an_escalation_is_reported_verbatim(self):
         escalation = {
             "kind": "contradiction",

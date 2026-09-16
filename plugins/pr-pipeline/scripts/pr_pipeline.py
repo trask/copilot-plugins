@@ -104,6 +104,23 @@ STAGE_LABELS = {
     STAGE_CI: "CI remediation",
     STAGE_DESCRIPTION: "description validation",
 }
+ACTIVE_TASK_STATES = frozenset(
+    {
+        "preparing",
+        "dispatching",
+        "running",
+        "resuming",
+        "validated",
+        "publishing",
+        "published",
+    }
+)
+RECOVERY_TASK_STATES = frozenset(
+    {"failed", "failed_after_mutation", "failed_after_publication", "interrupted"}
+)
+UNAVAILABLE_STATUS_REASONS = frozenset(
+    {"status_timeout", "status_failed", "invalid_status_json", "status_not_ready"}
+)
 
 
 def run_slug(target: dict[str, Any]) -> str:
@@ -500,6 +517,47 @@ def blocked_result(
     return payload
 
 
+def stage_blocker(
+    stage_result: dict[str, Any], *, after_launch: bool
+) -> tuple[str, str] | None:
+    reason = stage_result.get("reason")
+    if reason in UNAVAILABLE_STATUS_REASONS:
+        return (
+            "stage_status_unavailable",
+            stage_result.get("detail")
+            or f"{stage_result['stage']} status could not be read: {reason}",
+        )
+    if after_launch and reason == "no_state":
+        return (
+            "stage_did_not_record_state",
+            (
+                f"{stage_result['stage']} returned without recording a stage state; "
+                "clearance cannot be verified"
+            ),
+        )
+
+    status = stage_result.get("status")
+    task = status.get("agent_task") if isinstance(status, dict) else None
+    task_state = task.get("status") if isinstance(task, dict) else None
+    if task_state in ACTIVE_TASK_STATES:
+        return (
+            "stage_still_active",
+            (
+                f"{stage_result['stage']} still records Agent Task state "
+                f"{task_state}; a replacement must not be started"
+            ),
+        )
+    if task_state in RECOVERY_TASK_STATES:
+        detail = task.get("error")
+        if not isinstance(detail, str) or not detail:
+            detail = (
+                f"{stage_result['stage']} records Agent Task state {task_state}; "
+                "use its retained recovery details"
+            )
+        return "stage_recovery_required", detail
+    return None
+
+
 def run_pipeline(
     target: dict[str, Any],
     repo_root: Path,
@@ -610,6 +668,19 @@ def run_pipeline(
                 runs.append(record)
                 report_event(report, "stage_finished", run_id=run_id, **record)
                 continue
+            blocker = stage_blocker(before, after_launch=False)
+            if blocker is not None:
+                reason, detail = blocker
+                return blocked_result(
+                    pr=pr,
+                    run_id=run_id,
+                    sweeps=completed_sweeps,
+                    runs=runs,
+                    stage=entry["stage"],
+                    reason=reason,
+                    detail=detail,
+                    stage_result=before,
+                )
             if entry["stage"] == STAGE_CONFLICT and completed_conflict_resolution:
                 record = {
                     "stage": entry["stage"],
@@ -750,6 +821,19 @@ def run_pipeline(
             )
             runs.append(record)
             report_event(report, "stage_finished", run_id=run_id, **record)
+            blocker = stage_blocker(after, after_launch=True)
+            if blocker is not None:
+                reason, detail = blocker
+                return blocked_result(
+                    pr=current_pr,
+                    run_id=run_id,
+                    sweeps=completed_sweeps,
+                    runs=runs,
+                    stage=entry["stage"],
+                    reason=reason,
+                    detail=detail,
+                    stage_result=after,
+                )
             if entry["stage"] == STAGE_CONFLICT and after["outcome"] == "completed":
                 after_attempt_id = (
                     ((after.get("status") or {}).get("attempt") or {}).get("id")

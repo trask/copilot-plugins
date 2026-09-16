@@ -725,7 +725,7 @@ class LegacyAgentInstructions:
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.44")
+        self.assertEqual(plugin["version"], "1.0.45")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -880,7 +880,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.44")
+        self.assertEqual(plugin["version"], "1.0.45")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -2546,6 +2546,23 @@ class StatusAndCleanupTest(unittest.TestCase):
 
         self.assertEqual(stamp, self.emitted[-1]["last_helper_activity"])
 
+    def test_run_status_reports_failed_agent_task_recovery(self):
+        path = write_state(
+            self.directory,
+            agent_task={
+                "status": "failed",
+                "error": "start Agent Task failed with HTTP 409",
+                "recovery_files": ["result.json"],
+            },
+        )
+
+        MODULE.command_status(
+            SimpleNamespace(state=str(path), current=False, repo_root=None)
+        )
+
+        self.assertEqual("failed", self.emitted[-1]["agent_task"]["status"])
+        self.assertIn("HTTP 409", self.emitted[-1]["agent_task"]["error"])
+
     def test_status_reports_no_state_for_the_current_branch_pr(self):
         target = MODULE.parse_target("owner/repo#7")
         missing = self.directory / "missing.json"
@@ -2608,6 +2625,48 @@ class StatusAndCleanupTest(unittest.TestCase):
         self.assertEqual(result["kind"], MODULE.INDEX_KIND)
         self.assertEqual(result["latest_run_id"], "run-1")
         self.assertEqual(result["validated_head_sha"], "head1")
+
+    def test_index_status_reports_the_latest_run_agent_task(self):
+        target = MODULE.parse_target("owner/repo#7")
+        run_path = write_state(
+            self.directory,
+            agent_task={
+                "status": "failed_after_mutation",
+                "error": "verification failed",
+                "recovery_files": ["result.json"],
+            },
+        )
+        index_path = self.directory / "index.json"
+        MODULE.save_state(
+            index_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "kind": MODULE.INDEX_KIND,
+                "created_at": "2026-01-01T00:00:00Z",
+                "pr": pr_metadata(),
+                "runs": [{"run_id": "run-1", "state": str(run_path)}],
+                "latest_run_id": "run-1",
+                "latest_state": str(run_path),
+                "validated_head_sha": None,
+            },
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=self.directory
+            ),
+            mock.patch.object(MODULE, "current_pr_target", return_value=target),
+            mock.patch.object(
+                MODULE, "default_state_path", return_value=index_path
+            ),
+        ):
+            MODULE.command_status(
+                SimpleNamespace(state=None, current=True, repo_root=None)
+            )
+
+        result = self.emitted[-1]
+        self.assertEqual("failed_after_mutation", result["agent_task"]["status"])
+        self.assertEqual(["result.json"], result["agent_task"]["recovery_files"])
 
     def test_cleanup_removes_valid_state(self):
         path = write_state(self.directory)

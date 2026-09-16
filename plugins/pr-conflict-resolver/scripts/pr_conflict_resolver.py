@@ -6746,6 +6746,7 @@ def command_status(args: argparse.Namespace) -> None:
             "merge_methods": state.get("merge_methods"),
             "escalation": state.get("escalation"),
             "history": history,
+            "agent_task": state.get("agent_task"),
             "attempts": int(state.get("attempts", 0)),
             "last_helper_activity": last_helper_activity(state),
         },
@@ -6768,6 +6769,7 @@ def command_status(args: argparse.Namespace) -> None:
                     "base_branch": pr["base_branch"],
                 },
                 "attempt": attempt_summary(attempt),
+                "agent_task": state.get("agent_task"),
                 "escalation": state.get("escalation"),
                 "mergeable_at_head_sha": (attempt or {}).get("mergeable_at_head_sha"),
                 "counts": {

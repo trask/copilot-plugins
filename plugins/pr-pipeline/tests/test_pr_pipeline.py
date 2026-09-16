@@ -670,6 +670,25 @@ class MarkerTest(unittest.TestCase):
         self.assertEqual("clearance_is_for_an_older_base", result["reason"])
         self.assertEqual(BASE, result["clear_at_base_sha"])
 
+    def test_missing_conflict_state_is_not_mislabeled_as_an_older_base(self):
+        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT]
+        with mock.patch.object(
+            MODULE,
+            "read_stage_status",
+            return_value={
+                "ok": False,
+                "installed": True,
+                "state": "state.json",
+                "payload": None,
+                "reason": "no_state",
+            },
+        ):
+            result = MODULE.inspect_stage(entry, target(), HEAD, BASE)
+
+        self.assertFalse(result["clear"])
+        self.assertEqual("no_state", result["reason"])
+        self.assertIsNone(result["clear_at_base_sha"])
+
     def test_cap_is_incomplete_not_blocked(self):
         result = self.status(MODULE.STAGE_CI, {"stage_outcome": "carried"})
         self.assertFalse(result["clear"])
@@ -691,6 +710,22 @@ class MarkerTest(unittest.TestCase):
         )
         self.assertEqual(escalation, result["status"]["escalation"])
         self.assertEqual({"failed": 1}, result["status"]["counts"])
+
+    def test_preserves_agent_task_recovery_details(self):
+        agent_task = {
+            "status": "failed",
+            "error": "start Agent Task failed with HTTP 409",
+            "recovery_command": "python helper.py agent-task --resume",
+            "recovery_files": ["result.json"],
+        }
+        result = self.status(
+            MODULE.STAGE_SELF_REVIEW,
+            {
+                "stage_outcome": None,
+                "agent_task": agent_task,
+            },
+        )
+        self.assertEqual(agent_task, result["status"]["agent_task"])
 
 
 class SweepTest(unittest.TestCase):
@@ -838,6 +873,115 @@ class SweepTest(unittest.TestCase):
             [(stage, 1) for stage in MODULE.STAGE_NAMES],
             self.launched,
         )
+
+    def test_pipeline_stops_when_a_launched_stage_still_owns_failed_task_state(self):
+        self.clear_at[MODULE.STAGE_CONFLICT] = HEAD
+        self.clear_base_at = BASE
+        original = self.inspect
+        copilot_inspections = 0
+
+        def failed_after_launch(entry, *args):
+            nonlocal copilot_inspections
+            if entry["stage"] != MODULE.STAGE_COPILOT_REVIEW:
+                return original(entry, *args)
+            copilot_inspections += 1
+            if copilot_inspections == 1:
+                return uncleared_stage(entry["stage"], None)
+            return {
+                **uncleared_stage(entry["stage"], None),
+                "status": {
+                    "agent_task": {
+                        "status": "failed",
+                        "error": (
+                            "start Agent Task failed with HTTP 409: "
+                            "user or repo does not have CCA enabled"
+                        ),
+                        "recovery_command": "python review.py agent-task --resume",
+                        "recovery_files": ["prompt.txt", "result.json"],
+                    },
+                    "queue": {
+                        "id": "pr-347",
+                        "status": "active",
+                        "comments": [{"id": 4018692884, "status": "pending"}],
+                    },
+                },
+            }
+
+        MODULE.inspect_stage.side_effect = failed_after_launch
+        result = self.execute()
+
+        self.assertEqual("blocked", result["result"])
+        self.assertEqual("stage_recovery_required", result["reason"])
+        self.assertEqual(MODULE.STAGE_COPILOT_REVIEW, result["stage"])
+        self.assertIn("HTTP 409", result["detail"])
+        self.assertEqual(
+            [(MODULE.STAGE_COPILOT_REVIEW, 1)],
+            self.launched,
+        )
+        self.assertEqual(
+            "python review.py agent-task --resume",
+            result["stage_result"]["status"]["agent_task"]["recovery_command"],
+        )
+
+    def test_restart_does_not_duplicate_a_stage_with_an_active_task(self):
+        self.clear_at[MODULE.STAGE_CONFLICT] = HEAD
+        self.clear_base_at = BASE
+        original = self.inspect
+
+        def active_before_launch(entry, *args):
+            if entry["stage"] != MODULE.STAGE_COPILOT_REVIEW:
+                return original(entry, *args)
+            return {
+                **uncleared_stage(entry["stage"], None),
+                "status": {
+                    "agent_task": {"status": "running"},
+                    "queue": {"id": "pr-347", "status": "active"},
+                },
+            }
+
+        MODULE.inspect_stage.side_effect = active_before_launch
+        result = self.execute()
+
+        self.assertEqual("blocked", result["result"])
+        self.assertEqual("stage_still_active", result["reason"])
+        self.assertEqual([], self.launched)
+
+    def test_stage_that_returns_without_state_blocks_before_the_next_stage(self):
+        inspections = 0
+        original = self.inspect
+
+        def missing_after_launch(entry, *args):
+            nonlocal inspections
+            if entry["stage"] != MODULE.STAGE_CONFLICT:
+                return original(entry, *args)
+            inspections += 1
+            if inspections == 1:
+                return uncleared_stage(entry["stage"], None)
+            return {
+                **uncleared_stage(entry["stage"], None),
+                "reason": "no_state",
+            }
+
+        MODULE.inspect_stage.side_effect = missing_after_launch
+        result = self.execute()
+
+        self.assertEqual("blocked", result["result"])
+        self.assertEqual("stage_did_not_record_state", result["reason"])
+        self.assertEqual([(MODULE.STAGE_CONFLICT, 1)], self.launched)
+
+    def test_unreadable_stage_status_blocks_before_launch(self):
+        MODULE.inspect_stage.side_effect = None
+        MODULE.inspect_stage.return_value = {
+            **uncleared_stage(MODULE.STAGE_CONFLICT, None),
+            "reason": "status_timeout",
+            "detail": "status command timed out",
+        }
+        result = self.execute()
+
+        self.assertEqual("blocked", result["result"])
+        self.assertEqual("stage_status_unavailable", result["reason"])
+        self.assertEqual("status command timed out", result["detail"])
+        self.assertEqual([], self.launched)
 
     def test_head_change_runs_a_second_sweep_for_stale_stages(self):
         first_sweep_calls = 0
@@ -1291,7 +1435,8 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertIn("pr_pipeline.py\" start", text)
         self.assertIn("pr_pipeline.py\" watch", text)
         self.assertIn("at most two foreground sweeps", text)
-        self.assertIn("reaches its limit does not block", text)
+        self.assertIn("reaches a recorded limit does not block", text)
+        self.assertIn("block the pipeline instead of starting a duplicate worker", text)
         self.assertIn("Run `start` synchronously exactly once", text)
         self.assertIn("--wait-seconds 300", text)
         self.assertIn("no more than one per five minutes", text)

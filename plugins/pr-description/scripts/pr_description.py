@@ -2443,6 +2443,10 @@ def command_status(args: argparse.Namespace) -> None:
         path = cli_path(args.state)
     state = load_state(path)
     if state.get("kind") == INDEX_KIND:
+        latest_agent_task = None
+        latest_state = state.get("latest_state")
+        if isinstance(latest_state, str) and Path(latest_state).is_file():
+            latest_agent_task = load_run_state(Path(latest_state)).get("agent_task")
         emit(
             {
                 "result": "ready",
@@ -2454,6 +2458,7 @@ def command_status(args: argparse.Namespace) -> None:
                 "runs": state.get("runs") or [],
                 "validated_head_sha": state.get("validated_head_sha"),
                 "validation": state.get("validation"),
+                "agent_task": latest_agent_task,
                 **stage_outcome_fields(state),
                 "last_helper_activity": last_helper_activity(state),
             }
@@ -2472,6 +2477,7 @@ def command_status(args: argparse.Namespace) -> None:
             "proposal_count": proposal_count(state),
             "validated_head_sha": state.get("validated_head_sha"),
             "validation": state.get("validation"),
+            "agent_task": state.get("agent_task"),
             **stage_outcome_fields(state),
             "last_helper_activity": last_helper_activity(state),
         }
