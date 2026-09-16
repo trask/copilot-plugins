@@ -113,6 +113,39 @@ MARKETPLACE_REPORT_POLICY_HASH = hashlib.sha256(
 MARKETPLACE_REPORT_POLICY_SELECTOR = (
     f"{MARKETPLACE_REPORT_POLICY_ID}@{MARKETPLACE_REPORT_POLICY_VERSION}"
 )
+MARKETPLACE_APPLY_REPORT_POLICY_ID = "marketplace-agent-apply-report-worker"
+MARKETPLACE_APPLY_REPORT_POLICY_VERSION = 1
+MARKETPLACE_APPLY_REPORT_POLICY_SPEC = {
+    "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
+    "version": MARKETPLACE_APPLY_REPORT_POLICY_VERSION,
+    "execution_backend": "github-agent-tasks-rest",
+    "authentication": "local-gh-api",
+    "custom_agent": False,
+    "local_fallback": False,
+    "mode": "apply_with_report",
+    "require_exact_task_identity": True,
+    "require_unchanged_pr_head": True,
+    "require_unchanged_local_identity": True,
+    "require_linear_generated_history": True,
+    "require_expected_paths_only": True,
+    "require_fix_commit_correlation": True,
+    "human_report": "nonempty-utf8-markdown",
+    "worker_validation": False,
+    "dispatcher_generated_commit_order": True,
+    "dispatcher_structural_attestation": True,
+}
+MARKETPLACE_APPLY_REPORT_POLICY_HASH = hashlib.sha256(
+    json.dumps(
+        MARKETPLACE_APPLY_REPORT_POLICY_SPEC,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+).hexdigest()
+MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR = (
+    f"{MARKETPLACE_APPLY_REPORT_POLICY_ID}@"
+    f"{MARKETPLACE_APPLY_REPORT_POLICY_VERSION}"
+)
 FIX_COMMIT_CORRELATION_FIELD = "Finding"
 
 
@@ -158,6 +191,7 @@ class Options:
     result_file: Path | None = None
     policy: str | None = None
     task_id: str | None = None
+    request_id: str | None = None
     worker_receipt: str | None = None
     input_result_file: Path | None = None
     prior_result: Mapping[str, object] | None = None
@@ -381,6 +415,7 @@ def parse_args(args: Sequence[str]) -> Options:
     result_file: Path | None = None
     policy: str | None = None
     task_id: str | None = None
+    request_id: str | None = None
     worker_receipt: str | None = None
     input_result_file: Path | None = None
     prior_result: Mapping[str, object] | None = None
@@ -472,6 +507,25 @@ def parse_args(args: Sequence[str]) -> Options:
                 raise CloudError("invalid --task-id value", "task_identity_invalid")
             index += 2
             continue
+        if token == "--request-id":
+            if index + 1 >= len(args):
+                raise CloudError(
+                    "--request-id requires a value",
+                    "task_identity_invalid",
+                )
+            if request_id is not None:
+                raise CloudError(
+                    "--request-id may be specified only once",
+                    "task_identity_invalid",
+                )
+            request_id = args[index + 1]
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", request_id):
+                raise CloudError(
+                    "invalid --request-id value",
+                    "task_identity_invalid",
+                )
+            index += 2
+            continue
         if token == "--worker-receipt":
             if index + 1 >= len(args):
                 raise CloudError(
@@ -548,7 +602,7 @@ def parse_args(args: Sequence[str]) -> Options:
         if monitor_only:
             prior_result = read_dispatch_result(input_result_file)
         elif apply_with_report and allow_merged_pr:
-            prior_result = read_apply_result(input_result_file)
+            prior_result = read_apply_result(input_result_file, policy=policy)
         else:
             raise CloudError(
                 "--input-result-file is valid only with --monitor-only or "
@@ -556,8 +610,7 @@ def parse_args(args: Sequence[str]) -> Options:
                 "malformed_result",
             )
         task = prior_result["task"]
-        receipt_data = prior_result["worker_receipt"]
-        if not isinstance(task, dict) or not isinstance(receipt_data, dict):
+        if not isinstance(task, dict):
             raise AssertionError("validated result lost task metadata")
         if not isinstance(task.get("id"), str) or not task["id"]:
             raise CloudError(
@@ -565,7 +618,11 @@ def parse_args(args: Sequence[str]) -> Options:
                 "task_identity_invalid",
             )
         task_id = task["id"]
-        worker_receipt = str(receipt_data["path"])
+        if policy == MARKETPLACE_POLICY_SELECTOR:
+            receipt_data = prior_result.get("worker_receipt")
+            if not isinstance(receipt_data, dict):
+                raise AssertionError("validated result lost receipt metadata")
+            worker_receipt = str(receipt_data["path"])
     if prompt_file is not None:
         prompt = read_prompt_file(prompt_file)
     elif inline_prompt:
@@ -602,6 +659,7 @@ def parse_args(args: Sequence[str]) -> Options:
             "result_file_required",
         )
     known_policies = {
+        MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
         MARKETPLACE_POLICY_SELECTOR,
         MARKETPLACE_REPORT_POLICY_SELECTOR,
     }
@@ -630,14 +688,31 @@ def parse_args(args: Sequence[str]) -> Options:
             "validation-receipt options",
             "policy_rejected",
         )
+    if policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR and (
+        not apply_with_report
+        or pull_request is None
+        or (prompt_file is None and not resume_apply_with_report)
+        or report
+        or dispatch_only
+        or monitor_only
+    ):
+        raise CloudError(
+            f"{MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR} requires "
+            "--apply-with-report, --pr, --prompt-file, and --result-file",
+            "policy_rejected",
+        )
     if allow_merged_pr and (
-        policy != MARKETPLACE_POLICY_SELECTOR
+        policy
+        not in {
+            MARKETPLACE_POLICY_SELECTOR,
+            MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+        }
         or result_file is None
         or prompt_file is None
     ):
         raise CloudError(
             "historical apply-with-report requires --prompt-file, "
-            f"--result-file, and --policy {MARKETPLACE_POLICY_SELECTOR}",
+            "--result-file, and a supported apply-with-report policy",
             "policy_required",
         )
     if task_id is not None and not (
@@ -653,6 +728,17 @@ def parse_args(args: Sequence[str]) -> Options:
             "--task-id is valid only with --monitor-only, "
             "--resume-apply-with-report, or supported result recovery",
             "task_identity_invalid",
+        )
+    if request_id is not None and not resume_apply_with_report:
+        raise CloudError(
+            "--request-id is valid only with --resume-apply-with-report",
+            "task_identity_invalid",
+        )
+    if worker_receipt is not None and policy != MARKETPLACE_POLICY_SELECTOR:
+        raise CloudError(
+            "--worker-receipt is valid only with "
+            f"{MARKETPLACE_POLICY_SELECTOR}",
+            "receipt_invalid",
         )
     if worker_receipt is not None and not (
         monitor_only
@@ -693,14 +779,27 @@ def parse_args(args: Sequence[str]) -> Options:
         if (
             pull_request is None
             or task_id is None
-            or worker_receipt is None
+            or (
+                policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+                and request_id is None
+            )
             or result_file is None
-            or policy != MARKETPLACE_POLICY_SELECTOR
+            or policy
+            not in {
+                MARKETPLACE_POLICY_SELECTOR,
+                MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+            }
+            or (
+                policy == MARKETPLACE_POLICY_SELECTOR
+                and worker_receipt is None
+            )
         ):
             raise CloudError(
                 "--resume-apply-with-report requires --pr, --task-id, "
-                f"--worker-receipt, --result-file, and --policy "
-                f"{MARKETPLACE_POLICY_SELECTOR}",
+                "--result-file, and a supported apply-with-report policy "
+                "(the legacy validation policy also requires "
+                "--worker-receipt; the structural policy requires "
+                "--request-id)",
                 "policy_required",
             )
         if prompt_file is not None or inline_prompt:
@@ -727,6 +826,7 @@ def parse_args(args: Sequence[str]) -> Options:
         result_file=result_file,
         policy=policy,
         task_id=task_id,
+        request_id=request_id,
         worker_receipt=worker_receipt,
         input_result_file=input_result_file,
         prior_result=prior_result,
@@ -915,7 +1015,241 @@ def read_dispatch_result(path: Path) -> dict[str, object]:
     return data
 
 
-def read_apply_result(path: Path) -> dict[str, object]:
+def read_apply_result(
+    path: Path,
+    *,
+    policy: str | None,
+) -> dict[str, object]:
+    if policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+        return read_structural_apply_result(path)
+    return read_legacy_apply_result(path)
+
+
+def read_structural_apply_result(path: Path) -> dict[str, object]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        detail = error.msg if isinstance(error, json.JSONDecodeError) else str(error)
+        raise CloudError(
+            f"could not read prior result {path}: {detail}",
+            "malformed_result",
+        ) from None
+    expected_keys = {
+        "schema",
+        "status",
+        "mode",
+        "repository",
+        "pull_request",
+        "requested_model",
+        "policy",
+        "task",
+        "generated",
+        "application",
+        "report",
+        "attestation",
+        "error",
+    }
+    if not isinstance(data, dict) or set(data) != expected_keys:
+        raise CloudError(
+            "prior result has unexpected or missing fields",
+            "malformed_result",
+        )
+    if (
+        data.get("schema")
+        != {
+            "id": RESULT_SCHEMA_ID,
+            "version": REPORT_RESULT_SCHEMA_VERSION,
+        }
+        or data.get("mode") != "apply_with_report"
+        or data.get("policy")
+        != {
+            "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
+            "version": MARKETPLACE_APPLY_REPORT_POLICY_VERSION,
+            "sha256": MARKETPLACE_APPLY_REPORT_POLICY_HASH,
+        }
+    ):
+        raise CloudError(
+            "prior result has an unsupported schema, mode, or policy",
+            "policy_rejected",
+        )
+    status = data.get("status")
+    repository = data.get("repository")
+    pull_request = data.get("pull_request")
+    task = data.get("task")
+    generated = data.get("generated")
+    application = data.get("application")
+    report = data.get("report")
+    attestation = data.get("attestation")
+    error = data.get("error")
+    if (
+        status not in {"success", "error", "interrupted"}
+        or not isinstance(repository, dict)
+        or set(repository) != {"name_with_owner"}
+        or not isinstance(repository.get("name_with_owner"), str)
+        or not re.fullmatch(r"[^/\s]+/[^/\s]+", repository["name_with_owner"])
+        or not isinstance(data.get("requested_model"), str)
+        or data["requested_model"] not in MODEL_IDS.values()
+        or not isinstance(pull_request, dict)
+        or set(pull_request)
+        != {
+            "number",
+            "url",
+            "base_repository",
+            "base_ref",
+            "base_sha",
+            "head_repository",
+            "head_ref",
+            "head_sha",
+        }
+        or not isinstance(pull_request.get("number"), int)
+        or isinstance(pull_request.get("number"), bool)
+        or not isinstance(pull_request.get("url"), str)
+        or not isinstance(pull_request.get("base_repository"), str)
+        or not isinstance(pull_request.get("base_ref"), str)
+        or not isinstance(pull_request.get("base_sha"), str)
+        or not SHA_PATTERN.fullmatch(pull_request["base_sha"])
+        or not isinstance(pull_request.get("head_repository"), str)
+        or not isinstance(pull_request.get("head_ref"), str)
+        or not isinstance(pull_request.get("head_sha"), str)
+        or not SHA_PATTERN.fullmatch(pull_request["head_sha"])
+        or not isinstance(task, dict)
+        or set(task) != {"id", "url", "state", "base_ref", "base_sha"}
+        or (
+            task.get("id") is not None
+            and (
+                not isinstance(task.get("id"), str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", task["id"])
+            )
+        )
+        or (task.get("url") is not None and not isinstance(task.get("url"), str))
+        or (
+            task.get("state") is not None
+            and task.get("state") not in KNOWN_STATES
+        )
+        or (
+            task.get("base_ref") is not None
+            and not isinstance(task.get("base_ref"), str)
+        )
+        or (
+            task.get("base_sha") is not None
+            and (
+                not isinstance(task.get("base_sha"), str)
+                or not SHA_PATTERN.fullmatch(task["base_sha"])
+            )
+        )
+        or not isinstance(generated, dict)
+        or set(generated) != {"branch", "head_sha", "commits"}
+        or (
+            generated.get("branch") is not None
+            and not isinstance(generated.get("branch"), str)
+        )
+        or (
+            generated.get("head_sha") is not None
+            and (
+                not isinstance(generated.get("head_sha"), str)
+                or not SHA_PATTERN.fullmatch(generated["head_sha"])
+            )
+        )
+        or not isinstance(generated.get("commits"), list)
+        or any(
+            not isinstance(commit, str) or not SHA_PATTERN.fullmatch(commit)
+            for commit in generated.get("commits", [])
+        )
+        or not isinstance(application, dict)
+        or set(application) != {"status", "final_local_head"}
+        or application.get("status")
+        not in {"not_started", "not_applied", "applied", "no_changes"}
+        or (
+            application.get("final_local_head") is not None
+            and (
+                not isinstance(application.get("final_local_head"), str)
+                or not SHA_PATTERN.fullmatch(application["final_local_head"])
+            )
+        )
+        or not isinstance(attestation, dict)
+        or attestation.get("kind") != "dispatcher_structural"
+        or set(attestation) != {"kind", "structural_complete"}
+        or not isinstance(attestation.get("structural_complete"), bool)
+    ):
+        raise CloudError(
+            "prior result contains malformed identity fields",
+            "malformed_result",
+        )
+    if report is not None and (
+        not isinstance(report, dict)
+        or set(report) != {"path", "commit", "sha256"}
+        or not isinstance(report.get("path"), str)
+        or (
+            report.get("commit") is not None
+            and (
+                not isinstance(report.get("commit"), str)
+                or not SHA_PATTERN.fullmatch(report["commit"])
+            )
+        )
+        or (
+            report.get("sha256") is not None
+            and (
+                not isinstance(report.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", report["sha256"])
+            )
+        )
+    ):
+        raise CloudError("prior result report identity is malformed", "malformed_result")
+    try:
+        resolved_url = parse_pr_reference(pull_request["url"])
+    except CloudError:
+        raise CloudError(
+            "prior result contains a malformed pull request URL",
+            "malformed_result",
+        ) from None
+    if (
+        resolved_url.number != pull_request["number"]
+        or resolved_url.repository is None
+        or resolved_url.repository.casefold()
+        != pull_request["base_repository"].casefold()
+    ):
+        raise CloudError(
+            "prior result contains inconsistent pull request identity",
+            "malformed_result",
+        )
+    if status == "success":
+        code_commits = generated["commits"]
+        expected_local_head = (
+            code_commits[-1] if code_commits else pull_request["head_sha"]
+        )
+        if (
+            error is not None
+            or not task.get("id")
+            or task.get("state") != "completed"
+            or task.get("base_ref") != pull_request["head_sha"]
+            or task.get("base_sha") != pull_request["head_sha"]
+            or not generated.get("branch")
+            or not generated.get("head_sha")
+            or report is None
+            or report.get("commit") != generated.get("head_sha")
+            or report.get("sha256") is None
+            or application.get("status")
+            != ("applied" if code_commits else "no_changes")
+            or application.get("final_local_head") != expected_local_head
+            or attestation.get("structural_complete") is not True
+        ):
+            raise CloudError(
+                "successful prior result is incomplete",
+                "malformed_result",
+            )
+    elif (
+        not isinstance(error, dict)
+        or set(error) != {"code", "message"}
+        or not isinstance(error.get("code"), str)
+        or not error["code"]
+        or not isinstance(error.get("message"), str)
+        or not error["message"]
+    ):
+        raise CloudError("prior result error is malformed", "malformed_result")
+    return data
+
+
+def read_legacy_apply_result(path: Path) -> dict[str, object]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -1208,7 +1542,8 @@ def validate_interrupted_apply_task(
     pull_request: PullRequestSnapshot,
     request_id: str,
     report_path: str,
-    worker_receipt: str,
+    worker_receipt: str | None,
+    policy: str = MARKETPLACE_POLICY_SELECTOR,
 ) -> None:
     if task.get("id") != task_id:
         raise CloudError(
@@ -1261,14 +1596,24 @@ def validate_interrupted_apply_task(
         report_path,
         worker_receipt,
     )
-    expected_policy_suffix = build_policy_prompt(
-        "",
-        request_id=request_id,
-        receipt=worker_receipt,
-        mode="apply_with_report",
-        repository=repository,
-        pull_request=pull_request,
-    )
+    if policy == MARKETPLACE_POLICY_SELECTOR:
+        if worker_receipt is None:
+            raise AssertionError("legacy recovery lost its validation receipt")
+        expected_policy_suffix = build_policy_prompt(
+            "",
+            request_id=request_id,
+            receipt=worker_receipt,
+            mode="apply_with_report",
+            repository=repository,
+            pull_request=pull_request,
+        )
+    elif policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+        expected_policy_suffix = build_apply_report_policy_prompt(
+            "",
+            report_path=report_path,
+        )
+    else:
+        raise AssertionError("unsupported interrupted recovery policy")
     markers = (
         PR_CONTEXT_MARKER,
         APPLY_WITH_REPORT_MARKER,
@@ -1311,6 +1656,12 @@ def policy_metadata(options: Options) -> dict[str, object] | None:
             "version": MARKETPLACE_REPORT_POLICY_VERSION,
             "sha256": MARKETPLACE_REPORT_POLICY_HASH,
         }
+    if options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+        return {
+            "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
+            "version": MARKETPLACE_APPLY_REPORT_POLICY_VERSION,
+            "sha256": MARKETPLACE_APPLY_REPORT_POLICY_HASH,
+        }
     return {
         "id": MARKETPLACE_POLICY_ID,
         "version": MARKETPLACE_POLICY_VERSION,
@@ -1341,6 +1692,7 @@ def validate_policy_before_post(
     result_path: Path,
 ) -> None:
     if options.policy not in {
+        MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
         MARKETPLACE_POLICY_SELECTOR,
         MARKETPLACE_REPORT_POLICY_SELECTOR,
     }:
@@ -1522,17 +1874,25 @@ def validate_apply_result_identity(
     if (
         not isinstance(generated, dict)
         or not isinstance(application, dict)
-        or not isinstance(receipt, dict)
     ):
         raise CloudError("prior result identity is malformed", "malformed_result")
-    request_id = Path(str(receipt["path"])).stem
-    expected_report_path = f"{REPORT_DIRECTORY}/{request_id}.md"
-    if report is not None and (
-        not isinstance(report, dict)
-        or report.get("path") != expected_report_path
-    ):
+    if not isinstance(report, dict):
+        raise CloudError("prior result report identity is malformed", "malformed_result")
+    if isinstance(receipt, dict):
+        request_id = Path(str(receipt["path"])).stem
+        expected_report_path = f"{REPORT_DIRECTORY}/{request_id}.md"
+    else:
+        report_path_value = report.get("path")
+        if not isinstance(report_path_value, str):
+            raise CloudError(
+                "prior result report identity is malformed",
+                "malformed_result",
+            )
+        request_id = Path(report_path_value).stem
+        expected_report_path = f"{REPORT_DIRECTORY}/{request_id}.md"
+    if report.get("path") != expected_report_path:
         raise CloudError(
-            "prior result report and validation request IDs do not match",
+            "prior result report request identity does not match",
             "task_identity_mismatch",
         )
     commits = generated.get("commits")
@@ -1619,6 +1979,62 @@ def validate_prior_generated_result(
         )
 
 
+def validate_prior_structural_generated_result(
+    data: Mapping[str, object],
+    *,
+    generated_branch: str,
+    generated_head: str,
+    code_commits: Sequence[str],
+    report_path_value: str,
+    report_commit: str,
+    report_sha256: str,
+) -> None:
+    generated = data["generated"]
+    report = data["report"]
+    attestation = data["attestation"]
+    if not isinstance(generated, dict) or not isinstance(attestation, dict):
+        raise AssertionError("validated prior result lost generated metadata")
+    for prior, current, field in (
+        (generated.get("branch"), generated_branch, "generated branch"),
+        (generated.get("head_sha"), generated_head, "generated head"),
+    ):
+        if prior is not None and prior != current:
+            raise CloudError(
+                f"prior result {field} does not match the original task",
+                "task_identity_mismatch",
+            )
+    prior_commits = generated.get("commits")
+    if (
+        prior_commits or data.get("status") == "success"
+    ) and list(prior_commits) != list(code_commits):
+        raise CloudError(
+            "prior result generated commits do not match the original task",
+            "task_identity_mismatch",
+        )
+    if report is not None:
+        if not isinstance(report, dict):
+            raise AssertionError("validated prior result lost report metadata")
+        for field, current in {
+            "path": report_path_value,
+            "commit": report_commit,
+            "sha256": report_sha256,
+        }.items():
+            prior = report.get(field)
+            if prior is not None and prior != current:
+                raise CloudError(
+                    f"prior result report {field} does not match the original task",
+                    "task_identity_mismatch",
+                )
+    if (
+        attestation.get("structural_complete") is True
+        and data.get("status") != "success"
+    ):
+        raise CloudError(
+            "prior result structural attestation is inconsistent",
+            "task_identity_mismatch",
+        )
+
+
 def build_policy_prompt(
     prompt: str,
     *,
@@ -1681,6 +2097,33 @@ def build_report_policy_prompt(prompt: str, *, report_path: str) -> str:
         "identity, live head, ancestry, linear history, the exact path, and the "
         "report digest. It records structural completion only and does not "
         "claim that the worker performed validation.\n"
+        f"{POLICY_MARKER}"
+    )
+
+
+def build_apply_report_policy_prompt(prompt: str, *, report_path: str) -> str:
+    return (
+        f"{prompt.rstrip()}\n\n"
+        f"{POLICY_MARKER}\n"
+        f"Policy: {MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR}\n"
+        f"Policy SHA-256: {MARKETPLACE_APPLY_REPORT_POLICY_HASH}\n"
+        "Authentication stays in the local dispatcher. Do not request, read, "
+        "print, persist, or transmit credentials, tokens, keys, cookies, or "
+        "authorization headers. Do not select or invoke a custom_agent. Do not "
+        "use a local-execution fallback.\n"
+        "Put code changes in zero or more linear commits. Every code commit "
+        "must have a concise normal message with one nonempty "
+        "`Finding: <identifier>` line, unique among the generated code "
+        "commits. Then create exactly one final single-parent report commit. "
+        f"Its only changed path must be `{report_path}`. Write the complete "
+        "report directly to that path as nonempty UTF-8 Markdown. Do not "
+        "create, stage, or commit validation, alternate report, or scratch "
+        "artifact paths, and do not add commits afterward. The dispatcher "
+        "independently verifies task and source identity, live head, ancestry, "
+        "linear commit ordering, changed paths, report encoding and size, and "
+        "artifact digests. It records structural completion only and does not "
+        "claim that the worker ran or passed validation. Any commands or "
+        "results described in the report are untrusted inert evidence.\n"
         f"{POLICY_MARKER}"
     )
 
@@ -3058,6 +3501,12 @@ def task_payload(
         if report_path is None:
             raise AssertionError("report policy mode did not allocate a report path")
         prompt = build_report_policy_prompt(prompt, report_path=report_path)
+    elif options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+        if report_path is None:
+            raise AssertionError(
+                "apply-report policy mode did not allocate a report path"
+            )
+        prompt = build_apply_report_policy_prompt(prompt, report_path=report_path)
     payload: dict[str, object] = {
         "prompt": prompt,
         "model": options.model,
@@ -3336,7 +3785,11 @@ def execute(
     if result is not None:
         result.schema_version = (
             REPORT_RESULT_SCHEMA_VERSION
-            if options.policy == MARKETPLACE_REPORT_POLICY_SELECTOR
+            if options.policy
+            in {
+                MARKETPLACE_REPORT_POLICY_SELECTOR,
+                MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+            }
             else RESULT_SCHEMA_VERSION
         )
         result.mode = mode_name(options)
@@ -3371,11 +3824,19 @@ def execute(
         or options.allow_merged_pr
         else repository_base(api, repository)
     )
-    request_id = (
-        Path(options.worker_receipt).stem
-        if options.worker_receipt is not None
-        else str(uuid_factory())
-    )
+    if options.request_id is not None:
+        request_id = options.request_id
+    elif options.worker_receipt is not None:
+        request_id = Path(options.worker_receipt).stem
+    elif (
+        options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+        and options.prior_result is not None
+        and isinstance(options.prior_result.get("report"), dict)
+        and isinstance(options.prior_result["report"].get("path"), str)
+    ):
+        request_id = Path(options.prior_result["report"]["path"]).stem
+    else:
+        request_id = str(uuid_factory())
     pull_request: PullRequestSnapshot | None = None
     if options.pull_request is not None:
         pull_request = resolve_pull_request(
@@ -3486,16 +3947,22 @@ def execute(
     if options.policy is not None:
         validate_policy_before_post(options, root, options.result_file)
         policy_identity = git.identity(root)
-        if result is not None and receipt is not None:
-            result.receipt_path = receipt
+        if result is not None:
+            if receipt is not None:
+                result.receipt_path = receipt
+            if (
+                report_path is not None
+                and options.policy
+                in {
+                    MARKETPLACE_REPORT_POLICY_SELECTOR,
+                    MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+                }
+            ):
+                result.report_path = report_path
     if options.task_id is not None:
         initial = get_task(api, repository, options.task_id)
         if options.resume_apply_with_report:
-            if (
-                pull_request is None
-                or report_path is None
-                or receipt is None
-            ):
+            if pull_request is None or report_path is None:
                 raise AssertionError(
                     "interrupted apply-with-report recovery lost required identity"
                 )
@@ -3508,6 +3975,7 @@ def execute(
                 request_id=request_id,
                 report_path=report_path,
                 worker_receipt=receipt,
+                policy=str(options.policy),
             )
     else:
         initial = start_task(
@@ -3594,8 +4062,15 @@ def execute(
             raise AssertionError("policy mode did not record local identity")
         if options.policy == MARKETPLACE_POLICY_SELECTOR and receipt is None:
             raise AssertionError("validation policy did not allocate a receipt")
-        if options.policy == MARKETPLACE_REPORT_POLICY_SELECTOR and report_path is None:
-            raise AssertionError("report policy did not allocate a report path")
+        if (
+            options.policy
+            in {
+                MARKETPLACE_REPORT_POLICY_SELECTOR,
+                MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+            }
+            and report_path is None
+        ):
+            raise AssertionError("structural policy did not allocate a report path")
         validate_policy_before_mutation(
             git,
             policy_identity,
@@ -3629,7 +4104,11 @@ def execute(
             result.cloud_commits = list(all_commits)
         expected_paths = (
             [report_path]
-            if options.policy == MARKETPLACE_REPORT_POLICY_SELECTOR
+            if options.policy
+            in {
+                MARKETPLACE_REPORT_POLICY_SELECTOR,
+                MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+            }
             else [receipt]
         )
         if (
@@ -3673,12 +4152,15 @@ def execute(
                 api,
                 repository,
                 receipt,
-                refs.head,
+                worker_history.receipt_commit,
             )
         if report_path is not None:
             try:
                 policy_report = fetch_report(
-                    api, repository, report_path, refs.head
+                    api,
+                    repository,
+                    report_path,
+                    worker_history.receipt_commit,
                 )
                 if not policy_report.strip():
                     raise CloudError(
@@ -3693,25 +4175,39 @@ def execute(
             else None
         )
         if options.allow_merged_pr and options.prior_result is not None:
-            if receipt is None or validation_digest is None:
-                raise AssertionError("historical resume lost validation metadata")
             if report_path is None or report_digest is None:
                 raise AssertionError("historical resume did not retrieve its report")
-            validate_prior_generated_result(
-                options.prior_result,
-                generated_branch=refs.head,
-                generated_head=generated_head,
-                code_commits=worker_history.code_commits,
-                receipt_path_value=receipt,
-                receipt_commit=worker_history.receipt_commit,
-                receipt_sha256=validation_digest,
-                report_path_value=report_path,
-                report_commit=worker_history.receipt_commit,
-                report_sha256=report_digest,
-                validation_outcomes=outcomes,
-            )
+            if options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+                validate_prior_structural_generated_result(
+                    options.prior_result,
+                    generated_branch=refs.head,
+                    generated_head=generated_head,
+                    code_commits=worker_history.code_commits,
+                    report_path_value=report_path,
+                    report_commit=worker_history.receipt_commit,
+                    report_sha256=report_digest,
+                )
+            else:
+                if receipt is None or validation_digest is None:
+                    raise AssertionError("historical resume lost validation metadata")
+                validate_prior_generated_result(
+                    options.prior_result,
+                    generated_branch=refs.head,
+                    generated_head=generated_head,
+                    code_commits=worker_history.code_commits,
+                    receipt_path_value=receipt,
+                    receipt_commit=worker_history.receipt_commit,
+                    receipt_sha256=validation_digest,
+                    report_path_value=report_path,
+                    report_commit=worker_history.receipt_commit,
+                    report_sha256=report_digest,
+                    validation_outcomes=outcomes,
+                )
         if result is not None:
-            if options.policy == MARKETPLACE_REPORT_POLICY_SELECTOR:
+            if options.policy in {
+                MARKETPLACE_REPORT_POLICY_SELECTOR,
+                MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+            }:
                 result.structural_complete = True
             else:
                 result.validation_complete = True
@@ -3970,6 +4466,13 @@ def main(
             "id": MARKETPLACE_POLICY_ID,
             "version": MARKETPLACE_POLICY_VERSION,
             "sha256": MARKETPLACE_POLICY_HASH,
+        }
+    elif MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR in args:
+        result.schema_version = REPORT_RESULT_SCHEMA_VERSION
+        result.policy = {
+            "id": MARKETPLACE_APPLY_REPORT_POLICY_ID,
+            "version": MARKETPLACE_APPLY_REPORT_POLICY_VERSION,
+            "sha256": MARKETPLACE_APPLY_REPORT_POLICY_HASH,
         }
     elif MARKETPLACE_REPORT_POLICY_SELECTOR in args:
         result.schema_version = REPORT_RESULT_SCHEMA_VERSION

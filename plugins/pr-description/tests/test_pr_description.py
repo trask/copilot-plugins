@@ -136,8 +136,8 @@ def agent_task_result(preflight=None, **overrides):
         "pull_request": MODULE.expected_cloud_pull_request(preflight),
         "requested_model": "gpt-5.6-sol",
         "policy": {
-            "id": "marketplace-agent-worker",
-            "version": 5,
+            "id": "marketplace-agent-report-worker",
+            "version": 1,
             "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
         },
         "task": {
@@ -161,30 +161,9 @@ def agent_task_result(preflight=None, **overrides):
             "commit": generated_head,
             "sha256": "5" * 64,
         },
-        "worker_receipt": {
-            "path": f".github/agent-task-validations/{request_id}.json",
-            "commit": generated_head,
-            "sha256": MODULE.sha256_text(
-                json.dumps(
-                    [
-                        {
-                            "command": "review complete diff",
-                            "outcome": "passed",
-                        }
-                    ],
-                    separators=(",", ":"),
-                    sort_keys=True,
-                )
-            ),
-        },
-        "validation": {
-            "complete": True,
-            "outcomes":             [
-                {
-                    "command": "review complete diff",
-                    "outcome": "passed",
-                }
-            ],
+        "attestation": {
+            "kind": "dispatcher_structural",
+            "structural_complete": True,
         },
         "error": None,
     }
@@ -723,7 +702,7 @@ class LegacyAgentInstructions:
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.46")
+        self.assertEqual(plugin["version"], "1.0.47")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -864,12 +843,21 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("You are a thin local coordinator", instructions)
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-worker@5", instructions)
+        self.assertIn("marketplace-agent-report-worker@1", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertIn("Never scrape", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
         self.assertNotIn("custom_agent", plugin)
+
+    def test_report_parser_accepts_markdown_with_one_json_payload(self):
+        content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
+        self.assertEqual(
+            {"ok": True},
+            MODULE.parse_markdown_report(content, description="test report"),
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "exactly one"):
+            MODULE.parse_markdown_report("# Result", description="test report")
 
     def test_manifest_and_marketplace_versions_match(self):
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
@@ -877,7 +865,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.46")
+        self.assertEqual(plugin["version"], "1.0.47")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -936,12 +924,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             requested_model="gpt-5.6-sol",
             identity=self.identity,
         )
-        MODULE.validate_worker_receipt(
-            self.receipt(),
-            request_id=remote["request_id"],
-            preflight=self.preflight,
-            validation=remote["validation"],
-        )
         proposal = MODULE.validate_proposal_report(
             report_content,
             request_id=remote["request_id"],
@@ -980,8 +962,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     def test_rejects_incomplete_validation(self):
         value = self.result(self.proposal_report())
-        value["validation"] = {"complete": False, "outcomes": []}
-        with self.assertRaisesRegex(MODULE.WorkflowError, "validation"):
+        value["attestation"]["structural_complete"] = False
+        with self.assertRaises(MODULE.WorkflowError):
             MODULE.validate_success_result(
                 value,
                 preflight=self.preflight,
@@ -989,7 +971,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 identity=self.identity,
             )
 
-    def test_rejects_malformed_result_and_receipt(self):
+    def test_rejects_malformed_and_non_object_result(self):
         result_path = self.directory / "result.json"
         result_path.write_text(
             json.dumps({"schema": MODULE.AGENT_TASK_RESULT_SCHEMA}),
@@ -997,18 +979,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(MODULE.WorkflowError, "schema or fields"):
             MODULE.load_agent_task_result(result_path)
-        receipt = json.loads(self.receipt())
-        receipt[0]["unexpected"] = "other"
-        with self.assertRaisesRegex(MODULE.WorkflowError, "does not match"):
-            MODULE.validate_worker_receipt(
-                json.dumps(receipt),
-                request_id="request-1",
-                preflight=self.preflight,
-                validation=self.validation,
-            )
+        result_path.write_text("[]", encoding="utf-8")
+        with self.assertRaisesRegex(MODULE.WorkflowError, "schema or fields"):
+            MODULE.load_agent_task_result(result_path)
 
     def test_rejects_malformed_report_and_proposal(self):
-        with self.assertRaisesRegex(MODULE.WorkflowError, "invalid JSON"):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "fenced JSON"):
             MODULE.validate_proposal_report(
                 "not-json",
                 request_id="request-1",
@@ -1044,8 +1020,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         prompt = MODULE.build_worker_prompt(agent_task_preflight())
 
         self.assertIn("worker prompt version 2", prompt)
+        self.assertIn("human-readable UTF-8 Markdown report", prompt)
         self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
-        self.assertIn("`{{MARKETPLACE_VALIDATION_PATH}}`", prompt)
+        self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
         self.assertIn("Do not choose alternate artifact names", prompt)
 
     def test_success_uses_atomic_result_not_stdout_and_cleans_artifacts(self):
@@ -1062,7 +1039,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("--report", command)
         self.assertEqual(
             command[command.index("--policy") + 1],
-            "marketplace-agent-worker@5",
+            "marketplace-agent-report-worker@1",
         )
         self.assertNotIn("--custom-agent", command)
         result_path = Path(command[command.index("--result-file") + 1])

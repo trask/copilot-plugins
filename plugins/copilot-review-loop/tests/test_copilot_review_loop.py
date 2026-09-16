@@ -24,6 +24,11 @@ MALFORMED_VALIDATION_RESULT = (
     / "fixtures"
     / "malformed-validation-agent-task-result.json"
 )
+MALFORMED_V5_VALIDATION_RESULT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "malformed-v5-validation-agent-task-result.json"
+)
 SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -1005,8 +1010,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
             "requested_model": "gpt-5.6-sol",
             "policy": {
-                "id": "marketplace-agent-worker",
-                "version": 5,
+                "id": "marketplace-agent-apply-report-worker",
+                "version": 1,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -1030,12 +1035,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "commit": self.artifact,
                 "sha256": "4" * 64,
             },
-            "worker_receipt": {
-                "path": ".github/agent-task-validations/request-1.json",
-                "commit": self.artifact,
-                "sha256": MODULE.sha256_text(json.dumps(self.validation)),
+            "attestation": {
+                "kind": "dispatcher_structural",
+                "structural_complete": True,
             },
-            "validation": {"complete": True, "outcomes": self.validation},
             "error": None,
         }
 
@@ -1057,15 +1060,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     "final_local_head": self.head,
                 },
                 "report": None,
-                "worker_receipt": {
-                    "path": (
-                        ".github/agent-task-validations/"
-                        "430aab69-7593-4fd8-8e99-b0385a5f6a1d.json"
-                    ),
-                    "commit": None,
-                    "sha256": None,
+                "attestation": {
+                    "kind": "dispatcher_structural",
+                    "structural_complete": False,
                 },
-                "validation": {"complete": False, "outcomes": []},
                 "error": {
                     "code": "api_failure",
                     "message": (
@@ -1079,6 +1077,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     def terminal_validation_failure(self):
         result = self.result()
+        result["schema"] = MODULE.LEGACY_AGENT_TASK_RESULT_SCHEMA
+        result["policy"] = MODULE.LEGACY_AGENT_TASK_POLICY_V5
+        result.pop("attestation")
         result.update(
             {
                 "status": "error",
@@ -1086,12 +1087,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     "status": "not_applied",
                     "final_local_head": self.head,
                 },
-                "report": {
-                    **result["report"],
-                    "sha256": None,
-                },
+                "report": {**result["report"], "sha256": None},
                 "worker_receipt": {
-                    **result["worker_receipt"],
+                    "path": ".github/agent-task-validations/request-1.json",
+                    "commit": self.artifact,
                     "sha256": None,
                 },
                 "validation": {"complete": False, "outcomes": []},
@@ -1142,19 +1141,27 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                         "changed_paths": ["src/app.py"] if fixed else [],
                     }
                 ],
-                "validation": self.validation,
             }
         )
 
     def test_agent_definition_is_thin_and_version_is_bumped(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-worker@5", instructions)
+        self.assertIn("marketplace-agent-apply-report-worker@1", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.14")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.15")
+
+    def test_report_parser_accepts_markdown_with_one_json_payload(self):
+        content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
+        self.assertEqual(
+            {"ok": True},
+            MODULE.parse_markdown_report(content, description="test report"),
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "exactly one"):
+            MODULE.parse_markdown_report("# Result", description="test report")
 
     def test_prompt_is_self_contained_versioned_and_treats_inputs_as_untrusted(self):
         prompt = MODULE.build_worker_prompt(
@@ -1162,6 +1169,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             iteration_allowance=1,
             prior_history=[],
         )
+        self.assertIn("human-readable UTF-8 Markdown report", prompt)
         self.assertIn("worker prompt version 2", prompt)
         self.assertIn('"iteration_allowance": 1', prompt)
         self.assertIn("Do not sleep, poll, watch", prompt)
@@ -1169,7 +1177,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("untrusted data", prompt)
         self.assertIn("local-execution fallback", prompt)
         self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
-        self.assertIn("`{{MARKETPLACE_VALIDATION_PATH}}`", prompt)
+        self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
 
     def test_local_coordinator_waits_for_stable_actionable_feedback(self):
@@ -1293,12 +1301,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     def test_validates_success_and_no_op_receipts(self):
         remote = self.remote()
-        MODULE.validate_worker_receipt(
-            self.receipt(),
-            request_id="request-1",
-            preflight=self.preflight,
-            validation=self.validation,
-        )
         report = MODULE.validate_copilot_review_report(
             self.report(),
             request_id="request-1",
@@ -1338,8 +1340,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 requested_model="gpt-5.6-sol",
             )
         incomplete = self.result()
-        incomplete["validation"] = {"complete": False, "outcomes": []}
-        with self.assertRaisesRegex(MODULE.WorkflowError, "validation"):
+        incomplete["attestation"]["structural_complete"] = False
+        with self.assertRaisesRegex(MODULE.WorkflowError, "attestation"):
             MODULE.validate_success_result(
                 incomplete,
                 preflight=self.preflight,
@@ -1669,12 +1671,20 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "task-1",
         )
 
-    def test_task_error_keeps_artifacts_without_redispatching(self):
+    def test_task_error_resumes_the_same_task_without_a_replacement(self):
         state_path = self.directory / "resume-state.json"
         helper = self.directory / "cloud_task.py"
         helper.write_text("# helper\n", encoding="utf-8")
         failure = self.result()
-        failure["status"] = "failed"
+        failure["status"] = "interrupted"
+        failure["task"]["state"] = "in_progress"
+        failure["application"] = {
+            "status": "not_applied",
+            "final_local_head": self.head,
+        }
+        failure["report"]["commit"] = None
+        failure["report"]["sha256"] = None
+        failure["attestation"]["structural_complete"] = False
         failure["error"] = {"code": "interrupted", "message": "Worker interrupted."}
         commands = []
 
@@ -1734,12 +1744,20 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             mock.patch.object(
                 MODULE, "local_identity", return_value=self.preflight["identity"]
             ),
-            mock.patch.object(MODULE, "run") as resumed_run,
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "run", side_effect=fail_run) as resumed_run,
             self.assertRaisesRegex(MODULE.WorkflowError, "Worker interrupted"),
         ):
             MODULE.command_agent_task(self.arguments(state_path, resume=True))
 
-        resumed_run.assert_not_called()
+        self.assertEqual(1, resumed_run.call_count)
+        resumed_command = resumed_run.call_args.args[0]
+        self.assertIn("--resume-apply-with-report", resumed_command)
+        self.assertEqual("task-1", resumed_command[resumed_command.index("--task-id") + 1])
+        self.assertEqual(
+            "request-1", resumed_command[resumed_command.index("--request-id") + 1]
+        )
+        self.assertNotIn("--prompt-file", resumed_command)
 
     def test_exact_cca_disabled_result_is_a_trusted_task_creation_failure(self):
         result = MODULE.load_agent_task_result(CCA_DISABLED_RESULT)
@@ -1809,6 +1827,41 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual("validation_incomplete", failure["code"])
         with self.assertRaisesRegex(MODULE.WorkflowError, "mismatched policy"):
             MODULE.validate_terminal_validation_failure_result(
+                result,
+                preflight=preflight,
+                requested_model="gpt-5.6-sol",
+            )
+
+    def test_exact_v5_validation_failure_is_terminal_and_requires_replacement(self):
+        result = MODULE.load_agent_task_result(MALFORMED_V5_VALIDATION_RESULT)
+        preflight = {
+            "identity": {
+                "branch": "trask-actions-queue-events",
+                "head": "ba1cdf0d96365a55af87e62c2f476245af685bbb",
+                "status": "",
+            },
+            "pr": {
+                "number": 377,
+                "pr_url": "https://github.com/open-telemetry/shared-workflows/pull/377",
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_repository": "open-telemetry/shared-workflows",
+                "head_branch": "trask-actions-queue-events",
+                "head_sha": "ba1cdf0d96365a55af87e62c2f476245af685bbb",
+                "base_branch": "main",
+                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+            },
+        }
+
+        failure = MODULE.validate_terminal_validation_failure_result(
+            result,
+            preflight=preflight,
+            requested_model="gpt-5.6-sol",
+            allow_legacy_policy=True,
+        )
+
+        self.assertEqual("validation_incomplete", failure["code"])
+        with self.assertRaises(MODULE.WorkflowError):
+            MODULE.validate_success_result(
                 result,
                 preflight=preflight,
                 requested_model="gpt-5.6-sol",

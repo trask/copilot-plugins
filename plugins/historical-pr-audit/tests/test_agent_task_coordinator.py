@@ -55,8 +55,8 @@ def result(commits=None):
         "pull_request": MODULE.expected_result_pull_request(METADATA),
         "requested_model": "gpt-5.6-sol",
         "policy": {
-            "id": "marketplace-agent-worker",
-            "version": 5,
+            "id": "marketplace-agent-apply-report-worker",
+            "version": 1,
             "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
         },
         "task": {
@@ -80,14 +80,9 @@ def result(commits=None):
             "commit": generated_head,
             "sha256": "5" * 64,
         },
-        "worker_receipt": {
-            "path": ".github/agent-task-validations/request-1.json",
-            "commit": generated_head,
-            "sha256": MODULE.sha256_text(json.dumps(receipt())),
-        },
-        "validation": {
-            "complete": True,
-            "outcomes": [dict(item) for item in VALIDATION],
+        "attestation": {
+            "kind": "dispatcher_structural",
+            "structural_complete": True,
         },
         "error": None,
     }
@@ -102,9 +97,9 @@ def interrupted_result():
         "status": "not_applied",
         "final_local_head": METADATA["head_sha"],
     }
-    value["report"] = None
-    value["worker_receipt"]["commit"] = None
-    value["validation"] = {"complete": False, "outcomes": []}
+    value["report"]["commit"] = None
+    value["report"]["sha256"] = None
+    value["attestation"]["structural_complete"] = False
     value["error"] = {"code": "interrupted", "message": "monitoring interrupted"}
     return value
 
@@ -155,7 +150,6 @@ def report(commits=None, outcome=None):
             {"sha": sha, "summary": "Fix finding", "paths": ["app.py"]}
             for sha in commits
         ],
-        "validation": VALIDATION,
         "pipeline": {
             **PIPELINE,
             "stage_outcome": (
@@ -183,11 +177,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pins_shared_helper_and_policy_integrity(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "da6d87d46f9e9c231b7536c2a91d2eb3cb9331d32f92627dd37fba198b85f70c",
+            "83e51637411640c4022130e448face835e21a552c558e7bd8dccc952283708f2",
         )
         self.assertEqual(
             MODULE.AGENT_TASK_POLICY_SHA256,
-            "a9a1592c15abb39c077c5af0e23b46b7b0e3fc3d747e02f41975813130b0c096",
+            "ea61b3edb7eb56b262d80eccb3b6a7e20a2167d5ca4381db66b7663bca33dd78",
         )
 
     def test_prompt_is_versioned_untrusted_and_remote_only(self):
@@ -197,6 +191,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             max_iterations=5,
             pipeline=PIPELINE,
         )
+        self.assertIn("human-readable UTF-8 Markdown report", prompt)
         for text in (
             "worker prompt version 2",
             "untrusted data",
@@ -208,10 +203,18 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "single-parent fix commit",
             "max_iterations_reached",
             "`{{MARKETPLACE_REPORT_PATH}}`",
-            "`{{MARKETPLACE_VALIDATION_PATH}}`",
         ):
             self.assertIn(text, prompt)
         self.assertFalse(MODULE.contains_credentials(prompt))
+
+    def test_report_parser_accepts_markdown_with_one_json_payload(self):
+        content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
+        self.assertEqual(
+            {"ok": True},
+            MODULE.parse_markdown_report(content, description="test report"),
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "exactly one"):
+            MODULE.parse_markdown_report("# Result", description="test report")
 
     def test_artifacts_are_absolute_and_outside_repository(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -241,7 +244,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "--result-file",
             str(first_result),
             "--policy",
-            "marketplace-agent-worker@5",
+            "marketplace-agent-apply-report-worker@1",
         ]
         self.assertEqual(
             MODULE.agent_task_command(
@@ -365,9 +368,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         wrong_artifact = result()
         wrong_artifact["report"]["path"] = "README.md"
         cases.append(wrong_artifact)
-        failed_validation = result()
-        failed_validation["validation"]["outcomes"][0]["status"] = "failed"
-        cases.append(failed_validation)
+        failed_attestation = result()
+        failed_attestation["attestation"]["structural_complete"] = False
+        cases.append(failed_attestation)
         for value in cases:
             with self.subTest(value=value), self.assertRaises(MODULE.WorkflowError):
                 MODULE.validate_success_result(
@@ -383,7 +386,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             metadata=METADATA,
             audit_branch="trask-pr-audit-7",
             commits=[],
-            validation=VALIDATION,
             max_iterations=5,
             pipeline=PIPELINE,
         )
@@ -397,7 +399,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 metadata=METADATA,
                 audit_branch="trask-pr-audit-7",
                 commits=[],
-                validation=VALIDATION,
                 max_iterations=5,
                 pipeline=PIPELINE,
             )
@@ -411,7 +412,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             metadata=METADATA,
             audit_branch="trask-pr-audit-7",
             commits=commits,
-            validation=VALIDATION,
             max_iterations=5,
             pipeline=PIPELINE,
         )
@@ -442,7 +442,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     metadata=METADATA,
                     audit_branch="trask-pr-audit-7",
                     commits=commits,
-                    validation=VALIDATION,
                     max_iterations=5,
                     pipeline=PIPELINE,
                 )
@@ -476,7 +475,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "base_ref": None,
             "base_sha": None,
         }
-        no_task["worker_receipt"]["sha256"] = None
+        no_task["report"]["commit"] = None
+        no_task["report"]["sha256"] = None
         no_task["error"] = {
             "code": "api_failure",
             "message": "user or repo does not have CCA enabled",
@@ -504,28 +504,15 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.WorkflowError, "credentials"):
                 MODULE.load_agent_task_result(path)
 
-    def test_receipt_rejects_wrong_identity_incomplete_validation_and_credentials(self):
-        cases = []
-        wrong = receipt()
-        wrong[0]["unexpected"] = "identity"
-        cases.append(wrong)
-        incomplete = receipt()
-        incomplete.clear()
-        cases.append(incomplete)
-        failed = receipt()
-        failed[0]["status"] = "failed"
-        cases.append(failed)
-        credential = receipt()
-        credential[0]["detail"] = "token=github_pat_example_value_123456"
-        cases.append(credential)
-        for value in cases:
-            with self.subTest(value=value), self.assertRaises(MODULE.WorkflowError):
-                MODULE.validate_worker_receipt(
-                    json.dumps(value),
-                    request_id="request-1",
-                    metadata=METADATA,
-                    validation=VALIDATION,
-                )
+    def test_rejects_incomplete_structural_attestation(self):
+        value = result()
+        value["attestation"]["structural_complete"] = False
+        with self.assertRaises(MODULE.WorkflowError):
+            MODULE.validate_success_result(
+                value,
+                metadata=METADATA,
+                requested_model="gpt-5.6-sol",
+            )
 
     def test_cleanup_removes_all_attempt_artifacts_only_after_completion(self):
         with tempfile.TemporaryDirectory() as directory:

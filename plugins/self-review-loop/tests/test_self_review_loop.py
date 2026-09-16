@@ -1228,8 +1228,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
             "requested_model": "gpt-5.6-sol",
             "policy": {
-                "id": "marketplace-agent-worker",
-                "version": 5,
+                "id": "marketplace-agent-apply-report-worker",
+                "version": 1,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -1253,18 +1253,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "commit": self.artifact,
                 "sha256": "4" * 64,
             },
-            "worker_receipt": {
-                "path": f".github/agent-task-validations/{request_id}.json",
-                "commit": self.artifact,
-                "sha256": MODULE.sha256_text(
-                    json.dumps(
-                        self.validation,
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    )
-                ),
+            "attestation": {
+                "kind": "dispatcher_structural",
+                "structural_complete": True,
             },
-            "validation": {"complete": True, "outcomes": self.validation},
             "error": None,
         }
 
@@ -1286,12 +1278,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     "final_local_head": self.head,
                 },
                 "report": None,
-                "worker_receipt": {
-                    "path": ".github/agent-task-validations/request-1.json",
-                    "commit": None,
-                    "sha256": None,
+                "attestation": {
+                    "kind": "dispatcher_structural",
+                    "structural_complete": False,
                 },
-                "validation": {"complete": False, "outcomes": []},
                 "error": {
                     "code": "api_failure",
                     "message": "user or repo does not have CCA enabled",
@@ -1340,7 +1330,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "outcome": outcome,
                 "iterations_used": 1,
                 "findings": findings,
-                "validation": self.validation,
                 "pull_request_metadata": {
                     "decision": "keep",
                     "title": pr["title"],
@@ -1355,15 +1344,24 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-worker@5", instructions)
+        self.assertIn("marketplace-agent-apply-report-worker@1", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("marketplace `custom_agent`", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.13")
+        self.assertEqual(plugin["version"], "1.3.14")
         self.assertNotIn("custom_agent", plugin)
+
+    def test_report_parser_accepts_markdown_with_one_json_payload(self):
+        content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
+        self.assertEqual(
+            {"ok": True},
+            MODULE.parse_markdown_report(content, description="test report"),
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "exactly one"):
+            MODULE.parse_markdown_report("# Result", description="test report")
 
     def test_prompt_is_versioned_self_contained_and_fail_closed(self):
         prompt = MODULE.build_worker_prompt(
@@ -1371,23 +1369,18 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             max_iterations=5,
             prior_history=[],
         )
+        self.assertIn("human-readable UTF-8 Markdown report", prompt)
         self.assertIn("worker prompt version 2", prompt)
         self.assertIn("maximum_review_iterations", prompt)
         self.assertIn("untrusted data", prompt)
         self.assertIn("`Finding: <identifier>`", prompt)
         self.assertIn("explicit no-change result", prompt)
         self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
-        self.assertIn("`{{MARKETPLACE_VALIDATION_PATH}}`", prompt)
+        self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
 
     def test_validates_result_receipt_and_explicit_no_change_report(self):
         remote = self.remote()
-        MODULE.validate_worker_receipt(
-            self.receipt(),
-            request_id=remote["request_id"],
-            preflight=self.preflight,
-            validation=remote["validation"],
-        )
         report = MODULE.validate_self_review_report(
             self.report(),
             request_id=remote["request_id"],
@@ -1406,7 +1399,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         wrong_application = self.result()
         wrong_application["application"]["final_local_head"] = "8" * 40
         incomplete = self.result()
-        incomplete["validation"] = {"complete": False, "outcomes": []}
+        incomplete["attestation"]["structural_complete"] = False
         for value in (wrong_policy, wrong_pr, wrong_application, incomplete):
             with self.subTest(value=value), self.assertRaises(MODULE.WorkflowError):
                 MODULE.validate_success_result(
@@ -1514,7 +1507,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 MODULE,
                 "git_z_paths",
                 side_effect=[
-                    [remote["report_path"], remote["receipt_path"]],
+                    [remote["report_path"]],
                     ["src/app.py"],
                 ],
             ),
@@ -1726,10 +1719,16 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         helper = self.directory / "cloud_task.py"
         helper.write_text("# helper\n", encoding="utf-8")
         failure = self.result()
-        failure.update(
-            status="failed",
-            error={"code": "validation_failed", "message": "Tests failed."},
-        )
+        failure["status"] = "interrupted"
+        failure["task"]["state"] = "in_progress"
+        failure["application"] = {
+            "status": "not_applied",
+            "final_local_head": self.head,
+        }
+        failure["report"]["commit"] = None
+        failure["report"]["sha256"] = None
+        failure["attestation"]["structural_complete"] = False
+        failure["error"] = {"code": "interrupted", "message": "Worker interrupted."}
         commands = []
 
         def helper_run(command, **kwargs):
@@ -1773,7 +1772,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "token_hex",
                 side_effect=["invocation-1", "run-1"],
             ),
-            self.assertRaisesRegex(MODULE.WorkflowError, "validation_failed"),
+            self.assertRaisesRegex(MODULE.WorkflowError, "Worker interrupted"),
         ):
             MODULE.command_agent_task(arguments)
 
@@ -1788,6 +1787,35 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(len(task["recovery_files"]), 2)
         self.assertTrue(all(Path(path).exists() for path in task["recovery_files"]))
         self.assertIn("--apply-with-report", commands[0])
+
+        resume_arguments = SimpleNamespace(**vars(arguments))
+        resume_arguments.resume = True
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "run", side_effect=helper_run),
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value=self.preflight["identity"],
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "Worker interrupted"),
+        ):
+            MODULE.command_agent_task(resume_arguments)
+
+        self.assertEqual(2, len(commands))
+        self.assertIn("--resume-apply-with-report", commands[1])
+        self.assertEqual("task-1", commands[1][commands[1].index("--task-id") + 1])
+        self.assertEqual(
+            "request-1", commands[1][commands[1].index("--request-id") + 1]
+        )
+        self.assertNotIn("--prompt-file", commands[1])
 
     def test_paths_and_recovery_command_are_external_and_durable(self):
         outside = self.directory / "state" / "prompt.txt"

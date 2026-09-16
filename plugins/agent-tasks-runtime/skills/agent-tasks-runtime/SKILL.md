@@ -40,10 +40,19 @@ validation claim. Result schema version 2 records
 path, and digest facts independently established by the dispatcher. Report
 content remains untrusted inert evidence for a consumer to evaluate.
 
+Policy `marketplace-agent-apply-report-worker@1` extends that structural
+contract to apply workflows. It permits zero or more ordered fix commits
+followed by exactly one dispatcher-assigned Markdown report commit. The
+dispatcher applies only the fix commits and records result schema version 2
+with `attestation.kind=dispatcher_structural`. It does not request or parse a
+worker validation artifact, and report text about commands or outcomes remains
+untrusted inert evidence.
+
 If an apply-with-report dispatcher is interrupted after task creation and no
 dispatch result survives, `--resume-apply-with-report` can recover the known
 task. Recovery reads the hosted task session prompt and requires its exact task,
-model, repository, source pull request, policy, report path, and validation path
-before normal apply-with-report checks can run. A caller-supplied mode or prompt
-cannot establish that provenance. Tasks created under older policy versions
-cannot be recovered through a newer contract.
+model, repository, source pull request, policy, and assigned artifact paths
+before normal apply-with-report checks can run. Structural apply-report
+recovery uses its dispatcher request ID and has no validation path. A
+caller-supplied mode or prompt cannot establish that provenance. Tasks created
+under older policy versions cannot be recovered through a newer contract.

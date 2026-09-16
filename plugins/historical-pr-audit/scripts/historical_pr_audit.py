@@ -45,16 +45,20 @@ GITHUB_PR_DIFF = "github_pr_diff"
 CUMULATIVE_GIT_DIFF = "cumulative_git_diff"
 BARE_TARGET_PATTERN = re.compile(r"^#?(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "da6d87d46f9e9c231b7536c2a91d2eb3cb9331d32f92627dd37fba198b85f70c"
+    "83e51637411640c4022130e448face835e21a552c558e7bd8dccc952283708f2"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
 CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
-AGENT_TASK_POLICY = "marketplace-agent-worker@5"
+AGENT_TASK_POLICY = "marketplace-agent-apply-report-worker@1"
 AGENT_TASK_POLICY_SHA256 = (
-    "a9a1592c15abb39c077c5af0e23b46b7b0e3fc3d747e02f41975813130b0c096"
+    "ea61b3edb7eb56b262d80eccb3b6a7e20a2167d5ca4381db66b7663bca33dd78"
 )
 AGENT_TASK_RESULT_SCHEMA = {
+    "id": "github.copilot.agent-task-result",
+    "version": 2,
+}
+LEGACY_AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
     "version": 1,
 }
@@ -2303,6 +2307,25 @@ def parse_strict_json(value: str, *, description: str) -> Any:
         raise WorkflowError(f"{description} is invalid JSON: {error}") from error
 
 
+def parse_markdown_report(value: str, *, description: str) -> Any:
+    stripped = value.strip()
+    if stripped.startswith("{"):
+        return parse_strict_json(stripped, description=description)
+    matches = list(
+        re.finditer(r"```json[ \t]*\r?\n(?P<payload>.*?)\r?\n```", value, re.DOTALL)
+    )
+    if len(matches) != 1:
+        raise WorkflowError(
+            f"{description} must contain exactly one fenced JSON payload"
+        )
+    outside = value[: matches[0].start()] + value[matches[0].end() :]
+    if "```" in outside:
+        raise WorkflowError(f"{description} contains an unexpected fenced block")
+    return parse_strict_json(
+        matches[0].group("payload").strip(), description=f"{description} payload"
+    )
+
+
 def load_json_object(path: Path, *, description: str) -> dict[str, Any]:
     try:
         value = parse_strict_json(path.read_text(encoding="utf-8"), description=description)
@@ -2474,12 +2497,6 @@ def build_worker_prompt(
                 "paths": ["<repository-relative changed path>"],
             }
         ],
-        "validation": [
-            {
-                "command": "<exact command or deterministic review check>",
-                "outcome": "passed",
-            }
-        ],
         "pipeline": {
             **pipeline,
             "stage_outcome": "cleared or null",
@@ -2518,14 +2535,15 @@ def build_worker_prompt(
         "candidate decisions forward so a dropped, addressed, or no-code finding is "
         "not raised again. A clean first pass creates no fix commit. Do not invent a "
         "change to avoid a no-change result. Write the report directly to "
-        "`{{MARKETPLACE_REPORT_PATH}}` and the strict validation array directly to "
-        "`{{MARKETPLACE_VALIDATION_PATH}}`; the dispatcher replaces both placeholders "
-        "before task creation. Do not choose alternate artifact names or commit scratch "
-        "files.\n\n"
-        "Write the final report as one UTF-8 JSON object with no Markdown fence and no "
-        "text before or after it. Use exactly the keys and nesting in this shape. "
+        "`{{MARKETPLACE_REPORT_PATH}}`; the dispatcher replaces the placeholder "
+        "before task creation. Do not choose alternate artifact names or commit "
+        "scratch files. Commands and outcomes described in the report are inert "
+        "evidence, not dispatcher-attested validation.\n\n"
+        "Write a concise human-readable UTF-8 Markdown report, then end it with exactly "
+        "one fenced `json` block containing the object with the keys and nesting in "
+        "this shape. "
         "Record fix commits in oldest-to-newest order and list the exact changed paths "
-        "for each. The report validation array must exactly match the worker validation "
+        "for each. "
         "Use outcome no_change only with no fix commits. Use clean after one or more "
         "fix commits only when the final pass is clean. Use max_iterations_reached "
         "when the cap ends a non-clean run. Set pipeline.stage_outcome to cleared only "
@@ -2595,7 +2613,7 @@ def execute_managed_agent_task(
 
 def load_agent_task_result(path: Path) -> dict[str, Any]:
     result = load_json_object(path, description="Agent Task result")
-    expected_keys = {
+    structural_keys = {
         "schema",
         "status",
         "mode",
@@ -2607,38 +2625,28 @@ def load_agent_task_result(path: Path) -> dict[str, Any]:
         "generated",
         "application",
         "report",
-        "worker_receipt",
-        "validation",
+        "attestation",
         "error",
     }
-    if set(result) != expected_keys or result.get("schema") != AGENT_TASK_RESULT_SCHEMA:
+    legacy_keys = structural_keys - {"attestation"} | {"worker_receipt", "validation"}
+    if (
+        (
+            result.get("schema") == AGENT_TASK_RESULT_SCHEMA
+            and set(result) != structural_keys
+        )
+        or (
+            result.get("schema") == LEGACY_AGENT_TASK_RESULT_SCHEMA
+            and set(result) != legacy_keys
+        )
+        or result.get("schema")
+        not in (AGENT_TASK_RESULT_SCHEMA, LEGACY_AGENT_TASK_RESULT_SCHEMA)
+    ):
         raise WorkflowError("Agent Task result has an unsupported schema or fields")
     require_no_credentials(
         json.dumps(result, ensure_ascii=False, sort_keys=True),
         source="Agent Task result",
     )
     return result
-
-
-def validate_validation_outcomes(value: Any) -> list[dict[str, str]]:
-    if not isinstance(value, list) or not value:
-        raise WorkflowError("Agent Task validation is incomplete")
-    outcomes: list[dict[str, str]] = []
-    for outcome in value:
-        if (
-            not isinstance(outcome, dict)
-            or set(outcome) != {"command", "outcome"}
-            or not isinstance(outcome.get("command"), str)
-            or not outcome["command"].strip()
-            or outcome.get("outcome") != "passed"
-        ):
-            raise WorkflowError("Agent Task validation is incomplete or malformed")
-        require_no_credentials(
-            json.dumps(outcome, ensure_ascii=False, sort_keys=True),
-            source="Agent Task validation",
-        )
-        outcomes.append(outcome)
-    return outcomes
 
 
 def expected_result_pull_request(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -2666,16 +2674,15 @@ def validate_success_result(
     requested_model: str,
 ) -> dict[str, Any]:
     expected_policy = {
-        "id": "marketplace-agent-worker",
-        "version": 5,
+        "id": "marketplace-agent-apply-report-worker",
+        "version": 1,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     task = result.get("task")
     generated = result.get("generated")
     application = result.get("application")
     report = result.get("report")
-    receipt = result.get("worker_receipt")
-    validation = result.get("validation")
+    attestation = result.get("attestation")
     if (
         result.get("status") != "success"
         or result.get("error") is not None
@@ -2707,11 +2714,11 @@ def validate_success_result(
         or application.get("status") not in {"applied", "no_changes"}
         or not isinstance(report, dict)
         or set(report) != {"path", "commit", "sha256"}
-        or not isinstance(receipt, dict)
-        or set(receipt) != {"path", "commit", "sha256"}
-        or not isinstance(validation, dict)
-        or set(validation) != {"complete", "outcomes"}
-        or validation.get("complete") is not True
+        or attestation
+        != {
+            "kind": "dispatcher_structural",
+            "structural_complete": True,
+        }
     ):
         raise WorkflowError("Agent Task result identity or success data is malformed")
     commits = generated["commits"]
@@ -2725,27 +2732,16 @@ def validate_success_result(
         if isinstance(report.get("path"), str)
         else None
     )
-    receipt_match = (
-        RECEIPT_PATH_PATTERN.fullmatch(receipt.get("path"))
-        if isinstance(receipt.get("path"), str)
-        else None
-    )
     if (
         report_match is None
-        or receipt_match is None
-        or report_match.group("request_id") != receipt_match.group("request_id")
         or report.get("commit") != generated["head_sha"]
-        or receipt.get("commit") != generated["head_sha"]
         or not isinstance(report.get("sha256"), str)
         or not re.fullmatch(r"[0-9a-f]{64}", report["sha256"])
-        or not isinstance(receipt.get("sha256"), str)
-        or not re.fullmatch(r"[0-9a-f]{64}", receipt["sha256"])
         or application.get("final_local_head")
         != (commits[-1] if commits else metadata["head_sha"])
         or (application["status"] == "no_changes") != (not commits)
     ):
         raise WorkflowError("Agent Task artifact or application identity is malformed")
-    outcomes = validate_validation_outcomes(validation["outcomes"])
     return {
         "request_id": report_match.group("request_id"),
         "task": task,
@@ -2754,8 +2750,7 @@ def validate_success_result(
         "commits": commits,
         "final_local_head": application["final_local_head"],
         "report": report,
-        "receipt": receipt,
-        "validation": outcomes,
+        "structural_attestation": True,
     }
 
 
@@ -2784,26 +2779,6 @@ def fetch_committed_text(
         ) from error
 
 
-def validate_worker_receipt(
-    content: str,
-    *,
-    request_id: str,
-    metadata: dict[str, Any],
-    validation: list[dict[str, str]],
-) -> list[dict[str, str]]:
-    require_no_credentials(content, source="Agent Task worker validation")
-    artifact = parse_strict_json(
-        content,
-        description="Agent Task worker validation",
-    )
-    if artifact != validation:
-        raise WorkflowError(
-            "Agent Task worker validation does not match the dispatcher result"
-        )
-    validate_validation_outcomes(artifact)
-    return artifact
-
-
 def validate_audit_report(
     content: str,
     *,
@@ -2811,12 +2786,11 @@ def validate_audit_report(
     metadata: dict[str, Any],
     audit_branch: str,
     commits: list[str],
-    validation: list[dict[str, str]],
     max_iterations: int,
     pipeline: dict[str, str | None],
 ) -> dict[str, Any]:
     require_no_credentials(content, source="Agent Task audit report")
-    report = parse_strict_json(content, description="Agent Task audit report")
+    report = parse_markdown_report(content, description="Agent Task audit report")
     expected_pr = {
         "number": metadata["number"],
         "url": metadata["pr_url"],
@@ -2838,7 +2812,6 @@ def validate_audit_report(
             "iterations",
             "max_iterations",
             "commits",
-            "validation",
             "pipeline",
         }
         or report.get("schema") != AUDIT_REPORT_SCHEMA
@@ -2848,7 +2821,6 @@ def validate_audit_report(
         or report.get("audit_branch") != audit_branch
         or report.get("outcome") not in {"no_change", "clean", "max_iterations_reached"}
         or report.get("max_iterations") != max_iterations
-        or report.get("validation") != validation
         or not isinstance(report.get("iterations"), list)
         or not report["iterations"]
         or len(report["iterations"]) > max_iterations
@@ -3093,14 +3065,7 @@ def publish_agent_task_result(
     audit["commits"] = commits
     audit["iterations"] = remote["report_data"]["iterations"]
     state["iterations"] = len(remote["report_data"]["iterations"])
-    state["local_validation"] = [
-        {
-            "status": "passed",
-            "head_sha": remote["final_local_head"],
-            "commands": [item["command"] for item in remote["validation"]],
-            "source": "agent_task",
-        }
-    ]
+    state["local_validation"] = []
     state["agent_task"]["status"] = "completed"
     state["agent_task"]["completed_at"] = utc_now()
     state["agent_task"]["artifacts_removed"] = False
@@ -3129,7 +3094,7 @@ def publish_agent_task_result(
             else "cleared"
         ),
         "task": remote["task"],
-        "validation": remote["validation"],
+        "attestation": "dispatcher_structural",
         "pushed": pushed,
     }
 
@@ -3212,8 +3177,8 @@ def validate_recovery_result_identity(
     requested_model: str,
 ) -> bool:
     expected_policy = {
-        "id": "marketplace-agent-worker",
-        "version": 5,
+        "id": "marketplace-agent-apply-report-worker",
+        "version": 1,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     if (
@@ -3227,18 +3192,21 @@ def validate_recovery_result_identity(
         raise WorkflowError("Agent Task recovery result has the wrong identity")
     task = result.get("task")
     generated = result.get("generated")
-    receipt = result.get("worker_receipt")
-    validation = result.get("validation")
+    report = result.get("report")
+    attestation = result.get("attestation")
     error = result.get("error")
     if (
         not isinstance(task, dict)
         or set(task) != {"id", "url", "state", "base_ref", "base_sha"}
         or not isinstance(generated, dict)
         or set(generated) != {"branch", "head_sha", "commits"}
-        or not isinstance(receipt, dict)
-        or set(receipt) != {"path", "commit", "sha256"}
-        or not isinstance(receipt.get("path"), str)
-        or RECEIPT_PATH_PATTERN.fullmatch(receipt["path"]) is None
+        or not isinstance(report, dict)
+        or set(report) != {"path", "commit", "sha256"}
+        or not isinstance(report.get("path"), str)
+        or REPORT_PATH_PATTERN.fullmatch(report["path"]) is None
+        or not isinstance(attestation, dict)
+        or attestation.get("kind") != "dispatcher_structural"
+        or not isinstance(attestation.get("structural_complete"), bool)
     ):
         raise WorkflowError("Agent Task recovery result is malformed")
     task_id = task.get("id")
@@ -3252,10 +3220,9 @@ def validate_recovery_result_identity(
                 "status": "not_applied",
                 "final_local_head": metadata["head_sha"],
             }
-            or result.get("report") is not None
-            or receipt.get("commit") is not None
-            or receipt.get("sha256") is not None
-            or validation != {"complete": False, "outcomes": []}
+            or report.get("commit") is not None
+            or report.get("sha256") is not None
+            or attestation.get("structural_complete") is not False
             or not isinstance(error, dict)
             or set(error) != {"code", "message"}
             or not isinstance(error.get("code"), str)
@@ -3274,8 +3241,6 @@ def validate_recovery_result_identity(
             task.get("url") is not None
             and (not isinstance(task["url"], str) or not task["url"])
         )
-        or not isinstance(receipt.get("sha256"), str)
-        or not re.fullmatch(r"[0-9a-f]{64}", receipt["sha256"])
     ):
         raise WorkflowError("Agent Task recovery task identity is malformed")
     return True
@@ -3288,13 +3253,6 @@ def require_same_agent_task(
     current_task = current["task"]
     if prior_task.get("id") != current_task.get("id"):
         raise WorkflowError("Agent Task resume created or selected a replacement task")
-    prior_receipt = prior["worker_receipt"]
-    current_receipt = current["worker_receipt"]
-    if prior_receipt.get("path") != current_receipt.get("path") or (
-        prior_receipt.get("commit") is not None
-        and prior_receipt.get("commit") != current_receipt.get("commit")
-    ):
-        raise WorkflowError("Agent Task resume changed the original validation artifact")
     for field, label in (
         ("branch", "generated branch"),
         ("head_sha", "generated head"),
@@ -3316,13 +3274,13 @@ def require_same_agent_task(
             old = prior_report.get(field)
             if old is not None and old != current_report.get(field):
                 raise WorkflowError("Agent Task resume changed the original report")
-    prior_validation = prior.get("validation")
+    prior_attestation = prior.get("attestation")
     if (
-        isinstance(prior_validation, dict)
-        and prior_validation.get("complete") is True
-        and prior_validation != current.get("validation")
+        isinstance(prior_attestation, dict)
+        and prior_attestation.get("structural_complete") is True
+        and prior_attestation != current.get("attestation")
     ):
-        raise WorkflowError("Agent Task resume changed the original validation")
+        raise WorkflowError("Agent Task resume changed structural attestation")
 
 
 def preserve_agent_task_result(
@@ -3338,8 +3296,7 @@ def preserve_agent_task_result(
             "task": result.get("task"),
             "generated": result.get("generated"),
             "report": result.get("report"),
-            "worker_receipt": result.get("worker_receipt"),
-            "validation": result.get("validation"),
+            "attestation": result.get("attestation"),
         }
     )
 
@@ -3771,27 +3728,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
         )
         if sha256_text(report_content) != remote["report"]["sha256"]:
             raise WorkflowError("Agent Task audit report digest does not match")
-        receipt_content = fetch_committed_text(
-            metadata["repo_name"],
-            remote["receipt"]["path"],
-            remote["generated_head"],
-            description="worker validation",
-        )
-        if sha256_text(receipt_content) != remote["receipt"]["sha256"]:
-            raise WorkflowError("Agent Task worker validation digest does not match")
-        validate_worker_receipt(
-            receipt_content,
-            request_id=remote["request_id"],
-            metadata=metadata,
-            validation=remote["validation"],
-        )
         report = validate_audit_report(
             report_content,
             request_id=remote["request_id"],
             metadata=metadata,
             audit_branch=audit_branch,
             commits=remote["commits"],
-            validation=remote["validation"],
             max_iterations=max_iterations,
             pipeline=pipeline,
         )

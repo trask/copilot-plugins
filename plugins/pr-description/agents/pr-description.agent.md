@@ -27,7 +27,7 @@ You are a thin local coordinator. The bundled helper owns authenticated prefligh
    - Pass any supplied `--pipeline-run`, `--pipeline-iteration`, and `--pipeline-max-iterations` values exactly.
    - Pass `--model luna|terra|sol|astra` only when the user or caller selected one. The default is `sol`.
 3. After the helper succeeds, call `rename_session` exactly once with `PR Description: <number> - <title>` when the runtime exposes that tool. Build it from the canonical pull request and final title in the helper result. If the tool is unavailable, continue without renaming.
-4. Show the current title and description from the helper result. Then show its decision, proposed title and description, evidence, final action, validated head, canonical pull request URL, and Agent Task validation in concise Markdown.
+4. Show the current title and description from the helper result. Then show its decision, proposed title and description, evidence, final action, validated head, canonical pull request URL, and structural attestation in concise Markdown.
 
 ## Boundaries
 
@@ -37,8 +37,8 @@ You are a thin local coordinator. The bundled helper owns authenticated prefligh
 - Never scrape the managed worker's standard output. The bundled coordinator consumes the atomic result file and committed report.
 - Stop on any helper error. Report its prerequisite or recovery guidance and the returned state and recovery file paths. Do not improvise another path.
 - The helper may read GitHub metadata locally for authenticated preflight and verification. It must not execute or analyze repository code.
-- The coordinator discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies its pinned SHA-256 before dispatch, and requires policy `marketplace-agent-worker@5`. Authentication stays in local `gh api`.
-- The worker runs validation remotely and commits a strict validation array. The dispatcher treats command strings as inert data and rejects stale heads, changed title or body text, local repository drift, malformed reports or validation artifacts, incomplete validation, credentials, and every identity mismatch before mutation.
+- The coordinator discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies its pinned SHA-256 before dispatch, and requires policy `marketplace-agent-report-worker@1`. Authentication stays in local `gh api`.
+- The worker writes one human-readable Markdown report. The dispatcher attests only task and source identity, generated history, the exact report path, and its digest. It rejects stale heads, changed title or body text, local repository drift, malformed reports, credentials, and every identity mismatch before mutation.
 - GitHub's pull request update endpoint has no conditional unsafe request. The helper reads the exact pinned head, title, and body twice immediately before PATCH and verifies them afterward. Another writer can still change metadata inside that final request window.
 - Preserve helper state on completion and failure. The helper removes prompt and result files after successful consumption and retains useful recovery files on failure.
 

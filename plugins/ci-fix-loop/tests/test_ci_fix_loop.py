@@ -916,12 +916,6 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.head = "1" * 40
         self.base = "2" * 40
         self.artifact = "3" * 40
-        self.validation = [
-            {
-                "command": "python -m unittest tests.test_widget",
-                "outcome": "passed",
-            }
-        ]
         failure = {
             "key": "check:CI/test",
             "name": "test",
@@ -983,8 +977,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
             "requested_model": "gpt-5.6-sol",
             "policy": {
-                "id": "marketplace-agent-worker",
-                "version": 5,
+                "id": "marketplace-agent-apply-report-worker",
+                "version": 1,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -1008,18 +1002,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 "commit": self.artifact,
                 "sha256": "4" * 64,
             },
-            "worker_receipt": {
-                "path": ".github/agent-task-validations/request-1.json",
-                "commit": self.artifact,
-                "sha256": MODULE.sha256_text(
-                    json.dumps(
-                        self.validation,
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    )
-                ),
+            "attestation": {
+                "kind": "dispatcher_structural",
+                "structural_complete": True,
             },
-            "validation": {"complete": True, "outcomes": self.validation},
             "error": None,
         }
 
@@ -1041,12 +1027,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     "final_local_head": self.head,
                 },
                 "report": None,
-                "worker_receipt": {
-                    "path": ".github/agent-task-validations/request-1.json",
-                    "commit": None,
-                    "sha256": None,
+                "attestation": {
+                    "kind": "dispatcher_structural",
+                    "structural_complete": False,
                 },
-                "validation": {"complete": False, "outcomes": []},
                 "error": {
                     "code": "api_failure",
                     "message": "user or repo does not have CCA enabled",
@@ -1107,26 +1091,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                         "commit": commits[0] if disposition == "fixed" else None,
                     }
                 ],
-                "validation": self.validation,
-                "validation_coverage": (
-                    [
-                        {
-                            "check_key": failure["key"],
-                            "commands": [self.validation[0]["command"]],
-                        }
-                    ]
-                    if coverage
-                    else []
-                ),
                 "changed_paths": [] if changed_paths is None else changed_paths,
             },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-
-    def receipt(self):
-        return json.dumps(
-            self.validation,
             separators=(",", ":"),
             sort_keys=True,
         )
@@ -1144,13 +1110,22 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
         self.assertIn("loop <target>", instructions)
-        self.assertIn("marketplace-agent-worker@5", instructions)
+        self.assertIn("marketplace-agent-apply-report-worker@1", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("`custom_agent`", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.14", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.15", json.loads(PLUGIN.read_text())["version"])
+
+    def test_report_parser_accepts_markdown_with_one_json_payload(self):
+        content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
+        self.assertEqual(
+            {"ok": True},
+            MODULE.parse_markdown_report(content, description="test report"),
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "exactly one"):
+            MODULE.parse_markdown_report("# Result", description="test report")
 
     def test_prompt_pins_snapshot_allowance_model_policy_and_worker_boundary(self):
         prompt = MODULE.build_worker_prompt(
@@ -1159,6 +1134,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             prior_history=[],
             requested_model="gpt-5.6-sol",
         )
+        self.assertIn("human-readable UTF-8 Markdown report", prompt)
         self.assertIn("sole repository worker", prompt)
         self.assertIn(self.preflight["check_snapshot"]["sha256"], prompt)
         self.assertIn(MODULE.AGENT_TASK_POLICY_SHA256, prompt)
@@ -1167,7 +1143,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("use Cloud Sandboxes", prompt)
         self.assertIn("worker prompt version 2", prompt)
         self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
-        self.assertIn("`{{MARKETPLACE_VALIDATION_PATH}}`", prompt)
+        self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
 
     def test_failed_log_download_is_scoped_to_the_exact_job(self):
@@ -1187,12 +1163,6 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
     def test_accepts_noop_and_complete_relevant_validation(self):
         remote = self.remote()
-        MODULE.validate_worker_receipt(
-            self.receipt(),
-            request_id=remote["request_id"],
-            preflight=self.preflight,
-            validation=remote["validation"],
-        )
         report = self.validate_report(self.report())
         self.assertEqual("no_change", report["outcome"])
 
@@ -1221,7 +1191,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 )
                 self.assertEqual(outcome, report["outcome"])
 
-    def test_rejects_malformed_mismatched_result_report_and_receipt(self):
+    def test_rejects_malformed_mismatched_result_and_report(self):
         wrong = self.result()
         wrong["policy"]["sha256"] = "0" * 64
         with self.assertRaises(MODULE.WorkflowError):
@@ -1234,25 +1204,15 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         report["pull_request"]["check_snapshot_sha256"] = "0" * 64
         with self.assertRaises(MODULE.WorkflowError):
             self.validate_report(json.dumps(report))
-        receipt = json.loads(self.receipt())
-        receipt[0]["unexpected"] = "other"
-        with self.assertRaises(MODULE.WorkflowError):
-            MODULE.validate_worker_receipt(
-                json.dumps(receipt),
-                request_id="request-1",
-                preflight=self.preflight,
-                validation=self.validation,
-            )
-
-    def test_rejects_incomplete_or_irrelevant_validation(self):
-        with self.assertRaisesRegex(MODULE.WorkflowError, "cover"):
-            self.validate_report(self.report(coverage=False))
+    def test_rejects_worker_validation_claim_and_incomplete_attestation(self):
         report = json.loads(self.report())
-        report["validation_coverage"][0]["commands"] = ["not executed"]
-        with self.assertRaisesRegex(MODULE.WorkflowError, "relevance"):
+        report["validation"] = [
+            {"name": "invented worker claim", "outcome": "passed"}
+        ]
+        with self.assertRaisesRegex(MODULE.WorkflowError, "malformed"):
             self.validate_report(json.dumps(report))
         incomplete = self.result()
-        incomplete["validation"] = {"complete": False, "outcomes": []}
+        incomplete["attestation"]["structural_complete"] = False
         with self.assertRaises(MODULE.WorkflowError):
             MODULE.validate_success_result(
                 incomplete,
@@ -1260,11 +1220,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 requested_model="gpt-5.6-sol",
             )
 
-    def test_rejects_credentials_in_result_report_receipt_and_logs(self):
+    def test_rejects_credentials_in_result_report_and_logs(self):
         for source, value in (
             ("result", json.dumps(self.result()) + " token=secret-value"),
             ("report", self.report() + " password=hunter2"),
-            ("receipt", self.receipt() + " Authorization: Bearer abc"),
             ("log", "github_pat_abcdefghijklmnopqrstuvwxyz"),
         ):
             with self.subTest(source=source), self.assertRaisesRegex(
@@ -1369,10 +1328,23 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
     def test_recovery_rejects_a_failed_result_with_mismatched_identity(self):
         failed = self.result()
-        failed["status"] = "failure"
+        failed["status"] = "error"
+        failed["task"]["state"] = "in_progress"
+        failed["application"] = {
+            "status": "not_applied",
+            "final_local_head": self.head,
+        }
+        failed["report"]["commit"] = None
+        failed["report"]["sha256"] = None
+        failed["attestation"]["structural_complete"] = False
         failed["error"] = {"code": "worker_failed", "message": "transient failure"}
         self.assertEqual(
-            "task-1",
+            {
+                "task_id": "task-1",
+                "request_id": "request-1",
+                "generated_branch": "copilot/agent-task",
+                "generated_head": self.artifact,
+            },
             MODULE.validate_recovery_result_identity(
                 failed,
                 preflight=self.preflight,
@@ -1387,7 +1359,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 requested_model="gpt-5.6-sol",
             )
 
-    def test_failed_open_pr_task_is_retained_without_a_replacement_task(self):
+    def test_failed_open_pr_task_resumes_without_a_replacement_task(self):
         repo = self.root / "repo"
         repo.mkdir()
         state_path = self.root / "state.json"
@@ -1395,7 +1367,15 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         preflight["repository_root"] = str(repo)
         report = self.report()
         failed = self.result()
-        failed["status"] = "failure"
+        failed["status"] = "error"
+        failed["task"]["state"] = "in_progress"
+        failed["application"] = {
+            "status": "not_applied",
+            "final_local_head": self.head,
+        }
+        failed["report"]["commit"] = None
+        failed["report"]["sha256"] = None
+        failed["attestation"]["structural_complete"] = False
         failed["error"] = {"code": "worker_failed", "message": "transient failure"}
         helper_commands = []
 
@@ -1424,7 +1404,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(MODULE, "run", side_effect=run_helper),
             mock.patch.object(MODULE, "local_identity", return_value=preflight["identity"]),
             mock.patch.object(
-                MODULE, "fetch_committed_text", side_effect=[report, self.receipt()]
+                MODULE, "fetch_committed_text", return_value=report
             ),
             mock.patch.object(MODULE, "validate_generated_history"),
             mock.patch.object(MODULE, "refuse_test_suppression"),
@@ -1439,7 +1419,17 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     MODULE.build_parser().parse_args([*arguments, "--resume"])
                 )
 
-        self.assertEqual(1, len(helper_commands))
+        self.assertEqual(2, len(helper_commands))
+        self.assertIn("--resume-apply-with-report", helper_commands[1])
+        self.assertEqual(
+            "task-1",
+            helper_commands[1][helper_commands[1].index("--task-id") + 1],
+        )
+        self.assertEqual(
+            "request-1",
+            helper_commands[1][helper_commands[1].index("--request-id") + 1],
+        )
+        self.assertNotIn("--prompt-file", helper_commands[1])
         state = MODULE.load_state(state_path)
         self.assertEqual("failed", state["agent_task"]["status"])
         self.assertFalse(state["agent_task"].get("artifacts_removed", False))
@@ -1554,7 +1544,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(MODULE, "run", side_effect=run_command),
             mock.patch.object(MODULE, "local_identity", return_value=imported_identity),
             mock.patch.object(
-                MODULE, "fetch_committed_text", side_effect=[report, self.receipt()]
+                MODULE, "fetch_committed_text", return_value=report
             ),
             mock.patch.object(MODULE, "validate_generated_history"),
             mock.patch.object(MODULE, "refuse_test_suppression"),
@@ -1641,7 +1631,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "fetch_committed_text",
-                side_effect=[report, self.receipt(), report, self.receipt()],
+                side_effect=[report, report],
             ),
             mock.patch.object(MODULE, "validate_generated_history"),
             mock.patch.object(MODULE, "refuse_test_suppression"),
@@ -1751,12 +1741,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "fetch_committed_text",
-                side_effect=[
-                    reports[0],
-                    self.receipt(),
-                    reports[1],
-                    self.receipt(),
-                ],
+                side_effect=reports,
             ),
             mock.patch.object(MODULE, "validate_generated_history"),
             mock.patch.object(MODULE, "refuse_test_suppression"),

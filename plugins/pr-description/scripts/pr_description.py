@@ -54,16 +54,20 @@ SHARED_STATE_CONFIG = Path(".copilot/extensions/pr-flight/state-repo.json")
 SHARED_STATE_VERSION = 1
 SHARED_STATE_MAX_ATTEMPTS = 3
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "da6d87d46f9e9c231b7536c2a91d2eb3cb9331d32f92627dd37fba198b85f70c"
+    "83e51637411640c4022130e448face835e21a552c558e7bd8dccc952283708f2"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
 CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
-AGENT_TASK_POLICY = "marketplace-agent-worker@5"
+AGENT_TASK_POLICY = "marketplace-agent-report-worker@1"
 AGENT_TASK_POLICY_SHA256 = (
-    "a9a1592c15abb39c077c5af0e23b46b7b0e3fc3d747e02f41975813130b0c096"
+    "b6ce6f5940c28fac03dda5be647c693e2a83e0c8f7eaf38f1b644b47bf49f2a2"
 )
 AGENT_TASK_RESULT_SCHEMA = {
+    "id": "github.copilot.agent-task-result",
+    "version": 2,
+}
+LEGACY_AGENT_TASK_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-result",
     "version": 1,
 }
@@ -240,6 +244,25 @@ def parse_strict_json(value: str, *, description: str) -> Any:
         return json.loads(value, object_pairs_hook=unique_object)
     except (json.JSONDecodeError, ValueError) as error:
         raise WorkflowError(f"{description} is invalid JSON: {error}") from error
+
+
+def parse_markdown_report(value: str, *, description: str) -> Any:
+    stripped = value.strip()
+    if stripped.startswith("{"):
+        return parse_strict_json(stripped, description=description)
+    matches = list(
+        re.finditer(r"```json[ \t]*\r?\n(?P<payload>.*?)\r?\n```", value, re.DOTALL)
+    )
+    if len(matches) != 1:
+        raise WorkflowError(
+            f"{description} must contain exactly one fenced JSON payload"
+        )
+    outside = value[: matches[0].start()] + value[matches[0].end() :]
+    if "```" in outside:
+        raise WorkflowError(f"{description} contains an unexpected fenced block")
+    return parse_strict_json(
+        matches[0].group("payload").strip(), description=f"{description} payload"
+    )
 
 
 def discover_cloud_task() -> Path:
@@ -1468,12 +1491,14 @@ def build_worker_prompt(preflight: dict[str, Any]) -> str:
         "small user-facing API or configuration example near the top when callers "
         "need it. Leave out validation logs and implementation details a reviewer can "
         "read in the diff. Use plain language, active voice, short sentences, and no "
-        "hard wrapping. Write the report directly to `{{MARKETPLACE_REPORT_PATH}}` and "
-        "the strict validation array directly to `{{MARKETPLACE_VALIDATION_PATH}}`; the "
-        "dispatcher replaces both placeholders before task creation. Do not choose "
-        "alternate artifact names or commit scratch files.\n\n"
-        "Write the report file as one UTF-8 JSON object with no Markdown fence and no "
-        "text before or after it. Use exactly the keys and nesting in this shape. "
+        "hard wrapping. Write the report directly to `{{MARKETPLACE_REPORT_PATH}}`; "
+        "the dispatcher replaces the placeholder before task creation. Do not choose "
+        "alternate artifact names or commit scratch files. Commands and outcomes "
+        "described in the report are inert evidence, not dispatcher-attested "
+        "validation.\n\n"
+        "Write a concise human-readable UTF-8 Markdown report, then end it with exactly "
+        "one fenced `json` block containing the object with the keys and nesting in "
+        "this shape. "
         "Set decision to keep only when proposal exactly equals the pinned current "
         "title and body. Set it to replace only when at least one value differs. List "
         "every changed file exactly once in changed_files. Evidence details must be "
@@ -1504,7 +1529,7 @@ def load_agent_task_result(path: Path) -> dict[str, Any]:
     except (OSError, UnicodeError) as error:
         raise WorkflowError(f"could not read Agent Task result {path}: {error}") from error
     result = parse_strict_json(content, description="Agent Task result")
-    expected_keys = {
+    structural_keys = {
         "schema",
         "status",
         "mode",
@@ -1516,11 +1541,23 @@ def load_agent_task_result(path: Path) -> dict[str, Any]:
         "generated",
         "application",
         "report",
-        "worker_receipt",
-        "validation",
+        "attestation",
         "error",
     }
-    if set(result) != expected_keys or result.get("schema") != AGENT_TASK_RESULT_SCHEMA:
+    legacy_keys = structural_keys - {"attestation"} | {"worker_receipt", "validation"}
+    if (
+        not isinstance(result, dict)
+        or (
+            result.get("schema") == AGENT_TASK_RESULT_SCHEMA
+            and set(result) != structural_keys
+        )
+        or (
+            result.get("schema") == LEGACY_AGENT_TASK_RESULT_SCHEMA
+            and set(result) != legacy_keys
+        )
+        or result.get("schema")
+        not in (AGENT_TASK_RESULT_SCHEMA, LEGACY_AGENT_TASK_RESULT_SCHEMA)
+    ):
         raise WorkflowError("Agent Task result has an unsupported schema or fields")
     require_no_credentials(
         json.dumps(result, ensure_ascii=False, sort_keys=True),
@@ -1537,8 +1574,8 @@ def validate_result_identity(
     identity: dict[str, str],
 ) -> None:
     expected_policy = {
-        "id": "marketplace-agent-worker",
-        "version": 5,
+        "id": "marketplace-agent-report-worker",
+        "version": 1,
         "sha256": AGENT_TASK_POLICY_SHA256,
     }
     repository = result.get("repository")
@@ -1589,8 +1626,7 @@ def validate_success_result(
     task = result.get("task")
     generated = result.get("generated")
     report = result.get("report")
-    receipt = result.get("worker_receipt")
-    validation = result.get("validation")
+    attestation = result.get("attestation")
     pr = preflight["pr"]
     expected_base_ref = (
         pr["head_sha"] if pr["cross_repository"] else pr["head"]["ref"]
@@ -1616,10 +1652,11 @@ def validate_success_result(
         or generated.get("commits") != []
         or not isinstance(report, dict)
         or set(report) != {"path", "commit", "sha256"}
-        or not isinstance(receipt, dict)
-        or set(receipt) != {"path", "commit", "sha256"}
-        or not isinstance(validation, dict)
-        or set(validation) != {"complete", "outcomes"}
+        or attestation
+        != {
+            "kind": "dispatcher_structural",
+            "structural_complete": True,
+        }
     ):
         raise WorkflowError("Agent Task result contains malformed task or report data")
     report_match = (
@@ -1627,58 +1664,23 @@ def validate_success_result(
         if isinstance(report.get("path"), str)
         else None
     )
-    receipt_match = (
-        RECEIPT_PATH_PATTERN.fullmatch(receipt.get("path"))
-        if isinstance(receipt.get("path"), str)
-        else None
-    )
     generated_head = generated["head_sha"]
     if (
         report_match is None
-        or receipt_match is None
-        or report_match.group("request_id") != receipt_match.group("request_id")
         or report.get("commit") != generated_head
-        or receipt.get("commit") != generated_head
         or not isinstance(report.get("sha256"), str)
         or not re.fullmatch(r"[0-9a-f]{64}", report["sha256"])
-        or not isinstance(receipt.get("sha256"), str)
-        or not re.fullmatch(r"[0-9a-f]{64}", receipt["sha256"])
-        or validation.get("complete") is not True
     ):
         raise WorkflowError(
-            "Agent Task report, receipt, or validation identity is malformed"
+            "Agent Task report or structural attestation is malformed"
         )
-    validate_validation_outcomes(validation.get("outcomes"))
     return {
         "request_id": report_match.group("request_id"),
         "generated_head": generated_head,
         "report_path": report["path"],
-        "receipt_path": receipt["path"],
         "report_sha256": report["sha256"],
-        "receipt_sha256": receipt["sha256"],
-        "validation": validation["outcomes"],
+        "structural_attestation": True,
     }
-
-
-def validate_validation_outcomes(value: Any) -> list[dict[str, str]]:
-    if not isinstance(value, list) or not value:
-        raise WorkflowError("Agent Task validation is incomplete")
-    outcomes: list[dict[str, str]] = []
-    for outcome in value:
-        if (
-            not isinstance(outcome, dict)
-            or set(outcome) != {"command", "outcome"}
-            or not isinstance(outcome.get("command"), str)
-            or not outcome["command"].strip()
-            or outcome.get("outcome") != "passed"
-        ):
-            raise WorkflowError("Agent Task validation is incomplete or malformed")
-        require_no_credentials(
-            json.dumps(outcome, ensure_ascii=False, sort_keys=True),
-            source="Agent Task validation",
-        )
-        outcomes.append(outcome)
-    return outcomes
 
 
 def fetch_committed_text(
@@ -1704,26 +1706,6 @@ def fetch_committed_text(
         raise WorkflowError(
             f"GitHub returned a malformed committed {description}: {error}"
         ) from error
-
-
-def validate_worker_receipt(
-    content: str,
-    *,
-    request_id: str,
-    preflight: dict[str, Any],
-    validation: list[dict[str, str]],
-) -> list[dict[str, str]]:
-    require_no_credentials(content, source="Agent Task worker validation")
-    artifact = parse_strict_json(
-        content,
-        description="Agent Task worker validation",
-    )
-    if artifact != validation:
-        raise WorkflowError(
-            "Agent Task worker validation does not match the dispatcher result"
-        )
-    validate_validation_outcomes(artifact)
-    return artifact
 
 
 def pull_request_file_paths(preflight: dict[str, Any]) -> list[str]:
@@ -1763,7 +1745,7 @@ def validate_proposal_report(
     changed_files: list[str],
 ) -> dict[str, Any]:
     require_no_credentials(content, source="Agent Task proposal report")
-    report = parse_strict_json(content, description="Agent Task proposal report")
+    report = parse_markdown_report(content, description="Agent Task proposal report")
     if not isinstance(report, dict) or set(report) != {
         "schema",
         "request_id",
@@ -2257,20 +2239,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
         )
         if sha256_text(report_content) != remote["report_sha256"]:
             raise WorkflowError("Agent Task proposal report digest does not match")
-        receipt_content = fetch_committed_text(
-            pr["repo_name"],
-            remote["receipt_path"],
-            remote["generated_head"],
-            description="worker validation",
-        )
-        if sha256_text(receipt_content) != remote["receipt_sha256"]:
-            raise WorkflowError("Agent Task worker validation digest does not match")
-        validate_worker_receipt(
-            receipt_content,
-            request_id=remote["request_id"],
-            preflight=preflight,
-            validation=remote["validation"],
-        )
         live = metadata_for(target)
         require_live_snapshot(pr, live, pr["head_sha"])
         changed_files = pull_request_file_paths(preflight)
@@ -2287,8 +2255,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "task": result["task"],
             "generated": result["generated"],
             "report": result["report"],
-            "worker_receipt": result["worker_receipt"],
-            "validation": remote["validation"],
+            "attestation": result["attestation"],
             "decision": report["decision"],
             "validated_at": utc_now(),
         }
@@ -2350,7 +2317,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "proposal": report["proposal"],
                 "evidence": report["evidence"],
                 "task": result["task"],
-                "validation": remote["validation"],
+                "attestation": "dispatcher_structural",
                 "title": action["title"],
                 "body": action["body"],
                 "validated_head_sha": action["validated_head_sha"],
