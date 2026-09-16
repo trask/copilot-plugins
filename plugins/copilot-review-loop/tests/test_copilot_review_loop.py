@@ -49,6 +49,9 @@ COMPACT_V3_REPORT = (
 FORWARD_COMPACT_V3_REPORT = (
     Path(__file__).parent / "fixtures" / "forward-compact-v3-report.md"
 )
+POSITIONAL_COMPACT_V4_REPORT = (
+    Path(__file__).parent / "fixtures" / "positional-compact-v4-report.md"
+)
 SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -1148,7 +1151,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         fixed = bool(commits)
         return json.dumps(
             {
-                "schema": MODULE.COPILOT_REVIEW_REPORT_SCHEMA,
+                "schema": MODULE.POSITIONAL_COPILOT_REVIEW_REPORT_SCHEMA,
                 "request_id": "request-1",
                 "repository": "owner/repo",
                 "pull_request": {
@@ -1182,7 +1185,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.23")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.24")
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1200,7 +1203,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             prior_history=[],
         )
         self.assertIn("human-readable UTF-8 Markdown report", prompt)
-        self.assertIn("worker prompt version 4", prompt)
+        self.assertIn("worker prompt version 5", prompt)
         self.assertIn("do not omit identity fields or rename `commit`", prompt)
         self.assertIn('"iteration_allowance": 1', prompt)
         self.assertIn("Do not sleep, poll, watch", prompt)
@@ -1561,6 +1564,134 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         self.assertIn('"side": "RIGHT"', prompt)
         self.assertIn('"original_line": 7', prompt)
+        self.assertIn('"source": "thread"', prompt)
+        self.assertIn('"author": "copilot-pull-request-reviewer[bot]"', prompt)
+        self.assertIn('"head_ref": "feature"', prompt)
+        self.assertIn('"base_ref": "main"', prompt)
+
+    def test_canonical_report_v3_validates_refs_and_separate_author(self):
+        preflight = copy.deepcopy(self.preflight)
+        preflight["comment_identities"][0]["author"] = (
+            "copilot-pull-request-reviewer[bot]"
+        )
+        content = json.loads(self.report())
+        content["schema"] = MODULE.COPILOT_REVIEW_REPORT_SCHEMA
+        content["pull_request"].update(
+            {"head_ref": "feature", "base_ref": "main"}
+        )
+        content["comments"][0]["author"] = (
+            "copilot-pull-request-reviewer[bot]"
+        )
+
+        report = MODULE.validate_copilot_review_report(
+            f"```json\n{json.dumps(content)}\n```",
+            request_id="request-1",
+            preflight=preflight,
+            remote={"commits": [], "requires_apply": True},
+            paths_by_commit={},
+        )
+
+        self.assertEqual(
+            "copilot-pull-request-reviewer[bot]",
+            report["comments"][0]["author"],
+        )
+        self.assertEqual("thread", report["comments"][0]["source"])
+
+    def test_exact_positional_compact_report_recovers_bot_source_alias(self):
+        commit = "8f66336f18bbb637f105548ec82e1de7a4f611a0"
+        path = ".github/scripts/github-actions-queue/collect.py"
+        preflight = copy.deepcopy(self.preflight)
+        preflight["pr"].update(
+            {
+                "number": 377,
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_sha": "2d88ec12d35da8d0db74f695471daf29c22f4b68",
+                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+            }
+        )
+        preflight["comments"] = [
+            {
+                "id": 4024801108,
+                "author": "copilot-pull-request-reviewer",
+            }
+        ]
+        preflight["comment_identities"] = [
+            {
+                "body_sha256": (
+                    "155337067d355b313ecf0916975458687f2282a0b1c171f69f55b11013194603"
+                ),
+                "id": 4024801108,
+                "line": 478,
+                "original_line": 478,
+                "side": "RIGHT",
+                "path": path,
+                "review_id": 5221258792,
+                "source": "thread",
+                "thread_id": "PRRT_kwDOTENyc86i4Npm",
+                "url": (
+                    "https://github.com/open-telemetry/shared-workflows/"
+                    "pull/377#discussion_r4024801108"
+                ),
+            }
+        ]
+        content = POSITIONAL_COMPACT_V4_REPORT.read_text(encoding="utf-8")
+        self.assertEqual(
+            "7ed1633ebe69527359b040b22ef40273f33568a207631064b0b419cfe33e01bd",
+            MODULE.sha256_text(content),
+        )
+
+        report = MODULE.validate_copilot_review_report(
+            content,
+            request_id="08769fb7-efd9-4cb7-bb5a-d231223e0f64",
+            preflight=preflight,
+            remote={"commits": [commit], "requires_apply": True},
+            paths_by_commit={
+                commit: [
+                    path,
+                    ".github/scripts/github-actions-queue/test_collect.py",
+                ]
+            },
+        )
+
+        self.assertEqual("thread", report["comments"][0]["source"])
+        self.assertEqual("RIGHT", report["comments"][0]["side"])
+        self.assertEqual(commit, report["comments"][0]["commit"])
+
+        future = copy.deepcopy(preflight)
+        future["comment_identities"][0]["author"] = (
+            "copilot-pull-request-reviewer"
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "retained structural"):
+            MODULE.validate_copilot_review_report(
+                content,
+                request_id="08769fb7-efd9-4cb7-bb5a-d231223e0f64",
+                preflight=future,
+                remote={"commits": [commit], "requires_apply": True},
+                paths_by_commit={
+                    commit: [
+                        path,
+                        ".github/scripts/github-actions-queue/test_collect.py",
+                    ]
+                },
+            )
+
+        wrong_source = MODULE.parse_markdown_report(
+            content, description="test report"
+        )
+        wrong_source["comments"][0]["source"] = "thread"
+        with self.assertRaisesRegex(MODULE.WorkflowError, "mismatched comment"):
+            MODULE.validate_copilot_review_report(
+                f"```json\n{json.dumps(wrong_source)}\n```",
+                request_id="08769fb7-efd9-4cb7-bb5a-d231223e0f64",
+                preflight=preflight,
+                remote={"commits": [commit], "requires_apply": True},
+                paths_by_commit={
+                    commit: [
+                        path,
+                        ".github/scripts/github-actions-queue/test_collect.py",
+                    ]
+                },
+            )
 
     def test_preserve_artifacts_keeps_prompt_and_result_after_completion(self):
         task_state = {
