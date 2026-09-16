@@ -43,6 +43,9 @@ APPLIED_PATH_CORRELATED_V2_RESULT = (
 PATH_CORRELATED_V2_REPORT = (
     Path(__file__).parent / "fixtures" / "path-correlated-v2-report.md"
 )
+COMPACT_V3_REPORT = (
+    Path(__file__).parent / "fixtures" / "compact-v3-report.md"
+)
 SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -1176,7 +1179,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.19")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.20")
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1194,7 +1197,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             prior_history=[],
         )
         self.assertIn("human-readable UTF-8 Markdown report", prompt)
-        self.assertIn("worker prompt version 2", prompt)
+        self.assertIn("worker prompt version 3", prompt)
+        self.assertIn("do not omit identity fields or rename `commit`", prompt)
         self.assertIn('"iteration_allowance": 1', prompt)
         self.assertIn("Do not sleep, poll, watch", prompt)
         self.assertIn('"thread_id": "PRRT_thread"', prompt)
@@ -1353,6 +1357,92 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 remote=remote,
                 paths_by_commit={self.fix: ["src/other.py"]},
             )
+
+    def test_exact_compact_v3_report_recovers_omitted_original_line(self):
+        commit = "7f1f402d9f7d5a925367dea4a1e00ad446e9d9a3"
+        preflight = copy.deepcopy(self.preflight)
+        preflight["pr"].update(
+            {
+                "number": 377,
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_sha": "c546c4902433040a05262cb22fa5587ae829de62",
+                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+            }
+        )
+        preflight["comment_identities"] = [
+            {
+                "body_sha256": "279da450bebd45cee558de6794a34c47824b222787ea592ce85c3fc7db275d42",
+                "id": 4023137951,
+                "line": 466,
+                "original_line": 466,
+                "path": ".github/scripts/github-actions-queue/collect.py",
+                "review_id": 5219253546,
+                "source": "thread",
+                "thread_id": "PRRT_kwDOTENyc86iz-Sk",
+                "url": "https://github.com/open-telemetry/shared-workflows/pull/377#discussion_r4023137951",
+            }
+        ]
+        content = COMPACT_V3_REPORT.read_text(encoding="utf-8")
+        self.assertEqual(
+            MODULE.sha256_text(content),
+            "8da1ae73ca152e8480649f17d1b28225bdf13a100b70caac98895e0894b6f42c",
+        )
+
+        report = MODULE.validate_copilot_review_report(
+            content,
+            request_id="c7393d4d-bfd3-482a-87ac-baf3794c2c3a",
+            preflight=preflight,
+            remote={"commits": [commit], "requires_apply": True},
+            paths_by_commit={
+                commit: [
+                    ".github/scripts/github-actions-queue/collect.py",
+                    ".github/scripts/github-actions-queue/test_collect.py",
+                ]
+            },
+        )
+
+        self.assertEqual(
+            report["comments"][0]["original_line"],
+            466,
+        )
+        self.assertEqual(report["comments"][0]["commit"], commit)
+
+    def test_compact_v3_report_rejects_any_available_identity_drift(self):
+        commit = self.fix
+        identity = self.preflight["comment_identities"][0]
+        item = {
+            "body_sha256": identity["body_sha256"],
+            "changed_paths": ["src/app.py"],
+            "comment_id": identity["id"],
+            "disposition": "fixed",
+            "fix_commit": commit,
+            "line": identity["line"],
+            "path": identity["path"],
+            "review_id": identity["review_id"],
+            "source": "copilot-pull-request-reviewer",
+            "thread_id": identity["thread_id"],
+            "url": identity["url"],
+        }
+        for key, value in (
+            ("body_sha256", "0" * 64),
+            ("comment_id", 18),
+            ("line", 8),
+            ("path", "src/other.py"),
+            ("review_id", 30),
+            ("thread_id", "PRRT_other"),
+            ("url", "https://github.com/owner/repo/pull/7#discussion_r18"),
+            ("source", "another-author"),
+            ("fix_commit", "9" * 40),
+        ):
+            malformed = {**item, key: value}
+            with self.subTest(key=key), self.assertRaises(MODULE.WorkflowError):
+                MODULE.validate_copilot_review_report(
+                    json.dumps({"comments": [malformed]}),
+                    request_id="request-1",
+                    preflight=self.preflight,
+                    remote={"commits": [commit], "requires_apply": True},
+                    paths_by_commit={commit: ["src/app.py"]},
+                )
 
     def test_rejects_missing_unknown_or_ambiguous_report_commit_mapping(self):
         remote = self.remote([self.fix])
