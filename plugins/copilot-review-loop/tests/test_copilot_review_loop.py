@@ -46,6 +46,9 @@ PATH_CORRELATED_V2_REPORT = (
 COMPACT_V3_REPORT = (
     Path(__file__).parent / "fixtures" / "compact-v3-report.md"
 )
+FORWARD_COMPACT_V3_REPORT = (
+    Path(__file__).parent / "fixtures" / "forward-compact-v3-report.md"
+)
 SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -1179,7 +1182,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.21")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.22")
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1197,7 +1200,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             prior_history=[],
         )
         self.assertIn("human-readable UTF-8 Markdown report", prompt)
-        self.assertIn("worker prompt version 3", prompt)
+        self.assertIn("worker prompt version 4", prompt)
         self.assertIn("do not omit identity fields or rename `commit`", prompt)
         self.assertIn('"iteration_allowance": 1', prompt)
         self.assertIn("Do not sleep, poll, watch", prompt)
@@ -1406,6 +1409,158 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             466,
         )
         self.assertEqual(report["comments"][0]["commit"], commit)
+
+    def test_exact_forward_compact_v3_report_recovers_equal_original_line(self):
+        commit = "2d88ec12d35da8d0db74f695471daf29c22f4b68"
+        preflight = copy.deepcopy(self.preflight)
+        preflight["pr"].update(
+            {
+                "number": 377,
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_sha": "4076ad1e7b825752d99231ba1634ad0067c6d83b",
+                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
+            }
+        )
+        preflight["comment_identities"] = [
+            {
+                "body_sha256": (
+                    "a697bd0ef3e4293f41aa4b542c0867fa038323b2fd96cf6094ff6c8fef670ab1"
+                ),
+                "id": 4024467893,
+                "line": 115,
+                "original_line": 115,
+                "path": ".github/workflows/github-actions-queue-collector.yml",
+                "review_id": 5220865496,
+                "source": "thread",
+                "thread_id": "PRRT_kwDOTENyc86i3W2z",
+                "url": (
+                    "https://github.com/open-telemetry/shared-workflows/"
+                    "pull/377#discussion_r4024467893"
+                ),
+            }
+        ]
+        content = FORWARD_COMPACT_V3_REPORT.read_text(encoding="utf-8")
+        self.assertEqual(
+            "0e4a679644537c8f4fbf3a582c78a1964e2eb955fd60ac7c1c49fd2115521506",
+            MODULE.sha256_text(content),
+        )
+
+        report = MODULE.validate_copilot_review_report(
+            content,
+            request_id="1c52aa75-cb58-415d-8a47-c0392a8f1cf2",
+            preflight=preflight,
+            remote={"commits": [commit], "requires_apply": True},
+            paths_by_commit={
+                commit: [".github/workflows/github-actions-queue-collector.yml"]
+            },
+        )
+
+        self.assertEqual(115, report["comments"][0]["original_line"])
+        self.assertEqual(commit, report["comments"][0]["commit"])
+
+    def test_forward_compact_v3_report_rejects_lost_position_identity(self):
+        payload = MODULE.parse_markdown_report(
+            FORWARD_COMPACT_V3_REPORT.read_text(encoding="utf-8"),
+            description="test report",
+        )
+        preflight = copy.deepcopy(self.preflight)
+        preflight["pr"].update(
+            {
+                "number": 377,
+                "repo_name": "open-telemetry/shared-workflows",
+                "head_sha": payload["head_sha"],
+            }
+        )
+        item = payload["comments"][0]
+        identity = {
+            "body_sha256": item["body_sha256"],
+            "id": item["comment_id"],
+            "line": item["line"],
+            "original_line": item["line"],
+            "path": item["path"],
+            "review_id": item["review_id"],
+            "source": "thread",
+            "thread_id": item["thread_id"],
+            "url": item["url"],
+        }
+        preflight["comment_identities"] = [identity]
+        common = {
+            "content": FORWARD_COMPACT_V3_REPORT.read_text(encoding="utf-8"),
+            "request_id": "request-1",
+            "remote": {
+                "commits": [item["commit"]],
+                "requires_apply": True,
+            },
+            "paths_by_commit": {item["commit"]: item["changed_paths"]},
+        }
+        cases = []
+        distinct_original = copy.deepcopy(preflight)
+        distinct_original["comment_identities"][0]["original_line"] = 114
+        cases.append(distinct_original)
+        sided = copy.deepcopy(preflight)
+        sided["comment_identities"][0]["side"] = "RIGHT"
+        cases.append(sided)
+        for case in cases:
+            with self.subTest(identity=case["comment_identities"][0]):
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError, "omitted distinct position"
+                ):
+                    MODULE.validate_copilot_review_report(
+                        preflight=case,
+                        **common,
+                    )
+        malformed_payloads = []
+        wrong_head = copy.deepcopy(payload)
+        wrong_head["head_sha"] = "9" * 40
+        malformed_payloads.append(wrong_head)
+        wrong_pr = copy.deepcopy(payload)
+        wrong_pr["pull_request"] = 378
+        malformed_payloads.append(wrong_pr)
+        wrong_comment = copy.deepcopy(payload)
+        wrong_comment["comments"][0]["comment_id"] = 18
+        malformed_payloads.append(wrong_comment)
+        wrong_commit = copy.deepcopy(payload)
+        wrong_commit["comments"][0]["commit"] = "9" * 40
+        malformed_payloads.append(wrong_commit)
+        extra_position = copy.deepcopy(payload)
+        extra_position["comments"][0]["original_line"] = 115
+        malformed_payloads.append(extra_position)
+        for malformed in malformed_payloads:
+            with self.subTest(payload=malformed):
+                with self.assertRaises(MODULE.WorkflowError):
+                    MODULE.validate_copilot_review_report(
+                        json.dumps(malformed),
+                        request_id="request-1",
+                        preflight=preflight,
+                        remote=common["remote"],
+                        paths_by_commit=common["paths_by_commit"],
+                    )
+
+    def test_canonical_report_preserves_diff_side_and_legacy_schema(self):
+        preflight = copy.deepcopy(self.preflight)
+        comment = {**self.comment, "side": "RIGHT"}
+        preflight["comment_identities"] = [MODULE.comment_identity(comment)]
+        content = json.loads(self.report())
+        content["schema"] = MODULE.LEGACY_COPILOT_REVIEW_REPORT_SCHEMA
+        report = MODULE.validate_copilot_review_report(
+            json.dumps(content),
+            request_id="request-1",
+            preflight=self.preflight,
+            remote=self.remote(),
+            paths_by_commit={},
+        )
+        prompt = MODULE.build_worker_prompt(
+            preflight,
+            iteration_allowance=1,
+            prior_history=[],
+        )
+
+        self.assertEqual(
+            MODULE.LEGACY_COPILOT_REVIEW_REPORT_SCHEMA,
+            report["schema"],
+        )
+        self.assertIn('"side": "RIGHT"', prompt)
+        self.assertIn('"original_line": 7', prompt)
 
     def test_preserve_artifacts_keeps_prompt_and_result_after_completion(self):
         task_state = {
