@@ -1176,7 +1176,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.18")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.19")
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1602,6 +1602,66 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         ):
             MODULE.require_live_comments(self.preflight, allow_resolved=True)
 
+    def test_post_publish_inventory_accepts_only_exact_outdated_resolved_comment(self):
+        thread = {
+            "id": self.comment["thread_id"],
+            "isResolved": True,
+            "comments": {
+                "nodes": [
+                    {
+                        "databaseId": self.comment["id"],
+                        "url": self.comment["url"],
+                        "body": self.comment["body"],
+                        "path": self.comment["path"],
+                        "position": None,
+                        "originalPosition": self.comment["original_position"],
+                        "line": None,
+                        "originalLine": self.comment["original_line"],
+                        "author": {
+                            "login": self.comment["author"],
+                            "id": self.comment["author_bot_id"],
+                        },
+                        "pullRequestReview": {
+                            "databaseId": self.comment["review_id"]
+                        },
+                    }
+                ]
+            },
+        }
+        with (
+            mock.patch.object(
+                MODULE, "fetch_copilot_threads", return_value=([thread], [])
+            ),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
+        ):
+            selected = MODULE.require_live_comments(
+                self.preflight, allow_resolved=True
+            )
+        self.assertEqual(selected[0]["id"], self.comment["id"])
+        self.assertIsNone(selected[0]["line"])
+        self.assertTrue(selected[0]["resolved"])
+
+        thread["comments"]["nodes"][0]["body"] = "Changed review body"
+        with (
+            mock.patch.object(
+                MODULE, "fetch_copilot_threads", return_value=([thread], [])
+            ),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
+            self.assertRaisesRegex(MODULE.WorkflowError, "identity drifted"),
+        ):
+            MODULE.require_live_comments(self.preflight, allow_resolved=True)
+
+        thread["comments"]["nodes"][0]["body"] = self.comment["body"]
+        thread["comments"]["nodes"][0]["line"] = self.comment["line"] + 1
+        with (
+            mock.patch.object(
+                MODULE, "fetch_copilot_threads", return_value=([thread], [])
+            ),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
+            self.assertRaisesRegex(MODULE.WorkflowError, "identity drifted"),
+        ):
+            MODULE.require_live_comments(self.preflight, allow_resolved=True)
+
     def test_rejects_merge_artifacts_and_unexpected_history(self):
         remote = self.remote()
         with (
@@ -1862,6 +1922,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         helper_launches = 0
         pushes = 0
         metadata_reads = 0
+        comment_checks = []
 
         def run(command, **_kwargs):
             nonlocal helper_launches, local_head, pushes, remote_head
@@ -1887,6 +1948,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             if metadata_reads == 2:
                 raise MODULE.WorkflowError("PR metadata lookup interrupted")
             return {**self.preflight["pr"], "head_sha": self.fix}
+
+        def live_comments(_preflight, *, allow_resolved=False):
+            comment_checks.append(allow_resolved)
+            return [{**self.comment, "line": None, "resolved": allow_resolved}]
 
         common_patches = (
             mock.patch.object(MODULE, "require_tools"),
@@ -1919,7 +1984,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ),
             mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
             mock.patch.object(
-                MODULE, "require_live_comments", return_value=[self.comment]
+                MODULE, "require_live_comments", side_effect=live_comments
             ),
             mock.patch.object(MODULE, "post_missing_replies", return_value={17: 71}),
             mock.patch.object(MODULE, "resolve_threads"),
@@ -1948,6 +2013,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         self.assertIsNone(failed["agent_task"].get("published_head_sha"))
         self.assertEqual(failed["agent_task"]["status"], "failed_after_publication")
+        for field in (
+            "confirmed_remote_head_sha",
+            "publication_source_head_sha",
+            "published_head_sha",
+        ):
+            failed["agent_task"].pop(field, None)
+        failed["agent_task"]["status"] = "failed"
+        MODULE.save_state(state_path, failed)
 
         with ExitStack() as stack:
             for patcher in common_patches:
@@ -1956,6 +2029,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
         self.assertEqual(helper_launches, 1)
         self.assertEqual(pushes, 1)
+        self.assertIn(True, comment_checks)
         completed = MODULE.load_state(state_path)
         self.assertEqual(completed["agent_task"]["status"], "completed")
         self.assertEqual(completed["pr"]["head_sha"], self.fix)
@@ -2530,8 +2604,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             before_push,
         )
         after_push = source.index("require_live_comments(", push)
-        reply = source.index("post_missing_replies(state, handled)", after_push)
-        resolve = source.index("resolve_threads(handled)", reply)
+        reply = source.index("post_missing_replies(", after_push)
+        resolve = source.index("resolve_threads(", reply)
         self.assertLess(before_push, push)
         self.assertLess(push, after_push)
         self.assertLess(after_push, reply)
@@ -3763,6 +3837,178 @@ class ReplyPublishingTest(unittest.TestCase):
 
         self.assertEqual(reply_ids, {10: 11})
         gh_json.assert_called_once_with(["api", "user"])
+
+    def test_reconciles_partial_outdated_threads_reply_first_and_checkpoints(self):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "pr": {
+                "upstream_owner": "open-telemetry",
+                "upstream_repo": "shared-workflows",
+                "number": 377,
+            }
+        }
+        comments = [
+            {
+                "id": 4021507173,
+                "thread_id": "PRRT_kwDOTENyc86iv3hz",
+                "source": "thread",
+                "resolved": False,
+                "commit": "571bade3904ff473283e6b9da95853e712fe6c8a",
+                "reply": "Applied the pending-run checkpoint fix.",
+            },
+            {
+                "id": 4021507189,
+                "thread_id": "PRRT_kwDOTENyc86iv3iA",
+                "source": "thread",
+                "resolved": True,
+                "commit": "c546c4902433040a05262cb22fa5587ae829de62",
+                "reply": "Removed the redundant orphan-worktree command.",
+            },
+        ]
+        published: list[dict[str, Any]] = []
+        events: list[str] = []
+
+        def fake_gh_json(arguments, input_payload=None):
+            if arguments == ["api", "user"]:
+                return {"login": "trask"}
+            comment_id = int(arguments[-1].split("/")[-2])
+            reply = {
+                "id": 9000 + comment_id,
+                "in_reply_to_id": comment_id,
+                "user": {"login": "trask"},
+                "body": input_payload["body"],
+            }
+            published.append(reply)
+            events.append(f"reply:{comment_id}")
+            return reply
+
+        def fake_graphql(_query, variables):
+            events.append(f"resolve:{variables['thread']}")
+            return {
+                "data": {
+                    "resolveReviewThread": {
+                        "thread": {
+                            "id": variables["thread"],
+                            "isResolved": True,
+                        }
+                    }
+                }
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            MODULE.save_state(state_path, state)
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "fetch_review_comments",
+                    side_effect=lambda *_args: list(published),
+                ),
+                mock.patch.object(MODULE, "gh_json", side_effect=fake_gh_json),
+                mock.patch.object(MODULE, "graphql", side_effect=fake_graphql),
+            ):
+                reply_ids = MODULE.post_missing_replies(
+                    state, comments, state_path=state_path
+                )
+                MODULE.resolve_threads(
+                    comments, state=state, state_path=state_path
+                )
+
+                recovered = MODULE.load_state(state_path)
+                repeated = [dict(comment) for comment in comments]
+                MODULE.post_missing_replies(
+                    recovered, repeated, state_path=state_path
+                )
+                MODULE.resolve_threads(
+                    repeated, state=recovered, state_path=state_path
+                )
+
+        self.assertEqual(
+            reply_ids,
+            {4021507173: 4021516173, 4021507189: 4021516189},
+        )
+        self.assertEqual(
+            events,
+            [
+                "reply:4021507173",
+                "reply:4021507189",
+                "resolve:PRRT_kwDOTENyc86iv3hz",
+            ],
+        )
+        self.assertTrue(
+            state["thread_mutations"]["4021507173"]["resolved"]
+        )
+        self.assertTrue(
+            state["thread_mutations"]["4021507189"]["resolved"]
+        )
+
+    def test_reply_interruption_retains_complete_plan_and_finished_side_effect(self):
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "pr": {
+                "upstream_owner": "open-telemetry",
+                "upstream_repo": "shared-workflows",
+                "number": 377,
+            },
+        }
+        comments = [
+            {
+                "id": 4021507173,
+                "thread_id": "PRRT_kwDOTENyc86iv3hz",
+                "source": "thread",
+                "commit": "571bade3904ff473283e6b9da95853e712fe6c8a",
+                "reply": "Applied the pending-run checkpoint fix.",
+            },
+            {
+                "id": 4021507189,
+                "thread_id": "PRRT_kwDOTENyc86iv3iA",
+                "source": "thread",
+                "commit": "c546c4902433040a05262cb22fa5587ae829de62",
+                "reply": "Removed the redundant orphan-worktree command.",
+            },
+        ]
+        posts = 0
+
+        def fake_gh_json(arguments, input_payload=None):
+            nonlocal posts
+            if arguments == ["api", "user"]:
+                return {"login": "trask"}
+            posts += 1
+            if posts == 2:
+                raise MODULE.WorkflowError("reply transport interrupted")
+            return {
+                "id": 4021516173,
+                "in_reply_to_id": 4021507173,
+                "user": {"login": "trask"},
+                "body": input_payload["body"],
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            MODULE.save_state(state_path, state)
+            with (
+                mock.patch.object(MODULE, "fetch_review_comments", return_value=[]),
+                mock.patch.object(MODULE, "gh_json", side_effect=fake_gh_json),
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError, "reply transport interrupted"
+                ),
+            ):
+                MODULE.post_missing_replies(
+                    state, comments, state_path=state_path
+                )
+            recovered = MODULE.load_state(state_path)
+
+        self.assertEqual(
+            set(recovered["thread_mutations"]),
+            {"4021507173", "4021507189"},
+        )
+        self.assertEqual(
+            recovered["thread_mutations"]["4021507173"]["reply_id"],
+            4021516173,
+        )
+        self.assertIsNone(
+            recovered["thread_mutations"]["4021507189"]["reply_id"]
+        )
 
     def test_rejects_a_reply_without_a_numeric_comment_id(self):
         state = {

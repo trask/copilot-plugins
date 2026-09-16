@@ -2026,7 +2026,10 @@ def fetch_review_comments(owner: str, repo: str, number: int) -> list[dict[str, 
 
 
 def post_missing_replies(
-    state: dict[str, Any], comments: list[dict[str, Any]]
+    state: dict[str, Any],
+    comments: list[dict[str, Any]],
+    *,
+    state_path: Path | None = None,
 ) -> dict[int, int]:
     comments = [
         comment for comment in comments if comment.get("source", "thread") == "thread"
@@ -2038,10 +2041,53 @@ def post_missing_replies(
         pr["upstream_owner"], pr["upstream_repo"], pr["number"]
     )
     current_login = gh_json(["api", "user"])["login"]
-    replies: dict[int, dict[str, Any]] = {}
-    missing: list[tuple[dict[str, Any], str]] = []
+    mutations = state.setdefault("thread_mutations", {})
+    if not isinstance(mutations, dict):
+        raise WorkflowError("thread mutation recovery state is malformed")
+    expected_bodies: dict[int, str] = {}
     for comment in comments:
         expected_body = reply_body(comment)
+        expected_bodies[comment["id"]] = expected_body
+        key = str(comment["id"])
+        checkpoint = mutations.get(key)
+        if checkpoint is not None and (
+            not isinstance(checkpoint, dict)
+            or checkpoint.get("comment_id") != comment["id"]
+            or checkpoint.get("thread_id") != comment["thread_id"]
+            or checkpoint.get("reply_body_sha256") != sha256_text(expected_body)
+            or not isinstance(checkpoint.get("resolved"), bool)
+            or (
+                checkpoint.get("reply_id") is not None
+                and (
+                    isinstance(checkpoint.get("reply_id"), bool)
+                    or not isinstance(checkpoint.get("reply_id"), int)
+                )
+            )
+        ):
+            raise WorkflowError(
+                f"thread mutation checkpoint for comment {comment['id']} is malformed"
+            )
+        if checkpoint is None:
+            mutations[key] = {
+                "comment_id": comment["id"],
+                "thread_id": comment["thread_id"],
+                "reply_body_sha256": sha256_text(expected_body),
+                "reply_id": None,
+                "resolved": False,
+                "planned_at": utc_now(),
+            }
+    if state_path is not None:
+        save_state(state_path, state)
+
+    reply_ids: dict[int, int] = {}
+    for comment in comments:
+        expected_body = expected_bodies[comment["id"]]
+        key = str(comment["id"])
+        checkpoint = mutations.get(key)
+        if not isinstance(checkpoint, dict):
+            raise WorkflowError(
+                f"thread mutation checkpoint for comment {comment['id']} is missing"
+            )
         reply = next(
             (
                 item
@@ -2052,54 +2098,105 @@ def post_missing_replies(
             ),
             None,
         )
-        if reply is not None:
-            replies[comment["id"]] = reply
-        else:
-            missing.append((comment, expected_body))
-
-    # Each reply is posted through the REST replies endpoint, one at a time, so
-    # every reply is published on its own instead of being collected into the
-    # viewer's pending review.
-    for comment, expected_body in missing:
-        endpoint = (
-            f"repos/{pr['upstream_owner']}/{pr['upstream_repo']}"
-            f"/pulls/{pr['number']}/comments/{comment['id']}/replies"
-        )
-        reply = gh_json(
-            ["api", "--method", "POST", "--input", "-", endpoint],
-            input_payload={"body": expected_body},
-        )
+        if reply is None and checkpoint.get("reply_id") is not None:
+            raise WorkflowError(
+                f"recorded reply to comment {comment['id']} is no longer present"
+            )
+        if reply is None:
+            endpoint = (
+                f"repos/{pr['upstream_owner']}/{pr['upstream_repo']}"
+                f"/pulls/{pr['number']}/comments/{comment['id']}/replies"
+            )
+            reply = gh_json(
+                ["api", "--method", "POST", "--input", "-", endpoint],
+                input_payload={"body": expected_body},
+            )
         reply_id = reply.get("id") if isinstance(reply, dict) else None
         if isinstance(reply_id, bool) or not isinstance(reply_id, int):
             raise WorkflowError(
                 f"reply to comment {comment['id']} returned no numeric comment ID"
             )
-        replies[comment["id"]] = reply
-
-    reply_ids: dict[int, int] = {}
-    for comment in comments:
-        reply = replies[comment["id"]]
-        comment["reply_id"] = reply["id"]
-        reply_ids[comment["id"]] = reply["id"]
+        if checkpoint is not None and checkpoint.get("reply_id") not in {
+            None,
+            reply_id,
+        }:
+            raise WorkflowError(
+                f"thread mutation checkpoint for comment {comment['id']} "
+                "names another reply"
+            )
+        comment["reply_id"] = reply_id
+        reply_ids[comment["id"]] = reply_id
+        mutations[key] = {
+            "comment_id": comment["id"],
+            "thread_id": comment["thread_id"],
+            "reply_body_sha256": sha256_text(expected_body),
+            "reply_id": reply_id,
+            "resolved": bool(
+                checkpoint.get("resolved") if checkpoint is not None else False
+            ),
+            "updated_at": utc_now(),
+        }
+        if state_path is not None:
+            save_state(state_path, state)
     return reply_ids
 
 
-def resolve_threads(comments: list[dict[str, Any]]) -> None:
-    thread_ids = list(
-        dict.fromkeys(
-            comment["thread_id"]
-            for comment in comments
-            if comment.get("source", "thread") == "thread"
-        )
-    )
-    if not thread_ids:
-        return
-    fields = " ".join(
-        f't{index}:resolveReviewThread(input:{{threadId:"{thread_id}"}})'
-        "{thread{id isResolved}}"
-        for index, thread_id in enumerate(thread_ids)
-    )
-    graphql(f"mutation{{{fields}}}", {})
+def resolve_threads(
+    comments: list[dict[str, Any]],
+    *,
+    state: dict[str, Any] | None = None,
+    state_path: Path | None = None,
+) -> None:
+    for comment in comments:
+        if comment.get("source", "thread") != "thread":
+            continue
+        if not isinstance(comment.get("reply_id"), int):
+            raise WorkflowError(
+                f"refusing to resolve thread {comment['thread_id']} without "
+                "a verified reply"
+            )
+        if not comment.get("resolved"):
+            payload = graphql(
+                """
+mutation($thread:ID!){
+ resolveReviewThread(input:{threadId:$thread}){thread{id isResolved}}
+}
+""",
+                {"thread": comment["thread_id"]},
+            )
+            data = payload.get("data") if isinstance(payload, dict) else None
+            thread = (
+                (data.get("resolveReviewThread") or {}).get("thread")
+                if isinstance(data, dict)
+                else None
+            )
+            if (
+                not isinstance(thread, dict)
+                or thread.get("id") != comment["thread_id"]
+                or thread.get("isResolved") is not True
+            ):
+                raise WorkflowError(
+                    f"thread {comment['thread_id']} did not resolve exactly"
+                )
+            comment["resolved"] = True
+        if state is not None:
+            mutations = state.get("thread_mutations")
+            checkpoint = (
+                mutations.get(str(comment["id"]))
+                if isinstance(mutations, dict)
+                else None
+            )
+            if (
+                not isinstance(checkpoint, dict)
+                or checkpoint.get("reply_id") != comment["reply_id"]
+            ):
+                raise WorkflowError(
+                    f"thread {comment['thread_id']} has no reply checkpoint"
+                )
+            checkpoint["resolved"] = True
+            checkpoint["updated_at"] = utc_now()
+            if state_path is not None:
+                save_state(state_path, state)
 
 
 def copilot_is_requested(state: dict[str, Any], bot_id: str) -> bool:
@@ -2383,10 +2480,12 @@ def command_publish(args: argparse.Namespace) -> None:
             f"fork ref mismatch: local {local_head}, remote {pushed_head}"
         )
 
-    reply_ids = post_missing_replies(state, comments) if comments else {}
+    reply_ids = (
+        post_missing_replies(state, comments, state_path=path) if comments else {}
+    )
     if comments:
         save_state(path, state)
-        resolve_threads(comments)
+        resolve_threads(comments, state=state, state_path=path)
         save_state(path, state)
     monitoring = request_copilot(state, path, pushed_head)
     verification = verify_publish(state, comments)
@@ -3653,7 +3752,10 @@ def require_live_comments(
     for thread in threads:
         if not thread.get("comments", {}).get("nodes"):
             continue
-        all_thread_comments.extend(select_queue([{**thread, "isResolved": False}]))
+        selected_comments = select_queue([{**thread, "isResolved": False}])
+        for comment in selected_comments:
+            comment["resolved"] = bool(thread.get("isResolved"))
+        all_thread_comments.extend(selected_comments)
     reviews = fetch_reviews(pr["upstream_owner"], pr["upstream_repo"], pr["number"])
     latest = latest_copilot_review(reviews, preflight.get("copilot_bot_id"))
     suppressed: list[dict[str, Any]] = []
@@ -3665,6 +3767,9 @@ def require_live_comments(
     by_id = {comment["id"]: comment for comment in all_comments}
     expected = preflight["comment_identities"]
     selected = [by_id.get(identity["id"]) for identity in expected]
+    expected_comments = {
+        comment["id"]: comment for comment in preflight.get("comments", [])
+    }
     stable_keys = {
         "id",
         "source",
@@ -3684,6 +3789,26 @@ def require_live_comments(
         raise WorkflowError(
             "live unresolved Copilot thread or comment identity drifted from preflight"
         )
+    for identity, comment in zip(expected, selected):
+        if comment is None:
+            continue
+        expected_comment = expected_comments.get(identity["id"])
+        expected_line = identity.get("line")
+        live_line = comment.get("line")
+        if (
+            not isinstance(expected_comment, dict)
+            or comment.get("author") != expected_comment.get("author")
+            or comment.get("author_bot_id")
+            != expected_comment.get("author_bot_id")
+            or (
+                live_line != expected_line
+                and not (allow_resolved and live_line is None)
+            )
+        ):
+            raise WorkflowError(
+                "live unresolved Copilot thread or comment identity drifted "
+                "from preflight"
+            )
     unresolved_ids = {comment["id"] for comment in [*unresolved, *suppressed]}
     expected_ids = {identity["id"] for identity in expected}
     if (
@@ -4959,7 +5084,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
             if live.get("head_sha") not in allowed_heads:
                 raise WorkflowError("live pull request head drifted before publication")
             require_live_pr_snapshot(pr, live, expected_head=live["head_sha"])
-            require_live_comments(preflight)
+            require_live_comments(
+                preflight,
+                allow_resolved=live.get("head_sha") == remote["final_local_head"],
+            )
             branch_head = remote_head(
                 pr["head_owner"], pr["head_repo"], pr["head_branch"]
             )
@@ -5032,7 +5160,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
         state["pr"] = final_live
         live_comments = require_live_comments(
             preflight,
-            allow_resolved=bool(task_state.get("review_mutation_started")),
+            allow_resolved=(
+                published_head == remote["final_local_head"]
+                or bool(task_state.get("review_mutation_started"))
+            ),
         )
         by_id = {comment["id"]: comment for comment in live_comments}
         handled = []
@@ -5051,9 +5182,17 @@ def command_agent_task(args: argparse.Namespace) -> None:
         state["queue"]["comments"] = handled
         task_state["review_mutation_started"] = True
         save_state(state_path, state)
-        reply_ids = post_missing_replies(state, handled)
+        reply_ids = post_missing_replies(
+            state,
+            handled,
+            state_path=state_path,
+        )
         save_state(state_path, state)
-        resolve_threads(handled)
+        resolve_threads(
+            handled,
+            state=state,
+            state_path=state_path,
+        )
         save_state(state_path, state)
         monitoring = request_copilot(state, state_path, published_head)
         verification = verify_publish(state, handled)
