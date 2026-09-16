@@ -63,6 +63,14 @@ FORWARD_REPOSITORY_347_RESULT = (
     / "fixtures"
     / "forward-repository-347-agent-task-result.json"
 )
+FLAT_IDENTITY_347_REPORT = (
+    Path(__file__).parent / "fixtures" / "flat-identity-347-report.md"
+)
+FLAT_IDENTITY_347_RESULT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "flat-identity-347-agent-task-result.json"
+)
 SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -1196,7 +1204,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.29")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.30")
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1596,6 +1604,104 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     followup: ["unreported.py"],
                 },
             )
+
+    def test_exact_347_flat_identity_report_recovers_retained_task(self):
+        commit = "75866ae2d80645888b08e3fd6148030faefb61b5"
+        content = FLAT_IDENTITY_347_REPORT.read_text(encoding="utf-8")
+        payload = MODULE.parse_markdown_report(content, description="test report")
+        preflight = copy.deepcopy(self.preflight)
+        preflight["pr"].update(
+            {
+                "number": 347,
+                "repo_name": "open-telemetry/shared-workflows",
+                "pr_url": "https://github.com/open-telemetry/shared-workflows/pull/347",
+                "url": "https://github.com/open-telemetry/shared-workflows/pull/347",
+                "head_owner": "open-telemetry",
+                "head_repo": "shared-workflows",
+                "head_repository": "open-telemetry/shared-workflows",
+                "head_branch": "trask-fix-dashboard-publisher-contention",
+                "base_branch": "main",
+                "head_sha": "f1e7ea3dabd0fab27c6fadc2d257c97ce574e106",
+                "base_sha": "55fb421179d32aef3b36c7f6503f57193561d14c",
+            }
+        )
+        preflight["comment_identities"] = [
+            {
+                "id": item["comment"],
+                "author": item["author"],
+                "body_sha256": item["body_sha256"],
+                "line": item["current_line"],
+                "original_line": item["original_line"],
+                "path": item["path"],
+                "review_id": item["review"],
+                "side": item["side"],
+                "source": item["source"],
+                "thread_id": item["thread"],
+                "url": item["url"],
+            }
+            for item in payload["comments"]
+        ]
+        remote = MODULE.validate_success_result(
+            MODULE.load_agent_task_result(FLAT_IDENTITY_347_RESULT),
+            preflight=preflight,
+            requested_model="gpt-5.6-sol",
+        )
+        paths_by_commit = {
+            commit: [
+                ".github/scripts/pull-request-dashboard/process_queue_batch.py",
+                ".github/scripts/pull-request-dashboard/state_branch.py",
+                ".github/scripts/pull-request-dashboard/test_process_queue_batch.py",
+                ".github/scripts/pull-request-dashboard/test_state_branch.py",
+            ]
+        }
+
+        self.assertEqual(
+            "5ce26e7ec80ae94c4c7a2245a6f3c259e73f4d0880ea4f4e3bd5a0518b2d5d31",
+            MODULE.sha256_text(content),
+        )
+        self.assertEqual(
+            "5667cd5870d64090109e45c17baf3325299995d12d52492b987705206d99f3ca",
+            MODULE.sha256_text(
+                FLAT_IDENTITY_347_RESULT.read_text(encoding="utf-8")
+            ),
+        )
+        report = MODULE.validate_copilot_review_report(
+            content,
+            request_id="045b336c-74ed-4c30-ad1a-2d00f735908e",
+            preflight=preflight,
+            remote=remote,
+            paths_by_commit=paths_by_commit,
+        )
+
+        self.assertEqual(
+            [commit] * 3,
+            [item["commit"] for item in report["comments"]],
+        )
+        self.assertEqual(
+            [4028817771, 4028817841, 4028817901],
+            [item["id"] for item in report["comments"]],
+        )
+        stale = copy.deepcopy(payload)
+        stale["head_sha"] = "9" * 40
+        wrong_comment = copy.deepcopy(payload)
+        wrong_comment["comments"][0]["comment"] = 1
+        duplicate_thread = copy.deepcopy(payload)
+        duplicate_thread["comments"][1]["thread"] = duplicate_thread["comments"][0][
+            "thread"
+        ]
+        extra_field = copy.deepcopy(payload)
+        extra_field["comments"][0]["reason"] = "not part of this producer shape"
+        for candidate in (stale, wrong_comment, duplicate_thread, extra_field):
+            with self.subTest(candidate=candidate), self.assertRaises(
+                MODULE.WorkflowError
+            ):
+                MODULE.validate_copilot_review_report(
+                    f"```json\n{json.dumps(candidate)}\n```",
+                    request_id="045b336c-74ed-4c30-ad1a-2d00f735908e",
+                    preflight=preflight,
+                    remote=remote,
+                    paths_by_commit=paths_by_commit,
+                )
 
     def test_forward_compact_v3_report_rejects_lost_position_identity(self):
         payload = MODULE.parse_markdown_report(

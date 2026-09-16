@@ -3547,6 +3547,21 @@ def validate_copilot_review_report(
             remote=remote,
             paths_by_commit=paths_by_commit,
         )
+    elif isinstance(report, dict) and set(report) == {
+        "base_ref",
+        "comments",
+        "head_ref",
+        "head_sha",
+        "pull_request",
+        "repository",
+    }:
+        report, supplemental_commits = normalize_flat_identity_review_report(
+            report,
+            request_id=request_id,
+            preflight=preflight,
+            remote=remote,
+            paths_by_commit=paths_by_commit,
+        )
     expected_keys = {
         "schema",
         "request_id",
@@ -3653,6 +3668,119 @@ def validate_copilot_review_report(
     if bool(remote["commits"]) != (report["outcome"] == "addressed"):
         raise WorkflowError("report outcome does not match its fix commits")
     return report
+
+
+def normalize_flat_identity_review_report(
+    report: dict[str, Any],
+    *,
+    request_id: str,
+    preflight: dict[str, Any],
+    remote: dict[str, Any],
+    paths_by_commit: dict[str, list[str]],
+) -> tuple[dict[str, Any], list[str]]:
+    pr = preflight["pr"]
+    comments = report.get("comments")
+    expected_comments = preflight["comment_identities"]
+    item_keys = {
+        "author",
+        "body_sha256",
+        "changed_paths",
+        "commit",
+        "comment",
+        "current_line",
+        "disposition",
+        "original_line",
+        "path",
+        "review",
+        "side",
+        "source",
+        "thread",
+        "url",
+    }
+    if (
+        report.get("repository") != pr["repo_name"]
+        or pr["head_repository"] != pr["repo_name"]
+        or report.get("pull_request") != pr["number"]
+        or report.get("base_ref") != pr["base_branch"]
+        or report.get("head_ref") != pr["head_branch"]
+        or report.get("head_sha") != pr["head_sha"]
+        or not isinstance(comments, list)
+        or len(comments) != len(expected_comments)
+        or remote.get("requires_apply") is not True
+    ):
+        raise WorkflowError(
+            "Copilot Review Loop flat identity report has stale identity"
+        )
+    expected_by_thread = {
+        item.get("thread_id"): item
+        for item in expected_comments
+        if isinstance(item, dict) and isinstance(item.get("thread_id"), str)
+    }
+    if len(expected_by_thread) != len(expected_comments):
+        raise WorkflowError(
+            "Copilot Review Loop flat identity report requires unique retained threads"
+        )
+    mapped_comments = []
+    seen_threads: set[str] = set()
+    for item in comments:
+        thread_id = item.get("thread") if isinstance(item, dict) else None
+        expected = expected_by_thread.get(thread_id)
+        if (
+            not isinstance(item, dict)
+            or set(item) != item_keys
+            or not isinstance(thread_id, str)
+            or thread_id in seen_threads
+            or not isinstance(expected, dict)
+            or item.get("comment") != expected.get("id")
+            or item.get("author") != expected.get("author")
+            or item.get("body_sha256") != expected.get("body_sha256")
+            or item.get("current_line") != expected.get("line")
+            or item.get("original_line") != expected.get("original_line")
+            or item.get("path") != expected.get("path")
+            or item.get("review") != expected.get("review_id")
+            or item.get("side") != expected.get("side")
+            or item.get("source") != expected.get("source")
+            or item.get("url") != expected.get("url")
+        ):
+            raise WorkflowError(
+                "Copilot Review Loop flat identity report has a mismatched comment"
+            )
+        seen_threads.add(thread_id)
+        mapped_comments.append(
+            {
+                "author": item["author"],
+                "body_sha256": item["body_sha256"],
+                "changed_paths": item["changed_paths"],
+                "commit": item["commit"],
+                "current_line": item["current_line"],
+                "diff_side": item["side"],
+                "disposition": item["disposition"],
+                "original_line": item["original_line"],
+                "path": item["path"],
+                "review_id": item["review"],
+                "source": item["source"],
+                "thread_id": item["thread"],
+                "url": item["url"],
+            }
+        )
+    return normalize_repository_compact_review_report(
+        {
+            "pull_request": {
+                "base_ref": pr["base_branch"],
+                "base_repository": pr["repo_name"],
+                "head_ref": pr["head_branch"],
+                "head_repository": pr["head_repository"],
+                "head_sha": pr["head_sha"],
+                "number": pr["number"],
+                "repository": pr["repo_name"],
+            },
+            "comments": mapped_comments,
+        },
+        request_id=request_id,
+        preflight=preflight,
+        remote=remote,
+        paths_by_commit=paths_by_commit,
+    )
 
 
 def normalize_repository_compact_review_report(
