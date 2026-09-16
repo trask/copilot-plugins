@@ -4551,6 +4551,38 @@ def continue_after_review_request(
     )
 
 
+def finalize_agent_task_artifacts(
+    task_state: dict[str, Any],
+    cleanup_paths: set[Path],
+    *,
+    preserve: bool,
+) -> None:
+    if preserve:
+        task_state["artifacts_removed"] = False
+        task_state["artifacts_preserved"] = True
+        task_state.pop("recovery_command", None)
+        task_state.pop("recovery_files", None)
+        return
+    cleanup_errors = []
+    for artifact in cleanup_paths:
+        try:
+            artifact.unlink(missing_ok=True)
+        except OSError as error:
+            cleanup_errors.append(f"{artifact}: {error}")
+    if cleanup_errors:
+        raise WorkflowError(
+            "publication succeeded, but Agent Task artifact cleanup failed: "
+            + "; ".join(cleanup_errors)
+        )
+    task_state["artifacts_removed"] = True
+    task_state.pop("artifacts_preserved", None)
+    task_state.pop("prompt_file", None)
+    task_state.pop("result_file", None)
+    task_state.pop("pending_result_file", None)
+    task_state.pop("recovery_command", None)
+    task_state.pop("recovery_files", None)
+
+
 def command_agent_task(args: argparse.Namespace) -> None:
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
@@ -5339,26 +5371,14 @@ def command_agent_task(args: argparse.Namespace) -> None:
         for field in ("error", "failed_at", "recovery_files"):
             task_state.pop(field, None)
         save_state(state_path, state)
-        cleanup_errors = []
         cleanup_paths = {prompt_path, result_path}
         if input_result_path is not None:
             cleanup_paths.add(input_result_path)
-        for artifact in cleanup_paths:
-            try:
-                artifact.unlink(missing_ok=True)
-            except OSError as error:
-                cleanup_errors.append(f"{artifact}: {error}")
-        if cleanup_errors:
-            raise WorkflowError(
-                "publication succeeded, but Agent Task artifact cleanup failed: "
-                + "; ".join(cleanup_errors)
-            )
-        task_state["artifacts_removed"] = True
-        task_state.pop("prompt_file", None)
-        task_state.pop("result_file", None)
-        task_state.pop("pending_result_file", None)
-        task_state.pop("recovery_command", None)
-        task_state.pop("recovery_files", None)
+        finalize_agent_task_artifacts(
+            task_state,
+            cleanup_paths,
+            preserve=bool(getattr(args, "preserve_artifacts", False)),
+        )
         save_state(state_path, state)
         emit(
             {
@@ -5526,6 +5546,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--wait-timeout",
         type=float,
         default=DEFAULT_WATCH_TIMEOUT,
+    )
+    agent_task.add_argument(
+        "--preserve-artifacts",
+        action="store_true",
+        help="retain the managed prompt and result after successful publication",
     )
     agent_task.add_argument(
         "--stability-polls",

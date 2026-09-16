@@ -1179,7 +1179,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("task_id_status=not_created", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.20")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.21")
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1406,6 +1406,33 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             466,
         )
         self.assertEqual(report["comments"][0]["commit"], commit)
+
+    def test_preserve_artifacts_keeps_prompt_and_result_after_completion(self):
+        task_state = {
+            "prompt_file": "prompt.txt",
+            "result_file": "result.json",
+            "recovery_command": "resume",
+            "recovery_files": ["result.json"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            prompt = Path(directory) / "prompt.txt"
+            result = Path(directory) / "result.json"
+            prompt.write_text("prompt", encoding="utf-8")
+            result.write_text("result", encoding="utf-8")
+
+            MODULE.finalize_agent_task_artifacts(
+                task_state,
+                {prompt, result},
+                preserve=True,
+            )
+
+            self.assertTrue(prompt.is_file())
+            self.assertTrue(result.is_file())
+        self.assertFalse(task_state["artifacts_removed"])
+        self.assertTrue(task_state["artifacts_preserved"])
+        self.assertEqual(task_state["prompt_file"], "prompt.txt")
+        self.assertEqual(task_state["result_file"], "result.json")
+        self.assertNotIn("recovery_command", task_state)
 
     def test_compact_v3_report_rejects_any_available_identity_drift(self):
         commit = self.fix
