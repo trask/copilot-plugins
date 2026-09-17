@@ -43,6 +43,59 @@ PERMISSION_MODULE = importlib.util.module_from_spec(PERMISSION_SPEC)
 PERMISSION_SPEC.loader.exec_module(PERMISSION_MODULE)
 
 
+def reconciled_forward_head_task(root):
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    prompt_path = root / "legacy-prompt.txt"
+    result_path = root / "legacy-result.json"
+    triage_result_path = root / "legacy-triage-result.json"
+    prompt_path.write_text("legacy prompt\n", encoding="utf-8")
+    triage_result_path.write_text("{}\n", encoding="utf-8")
+    started_at = "2026-09-17T17:16:45.254471Z"
+    finished_at = "2026-09-17T20:20:06.098081Z"
+    return {
+        "dispatch_monitor": {
+            "schema": MODULE.HOSTED_DISPATCH_MONITOR_SCHEMA,
+            "status": "owner_lost",
+            "started_at": started_at,
+            "timeout_seconds": None,
+            "discovery_interval_seconds": None,
+            "baseline_task_ids": None,
+            "helper_pid": None,
+            "helper_exit_code": None,
+            "finished_at": finished_at,
+            "failure": MODULE.RECONCILED_FORWARD_HEAD_FAILURE,
+            "legacy_evidence": {
+                "blocked_coordinator_observed_at": "2026-09-17T18:15:55Z",
+                "prompt_sha256": MODULE.sha256_file(prompt_path),
+                "triage_result_sha256": MODULE.sha256_file(triage_result_path),
+                "result_absent": True,
+                "matching_process_ids": [],
+                "eligibility_artifact_sha256": "1" * 64,
+                "package_manifest_sha256": "2" * 64,
+                "authorization_token": "3" * 64,
+                "snapshot_sha256": "4" * 64,
+                "forward_head_provenance_sha256": "5" * 64,
+                "old_task_result_imported": False,
+            },
+        },
+        "error": MODULE.RECONCILED_FORWARD_HEAD_OWNER_ERROR,
+        "failed_at": finished_at,
+        "iteration_allowance": 1,
+        "model": "gpt-5.6-sol",
+        "phase": "hosted_fix",
+        "policy": MODULE.AGENT_TASK_POLICY,
+        "prompt_file": str(prompt_path),
+        "result_file": str(result_path),
+        "run_id": "a" * 32,
+        "started_at": started_at,
+        "status": "failed",
+        "task_id": None,
+        "task_id_status": "unknown",
+        "triage_result_file": str(triage_result_path),
+    }
+
+
 class AgentCommandAdmissionTest(unittest.TestCase):
     def payload(
         self,
@@ -137,8 +190,8 @@ class AgentCommandAdmissionTest(unittest.TestCase):
             / "files"
         )
         files.mkdir(parents=True, exist_ok=True)
-        artifact_path = files / "ci-fix-loop-1.6.37-7-sealed-invocation.json"
-        manifest_path = files / "ci-fix-loop-1.6.37-package-manifest.json"
+        artifact_path = files / "ci-fix-loop-1.6.38-7-sealed-invocation.json"
+        manifest_path = files / "ci-fix-loop-1.6.38-package-manifest.json"
         manifest_path.write_text("{}\n", encoding="utf-8", newline="\n")
         package = {
             "path": str(manifest_path),
@@ -148,7 +201,7 @@ class AgentCommandAdmissionTest(unittest.TestCase):
             "installed_root": str(root / "installed"),
             "package": {
                 "name": "ci-fix-loop",
-                "version": "1.6.37",
+                "version": "1.6.38",
                 "file_count": 8,
                 "package_sha256": "c" * 64,
             },
@@ -831,8 +884,8 @@ class SealedCiFixCommandTest(unittest.TestCase):
             / "files"
         )
         files.mkdir(parents=True)
-        artifact_path = files / "ci-fix-loop-1.6.37-7-sealed-invocation.json"
-        manifest_path = files / "ci-fix-loop-1.6.37-package-manifest.json"
+        artifact_path = files / "ci-fix-loop-1.6.38-7-sealed-invocation.json"
+        manifest_path = files / "ci-fix-loop-1.6.38-package-manifest.json"
         manifest_path.write_text("{}\n", encoding="utf-8", newline="\n")
         state_path = root / "ci-fix-state.json"
         package = {
@@ -843,7 +896,7 @@ class SealedCiFixCommandTest(unittest.TestCase):
             "installed_root": str(root / "installed"),
             "package": {
                 "name": "ci-fix-loop",
-                "version": "1.6.37",
+                "version": "1.6.38",
                 "file_count": 8,
                 "package_sha256": "c" * 64,
             },
@@ -1054,6 +1107,195 @@ class SealedCiFixCommandTest(unittest.TestCase):
                 "sealed_ci_fix_completed",
                 json.loads(output.getvalue())["result"],
             )
+
+    def test_direct_command_archives_exact_reconciled_owner(self):
+        with tempfile.TemporaryDirectory(prefix="sealed reconciled ") as directory:
+            root = Path(directory)
+            (
+                repo,
+                state_path,
+                artifact_path,
+                package,
+                snapshot,
+                _artifact,
+            ) = self.fixture(root)
+            reconciled = reconciled_forward_head_task(root / "legacy evidence")
+            MODULE.save_state(
+                state_path,
+                {
+                    "version": MODULE.STATE_VERSION,
+                    "created_at": MODULE.utc_now(),
+                    "iterations": 0,
+                    "history": [],
+                    "reruns": {},
+                    "escalation": None,
+                    "agent_task": copy.deepcopy(reconciled),
+                },
+            )
+            current_head = "2c3366080075fbd99b51572736f0b2e86586d8a2"
+            snapshot["source"]["head"] = current_head
+            snapshot["pull_request"] = {
+                "number": 7,
+                "title": "Fix widget",
+                "body": "",
+                "pr_url": "https://github.com/owner/repo/pull/7",
+                "repo_name": "owner/repo",
+                "state": "OPEN",
+                "head_owner": "owner",
+                "head_repo": "repo",
+                "head_repository": "owner/repo",
+                "head_branch": "feature",
+                "head_sha": current_head,
+                "base_branch": "main",
+                "base_sha": "e" * 40,
+                "cross_repository": False,
+            }
+            snapshot["checks"] = {
+                "head_sha": current_head,
+                "rollup": [],
+                "decision": {
+                    "decision": "green",
+                    "reason": "all_checks_passed",
+                    "checks": [],
+                    "detail": "all checks passed",
+                },
+            }
+            snapshot["checks"]["sha256"] = MODULE.canonical_json_sha256(
+                snapshot["checks"]
+            )
+            MODULE.record_coordinator_identity(
+                state_path,
+                repo,
+                snapshot["pull_request"],
+                snapshot["source"],
+            )
+            self.assertEqual(
+                reconciled,
+                MODULE.load_state(state_path)["agent_task"],
+            )
+            snapshot["state"] = MODULE.sealed_ci_fix_state_identity(state_path)
+            artifact = MODULE.sealed_ci_fix_artifact(
+                artifact_path=artifact_path,
+                package_manifest=package,
+                snapshot=snapshot,
+                invocation_id="f" * 32,
+                owner_session_id="87654321-4321-4321-4321-cba987654321",
+            )
+            artifact_path.write_text(
+                json.dumps(artifact, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            artifact_path.with_name(f"{artifact_path.name}.sha256").write_text(
+                f"{MODULE.sha256_file(artifact_path)}\n",
+                encoding="ascii",
+                newline="\n",
+            )
+            preflight = {
+                "repository_root": str(repo),
+                "identity": copy.deepcopy(snapshot["source"]),
+                "pr": copy.deepcopy(snapshot["pull_request"]),
+                "viewer": {"login": "viewer", "permissions": {"push": True}},
+                "stack_guard": None,
+                "check_snapshot": {
+                    **copy.deepcopy(snapshot["checks"]),
+                    "base_sha": "e" * 40,
+                    "observed_at": "2026-09-17T21:46:41Z",
+                    "rollup_sha256": MODULE.sha256_text("[]"),
+                    "failures": [],
+                },
+            }
+
+            def stack_start(_arguments):
+                MODULE.emit(
+                    {
+                        "result": "single",
+                        "target": "https://github.com/owner/repo/pull/7",
+                        "reason": "sealed_single_pull_request",
+                        "pr": {
+                            "number": 7,
+                            "pr_url": "https://github.com/owner/repo/pull/7",
+                            "repo_name": "owner/repo",
+                        },
+                    }
+                )
+
+            with contextlib.ExitStack() as stack:
+                for patch in self.run_patches(repo, package, snapshot):
+                    stack.enter_context(patch)
+                stack.enter_context(
+                    mock.patch.object(
+                        MODULE,
+                        "command_stack_start",
+                        side_effect=stack_start,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        MODULE,
+                        "wait_for_stable_ci_preflight",
+                        return_value=preflight,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(MODULE, "require_live_check_snapshot")
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        MODULE,
+                        "reconcile_dead_hosted_owner",
+                        side_effect=lambda _path, state, **_kwargs: state,
+                    )
+                )
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    MODULE.command_run_sealed_ci_fix(
+                        SimpleNamespace(invocation_artifact=str(artifact_path))
+                    )
+
+            result = json.loads(
+                Path(artifact["outputs"]["result"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual("succeeded", result["status"])
+            state = MODULE.load_state(state_path)
+            self.assertNotIn("agent_task", state)
+            self.assertEqual([reconciled], state["managed_task_history"])
+            self.assertEqual("green", state["outcome"])
+
+    def test_ineligible_owner_stops_before_checkout_or_state_write(self):
+        with tempfile.TemporaryDirectory(prefix="sealed owner precheck ") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            state_path = root / "state.json"
+            task = reconciled_forward_head_task(root / "legacy evidence")
+            task["recovery_command"] = "do not supersede"
+            MODULE.save_state(
+                state_path,
+                {
+                    "version": MODULE.STATE_VERSION,
+                    "agent_task": task,
+                },
+            )
+            state_before = state_path.read_bytes()
+            with (
+                mock.patch.object(MODULE, "git", return_value=""),
+                mock.patch.object(MODULE, "metadata_for") as metadata,
+                mock.patch.object(MODULE, "checkout_pr") as checkout,
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "unfinished Agent Task",
+                ),
+            ):
+                MODULE.agent_task_preflight(
+                    repo,
+                    {"repo_name": "owner/repo", "number": 7},
+                    state_path=state_path,
+                )
+
+            metadata.assert_not_called()
+            checkout.assert_not_called()
+            self.assertEqual(state_before, state_path.read_bytes())
 
     def test_missing_preflight_result_stops_before_loop_and_cannot_repeat(self):
         with tempfile.TemporaryDirectory(prefix="sealed missing ") as directory:
@@ -1306,7 +1548,8 @@ class SealedCiFixCommandTest(unittest.TestCase):
 
     def test_sealed_state_rejects_active_or_recoverable_ownership(self):
         with tempfile.TemporaryDirectory(prefix="sealed state ") as directory:
-            state_path = Path(directory) / "state.json"
+            root = Path(directory)
+            state_path = root / "state.json"
             state = {
                 "version": MODULE.STATE_VERSION,
                 "agent_task": {"status": "running"},
@@ -1329,22 +1572,42 @@ class SealedCiFixCommandTest(unittest.TestCase):
             ):
                 MODULE.sealed_ci_fix_state_identity(state_path)
 
-            state["agent_task"] = {
-                "status": "failed",
-                "phase": "hosted_fix",
-                "task_id": None,
-                "task_id_status": "unknown",
-                "error": (
-                    "legacy hosted Agent Task helper owner was superseded by an "
-                    "independently advanced forward pull request head; old task "
-                    "result was not imported"
-                ),
-            }
+            reconciled = reconciled_forward_head_task(root / "legacy evidence")
+            state["agent_task"] = reconciled
             state["coordinator"] = {"status": "blocked"}
             MODULE.save_state(state_path, state)
             identity = MODULE.sealed_ci_fix_state_identity(state_path)
             self.assertTrue(identity["exists"])
             self.assertEqual(MODULE.sha256_file(state_path), identity["sha256"])
+
+            near_misses = {
+                "recovery command": lambda task: task.update(
+                    {"recovery_command": "do not supersede"}
+                ),
+                "task identity": lambda task: task.update({"task_id": "task-7"}),
+                "imported result": lambda task: task["dispatch_monitor"][
+                    "legacy_evidence"
+                ].update({"old_task_result_imported": True}),
+                "missing provenance": lambda task: task["dispatch_monitor"][
+                    "legacy_evidence"
+                ].pop("forward_head_provenance_sha256"),
+                "changed prompt": lambda task: Path(task["prompt_file"]).write_text(
+                    "changed\n", encoding="utf-8"
+                ),
+            }
+            for name, mutate in near_misses.items():
+                with self.subTest(name=name):
+                    candidate = reconciled_forward_head_task(
+                        root / f"near miss {name}"
+                    )
+                    mutate(candidate)
+                    state["agent_task"] = candidate
+                    MODULE.save_state(state_path, state)
+                    with self.assertRaisesRegex(
+                        MODULE.WorkflowError,
+                        "active workflow ownership",
+                    ):
+                        MODULE.sealed_ci_fix_state_identity(state_path)
 
 
 class WindowsSubprocessTest(unittest.TestCase):
@@ -4111,7 +4374,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [execute, agent, todo", instructions)
-        self.assertEqual("1.6.37", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.38", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_canonicalizes_stack_start_target(self):
         instructions = AGENT.read_text(encoding="utf-8")

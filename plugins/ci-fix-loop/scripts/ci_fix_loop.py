@@ -198,6 +198,14 @@ AGENT_TASK_POLICY = "marketplace-agent-apply-report-worker@3"
 AGENT_TASK_POLICY_SHA256 = (
     "7d48868140710139939cabc803a99f2122305e97dedbffa747e5f69903c16af1"
 )
+HOSTED_DISPATCH_MONITOR_SCHEMA = (
+    "github.copilot.ci-fix-loop-hosted-dispatch-monitor.v1"
+)
+RECONCILED_FORWARD_HEAD_OWNER_ERROR = (
+    "legacy hosted Agent Task helper owner was superseded by an independently "
+    "advanced forward pull request head; old task result was not imported"
+)
+RECONCILED_FORWARD_HEAD_FAILURE = "legacy_hosted_helper_owner_lost"
 LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2 = {
     "id": "marketplace-agent-apply-report-worker",
     "version": 2,
@@ -5851,6 +5859,17 @@ def agent_task_preflight(
     dirty = git(repo_root, "status", "--porcelain=v1")
     if dirty:
         raise WorkflowError(f"worktree is not clean:\n{dirty}")
+    if state_path is not None and state_path.is_file():
+        task = load_state(state_path).get("agent_task")
+        if not fresh_invocation_may_supersede_task(task):
+            action = (
+                "use its recovery_command"
+                if isinstance(task, dict) and task.get("recovery_command")
+                else "no generic retry or recovery is permitted"
+            )
+            raise WorkflowError(
+                f"an unfinished Agent Task already owns this state; {action}"
+            )
     pr = metadata_for(target)
     if pr["state"] != "OPEN":
         raise WorkflowError(
@@ -7690,7 +7709,7 @@ def run_hosted_helper(
     baseline_task_ids = listed_agent_task_ids(repository)
     started_at = utc_now()
     monitor = {
-        "schema": "github.copilot.ci-fix-loop-hosted-dispatch-monitor.v1",
+        "schema": HOSTED_DISPATCH_MONITOR_SCHEMA,
         "status": "starting",
         "started_at": started_at,
         "timeout_seconds": timeout,
@@ -8774,6 +8793,128 @@ def ci_fix_state_file_identity(state_path: Path) -> dict[str, Any]:
     }
 
 
+def is_reconciled_forward_head_terminal_task(task: Any) -> bool:
+    if not isinstance(task, dict):
+        return False
+    monitor = task.get("dispatch_monitor")
+    evidence = monitor.get("legacy_evidence") if isinstance(monitor, dict) else None
+    if (
+        task.get("status") != "failed"
+        or task.get("phase") != "hosted_fix"
+        or task.get("task_id") is not None
+        or task.get("task_id_status") != "unknown"
+        or task.get("error") != RECONCILED_FORWARD_HEAD_OWNER_ERROR
+        or task.get("model") != "gpt-5.6-sol"
+        or task.get("policy") != AGENT_TASK_POLICY
+        or task.get("iteration_allowance") != 1
+        or COMMAND_ID_PATTERN.fullmatch(str(task.get("run_id") or "")) is None
+        or "retry_command" in task
+        or "recovery_command" in task
+        or not isinstance(task.get("started_at"), str)
+        or not isinstance(task.get("failed_at"), str)
+        or not isinstance(monitor, dict)
+        or set(monitor)
+        != {
+            "schema",
+            "status",
+            "started_at",
+            "timeout_seconds",
+            "discovery_interval_seconds",
+            "baseline_task_ids",
+            "helper_pid",
+            "helper_exit_code",
+            "finished_at",
+            "failure",
+            "legacy_evidence",
+        }
+        or monitor.get("schema") != HOSTED_DISPATCH_MONITOR_SCHEMA
+        or monitor.get("status") != "owner_lost"
+        or monitor.get("failure") != RECONCILED_FORWARD_HEAD_FAILURE
+        or monitor.get("started_at") != task["started_at"]
+        or monitor.get("finished_at") != task["failed_at"]
+        or any(
+            monitor.get(key) is not None
+            for key in (
+                "timeout_seconds",
+                "discovery_interval_seconds",
+                "baseline_task_ids",
+                "helper_pid",
+                "helper_exit_code",
+            )
+        )
+        or not isinstance(evidence, dict)
+        or set(evidence)
+        != {
+            "blocked_coordinator_observed_at",
+            "prompt_sha256",
+            "triage_result_sha256",
+            "result_absent",
+            "matching_process_ids",
+            "eligibility_artifact_sha256",
+            "package_manifest_sha256",
+            "authorization_token",
+            "snapshot_sha256",
+            "forward_head_provenance_sha256",
+            "old_task_result_imported",
+        }
+        or not isinstance(evidence.get("blocked_coordinator_observed_at"), str)
+        or not evidence["blocked_coordinator_observed_at"]
+        or evidence.get("result_absent") is not True
+        or evidence.get("matching_process_ids") != []
+        or evidence.get("old_task_result_imported") is not False
+        or any(
+            SHA256_PATTERN.fullmatch(str(evidence.get(key) or "")) is None
+            for key in (
+                "prompt_sha256",
+                "triage_result_sha256",
+                "eligibility_artifact_sha256",
+                "package_manifest_sha256",
+                "authorization_token",
+                "snapshot_sha256",
+                "forward_head_provenance_sha256",
+            )
+        )
+    ):
+        return False
+    prompt_path = Path(str(task.get("prompt_file") or ""))
+    result_path = Path(str(task.get("result_file") or ""))
+    triage_result_path = Path(str(task.get("triage_result_file") or ""))
+    if (
+        not prompt_path.is_absolute()
+        or not result_path.is_absolute()
+        or not triage_result_path.is_absolute()
+        or not prompt_path.is_file()
+        or prompt_path.is_symlink()
+        or result_path.exists()
+        or result_path.is_symlink()
+        or not triage_result_path.is_file()
+        or triage_result_path.is_symlink()
+    ):
+        return False
+    try:
+        return (
+            sha256_file(prompt_path) == evidence["prompt_sha256"]
+            and sha256_file(triage_result_path) == evidence["triage_result_sha256"]
+        )
+    except OSError:
+        return False
+
+
+def fresh_invocation_may_supersede_task(task: Any) -> bool:
+    if task is None:
+        return True
+    if not isinstance(task, dict):
+        return False
+    return (
+        task.get("status") in {"completed", "consumed"}
+        or (
+            task.get("status") == "failed"
+            and task.get("task_id_status") == "not_created"
+        )
+        or is_reconciled_forward_head_terminal_task(task)
+    )
+
+
 def sealed_ci_fix_state_identity(state_path: Path) -> dict[str, Any]:
     identity = ci_fix_state_file_identity(state_path)
     if not identity["exists"]:
@@ -8787,21 +8928,8 @@ def sealed_ci_fix_state_identity(state_path: Path) -> dict[str, Any]:
         if isinstance(coordinator, dict)
         else None
     )
-    reconciled_legacy_owner = bool(
-        isinstance(task, dict)
-        and task.get("status") == "failed"
-        and task.get("phase") == "hosted_fix"
-        and task.get("task_id") is None
-        and task.get("task_id_status") == "unknown"
-        and task.get("error")
-        == (
-            "legacy hosted Agent Task helper owner was superseded by an "
-            "independently advanced forward pull request head; old task result "
-            "was not imported"
-        )
-    )
     if (
-        (isinstance(task, dict) and task.get("status") == "running")
+        not fresh_invocation_may_supersede_task(task)
         or (
             isinstance(task, dict)
             and (
@@ -8819,11 +8947,6 @@ def sealed_ci_fix_state_identity(state_path: Path) -> dict[str, Any]:
         )
         or isinstance(state.get("pending_stack_push"), dict)
         or isinstance(pending_rerun, dict)
-        or (
-            isinstance(task, dict)
-            and task.get("status") == "failed"
-            and not reconciled_legacy_owner
-        )
     ):
         raise WorkflowError("sealed CI Fix state still has active workflow ownership")
     return identity
@@ -10276,7 +10399,7 @@ def command_apply_legacy_owner_reconciliation(
     triage_result_path = Path(task["triage_result_file"])
     finished_at = utc_now()
     task["dispatch_monitor"] = {
-        "schema": "github.copilot.ci-fix-loop-hosted-dispatch-monitor.v1",
+        "schema": HOSTED_DISPATCH_MONITOR_SCHEMA,
         "status": "owner_lost",
         "started_at": task.get("started_at"),
         "timeout_seconds": None,
@@ -10285,7 +10408,7 @@ def command_apply_legacy_owner_reconciliation(
         "helper_pid": None,
         "helper_exit_code": None,
         "finished_at": finished_at,
-        "failure": "legacy_hosted_helper_owner_lost",
+        "failure": RECONCILED_FORWARD_HEAD_FAILURE,
         "legacy_evidence": {
             "blocked_coordinator_observed_at": coordinator.get("observed_at"),
             "prompt_sha256": sha256_file(prompt_path),
@@ -10311,9 +10434,7 @@ def command_apply_legacy_owner_reconciliation(
     task["task_id_status"] = "unknown"
     task["task_id"] = None
     task["error"] = (
-        "legacy hosted Agent Task helper owner was superseded by an "
-        "independently advanced forward pull request head; old task result "
-        "was not imported"
+        RECONCILED_FORWARD_HEAD_OWNER_ERROR
         if artifact["snapshot"].get("forward_head_provenance") is not None
         else (
             "legacy hosted Agent Task helper owner is no longer running; "
@@ -10359,16 +10480,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
     existing_task = existing.get("agent_task") if existing is not None else None
     if (
         not args.resume
-        and isinstance(existing_task, dict)
-        and existing_task.get("status") not in {"completed", "consumed"}
-        and not (
-            existing_task.get("status") == "failed"
-            and existing_task.get("task_id_status") == "not_created"
-        )
+        and not fresh_invocation_may_supersede_task(existing_task)
     ):
         action = (
             "use its recovery_command"
-            if existing_task.get("recovery_command")
+            if isinstance(existing_task, dict)
+            and existing_task.get("recovery_command")
             else "no generic retry or recovery is permitted"
         )
         raise WorkflowError(
@@ -10466,22 +10583,22 @@ def command_agent_task(args: argparse.Namespace) -> None:
         else:
             state = existing
             active_task = state.get("agent_task")
-            if isinstance(active_task, dict) and active_task.get("status") not in {
-                "completed",
-                "consumed",
-            } and not (
-                active_task.get("status") == "failed"
-                and active_task.get("task_id_status") == "not_created"
-            ):
+            if not fresh_invocation_may_supersede_task(active_task):
                 action = (
                     "use its recovery_command"
-                    if active_task.get("recovery_command")
+                    if isinstance(active_task, dict)
+                    and active_task.get("recovery_command")
                     else "no generic retry or recovery is permitted"
                 )
                 raise WorkflowError(
                     f"an unfinished Agent Task already owns this state; {action}"
                 )
-            if (
+            if is_reconciled_forward_head_terminal_task(active_task):
+                state.setdefault("managed_task_history", []).append(
+                    copy.deepcopy(active_task)
+                )
+                state.pop("agent_task", None)
+            elif (
                 isinstance(active_task, dict)
                 and active_task.get("status") == "failed"
                 and active_task.get("task_id_status") == "not_created"
@@ -11546,14 +11663,7 @@ def record_coordinator_identity(
 ) -> None:
     state = coordinator_file_state(path)
     active_task = state.get("agent_task")
-    if (
-        isinstance(active_task, dict)
-        and active_task.get("status") not in {"completed", "consumed"}
-        and not (
-            active_task.get("status") == "failed"
-            and active_task.get("task_id_status") == "not_created"
-        )
-    ):
+    if not fresh_invocation_may_supersede_task(active_task):
         raise WorkflowError(
             "an unfinished Agent Task already owns this state; use its "
             "recovery_command"
