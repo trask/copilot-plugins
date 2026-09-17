@@ -21,8 +21,16 @@ from typing import Callable, Mapping, Sequence, TextIO
 API_VERSION = "2026-03-10"
 ACCEPT = "application/vnd.github+json"
 POLL_SECONDS = 60
-TASK_PROMPT_MAX_CHARACTERS = 28_000
-TASK_PROMPT_MAX_UTF8_BYTES = 28_000
+AGENT_TASK_PROMPT_MAX_CHARACTERS = 28_000
+AGENT_TASK_PROMPT_MAX_UTF8_BYTES = 28_000
+TASK_PROMPT_HEADROOM_CHARACTERS = 1_000
+TASK_PROMPT_HEADROOM_UTF8_BYTES = 1_000
+TASK_PROMPT_MAX_CHARACTERS = (
+    AGENT_TASK_PROMPT_MAX_CHARACTERS - TASK_PROMPT_HEADROOM_CHARACTERS
+)
+TASK_PROMPT_MAX_UTF8_BYTES = (
+    AGENT_TASK_PROMPT_MAX_UTF8_BYTES - TASK_PROMPT_HEADROOM_UTF8_BYTES
+)
 EXACT_PATH_EVIDENCE_MAX_COUNT = 64
 EXACT_PATH_EVIDENCE_MAX_BYTES = 4_096
 PATH_EVIDENCE_BOUNDARY_COUNT = 8
@@ -1891,20 +1899,28 @@ def compact_path_evidence(paths: Sequence[str]) -> Mapping[str, object]:
     }
 
 
-def compact_commit_evidence(commit: Mapping[str, object]) -> Mapping[str, object]:
-    return {
+def compact_commit_evidence(
+    commit: Mapping[str, object],
+    *,
+    include_paths: bool = False,
+) -> Mapping[str, object]:
+    evidence: dict[str, object] = {
         "sha": commit["sha"],
         "patch_sha256": commit["patch_sha256"],
-        "paths": {
-            "count": len(commit["paths"]),
-            "sha256": value_digest(commit["paths"]),
-        },
         "retained_evidence_sha256": value_digest(commit),
     }
+    if include_paths:
+        evidence["paths"] = {
+            "count": len(commit["paths"]),
+            "sha256": value_digest(commit["paths"]),
+        }
+    return evidence
 
 
 def compact_request_contract(
     request: Mapping[str, object],
+    *,
+    include_per_commit_paths: bool = False,
 ) -> Mapping[str, object]:
     stack = request["native_stack"]
     compact_stack = None
@@ -1929,7 +1945,10 @@ def compact_request_contract(
                         )
                     },
                     "old_commits": [
-                        compact_commit_evidence(commit)
+                        compact_commit_evidence(
+                            commit,
+                            include_paths=include_per_commit_paths,
+                        )
                         for commit in member["old_commits"]
                     ],
                     "sync_merges": member["sync_merges"],
@@ -1953,7 +1972,10 @@ def compact_request_contract(
         "guards": request["guards"],
         "allowed_paths": compact_path_evidence(request["allowed_paths"]),
         "head_commits": [
-            compact_commit_evidence(commit)
+            compact_commit_evidence(
+                commit,
+                include_paths=include_per_commit_paths,
+            )
             for commit in request["head_commits"]
         ],
         "native_stack": compact_stack,
@@ -2116,9 +2138,16 @@ def receipt_contract_template(
     }
 
 
-def policy_prompt(options: Options) -> str:
+def policy_prompt(
+    options: Options,
+    *,
+    include_per_commit_paths: bool = False,
+) -> str:
     report_path, receipt_path = artifact_paths(options.request["request_id"])
-    compact_request = compact_request_contract(options.request)
+    compact_request = compact_request_contract(
+        options.request,
+        include_per_commit_paths=include_per_commit_paths,
+    )
     compact_receipt = compact_receipt_contract(options.request)
     return (
         f"{options.prompt.rstrip()}\n\n"
@@ -2178,9 +2207,12 @@ def validated_task_prompt(options: Options) -> str:
     ):
         raise ConflictError(
             "Agent Task prompt_too_large: compact problem statement is "
-            f"{characters} characters and {utf8_bytes} UTF-8 bytes; limits are "
+            f"{characters} characters and {utf8_bytes} UTF-8 bytes; submission "
+            "limits with reserved headroom are "
             f"{TASK_PROMPT_MAX_CHARACTERS} characters and "
-            f"{TASK_PROMPT_MAX_UTF8_BYTES} UTF-8 bytes",
+            f"{TASK_PROMPT_MAX_UTF8_BYTES} UTF-8 bytes below Agent Task limits of "
+            f"{AGENT_TASK_PROMPT_MAX_CHARACTERS} characters and "
+            f"{AGENT_TASK_PROMPT_MAX_UTF8_BYTES} UTF-8 bytes",
             "prompt_too_large",
         )
     return prompt
@@ -2237,11 +2269,21 @@ def validate_malformed_completed_replacement(
         replacement.prompt,
         None,
     )
-    expected_prompt = validated_task_prompt(prompt_options)
-    if (
-        hashlib.sha256(expected_prompt.encode("utf-8")).hexdigest()
-        != replacement.task_prompt_sha256
-    ):
+    current_prompt = policy_prompt(prompt_options)
+    legacy_prompt = policy_prompt(
+        prompt_options,
+        include_per_commit_paths=True,
+    )
+    expected_prompt = next(
+        (
+            prompt
+            for prompt in (current_prompt, legacy_prompt)
+            if hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            == replacement.task_prompt_sha256
+        ),
+        None,
+    )
+    if expected_prompt is None:
         raise ConflictError(
             "replacement task prompt hash does not match",
             "policy_rejected",

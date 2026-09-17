@@ -887,7 +887,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "555fb75dd1454c43f5bc04c3bb61f57315fb6a53c7594ec1be0880a1fdd08e5d",
+            "9b34e33c65e87e02e87344f3a7b14018be168c69b273ad29e2887ff2335d107f",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -3962,39 +3962,83 @@ class ManagedTaskPromptTest(unittest.TestCase):
         request = self.request()
         request["strategy"] = "native-stack"
         request["head_commits"] = []
+        request["allowed_paths"] = [
+            f"instrumentation/library-{number:04d}/src/main/java/Type{number}.java"
+            for number in range(397)
+        ]
+        repository = "open-telemetry/opentelemetry-java-instrumentation"
+        member_refs = {
+            20070: "trask-redis-redisson-targets",
+            20075: "trask-redis-rediscala-targets",
+        }
         members = []
-        for member_number, start in ((7, 1), (8, 21)):
+        for member_number, start, count in ((20070, 1, 40), (20075, 41, 10)):
             old_commits = [
                 self.commit(number, f"module-{member_number}/File{number}.java")
-                for number in range(start, start + 20)
+                for number in range(start, start + count)
             ]
             members.append(
                 {
                     "pr_number": member_number,
-                    "repository": "owner/repo",
-                    "head_ref": f"feature-{member_number}",
+                    "repository": repository,
+                    "head_ref": member_refs[member_number],
                     "head_sha": old_commits[-1]["sha"],
                     "direct_base_ref": (
-                        "main" if member_number == 7 else "feature-7"
+                        "main" if member_number == 20070 else member_refs[20070]
                     ),
                     "direct_base_sha": (
-                        "a" * 40 if member_number == 7 else members[0]["head_sha"]
+                        "a" * 40
+                        if member_number == 20070
+                        else members[0]["head_sha"]
                     ),
                     "retained_base_sha": f"{100 + member_number:040x}",
                     "direct_merge_base": f"{200 + member_number:040x}",
                     "expected_new_parent": {
-                        "role": "trunk" if member_number == 7 else "member-7",
+                        "role": (
+                            "trunk"
+                            if member_number == 20070
+                            else "member-20070"
+                        ),
                         "old_sha": (
                             "a" * 40
-                            if member_number == 7
+                            if member_number == 20070
                             else members[0]["head_sha"]
                         ),
                     },
                     "old_commits": old_commits,
-                    "sync_merges": [],
+                    "sync_merges": (
+                        []
+                        if member_number == 20070
+                        else [
+                            {
+                                "sha": "b" * 40,
+                                "position": 5,
+                                "parents": ["c" * 40, members[0]["head_sha"]],
+                                "tree": "d" * 40,
+                                "subject": "Synchronize direct base",
+                                "trailers": [
+                                    "Co-authored-by: Example <example@example.com>"
+                                ],
+                                "remerge_diff_sha256": hashlib.sha256(
+                                    b""
+                                ).hexdigest(),
+                            }
+                        ]
+                    ),
                     "lease_sha": old_commits[-1]["sha"],
                 }
             )
+        request["repository"] = repository
+        request["pull_request"].update(
+            {
+                "number": 20070,
+                "url": f"https://github.com/{repository}/pull/20070",
+                "head_repository": repository,
+                "head_ref": member_refs[20070],
+                "head_sha": members[0]["head_sha"],
+                "base_repository": repository,
+            }
+        )
         request["native_stack"] = {
             "trunk": {"ref": "main", "sha": "a" * 40},
             "members": members,
@@ -4005,15 +4049,39 @@ class ManagedTaskPromptTest(unittest.TestCase):
         first = CLOUD_MODULE.validated_task_prompt(self.options(request))
         second = CLOUD_MODULE.validated_task_prompt(self.options(request))
         compact = CLOUD_MODULE.compact_request_contract(request)
+        legacy_prompt = CLOUD_MODULE.policy_prompt(
+            self.options(request),
+            include_per_commit_paths=True,
+        )
 
         self.assertEqual(first, second)
+        self.assertGreater(
+            len(legacy_prompt),
+            CLOUD_MODULE.AGENT_TASK_PROMPT_MAX_CHARACTERS,
+        )
+        self.assertGreater(
+            len(legacy_prompt.encode("utf-8")),
+            CLOUD_MODULE.AGENT_TASK_PROMPT_MAX_UTF8_BYTES,
+        )
+        self.assertLessEqual(
+            len(first) + CLOUD_MODULE.TASK_PROMPT_HEADROOM_CHARACTERS,
+            CLOUD_MODULE.AGENT_TASK_PROMPT_MAX_CHARACTERS,
+        )
         self.assertLessEqual(
             len(first.encode("utf-8")),
             CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES,
         )
+        self.assertLessEqual(
+            len(first.encode("utf-8"))
+            + CLOUD_MODULE.TASK_PROMPT_HEADROOM_UTF8_BYTES,
+            CLOUD_MODULE.AGENT_TASK_PROMPT_MAX_UTF8_BYTES,
+        )
         self.assertIn('"commit_mapping_keys"', first)
         compact_members = compact["native_stack"]["members"]
-        self.assertEqual([7, 8], [member["pr_number"] for member in compact_members])
+        self.assertEqual(
+            [20070, 20075],
+            [member["pr_number"] for member in compact_members],
+        )
         for original, retained in zip(members, compact_members, strict=True):
             self.assertEqual(original["head_sha"], retained["head_sha"])
             self.assertEqual(original["lease_sha"], retained["lease_sha"])
@@ -4028,7 +4096,57 @@ class ManagedTaskPromptTest(unittest.TestCase):
                     CLOUD_MODULE.value_digest(commit),
                     evidence["retained_evidence_sha256"],
                 )
+                self.assertEqual(commit["patch_sha256"], evidence["patch_sha256"])
+                self.assertNotIn("paths", evidence)
                 self.assertIn(commit["sha"], first)
+
+        snapshot = SimpleNamespace(
+            control_root=Path("control"),
+            repository=repository,
+        )
+        task = {"id": "task-1", "state": "queued"}
+        with mock.patch.object(
+            CLOUD_MODULE, "api_json", return_value=task
+        ) as api_json:
+            self.assertEqual(
+                task,
+                CLOUD_MODULE.start_task(
+                    mock.sentinel.runner,
+                    snapshot,
+                    self.options(request),
+                ),
+            )
+        self.assertEqual(first, api_json.call_args.args[4]["prompt"])
+
+    def test_final_submitted_prompt_includes_envelope_with_headroom(self):
+        request = self.request()
+        options = self.options(request)
+        snapshot = SimpleNamespace(
+            control_root=Path("control"),
+            repository=request["repository"],
+        )
+        task = {"id": "task-1", "state": "queued"}
+
+        with mock.patch.object(
+            CLOUD_MODULE, "api_json", return_value=task
+        ) as api_json:
+            self.assertEqual(
+                task,
+                CLOUD_MODULE.start_task(mock.sentinel.runner, snapshot, options),
+            )
+
+        submitted = api_json.call_args.args[4]["prompt"]
+        self.assertEqual(CLOUD_MODULE.policy_prompt(options), submitted)
+        self.assertIn("marketplace conflict worker policy", submitted)
+        self.assertLessEqual(
+            len(submitted) + CLOUD_MODULE.TASK_PROMPT_HEADROOM_CHARACTERS,
+            CLOUD_MODULE.AGENT_TASK_PROMPT_MAX_CHARACTERS,
+        )
+        self.assertLessEqual(
+            len(submitted.encode("utf-8"))
+            + CLOUD_MODULE.TASK_PROMPT_HEADROOM_UTF8_BYTES,
+            CLOUD_MODULE.AGENT_TASK_PROMPT_MAX_UTF8_BYTES,
+        )
 
     def test_exact_ascii_character_and_byte_limit_is_accepted(self):
         options = self.options(self.request())
@@ -4038,6 +4156,16 @@ class ManagedTaskPromptTest(unittest.TestCase):
             CLOUD_MODULE, "policy_prompt", return_value=prompt
         ):
             self.assertEqual(prompt, CLOUD_MODULE.validated_task_prompt(options))
+        self.assertEqual(
+            CLOUD_MODULE.AGENT_TASK_PROMPT_MAX_CHARACTERS,
+            CLOUD_MODULE.TASK_PROMPT_MAX_CHARACTERS
+            + CLOUD_MODULE.TASK_PROMPT_HEADROOM_CHARACTERS,
+        )
+        self.assertEqual(
+            CLOUD_MODULE.AGENT_TASK_PROMPT_MAX_UTF8_BYTES,
+            CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES
+            + CLOUD_MODULE.TASK_PROMPT_HEADROOM_UTF8_BYTES,
+        )
 
     def test_character_overflow_fails_closed(self):
         options = self.options(self.request())
@@ -4207,6 +4335,35 @@ class MalformedCompletedReplacementTest(unittest.TestCase):
 
     def test_accepts_exact_completed_task_without_generated_changes(self):
         self.validate()
+
+    def test_accepts_exact_legacy_prompt_contract_for_recovery(self):
+        options = SimpleNamespace(
+            request=self.request,
+            prompt=self.prompt,
+            strategy=self.request["strategy"],
+        )
+        legacy_prompt = CLOUD_MODULE.policy_prompt(
+            options,
+            include_per_commit_paths=True,
+        )
+        self.replacement = CLOUD_MODULE.MalformedCompletedReplacement(
+            self.replacement.request_file,
+            self.replacement.prompt_file,
+            self.replacement.original_result_file,
+            self.replacement.resumed_result_file,
+            self.replacement.request,
+            self.replacement.prompt,
+            self.replacement.result,
+            hashlib.sha256(legacy_prompt.encode("utf-8")).hexdigest(),
+        )
+        self.task["sessions"][0]["prompt"] = legacy_prompt
+
+        with mock.patch.object(
+            CLOUD_MODULE,
+            "validated_task_prompt",
+            side_effect=AssertionError("recovery must not apply the submission cap"),
+        ):
+            self.validate()
 
     def test_parser_accepts_only_a_complete_byte_identical_replacement_bundle(self):
         directory = temporary_directory(self)
