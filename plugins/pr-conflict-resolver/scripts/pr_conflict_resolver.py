@@ -72,16 +72,16 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "9b34e33c65e87e02e87344f3a7b14018be168c69b273ad29e2887ff2335d107f"
+    "72adbe1a50a294fb8123155077d215e62a20a3d65c7a37203217c87fc87e238a"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
-CONFLICT_POLICY = "marketplace-conflict-worker@1"
+CONFLICT_POLICY = "marketplace-conflict-worker@2"
 CONFLICT_POLICY_SHA256 = (
-    "30c96b070bed7b652ffd9181fd4f74b052f670226dab9693d595338aaf0a9d6a"
+    "8ef8ce9fd429740875f1c06ae3c2dbb10f06759e49179a05dc9f493d4c72bd60"
 )
 CONFLICT_POLICY_IDENTITY = {
     "id": "marketplace-conflict-worker",
-    "version": 1,
+    "version": 2,
     "sha256": CONFLICT_POLICY_SHA256,
 }
 CONFLICT_REQUEST_SCHEMA = {
@@ -90,7 +90,7 @@ CONFLICT_REQUEST_SCHEMA = {
 }
 CONFLICT_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-result",
-    "version": 1,
+    "version": 2,
 }
 CONFLICT_RECEIPT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-receipt",
@@ -103,6 +103,7 @@ SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 CONFLICT_REPORT_DIRECTORY = ".github/agent-task-conflict-reports"
 CONFLICT_RECEIPT_DIRECTORY = ".github/agent-task-conflict-receipts"
+CONFLICT_SEMANTIC_DIRECTORY = ".github/agent-task-conflict-semantic"
 
 
 class WorkflowError(RuntimeError):
@@ -7723,15 +7724,18 @@ def build_conflict_prompt(preflight: dict[str, Any]) -> str:
         "every listed linear commit one-to-one. Preserve unaffected patches exactly. "
         "Record each conflict and companion path with a concrete rationale.\n\n"
         "Run the repository's required formatting and focused validation remotely. "
-        "Return only generated code refs plus the distinct report-and-receipt "
-        "artifact ref. Do not push a user branch or edit pull request metadata. Do "
+        "Publish only the dispatcher-assigned request-scoped code refs plus the "
+        "Agent Task semantic artifact branch. Do not push a user branch or edit "
+        "pull request metadata. Do "
         "not read or transmit credentials. Do not use a custom agent, Cloud "
         "Sandboxes, or a local fallback.\n\n"
         "The managed policy appends a compact immutable contract for request "
         f"{request['request_id']} with retained request SHA-256 "
         f"{request['request_sha256']}. The full request remains outside the "
         "repository as dispatcher-owned evidence and is never truncated into the "
-        "hosted problem statement.\n"
+        "hosted problem statement. The worker supplies only conflict annotations, a "
+        "summary, and validation evidence; the maintained helper derives history and "
+        "generates the identity-bound report, receipt, and result envelope.\n"
     )
 
 
@@ -8069,6 +8073,80 @@ def verify_quarantined_result(
                 allowed_paths,
             )
             previous_tip = code_ref["new_sha"]
+    if set(artifact) == {"branch", "head_sha", "semantic", "report", "receipt"}:
+        artifact_ref = quarantine_ref(request["request_id"], "artifact")
+        artifact_head = git(repo_root, "rev-parse", "--verify", artifact_ref).lower()
+        semantic = artifact["semantic"]
+        report = artifact["report"]
+        receipt = artifact["receipt"]
+        semantic_path = (
+            f"{CONFLICT_SEMANTIC_DIRECTORY}/{request['request_id']}.json"
+        )
+        semantic_bytes = git_bytes(
+            repo_root,
+            "show",
+            f"{artifact_head}:{semantic_path}",
+        )
+        if (
+            artifact_head != artifact["head_sha"]
+            or artifact_head in {item["new_sha"] for item in code_refs}
+            or commit_parents(repo_root, artifact_head) != [code_refs[-1]["new_sha"]]
+            or conflict_changed_paths(repo_root, artifact_head) != [semantic_path]
+            or semantic_bytes is None
+            or semantic
+            != {
+                "path": semantic_path,
+                "commit": artifact_head,
+                "sha256": hashlib.sha256(semantic_bytes).hexdigest(),
+            }
+            or not isinstance(report, dict)
+            or set(report) != {"sha256", "content"}
+            or not isinstance(report.get("content"), str)
+            or not report["content"].strip()
+            or report.get("sha256")
+            != hashlib.sha256(report["content"].encode("utf-8")).hexdigest()
+            or request["request_id"] not in report["content"]
+            or request["request_sha256"] not in report["content"]
+            or not isinstance(receipt, dict)
+            or set(receipt) != {"sha256", "value"}
+            or not isinstance(receipt.get("value"), dict)
+            or receipt.get("sha256")
+            != hashlib.sha256(
+                canonical_json(receipt["value"]).encode("utf-8")
+            ).hexdigest()
+        ):
+            raise WorkflowError("managed semantic artifact identity is malformed")
+        expected_receipt = {
+            "schema": CONFLICT_RECEIPT_SCHEMA,
+            "request": {
+                "id": request["request_id"],
+                "sha256": request["request_sha256"],
+            },
+            "policy": CONFLICT_POLICY_IDENTITY,
+            "model": request["model"],
+            "mode": "conflict_with_report",
+            "strategy": request["strategy"],
+            "repository": request["repository"],
+            "pull_request": request["pull_request"],
+            "generated_refs": [
+                {
+                    "ref": item,
+                    "sha256": hashlib.sha256(
+                        canonical_json(item).encode("utf-8")
+                    ).hexdigest(),
+                }
+                for item in code_refs
+            ],
+            "validation_complete": True,
+            "validation": validations,
+        }
+        if receipt["value"] != expected_receipt:
+            raise WorkflowError(
+                "mechanical conflict receipt does not match the pinned request"
+            )
+        require_no_credentials(report["content"], source="conflict report")
+        validate_passed_validations(receipt["value"]["validation"])
+        return
     artifact_keys = {"branch", "head_sha", "report", "receipt"}
     if not isinstance(artifact, dict) or set(artifact) != artifact_keys:
         raise WorkflowError("managed artifact identity is malformed")

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -105,6 +106,7 @@ class PolicyPromptTest(unittest.TestCase):
                     "one of marketplace-agent-apply-report-worker@1, "
                     "marketplace-agent-apply-report-worker@2, "
                     "marketplace-agent-apply-report-worker@3, "
+                    "marketplace-agent-apply-report-worker@4, "
                     "marketplace-agent-report-worker@1, "
                     "marketplace-agent-worker@5",
                 ) as raised:
@@ -148,6 +150,35 @@ class PolicyPromptTest(unittest.TestCase):
                             policy,
                         ]
                     )
+
+        self.assertNotIn(
+            MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
+            MODULE.RECOVERY_ONLY_APPLY_REPORT_POLICY_SELECTORS,
+        )
+
+    def test_structural_policy_v3_remains_dispatchable_for_existing_consumers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt_path = root / "prompt.txt"
+            prompt_path.write_text("Review and fix.", encoding="utf-8")
+            options = MODULE.parse_args(
+                [
+                    "--apply-with-report",
+                    "--pr",
+                    "owner/repo#1",
+                    "--prompt-file",
+                    str(prompt_path),
+                    "--result-file",
+                    str(root / "result.json"),
+                    "--policy",
+                    MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
+                ]
+            )
+
+        self.assertEqual(
+            options.policy,
+            MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
+        )
 
     def test_report_policy_requests_one_markdown_artifact(self):
         report_path = ".github/agent-task-reports/request-1.md"
@@ -208,7 +239,7 @@ class PolicyPromptTest(unittest.TestCase):
             pull_request=MODULE.PrReference(1, "owner/repo", "owner/repo#1"),
             apply_with_report=True,
             result_file=(Path.cwd().parent / "result.json").resolve(),
-            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
             prompt_file=(Path.cwd().parent / "prompt.txt").resolve(),
         )
 
@@ -246,6 +277,93 @@ class PolicyPromptTest(unittest.TestCase):
         self.assertNotIn("agent-task-validations", prompt)
         self.assertNotIn(MODULE.VALIDATION_PATH_PLACEHOLDER, prompt)
 
+    def test_semantic_policy_removes_worker_owned_identity_and_commit_shas(self):
+        semantic_path = ".github/agent-task-semantic/request-1.json"
+        options = MODULE.Options(
+            report=False,
+            model="gpt-5.6-sol",
+            prompt=f"Write `{MODULE.SEMANTIC_PATH_PLACEHOLDER}`.",
+            pull_request=MODULE.PrReference(1, "owner/repo", "owner/repo#1"),
+            apply_with_report=True,
+            result_file=(Path.cwd().parent / "result.json").resolve(),
+            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+            prompt_file=(Path.cwd().parent / "prompt.txt").resolve(),
+            semantic_kind="self-review-loop",
+        )
+
+        payload = MODULE.task_payload(
+            options,
+            report_path=semantic_path,
+            pull_request=MODULE.PullRequestSnapshot(
+                1,
+                "https://github.com/owner/repo/pull/1",
+                "OPEN",
+                "owner/repo",
+                "main",
+                "2" * 40,
+                "owner/repo",
+                "feature",
+                "1" * 40,
+                False,
+            ),
+            request_id="request-1",
+            repository="owner/repo",
+        )
+        prompt = payload["prompt"]
+
+        self.assertIn("Policy: marketplace-agent-apply-report-worker@4", prompt)
+        self.assertIn(f"only changed path is `{semantic_path}`", prompt)
+        self.assertIn('"kind": "self-review-loop"', prompt)
+        self.assertIn("one-based integer `commit_index`", prompt)
+        self.assertIn("identities belong only to the dispatcher", prompt.lower())
+        self.assertNotIn(MODULE.SEMANTIC_PATH_PLACEHOLDER, prompt)
+
+    def test_semantic_binding_rejects_identity_and_requires_every_commit(self):
+        commits = ["1" * 40, "2" * 40]
+        payload, references = MODULE.bind_semantic_payload(
+            {
+                "findings": [
+                    {"commit_index": 1},
+                    {"commit_index": 2},
+                    {"commit_index": 2},
+                ]
+            },
+            commits,
+        )
+        self.assertEqual(references, {1, 2})
+        self.assertEqual(
+            [finding["commit"] for finding in payload["findings"]],
+            [commits[0], commits[1], commits[1]],
+        )
+        with self.assertRaisesRegex(MODULE.CloudError, "dispatcher-owned"):
+            MODULE.bind_semantic_payload(
+                {"repository": "wrong/repo", "findings": []},
+                [],
+            )
+        for field in ("commit", "commits", "sha"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(MODULE.CloudError, "dispatcher-owned"):
+                    MODULE.bind_semantic_payload(
+                        {"findings": [{field: "1" * 40}]},
+                        [],
+                    )
+
+    def test_artifact_placeholders_do_not_cross_policy_boundaries(self):
+        with self.assertRaisesRegex(MODULE.CloudError, "unresolved artifact"):
+            MODULE.render_artifact_paths(
+                f"Write {MODULE.SEMANTIC_PATH_PLACEHOLDER}.",
+                report_path=".github/agent-task-reports/request-1.md",
+                worker_receipt=None,
+                semantic=False,
+            )
+        with self.assertRaisesRegex(MODULE.CloudError, "unresolved artifact"):
+            MODULE.render_artifact_paths(
+                f"Write {MODULE.REPORT_PATH_PLACEHOLDER}.",
+                report_path=".github/agent-task-semantic/request-1.json",
+                worker_receipt=None,
+                semantic=True,
+            )
+
     def test_structural_recovery_requires_request_id_and_rejects_receipt(self):
         result_path = str((Path.cwd().parent / "result.json").resolve())
         base = [
@@ -257,7 +375,7 @@ class PolicyPromptTest(unittest.TestCase):
             "--result-file",
             result_path,
             "--policy",
-            MODULE.MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+            MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
         ]
         with self.assertRaisesRegex(MODULE.CloudError, "--request-id"):
             MODULE.parse_args(base)
@@ -471,13 +589,14 @@ class InterruptedApplyRecoveryTest(unittest.TestCase):
                 self.pull_request,
             ),
             report_path=self.report_path,
+            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
         )
         task = self.mutated_task(prompt=prompt)
 
         self.validate(
             task,
             worker_receipt=None,
-            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
         )
 
     def test_structural_v1_recovery_cannot_cross_policy_versions(self):
@@ -507,7 +626,7 @@ class InterruptedApplyRecoveryTest(unittest.TestCase):
             self.validate(
                 task,
                 worker_receipt=None,
-                policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+                policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
             )
 
     def test_parse_requires_complete_recovery_identity(self):
@@ -1034,6 +1153,15 @@ class DispatcherFinalizationTest(unittest.TestCase):
             else mock.Mock()
         )
         report_fetch = mock.Mock(return_value=self.report)
+        semantic_fetch = mock.Mock(
+            return_value=(
+                {
+                    "outcome": "cleared",
+                    "findings": [{"commit": self.code_commit}],
+                },
+                "6" * 64,
+            )
+        )
         with (
             mock.patch.object(MODULE, "GitRepository", return_value=repository),
             mock.patch.object(MODULE, "ApiClient"),
@@ -1062,6 +1190,11 @@ class DispatcherFinalizationTest(unittest.TestCase):
                 return_value=(outcomes, "5" * 64),
             ),
             mock.patch.object(MODULE, "fetch_report", report_fetch),
+            mock.patch.object(
+                MODULE,
+                "fetch_semantic_output",
+                semantic_fetch,
+            ),
         ):
             code = MODULE.execute(
                 options,
@@ -1070,6 +1203,7 @@ class DispatcherFinalizationTest(unittest.TestCase):
                 result=result,
             )
         self.last_report_fetch = report_fetch
+        self.last_semantic_fetch = semantic_fetch
         return code, result, mutation, start
 
     def test_successfully_attests_and_applies_only_fix_commits(self):
@@ -1120,7 +1254,7 @@ class DispatcherFinalizationTest(unittest.TestCase):
             pull_request=MODULE.PrReference(7, "owner/repo", "owner/repo#7"),
             apply_with_report=True,
             result_file=Path("C:/state/result.json"),
-            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
             prompt_file=Path("C:/state/prompt.txt"),
         )
 
@@ -1158,6 +1292,47 @@ class DispatcherFinalizationTest(unittest.TestCase):
                 "structural_complete": True,
             },
         )
+
+    def test_semantic_apply_binds_payload_without_worker_report(self):
+        repository = self.repository()
+        options = MODULE.Options(
+            report=False,
+            model="gpt-5.6-sol",
+            prompt="Write {{MARKETPLACE_SEMANTIC_PATH}}.",
+            pull_request=MODULE.PrReference(7, "owner/repo", "owner/repo#7"),
+            apply_with_report=True,
+            result_file=Path("C:/state/result.json"),
+            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+            prompt_file=Path("C:/state/prompt.txt"),
+            semantic_kind="self-review-loop",
+        )
+
+        code, result, _, _ = self.execute(repository, options=options)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(result.schema_version, 3)
+        self.assertTrue(result.structural_complete)
+        self.assertIsNone(result.report_path)
+        self.assertEqual(
+            result.semantic_path,
+            ".github/agent-task-semantic/request-1.json",
+        )
+        self.assertEqual(result.semantic_commit, self.artifact_commit)
+        self.assertEqual(result.semantic_sha256, "6" * 64)
+        self.assertEqual(
+            result.semantic_payload,
+            {
+                "outcome": "cleared",
+                "findings": [{"commit": self.code_commit}],
+            },
+        )
+        self.assertEqual(result.application_status, "not_applied")
+        repository.fast_forward.assert_not_called()
+        self.last_report_fetch.assert_not_called()
+        self.last_semantic_fetch.assert_called_once()
+        envelope = result.as_dict()
+        self.assertEqual(envelope["attestation"]["kind"], "dispatcher_semantic")
+        self.assertIsNone(envelope["report"])
 
     def test_structural_v1_keeps_commit_trailer_correlation(self):
         repository = self.repository()

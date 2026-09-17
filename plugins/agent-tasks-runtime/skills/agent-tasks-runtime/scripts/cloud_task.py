@@ -39,8 +39,10 @@ BLOCKED_STATES = {"waiting_for_user", "idle"}
 KNOWN_STATES = ACTIVE_STATES | SUCCESS_STATES | ERROR_STATES | BLOCKED_STATES
 SHA_PATTERN = re.compile(r"\A[0-9a-fA-F]{40}\Z")
 REPORT_DIRECTORY = ".github/agent-task-reports"
+SEMANTIC_DIRECTORY = ".github/agent-task-semantic"
 VALIDATION_DIRECTORY = ".github/agent-task-validations"
 REPORT_PATH_PLACEHOLDER = "{{MARKETPLACE_REPORT_PATH}}"
+SEMANTIC_PATH_PLACEHOLDER = "{{MARKETPLACE_SEMANTIC_PATH}}"
 VALIDATION_PATH_PLACEHOLDER = "{{MARKETPLACE_VALIDATION_PATH}}"
 REPORT_MARKER = "----- /cloud report instructions -----"
 APPLY_WITH_REPORT_MARKER = "----- /cloud apply-with-report instructions -----"
@@ -49,6 +51,11 @@ POLICY_MARKER = "----- marketplace agent worker policy -----"
 RESULT_SCHEMA_ID = "github.copilot.agent-task-result"
 RESULT_SCHEMA_VERSION = 1
 REPORT_RESULT_SCHEMA_VERSION = 2
+SEMANTIC_RESULT_SCHEMA_VERSION = 3
+SEMANTIC_OUTPUT_SCHEMA = {
+    "id": "github.copilot.agent-task-semantic-output",
+    "version": 1,
+}
 MARKETPLACE_POLICY_ID = "marketplace-agent-worker"
 MARKETPLACE_POLICY_VERSION = 5
 MARKETPLACE_POLICY_SPEC = {
@@ -178,11 +185,32 @@ MARKETPLACE_APPLY_REPORT_POLICY_V2_SELECTOR = (
     f"{MARKETPLACE_APPLY_REPORT_POLICY_ID}@"
     f"{MARKETPLACE_APPLY_REPORT_POLICY_V2_VERSION}"
 )
-MARKETPLACE_APPLY_REPORT_POLICY_VERSION = 3
-MARKETPLACE_APPLY_REPORT_POLICY_SPEC = {
+MARKETPLACE_APPLY_REPORT_POLICY_V3_VERSION = 3
+MARKETPLACE_APPLY_REPORT_POLICY_V3_SPEC = {
     **MARKETPLACE_APPLY_REPORT_POLICY_V2_SPEC,
-    "version": MARKETPLACE_APPLY_REPORT_POLICY_VERSION,
+    "version": MARKETPLACE_APPLY_REPORT_POLICY_V3_VERSION,
     "application": "consumer-after-report-validation",
+}
+MARKETPLACE_APPLY_REPORT_POLICY_V3_HASH = hashlib.sha256(
+    json.dumps(
+        MARKETPLACE_APPLY_REPORT_POLICY_V3_SPEC,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+).hexdigest()
+MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR = (
+    f"{MARKETPLACE_APPLY_REPORT_POLICY_ID}@"
+    f"{MARKETPLACE_APPLY_REPORT_POLICY_V3_VERSION}"
+)
+MARKETPLACE_APPLY_REPORT_POLICY_VERSION = 4
+MARKETPLACE_APPLY_REPORT_POLICY_SPEC = {
+    **MARKETPLACE_APPLY_REPORT_POLICY_V3_SPEC,
+    "version": MARKETPLACE_APPLY_REPORT_POLICY_VERSION,
+    "worker_artifact": "versioned-semantic-json",
+    "worker_identity_fields": False,
+    "worker_commit_identity": "one-based-commit-index",
+    "dispatcher_semantic_binding": True,
 }
 MARKETPLACE_APPLY_REPORT_POLICY_HASH = hashlib.sha256(
     json.dumps(
@@ -199,7 +227,17 @@ MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR = (
 MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS = {
     MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR,
     MARKETPLACE_APPLY_REPORT_POLICY_V2_SELECTOR,
+    MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
     MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+}
+LEGACY_MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS = {
+    MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR,
+    MARKETPLACE_APPLY_REPORT_POLICY_V2_SELECTOR,
+    MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
+}
+RECOVERY_ONLY_APPLY_REPORT_POLICY_SELECTORS = {
+    MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR,
+    MARKETPLACE_APPLY_REPORT_POLICY_V2_SELECTOR,
 }
 FIX_COMMIT_CORRELATION_FIELD = "Finding"
 
@@ -248,6 +286,7 @@ class Options:
     task_id: str | None = None
     request_id: str | None = None
     worker_receipt: str | None = None
+    semantic_kind: str | None = None
     input_result_file: Path | None = None
     prior_result: Mapping[str, object] | None = None
     allow_merged_pr: bool = False
@@ -352,6 +391,11 @@ class ResultEnvelope:
     report_path: str | None = None
     report_commit: str | None = None
     report_sha256: str | None = None
+    semantic_kind: str | None = None
+    semantic_path: str | None = None
+    semantic_commit: str | None = None
+    semantic_sha256: str | None = None
+    semantic_payload: Mapping[str, object] | None = None
     receipt_path: str | None = None
     receipt_commit: str | None = None
     receipt_sha256: str | None = None
@@ -416,11 +460,31 @@ class ResultEnvelope:
                 else None
             ),
         }
-        if self.schema_version == REPORT_RESULT_SCHEMA_VERSION:
+        if self.schema_version in {
+            REPORT_RESULT_SCHEMA_VERSION,
+            SEMANTIC_RESULT_SCHEMA_VERSION,
+        }:
             common["attestation"] = {
-                "kind": "dispatcher_structural",
+                "kind": (
+                    "dispatcher_semantic"
+                    if self.schema_version == SEMANTIC_RESULT_SCHEMA_VERSION
+                    else "dispatcher_structural"
+                ),
                 "structural_complete": self.structural_complete,
             }
+            if self.schema_version == SEMANTIC_RESULT_SCHEMA_VERSION:
+                common["semantic_output"] = (
+                    {
+                        "schema": SEMANTIC_OUTPUT_SCHEMA,
+                        "kind": self.semantic_kind,
+                        "path": self.semantic_path,
+                        "commit": self.semantic_commit,
+                        "sha256": self.semantic_sha256,
+                        "payload": self.semantic_payload,
+                    }
+                    if self.semantic_path is not None
+                    else None
+                )
         else:
             common["worker_receipt"] = (
                 {
@@ -472,6 +536,7 @@ def parse_args(args: Sequence[str]) -> Options:
     task_id: str | None = None
     request_id: str | None = None
     worker_receipt: str | None = None
+    semantic_kind: str | None = None
     input_result_file: Path | None = None
     prior_result: Mapping[str, object] | None = None
     allow_merged_pr = False
@@ -593,6 +658,25 @@ def parse_args(args: Sequence[str]) -> Options:
                     "receipt_invalid",
                 )
             worker_receipt = args[index + 1]
+            index += 2
+            continue
+        if token == "--semantic-kind":
+            if index + 1 >= len(args):
+                raise CloudError(
+                    "--semantic-kind requires a value",
+                    "semantic_output_invalid",
+                )
+            if semantic_kind is not None:
+                raise CloudError(
+                    "--semantic-kind may be specified only once",
+                    "semantic_output_invalid",
+                )
+            semantic_kind = args[index + 1]
+            if not re.fullmatch(r"[a-z][a-z0-9.-]*", semantic_kind):
+                raise CloudError(
+                    "invalid --semantic-kind value",
+                    "semantic_output_invalid",
+                )
             index += 2
             continue
         if token == "--input-result-file":
@@ -725,11 +809,7 @@ def parse_args(args: Sequence[str]) -> Options:
             "policy_unknown",
         )
     if (
-        policy
-        in {
-            MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR,
-            MARKETPLACE_APPLY_REPORT_POLICY_V2_SELECTOR,
-        }
+        policy in RECOVERY_ONLY_APPLY_REPORT_POLICY_SELECTORS
         and not resume_apply_with_report
     ):
         raise CloudError(
@@ -766,6 +846,20 @@ def parse_args(args: Sequence[str]) -> Options:
         raise CloudError(
             f"{policy} requires "
             "--apply-with-report, --pr, --prompt-file, and --result-file",
+            "policy_rejected",
+        )
+    if policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR and semantic_kind is None:
+        raise CloudError(
+            f"{policy} requires --semantic-kind",
+            "policy_rejected",
+        )
+    if (
+        semantic_kind is not None
+        and policy != MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+    ):
+        raise CloudError(
+            "--semantic-kind is valid only with "
+            f"{MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR}",
             "policy_rejected",
         )
     if allow_merged_pr and (
@@ -896,6 +990,7 @@ def parse_args(args: Sequence[str]) -> Options:
         prior_result=prior_result,
         allow_merged_pr=allow_merged_pr,
         prompt_file=Path(prompt_file) if prompt_file is not None else None,
+        semantic_kind=semantic_kind,
     )
 
 
@@ -1096,6 +1191,9 @@ def structural_policy_metadata(policy: str) -> dict[str, object]:
     elif policy == MARKETPLACE_APPLY_REPORT_POLICY_V2_SELECTOR:
         version = MARKETPLACE_APPLY_REPORT_POLICY_V2_VERSION
         digest = MARKETPLACE_APPLY_REPORT_POLICY_V2_HASH
+    elif policy == MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR:
+        version = MARKETPLACE_APPLY_REPORT_POLICY_V3_VERSION
+        digest = MARKETPLACE_APPLY_REPORT_POLICY_V3_HASH
     elif policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
         version = MARKETPLACE_APPLY_REPORT_POLICY_VERSION
         digest = MARKETPLACE_APPLY_REPORT_POLICY_HASH
@@ -1299,7 +1397,10 @@ def read_structural_apply_result(
         )
     if status == "success":
         code_commits = generated["commits"]
-        two_phase = policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+        two_phase = policy in {
+            MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
+            MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+        }
         expected_local_head = (
             pull_request["head_sha"]
             if two_phase
@@ -1640,6 +1741,7 @@ def validate_interrupted_apply_task(
     report_path: str,
     worker_receipt: str | None,
     policy: str = MARKETPLACE_POLICY_SELECTOR,
+    semantic_kind: str | None = None,
 ) -> None:
     if task.get("id") != task_id:
         raise CloudError(
@@ -1687,10 +1789,14 @@ def validate_interrupted_apply_task(
             "malformed_report",
         )
     expected_prefix = build_pr_prompt("", pull_request)
-    expected_apply_suffix = build_apply_with_report_prompt(
-        "",
-        report_path,
-        worker_receipt,
+    expected_apply_suffix = (
+        ""
+        if policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+        else build_apply_with_report_prompt(
+            "",
+            report_path,
+            worker_receipt,
+        )
     )
     if policy == MARKETPLACE_POLICY_SELECTOR:
         if worker_receipt is None:
@@ -1708,14 +1814,13 @@ def validate_interrupted_apply_task(
             "",
             report_path=report_path,
             policy=policy,
+            semantic_kind=semantic_kind,
         )
     else:
         raise AssertionError("unsupported interrupted recovery policy")
-    markers = (
-        PR_CONTEXT_MARKER,
-        APPLY_WITH_REPORT_MARKER,
-        POLICY_MARKER,
-    )
+    markers = [PR_CONTEXT_MARKER, POLICY_MARKER]
+    if policy != MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+        markers.append(APPLY_WITH_REPORT_MARKER)
     if (
         any(prompt.count(marker) != 2 for marker in markers)
         or REPORT_MARKER in prompt
@@ -1728,15 +1833,17 @@ def validate_interrupted_apply_task(
             "task_identity_mismatch",
         )
     before_policy = prompt[: -len(expected_policy_suffix)]
-    if not before_policy.endswith(expected_apply_suffix):
+    if expected_apply_suffix and not before_policy.endswith(expected_apply_suffix):
         raise CloudError(
             "Agent Task prompt does not prove the expected report and validation "
             "artifact paths",
             "task_identity_mismatch",
         )
-    workflow_prompt = before_policy[
-        len(expected_prefix) : -len(expected_apply_suffix)
-    ]
+    workflow_prompt = (
+        before_policy[len(expected_prefix) : -len(expected_apply_suffix)]
+        if expected_apply_suffix
+        else before_policy[len(expected_prefix) :]
+    )
     if not workflow_prompt.strip():
         raise CloudError(
             "Agent Task prompt has no workflow instructions",
@@ -2199,6 +2306,7 @@ def build_apply_report_policy_prompt(
     *,
     report_path: str,
     policy: str = MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+    semantic_kind: str | None = None,
 ) -> str:
     if policy == MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR:
         policy_hash = MARKETPLACE_APPLY_REPORT_POLICY_V1_HASH
@@ -2208,7 +2316,7 @@ def build_apply_report_policy_prompt(
         )
     elif policy in {
         MARKETPLACE_APPLY_REPORT_POLICY_V2_SELECTOR,
-        MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+        MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
     }:
         policy_hash = str(structural_policy_metadata(policy)["sha256"])
         correlation = (
@@ -2216,6 +2324,43 @@ def build_apply_report_policy_prompt(
             "Record finding-to-commit and changed-path correlation only in the "
             "assigned report. The local workflow coordinator validates that mapping "
             "against the exact request and generated history before publication. "
+        )
+    elif policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+        if semantic_kind is None:
+            raise CloudError(
+                f"{policy} requires a semantic kind",
+                "policy_rejected",
+            )
+        semantic_shape = {
+            "schema": SEMANTIC_OUTPUT_SCHEMA,
+            "kind": semantic_kind,
+            "payload": {},
+        }
+        return (
+            f"{prompt.rstrip()}\n\n"
+            f"{POLICY_MARKER}\n"
+            f"Policy: {policy}\n"
+            f"Policy SHA-256: {MARKETPLACE_APPLY_REPORT_POLICY_HASH}\n"
+            "Authentication and all request, repository, pull request, frozen "
+            "head/base, model, policy, task, session, generated-history, and "
+            "completion identities belong only to the dispatcher. Do not echo, "
+            "reconstruct, or author any of them in the semantic output.\n"
+            "Put substantive code changes in zero or more linear single-parent "
+            "commits. Then create exactly one final single-parent semantic artifact "
+            f"commit whose only changed path is `{report_path}`. Write UTF-8 JSON "
+            "with exactly the wrapper shown below. Replace `payload` with the "
+            "workflow-specific semantic object required above; do not add wrapper "
+            "keys. Refer to a generated fix commit only with a one-based integer "
+            "`commit_index`, where 1 is the oldest generated fix commit. Use null "
+            "when no fix commit applies. Do not write commit SHAs or identity fields "
+            "such as request_id, repository, pull_request, head, base, model, policy, "
+            "task, session, generated, validation, report, or receipt. The dispatcher "
+            "derives history, binds trusted identity, resolves commit indices, and "
+            "writes the canonical result envelope. Every generated fix commit must be "
+            "referenced by at least one commit_index; missing, malformed, out-of-range, "
+            "or extra references fail closed.\n"
+            f"{json.dumps(semantic_shape, ensure_ascii=False, sort_keys=True)}\n"
+            f"{POLICY_MARKER}"
         )
     else:
         raise CloudError(f"unsupported structural apply policy {policy!r}")
@@ -3542,8 +3687,12 @@ def render_artifact_paths(
     *,
     report_path: str,
     worker_receipt: str | None,
+    semantic: bool,
 ) -> str:
-    rendered = prompt.replace(REPORT_PATH_PLACEHOLDER, report_path)
+    placeholder = (
+        SEMANTIC_PATH_PLACEHOLDER if semantic else REPORT_PATH_PLACEHOLDER
+    )
+    rendered = prompt.replace(placeholder, report_path)
     if VALIDATION_PATH_PLACEHOLDER in rendered:
         if worker_receipt is None:
             raise CloudError(
@@ -3551,7 +3700,11 @@ def render_artifact_paths(
                 "policy_required",
             )
         rendered = rendered.replace(VALIDATION_PATH_PLACEHOLDER, worker_receipt)
-    if REPORT_PATH_PLACEHOLDER in rendered or VALIDATION_PATH_PLACEHOLDER in rendered:
+    if (
+        REPORT_PATH_PLACEHOLDER in rendered
+        or SEMANTIC_PATH_PLACEHOLDER in rendered
+        or VALIDATION_PATH_PLACEHOLDER in rendered
+    ):
         raise CloudError(
             "the workflow prompt contains an unresolved artifact path placeholder",
             "malformed_report",
@@ -3622,20 +3775,29 @@ def task_payload(
                 options.prompt,
                 report_path=report_path,
                 worker_receipt=worker_receipt,
+                semantic=False,
             ),
             report_path,
         )
     elif options.apply_with_report:
         if report_path is None:
             raise AssertionError("apply-with-report mode did not allocate a report path")
-        prompt = build_apply_with_report_prompt(
-            render_artifact_paths(
-                options.prompt,
-                report_path=report_path,
-                worker_receipt=worker_receipt,
+        rendered = render_artifact_paths(
+            options.prompt,
+            report_path=report_path,
+            worker_receipt=worker_receipt,
+            semantic=(
+                options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
             ),
-            report_path,
-            worker_receipt if options.policy is not None else None,
+        )
+        prompt = (
+            rendered
+            if options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+            else build_apply_with_report_prompt(
+                rendered,
+                report_path,
+                worker_receipt if options.policy is not None else None,
+            )
         )
     else:
         prompt = options.prompt
@@ -3667,6 +3829,7 @@ def task_payload(
             prompt,
             report_path=report_path,
             policy=options.policy,
+            semantic_kind=options.semantic_kind,
         )
     payload: dict[str, object] = {
         "prompt": prompt,
@@ -3856,6 +4019,126 @@ def fetch_report(
     return content
 
 
+SEMANTIC_IDENTITY_KEYS = {
+    "base",
+    "base_sha",
+    "commit",
+    "commits",
+    "fix_commit",
+    "fix_commits",
+    "generated",
+    "head",
+    "head_sha",
+    "model",
+    "policy",
+    "pull_request",
+    "receipt",
+    "report",
+    "repository",
+    "request_id",
+    "session",
+    "sha",
+    "task",
+    "validation",
+    "validation_complete",
+}
+
+
+def bind_semantic_payload(
+    value: object,
+    commits: Sequence[str],
+) -> tuple[object, set[int]]:
+    references: set[int] = set()
+
+    def bind(item: object) -> object:
+        if isinstance(item, list):
+            return [bind(entry) for entry in item]
+        if not isinstance(item, dict):
+            return item
+        forbidden = sorted(SEMANTIC_IDENTITY_KEYS & set(item))
+        if forbidden:
+            raise CloudError(
+                "semantic output contains dispatcher-owned fields: "
+                + ", ".join(forbidden),
+                "semantic_output_invalid",
+            )
+        result: dict[str, object] = {}
+        for key, nested in item.items():
+            if not isinstance(key, str):
+                raise CloudError(
+                    "semantic output contains a non-string key",
+                    "semantic_output_invalid",
+                )
+            if key == "commit_index":
+                if "commit" in item:
+                    raise CloudError(
+                        "semantic output contains both commit and commit_index",
+                        "semantic_output_invalid",
+                    )
+                if nested is None:
+                    result["commit"] = None
+                    continue
+                if (
+                    isinstance(nested, bool)
+                    or not isinstance(nested, int)
+                    or nested < 1
+                    or nested > len(commits)
+                ):
+                    raise CloudError(
+                        "semantic output contains an invalid commit_index",
+                        "semantic_output_invalid",
+                    )
+                references.add(nested)
+                result["commit"] = commits[nested - 1]
+                continue
+            result[key] = bind(nested)
+        return result
+
+    return bind(value), references
+
+
+def fetch_semantic_output(
+    api: ApiClient,
+    repository: str,
+    path: str,
+    head_ref: str,
+    *,
+    kind: str,
+    commits: Sequence[str],
+) -> tuple[Mapping[str, object], str]:
+    try:
+        content = fetch_report(api, repository, path, head_ref)
+        value = json.loads(content)
+    except (CloudError, json.JSONDecodeError) as error:
+        message = str(error) if isinstance(error, CloudError) else error.msg
+        raise CloudError(
+            f"malformed marketplace semantic output {path}: {message}",
+            "semantic_output_invalid",
+        ) from None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema", "kind", "payload"}
+        or value.get("schema") != SEMANTIC_OUTPUT_SCHEMA
+        or value.get("kind") != kind
+        or not isinstance(value.get("payload"), dict)
+        or not value["payload"]
+    ):
+        raise CloudError(
+            "marketplace semantic output has an unsupported wrapper",
+            "semantic_output_invalid",
+        )
+    payload, references = bind_semantic_payload(value["payload"], commits)
+    expected_references = set(range(1, len(commits) + 1))
+    if references != expected_references:
+        raise CloudError(
+            "semantic output does not account for every generated fix commit",
+            "semantic_output_invalid",
+        )
+    if not isinstance(payload, dict):
+        raise AssertionError("semantic payload binding lost its object shape")
+    return payload, hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 def fetch_worker_receipt(
     api: ApiClient,
     repository: str,
@@ -3945,13 +4228,17 @@ def execute(
     api = ApiClient(runner, sleep, wall_clock)
     if result is not None:
         result.schema_version = (
-            REPORT_RESULT_SCHEMA_VERSION
-            if options.policy
-            in {
-                MARKETPLACE_REPORT_POLICY_SELECTOR,
-                *MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
-            }
-            else RESULT_SCHEMA_VERSION
+            SEMANTIC_RESULT_SCHEMA_VERSION
+            if options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+            else (
+                REPORT_RESULT_SCHEMA_VERSION
+                if options.policy
+                in {
+                    MARKETPLACE_REPORT_POLICY_SELECTOR,
+                    *LEGACY_MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
+                }
+                else RESULT_SCHEMA_VERSION
+            )
         )
         result.mode = mode_name(options)
         result.requested_model = options.model
@@ -4091,7 +4378,11 @@ def execute(
                 pull_request=pull_request,
             )
     report_path = (
-        f"{REPORT_DIRECTORY}/{request_id}.md"
+        (
+            f"{SEMANTIC_DIRECTORY}/{request_id}.json"
+            if options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+            else f"{REPORT_DIRECTORY}/{request_id}.md"
+        )
         if options.report or options.apply_with_report
         else None
     )
@@ -4116,10 +4407,16 @@ def execute(
                 and options.policy
                 in {
                     MARKETPLACE_REPORT_POLICY_SELECTOR,
-                    *MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
+                    *LEGACY_MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
                 }
             ):
                 result.report_path = report_path
+            elif (
+                report_path is not None
+                and options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+            ):
+                result.semantic_kind = options.semantic_kind
+                result.semantic_path = report_path
     if options.task_id is not None:
         initial = get_task(api, repository, options.task_id)
         if options.resume_apply_with_report:
@@ -4137,6 +4434,7 @@ def execute(
                 report_path=report_path,
                 worker_receipt=receipt,
                 policy=str(options.policy),
+                semantic_kind=options.semantic_kind,
             )
     else:
         initial = start_task(
@@ -4218,6 +4516,7 @@ def execute(
     commits: list[str] | None = None
     worker_history: WorkerHistory | None = None
     policy_report: str | None = None
+    semantic_payload: Mapping[str, object] | None = None
     if options.policy is not None:
         if policy_identity is None:
             raise AssertionError("policy mode did not record local identity")
@@ -4287,9 +4586,15 @@ def execute(
         if result is not None:
             result.cloud_commits = commits
             result.receipt_commit = worker_history.receipt_commit
-            if report_path is not None:
+            if (
+                report_path is not None
+                and options.policy != MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+            ):
                 result.report_path = report_path
                 result.report_commit = worker_history.receipt_commit
+            elif report_path is not None:
+                result.semantic_path = report_path
+                result.semantic_commit = worker_history.receipt_commit
         if (
             options.allow_merged_pr
             and generated_head != worker_history.receipt_commit
@@ -4315,7 +4620,27 @@ def execute(
                 receipt,
                 worker_history.receipt_commit,
             )
-        if report_path is not None:
+        if (
+            report_path is not None
+            and options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+        ):
+            if options.semantic_kind is None:
+                raise AssertionError("semantic policy lost its kind")
+            try:
+                semantic_payload, semantic_digest = fetch_semantic_output(
+                    api,
+                    repository,
+                    report_path,
+                    worker_history.receipt_commit,
+                    kind=options.semantic_kind,
+                    commits=worker_history.code_commits,
+                )
+            except CloudError as error:
+                raise _missing_report_context(error, final, refs) from None
+            if result is not None:
+                result.semantic_payload = semantic_payload
+                result.semantic_sha256 = semantic_digest
+        elif report_path is not None:
             try:
                 policy_report = fetch_report(
                     api,
@@ -4374,7 +4699,11 @@ def execute(
                 result.validation_complete = True
                 result.validation_outcomes = outcomes
                 result.receipt_sha256 = validation_digest
-            if report_path is not None and policy_report is not None:
+            if (
+                report_path is not None
+                and policy_report is not None
+                and options.policy != MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+            ):
                 result.report_sha256 = report_digest
 
     if options.monitor_only:
@@ -4431,7 +4760,15 @@ def execute(
                 worker_history.receipt_commit,
             )
             report = policy_report
-            if report is None:
+            if (
+                options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+                and semantic_payload is None
+            ):
+                raise AssertionError("policy mode did not retrieve semantic output")
+            if (
+                options.policy != MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+                and report is None
+            ):
                 raise AssertionError("policy mode did not retrieve its report")
             if options.policy in {
                 MARKETPLACE_POLICY_SELECTOR,
@@ -4453,7 +4790,7 @@ def execute(
                 )
             except CloudError as error:
                 raise _missing_report_context(error, final, refs) from None
-        if result is not None:
+        if result is not None and options.policy != MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
             result.cloud_commits = list(history.code_commits)
             result.report_path = report_path
             result.report_commit = history.report_commit
@@ -4482,9 +4819,12 @@ def execute(
                 f"{', '.join(history.code_commits) or 'none'}",
                 error.code,
             ) from None
-        if options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR:
+        if options.policy in {
+            MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
+            MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+        }:
             print(
-                f"Validated {len(history.code_commits)} fix commit(s) and report "
+                f"Validated {len(history.code_commits)} fix commit(s) and semantic "
                 f"commit {history.report_commit} without modifying "
                 f"{snapshot.branch}.",
                 file=stderr,

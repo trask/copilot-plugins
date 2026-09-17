@@ -2535,7 +2535,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             ]
             package = {
                 "name": "ci-fix-loop",
-                "version": "1.6.35",
+                "version": "1.6.37",
                 "file_count": 1,
                 "byte_count": helper.stat().st_size,
                 "package_sha256": MODULE.canonical_package_digest(files),
@@ -2686,7 +2686,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "installed_root": str(root / "installed"),
                 "package": {
                     "name": "ci-fix-loop",
-                    "version": "1.6.35",
+                    "version": "1.6.37",
                     "file_count": 8,
                     "package_sha256": "c" * 64,
                 },
@@ -2846,7 +2846,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "installed_root": str(root / "installed"),
                 "package": {
                     "name": "ci-fix-loop",
-                    "version": "1.6.35",
+                    "version": "1.6.37",
                     "file_count": 8,
                     "package_sha256": "c" * 64,
                 },
@@ -3055,7 +3055,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "installed_root": str(root / "installed"),
                 "package": {
                     "name": "ci-fix-loop",
-                    "version": "1.6.35",
+                    "version": "1.6.37",
                     "file_count": 8,
                     "package_sha256": "c" * 64,
                 },
@@ -3413,7 +3413,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [execute, agent, todo", instructions)
-        self.assertEqual("1.6.36", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.37", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_canonicalizes_stack_start_target(self):
         instructions = AGENT.read_text(encoding="utf-8")

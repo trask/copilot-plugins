@@ -40,17 +40,37 @@ validation claim. Result schema version 2 records
 path, and digest facts independently established by the dispatcher. Report
 content remains untrusted inert evidence for a consumer to evaluate.
 
-Policy `marketplace-agent-apply-report-worker@3` extends that structural
-contract to apply workflows. It permits zero or more ordered fix commits
-followed by exactly one dispatcher-assigned Markdown report commit. The
-dispatcher fetches and validates the generated history but leaves the consumer
-worktree at its pinned source head. It records result schema version 2 with
-`attestation.kind=dispatcher_structural` and `application.status=not_applied`.
-It does not request or parse a worker validation artifact, and report text about
-commands or outcomes remains untrusted inert evidence. Finding-to-commit
-correlation lives only in the workflow-specific report. Each consumer must
-validate the report against its pinned findings, generated commit order, exact
-changed paths, and live identity before a guarded fast-forward and publication.
+Policy `marketplace-agent-apply-report-worker@4` is the current apply contract.
+The worker writes one request-scoped
+`github.copilot.agent-task-semantic-output` version 1 JSON artifact and may
+produce ordered fix commits. The semantic payload contains only
+workflow-specific findings, decisions, and validation evidence. It cannot
+contain dispatcher-owned request, repository, pull request, frozen head or
+base, model, policy, task, session, generated-ref, commit, report, receipt, or
+validation-completion identity. Findings refer to generated commits only by
+one-based `commit_index`.
+
+The dispatcher derives the complete fix history from Git, resolves every commit
+index, requires the payload to account for every generated fix commit, and
+returns result schema version 3 with
+`attestation.kind=dispatcher_semantic`. Consumers combine that payload with
+their frozen local request to generate the canonical workflow report and then
+run their workflow-specific consistency checks before guarded publication.
+Missing or malformed semantic output, unaccounted commits, stale frozen
+identity, and clean outcomes with nonempty fix history fail closed.
+
+Validation evidence remains semantic worker output because the dispatcher
+cannot truthfully claim commands it did not execute. It is never promoted to a
+dispatcher validation claim or inferred from prose or standard output.
+
+Policy `marketplace-agent-apply-report-worker@3` remains dispatchable for
+existing consumers and recoverable for tasks created under that immutable
+contract. It permits zero or more ordered fix commits followed by exactly one
+dispatcher-assigned Markdown report commit. The dispatcher records result schema version 2 with
+`attestation.kind=dispatcher_structural` and
+`application.status=not_applied`. Legacy report content stays untrusted and
+must pass the original consumer validation; it is never normalized into a
+version 4 semantic result.
 
 Policy `marketplace-agent-apply-report-worker@2` remains available only for
 recovery of tasks created under that immutable contract. It applies fix commits

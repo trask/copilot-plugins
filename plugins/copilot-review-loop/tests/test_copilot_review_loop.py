@@ -2185,7 +2185,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.52")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.53")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -4242,7 +4242,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "packages": [
                 {
                     "name": "copilot-review-loop",
-                    "version": "1.1.52",
+                    "version": "1.1.53",
                     "file_count": 25,
                     "package_sha256": "c" * 64,
                 }
@@ -4495,7 +4495,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         helper_path.write_text("exact helper bytes\n", encoding="utf-8", newline="\n")
         plugin_path = package_root / "plugin.json"
         plugin_path.write_text(
-            '{"name":"copilot-review-loop","version":"1.1.52"}\n',
+            '{"name":"copilot-review-loop","version":"1.1.53"}\n',
             encoding="utf-8",
             newline="\n",
         )
@@ -4511,7 +4511,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             )
         package = {
             "name": "copilot-review-loop",
-            "version": "1.1.52",
+            "version": "1.1.53",
             "file_count": len(files),
             "byte_count": sum(item["size"] for item in files),
             "package_sha256": MODULE.canonical_package_digest(files),

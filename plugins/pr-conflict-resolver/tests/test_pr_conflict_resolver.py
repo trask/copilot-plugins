@@ -887,11 +887,11 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "9b34e33c65e87e02e87344f3a7b14018be168c69b273ad29e2887ff2335d107f",
+            "72adbe1a50a294fb8123155077d215e62a20a3d65c7a37203217c87fc87e238a",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
-            "30c96b070bed7b652ffd9181fd4f74b052f670226dab9693d595338aaf0a9d6a",
+            "8ef8ce9fd429740875f1c06ae3c2dbb10f06759e49179a05dc9f493d4c72bd60",
         )
         self.assertEqual(
             MODULE.CONFLICT_REQUEST_SCHEMA["id"],
@@ -3919,6 +3919,103 @@ class ManagedTaskPromptTest(unittest.TestCase):
         self.assertIn(request["pull_request"]["head_sha"], prompt)
         self.assertIn("complete_values_in_retained_request", prompt)
 
+    def test_semantic_contract_assigns_refs_and_removes_worker_receipt_identity(self):
+        request = self.request()
+        prompt = CLOUD_MODULE.policy_prompt(self.options(request))
+
+        self.assertIn("Policy: marketplace-conflict-worker@2", prompt)
+        self.assertIn(
+            CLOUD_MODULE.assigned_code_ref(request["request_id"], "code"),
+            prompt,
+        )
+        self.assertIn("derives every SHA", prompt)
+        self.assertIn('"kind": "conflict-resolution"', prompt)
+        self.assertIn("Do not include SHAs, refs, roles, request identity", prompt)
+        self.assertNotIn("Compact required receipt contract", prompt)
+
+    def test_missing_semantic_artifact_fails_closed(self):
+        request = self.request()
+        snapshot = CLOUD_MODULE.LocalSnapshot(
+            Path("C:/repo"),
+            Path("C:/state"),
+            request["repository"],
+            "origin",
+            request["pull_request"]["head_ref"],
+            request["pull_request"]["head_sha"],
+            "",
+            None,
+        )
+        remote = CLOUD_MODULE.RemoteRef(
+            "artifact",
+            None,
+            request["repository"],
+            "copilot/task-1",
+        )
+        final_code_head = "c" * 40
+        artifact_head = "d" * 40
+
+        with (
+            mock.patch.object(
+                CLOUD_MODULE,
+                "parents",
+                return_value=[final_code_head],
+            ),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "changed_paths",
+                return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
+            ),
+            mock.patch.object(CLOUD_MODULE, "git_show_file", return_value=""),
+            self.assertRaisesRegex(
+                CLOUD_MODULE.ConflictError,
+                "semantic output is malformed",
+            ),
+        ):
+            CLOUD_MODULE.validate_semantic_artifact(
+                mock.Mock(),
+                snapshot,
+                request,
+                remote,
+                artifact_head,
+                final_code_head,
+            )
+
+    def test_runtime_generates_identity_bound_report_and_receipt(self):
+        request = self.request()
+        code_ref = {
+            "role": "code",
+            "pr_number": request["pull_request"]["number"],
+            "repository": request["repository"],
+            "ref": CLOUD_MODULE.assigned_code_ref(request["request_id"], "code"),
+            "old_sha": request["pull_request"]["head_sha"],
+            "new_sha": "c" * 40,
+            "base_ref": request["pull_request"]["base_ref"],
+            "base_sha": request["pull_request"]["head_sha"],
+            "lease_sha": request["pull_request"]["head_sha"],
+            "commits": ["c" * 40],
+        }
+        validations = [
+            {
+                "command": "git diff --check",
+                "status": "passed",
+                "detail": "clean",
+            }
+        ]
+
+        report, receipt = CLOUD_MODULE.canonical_conflict_artifacts(
+            request,
+            [code_ref],
+            validations,
+            "Resolved both sides.",
+        )
+
+        self.assertIn(request["request_id"], report)
+        self.assertIn(request["request_sha256"], report)
+        self.assertEqual(receipt["request"]["id"], request["request_id"])
+        self.assertEqual(receipt["policy"], CLOUD_MODULE.POLICY)
+        self.assertEqual(receipt["generated_refs"][0]["ref"], code_ref)
+        self.assertEqual(receipt["validation"], validations)
+
     def test_small_path_corpus_is_retained_exactly(self):
         paths = ["src/main.py", "src/café.py"]
 
@@ -4055,13 +4152,10 @@ class ManagedTaskPromptTest(unittest.TestCase):
         )
 
         self.assertEqual(first, second)
-        self.assertGreater(
-            len(legacy_prompt),
-            CLOUD_MODULE.AGENT_TASK_PROMPT_MAX_CHARACTERS,
-        )
+        self.assertGreater(len(legacy_prompt), len(first))
         self.assertGreater(
             len(legacy_prompt.encode("utf-8")),
-            CLOUD_MODULE.AGENT_TASK_PROMPT_MAX_UTF8_BYTES,
+            len(first.encode("utf-8")),
         )
         self.assertLessEqual(
             len(first) + CLOUD_MODULE.TASK_PROMPT_HEADROOM_CHARACTERS,
@@ -4076,7 +4170,12 @@ class ManagedTaskPromptTest(unittest.TestCase):
             + CLOUD_MODULE.TASK_PROMPT_HEADROOM_UTF8_BYTES,
             CLOUD_MODULE.AGENT_TASK_PROMPT_MAX_UTF8_BYTES,
         )
-        self.assertIn('"commit_mapping_keys"', first)
+        self.assertIn('"commit_annotations"', first)
+        for role in ("member-20070", "member-20075"):
+            self.assertIn(
+                CLOUD_MODULE.assigned_code_ref(request["request_id"], role),
+                first,
+            )
         compact_members = compact["native_stack"]["members"]
         self.assertEqual(
             [20070, 20075],

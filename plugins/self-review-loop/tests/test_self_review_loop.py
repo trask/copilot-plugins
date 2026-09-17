@@ -1315,7 +1315,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         commits = [] if commits is None else commits
         request_id = "request-1"
         return {
-            "schema": MODULE.AGENT_TASK_RESULT_SCHEMA,
+            "schema": MODULE.STRUCTURAL_AGENT_TASK_RESULT_SCHEMA,
             "status": "success",
             "mode": "apply_with_report",
             "repository": {"name_with_owner": "owner/repo"},
@@ -1324,7 +1324,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "policy": {
                 "id": "marketplace-agent-apply-report-worker",
                 "version": 3,
-                "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
+                "sha256": MODULE.LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V3["sha256"],
             },
             "task": {
                 "id": "task-1",
@@ -1353,6 +1353,36 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             },
             "error": None,
         }
+
+    def semantic_result(self, *, commits=None, payload):
+        result = self.result(commits=commits)
+        result.update(
+            {
+                "schema": MODULE.AGENT_TASK_RESULT_SCHEMA,
+                "policy": {
+                    "id": "marketplace-agent-apply-report-worker",
+                    "version": 4,
+                    "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
+                },
+                "report": None,
+                "semantic_output": {
+                    "schema": {
+                        "id": "github.copilot.agent-task-semantic-output",
+                        "version": 1,
+                    },
+                    "kind": "self-review-loop",
+                    "path": ".github/agent-task-semantic/request-1.json",
+                    "commit": self.artifact,
+                    "sha256": "5" * 64,
+                    "payload": payload,
+                },
+                "attestation": {
+                    "kind": "dispatcher_semantic",
+                    "structural_complete": True,
+                },
+            }
+        )
+        return result
 
     def legacy_malformed_owner_state(self, state_path):
         request_id = "legacy-request-1"
@@ -1915,14 +1945,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-apply-report-worker@3", instructions)
+        self.assertIn("marketplace-agent-apply-report-worker@4", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("marketplace `custom_agent`", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.32")
+        self.assertEqual(plugin["version"], "1.3.33")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -1940,21 +1970,200 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             max_iterations=5,
             prior_history=[],
         )
-        self.assertIn("human-readable UTF-8 Markdown report", prompt)
+        self.assertIn("workflow-specific semantic payload", prompt)
         self.assertIn("worker prompt version 6", prompt)
-        self.assertIn("do not omit the repository", prompt)
-        self.assertIn("including both head and base refs", prompt)
-        self.assertIn("Never put `head`, `base`, or `fix_commits`", prompt)
-        self.assertIn("never encode `pull_request` as an integer", prompt)
-        self.assertIn("Do not nest `head`, `base`, or `fix_commits`", prompt)
+        self.assertIn("Do not copy request, repository, pull request", prompt)
+        self.assertIn("one-based `commit_index`", prompt)
+        self.assertIn("binds the frozen identity", prompt)
+        self.assertIn("{{MARKETPLACE_SEMANTIC_PATH}}", prompt)
+        self.assertNotIn('"request_id":', prompt)
         self.assertIn("maximum_review_iterations", prompt)
         self.assertIn("untrusted data", prompt)
-        self.assertIn("Map every fix commit to its findings in the report", prompt)
+        self.assertIn("Map every fix commit to its findings", prompt)
         self.assertNotIn("`Finding: <identifier>`", prompt)
         self.assertIn("explicit no-change result", prompt)
-        self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
+        self.assertIn("`{{MARKETPLACE_SEMANTIC_PATH}}`", prompt)
         self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
+
+    def test_canonical_semantic_report_binds_frozen_identity(self):
+        content = MODULE.canonical_self_review_report(
+            preflight=self.preflight,
+            request_id="request-1",
+            semantic_payload={
+                "outcome": "cleared",
+                "iterations_used": 1,
+                "findings": [],
+                "pull_request_metadata": {
+                    "decision": "keep",
+                    "title": self.preflight["pr"]["title"],
+                    "body": self.preflight["pr"]["body"],
+                    "reason": "No metadata change is needed.",
+                },
+            },
+        )
+        report = MODULE.parse_markdown_report(
+            content,
+            description="canonical semantic report",
+        )
+
+        self.assertEqual(report["request_id"], "request-1")
+        self.assertEqual(
+            report["pull_request"]["base_sha"],
+            self.preflight["pr"]["base_sha"],
+        )
+        self.assertEqual(
+            report["pull_request"]["head_sha"],
+            self.preflight["pr"]["head_sha"],
+        )
+
+    def test_clean_semantic_payload_cannot_hide_a_fix_commit(self):
+        commit = "4" * 40
+        remote = {
+            "requires_apply": True,
+            "commits": [commit],
+        }
+        content = MODULE.canonical_self_review_report(
+            preflight=self.preflight,
+            request_id="request-1",
+            semantic_payload={
+                "outcome": "cleared",
+                "iterations_used": 1,
+                "findings": [],
+                "pull_request_metadata": {
+                    "decision": "keep",
+                    "title": self.preflight["pr"]["title"],
+                    "body": self.preflight["pr"]["body"],
+                    "reason": "No metadata change is needed.",
+                },
+            },
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "account for every fix commit",
+        ):
+            MODULE.validate_self_review_report(
+                content,
+                request_id="request-1",
+                preflight=self.preflight,
+                remote=remote,
+                max_iterations=5,
+                paths_by_commit={commit: ["src/app.py"]},
+            )
+
+    def test_semantic_result_preserves_distinct_artifact_and_report_digests(self):
+        result = self.result()
+        payload = {
+            "outcome": "cleared",
+            "iterations_used": 1,
+            "findings": [],
+            "pull_request_metadata": {
+                "decision": "keep",
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+                "reason": "No metadata change is needed.",
+            },
+        }
+        semantic_sha256 = "5" * 64
+        result.update(
+            {
+                "schema": MODULE.AGENT_TASK_RESULT_SCHEMA,
+                "policy": {
+                    "id": "marketplace-agent-apply-report-worker",
+                    "version": 4,
+                    "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
+                },
+                "report": None,
+                "semantic_output": {
+                    "schema": {
+                        "id": "github.copilot.agent-task-semantic-output",
+                        "version": 1,
+                    },
+                    "kind": "self-review-loop",
+                    "path": ".github/agent-task-semantic/request-1.json",
+                    "commit": self.artifact,
+                    "sha256": semantic_sha256,
+                    "payload": payload,
+                },
+                "attestation": {
+                    "kind": "dispatcher_semantic",
+                    "structural_complete": True,
+                },
+            }
+        )
+
+        remote = MODULE.validate_success_result(
+            result,
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+        )
+        report_content = MODULE.canonical_self_review_report(
+            preflight=self.preflight,
+            request_id="request-1",
+            semantic_payload=payload,
+        )
+
+        self.assertEqual(remote["semantic_sha256"], semantic_sha256)
+        self.assertEqual(
+            remote["report_sha256"],
+            MODULE.sha256_text(report_content),
+        )
+        self.assertNotEqual(remote["report_sha256"], semantic_sha256)
+
+    def test_semantic_report_identity_survives_prepare_and_apply(self):
+        prompt_path = self.directory / "prompt.txt"
+        result_path = self.directory / "result.json"
+        prompt_path.write_text("prompt", encoding="utf-8")
+        result_path.write_text("result", encoding="utf-8")
+        report_content = "# Self Review Loop result\n"
+        report_identity = {
+            "path": ".github/agent-task-semantic/request-1.json",
+            "commit": self.artifact,
+            "sha256": MODULE.sha256_text(report_content),
+        }
+        task_state = {
+            "report": report_identity,
+            "prompt_file": str(prompt_path),
+            "result_file": str(result_path),
+        }
+
+        MODULE.finalize_agent_task_artifacts(
+            task_state,
+            {prompt_path, result_path},
+            preserve=True,
+            report_content=report_content,
+        )
+        MODULE.validate_preserved_agent_task_artifacts(
+            task_state,
+            self.directory / "repo",
+            report_content=report_content,
+        )
+
+        self.assertEqual(len(task_state["preserved_artifacts"]), 3)
+
+    def test_prepared_semantic_report_recovers_its_request_identity(self):
+        task_state = {
+            "task_id": "task-1",
+            "generated_head": self.artifact,
+            "report_path": ".github/agent-task-semantic/request-1.json",
+            "report_sha256": "5" * 64,
+            "preflight": self.preflight,
+            "preparation": {
+                "report_identity_recovery": {
+                    "base_sha": "4" * 40,
+                    "task_id": "task-1",
+                    "request_id": "request-1",
+                    "generated_head": self.artifact,
+                    "report_sha256": "5" * 64,
+                }
+            },
+        }
+
+        self.assertEqual(
+            MODULE.validated_prepared_report_recovery_base(task_state),
+            "4" * 40,
+        )
 
     def test_validates_result_receipt_and_explicit_no_change_report(self):
         remote = self.remote()
@@ -3323,13 +3532,18 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "body": "Accurate body",
             "reason": "The final diff changes the public behavior.",
         }
-        report = self.report(
-            commits=[fix],
-            findings=[finding],
-            metadata=metadata,
+        payload = {
+            "outcome": "cleared",
+            "iterations_used": 1,
+            "findings": [finding],
+            "pull_request_metadata": metadata,
+        }
+        report = MODULE.canonical_self_review_report(
+            preflight=self.preflight,
+            request_id="request-1",
+            semantic_payload=payload,
         )
-        result = self.result(commits=[fix])
-        result["report"]["sha256"] = MODULE.sha256_text(report)
+        result = self.semantic_result(commits=[fix], payload=payload)
         helper_launches = 0
 
         def prepare_run(command, **_kwargs):

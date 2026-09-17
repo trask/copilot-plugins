@@ -37,10 +37,24 @@ PATH_EVIDENCE_BOUNDARY_COUNT = 8
 PATH_EVIDENCE_VALUE_MAX_BYTES = 256
 MODE = "conflict_with_report"
 REQUEST_SCHEMA = {"id": "github.copilot.agent-task-conflict-request", "version": 1}
-RESULT_SCHEMA = {"id": "github.copilot.agent-task-conflict-result", "version": 1}
+RESULT_SCHEMA = {"id": "github.copilot.agent-task-conflict-result", "version": 2}
+LEGACY_RESULT_SCHEMA = {"id": "github.copilot.agent-task-conflict-result", "version": 1}
 RECEIPT_SCHEMA = {"id": "github.copilot.agent-task-conflict-receipt", "version": 1}
+SEMANTIC_SCHEMA = {
+    "id": "github.copilot.agent-task-conflict-semantic-output",
+    "version": 1,
+}
 POLICY_ID = "marketplace-conflict-worker"
-POLICY_VERSION = 1
+LEGACY_POLICY_VERSION = 1
+LEGACY_POLICY_SHA256 = (
+    "30c96b070bed7b652ffd9181fd4f74b052f670226dab9693d595338aaf0a9d6a"
+)
+LEGACY_POLICY = {
+    "id": POLICY_ID,
+    "version": LEGACY_POLICY_VERSION,
+    "sha256": LEGACY_POLICY_SHA256,
+}
+POLICY_VERSION = 2
 POLICY_SPEC = {
     "id": POLICY_ID,
     "version": POLICY_VERSION,
@@ -48,9 +62,12 @@ POLICY_SPEC = {
     "authentication": "local-gh-api",
     "custom_agent": False,
     "local_fallback": False,
-    "generated_ref_publication": "receipt-declared-only",
+    "generated_ref_publication": "dispatcher-assigned-request-scoped",
     "user_branch_publication": False,
     "quarantined_refs_only": True,
+    "worker_identity_fields": False,
+    "semantic_artifact": "versioned-json",
+    "dispatcher_generated_report_receipt": True,
     "require_exact_request_identity": True,
     "require_exact_target_identity": True,
     "require_mechanical_history_proof": True,
@@ -62,6 +79,7 @@ POLICY_SHA256 = hashlib.sha256(
     json.dumps(POLICY_SPEC, sort_keys=True, separators=(",", ":")).encode("ascii")
 ).hexdigest()
 POLICY_SELECTOR = f"{POLICY_ID}@{POLICY_VERSION}"
+LEGACY_POLICY_SELECTOR = f"{POLICY_ID}@{LEGACY_POLICY_VERSION}"
 POLICY = {"id": POLICY_ID, "version": POLICY_VERSION, "sha256": POLICY_SHA256}
 MODEL_IDS = {
     "luna": "gpt-5.6-luna",
@@ -93,6 +111,7 @@ TASK_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
 REPO_RE = re.compile(r"\A[^/\s]+/[^/\s]+\Z")
 REPORT_DIRECTORY = ".github/agent-task-conflict-reports"
 RECEIPT_DIRECTORY = ".github/agent-task-conflict-receipts"
+SEMANTIC_DIRECTORY = ".github/agent-task-conflict-semantic"
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
@@ -173,6 +192,7 @@ class Progress:
 
 @dataclass
 class Result:
+    schema: Mapping[str, object] = field(default_factory=lambda: RESULT_SCHEMA)
     status: str = "error"
     error: dict[str, str] | None = None
     model: str | None = None
@@ -190,14 +210,15 @@ class Result:
     code_refs: list[Mapping[str, object]] = field(default_factory=list)
     application_status: str = "not_started"
     validations: list[Mapping[str, str]] = field(default_factory=list)
+    policy: Mapping[str, object] = field(default_factory=lambda: POLICY)
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "schema": RESULT_SCHEMA,
+            "schema": self.schema,
             "status": self.status,
             "error": self.error,
             "model": self.model,
-            "policy": POLICY,
+            "policy": self.policy,
             "repository": self.repository,
             "task": {
                 "id": self.task_id,
@@ -616,6 +637,7 @@ def validate_request(
     expected_strategy: str,
     expected_model: str,
     expected_pr_url: str,
+    expected_policy: Mapping[str, object] = POLICY,
 ) -> Mapping[str, object]:
     request = require_exact_keys(
         data,
@@ -646,7 +668,7 @@ def validate_request(
     require_sha256(request["request_sha256"], "request_sha256")
     if request_digest(request) != request["request_sha256"]:
         raise ConflictError("conflict request digest mismatch", "policy_rejected")
-    if request["model"] != expected_model or request["policy"] != POLICY:
+    if request["model"] != expected_model or request["policy"] != expected_policy:
         raise ConflictError(
             "conflict request model or policy mismatch",
             "policy_rejected",
@@ -823,7 +845,7 @@ def parse_args(args: Sequence[str]) -> Options:
             f"missing required options: {', '.join(missing)}",
             "policy_rejected",
         )
-    if values["--policy"] != POLICY_SELECTOR:
+    if values["--policy"] not in {POLICY_SELECTOR, LEGACY_POLICY_SELECTOR}:
         raise ConflictError("unsupported conflict worker policy", "policy_rejected")
     strategy = str(values["--strategy"])
     if strategy not in STRATEGIES:
@@ -865,6 +887,11 @@ def parse_args(args: Sequence[str]) -> Options:
         expected_strategy=strategy,
         expected_model=MODEL_IDS[alias],
         expected_pr_url=pr_url,
+        expected_policy=(
+            POLICY
+            if values["--policy"] == POLICY_SELECTOR
+            else LEGACY_POLICY
+        ),
     )
     prompt = read_external_text(paths["--prompt-file"], "prompt file")
     prior = (
@@ -1917,6 +1944,28 @@ def compact_commit_evidence(
     return evidence
 
 
+def semantic_path(request_id: str) -> str:
+    return f"{SEMANTIC_DIRECTORY}/{request_id}.json"
+
+
+def assigned_code_ref(request_id: str, role: str) -> str:
+    safe_request = re.sub(r"[^A-Za-z0-9._-]", "-", request_id)
+    safe_role = re.sub(r"[^A-Za-z0-9._-]", "-", role)
+    return f"copilot/conflict-{safe_request}-{safe_role}"
+
+
+def assigned_code_refs(request: Mapping[str, object]) -> list[RemoteRef]:
+    return [
+        RemoteRef(
+            role,
+            pr_number,
+            repository,
+            assigned_code_ref(str(request["request_id"]), role),
+        )
+        for role, pr_number, repository in expected_roles(request)
+    ]
+
+
 def compact_request_contract(
     request: Mapping[str, object],
     *,
@@ -2143,6 +2192,86 @@ def policy_prompt(
     *,
     include_per_commit_paths: bool = False,
 ) -> str:
+    if options.request["policy"] == POLICY:
+        path = semantic_path(options.request["request_id"])
+        compact_request = compact_request_contract(
+            options.request,
+            include_per_commit_paths=include_per_commit_paths,
+        )
+        refs = [
+            {
+                "role_index": index,
+                "role": remote.role,
+                "branch": remote.ref,
+                "annotation_count": (
+                    0
+                    if options.request["strategy"] == "merge"
+                    else len(code_ref_base(options.request, remote.role)[4])
+                ),
+            }
+            for index, remote in enumerate(
+                assigned_code_refs(options.request),
+                start=1,
+            )
+        ]
+        shape = {
+            "schema": SEMANTIC_SCHEMA,
+            "kind": "conflict-resolution",
+            "payload": {
+                "summary": "<nonempty explanation of the resolution>",
+                "commit_annotations": [
+                    [
+                        {
+                            "conflict_paths": [],
+                            "companion_paths": [],
+                            "rationale": "",
+                        }
+                    ]
+                ],
+                "validation": [
+                    {
+                        "command": "<exact command or deterministic proof>",
+                        "status": "passed",
+                        "detail": "<concise result>",
+                    }
+                ],
+            },
+        }
+        return (
+            f"{options.prompt.rstrip()}\n\n"
+            "----- marketplace conflict worker policy -----\n"
+            f"Policy: {POLICY_SELECTOR}\n"
+            f"Policy SHA-256: {POLICY_SHA256}\n"
+            f"Mode: {MODE}\n"
+            f"Strategy: {options.strategy}\n"
+            "The dispatcher owns and binds every request, repository, pull request, "
+            "frozen head/base, model, policy, task, session, generated-ref, commit, "
+            "report, receipt, and completion identity. Do not author or echo those "
+            "fields in the semantic artifact.\n"
+            "Compact immutable task contract (input evidence only): "
+            f"{canonical_json(compact_request).decode('utf-8')}\n"
+            "Publish each resolved code tip to the exact request-scoped branch assigned "
+            "below, in role order. These branch names are locators only; the dispatcher "
+            "fetches them into quarantine and derives every SHA and ordered mapping from "
+            "Git history. Do not publish any other code branch.\n"
+            f"{json.dumps(refs, ensure_ascii=False, sort_keys=True)}\n"
+            "Create one final single-parent task artifact commit on the Agent Task "
+            f"branch. Its only changed path must be `{path}` and its parent must be "
+            "the final assigned code tip. Write exactly the versioned JSON wrapper "
+            "below. `commit_annotations` is positional: one array per assigned role, "
+            "and for rebase/native-stack one entry per frozen old commit. Merge uses "
+            "one empty annotations array. An unchanged rewritten commit uses empty "
+            "path arrays and an empty rationale; a conflict-touched commit must name "
+            "its conflict paths, any companion paths, and a concrete rationale. Do "
+            "not include SHAs, refs, roles, request identity, validation completion, "
+            "or any report/receipt/envelope fields. Missing or malformed semantic "
+            "output fails closed. Validation entries are untrusted evidence and must "
+            "all describe passed work; the dispatcher never invents validation.\n"
+            f"{json.dumps(shape, ensure_ascii=False, sort_keys=True)}\n"
+            "----- marketplace conflict worker policy -----"
+        )
+    if options.request["policy"] != LEGACY_POLICY:
+        raise ConflictError("unsupported conflict worker policy", "policy_rejected")
     report_path, receipt_path = artifact_paths(options.request["request_id"])
     compact_request = compact_request_contract(
         options.request,
@@ -3039,6 +3168,68 @@ def validate_mapping(
     return value
 
 
+def mapping_from_annotation(
+    annotation: object,
+    old: Mapping[str, object],
+    new_sha: str,
+    runner: Runner,
+    root: Path,
+    parent: str,
+    allowed_paths: set[str],
+) -> Mapping[str, object]:
+    value = require_exact_keys(
+        annotation,
+        {"conflict_paths", "companion_paths", "rationale"},
+        "semantic commit annotation",
+    )
+    conflict_paths = value["conflict_paths"]
+    companion_paths = value["companion_paths"]
+    rationale = value["rationale"]
+    if (
+        not isinstance(conflict_paths, list)
+        or not isinstance(companion_paths, list)
+        or any(not isinstance(path, str) for path in [*conflict_paths, *companion_paths])
+        or not isinstance(rationale, str)
+    ):
+        raise ConflictError(
+            "semantic commit annotation is malformed",
+            "validation_failed",
+        )
+    old_parent = parents(runner, root, old["sha"])
+    if len(old_parent) != 1:
+        raise ConflictError("old commit is not linear", "unexpected_history")
+    unaffected_paths = set(old["paths"]) - set(conflict_paths)
+    mapping = {
+        "old_sha": old["sha"],
+        "new_sha": new_sha,
+        "subject": commit_subject(runner, root, new_sha),
+        "trailers": commit_trailers(runner, root, new_sha),
+        "patch_sha256": patch_sha256(runner, root, parent, new_sha),
+        "conflict_paths": conflict_paths,
+        "companion_paths": companion_paths,
+        "unaffected_path_digests": {
+            path: path_patch_sha256(
+                runner,
+                root,
+                old_parent[0],
+                old["sha"],
+                path,
+            )
+            for path in sorted(unaffected_paths)
+        },
+        "rationale": rationale,
+    }
+    return validate_mapping(
+        mapping,
+        old,
+        new_sha,
+        runner,
+        root,
+        parent,
+        allowed_paths,
+    )
+
+
 def prove_rebase_range(
     runner: Runner,
     root: Path,
@@ -3063,6 +3254,42 @@ def prove_rebase_range(
         )
         parent = new_sha
     return commits
+
+
+def prove_rebase_range_from_annotations(
+    runner: Runner,
+    root: Path,
+    base_sha: str,
+    tip: str,
+    old_commits: Sequence[Mapping[str, object]],
+    annotations: Sequence[object],
+    allowed_paths: set[str],
+) -> tuple[list[str], list[Mapping[str, object]]]:
+    commits = ordered_commits(runner, root, base_sha, tip)
+    if len(commits) != len(old_commits) or len(annotations) != len(old_commits):
+        raise ConflictError(
+            "rewritten range dropped, squashed, reordered, added, or omitted "
+            "semantic annotations",
+            "unexpected_history",
+        )
+    mappings: list[Mapping[str, object]] = []
+    parent = base_sha
+    for old, new_sha, annotation in zip(old_commits, commits, annotations):
+        if parents(runner, root, new_sha) != [parent]:
+            raise ConflictError("rewritten range is not linear", "unexpected_history")
+        mappings.append(
+            mapping_from_annotation(
+                annotation,
+                old,
+                new_sha,
+                runner,
+                root,
+                parent,
+                allowed_paths,
+            )
+        )
+        parent = new_sha
+    return commits, mappings
 
 
 def code_ref_base(
@@ -3255,6 +3482,260 @@ def validate_artifact(
     return artifact, validations
 
 
+def validate_semantic_artifact(
+    runner: Runner,
+    snapshot: LocalSnapshot,
+    request: Mapping[str, object],
+    artifact_remote: RemoteRef,
+    artifact_head: str,
+    final_code_head: str,
+) -> tuple[str, Sequence[Sequence[object]], list[Mapping[str, str]], str]:
+    path = semantic_path(str(request["request_id"]))
+    if parents(runner, snapshot.root, artifact_head) != [final_code_head]:
+        raise ConflictError(
+            "semantic artifact is not the sole child of the final code head",
+            "unexpected_history",
+        )
+    if changed_paths(runner, snapshot.root, artifact_head) != [path]:
+        raise ConflictError(
+            "semantic artifact commit changed unexpected paths",
+            "unexpected_history",
+        )
+    content = git_show_file(runner, snapshot.root, artifact_head, path)
+    try:
+        value = json.loads(content)
+    except json.JSONDecodeError:
+        raise ConflictError(
+            "conflict semantic output is malformed",
+            "validation_failed",
+        ) from None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema", "kind", "payload"}
+        or value.get("schema") != SEMANTIC_SCHEMA
+        or value.get("kind") != "conflict-resolution"
+        or not isinstance(value.get("payload"), dict)
+        or set(value["payload"])
+        != {"summary", "commit_annotations", "validation"}
+        or not isinstance(value["payload"].get("summary"), str)
+        or not value["payload"]["summary"].strip()
+        or contains_credentials(value["payload"]["summary"])
+        or not isinstance(value["payload"].get("commit_annotations"), list)
+    ):
+        raise ConflictError(
+            "conflict semantic output has an unsupported shape",
+            "validation_failed",
+        )
+    annotations = value["payload"]["commit_annotations"]
+    expected_role_count = len(expected_roles(request))
+    if (
+        len(annotations) != expected_role_count
+        or any(not isinstance(items, list) for items in annotations)
+    ):
+        raise ConflictError(
+            "conflict semantic annotations do not match assigned roles",
+            "validation_failed",
+        )
+    validations = validate_validations(value["payload"]["validation"])
+    return (
+        value["payload"]["summary"],
+        annotations,
+        validations,
+        hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    )
+
+
+def canonical_conflict_artifacts(
+    request: Mapping[str, object],
+    code_refs: Sequence[Mapping[str, object]],
+    validations: Sequence[Mapping[str, str]],
+    summary: str,
+) -> tuple[str, Mapping[str, object]]:
+    lines = [
+        "# Conflict resolution",
+        "",
+        f"Request: `{request['request_id']}`",
+        f"Request SHA-256: `{request['request_sha256']}`",
+        "",
+        summary.strip(),
+        "",
+        "## Generated history",
+        "",
+    ]
+    for code_ref in code_refs:
+        lines.append(
+            f"- `{code_ref['role']}`: `{code_ref['old_sha']}` -> "
+            f"`{code_ref['new_sha']}`"
+        )
+        for mapping in code_ref["commits"]:
+            if isinstance(mapping, dict):
+                lines.append(
+                    f"  - `{mapping['old_sha']}` -> `{mapping['new_sha']}`"
+                )
+    report = "\n".join(lines).rstrip() + "\n"
+    receipt = {
+        "schema": RECEIPT_SCHEMA,
+        "request": {
+            "id": request["request_id"],
+            "sha256": request["request_sha256"],
+        },
+        "policy": request["policy"],
+        "model": request["model"],
+        "mode": MODE,
+        "strategy": request["strategy"],
+        "repository": request["repository"],
+        "pull_request": request["pull_request"],
+        "generated_refs": [
+            {"ref": ref, "sha256": object_digest(ref)}
+            for ref in code_refs
+        ],
+        "validation_complete": True,
+        "validation": list(validations),
+    }
+    return report, receipt
+
+
+def prove_generated_semantic(
+    runner: Runner,
+    snapshot: LocalSnapshot,
+    request: Mapping[str, object],
+    task: Mapping[str, object],
+    recovery_result: Result | None = None,
+) -> tuple[list[Mapping[str, object]], Mapping[str, object], list[Mapping[str, str]]]:
+    artifact_remote = discover_artifact_ref(task, request)
+    request_id = str(request["request_id"])
+    quarantine: list[str] = []
+    artifact_ref, artifact_head = fetch_quarantined(
+        runner,
+        snapshot,
+        artifact_remote,
+        request_id,
+    )
+    quarantine.append(artifact_ref)
+    fetched_code: list[tuple[RemoteRef, str, str]] = []
+    for remote in assigned_code_refs(request):
+        target, tip = fetch_quarantined(
+            runner,
+            snapshot,
+            remote,
+            request_id,
+        )
+        quarantine.append(target)
+        fetched_code.append((remote, target, tip))
+    require_local_unchanged(runner, snapshot, quarantine)
+    final_code_head = fetched_code[-1][2]
+    summary, annotations, validations, semantic_sha256 = validate_semantic_artifact(
+        runner,
+        snapshot,
+        request,
+        artifact_remote,
+        artifact_head,
+        final_code_head,
+    )
+    allowed_paths = set(request["allowed_paths"])
+    code_refs: list[Mapping[str, object]] = []
+    if request["strategy"] == "merge":
+        if annotations != [[]]:
+            raise ConflictError(
+                "merge semantic annotations must be one empty array",
+                "validation_failed",
+            )
+        remote, _, tip = fetched_code[0]
+        commits = first_parent_chain(
+            runner,
+            snapshot.root,
+            request["pull_request"]["head_sha"],
+            tip,
+        )
+        if not commits or parents(runner, snapshot.root, commits[0]) != [
+            request["pull_request"]["head_sha"],
+            request["pull_request"]["base_sha"],
+        ]:
+            raise ConflictError(
+                "merge integration parents are not [head, base]",
+                "unexpected_history",
+            )
+        parent = commits[0]
+        for commit in commits[1:]:
+            if parents(runner, snapshot.root, commit) != [parent]:
+                raise ConflictError("merge fixes are not linear", "unexpected_history")
+            parent = commit
+        code_ref = build_code_ref(request, remote, tip, commits, [])
+        code_ref["base_sha"] = request["pull_request"]["base_sha"]
+        code_refs.append(code_ref)
+    elif request["strategy"] == "rebase":
+        remote, _, tip = fetched_code[0]
+        commits, mappings = prove_rebase_range_from_annotations(
+            runner,
+            snapshot.root,
+            request["pull_request"]["base_sha"],
+            tip,
+            request["head_commits"],
+            annotations[0],
+            allowed_paths,
+        )
+        code_refs.append(build_code_ref(request, remote, tip, commits, mappings))
+    else:
+        previous_tip = request["native_stack"]["trunk"]["sha"]
+        for index, (remote, _, tip) in enumerate(fetched_code):
+            member = request["native_stack"]["members"][index]
+            prove_native_stack_member_input(runner, snapshot.root, member)
+            commits, mappings = prove_rebase_range_from_annotations(
+                runner,
+                snapshot.root,
+                previous_tip,
+                tip,
+                member["old_commits"],
+                annotations[index],
+                allowed_paths,
+            )
+            code_ref = build_code_ref(
+                request,
+                remote,
+                tip,
+                commits,
+                mappings,
+                generated_base_sha=previous_tip,
+            )
+            if (
+                code_ref["old_sha"] != member["head_sha"]
+                or code_ref["lease_sha"] != member["lease_sha"]
+            ):
+                raise ConflictError(
+                    "native stack lease identity mismatch",
+                    "stale_target",
+                )
+            code_refs.append(code_ref)
+            previous_tip = tip
+    report, receipt = canonical_conflict_artifacts(
+        request,
+        code_refs,
+        validations,
+        summary,
+    )
+    artifact = {
+        "branch": artifact_remote.ref,
+        "head_sha": artifact_head,
+        "semantic": {
+            "path": semantic_path(request_id),
+            "commit": artifact_head,
+            "sha256": semantic_sha256,
+        },
+        "report": {
+            "sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
+            "content": report,
+        },
+        "receipt": {
+            "sha256": object_digest(receipt),
+            "value": receipt,
+        },
+    }
+    if recovery_result is not None:
+        recovery_result.code_refs = list(code_refs)
+        recovery_result.artifact = artifact
+    return code_refs, artifact, validations
+
+
 def prove_generated(
     runner: Runner,
     snapshot: LocalSnapshot,
@@ -3262,6 +3743,14 @@ def prove_generated(
     task: Mapping[str, object],
     recovery_result: Result | None = None,
 ) -> tuple[list[Mapping[str, object]], Mapping[str, object], list[Mapping[str, str]]]:
+    if request["policy"] == POLICY:
+        return prove_generated_semantic(
+            runner,
+            snapshot,
+            request,
+            task,
+            recovery_result,
+        )
     remote_artifact = discover_artifact_ref(task, request)
     request_id = request["request_id"]
     quarantine: list[str] = []
@@ -3613,6 +4102,13 @@ def execute(
     require_target_fresh(runner, snapshot, request)
     require_local_unchanged(runner, snapshot)
     if result is not None:
+        request_policy = request.get("policy", POLICY)
+        result.schema = (
+            LEGACY_RESULT_SCHEMA
+            if request_policy == LEGACY_POLICY
+            else RESULT_SCHEMA
+        )
+        result.policy = request_policy
         result.model = options.model
         result.repository = snapshot.repository
         result.strategy = options.strategy
