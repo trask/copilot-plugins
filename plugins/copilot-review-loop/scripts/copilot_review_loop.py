@@ -7039,6 +7039,23 @@ def rescope_prepared_publication(
         apply_prepared=True,
         publish_prepared_only=True,
     )
+    if (
+        task_state.get("apply_scope") == "source_publication_only"
+        and task_state.get("apply_command") == command
+        and task_state.get("recovery_command") == command
+    ):
+        emit(
+            {
+                "result": "validated_source_publication_only",
+                "state": str(state_path),
+                "pr": preflight["pr"]["pr_url"],
+                "head_sha": remote["final_local_head"],
+                "ordered_commits": remote["commits"],
+                "apply_scope": task_state["apply_scope"],
+                "apply_command": command,
+            }
+        )
+        return
     task_state["apply_scope"] = "source_publication_only"
     task_state["apply_command"] = command
     task_state["recovery_command"] = command

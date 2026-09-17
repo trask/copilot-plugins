@@ -2030,7 +2030,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.45")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.46")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -4027,13 +4027,21 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "emit") as emit,
         ):
             MODULE.command_agent_task(rescope_args)
+            first_rescope_result = emit.call_args.args[0]["result"]
+            scoped_state_bytes = state_path.read_bytes()
+            MODULE.command_agent_task(rescope_args)
+            second_rescope_result = emit.call_args.args[0]["result"]
         worker.assert_not_called()
         prepared = MODULE.load_state(state_path)["agent_task"]
         self.assertEqual("source_publication_only", prepared["apply_scope"])
         self.assertIn("--publish-prepared-only", prepared["apply_command"])
         self.assertEqual(
-            "prepared_source_publication_only", emit.call_args.args[0]["result"]
+            "prepared_source_publication_only", first_rescope_result
         )
+        self.assertEqual(
+            "validated_source_publication_only", second_rescope_result
+        )
+        self.assertEqual(scoped_state_bytes, state_path.read_bytes())
 
         remote_head = self.head
         pushes = 0
