@@ -666,6 +666,61 @@ def process_is_running(pid: int) -> bool:
     return True
 
 
+def command_fragment_process_ids(fragment: str) -> list[int]:
+    if not fragment:
+        raise WorkflowError("process command fragment is empty")
+    if IS_WINDOWS:
+        script = (
+            "$needle=[Text.Encoding]::UTF8.GetString("
+            "[Convert]::FromBase64String('"
+            + base64.b64encode(fragment.encode("utf-8")).decode("ascii")
+            + "'));"
+            "Get-CimInstance Win32_Process | "
+            "Where-Object {$_.ProcessId -ne $PID -and "
+            "$_.CommandLine -and $_.CommandLine.Contains($needle)} | "
+            "ForEach-Object {$_.ProcessId}"
+        )
+        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        process = run(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                encoded,
+            ]
+        )
+        try:
+            return sorted(
+                {
+                    int(line.strip())
+                    for line in process.stdout.splitlines()
+                    if line.strip()
+                }
+            )
+        except ValueError as error:
+            raise WorkflowError(
+                "Windows returned a malformed managed helper process identity"
+            ) from error
+    matches = []
+    proc = Path("/proc")
+    if not proc.is_dir():
+        raise WorkflowError("cannot inspect managed helper processes on this platform")
+    for candidate in proc.iterdir():
+        if not candidate.name.isdigit() or int(candidate.name) == os.getpid():
+            continue
+        try:
+            command = (candidate / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", errors="replace"
+            )
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if fragment in command:
+            matches.append(int(candidate.name))
+    return sorted(matches)
+
+
 def subprocess_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
     environment = {**os.environ, **(extra or {})}
     environment["PYTHONIOENCODING"] = "utf-8"
@@ -6976,20 +7031,110 @@ def run_hosted_helper(
 def reconcile_dead_hosted_owner(
     state_path: Path,
     state: dict[str, Any],
+    *,
+    repo_root: Path,
+    target: dict[str, Any],
 ) -> dict[str, Any]:
     task = state.get("agent_task")
     monitor = task.get("dispatch_monitor") if isinstance(task, dict) else None
     pid = monitor.get("helper_pid") if isinstance(monitor, dict) else None
-    if (
-        not isinstance(task, dict)
-        or task.get("status") != "running"
-        or task.get("phase") != "hosted_fix"
-        or not isinstance(monitor, dict)
-        or monitor.get("status") != "running"
-        or not isinstance(pid, int)
-        or isinstance(pid, bool)
-        or process_is_running(pid)
-    ):
+    if not isinstance(task, dict) or task.get("status") != "running":
+        return state
+    if isinstance(monitor, dict):
+        if (
+            task.get("phase") != "hosted_fix"
+            or monitor.get("status") != "running"
+            or not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or process_is_running(pid)
+        ):
+            return state
+    elif monitor is None:
+        legacy_error = (
+            "an unfinished Agent Task already owns this state; "
+            "use its recovery_command"
+        )
+        coordinator = state.get("coordinator")
+        escalation = state.get("escalation")
+        preflight = task.get("preflight")
+        pr = preflight.get("pr") if isinstance(preflight, dict) else None
+        snapshot = (
+            preflight.get("check_snapshot")
+            if isinstance(preflight, dict)
+            else None
+        )
+        identity = (
+            preflight.get("identity") if isinstance(preflight, dict) else None
+        )
+        prompt_path = Path(str(task.get("prompt_file") or ""))
+        result_path = Path(str(task.get("result_file") or ""))
+        triage_result_path = Path(str(task.get("triage_result_file") or ""))
+        if (
+            task.get("phase") != "hosted_fix"
+            or task.get("task_id") is not None
+            or task.get("task_id_status") is not None
+            or task.get("model") != "gpt-5.6-sol"
+            or task.get("policy") != AGENT_TASK_POLICY
+            or task.get("iteration_allowance") != 1
+            or not isinstance(task.get("recovery_command"), str)
+            or "--resume" not in task["recovery_command"].split()
+            or not isinstance(preflight, dict)
+            or not isinstance(pr, dict)
+            or not isinstance(identity, dict)
+            or not isinstance(snapshot, dict)
+            or Path(str(preflight.get("repository_root") or "")).resolve()
+            != repo_root.resolve()
+            or target.get("repo_name") != pr.get("repo_name")
+            or target.get("number") != pr.get("number")
+            or not isinstance(coordinator, dict)
+            or coordinator.get("status") != "blocked"
+            or coordinator.get("detail") != legacy_error
+            or coordinator.get("head_sha") != pr.get("head_sha")
+            or coordinator.get("base_sha") != pr.get("base_sha")
+            or coordinator.get("snapshot_sha256")
+            != snapshot.get("sha256")
+            or not isinstance(escalation, dict)
+            or escalation.get("reason") != "coordinator_error"
+            or escalation.get("detail") != legacy_error
+            or not prompt_path.is_file()
+            or result_path.exists()
+            or not triage_result_path.is_file()
+        ):
+            return state
+        require_outside_repository(prompt_path, repo_root)
+        require_outside_repository(result_path, repo_root)
+        require_outside_repository(triage_result_path, repo_root)
+        if local_identity(repo_root) != identity:
+            raise WorkflowError(
+                "legacy hosted owner source identity changed before finalization"
+            )
+        live = metadata_for(target)
+        require_live_pr_snapshot(pr, live, expected_head=pr["head_sha"])
+        require_live_check_snapshot(preflight)
+        active_pids = command_fragment_process_ids(str(result_path.resolve()))
+        if active_pids:
+            return state
+        monitor = {
+            "schema": "github.copilot.ci-fix-loop-hosted-dispatch-monitor.v1",
+            "status": "owner_lost",
+            "started_at": task.get("started_at"),
+            "timeout_seconds": None,
+            "discovery_interval_seconds": None,
+            "baseline_task_ids": None,
+            "helper_pid": None,
+            "helper_exit_code": None,
+            "finished_at": utc_now(),
+            "failure": "legacy_hosted_helper_owner_lost",
+            "legacy_evidence": {
+                "blocked_coordinator_observed_at": coordinator.get("observed_at"),
+                "prompt_sha256": sha256_file(prompt_path),
+                "triage_result_sha256": sha256_file(triage_result_path),
+                "result_absent": True,
+                "matching_process_ids": [],
+            },
+        }
+        task["dispatch_monitor"] = monitor
+    else:
         return state
     identity = task.get("dispatch_identity")
     known = (
@@ -6999,8 +7144,8 @@ def reconcile_dead_hosted_owner(
         and bool(identity["task_id"])
     )
     monitor["status"] = "owner_lost"
-    monitor["finished_at"] = utc_now()
-    monitor["failure"] = "hosted_helper_owner_lost"
+    monitor["finished_at"] = monitor.get("finished_at") or utc_now()
+    monitor["failure"] = monitor.get("failure") or "hosted_helper_owner_lost"
     task["status"] = "failed"
     task["task_id_status"] = "known" if known else "unknown"
     task["task_id"] = identity["task_id"] if known else None
@@ -7023,7 +7168,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
     if existing is not None:
-        existing = reconcile_dead_hosted_owner(state_path, existing)
+        existing = reconcile_dead_hosted_owner(
+            state_path,
+            existing,
+            repo_root=repo_root,
+            target=target,
+        )
     existing_task = existing.get("agent_task") if existing is not None else None
     if (
         not args.resume

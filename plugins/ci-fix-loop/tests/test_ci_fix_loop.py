@@ -1417,7 +1417,10 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 MODULE, "process_is_running", return_value=False
             ):
                 reconciled = MODULE.reconcile_dead_hosted_owner(
-                    state_path, MODULE.load_state(state_path)
+                    state_path,
+                    MODULE.load_state(state_path),
+                    repo_root=Path(directory),
+                    target={"repo_name": "owner/repo", "number": 7},
                 )
 
             task = reconciled["agent_task"]
@@ -1516,7 +1519,10 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 MODULE, "process_is_running", return_value=True
             ):
                 reconciled = MODULE.reconcile_dead_hosted_owner(
-                    state_path, MODULE.load_state(state_path)
+                    state_path,
+                    MODULE.load_state(state_path),
+                    repo_root=Path(directory),
+                    target={"repo_name": "owner/repo", "number": 7},
                 )
 
             self.assertEqual("running", reconciled["agent_task"]["status"])
@@ -1543,7 +1549,10 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 MODULE, "process_is_running", return_value=False
             ):
                 reconciled = MODULE.reconcile_dead_hosted_owner(
-                    state_path, MODULE.load_state(state_path)
+                    state_path,
+                    MODULE.load_state(state_path),
+                    repo_root=Path(directory),
+                    target={"repo_name": "owner/repo", "number": 7},
                 )
 
             task = reconciled["agent_task"]
@@ -1551,6 +1560,129 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             self.assertEqual("unknown", task["task_id_status"])
             self.assertIsNone(task["task_id"])
             self.assertNotIn("recovery_command", task)
+
+    def legacy_owner_state(self, directory):
+        root = Path(directory)
+        repo = root / "repo"
+        repo.mkdir()
+        prompt = root / "prompt.txt"
+        result = root / "result.json"
+        triage = root / "triage.json"
+        prompt.write_text("prompt", encoding="utf-8")
+        triage.write_text("{}", encoding="utf-8")
+        identity = {"branch": "feature", "head": "1" * 40, "status": ""}
+        preflight = {
+            "repository_root": str(repo),
+            "identity": identity,
+            "pr": {
+                "repo_name": "owner/repo",
+                "number": 7,
+                "pr_url": "https://github.com/owner/repo/pull/7",
+                "head_sha": "1" * 40,
+                "base_sha": "2" * 40,
+                "head_branch": "feature",
+                "base_branch": "main",
+                "title": "Title",
+                "body": "Body",
+            },
+            "check_snapshot": {"sha256": "3" * 64},
+        }
+        error = (
+            "an unfinished Agent Task already owns this state; "
+            "use its recovery_command"
+        )
+        return repo, identity, {
+            "version": MODULE.STATE_VERSION,
+            "iterations": 1,
+            "agent_task": {
+                "run_id": "run-1",
+                "status": "running",
+                "phase": "hosted_fix",
+                "model": "gpt-5.6-sol",
+                "policy": MODULE.AGENT_TASK_POLICY,
+                "iteration_allowance": 1,
+                "started_at": "2026-01-01T00:00:00Z",
+                "recovery_command": "python helper.py agent-task --resume",
+                "prompt_file": str(prompt),
+                "result_file": str(result),
+                "triage_result_file": str(triage),
+                "preflight": preflight,
+            },
+            "coordinator": {
+                "status": "blocked",
+                "detail": error,
+                "head_sha": "1" * 40,
+                "base_sha": "2" * 40,
+                "snapshot_sha256": "3" * 64,
+                "observed_at": "2026-01-01T01:00:00Z",
+            },
+            "escalation": {
+                "reason": "coordinator_error",
+                "detail": error,
+            },
+        }
+
+    def test_legacy_dead_owner_finalizes_after_exact_blocked_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            repo, identity, state = self.legacy_owner_state(directory)
+            MODULE.save_state(state_path, state)
+            with (
+                mock.patch.object(MODULE, "local_identity", return_value=identity),
+                mock.patch.object(
+                    MODULE, "metadata_for", return_value=state["agent_task"]["preflight"]["pr"]
+                ),
+                mock.patch.object(MODULE, "require_live_pr_snapshot"),
+                mock.patch.object(MODULE, "require_live_check_snapshot"),
+                mock.patch.object(
+                    MODULE, "command_fragment_process_ids", return_value=[]
+                ),
+            ):
+                reconciled = MODULE.reconcile_dead_hosted_owner(
+                    state_path,
+                    MODULE.load_state(state_path),
+                    repo_root=repo,
+                    target={"repo_name": "owner/repo", "number": 7},
+                )
+
+            task = reconciled["agent_task"]
+            self.assertEqual("failed", task["status"])
+            self.assertEqual("unknown", task["task_id_status"])
+            self.assertEqual(
+                "legacy_hosted_helper_owner_lost",
+                task["dispatch_monitor"]["failure"],
+            )
+            self.assertTrue(
+                task["dispatch_monitor"]["legacy_evidence"]["result_absent"]
+            )
+            self.assertEqual(1, reconciled["iterations"])
+            self.assertNotIn("recovery_command", task)
+
+    def test_legacy_owner_stays_active_while_exact_helper_process_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            repo, identity, state = self.legacy_owner_state(directory)
+            MODULE.save_state(state_path, state)
+            with (
+                mock.patch.object(MODULE, "local_identity", return_value=identity),
+                mock.patch.object(
+                    MODULE, "metadata_for", return_value=state["agent_task"]["preflight"]["pr"]
+                ),
+                mock.patch.object(MODULE, "require_live_pr_snapshot"),
+                mock.patch.object(MODULE, "require_live_check_snapshot"),
+                mock.patch.object(
+                    MODULE, "command_fragment_process_ids", return_value=[77]
+                ),
+            ):
+                reconciled = MODULE.reconcile_dead_hosted_owner(
+                    state_path,
+                    MODULE.load_state(state_path),
+                    repo_root=repo,
+                    target={"repo_name": "owner/repo", "number": 7},
+                )
+
+            self.assertEqual("running", reconciled["agent_task"]["status"])
+            self.assertIn("recovery_command", reconciled["agent_task"])
 
 
 class ManagedAgentTaskContractTest(unittest.TestCase):
@@ -1845,7 +1977,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("tools: [execute, agent, rename_session]", instructions)
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [execute, agent, todo", instructions)
-        self.assertEqual("1.6.29", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.30", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_canonicalizes_stack_start_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
