@@ -2100,7 +2100,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.49")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.50")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -3861,6 +3861,286 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             rescope_prepared_publish_only=False,
             publish_prepared_only=False,
         )
+
+    def dead_local_owner_case(self, state_path):
+        run_id = "d" * 32
+        session_id = "f40839bc-8282-4b2b-aedb-eea76c34f74b"
+        prompt_path = self.directory / "dead-local-prompt.txt"
+        result_path = self.directory / "dead-local-result.json"
+        decision_path = self.directory / "dead-local-decisions.json"
+        canonical_path = self.directory / "dead-local-canonical.json"
+        prompt_path.write_text("exact prompt\n", encoding="utf-8", newline="\n")
+        events_path = (
+            self.copilot_home / "session-state" / session_id / "events.jsonl"
+        )
+        events_path.parent.mkdir(parents=True)
+        events_path.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session.start",
+                            "data": {
+                                "sessionId": session_id,
+                                "selectedModel": MODULE.LOCAL_DECISION_MODEL,
+                                "reasoningEffort": (
+                                    MODULE.LOCAL_DECISION_REASONING_EFFORT
+                                ),
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant.message",
+                            "data": {"model": MODULE.LOCAL_DECISION_MODEL},
+                        }
+                    ),
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        lock_path = events_path.parent / "inuse.4242.lock"
+        lock_path.write_text("4242", encoding="ascii")
+        source_before = MODULE.local_source_owner_fingerprint(
+            self.source_fingerprint
+        )
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "created_at": "2026-09-17T00:00:00Z",
+            "iterations": 0,
+            "history": [],
+            "managed_task_history": [],
+            "repo_root": str(self.repo_root),
+            "pr": copy.deepcopy(self.preflight["pr"]),
+            "monitoring": {"status": "completed"},
+            "agent_task": {
+                "canonical_report_file": str(canonical_path),
+                "decision_file": str(decision_path),
+                "github_before": copy.deepcopy(self.github_fingerprint),
+                "local_session_id": session_id,
+                "model": MODULE.LOCAL_DECISION_MODEL,
+                "policy": MODULE.LOCAL_DECISION_POLICY,
+                "preflight": copy.deepcopy(self.preflight),
+                "producer": "local",
+                "prompt_file": str(prompt_path),
+                "prompt_sha256": MODULE.sha256_file(prompt_path),
+                "reasoning_effort": MODULE.LOCAL_DECISION_REASONING_EFFORT,
+                "recovery_command": "legacy command",
+                "remaining_iterations": 5,
+                "result_file": str(result_path),
+                "resume_attempts": 0,
+                "run_id": run_id,
+                "source_before": source_before,
+                "started_at": "2026-09-17T00:00:00Z",
+                "status": "running",
+                "worker_command": MODULE.local_decision_command(
+                    self.repo_root,
+                    session_id=session_id,
+                    run_id=run_id,
+                    pr_number=7,
+                ),
+            },
+        }
+        MODULE.save_state(state_path, state)
+        current_source = {
+            "branch": "feature",
+            "head": self.fix,
+            "status": "",
+            "refs_sha256": "f" * 64,
+        }
+        current_preflight = copy.deepcopy(self.preflight)
+        current_preflight["identity"]["head"] = self.fix
+        current_preflight["pr"]["head_sha"] = self.fix
+        current_preflight["pr"]["base_sha"] = self.artifact
+        return {
+            "state": state,
+            "state_path": state_path,
+            "session_id": session_id,
+            "events_path": events_path,
+            "lock_path": lock_path,
+            "current_source": current_source,
+            "current_preflight": current_preflight,
+            "target": {
+                "owner": "owner",
+                "repo": "repo",
+                "number": 7,
+                "pr_url": "https://github.com/owner/repo/pull/7",
+            },
+        }
+
+    def dead_local_owner_patches(self, case):
+        return (
+            mock.patch.object(
+                MODULE,
+                "local_source_fingerprint",
+                return_value=case["current_source"],
+            ),
+            mock.patch.object(
+                MODULE,
+                "agent_task_preflight",
+                return_value=case["current_preflight"],
+            ),
+            mock.patch.object(
+                MODULE, "base_revision_is_ancestor", return_value=True
+            ),
+            mock.patch.object(
+                MODULE,
+                "git",
+                side_effect=lambda _root, command, *args: (
+                    self.fix + "\n" if command == "rev-list" else "src/app.py\n"
+                ),
+            ),
+            mock.patch.object(MODULE, "process_is_running", return_value=False),
+        )
+
+    def test_reconciles_exact_dead_legacy_local_owner_without_spending_budget(self):
+        state_path = self.directory / "dead-local-owner.json"
+        case = self.dead_local_owner_case(state_path)
+        emitted = []
+        with ExitStack() as stack:
+            for patcher in self.dead_local_owner_patches(case):
+                stack.enter_context(patcher)
+            snapshot, _ = MODULE.dead_local_owner_reconciliation_snapshot(
+                state=case["state"],
+                state_path=state_path,
+                repo_root=self.repo_root,
+                target=case["target"],
+            )
+            seal = MODULE.dead_local_owner_reconciliation_seal(snapshot)
+            stack.enter_context(mock.patch.object(MODULE, "require_tools"))
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=self.repo_root
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE, "resolve_target", return_value=case["target"]
+                )
+            )
+            stack.enter_context(mock.patch.object(MODULE, "emit", emitted.append))
+            MODULE.command_reconcile_dead_local_owner(
+                SimpleNamespace(
+                    target="owner/repo#7",
+                    repo_root=str(self.repo_root),
+                    state=str(state_path),
+                    expected_seal=seal,
+                )
+            )
+
+        reconciled = MODULE.load_state(state_path)
+        self.assertEqual(0, reconciled["iterations"])
+        self.assertEqual("consumed", reconciled["agent_task"]["status"])
+        self.assertEqual("terminal_unusable", reconciled["agent_task"]["task_id_status"])
+        self.assertEqual(1, len(reconciled["managed_task_history"]))
+        self.assertEqual(
+            "archived_dead_local",
+            reconciled["managed_task_history"][0]["status"],
+        )
+        self.assertEqual(seal, emitted[-1]["seal"])
+        self.local_worker.assert_not_called()
+
+    def test_dead_local_owner_reconciliation_rejects_live_or_ambiguous_session(self):
+        state_path = self.directory / "dead-local-owner-live.json"
+        case = self.dead_local_owner_case(state_path)
+        with (
+            mock.patch.object(MODULE, "process_is_running", return_value=True),
+            self.assertRaisesRegex(MODULE.WorkflowError, "still running"),
+        ):
+            MODULE.dead_local_session_lock(case["session_id"])
+
+        second_lock = case["lock_path"].with_name("inuse.4243.lock")
+        second_lock.write_text("4243", encoding="ascii")
+        with self.assertRaisesRegex(MODULE.WorkflowError, "ambiguous"):
+            MODULE.dead_local_session_lock(case["session_id"])
+
+    def test_dead_local_owner_reconciliation_rejects_output_and_source_drift(self):
+        state_path = self.directory / "dead-local-owner-drift.json"
+        case = self.dead_local_owner_case(state_path)
+        Path(case["state"]["agent_task"]["result_file"]).write_text(
+            "{}\n", encoding="utf-8"
+        )
+        with ExitStack() as stack:
+            for patcher in self.dead_local_owner_patches(case):
+                stack.enter_context(patcher)
+            with self.assertRaisesRegex(MODULE.WorkflowError, "output artifact"):
+                MODULE.dead_local_owner_reconciliation_snapshot(
+                    state=case["state"],
+                    state_path=state_path,
+                    repo_root=self.repo_root,
+                    target=case["target"],
+                )
+
+        Path(case["state"]["agent_task"]["result_file"]).unlink()
+        patches = list(self.dead_local_owner_patches(case))
+        patches[2] = mock.patch.object(
+            MODULE, "base_revision_is_ancestor", return_value=False
+        )
+        with ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "source identity cannot be reconciled"
+            ):
+                MODULE.dead_local_owner_reconciliation_snapshot(
+                    state=case["state"],
+                    state_path=state_path,
+                    repo_root=self.repo_root,
+                    target=case["target"],
+                )
+
+    def test_dead_local_owner_reconciliation_seal_rejects_changed_events(self):
+        state_path = self.directory / "dead-local-owner-events.json"
+        case = self.dead_local_owner_case(state_path)
+        with ExitStack() as stack:
+            for patcher in self.dead_local_owner_patches(case):
+                stack.enter_context(patcher)
+            snapshot, _ = MODULE.dead_local_owner_reconciliation_snapshot(
+                state=case["state"],
+                state_path=state_path,
+                repo_root=self.repo_root,
+                target=case["target"],
+            )
+        seal = MODULE.dead_local_owner_reconciliation_seal(snapshot)
+        with case["events_path"].open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "type": "assistant.message",
+                        "data": {"model": MODULE.LOCAL_DECISION_MODEL},
+                    }
+                )
+                + "\n"
+            )
+        emitted = []
+        with ExitStack() as stack:
+            for patcher in self.dead_local_owner_patches(case):
+                stack.enter_context(patcher)
+            stack.enter_context(mock.patch.object(MODULE, "require_tools"))
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=self.repo_root
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE, "resolve_target", return_value=case["target"]
+                )
+            )
+            stack.enter_context(mock.patch.object(MODULE, "emit", emitted.append))
+            with self.assertRaisesRegex(MODULE.WorkflowError, "seal drifted"):
+                MODULE.command_reconcile_dead_local_owner(
+                    SimpleNamespace(
+                        target="owner/repo#7",
+                        repo_root=str(self.repo_root),
+                        state=str(state_path),
+                        expected_seal=seal,
+                    )
+                )
+        self.assertEqual("running", MODULE.load_state(state_path)["agent_task"]["status"])
+        self.assertEqual([], emitted)
 
     def terminal_local_recovery_case(self, state_path):
         prompt_path = self.directory / "terminal-prompt.txt"

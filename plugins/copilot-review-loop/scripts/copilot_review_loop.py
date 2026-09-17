@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -44,6 +45,33 @@ DEFAULT_DEBOUNCE_SECONDS = 10.0
 DEFAULT_POLL_JITTER = 0.2
 STAGE_PROGRESS_PHASES = frozenset(
     {"waiting_for_review", "addressing_comments", "validating"}
+)
+DEAD_LOCAL_OWNER_RECONCILIATION_SCHEMA = (
+    "github.copilot.review-loop-dead-local-owner-reconciliation.v1"
+)
+LEGACY_RUNNING_LOCAL_OWNER_FIELDS = frozenset(
+    {
+        "canonical_report_file",
+        "decision_file",
+        "github_before",
+        "local_session_id",
+        "model",
+        "policy",
+        "preflight",
+        "producer",
+        "prompt_file",
+        "prompt_sha256",
+        "reasoning_effort",
+        "recovery_command",
+        "remaining_iterations",
+        "result_file",
+        "resume_attempts",
+        "run_id",
+        "source_before",
+        "started_at",
+        "status",
+        "worker_command",
+    }
 )
 # How many of its own iterations an outer loop is assumed to allow when it names no
 # cap of its own. Only the ceiling derived from it is affected, never the per-iteration
@@ -9263,6 +9291,360 @@ def command_status(args: argparse.Namespace) -> None:
     emit(payload)
 
 
+def dead_local_session_lock(session_id: str) -> dict[str, Any]:
+    session_directory = local_session_events_path(session_id).parent
+    if not session_directory.is_dir() or session_directory.is_symlink():
+        raise WorkflowError("dead local owner session directory is unavailable")
+    candidates = [
+        path
+        for path in session_directory.iterdir()
+        if path.name.startswith("inuse.")
+    ]
+    if len(candidates) != 1:
+        raise WorkflowError("dead local owner session lock identity is ambiguous")
+    lock_path = candidates[0]
+    match = re.fullmatch(r"inuse\.([1-9][0-9]*)\.lock", lock_path.name)
+    if (
+        match is None
+        or lock_path.is_symlink()
+        or not lock_path.is_file()
+    ):
+        raise WorkflowError("dead local owner session lock is malformed")
+    pid = int(match.group(1))
+    try:
+        content = lock_path.read_text(encoding="ascii")
+    except (OSError, UnicodeError) as error:
+        raise WorkflowError(
+            f"dead local owner session lock cannot be read: {error}"
+        ) from error
+    if content.strip() != str(pid) or any(
+        character not in "0123456789\r\n" for character in content
+    ):
+        raise WorkflowError("dead local owner session lock is malformed")
+    if process_is_running(pid):
+        raise WorkflowError("dead local owner session process is still running")
+    return {
+        "path": str(lock_path),
+        "pid": pid,
+        "sha256": sha256_file(lock_path),
+        "size": lock_path.stat().st_size,
+    }
+
+
+def dead_local_comment_identity(preflight: dict[str, Any]) -> list[dict[str, Any]]:
+    fields = (
+        "id",
+        "source",
+        "thread_id",
+        "review_id",
+        "url",
+        "path",
+        "original_line",
+        "body_sha256",
+        "side",
+        "author",
+    )
+    identities = preflight.get("comment_identities")
+    if not isinstance(identities, list):
+        raise WorkflowError("dead local owner comment identities are malformed")
+    normalized = [
+        {field: item.get(field) for field in fields if field in item}
+        for item in identities
+        if isinstance(item, dict)
+    ]
+    if len(normalized) != len(identities):
+        raise WorkflowError("dead local owner comment identities are malformed")
+    return sorted(
+        normalized,
+        key=lambda item: (
+            str(item.get("source")),
+            int(item.get("id", 0)),
+            str(item.get("thread_id")),
+        ),
+    )
+
+
+def dead_local_owner_reconciliation_snapshot(
+    *,
+    state: dict[str, Any],
+    state_path: Path,
+    repo_root: Path,
+    target: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    task = state.get("agent_task")
+    if (
+        not isinstance(task, dict)
+        or set(task) != LEGACY_RUNNING_LOCAL_OWNER_FIELDS
+        or task.get("status") != "running"
+        or task.get("producer") != "local"
+        or task.get("policy") != LOCAL_DECISION_POLICY
+        or task.get("model") != LOCAL_DECISION_MODEL
+        or task.get("reasoning_effort") != LOCAL_DECISION_REASONING_EFFORT
+        or task.get("resume_attempts") != 0
+        or not isinstance(task.get("remaining_iterations"), int)
+        or isinstance(task["remaining_iterations"], bool)
+        or task["remaining_iterations"] <= 0
+    ):
+        raise WorkflowError(
+            "state is not an exact legacy running local decision owner"
+        )
+    monitoring = state.get("monitoring")
+    if isinstance(monitoring, dict) and monitoring.get("status") in {
+        "requested",
+        "running",
+    }:
+        raise WorkflowError("a review watcher still owns this state")
+    run_id = task.get("run_id")
+    session_id = task.get("local_session_id")
+    preflight = task.get("preflight")
+    if (
+        not isinstance(run_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", run_id) is None
+        or not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(preflight, dict)
+        or preflight.get("repository_root") != str(repo_root)
+        or not isinstance(preflight.get("pr"), dict)
+        or preflight["pr"].get("pr_url") != target["pr_url"]
+    ):
+        raise WorkflowError("dead local owner identity is malformed")
+    history = state.get("managed_task_history", [])
+    if (
+        not isinstance(history, list)
+        or any(
+            isinstance(item, dict) and item.get("run_id") == run_id
+            for item in history
+        )
+    ):
+        raise WorkflowError("dead local owner is already archived or history is malformed")
+    prompt_path = Path(task.get("prompt_file", ""))
+    result_path = Path(task.get("result_file", ""))
+    decision_path = Path(task.get("decision_file", ""))
+    canonical_path = Path(task.get("canonical_report_file", ""))
+    for artifact in (prompt_path, result_path, decision_path, canonical_path):
+        require_outside_repository(artifact, repo_root)
+    if (
+        not prompt_path.is_file()
+        or prompt_path.is_symlink()
+        or sha256_file(prompt_path) != task.get("prompt_sha256")
+    ):
+        raise WorkflowError("dead local owner prompt identity drifted")
+    missing_artifacts = sorted(
+        str(path) for path in (result_path, decision_path, canonical_path)
+    )
+    if any(Path(path).exists() or Path(path).is_symlink() for path in missing_artifacts):
+        raise WorkflowError("dead local owner produced an output artifact")
+    expected_command = local_decision_command(
+        repo_root,
+        session_id=session_id,
+        run_id=run_id,
+        pr_number=preflight["pr"]["number"],
+    )
+    if task.get("worker_command") != expected_command:
+        raise WorkflowError("dead local owner worker command identity drifted")
+    attestation = local_session_model_attestation(
+        session_id,
+        require_assistant_message=True,
+    )
+    lock = dead_local_session_lock(session_id)
+    before_source = local_source_owner_fingerprint(task.get("source_before"))
+    current_source = local_source_fingerprint(repo_root)
+    if (
+        before_source["status"]
+        or current_source["status"]
+        or current_source["branch"] != before_source["branch"]
+        or not base_revision_is_ancestor(
+            repo_root, before_source["head"], current_source["head"]
+        )
+    ):
+        raise WorkflowError("dead local owner source identity cannot be reconciled")
+    live_preflight = agent_task_preflight(repo_root, target)
+    old_pr = preflight["pr"]
+    live_pr = live_preflight["pr"]
+    stable_pr_fields = (
+        "number",
+        "repo_name",
+        "pr_url",
+        "pr_node_id",
+        "title",
+        "body",
+        "head_owner",
+        "head_repo",
+        "head_branch",
+        "base_branch",
+        "state",
+        "is_draft",
+    )
+    if any(old_pr.get(field) != live_pr.get(field) for field in stable_pr_fields):
+        raise WorkflowError("dead local owner pull request identity drifted")
+    if (
+        live_pr["head_sha"] != current_source["head"]
+        or not base_revision_is_ancestor(
+            repo_root, old_pr["base_sha"], live_pr["base_sha"]
+        )
+        or dead_local_comment_identity(preflight)
+        != dead_local_comment_identity(live_preflight)
+    ):
+        raise WorkflowError("dead local owner live review identity drifted")
+    source_commits = git(
+        repo_root,
+        "rev-list",
+        "--reverse",
+        f"{before_source['head']}..{current_source['head']}",
+    ).splitlines()
+    source_paths = git(
+        repo_root,
+        "diff",
+        "--name-only",
+        f"{before_source['head']}..{current_source['head']}",
+    ).splitlines()
+    snapshot = {
+        "schema": DEAD_LOCAL_OWNER_RECONCILIATION_SCHEMA,
+        "helper_sha256": sha256_file(Path(__file__).resolve()),
+        "state": {
+            "path": str(state_path),
+            "sha256": sha256_file(state_path),
+        },
+        "target": target["pr_url"],
+        "repo_root": str(repo_root),
+        "owner": run_id,
+        "session_id": session_id,
+        "prompt": {
+            "path": str(prompt_path),
+            "sha256": task["prompt_sha256"],
+            "size": prompt_path.stat().st_size,
+        },
+        "missing_artifacts": missing_artifacts,
+        "events": {
+            "path": attestation["events_path"],
+            "sha256": attestation["events_sha256"],
+            "assistant_message_count": attestation["assistant_message_count"],
+        },
+        "session_lock": lock,
+        "worker_command_sha256": sha256_text(
+            json.dumps(expected_command, separators=(",", ":"), ensure_ascii=True)
+        ),
+        "source_before": before_source,
+        "source_current": current_source,
+        "source_transition": {
+            "commits": source_commits,
+            "paths": source_paths,
+        },
+        "review_before_sha256": review_snapshot_sha256(preflight),
+        "review_current_sha256": review_snapshot_sha256(live_preflight),
+        "live_pr": {
+            "head_sha": live_pr["head_sha"],
+            "base_sha": live_pr["base_sha"],
+            "head_branch": live_pr["head_branch"],
+            "base_branch": live_pr["base_branch"],
+            "is_draft": live_pr["is_draft"],
+        },
+        "remaining_iterations": task["remaining_iterations"],
+    }
+    return snapshot, live_preflight
+
+
+def dead_local_owner_reconciliation_seal(snapshot: dict[str, Any]) -> str:
+    return sha256_text(
+        json.dumps(
+            snapshot,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+
+
+def command_reconcile_dead_local_owner(args: argparse.Namespace) -> None:
+    require_tools()
+    repo_root = resolve_repo_root(args.repo_root)
+    target = resolve_target(args.target, repo_root)
+    state_path = cli_path(args.state) if args.state else default_state_path(target)
+    require_outside_repository(state_path, repo_root)
+    state = load_state(state_path)
+    snapshot, live_preflight = dead_local_owner_reconciliation_snapshot(
+        state=state,
+        state_path=state_path,
+        repo_root=repo_root,
+        target=target,
+    )
+    seal = dead_local_owner_reconciliation_seal(snapshot)
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "reconcile-dead-local-owner",
+        target["pr_url"],
+        "--repo-root",
+        str(repo_root),
+        "--state",
+        str(state_path),
+        "--expected-seal",
+        seal,
+    ]
+    if args.expected_seal is None:
+        emit(
+            {
+                "result": "dead_local_owner_reconciliation_eligible",
+                "seal": seal,
+                "snapshot": snapshot,
+                "reconcile_command": command,
+            }
+        )
+        return
+    if args.expected_seal != seal:
+        raise WorkflowError("dead local owner reconciliation seal drifted")
+    state = load_state(state_path)
+    verified_snapshot, verified_preflight = dead_local_owner_reconciliation_snapshot(
+        state=state,
+        state_path=state_path,
+        repo_root=repo_root,
+        target=target,
+    )
+    if (
+        verified_snapshot != snapshot
+        or verified_preflight != live_preflight
+        or dead_local_owner_reconciliation_seal(verified_snapshot) != seal
+    ):
+        raise WorkflowError("dead local owner changed during reconciliation")
+    archived_at = utc_now()
+    archived = copy.deepcopy(state["agent_task"])
+    archived.update(
+        {
+            "status": "archived_dead_local",
+            "task_id": archived["local_session_id"],
+            "task_id_status": "terminal_unusable",
+            "error": "reconciled dead legacy local decision owner",
+            "failed_at": archived_at,
+            "dead_local_reconciliation": {
+                "schema": DEAD_LOCAL_OWNER_RECONCILIATION_SCHEMA,
+                "seal": seal,
+                "archived_at": archived_at,
+                "snapshot": verified_snapshot,
+            },
+        }
+    )
+    archived.pop("recovery_command", None)
+    state.setdefault("managed_task_history", []).append(archived)
+    consumed = copy.deepcopy(archived)
+    consumed["status"] = "consumed"
+    consumed["consumed_at"] = archived_at
+    state["agent_task"] = consumed
+    state["pr"] = verified_preflight["pr"]
+    state["repo_root"] = str(repo_root)
+    save_state(state_path, state)
+    emit(
+        {
+            "result": "dead_local_owner_reconciled",
+            "state": str(state_path),
+            "seal": seal,
+            "owner": archived["run_id"],
+            "session_id": archived["local_session_id"],
+            "iterations": state.get("iterations", 0),
+            "source_head": verified_snapshot["source_current"]["head"],
+        }
+    )
+
+
 def command_cleanup(args: argparse.Namespace) -> None:
     path = cli_path(args.state)
     state = load_state(path)
@@ -9569,6 +9951,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     status.add_argument("--repo-root")
     status.set_defaults(function=command_status)
+
+    reconcile_dead_local = subparsers.add_parser(
+        "reconcile-dead-local-owner",
+        help="inspect or archive one exact dead legacy local decision owner",
+    )
+    reconcile_dead_local.add_argument(
+        "target",
+        nargs="?",
+        help=(
+            "PR URL or owner/repo#number; omit only from a worktree "
+            "attached to the PR's branch"
+        ),
+    )
+    reconcile_dead_local.add_argument("--repo-root")
+    reconcile_dead_local.add_argument("--state")
+    reconcile_dead_local.add_argument(
+        "--expected-seal",
+        help="apply only the exact SHA-256 eligibility snapshot emitted earlier",
+    )
+    reconcile_dead_local.set_defaults(function=command_reconcile_dead_local_owner)
 
     cleanup = subparsers.add_parser("cleanup", help="delete completed external state")
     cleanup.add_argument("--state", required=True)

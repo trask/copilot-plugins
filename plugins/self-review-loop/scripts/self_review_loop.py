@@ -4870,11 +4870,16 @@ def archive_legacy_malformed_owner(
         )
     if (
         live_pr["head_sha"] != identity["source_head"]
-        or live_pr["base_sha"] != identity["direct_base"]
+        or live_pr["base_sha"] != old_pr["base_sha"]
     ):
         raise WorkflowError(
             "cannot replace legacy malformed owner after source identity drift"
         )
+    require_github_ancestor(
+        old_pr["repo_name"],
+        identity["direct_base"],
+        live_pr["base_sha"],
+    )
     task_payload = gh_json(
         [
             "api",
@@ -4938,6 +4943,15 @@ def archive_legacy_malformed_owner(
             "request_id": identity["request_id"],
             "prompt_sha256": projection["prompt_sha256"],
             "result_sha256": projection["result_sha256"],
+            "direct_base_transition": {
+                "worker_base_sha": identity["direct_base"],
+                "preflight_base_sha": live_pr["base_sha"],
+                "rule": (
+                    "exact"
+                    if identity["direct_base"] == live_pr["base_sha"]
+                    else "worker-base-forward-ancestor"
+                ),
+            },
             "report_sha256": report_sha256,
             "validation_sha256": validation_sha256,
             "ordered_commits": [],

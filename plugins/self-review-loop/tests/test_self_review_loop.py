@@ -1285,7 +1285,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def legacy_malformed_owner_state(self, state_path):
         request_id = "legacy-request-1"
         generated_head = "3" * 40
-        direct_base = "4" * 40
+        direct_base = self.preflight["pr"]["base_sha"]
         prompt_path = self.directory / "legacy-prompt.txt"
         result_path = self.directory / "legacy-result.json"
         prompt_path.write_text(
@@ -1850,7 +1850,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.30")
+        self.assertEqual(plugin["version"], "1.3.31")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -4207,6 +4207,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(
             MODULE.sha256_text(malformed_validation), task["validation_sha256"]
         )
+        self.assertEqual(
+            {
+                "worker_base_sha": result["pull_request"]["base_sha"],
+                "preflight_base_sha": live_preflight["pr"]["base_sha"],
+                "rule": "exact",
+            },
+            task["direct_base_transition"],
+        )
         self.assertEqual(4, len(task["preserved_artifacts"]))
         self.assertEqual(
             sorted([result["report"]["path"], result["worker_receipt"]["path"]]),
@@ -4214,6 +4222,67 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         self.assertEqual("failed", archived["review"]["status"])
         self.assertEqual(1, len(archived["managed_review_history"]))
+
+    def test_archives_legacy_owner_after_frozen_base_advanced(self):
+        state_path = self.directory / "legacy-advanced-base.json"
+        state, result, _, result_path = self.legacy_malformed_owner_state(state_path)
+        worker_base = "4" * 40
+        result["pull_request"]["base_sha"] = worker_base
+        result_path.write_text(
+            json.dumps(result, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+        live_preflight = copy.deepcopy(self.preflight)
+        report = "Untrusted legacy report\n"
+        malformed_validation = json.dumps(
+            [{"command": "python -m pytest", "outcome": "not-run"}]
+        )
+        compare_payload = {
+            "status": "ahead",
+            "merge_base_commit": {"sha": worker_base},
+        }
+        task_payload = {"id": result["task"]["id"], "state": "completed"}
+        commit_payload = {
+            "sha": result["generated"]["head_sha"],
+            "parents": [{"sha": self.head}],
+            "files": [
+                {"filename": result["report"]["path"], "status": "added"},
+                {
+                    "filename": result["worker_receipt"]["path"],
+                    "status": "added",
+                },
+            ],
+        }
+        with (
+            mock.patch.object(
+                MODULE,
+                "gh_json",
+                side_effect=[compare_payload, task_payload, commit_payload],
+            ),
+            mock.patch.object(
+                MODULE,
+                "fetch_committed_text",
+                side_effect=[report, malformed_validation],
+            ),
+        ):
+            self.assertTrue(
+                MODULE.archive_legacy_malformed_owner(
+                    state,
+                    state_path=state_path,
+                    repo_root=self.repo_root,
+                    live_preflight=live_preflight,
+                )
+            )
+
+        archived = MODULE.load_state(state_path)
+        self.assertEqual(
+            {
+                "worker_base_sha": worker_base,
+                "preflight_base_sha": self.preflight["pr"]["base_sha"],
+                "rule": "worker-base-forward-ancestor",
+            },
+            archived["managed_task_history"][0]["direct_base_transition"],
+        )
 
     def test_legacy_malformed_owner_projection_fails_closed(self):
         mutations = {
@@ -4267,6 +4336,32 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         live_preflight["pr"]["base_sha"] = result["pull_request"]["base_sha"]
         live_preflight["pr"]["head_sha"] = "6" * 40
         with self.assertRaisesRegex(MODULE.WorkflowError, "source identity drift"):
+            MODULE.archive_legacy_malformed_owner(
+                state,
+                state_path=state_path,
+                repo_root=self.repo_root,
+                live_preflight=live_preflight,
+            )
+
+        state, result, _, result_path = self.legacy_malformed_owner_state(state_path)
+        worker_base = "4" * 40
+        result["pull_request"]["base_sha"] = worker_base
+        result_path.write_text(
+            json.dumps(result, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+        live_preflight = copy.deepcopy(self.preflight)
+        with (
+            mock.patch.object(
+                MODULE,
+                "gh_json",
+                return_value={
+                    "status": "diverged",
+                    "merge_base_commit": {"sha": "5" * 40},
+                },
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "is not an ancestor"),
+        ):
             MODULE.archive_legacy_malformed_owner(
                 state,
                 state_path=state_path,

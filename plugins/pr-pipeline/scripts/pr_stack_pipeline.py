@@ -25,6 +25,8 @@ import uuid
 from typing import Any, Callable
 
 
+sys.dont_write_bytecode = True
+
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
 

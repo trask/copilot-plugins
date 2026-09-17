@@ -2,7 +2,9 @@ from contextlib import redirect_stdout
 import importlib.util
 from io import StringIO
 import json
+import os
 from pathlib import Path
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -67,6 +69,29 @@ def stack(members=(11, 12, 13), number=77, heads=None) -> dict:
         "trunk": "main",
         "members": entries,
     }
+
+
+class InstalledRuntimeTest(unittest.TestCase):
+    def test_dynamic_common_import_does_not_write_bytecode(self):
+        with tempfile.TemporaryDirectory() as raw_directory:
+            installed = Path(raw_directory)
+            copied_script = installed / SCRIPT.name
+            copied_script.write_bytes(SCRIPT.read_bytes())
+            (installed / COMMON_SCRIPT.name).write_bytes(COMMON_SCRIPT.read_bytes())
+            environment = os.environ.copy()
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            completed = subprocess.run(
+                [os.fsdecode(os.environ.get("PYTHON", "python")), str(copied_script), "--help"],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                creationflags=(
+                    subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                ),
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertFalse((installed / "__pycache__").exists())
 
 
 class FakeHandle:
