@@ -1060,6 +1060,42 @@ class SweepTest(unittest.TestCase):
             result["stage_result"]["status"]["agent_task"]["recovery_command"],
         )
 
+    def test_pipeline_stops_for_native_stack_normalization(self):
+        original = self.inspect
+        conflict_inspections = 0
+
+        def normalization_after_launch(entry, *args):
+            nonlocal conflict_inspections
+            if entry["stage"] != MODULE.STAGE_CONFLICT:
+                return original(entry, *args)
+            conflict_inspections += 1
+            if conflict_inspections == 1:
+                return uncleared_stage(entry["stage"], None)
+            return {
+                **uncleared_stage(entry["stage"], None),
+                "status": {
+                    "agent_task": {
+                        "status": "normalization_required",
+                        "task_id": None,
+                        "task_id_status": "not_created",
+                        "error": {
+                            "code": "native_stack_normalization_required",
+                            "message": "native stack member requires normalization",
+                        },
+                        "normalization_sha256": "a" * 64,
+                    },
+                },
+            }
+
+        MODULE.inspect_stage.side_effect = normalization_after_launch
+        result = self.execute()
+
+        self.assertEqual("blocked", result["result"])
+        self.assertEqual("stage_recovery_required", result["reason"])
+        self.assertEqual(MODULE.STAGE_CONFLICT, result["stage"])
+        self.assertIn("native_stack_normalization_required", result["detail"])
+        self.assertEqual([(MODULE.STAGE_CONFLICT, 1)], self.launched)
+
     def test_restart_does_not_duplicate_a_stage_with_an_active_task(self):
         self.clear_at[MODULE.STAGE_CONFLICT] = HEAD
         self.clear_base_at = BASE

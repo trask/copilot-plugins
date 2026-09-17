@@ -46,6 +46,7 @@ POLICY_SPEC = {
     "require_exact_request_identity": True,
     "require_exact_target_identity": True,
     "require_mechanical_history_proof": True,
+    "safe_direct_base_sync_merge_omission": True,
     "require_separate_artifact_ref": True,
     "require_complete_successful_validation": True,
 }
@@ -315,6 +316,62 @@ def validate_commit_identity(value: object, description: str) -> Mapping[str, ob
     return commit
 
 
+def validate_sync_merge_identity(
+    value: object, description: str
+) -> Mapping[str, object]:
+    merge = require_exact_keys(
+        value,
+        {
+            "sha",
+            "position",
+            "parents",
+            "subject",
+            "trailers",
+            "tree",
+            "remerge_diff_sha256",
+        },
+        description,
+    )
+    require_sha(merge["sha"], f"{description}.sha")
+    if (
+        not isinstance(merge["position"], int)
+        or isinstance(merge["position"], bool)
+        or merge["position"] < 0
+    ):
+        raise ConflictError(
+            f"{description}.position is invalid", "policy_rejected"
+        )
+    merge_parents = merge["parents"]
+    if not isinstance(merge_parents, list) or len(merge_parents) != 2:
+        raise ConflictError(
+            f"{description}.parents is invalid", "policy_rejected"
+        )
+    for parent in merge_parents:
+        require_sha(parent, f"{description}.parents")
+    if not isinstance(merge["subject"], str) or not merge["subject"].strip():
+        raise ConflictError(
+            f"{description}.subject is invalid", "policy_rejected"
+        )
+    trailers = merge["trailers"]
+    if not isinstance(trailers, list) or any(
+        not isinstance(item, str) or not item.strip() for item in trailers
+    ):
+        raise ConflictError(
+            f"{description}.trailers is invalid", "policy_rejected"
+        )
+    require_sha(merge["tree"], f"{description}.tree")
+    require_sha256(
+        merge["remerge_diff_sha256"],
+        f"{description}.remerge_diff_sha256",
+    )
+    if merge["remerge_diff_sha256"] != hashlib.sha256(b"").hexdigest():
+        raise ConflictError(
+            f"{description} carries conflict-resolution changes",
+            "policy_rejected",
+        )
+    return merge
+
+
 def validate_pr_snapshot(value: object, description: str) -> Mapping[str, object]:
     snapshot = require_exact_keys(
         value,
@@ -383,6 +440,7 @@ def validate_native_stack(value: object) -> Mapping[str, object]:
                 "direct_merge_base",
                 "expected_new_parent",
                 "old_commits",
+                "sync_merges",
                 "lease_sha",
             },
             f"native_stack.members[{index}]",
@@ -431,6 +489,23 @@ def validate_native_stack(value: object) -> Mapping[str, object]:
             validate_commit_identity(
                 commit,
                 f"native_stack.members[{index}].old_commits[{commit_index}]",
+            )
+        sync_merges = member["sync_merges"]
+        if not isinstance(sync_merges, list):
+            raise ConflictError(
+                "native stack member sync_merges is invalid",
+                "policy_rejected",
+            )
+        for merge_index, merge in enumerate(sync_merges):
+            validate_sync_merge_identity(
+                merge,
+                f"native_stack.members[{index}].sync_merges[{merge_index}]",
+            )
+        positions = [merge["position"] for merge in sync_merges]
+        if positions != sorted(set(positions)):
+            raise ConflictError(
+                "native stack synchronization merge positions are invalid",
+                "policy_rejected",
             )
         if commits[-1]["sha"] != member["head_sha"]:
             raise ConflictError(
@@ -1725,6 +1800,7 @@ def compact_request_contract(
                         compact_commit_evidence(commit)
                         for commit in member["old_commits"]
                     ],
+                    "sync_merges": member["sync_merges"],
                 }
                 for member in stack["members"]
             ],
@@ -1938,6 +2014,12 @@ def policy_prompt(options: Options) -> str:
         "complete retained request, generated history, report, receipt, paths, and "
         "patch identities after the task; compact prompt evidence never weakens that "
         "validation.\n"
+        "A native-stack member may list direct-base synchronization merges. The "
+        "dispatcher proved each has exactly two parents, its second parent belongs "
+        "to the current direct-base ancestry, and its remerge diff is empty. These "
+        "merges are topology-only base updates: omit their merge commits while "
+        "rebasing, map every listed old linear commit one-to-one and in order, and "
+        "never omit or flatten any other merge.\n"
         "Do not read, request, print, persist, or transmit credentials, local "
         "environment values, cookies, tokens, keys, or authorization headers. "
         "Do not invoke a custom_agent or local fallback. Do not update any user "
@@ -2215,6 +2297,121 @@ def parents(runner: Runner, root: Path, commit: str) -> list[str]:
     if not parts or parts[0] != commit:
         raise ConflictError("commit parent identity is malformed", "unexpected_history")
     return parts[1:]
+
+
+def prove_native_stack_member_input(
+    runner: Runner,
+    root: Path,
+    member: Mapping[str, object],
+) -> None:
+    chain = [
+        value.strip().lower()
+        for value in git(
+            runner,
+            root,
+            "rev-list",
+            "--reverse",
+            "--first-parent",
+            f"{member['retained_base_sha']}..{member['head_sha']}",
+        ).splitlines()
+        if value.strip()
+    ]
+    sync_by_position = {
+        merge["position"]: merge for merge in member["sync_merges"]
+    }
+    linear = iter(member["old_commits"])
+    for position, commit in enumerate(chain):
+        merge = sync_by_position.get(position)
+        commit_parents = parents(runner, root, commit)
+        if merge is None:
+            try:
+                old = next(linear)
+            except StopIteration as error:
+                raise ConflictError(
+                    "native stack linear history has extra commits",
+                    "unexpected_history",
+                ) from error
+            if commit != old["sha"] or len(commit_parents) != 1:
+                raise ConflictError(
+                    "native stack linear commit identity changed",
+                    "unexpected_history",
+                )
+            continue
+        if (
+            commit != merge["sha"]
+            or commit_parents != merge["parents"]
+            or len(commit_parents) != 2
+        ):
+            raise ConflictError(
+                "native stack synchronization merge identity changed",
+                "unexpected_history",
+            )
+        ancestry = run_process(
+            runner,
+            [
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                commit_parents[1],
+                member["direct_base_sha"],
+            ],
+            cwd=root,
+        )
+        remerge_diff = git(
+            runner,
+            root,
+            "show",
+            "--remerge-diff",
+            "--format=",
+            "--no-ext-diff",
+            "--binary",
+            commit,
+        )
+        if (
+            ancestry.returncode != 0
+            or remerge_diff
+            or merge["tree"]
+            != git(runner, root, "show", "-s", "--format=%T", commit).strip()
+            or merge["subject"]
+            != git(runner, root, "show", "-s", "--format=%s", commit).strip()
+            or merge["trailers"]
+            != [
+                line
+                for line in git(
+                    runner,
+                    root,
+                    "show",
+                    "-s",
+                    "--format=%(trailers:only,unfold)",
+                    commit,
+                ).splitlines()
+                if line
+            ]
+            or merge["remerge_diff_sha256"]
+            != hashlib.sha256(remerge_diff.encode("utf-8")).hexdigest()
+        ):
+            raise ConflictError(
+                "native stack synchronization merge proof changed",
+                "unexpected_history",
+            )
+    try:
+        next(linear)
+    except StopIteration:
+        pass
+    else:
+        raise ConflictError(
+            "native stack linear history is incomplete",
+            "unexpected_history",
+        )
+    if set(sync_by_position) != {
+        position
+        for position, commit in enumerate(chain)
+        if len(parents(runner, root, commit)) == 2
+    }:
+        raise ConflictError(
+            "native stack synchronization merge set is incomplete",
+            "unexpected_history",
+        )
 
 
 def ordered_commits(
@@ -2872,6 +3069,11 @@ def prove_generated(
             raise ConflictError("outside dependent was represented", "unexpected_history")
         for remote, tip in fetched_code:
             member = member_by_number[remote.pr_number]
+            prove_native_stack_member_input(
+                runner,
+                snapshot.root,
+                member,
+            )
             expected_parent = member["expected_new_parent"]
             expected_role = (
                 "trunk"

@@ -1423,7 +1423,13 @@ ACTIVE_TASK_STATES = frozenset(
     }
 )
 RECOVERY_TASK_STATES = frozenset(
-    {"failed", "failed_after_mutation", "failed_after_publication", "interrupted"}
+    {
+        "failed",
+        "failed_after_mutation",
+        "failed_after_publication",
+        "interrupted",
+        "normalization_required",
+    }
 )
 UNAVAILABLE_STATUS_REASONS = frozenset(
     {"status_timeout", "status_failed", "invalid_status_json", "status_not_ready"}

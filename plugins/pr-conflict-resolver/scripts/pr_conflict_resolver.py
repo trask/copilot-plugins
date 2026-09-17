@@ -72,12 +72,12 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "992b7a64c5d45155a9bbb95984691f21e202f406501fcf7d30e7158e8d55ff09"
+    "311b4e50da163470ec0991c48ba8f904fc3fa5f645e7ff15ab2e9510d7d4393b"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@1"
 CONFLICT_POLICY_SHA256 = (
-    "7fcb65dff47f5dc76f790f999de202e28692c5207dba7d3ff007145a327e6c67"
+    "30c96b070bed7b652ffd9181fd4f74b052f670226dab9693d595338aaf0a9d6a"
 )
 CONFLICT_POLICY_IDENTITY = {
     "id": "marketplace-conflict-worker",
@@ -107,6 +107,21 @@ CONFLICT_RECEIPT_DIRECTORY = ".github/agent-task-conflict-receipts"
 
 class WorkflowError(RuntimeError):
     pass
+
+
+class NativeStackNormalizationRequired(WorkflowError):
+    def __init__(self, manifest: dict[str, Any]):
+        self.manifest = manifest
+        self.manifest_sha256 = hashlib.sha256(
+            canonical_json(manifest).encode("utf-8")
+        ).hexdigest()
+        commits = ", ".join(
+            merge["sha"] for merge in manifest["normalization_merges"]
+        )
+        super().__init__(
+            "native stack member requires explicit owner normalization for "
+            f"merge commits: {commits}"
+        )
 
 
 class MergedPredecessorLineageError(WorkflowError):
@@ -6900,6 +6915,13 @@ def managed_retry_command(
         )
     else:
         command.extend(["--max-iterations", str(next_budget)])
+    if state_path.is_file():
+        command.extend(
+            [
+                "--expected-state-sha256",
+                sha256_file(state_path),
+            ]
+        )
     return " ".join(json.dumps(part) for part in command)
 
 
@@ -7039,13 +7061,116 @@ def ordered_commits(repo_root: Path, base: str, head: str) -> list[str]:
     return [line for line in output.splitlines() if line]
 
 
+def first_parent_commits(repo_root: Path, base: str, head: str) -> list[str]:
+    output = git(
+        repo_root,
+        "rev-list",
+        "--reverse",
+        "--first-parent",
+        f"{base}..{head}",
+    )
+    return [line for line in output.splitlines() if line]
+
+
+def sync_merge_identity(
+    repo_root: Path,
+    commit: str,
+    *,
+    current_base: str,
+    position: int,
+) -> dict[str, Any]:
+    parents = commit_parents(repo_root, commit)
+    if (
+        len(parents) != 2
+        or not is_ancestor(repo_root, parents[1], current_base)
+    ):
+        raise WorkflowError(
+            f"merge commit {commit} is not a direct-base synchronization merge"
+        )
+    remerge_diff = run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "show",
+            "--remerge-diff",
+            "--format=",
+            "--no-ext-diff",
+            "--binary",
+            commit,
+        ]
+    ).stdout
+    if remerge_diff:
+        raise WorkflowError(
+            f"merge commit {commit} carries conflict-resolution changes and "
+            "requires explicit owner normalization"
+        )
+    return {
+        "sha": commit,
+        "position": position,
+        "parents": parents,
+        "subject": conflict_commit_subject(repo_root, commit),
+        "trailers": conflict_commit_trailers(repo_root, commit),
+        "tree": git(repo_root, "show", "-s", "--format=%T", commit),
+        "remerge_diff_sha256": hashlib.sha256(remerge_diff.encode("utf-8")).hexdigest(),
+    }
+
+
+def normalization_merge_identity(
+    repo_root: Path,
+    commit: str,
+    *,
+    position: int,
+    reason: str,
+) -> dict[str, Any]:
+    remerge_diff = run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "show",
+            "--remerge-diff",
+            "--format=",
+            "--no-ext-diff",
+            "--binary",
+            commit,
+        ]
+    ).stdout
+    remerge_paths = [
+        path
+        for path in git(
+            repo_root,
+            "show",
+            "--remerge-diff",
+            "--format=",
+            "--name-only",
+            "--no-renames",
+            commit,
+        ).splitlines()
+        if path
+    ]
+    return {
+        "sha": commit,
+        "position": position,
+        "parents": commit_parents(repo_root, commit),
+        "subject": conflict_commit_subject(repo_root, commit),
+        "trailers": conflict_commit_trailers(repo_root, commit),
+        "tree": git(repo_root, "show", "-s", "--format=%T", commit),
+        "remerge_diff_sha256": hashlib.sha256(
+            remerge_diff.encode("utf-8")
+        ).hexdigest(),
+        "remerge_paths": remerge_paths,
+        "reason": reason,
+    }
+
+
 def native_stack_member_history(
     repo_root: Path,
     *,
     current_base: str,
     retained_base: str,
     head: str,
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str], list[dict[str, Any]]]:
     if not is_ancestor(repo_root, retained_base, head):
         raise WorkflowError(
             f"retained direct-base snapshot {retained_base} is not an ancestor "
@@ -7066,10 +7191,102 @@ def native_stack_member_history(
         raise WorkflowError(
             "native stack member has no unique common history with its current base"
         )
-    commits = ordered_commits(repo_root, retained_base, head)
+    commits = first_parent_commits(repo_root, retained_base, head)
     if not commits:
         raise WorkflowError("native stack member has an empty unique range")
-    return merge_bases[0], commits
+    linear_commits = []
+    sync_merges = []
+    normalization_merges = []
+    previous = None
+    for position, commit in enumerate(commits):
+        parents = commit_parents(repo_root, commit)
+        if previous is not None and (not parents or parents[0] != previous):
+            raise WorkflowError(
+                "native stack member first-parent history is discontinuous"
+            )
+        if len(parents) == 1:
+            linear_commits.append(commit)
+        elif len(parents) == 2:
+            try:
+                sync_merges.append(
+                    sync_merge_identity(
+                        repo_root,
+                        commit,
+                        current_base=current_base,
+                        position=position,
+                    )
+                )
+            except WorkflowError as error:
+                normalization_merges.append(
+                    normalization_merge_identity(
+                        repo_root,
+                        commit,
+                        position=position,
+                        reason=str(error),
+                    )
+                )
+        else:
+            normalization_merges.append(
+                normalization_merge_identity(
+                    repo_root,
+                    commit,
+                    position=position,
+                    reason=(
+                        f"commit {commit} has {len(parents)} parents and requires "
+                        "explicit owner normalization"
+                    ),
+                )
+            )
+        previous = commit
+    if not linear_commits or commits[-1] != linear_commits[-1]:
+        tip_sync_merge = next(
+            (merge for merge in sync_merges if merge["sha"] == head),
+            None,
+        )
+        if tip_sync_merge is not None:
+            sync_merges.remove(tip_sync_merge)
+            normalization_merges.append(
+                normalization_merge_identity(
+                    repo_root,
+                    head,
+                    position=tip_sync_merge["position"],
+                    reason=(
+                        "native stack member ends in a merge commit and requires "
+                        "explicit owner normalization"
+                    ),
+                )
+            )
+    if normalization_merges:
+        raise NativeStackNormalizationRequired(
+            {
+                "schema": {
+                    "id": "github.copilot.native-stack-normalization",
+                    "version": 1,
+                },
+                "current_base_sha": current_base,
+                "retained_base_sha": retained_base,
+                "head_sha": head,
+                "direct_merge_base": merge_bases[0],
+                "first_parent_commits": commits,
+                "linear_commits": linear_commits,
+                "safe_sync_merges": sync_merges,
+                "normalization_merges": normalization_merges,
+                "required_outcome": {
+                    "history": "linear",
+                    "new_parent": current_base,
+                    "preserve_linear_commits": True,
+                    "preserve_merge_resolution_intent": True,
+                    "push": False,
+                },
+                "owner_session": {
+                    "agent": "general-purpose",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                    "scope": "local-only",
+                },
+            }
+        )
+    return merge_bases[0], linear_commits, sync_merges
 
 
 def conflict_commit_subject(repo_root: Path, commit: str) -> str:
@@ -7314,12 +7531,58 @@ def conflict_preflight(
                 member["head_sha"],
             )
             retained_base_sha = member["base_sha"]
-            direct_merge_base, unique_commits = native_stack_member_history(
-                repo_root,
-                current_base=direct_base_sha,
-                retained_base=retained_base_sha,
-                head=member["head_sha"],
-            )
+            try:
+                (
+                    direct_merge_base,
+                    unique_commits,
+                    sync_merges,
+                ) = native_stack_member_history(
+                    repo_root,
+                    current_base=direct_base_sha,
+                    retained_base=retained_base_sha,
+                    head=member["head_sha"],
+                )
+            except NativeStackNormalizationRequired as error:
+                error.manifest["member"] = {
+                    "pr_number": member["number"],
+                    "repository": metadata["repo_name"],
+                    "head_ref": member["head_branch"],
+                    "head_sha": member["head_sha"],
+                    "direct_base_ref": member["base_branch"],
+                    "direct_base_sha": direct_base_sha,
+                    "retained_base_sha": retained_base_sha,
+                    "lease_sha": member["head_sha"],
+                }
+                error.manifest["target_pull_request"] = {
+                    "number": metadata["number"],
+                    "url": metadata["pr_url"],
+                    "head_ref": metadata["head_branch"],
+                    "head_sha": metadata["head_sha"],
+                    "base_ref": metadata["base_branch"],
+                    "base_sha": metadata["base_sha"],
+                }
+                error.manifest["stack"] = {
+                    "trunk": stack["trunk"],
+                    "members": [
+                        {
+                            "pr_number": item["number"],
+                            "head_ref": item["head_branch"],
+                            "head_sha": item["head_sha"],
+                            "direct_base_ref": item["base_branch"],
+                            "retained_base_sha": item["base_sha"],
+                        }
+                        for item in stack["members"]
+                    ],
+                }
+                error.manifest["iteration"] = {
+                    "id": iteration_id,
+                    "number": iteration_number,
+                    "budget": iteration_budget,
+                }
+                error.manifest_sha256 = hashlib.sha256(
+                    canonical_json(error.manifest).encode("utf-8")
+                ).hexdigest()
+                raise
             commits = [
                 commit_identity(repo_root, sha, linear=True)
                 for sha in unique_commits
@@ -7350,6 +7613,7 @@ def conflict_preflight(
                         "old_sha": previous_sha,
                     },
                     "old_commits": commits,
+                    "sync_merges": sync_merges,
                     "lease_sha": member["head_sha"],
                 }
             )
@@ -7453,8 +7717,11 @@ def build_conflict_prompt(preflight: dict[str, Any]) -> str:
         "commit with parents in the exact order [frozen head, frozen base]. For "
         "rebase, preserve every old commit one-to-one and in order. For a native "
         "stack, preserve every member, order, direct-base relation, unique range, "
-        "and lease. Preserve unaffected patches exactly. Record each conflict and "
-        "companion path with a concrete rationale.\n\n"
+        "and lease. A recorded direct-base synchronization merge has exactly two "
+        "parents, a second parent in the current direct-base ancestry, and an empty "
+        "remerge diff. Omit only those topology-only merge commits while mapping "
+        "every listed linear commit one-to-one. Preserve unaffected patches exactly. "
+        "Record each conflict and companion path with a concrete rationale.\n\n"
         "Run the repository's required formatting and focused validation remotely. "
         "Return only generated code refs plus the distinct report-and-receipt "
         "artifact ref. Do not push a user branch or edit pull request metadata. Do "
@@ -7665,6 +7932,26 @@ def verify_rebased_range(
         parent = new_sha
 
 
+def verify_native_stack_member_input(
+    repo_root: Path,
+    member: dict[str, Any],
+) -> None:
+    merge_base, commits, sync_merges = native_stack_member_history(
+        repo_root,
+        current_base=member["direct_base_sha"],
+        retained_base=member["retained_base_sha"],
+        head=member["head_sha"],
+    )
+    if (
+        merge_base != member["direct_merge_base"]
+        or commits != [commit["sha"] for commit in member["old_commits"]]
+        or sync_merges != member["sync_merges"]
+    ):
+        raise WorkflowError(
+            "native stack member retained history identity drifted"
+        )
+
+
 def verify_merge_range(
     repo_root: Path,
     head: str,
@@ -7772,6 +8059,7 @@ def verify_quarantined_result(
                 or code_ref["base_sha"] != previous_tip
             ):
                 raise WorkflowError("native stack result violates member order or lease")
+            verify_native_stack_member_input(repo_root, member)
             verify_rebased_range(
                 repo_root,
                 previous_tip,
@@ -8125,6 +8413,13 @@ def command_agent_task(args: argparse.Namespace) -> None:
     iteration_budget = args.pipeline_max_iterations or args.max_iterations
     replaced_task: dict[str, Any] | None = None
     replacement_identity: dict[str, str] | None = None
+    if args.expected_state_sha256 is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", args.expected_state_sha256):
+            raise WorkflowError("expected state hash must be lowercase SHA-256")
+        if existing is None:
+            raise WorkflowError("expected state does not exist")
+        if sha256_file(state_path) != args.expected_state_sha256:
+            raise WorkflowError("expected state hash does not match")
     if args.replace_unidentified_owner is not None:
         if args.resume:
             raise WorkflowError(
@@ -8134,12 +8429,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
             raise WorkflowError(
                 "--replace-unidentified-owner requires --expected-state-sha256"
             )
-        if not re.fullmatch(r"[0-9a-f]{64}", args.expected_state_sha256):
-            raise WorkflowError("replacement state hash must be lowercase SHA-256")
-        if existing is None:
-            raise WorkflowError("replacement state does not exist")
-        if sha256_file(state_path) != args.expected_state_sha256:
-            raise WorkflowError("replacement state hash does not match")
         active = existing.get("agent_task")
         error = active.get("error") if isinstance(active, dict) else None
         if (
@@ -8195,23 +8484,21 @@ def command_agent_task(args: argparse.Namespace) -> None:
     else:
         if existing is not None:
             active = existing.get("agent_task")
+            replaceable_preflight = (
+                isinstance(active, dict)
+                and active.get("status") in {"failed", "normalization_required"}
+                and active.get("task_id_status") == "not_created"
+            )
             if (
                 isinstance(active, dict)
                 and active.get("status") not in {"completed", "consumed"}
                 and replacement_identity is None
-                and not (
-                    active.get("status") == "failed"
-                    and active.get("task_id_status") == "not_created"
-                )
+                and not replaceable_preflight
             ):
                 raise WorkflowError(
                     "an unfinished managed conflict task owns this state; use --resume"
                 )
-            if (
-                isinstance(active, dict)
-                and active.get("status") == "failed"
-                and active.get("task_id_status") == "not_created"
-            ):
+            if replaceable_preflight:
                 replaced_task = active
         prior_attempts = int(existing.get("attempts", 0)) if existing else 0
         prior_managed_attempts = managed_attempt_count(existing)
@@ -8309,6 +8596,42 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 iteration_budget=iteration_budget,
                 model=model,
             )
+        except NativeStackNormalizationRequired as error:
+            task = state["agent_task"]
+            task["status"] = "normalization_required"
+            task["normalization"] = error.manifest
+            task["normalization_sha256"] = error.manifest_sha256
+            task["error"] = {
+                "code": "native_stack_normalization_required",
+                "message": str(error),
+            }
+            save_state(state_path, state)
+            emit(
+                {
+                    "result": "normalization_required",
+                    "state": str(state_path),
+                    "task_id": None,
+                    "task_id_status": "not_created",
+                    "error": task["error"],
+                    "normalization": error.manifest,
+                    "normalization_sha256": error.manifest_sha256,
+                    "retry_command": managed_retry_command(
+                        args,
+                        repo_root=repo_root,
+                        target=target,
+                        state_path=state_path,
+                        next_budget=iteration_budget,
+                    ),
+                    "next_action": (
+                        "Use a fresh local owner session to linearize the named "
+                        "stack member without pushing, preserving every linear "
+                        "commit and each recorded merge-resolution intent. "
+                        "Re-run this command only after reviewing that local result."
+                    ),
+                    "stage_outcome": "escalated",
+                }
+            )
+            return
         except (WorkflowError, json.JSONDecodeError, OSError) as error:
             task = state["agent_task"]
             task["status"] = "failed"

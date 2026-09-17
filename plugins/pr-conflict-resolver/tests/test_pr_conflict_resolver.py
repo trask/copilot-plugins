@@ -886,11 +886,11 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "992b7a64c5d45155a9bbb95984691f21e202f406501fcf7d30e7158e8d55ff09",
+            "311b4e50da163470ec0991c48ba8f904fc3fa5f645e7ff15ab2e9510d7d4393b",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
-            "7fcb65dff47f5dc76f790f999de202e28692c5207dba7d3ff007145a327e6c67",
+            "30c96b070bed7b652ffd9181fd4f74b052f670226dab9693d595338aaf0a9d6a",
         )
         self.assertEqual(
             MODULE.CONFLICT_REQUEST_SCHEMA["id"],
@@ -1603,6 +1603,164 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         status = emitted(status_emit)
         self.assertEqual("ready", status["result"])
         self.assertEqual("failed", status["agent_task"]["status"])
+
+    def test_native_stack_normalization_is_retained_without_task_creation(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+                "--model",
+                "sol",
+            ]
+        )
+        target = MODULE.parse_target("owner/repo#7")
+        manifest = {
+            "schema": {
+                "id": "github.copilot.native-stack-normalization",
+                "version": 1,
+            },
+            "normalization_merges": [{"sha": "a" * 40}],
+        }
+        error = MODULE.NativeStackNormalizationRequired(manifest)
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(
+                MODULE,
+                "conflict_preflight",
+                side_effect=error,
+            ),
+            mock.patch.object(MODULE, "discover_conflict_task") as discover,
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(args)
+
+        discover.assert_not_called()
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        task = state["agent_task"]
+        self.assertEqual(0, state["attempts"])
+        self.assertEqual("normalization_required", task["status"])
+        self.assertEqual("not_created", task["task_id_status"])
+        self.assertEqual(
+            "native_stack_normalization_required",
+            task["error"]["code"],
+        )
+        self.assertEqual(manifest, task["normalization"])
+        self.assertEqual(error.manifest_sha256, task["normalization_sha256"])
+        payload = emitted(emit)
+        self.assertEqual("normalization_required", payload["result"])
+        self.assertEqual("not_created", payload["task_id_status"])
+        self.assertEqual(manifest, payload["normalization"])
+        self.assertEqual(error.manifest_sha256, payload["normalization_sha256"])
+        self.assertIn('"--model" "sol"', payload["retry_command"])
+        state_sha256 = hashlib.sha256(state_path.read_bytes()).hexdigest()
+        self.assertIn(
+            f'"--expected-state-sha256" "{state_sha256}"',
+            payload["retry_command"],
+        )
+
+        retry_args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+                "--model",
+                "sol",
+                "--expected-state-sha256",
+                state_sha256,
+            ]
+        )
+        mergeable = {
+            "already_mergeable": True,
+            "pr": {
+                **target,
+                "head_sha": "b" * 40,
+                "base_sha": "a" * 40,
+                "head_branch": "feature",
+                "base_branch": "main",
+            },
+            "strategy": None,
+        }
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(
+                MODULE,
+                "conflict_preflight",
+                return_value=mergeable,
+            ),
+            mock.patch.object(MODULE, "discover_conflict_task") as discover,
+            mock.patch.object(MODULE, "emit") as retry_emit,
+        ):
+            MODULE.command_agent_task(retry_args)
+
+        discover.assert_not_called()
+        retried = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(0, retried["managed_attempts"])
+        self.assertEqual(1, retried["attempts"])
+        self.assertEqual(
+            "normalization_required",
+            retried["managed_task_history"][-1]["status"],
+        )
+        self.assertEqual("mergeable", emitted(retry_emit)["result"])
+
+    def test_retry_state_hash_mismatch_stops_before_preflight(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "created_at": "2026-09-15T00:00:00Z",
+                    "attempts": 0,
+                    "history": [],
+                    "escalation": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+                "--expected-state-sha256",
+                "0" * 64,
+            ]
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(MODULE, "conflict_preflight") as preflight,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "expected state hash does not match",
+            ):
+                MODULE.command_agent_task(args)
+        preflight.assert_not_called()
 
     def test_mergeable_agent_task_needs_no_repository_strategy(self):
         directory = temporary_directory(self)
@@ -2932,7 +3090,16 @@ class StrategyChoiceTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "ordered_commits",
-                side_effect=[[], [lower], [upper]],
+                return_value=[],
+            ),
+            mock.patch.object(
+                MODULE,
+                "native_stack_member_history",
+                side_effect=lambda _root, current_base, retained_base, head: (
+                    "f" * 40,
+                    [head],
+                    [],
+                ),
             ),
             mock.patch.object(
                 MODULE,
@@ -2996,7 +3163,7 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
             if arguments == (
                 "rev-list",
                 "--reverse",
-                "--topo-order",
+                "--first-parent",
                 f"{retained_base}..{head}",
             ):
                 return head
@@ -3010,6 +3177,10 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
             MODULE,
             "is_ancestor",
             return_value=ancestor,
+        ), mock.patch.object(
+            MODULE,
+            "commit_parents",
+            return_value=[retained_base],
         ):
             return MODULE.native_stack_member_history(
                 Path("C:/repo"),
@@ -3024,7 +3195,7 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
         head = "c" * 40
         common = "d" * 40
 
-        merge_base, commits = self.validate(
+        merge_base, commits, sync_merges = self.validate(
             current_base=current,
             retained_base=retained,
             head=head,
@@ -3033,6 +3204,7 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
 
         self.assertEqual(common, merge_base)
         self.assertEqual([head], commits)
+        self.assertEqual([], sync_merges)
 
     def test_dependent_base_may_have_advanced_beyond_the_child(self):
         current_parent = "e" * 40
@@ -3040,7 +3212,7 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
         child = "1" * 40
         common = "2" * 40
 
-        merge_base, commits = self.validate(
+        merge_base, commits, sync_merges = self.validate(
             current_base=current_parent,
             retained_base=retained_parent,
             head=child,
@@ -3049,6 +3221,7 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
 
         self.assertEqual(common, merge_base)
         self.assertEqual([child], commits)
+        self.assertEqual([], sync_merges)
 
     def test_member_requires_common_history_with_current_base(self):
         with self.assertRaisesRegex(
@@ -3086,6 +3259,155 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
                 merge_bases="e" * 40,
                 ancestor=False,
             )
+
+
+class NativeStackSynchronizationMergeIntegrationTest(unittest.TestCase):
+    def setUp(self):
+        self.repo = temporary_directory(self)
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.name", "Test")
+        self.git("config", "user.email", "test@example.invalid")
+        self.write("base.txt", "base\n")
+        self.git("add", "base.txt")
+        self.git("commit", "-q", "-m", "base")
+        self.retained_base = self.git("rev-parse", "HEAD")
+
+    def git(self, *arguments, check=True):
+        result = subprocess.run(
+            ["git", "-C", str(self.repo), *arguments],
+            check=check,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    def write(self, path, content):
+        (self.repo / path).write_text(content, encoding="utf-8", newline="\n")
+
+    def build_sync_merge(self, *, conflicted=False):
+        self.git("checkout", "-q", "-b", "upper")
+        if conflicted:
+            self.write("base.txt", "upper\n")
+            self.git("add", "base.txt")
+        else:
+            self.write("upper.txt", "upper\n")
+            self.git("add", "upper.txt")
+        self.git("commit", "-q", "-m", "Upper change")
+        upper_before_merge = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "-q", "main")
+        self.write("base.txt", "lower\n")
+        self.git("commit", "-q", "-am", "Lower change")
+        current_base = self.git("rev-parse", "HEAD")
+
+        self.git("checkout", "-q", "upper")
+        if conflicted:
+            self.git("merge", "--no-ff", "main", "-m", "Merge latest base", check=False)
+            self.write("base.txt", "upper and lower\n")
+            self.git("add", "base.txt")
+            self.git("commit", "-q", "-m", "Merge latest base")
+        else:
+            self.git("merge", "-q", "--no-ff", "main", "-m", "Merge latest base")
+        merge = self.git("rev-parse", "HEAD")
+        self.write("after.txt", "after merge\n")
+        self.git("add", "after.txt")
+        self.git("commit", "-q", "-m", "Upper follow-up")
+        head = self.git("rev-parse", "HEAD")
+        return current_base, upper_before_merge, merge, head
+
+    def test_automatic_direct_base_sync_merge_is_safely_omitted(self):
+        current_base, upper, merge, head = self.build_sync_merge()
+        old_range = MODULE.ordered_commits(
+            self.repo,
+            self.retained_base,
+            head,
+        )
+        self.assertIn(merge, old_range)
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "not a supported linear commit",
+        ):
+            MODULE.commit_identity(self.repo, merge, linear=True)
+
+        merge_base, commits, sync_merges = MODULE.native_stack_member_history(
+            self.repo,
+            current_base=current_base,
+            retained_base=self.retained_base,
+            head=head,
+        )
+
+        self.assertEqual(current_base, merge_base)
+        self.assertEqual([upper, head], commits)
+        self.assertEqual([merge], [item["sha"] for item in sync_merges])
+        self.assertEqual(1, sync_merges[0]["position"])
+        self.assertEqual([upper, current_base], sync_merges[0]["parents"])
+        self.assertEqual(
+            hashlib.sha256(b"").hexdigest(),
+            sync_merges[0]["remerge_diff_sha256"],
+        )
+        member = {
+            "direct_base_sha": current_base,
+            "retained_base_sha": self.retained_base,
+            "head_sha": head,
+            "old_commits": [
+                MODULE.commit_identity(self.repo, commit, linear=True)
+                for commit in commits
+            ],
+            "sync_merges": sync_merges,
+        }
+        CLOUD_MODULE.prove_native_stack_member_input(
+            subprocess.run,
+            self.repo,
+            member,
+        )
+
+        member["sync_merges"][0]["parents"][1] = self.retained_base
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError,
+            "synchronization merge identity changed",
+        ):
+            CLOUD_MODULE.prove_native_stack_member_input(
+                subprocess.run,
+                self.repo,
+                member,
+            )
+
+    def test_sync_merge_with_resolution_changes_fails_closed(self):
+        current_base, _upper, merge, head = self.build_sync_merge(
+            conflicted=True
+        )
+
+        with self.assertRaises(MODULE.NativeStackNormalizationRequired) as raised:
+            MODULE.native_stack_member_history(
+                self.repo,
+                current_base=current_base,
+                retained_base=self.retained_base,
+                head=head,
+            )
+        manifest = raised.exception.manifest
+        self.assertEqual(
+            "github.copilot.native-stack-normalization",
+            manifest["schema"]["id"],
+        )
+        self.assertEqual([merge], [
+            item["sha"] for item in manifest["normalization_merges"]
+        ])
+        self.assertEqual(
+            "merge commit "
+            f"{merge} carries conflict-resolution changes and requires "
+            "explicit owner normalization",
+            manifest["normalization_merges"][0]["reason"],
+        )
+        self.assertNotEqual(
+            hashlib.sha256(b"").hexdigest(),
+            manifest["normalization_merges"][0]["remerge_diff_sha256"],
+        )
+        self.assertEqual(
+            ["base.txt"],
+            manifest["normalization_merges"][0]["remerge_paths"],
+        )
+        self.assertEqual(False, manifest["required_outcome"]["push"])
+        self.assertEqual(2, len(MODULE.commit_parents(self.repo, merge)))
 
 
 class ManagedRequestStrategyTest(unittest.TestCase):
@@ -3186,6 +3508,7 @@ class ManagedRequestStrategyTest(unittest.TestCase):
                             "paths": ["app.py"],
                         }
                     ],
+                    "sync_merges": [],
                     "lease_sha": "b" * 40,
                 }
             ],
@@ -3361,6 +3684,7 @@ class ManagedTaskPromptTest(unittest.TestCase):
                         ),
                     },
                     "old_commits": old_commits,
+                    "sync_merges": [],
                     "lease_sha": old_commits[-1]["sha"],
                 }
             )

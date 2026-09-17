@@ -55,7 +55,10 @@ Local Git checks stay pinned to the frozen worktree through `git -C <exact-root>
 
 The current base comes from the advertised branch ref, not the pull request's lagging base snapshot. Native stack requests preserve the snapshot in preflight evidence but pin each direct base to its live branch ref.
 
-Policy `marketplace-conflict-worker@1` has SHA-256 `7fcb65dff47f5dc76f790f999de202e28692c5207dba7d3ff007145a327e6c67`.
+An upper native-stack member may contain a merge that only synchronized its direct base. The coordinator omits that topology marker from the linear replay only when it has exactly two parents, its second parent is in the current direct-base ancestry, and `git show --remerge-diff` is empty. The request retains the exact merge position, parents, tree, subject, trailers, and empty-diff digest. Any merge with manual resolution content, unrelated ancestry, more than two parents, or no later linear tip stops before task creation at a hash-bound owner-normalization boundary. The retained manifest identifies every safe synchronization merge and every merge whose intent a fresh local owner session must preserve while producing linear history. The generated retry command pins the resulting state SHA-256 and cannot consume a managed attempt until normalization passes preflight.
+
+Policy `marketplace-conflict-worker@1` has SHA-256 `30c96b070bed7b652ffd9181fd4f74b052f670226dab9693d595338aaf0a9d6a`.
+The bundled worker helper has SHA-256 `311b4e50da163470ec0991c48ba8f904fc3fa5f645e7ff15ab2e9510d7d4393b`.
 
 The full immutable request remains retained outside the repository. The hosted problem statement carries every execution identity and commit SHA, exact evidence for bounded path sets, and canonical SHA-256 summaries plus boundary samples for large path sets. The managed helper refuses a compact statement over 28,000 characters or UTF-8 bytes as `prompt_too_large` before contacting the Agent Tasks API; it never truncates or silently falls back.
 
