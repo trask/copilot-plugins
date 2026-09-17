@@ -1682,6 +1682,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
         root = Path(directory)
         repo = root / "repo"
         repo.mkdir()
+        state_path = root / "state.json"
         prompt = root / "prompt.txt"
         result = root / "result.json"
         triage = root / "triage.json"
@@ -1708,6 +1709,22 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             "an unfinished Agent Task already owns this state; "
             "use its recovery_command"
         )
+        recovery_command = " ".join(
+            json.dumps(value)
+            for value in (
+                sys.executable,
+                str(SCRIPT.resolve()),
+                "agent-task",
+                "https://github.com/owner/repo/pull/7",
+                "--repo-root",
+                str(repo),
+                "--state",
+                str(state_path),
+                "--model",
+                "sol",
+                "--resume",
+            )
+        )
         return repo, identity, {
             "version": MODULE.STATE_VERSION,
             "iterations": 1,
@@ -1719,7 +1736,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "policy": MODULE.AGENT_TASK_POLICY,
                 "iteration_allowance": 1,
                 "started_at": "2026-01-01T00:00:00Z",
-                "recovery_command": "python helper.py agent-task --resume",
+                "recovery_command": recovery_command,
                 "prompt_file": str(prompt),
                 "result_file": str(result),
                 "triage_result_file": str(triage),
@@ -1865,7 +1882,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             ]
             package = {
                 "name": "ci-fix-loop",
-                "version": "1.6.31",
+                "version": "1.6.32",
                 "file_count": 1,
                 "byte_count": helper.stat().st_size,
                 "package_sha256": MODULE.canonical_package_digest(files),
@@ -1933,7 +1950,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "installed_root": str(root / "installed"),
                 "package": {
                     "name": "ci-fix-loop",
-                    "version": "1.6.31",
+                    "version": "1.6.32",
                     "file_count": 8,
                     "package_sha256": "c" * 64,
                 },
@@ -2093,7 +2110,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "installed_root": str(root / "installed"),
                 "package": {
                     "name": "ci-fix-loop",
-                    "version": "1.6.31",
+                    "version": "1.6.32",
                     "file_count": 8,
                     "package_sha256": "c" * 64,
                 },
@@ -2176,7 +2193,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "installed_root": str(root / "installed"),
                 "package": {
                     "name": "ci-fix-loop",
-                    "version": "1.6.31",
+                    "version": "1.6.32",
                     "file_count": 8,
                     "package_sha256": "c" * 64,
                 },
@@ -2532,7 +2549,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("tools: [execute, agent, rename_session]", instructions)
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [execute, agent, todo", instructions)
-        self.assertEqual("1.6.31", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.32", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_canonicalizes_stack_start_target(self):
         instructions = AGENT.read_text(encoding="utf-8")

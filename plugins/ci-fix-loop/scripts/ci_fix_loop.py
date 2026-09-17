@@ -16,6 +16,7 @@ from pathlib import Path
 import random
 import re
 import secrets
+import shlex
 import signal
 import shutil
 import subprocess
@@ -7354,6 +7355,43 @@ def canonical_json_sha256(value: Any) -> str:
     )
 
 
+def legacy_recovery_command_matches(
+    value: Any,
+    *,
+    target: dict[str, Any],
+    repo_root: Path,
+    state_path: Path,
+) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        tokens = shlex.split(value, posix=True)
+    except ValueError:
+        return False
+    expected = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "agent-task",
+        target["pr_url"],
+        "--repo-root",
+        str(repo_root),
+        "--state",
+        str(state_path),
+        "--model",
+        "sol",
+        "--resume",
+    ]
+    if len(tokens) != len(expected):
+        return False
+    return all(
+        os.path.normcase(os.path.abspath(actual))
+        == os.path.normcase(os.path.abspath(wanted))
+        if index in {0, 1, 5, 7}
+        else actual == wanted
+        for index, (actual, wanted) in enumerate(zip(tokens, expected))
+    )
+
+
 def legacy_hosted_owner_reconciliation_snapshot(
     *,
     state_path: Path,
@@ -7387,8 +7425,12 @@ def legacy_hosted_owner_reconciliation_snapshot(
         or task.get("iteration_allowance") != 1
         or not isinstance(task.get("run_id"), str)
         or not task["run_id"]
-        or not isinstance(task.get("recovery_command"), str)
-        or "--resume" not in task["recovery_command"].split()
+        or not legacy_recovery_command_matches(
+            task.get("recovery_command"),
+            target=target,
+            repo_root=repo_root,
+            state_path=state_path,
+        )
         or not isinstance(preflight, dict)
         or not isinstance(pr, dict)
         or not isinstance(identity, dict)
