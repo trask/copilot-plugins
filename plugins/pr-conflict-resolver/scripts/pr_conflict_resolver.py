@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "f23e58a12a8c455da54d7970bfb76eabb5848d0da1024b93154742a52229c0f5"
+    "c66f40f82d193667165f9ae46d5ed36f62039d3fbe867e126479951a754d807e"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@1"
@@ -6921,6 +6921,69 @@ def require_no_credentials(value: str, *, source: str) -> None:
         raise WorkflowError(f"{source} appears to contain credentials")
 
 
+MANAGED_OUTPUT_MAX_BYTES = 4096
+
+
+def sanitize_managed_output(value: str) -> dict[str, Any]:
+    patterns = (
+        (
+            r"(?i)\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}\b",
+            "<redacted-token>",
+        ),
+        (
+            r"(?i)\b(?:xox[baprs]|sk-[A-Za-z0-9]+)-[A-Za-z0-9-]{12,}\b",
+            "<redacted-token>",
+        ),
+        (r"\bAKIA[0-9A-Z]{16}\b", "<redacted-key>"),
+        (
+            r"(?i)(\bAuthorization\s*:\s*)(?:Bearer|Basic)\s+\S+",
+            r"\1<redacted>",
+        ),
+        (
+            r"(?i)(\b(?:password|passwd|token|api[_-]?key|secret)\s*[:=]\s*)\S+",
+            r"\1<redacted>",
+        ),
+        (
+            r"(?i)(https?://)[^/\s:@]+:[^/\s@]+@",
+            r"\1<redacted>@",
+        ),
+        (
+            r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?"
+            r"-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+            "<redacted-private-key>",
+        ),
+    )
+    sanitized = value
+    for pattern, replacement in patterns:
+        sanitized = re.sub(pattern, replacement, sanitized, flags=re.DOTALL)
+    encoded = sanitized.encode("utf-8")
+    truncated = len(encoded) > MANAGED_OUTPUT_MAX_BYTES
+    if truncated:
+        encoded = encoded[:MANAGED_OUTPUT_MAX_BYTES]
+        while True:
+            try:
+                sanitized = encoded.decode("utf-8")
+                break
+            except UnicodeDecodeError as error:
+                encoded = encoded[: error.start]
+    return {
+        "text": sanitized,
+        "bytes": len(value.encode("utf-8")),
+        "truncated": truncated,
+        "sha256": hashlib.sha256(sanitized.encode("utf-8")).hexdigest(),
+    }
+
+
+def managed_process_diagnostics(
+    process: subprocess.CompletedProcess[str],
+) -> dict[str, Any]:
+    return {
+        "returncode": process.returncode,
+        "stdout": sanitize_managed_output(process.stdout or ""),
+        "stderr": sanitize_managed_output(process.stderr or ""),
+    }
+
+
 def discover_conflict_task() -> Path:
     helper = Path(__file__).resolve().with_name(CONFLICT_TASK_FILENAME)
     if (
@@ -8433,6 +8496,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         task["status"] = "interrupted"
         task["task_id"] = None
         task["task_id_status"] = "unknown"
+        task["process"] = managed_process_diagnostics(process)
         task["error"] = {
             "code": "managed_task_result_missing",
             "message": "managed conflict helper returned no result file",
@@ -8445,6 +8509,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "task_id": None,
                 "task_id_status": task["task_id_status"],
                 "error": task["error"],
+                "process": task["process"],
                 "recovery_files": task["recovery_files"],
                 "next_action": (
                     "Inspect managed Agent Tasks for this pull request before "
@@ -8454,7 +8519,35 @@ def command_agent_task(args: argparse.Namespace) -> None:
             }
         )
         return
-    result = load_conflict_result(result_path)
+    try:
+        result = load_conflict_result(result_path)
+    except WorkflowError as error:
+        task["status"] = "interrupted"
+        task["task_id"] = None
+        task["task_id_status"] = "unknown"
+        task["process"] = managed_process_diagnostics(process)
+        task["error"] = {
+            "code": "managed_task_result_unreadable",
+            "message": str(error),
+        }
+        save_state(state_path, state)
+        emit(
+            {
+                "result": "recovery_required",
+                "state": str(state_path),
+                "task_id": None,
+                "task_id_status": task["task_id_status"],
+                "error": task["error"],
+                "process": task["process"],
+                "recovery_files": task["recovery_files"],
+                "next_action": (
+                    "Inspect managed Agent Tasks for this pull request before "
+                    "starting any replacement."
+                ),
+                "stage_outcome": "escalated",
+            }
+        )
+        return
     task["result"] = result
     task["result_file"] = str(result_path)
     if process.returncode != 0 or result.get("status") != "success":

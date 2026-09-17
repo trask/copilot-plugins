@@ -2926,6 +2926,16 @@ def main(
         }
         print(f"error: {safe_error_message(str(error))}", file=stderr)
         exit_code = 2
+    except Exception as error:
+        result.status = "error"
+        result.task_id = result.task_id or progress.task_id
+        result.task_state = result.task_state or progress.task_state
+        result.error = {
+            "code": "unexpected_helper_error",
+            "message": safe_error_message(str(error)),
+        }
+        print(f"error: {safe_error_message(str(error))}", file=stderr)
+        exit_code = 2
     if result_path is not None:
         try:
             atomic_write_json(result_path, result.as_dict())

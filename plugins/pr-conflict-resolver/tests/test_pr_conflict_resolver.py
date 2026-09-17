@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -884,7 +885,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "f23e58a12a8c455da54d7970bfb76eabb5848d0da1024b93154742a52229c0f5",
+            "c66f40f82d193667165f9ae46d5ed36f62039d3fbe867e126479951a754d807e",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -1132,6 +1133,130 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual(failed_result["error"], payload["error"])
         self.assertNotIn("recovery_command", payload)
         self.assertIn("--state", payload["retry_command"])
+
+    def test_nonzero_helper_without_result_retains_bounded_redacted_diagnostics(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+            ]
+        )
+        target = MODULE.parse_target("owner/repo#7")
+        preflight = {
+            "already_mergeable": False,
+            "pr": {
+                **target,
+                "head_sha": "b" * 40,
+                "base_sha": "a" * 40,
+            },
+            "strategy": "merge",
+            "request": self.request(),
+            "repository_root": str(directory),
+        }
+        stdout = "token=github_pat_" + "a" * 24 + "\n" + "x" * 5000
+        stderr = "Authorization: Bearer secret-value"
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(MODULE, "conflict_preflight", return_value=preflight),
+            mock.patch.object(MODULE, "build_conflict_prompt", return_value="prompt"),
+            mock.patch.object(
+                MODULE, "discover_conflict_task", return_value=directory / "helper.py"
+            ),
+            mock.patch.object(
+                MODULE,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    ["helper"], 7, stdout, stderr
+                ),
+            ),
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(args)
+
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        task = state["agent_task"]
+        self.assertEqual("interrupted", task["status"])
+        self.assertEqual("unknown", task["task_id_status"])
+        self.assertEqual("managed_task_result_missing", task["error"]["code"])
+        self.assertEqual(7, task["process"]["returncode"])
+        self.assertTrue(task["process"]["stdout"]["truncated"])
+        self.assertLessEqual(
+            len(task["process"]["stdout"]["text"].encode("utf-8")),
+            MODULE.MANAGED_OUTPUT_MAX_BYTES,
+        )
+        self.assertNotIn("github_pat_", task["process"]["stdout"]["text"])
+        self.assertNotIn("secret-value", task["process"]["stderr"]["text"])
+        self.assertIn("<redacted>", task["process"]["stderr"]["text"])
+        payload = emitted(emit)
+        self.assertEqual("recovery_required", payload["result"])
+        self.assertEqual(task["process"], payload["process"])
+        self.assertNotIn("retry_command", payload)
+
+    def test_unreadable_result_retains_process_diagnostics_without_replacement(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+            ]
+        )
+        target = MODULE.parse_target("owner/repo#7")
+        preflight = {
+            "already_mergeable": False,
+            "pr": {
+                **target,
+                "head_sha": "b" * 40,
+                "base_sha": "a" * 40,
+            },
+            "strategy": "merge",
+            "request": self.request(),
+            "repository_root": str(directory),
+        }
+
+        def write_invalid_result(command, **_kwargs):
+            path = Path(command[command.index("--result-file") + 1])
+            path.write_text("{", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 2, "", "invalid result")
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(MODULE, "conflict_preflight", return_value=preflight),
+            mock.patch.object(MODULE, "build_conflict_prompt", return_value="prompt"),
+            mock.patch.object(
+                MODULE, "discover_conflict_task", return_value=directory / "helper.py"
+            ),
+            mock.patch.object(MODULE, "run", side_effect=write_invalid_result),
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(args)
+
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        task = state["agent_task"]
+        self.assertEqual("interrupted", task["status"])
+        self.assertEqual("unknown", task["task_id_status"])
+        self.assertEqual("managed_task_result_unreadable", task["error"]["code"])
+        self.assertEqual(2, task["process"]["returncode"])
+        self.assertEqual("invalid result", task["process"]["stderr"]["text"])
+        payload = emitted(emit)
+        self.assertEqual("recovery_required", payload["result"])
+        self.assertNotIn("retry_command", payload)
 
     def test_preflight_failure_persists_before_task_creation(self):
         directory = temporary_directory(self)
@@ -2798,6 +2923,106 @@ class ManagedRequestStrategyTest(unittest.TestCase):
             "does not allow merge publication",
         ):
             self.validate(request)
+
+
+class ManagedTaskResultPersistenceTest(unittest.TestCase):
+    def invoke(self, failure):
+        directory = temporary_directory(self)
+        result_path = directory / "result.json"
+        options = SimpleNamespace(result_file=result_path)
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(CLOUD_MODULE, "parse_args", return_value=options),
+            mock.patch.object(CLOUD_MODULE, "execute", side_effect=failure),
+        ):
+            exit_code = CLOUD_MODULE.main(
+                ["--result-file", str(result_path)],
+                cwd=directory,
+                stderr=stderr,
+            )
+        return exit_code, json.loads(result_path.read_text(encoding="utf-8")), stderr
+
+    def test_unexpected_exception_before_task_creation_writes_terminal_result(self):
+        exit_code, result, stderr = self.invoke(RuntimeError("unexpected failure"))
+
+        self.assertEqual(2, exit_code)
+        self.assertEqual("error", result["status"])
+        self.assertEqual("unexpected_helper_error", result["error"]["code"])
+        self.assertEqual("unexpected failure", result["error"]["message"])
+        self.assertIsNone(result["task"]["id"])
+        self.assertIsNone(result["task"]["state"])
+        self.assertIn("unexpected failure", stderr.getvalue())
+
+    def test_unexpected_exception_after_task_identity_preserves_that_identity(self):
+        def fail_after_task(_options, **kwargs):
+            kwargs["progress"].task_id = "task-1"
+            kwargs["progress"].task_state = "in_progress"
+            raise RuntimeError("monitor failed")
+
+        exit_code, result, _stderr = self.invoke(fail_after_task)
+
+        self.assertEqual(2, exit_code)
+        self.assertEqual("unexpected_helper_error", result["error"]["code"])
+        self.assertEqual("task-1", result["task"]["id"])
+        self.assertEqual("in_progress", result["task"]["state"])
+
+    def test_unexpected_exception_redacts_credentials_from_the_result(self):
+        exit_code, result, stderr = self.invoke(
+            RuntimeError("Authorization: Bearer secret-value")
+        )
+
+        self.assertEqual(2, exit_code)
+        self.assertEqual(
+            "operation failed; sensitive detail omitted",
+            result["error"]["message"],
+        )
+        self.assertNotIn("secret-value", stderr.getvalue())
+
+    def test_keyboard_interrupt_keeps_the_existing_interrupted_result(self):
+        exit_code, result, _stderr = self.invoke(KeyboardInterrupt())
+
+        self.assertEqual(130, exit_code)
+        self.assertEqual("interrupted", result["status"])
+        self.assertEqual("interrupted", result["error"]["code"])
+        self.assertIsNone(result["task"]["id"])
+
+    def test_conflict_error_keeps_its_stable_classification(self):
+        exit_code, result, _stderr = self.invoke(
+            CLOUD_MODULE.ConflictError("stale repository", "stale_target")
+        )
+
+        self.assertEqual(2, exit_code)
+        self.assertEqual("error", result["status"])
+        self.assertEqual("stale_target", result["error"]["code"])
+        self.assertEqual("stale repository", result["error"]["message"])
+
+    def test_result_write_failure_returns_nonzero_without_a_success_fallback(self):
+        directory = temporary_directory(self)
+        result_path = directory / "result.json"
+        options = SimpleNamespace(result_file=result_path)
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(CLOUD_MODULE, "parse_args", return_value=options),
+            mock.patch.object(
+                CLOUD_MODULE, "execute", side_effect=RuntimeError("failed")
+            ),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "atomic_write_json",
+                side_effect=CLOUD_MODULE.ConflictError(
+                    "could not write result file", "malformed_result"
+                ),
+            ),
+        ):
+            exit_code = CLOUD_MODULE.main(
+                ["--result-file", str(result_path)],
+                cwd=directory,
+                stderr=stderr,
+            )
+
+        self.assertEqual(2, exit_code)
+        self.assertFalse(result_path.exists())
+        self.assertIn("could not write result file", stderr.getvalue())
 
 
 class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
