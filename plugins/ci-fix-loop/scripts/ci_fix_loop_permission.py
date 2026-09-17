@@ -59,7 +59,7 @@ LEGACY_OWNER_AUTHORIZATION_FILE_SCHEMA = (
     "github.copilot.ci-fix-loop-legacy-owner-authorization-file.v1"
 )
 SEALED_CI_FIX_INVOCATION_SCHEMA = (
-    "github.copilot.ci-fix-loop-sealed-invocation.v1"
+    "github.copilot.ci-fix-loop-sealed-invocation.v2"
 )
 SEALED_CI_FIX_MUTATION_POLICY = {
     "id": "source-only",
@@ -524,6 +524,18 @@ def sealed_ci_fix_admission(
         or not isinstance(state, dict)
         or not isinstance(state.get("path"), str)
         or not Path(state["path"]).is_absolute()
+        or request.get("state") != state["path"]
+        or state.get("exists") is not False
+        or state.get("size") is not None
+        or state.get("sha256") is not None
+        or snapshot.get("active_owner") is not None
+        or not isinstance(snapshot.get("source"), dict)
+        or not isinstance(snapshot.get("pull_request"), dict)
+        or snapshot["source"].get("status") != ""
+        or snapshot["source"].get("head")
+        != snapshot["pull_request"].get("head_sha")
+        or snapshot["source"].get("branch")
+        != snapshot["pull_request"].get("head_branch")
         or manifest_path is None
         or not manifest_path.is_absolute()
         or not manifest_path.is_file()
@@ -547,6 +559,9 @@ def sealed_ci_fix_admission(
     outputs = payload.get("outputs")
     invocation_id = payload["invocation_id"]
     expected_outputs = {
+        "state": artifact_path.with_name(
+            f"ci-fix-loop-sealed-{invocation_id}-state.json"
+        ),
         "result": artifact_path.with_name(
             f"ci-fix-loop-sealed-{invocation_id}-result.json"
         ),
@@ -566,6 +581,7 @@ def sealed_ci_fix_admission(
             or path.is_symlink()
             for name, path in expected_outputs.items()
         )
+        or state["path"] != outputs["state"]
     ):
         return False
     return True
@@ -589,80 +605,15 @@ def admission_allowed(payload: Any) -> bool:
     ):
         return False
     tokens = command_tokens(tool_name, tool_input["command"])
-    if not tokens or tokens[0] not in ALLOWED_SUBCOMMANDS:
-        return bool(
-            tokens
-            and (
-                (
-                    tokens[0] in SEALED_CI_FIX_COMMANDS
-                    and sealed_ci_fix_admission(
-                        tokens,
-                        cwd=cwd,
-                        session_id=session_id,
-                    )
-                )
-                or (
-                    tokens[0] in RECONCILIATION_COMMANDS
-                    and reconciliation_admission(tokens, cwd=cwd)
-                )
-                or (
-                    tokens[0] in SEALED_RECONCILIATION_COMMANDS
-                    and sealed_reconciliation_admission(tokens, cwd=cwd)
-                )
-            )
+    return bool(
+        tokens
+        and tokens[0] in SEALED_CI_FIX_COMMANDS
+        and sealed_ci_fix_admission(
+            tokens,
+            cwd=cwd,
+            session_id=session_id,
         )
-    subcommand = tokens[0]
-    if subcommand in TARGET_COMMANDS:
-        if len(tokens) < 2 or TARGET_PATTERN.fullmatch(tokens[1]) is None:
-            return False
-        roots = option_values(tokens, "--repo-root")
-        if len(roots) != 1 or normalized_path(roots[0]) != normalized_path(cwd):
-            return False
-    if subcommand in COMMAND_RESULT_SCHEMAS:
-        result_files = option_values(tokens, "--result-file")
-        if len(result_files) != 1:
-            return False
-        result_path = command_result_path(
-            result_files[0],
-            subcommand,
-            must_exist=False,
-        )
-        if result_path is None:
-            return False
-        if subcommand == "loop":
-            pipeline_runs = option_values(tokens, "--pipeline-run")
-            preflight_files = option_values(tokens, "--preflight-result-file")
-            if pipeline_runs:
-                if len(pipeline_runs) != 1 or preflight_files:
-                    return False
-            else:
-                if len(preflight_files) != 1:
-                    return False
-                preflight_path = command_result_path(
-                    preflight_files[0],
-                    "stack-start",
-                    must_exist=True,
-                )
-                stack_states = option_values(tokens, "--stack-state")
-                if (
-                    preflight_path is None
-                    or preflight_path.parent != result_path.parent
-                    or len(stack_states) > 1
-                    or not valid_stack_start_result(
-                        preflight_path,
-                        target=tokens[1],
-                        cwd=cwd,
-                        stack_state=stack_states[0] if stack_states else None,
-                    )
-                ):
-                    return False
-    models = option_values(tokens, "--model")
-    if subcommand in MODEL_COMMANDS:
-        if models != ["sol"]:
-            return False
-    elif models:
-        return False
-    return True
+    )
 
 
 def main() -> int:

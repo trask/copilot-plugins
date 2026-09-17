@@ -191,6 +191,10 @@ class AgentCommandAdmissionTest(unittest.TestCase):
         )
         files.mkdir(parents=True, exist_ok=True)
         artifact_path = files / "ci-fix-loop-1.6.38-7-sealed-invocation.json"
+        invocation_id = "f" * 32
+        outputs = MODULE.sealed_ci_fix_output_paths(
+            artifact_path, invocation_id
+        )
         manifest_path = files / "ci-fix-loop-1.6.38-package-manifest.json"
         manifest_path.write_text("{}\n", encoding="utf-8", newline="\n")
         package = {
@@ -211,7 +215,7 @@ class AgentCommandAdmissionTest(unittest.TestCase):
             "target": "https://github.com/owner/repo/pull/7",
             "repo_root": str(cwd.resolve()),
             "state": {
-                "path": str((root / "state.json").resolve()),
+                "path": outputs["state"],
                 "exists": False,
                 "size": None,
                 "sha256": None,
@@ -220,6 +224,7 @@ class AgentCommandAdmissionTest(unittest.TestCase):
             "pull_request": {
                 "number": 7,
                 "head_sha": "d" * 40,
+                "head_branch": "feature",
                 "title": "Résumé",
             },
             "checks": {
@@ -241,7 +246,7 @@ class AgentCommandAdmissionTest(unittest.TestCase):
             artifact_path=artifact_path,
             package_manifest=package,
             snapshot=snapshot,
-            invocation_id="f" * 32,
+            invocation_id=invocation_id,
             owner_session_id="87654321-4321-4321-4321-cba987654321",
         )
         artifact_path.write_text(
@@ -262,77 +267,22 @@ class AgentCommandAdmissionTest(unittest.TestCase):
             cwd = root / "repo"
             cwd.mkdir()
             preflight, result = self.command_result_paths(root)
-            self.assertTrue(
-                PERMISSION_MODULE.admission_allowed(
-                    self.payload(
-                        self.powershell_command(
-                            f'stack-start owner/repo#7 --repo-root "{cwd}" '
-                            f'--result-file "{preflight}"'
-                        ),
-                        cwd=str(cwd),
+            for arguments in (
+                f'stack-start owner/repo#7 --repo-root "{cwd}" '
+                f'--result-file "{preflight}"',
+                f'loop owner/repo#7 --repo-root "{cwd}" --model sol '
+                f'--result-file "{result}"',
+                f'agent-task owner/repo#7 --repo-root "{cwd}" --model sol',
+            ):
+                with self.subTest(arguments=arguments):
+                    self.assertFalse(
+                        PERMISSION_MODULE.admission_allowed(
+                            self.payload(
+                                self.powershell_command(arguments),
+                                cwd=str(cwd),
+                            )
+                        )
                     )
-                )
-            )
-            self.write_stack_start_result(preflight, cwd=cwd)
-            self.assertFalse(
-                PERMISSION_MODULE.admission_allowed(
-                    self.payload(
-                        self.powershell_command(
-                            f'stack-start owner/repo#7 --repo-root "{cwd}" '
-                            f'--result-file "{preflight}"'
-                        ),
-                        cwd=str(cwd),
-                    )
-                )
-            )
-            loop_arguments = (
-                f'loop https://github.com/owner/repo/pull/7 --repo-root "{cwd}" '
-                "--model sol --new-invocation "
-                f'--preflight-result-file "{preflight}" '
-                f'--result-file "{result}"'
-            )
-            self.assertTrue(
-                PERMISSION_MODULE.admission_allowed(
-                    self.payload(
-                        f"{PERMISSION_MODULE.BASH_PREFIX}{loop_arguments}",
-                        cwd=str(cwd),
-                        tool_name="bash",
-                    )
-                )
-            )
-            self.assertTrue(
-                PERMISSION_MODULE.admission_allowed(
-                    self.payload(
-                        self.powershell_command(loop_arguments),
-                        cwd=str(cwd),
-                    )
-                )
-            )
-            preflight.write_text("{}\n", encoding="utf-8", newline="\n")
-            self.assertFalse(
-                PERMISSION_MODULE.admission_allowed(
-                    self.payload(
-                        self.powershell_command(loop_arguments),
-                        cwd=str(cwd),
-                    )
-                )
-            )
-            pipeline_result = result.with_name(
-                "ci-fix-loop-loop-result-2.json"
-            )
-            self.assertTrue(
-                PERMISSION_MODULE.admission_allowed(
-                    self.payload(
-                        self.powershell_command(
-                            f'loop owner/repo#7 --repo-root "{cwd}" '
-                            "--model sol --pipeline-run pipeline "
-                            "--pipeline-iteration 1 --pipeline-max-iterations 2 "
-                            f'--result-file "{pipeline_result}"'
-                        ),
-                        cwd=str(cwd),
-                    )
-                )
-            )
 
     def test_admits_one_sealed_direct_command_and_rejects_reuse(self):
         with tempfile.TemporaryDirectory(prefix="sealed owner path ") as directory:
@@ -491,7 +441,7 @@ class AgentCommandAdmissionTest(unittest.TestCase):
             **process_options,
         )
 
-        self.assertEqual('{"behavior":"allow"}\n', completed.stdout)
+        self.assertEqual("{}\n", completed.stdout)
         self.assertEqual("", completed.stderr)
 
     def test_plugin_declares_narrow_permission_hook(self):
@@ -540,7 +490,7 @@ class AgentCommandAdmissionTest(unittest.TestCase):
             ]
             command = subprocess.list2cmdline(argv)
 
-            self.assertTrue(
+            self.assertFalse(
                 PERMISSION_MODULE.admission_allowed(
                     self.payload(command, cwd=str(repo))
                 )
@@ -586,7 +536,7 @@ class AgentCommandAdmissionTest(unittest.TestCase):
                 "--expected-authorization-token",
                 "4" * 64,
             ]
-            self.assertTrue(
+            self.assertFalse(
                 PERMISSION_MODULE.admission_allowed(
                     self.payload(
                         subprocess.list2cmdline(valid),
@@ -656,7 +606,7 @@ class AgentCommandAdmissionTest(unittest.TestCase):
                 newline="\n",
             )
             verify_command = subprocess.list2cmdline(verifier_argv)
-            self.assertTrue(
+            self.assertFalse(
                 PERMISSION_MODULE.admission_allowed(
                     self.payload(verify_command, cwd=str(repo))
                 )
@@ -675,7 +625,7 @@ class AgentCommandAdmissionTest(unittest.TestCase):
                 check=True,
                 **process_options,
             )
-            self.assertEqual('{"behavior":"allow"}\n', completed.stdout)
+            self.assertEqual("{}\n", completed.stdout)
             self.assertEqual("", completed.stderr)
 
             apply_argv = [
@@ -702,7 +652,7 @@ class AgentCommandAdmissionTest(unittest.TestCase):
                 newline="\n",
             )
             apply_command = subprocess.list2cmdline(apply_argv)
-            self.assertTrue(
+            self.assertFalse(
                 PERMISSION_MODULE.admission_allowed(
                     self.payload(apply_command, cwd=str(repo))
                 )
@@ -723,21 +673,13 @@ class AgentCommandAdmissionTest(unittest.TestCase):
 
     def test_agent_reconciliation_path_is_direct_and_denial_is_terminal(self):
         instructions = AGENT.read_text(encoding="utf-8")
+        self.assertIn("reconciliation", instructions)
         self.assertIn(
-            'append only `verify-sealed-legacy-owner-reconciliation "<exact artifact path>"`',
+            "a fresh sealed CI Fix invocation artifact is required",
             instructions,
         )
-        self.assertIn(
-            'append only `apply-sealed-legacy-owner-reconciliation "<exact authorization file path>"`',
-            instructions,
-        )
-        self.assertIn("Do not read the artifact", instructions)
-        self.assertIn("Do not read the file", instructions)
-        self.assertIn("never run `Select-String`", instructions)
-        self.assertIn("A permission denial or verifier error is terminal", instructions)
-        self.assertIn(
-            "stop without `stack-start`, `loop`, `agent-task`", instructions
-        )
+        self.assertNotIn("verify-sealed-legacy-owner-reconciliation", instructions)
+        self.assertNotIn("apply-sealed-legacy-owner-reconciliation", instructions)
 
     @unittest.skipUnless(
         os.environ.get("COPILOT_CI_FIX_AGENT_INTEGRATION") == "1",
@@ -885,9 +827,13 @@ class SealedCiFixCommandTest(unittest.TestCase):
         )
         files.mkdir(parents=True)
         artifact_path = files / "ci-fix-loop-1.6.38-7-sealed-invocation.json"
+        invocation_id = "f" * 32
+        outputs = MODULE.sealed_ci_fix_output_paths(
+            artifact_path, invocation_id
+        )
         manifest_path = files / "ci-fix-loop-1.6.38-package-manifest.json"
         manifest_path.write_text("{}\n", encoding="utf-8", newline="\n")
-        state_path = root / "ci-fix-state.json"
+        state_path = Path(outputs["state"])
         package = {
             "path": str(manifest_path),
             "sha256": "a" * 64,
@@ -915,6 +861,7 @@ class SealedCiFixCommandTest(unittest.TestCase):
             "pull_request": {
                 "number": 7,
                 "head_sha": "d" * 40,
+                "head_branch": "feature",
                 "base_sha": "e" * 40,
             },
             "checks": {
@@ -936,7 +883,7 @@ class SealedCiFixCommandTest(unittest.TestCase):
             artifact_path=artifact_path,
             package_manifest=package,
             snapshot=snapshot,
-            invocation_id="f" * 32,
+            invocation_id=invocation_id,
             owner_session_id="87654321-4321-4321-4321-cba987654321",
         )
         if write_artifact:
@@ -988,7 +935,6 @@ class SealedCiFixCommandTest(unittest.TestCase):
             arguments = SimpleNamespace(
                 target="owner/repo#7",
                 repo_root=str(repo),
-                state=str(state_path),
                 owner_session_id="87654321-4321-4321-4321-cba987654321",
                 invocation_artifact=str(artifact_path),
                 package_manifest=package["path"],
@@ -997,6 +943,18 @@ class SealedCiFixCommandTest(unittest.TestCase):
             with contextlib.ExitStack() as stack:
                 for patch in self.run_patches(repo, package, snapshot):
                     stack.enter_context(patch)
+                stack.enter_context(
+                    mock.patch.object(
+                        MODULE.uuid,
+                        "uuid4",
+                        return_value=SimpleNamespace(hex="f" * 32),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        MODULE, "default_state_path", side_effect=AssertionError
+                    )
+                )
                 execute = stack.enter_context(
                     mock.patch.object(MODULE, "execute_managed_command")
                 )
@@ -1022,6 +980,94 @@ class SealedCiFixCommandTest(unittest.TestCase):
             self.assertEqual(4, len(loaded["run_command_argv"]))
             self.assertNotIn("agent", loaded["run_command_argv"])
             self.assertNotIn("copilot", loaded["run_command_argv"])
+
+    def test_each_sealed_invocation_has_a_unique_state_path(self):
+        with tempfile.TemporaryDirectory(prefix="sealed states ") as directory:
+            root = Path(directory)
+            artifact = (
+                root
+                / ".copilot"
+                / "session-state"
+                / "12345678-1234-1234-1234-123456789abc"
+                / "files"
+                / "invocation.json"
+            )
+            first = MODULE.sealed_ci_fix_output_paths(artifact, "a" * 32)
+            second = MODULE.sealed_ci_fix_output_paths(artifact, "b" * 32)
+
+            self.assertNotEqual(first["state"], second["state"])
+            self.assertEqual(
+                set(first),
+                {"state", "result", "stack_start_result", "loop_result"},
+            )
+            self.assertIn("a" * 32, first["state"])
+            self.assertIn("b" * 32, second["state"])
+
+    def test_old_stateful_sealed_schema_cannot_match(self):
+        with tempfile.TemporaryDirectory(prefix="sealed v1 ") as directory:
+            root = Path(directory)
+            _, _, artifact_path, _, _, _ = self.fixture(root)
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            artifact["schema"] = (
+                "github.copilot.ci-fix-loop-sealed-invocation.v1"
+            )
+            artifact["seal"] = MODULE.sealed_ci_fix_invocation_seal(artifact)
+            artifact_path.write_text(
+                json.dumps(artifact, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            artifact_path.with_name(f"{artifact_path.name}.sha256").write_text(
+                f"{MODULE.sha256_file(artifact_path)}\n",
+                encoding="ascii",
+                newline="\n",
+            )
+
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "invocation artifact is malformed",
+            ):
+                MODULE.load_sealed_ci_fix_artifact(artifact_path)
+
+    def test_sealed_snapshot_requires_the_exact_live_head_before_checks(self):
+        with tempfile.TemporaryDirectory(prefix="sealed head ") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            state_path = root / "new-state.json"
+            target = MODULE.parse_target("owner/repo#7")
+            pull_request = {
+                "state": "OPEN",
+                "head_sha": "d" * 40,
+                "base_sha": "e" * 40,
+                "head_branch": "feature",
+            }
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "local_identity",
+                    return_value={
+                        "branch": "feature",
+                        "head": "c" * 40,
+                        "status": "",
+                    },
+                ),
+                mock.patch.object(
+                    MODULE, "metadata_for", return_value=pull_request
+                ),
+                mock.patch.object(MODULE, "fetch_rollup") as fetch_rollup,
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "clean checkout at the live pull request head",
+                ),
+            ):
+                MODULE.sealed_ci_fix_live_snapshot(
+                    repo_root=repo,
+                    target=target,
+                    state_path=state_path,
+                )
+
+            fetch_rollup.assert_not_called()
 
     def test_direct_command_owns_preflight_and_complete_loop(self):
         with tempfile.TemporaryDirectory(prefix="sealed run ") as directory:
@@ -1108,8 +1154,8 @@ class SealedCiFixCommandTest(unittest.TestCase):
                 json.loads(output.getvalue())["result"],
             )
 
-    def test_direct_command_archives_exact_reconciled_owner(self):
-        with tempfile.TemporaryDirectory(prefix="sealed reconciled ") as directory:
+    def test_direct_command_ignores_retained_pr_state(self):
+        with tempfile.TemporaryDirectory(prefix="sealed stateless ") as directory:
             root = Path(directory)
             (
                 repo,
@@ -1117,94 +1163,23 @@ class SealedCiFixCommandTest(unittest.TestCase):
                 artifact_path,
                 package,
                 snapshot,
-                _artifact,
+                artifact,
             ) = self.fixture(root)
-            reconciled = reconciled_forward_head_task(root / "legacy evidence")
+            legacy_state = root / "legacy-pr-state.json"
             MODULE.save_state(
-                state_path,
+                legacy_state,
                 {
                     "version": MODULE.STATE_VERSION,
-                    "created_at": MODULE.utc_now(),
-                    "iterations": 0,
-                    "history": [],
-                    "reruns": {},
-                    "escalation": None,
-                    "agent_task": copy.deepcopy(reconciled),
+                    "agent_task": {
+                        "status": "running",
+                        "phase": "hosted_fix",
+                        "run_id": "abandoned-run",
+                        "task_id": "abandoned-task",
+                        "task_id_status": "known",
+                    },
                 },
             )
-            current_head = "2c3366080075fbd99b51572736f0b2e86586d8a2"
-            snapshot["source"]["head"] = current_head
-            snapshot["pull_request"] = {
-                "number": 7,
-                "title": "Fix widget",
-                "body": "",
-                "pr_url": "https://github.com/owner/repo/pull/7",
-                "repo_name": "owner/repo",
-                "state": "OPEN",
-                "head_owner": "owner",
-                "head_repo": "repo",
-                "head_repository": "owner/repo",
-                "head_branch": "feature",
-                "head_sha": current_head,
-                "base_branch": "main",
-                "base_sha": "e" * 40,
-                "cross_repository": False,
-            }
-            snapshot["checks"] = {
-                "head_sha": current_head,
-                "rollup": [],
-                "decision": {
-                    "decision": "green",
-                    "reason": "all_checks_passed",
-                    "checks": [],
-                    "detail": "all checks passed",
-                },
-            }
-            snapshot["checks"]["sha256"] = MODULE.canonical_json_sha256(
-                snapshot["checks"]
-            )
-            MODULE.record_coordinator_identity(
-                state_path,
-                repo,
-                snapshot["pull_request"],
-                snapshot["source"],
-            )
-            self.assertEqual(
-                reconciled,
-                MODULE.load_state(state_path)["agent_task"],
-            )
-            snapshot["state"] = MODULE.sealed_ci_fix_state_identity(state_path)
-            artifact = MODULE.sealed_ci_fix_artifact(
-                artifact_path=artifact_path,
-                package_manifest=package,
-                snapshot=snapshot,
-                invocation_id="f" * 32,
-                owner_session_id="87654321-4321-4321-4321-cba987654321",
-            )
-            artifact_path.write_text(
-                json.dumps(artifact, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-                newline="\n",
-            )
-            artifact_path.with_name(f"{artifact_path.name}.sha256").write_text(
-                f"{MODULE.sha256_file(artifact_path)}\n",
-                encoding="ascii",
-                newline="\n",
-            )
-            preflight = {
-                "repository_root": str(repo),
-                "identity": copy.deepcopy(snapshot["source"]),
-                "pr": copy.deepcopy(snapshot["pull_request"]),
-                "viewer": {"login": "viewer", "permissions": {"push": True}},
-                "stack_guard": None,
-                "check_snapshot": {
-                    **copy.deepcopy(snapshot["checks"]),
-                    "base_sha": "e" * 40,
-                    "observed_at": "2026-09-17T21:46:41Z",
-                    "rollup_sha256": MODULE.sha256_text("[]"),
-                    "failures": [],
-                },
-            }
+            legacy_bytes = legacy_state.read_bytes()
 
             def stack_start(_arguments):
                 MODULE.emit(
@@ -1220,47 +1195,45 @@ class SealedCiFixCommandTest(unittest.TestCase):
                     }
                 )
 
+            def loop(_arguments):
+                MODULE.save_state(
+                    state_path,
+                    {
+                        "version": MODULE.STATE_VERSION,
+                        "iterations": 0,
+                        "history": [],
+                        "reruns": {},
+                        "outcome": "green",
+                    },
+                )
+                MODULE.emit(
+                    {
+                        "result": "green",
+                        "state": str(state_path),
+                        "head_sha": "d" * 40,
+                    }
+                )
+
             with contextlib.ExitStack() as stack:
                 for patch in self.run_patches(repo, package, snapshot):
                     stack.enter_context(patch)
                 stack.enter_context(
                     mock.patch.object(
-                        MODULE,
-                        "command_stack_start",
-                        side_effect=stack_start,
+                        MODULE, "default_state_path", side_effect=AssertionError
                     )
                 )
                 stack.enter_context(
-                    mock.patch.object(
-                        MODULE,
-                        "wait_for_stable_ci_preflight",
-                        return_value=preflight,
-                    )
+                    mock.patch.object(MODULE, "command_stack_start", stack_start)
                 )
-                stack.enter_context(
-                    mock.patch.object(MODULE, "require_live_check_snapshot")
-                )
-                stack.enter_context(
-                    mock.patch.object(
-                        MODULE,
-                        "reconcile_dead_hosted_owner",
-                        side_effect=lambda _path, state, **_kwargs: state,
-                    )
-                )
-                output = io.StringIO()
-                with contextlib.redirect_stdout(output):
+                stack.enter_context(mock.patch.object(MODULE, "command_loop", loop))
+                with contextlib.redirect_stdout(io.StringIO()):
                     MODULE.command_run_sealed_ci_fix(
                         SimpleNamespace(invocation_artifact=str(artifact_path))
                     )
 
-            result = json.loads(
-                Path(artifact["outputs"]["result"]).read_text(encoding="utf-8")
-            )
-            self.assertEqual("succeeded", result["status"])
-            state = MODULE.load_state(state_path)
-            self.assertNotIn("agent_task", state)
-            self.assertEqual([reconciled], state["managed_task_history"])
-            self.assertEqual("green", state["outcome"])
+            self.assertEqual(legacy_bytes, legacy_state.read_bytes())
+            self.assertEqual(artifact["outputs"]["state"], str(state_path))
+            self.assertEqual("green", MODULE.load_state(state_path)["outcome"])
 
     def test_ineligible_owner_stops_before_checkout_or_state_write(self):
         with tempfile.TemporaryDirectory(prefix="sealed owner precheck ") as directory:
@@ -1576,9 +1549,11 @@ class SealedCiFixCommandTest(unittest.TestCase):
             state["agent_task"] = reconciled
             state["coordinator"] = {"status": "blocked"}
             MODULE.save_state(state_path, state)
-            identity = MODULE.sealed_ci_fix_state_identity(state_path)
-            self.assertTrue(identity["exists"])
-            self.assertEqual(MODULE.sha256_file(state_path), identity["sha256"])
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "active workflow ownership",
+            ):
+                MODULE.sealed_ci_fix_state_identity(state_path)
 
             near_misses = {
                 "recovery command": lambda task: task.update(
@@ -2572,13 +2547,13 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "cross_repository": False,
             }
         }
-        self.report_path = ".github/agent-task-reports/request-1.md"
+        self.report_path = ".github/agent-task-semantic/request-1.json"
         self.consumer_prompt = (
             "worker instructions\n"
-            f"write {MODULE.REPORT_PATH_PLACEHOLDER}\n"
+            f"write {MODULE.SEMANTIC_PATH_PLACEHOLDER}\n"
         )
         rendered = self.consumer_prompt.replace(
-            MODULE.REPORT_PATH_PLACEHOLDER, self.report_path
+            MODULE.SEMANTIC_PATH_PLACEHOLDER, self.report_path
         )
         self.live_prompt = (
             f"{rendered}\n"
@@ -3629,7 +3604,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 self.assertEqual("{}\n", permission_result.stdout)
                 self.assertFalse((scripts / "__pycache__").exists())
 
-    def test_sealed_verifier_authorizes_only_exact_two_pass_snapshot(self):
+    def legacy_sealed_verifier_authorizes_only_exact_two_pass_snapshot(self):
         with tempfile.TemporaryDirectory(prefix="legacy owner ") as directory:
             root = Path(directory)
             state_path = root / "state.json"
@@ -3788,7 +3763,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             self.assertFalse(applied[-1]["task_created"])
             self.assertIsNone(applied[-1]["continuation"])
 
-    def test_prepare_writes_one_sealed_nonexecuted_artifact(self):
+    def legacy_prepare_writes_one_sealed_nonexecuted_artifact(self):
         with tempfile.TemporaryDirectory(prefix="legacy prepare ") as directory:
             root = Path(directory)
             state_path = root / "state.json"
@@ -3875,7 +3850,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 artifact["verifier_command_argv"],
             )
 
-    def test_minimal_sealed_commands_write_and_consume_authorization_file(self):
+    def legacy_minimal_sealed_commands_write_and_consume_authorization_file(self):
         with tempfile.TemporaryDirectory(prefix="sealed command ") as directory:
             root = Path(directory)
             repo = root / "source workspace"
@@ -3998,7 +3973,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 applied[0].expected_authorization_token,
             )
 
-    def test_verifier_rejects_stale_second_pass_without_mutation(self):
+    def legacy_verifier_rejects_stale_second_pass_without_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             state_path = root / "state.json"
@@ -4078,6 +4053,26 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 MODULE.command_verify_legacy_owner_reconciliation(arguments)
 
             self.assertEqual("running", MODULE.load_state(state_path)["agent_task"]["status"])
+
+
+class StatelessLegacyCommandTest(unittest.TestCase):
+    def test_legacy_reconciliation_commands_fail_before_tools(self):
+        commands = (
+            MODULE.command_prepare_legacy_owner_reconciliation,
+            MODULE.command_verify_sealed_legacy_owner_reconciliation,
+            MODULE.command_verify_legacy_owner_reconciliation,
+            MODULE.command_apply_sealed_legacy_owner_reconciliation,
+            MODULE.command_apply_legacy_owner_reconciliation,
+        )
+        with mock.patch.object(MODULE, "require_tools") as require_tools:
+            for command in commands:
+                with self.subTest(command=command.__name__):
+                    with self.assertRaisesRegex(
+                        MODULE.WorkflowError,
+                        "start a fresh sealed CI Fix invocation",
+                    ):
+                        command(SimpleNamespace())
+        require_tools.assert_not_called()
 
 
 class ManagedAgentTaskContractTest(unittest.TestCase):
@@ -4176,8 +4171,60 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.addCleanup(self.github_fingerprint.stop)
         self.addCleanup(self.hosted_helper.stop)
 
-    def result(self, commits=None):
+    def semantic_payload(
+        self,
+        commits=None,
+        *,
+        outcome=None,
+        disposition=None,
+        changed_paths=None,
+    ):
         commits = [] if commits is None else commits
+        outcome = outcome or ("fixed" if commits else "no_change")
+        disposition = disposition or ("fixed" if commits else "already_fixed")
+        failure = self.preflight["check_snapshot"]["failures"][0]
+        return {
+            "outcome": outcome,
+            "failures": [
+                {
+                    "key": failure["key"],
+                    "name": failure["name"],
+                    "disposition": disposition,
+                    "reason": "The focused test proves the result.",
+                    "fixes": [
+                        {"commit_index": index}
+                        for index in range(1, len(commits) + 1)
+                    ]
+                    if disposition == "fixed"
+                    else [],
+                }
+            ],
+            "changed_paths": (
+                ["src/App.java"] if commits and changed_paths is None else changed_paths or []
+            ),
+            "evidence": [
+                {"command": "pytest focused", "outcome": "passed"}
+            ],
+        }
+
+    def semantic_artifact(self, commits=None, **kwargs):
+        return json.dumps(
+            {
+                "schema": MODULE.CI_FIX_SEMANTIC_OUTPUT_SCHEMA,
+                "kind": MODULE.CI_FIX_SEMANTIC_KIND,
+                "payload": self.semantic_payload(commits, **kwargs),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    def result(self, commits=None, **kwargs):
+        commits = [] if commits is None else commits
+        semantic_content = self.semantic_artifact(commits, **kwargs)
+        bound_payload = MODULE.bind_ci_fix_semantic_payload(
+            self.semantic_payload(commits, **kwargs),
+            commits=commits,
+        )
         return {
             "schema": MODULE.AGENT_TASK_RESULT_SCHEMA,
             "status": "success",
@@ -4187,7 +4234,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "requested_model": "gpt-5.6-sol",
             "policy": {
                 "id": "marketplace-agent-apply-report-worker",
-                "version": 3,
+                "version": 4,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -4206,13 +4253,17 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 "status": "not_applied",
                 "final_local_head": self.head,
             },
-            "report": {
-                "path": ".github/agent-task-reports/request-1.md",
+            "report": None,
+            "semantic_output": {
+                "schema": MODULE.CI_FIX_SEMANTIC_OUTPUT_SCHEMA,
+                "kind": MODULE.CI_FIX_SEMANTIC_KIND,
+                "path": ".github/agent-task-semantic/request-1.json",
                 "commit": self.artifact,
-                "sha256": "4" * 64,
+                "sha256": MODULE.sha256_text(semantic_content),
+                "payload": bound_payload,
             },
             "attestation": {
-                "kind": "dispatcher_structural",
+                "kind": "dispatcher_semantic",
                 "structural_complete": True,
             },
             "error": None,
@@ -4236,8 +4287,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     "final_local_head": self.head,
                 },
                 "report": None,
+                "semantic_output": None,
                 "attestation": {
-                    "kind": "dispatcher_structural",
+                    "kind": "dispatcher_semantic",
                     "structural_complete": False,
                 },
                 "error": {
@@ -4257,9 +4309,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
         self.assertEqual("api_failure", error["code"])
 
-    def remote(self, commits=None):
+    def remote(self, commits=None, **kwargs):
         return MODULE.validate_success_result(
-            self.result(commits),
+            self.result(commits, **kwargs),
             preflight=self.preflight,
             requested_model="gpt-5.6-sol",
         )
@@ -4300,6 +4352,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     }
                 ],
                 "changed_paths": [] if changed_paths is None else changed_paths,
+                "evidence": [
+                    {"command": "pytest focused", "outcome": "passed"}
+                ],
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -4361,73 +4416,41 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
-        self.assertIn("agent-task <target>", instructions)
-        self.assertIn("loop <canonical-target>", instructions)
-        self.assertIn("marketplace-agent-apply-report-worker@3", instructions)
-        self.assertIn("Never use Cloud Sandboxes", instructions)
-        self.assertIn("`custom_agent`", instructions)
-        self.assertIn("Never run `gh pr diff`", instructions)
-        self.assertNotIn("tools: [edit", instructions)
+        self.assertIn("run-sealed-ci-fix", instructions)
+        self.assertIn("runs one installed coordinator command", instructions)
+        self.assertIn("It emits no retry or recovery command", instructions)
         self.assertIn(
-            "tools: [execute, read, agent, rename_session]",
+            "tools: [execute, read, rename_session]",
             instructions,
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
-        self.assertNotIn("tools: [execute, agent, todo", instructions)
-        self.assertEqual("1.6.38", json.loads(PLUGIN.read_text())["version"])
+        self.assertNotIn("tools: [edit", instructions)
+        self.assertEqual("1.6.39", json.loads(PLUGIN.read_text())["version"])
 
-    def test_agent_canonicalizes_stack_start_target(self):
+    def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
         frontmatter = instructions.split("---", 2)[1]
-        invocation = _agent_section(instructions, "## Invocation")
+        invocation = _agent_section(instructions, "## Exact command")
 
         self.assertIn(
-            "argument-hint: \"Canonical PR URL or owner/repo#number; "
-            "omit only from a worktree attached to the PR's branch\"",
+            'argument-hint: "Absolute path to a fresh sealed CI Fix '
+            'invocation artifact"',
             frontmatter,
         )
-        self.assertIn(
-            "combine it with the current workspace repository to form "
-            "`owner/repo#19204`",
-            invocation,
-        )
-        self.assertIn(
-            "`stack-start <canonical-target> --repo-root <workspace> "
-            '--result-file "<exact stack-start result path>"`',
-            invocation,
-        )
-        self.assertIn(
-            "Every `stack-start` command must include that canonical target",
-            invocation,
-        )
+        self.assertIn('run-sealed-ci-fix "<exact absolute', invocation)
+        self.assertIn("Replace only the artifact path", invocation)
+        self.assertIn("Do not add flags", invocation)
 
-    def test_agent_keeps_reading_a_pending_coordinator_shell(self):
+    def test_agent_never_retries_a_sealed_command(self):
         instructions = AGENT.read_text(encoding="utf-8")
-        invocation = _agent_section(instructions, "## Invocation")
+        invocation = _agent_section(instructions, "## Exact command")
 
-        self.assertIn("delay of at most 540 seconds", invocation)
-        self.assertIn("Repeat direct reads of that same shell until it exits", invocation)
-        self.assertIn("Never end the turn", invocation)
-        self.assertIn("do not retry or recover it", invocation)
         arguments = MODULE.build_parser().parse_args(["loop", "owner/repo#7"])
         self.assertGreater(arguments.hosted_timeout, 600)
-        self.assertIn(
-            "Never pass a bare number and never omit the target",
-            invocation,
-        )
-        self.assertNotIn("stack-start <target>", invocation)
-        self.assertIn("`stack-start` does not accept `--model`", invocation)
-        self.assertIn("Use exactly `--model sol`", invocation)
-        self.assertIn("Ignore stdout completely", invocation)
-        self.assertIn(
-            'runs the installed coordinator prefix once with '
-            '`run-sealed-ci-fix "<exact artifact path>"`',
-            invocation,
-        )
-        self.assertIn("Do not select or nest this agent for that path", invocation)
-        self.assertIn("Never repeat `stack-start`", invocation)
-        self.assertIn("--preflight-result-file", invocation)
-        self.assertIn("read only the exact result file", invocation)
+        self.assertIn("Run it once", invocation)
+        self.assertIn("tool error is terminal", invocation)
+        self.assertIn("Do not repeat the command", invocation)
+        self.assertIn("Stdout is not workflow evidence", invocation)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -4449,17 +4472,19 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 "The test failure is the root failure.\n"
             ),
         )
-        self.assertIn("human-readable UTF-8 Markdown report", prompt)
+        self.assertIn("Write exactly one UTF-8 JSON object", prompt)
         self.assertIn("sole repository worker", prompt)
         self.assertIn(self.preflight["check_snapshot"]["sha256"], prompt)
         self.assertIn(MODULE.AGENT_TASK_POLICY_SHA256, prompt)
         self.assertIn('"iteration_allowance": 1', prompt)
         self.assertIn("Never select a marketplace `custom_agent`", prompt)
         self.assertIn("use Cloud Sandboxes", prompt)
-        self.assertIn("worker prompt version 4", prompt)
+        self.assertIn("worker prompt version 5", prompt)
         self.assertNotIn("AssertionError: expected 2", prompt)
         self.assertIn("Never replace a check key with a numeric database ID", prompt)
-        self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
+        self.assertIn("`{{MARKETPLACE_SEMANTIC_PATH}}`", prompt)
+        self.assertIn('"commit_index"', prompt)
+        self.assertNotIn("MARKETPLACE_REPORT_PATH", prompt)
         self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
 
@@ -4615,7 +4640,6 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         resolve.assert_not_called()
 
     def test_accepts_noop_and_complete_relevant_validation(self):
-        remote = self.remote()
         report = self.validate_report(self.report())
         self.assertEqual("no_change", report["outcome"])
 
@@ -4647,7 +4671,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertEqual(commits, report["failures"][0]["fix_commits"])
         self.assertEqual(commits[-1], report["failures"][0]["commit"])
 
-    def test_accepts_legacy_v2_report_for_retained_task_recovery(self):
+    def test_rejects_legacy_v2_report(self):
         commit = "5" * 40
         payload = json.loads(
             self.report(
@@ -4663,26 +4687,27 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         ][0]["log_sha256"]
         payload["failures"][0]["commit"] = payload["failures"][0].pop("commits")[0]
 
-        report = self.validate_report(
-            json.dumps(payload, separators=(",", ":"), sort_keys=True),
-            commits=[commit],
-        )
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "malformed or has stale identity"
+        ):
+            self.validate_report(
+                json.dumps(payload, separators=(",", ":"), sort_keys=True),
+                commits=[commit],
+            )
 
-        self.assertEqual(MODULE.CI_FIX_REPORT_SCHEMA, report["schema"])
-        self.assertEqual([commit], report["failures"][0]["fix_commits"])
-
-    def test_accepts_legacy_v3_report_for_retained_task_recovery(self):
+    def test_rejects_legacy_v3_report(self):
         payload = json.loads(self.report())
         payload["schema"] = MODULE.LEGACY_CI_FIX_REPORT_SCHEMA_V3
         payload["failures"][0]["log_sha256"] = self.preflight["check_snapshot"][
             "failures"
         ][0]["log_sha256"]
 
-        report = self.validate_report(
-            json.dumps(payload, separators=(",", ":"), sort_keys=True)
-        )
-
-        self.assertEqual(MODULE.CI_FIX_REPORT_SCHEMA, report["schema"])
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "malformed or has stale identity"
+        ):
+            self.validate_report(
+                json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            )
 
     def test_current_report_may_omit_cascading_failures(self):
         second = copy.deepcopy(self.preflight["check_snapshot"]["failures"][0])
@@ -4699,7 +4724,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
         self.assertEqual(["check:CI/test"], [item["key"] for item in report["failures"]])
 
-    def test_accepts_exact_policy_v3_compact_external_check_report(self):
+    def test_rejects_legacy_compact_external_check_report(self):
         preflight, remote = self.compact_report_context()
         content = COMPACT_ZIZMOR_REPORT.read_text(encoding="utf-8")
         self.assertEqual(
@@ -4707,23 +4732,16 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             MODULE.sha256_text(content),
         )
 
-        report = MODULE.validate_ci_fix_report(
-            content,
-            request_id="request-1",
-            preflight=preflight,
-            remote=remote,
-            iteration_allowance=1,
-        )
-
-        failure = report["failures"][0]
-        self.assertEqual("check:zizmor", failure["key"])
-        self.assertEqual(MODULE.sha256_text(""), failure["log_sha256"])
-        self.assertEqual(remote["commits"], failure["fix_commits"])
-        self.assertEqual(remote["commits"][-1], failure["commit"])
-        self.assertEqual(
-            [".github/workflows/github-actions-queue-collector.yml"],
-            report["changed_paths"],
-        )
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "malformed or has stale identity"
+        ):
+            MODULE.validate_ci_fix_report(
+                content,
+                request_id="request-1",
+                preflight=preflight,
+                remote=remote,
+                iteration_allowance=1,
+            )
 
     def test_rejects_compact_external_check_report_identity_drift(self):
         preflight, remote = self.compact_report_context()
@@ -4813,6 +4831,172 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         report["pull_request"]["check_snapshot_sha256"] = "0" * 64
         with self.assertRaises(MODULE.WorkflowError):
             self.validate_report(json.dumps(report))
+
+    def test_rejects_legacy_model_authored_report_shape_from_19204(self):
+        malformed = {
+            "outcome": "fixed",
+            "fix_commits": [
+                "a7a0b4fbc220a255893f8e3aff92c5d16311d1a5",
+                "eb1240aeb7300bbe5aa1295cee541f3f66047bda",
+            ],
+            "changed_paths": ["instrumentation/redisson/src/main/java/Example.java"],
+        }
+        content = (
+            "# CI Fix Loop Report\n\n```json\n"
+            + json.dumps(malformed, separators=(",", ":"), sort_keys=True)
+            + "\n```\n"
+        )
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "malformed"):
+            MODULE.validate_ci_fix_report(
+                content,
+                request_id="request-1",
+                preflight=self.preflight,
+                remote=self.remote(malformed["fix_commits"]),
+                iteration_allowance=1,
+            )
+
+    def test_validates_runtime_bound_semantic_artifact_and_canonical_report(self):
+        commit = "5" * 40
+        content = self.semantic_artifact(
+            [commit],
+            changed_paths=["src/widget.py"],
+        )
+        remote = self.remote([commit], changed_paths=["src/widget.py"])
+        remote["semantic_sha256"] = MODULE.sha256_text(content)
+
+        payload = MODULE.validate_ci_fix_semantic_artifact(
+            content,
+            remote=remote,
+        )
+        report_content = MODULE.canonical_ci_fix_report(
+            preflight=self.preflight,
+            request_id=remote["request_id"],
+            iteration_allowance=1,
+            semantic_payload=payload,
+        )
+        report = MODULE.validate_ci_fix_report(
+            report_content,
+            request_id=remote["request_id"],
+            preflight=self.preflight,
+            remote=remote,
+            iteration_allowance=1,
+        )
+
+        self.assertEqual([commit], report["failures"][0]["fix_commits"])
+        self.assertEqual(
+            [{"command": "pytest focused", "outcome": "passed"}],
+            report["evidence"],
+        )
+        self.assertNotEqual(
+            MODULE.sha256_text(content),
+            MODULE.sha256_text(report_content),
+        )
+
+    def test_rejects_semantic_artifact_wrapper_identity_and_digest_drift(self):
+        content = self.semantic_artifact()
+        remote = self.remote()
+        cases = {}
+        wrong_wrapper = json.loads(content)
+        wrong_wrapper["kind"] = "self-review-loop"
+        cases["kind"] = (
+            json.dumps(wrong_wrapper, separators=(",", ":"), sort_keys=True),
+            copy.deepcopy(remote),
+        )
+        forbidden_identity = json.loads(content)
+        forbidden_identity["payload"]["repository"] = "owner/repo"
+        cases["identity field"] = (
+            json.dumps(forbidden_identity, separators=(",", ":"), sort_keys=True),
+            copy.deepcopy(remote),
+        )
+        digest_drift = copy.deepcopy(remote)
+        digest_drift["semantic_sha256"] = "0" * 64
+        cases["digest"] = (content, digest_drift)
+
+        for name, (case_content, case_remote) in cases.items():
+            if name != "digest":
+                case_remote["semantic_sha256"] = MODULE.sha256_text(case_content)
+            with self.subTest(name=name), self.assertRaises(MODULE.WorkflowError):
+                MODULE.validate_ci_fix_semantic_artifact(
+                    case_content,
+                    remote=case_remote,
+                )
+
+    def test_rejects_invalid_semantic_commit_index_and_bound_payload_drift(self):
+        commit = "5" * 40
+        artifact = json.loads(self.semantic_artifact([commit]))
+        artifact["payload"]["failures"][0]["fixes"][0]["commit_index"] = 2
+        content = json.dumps(artifact, separators=(",", ":"), sort_keys=True)
+        remote = self.remote([commit])
+        remote["semantic_sha256"] = MODULE.sha256_text(content)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "invalid commit index"):
+            MODULE.validate_ci_fix_semantic_artifact(content, remote=remote)
+
+        content = self.semantic_artifact([commit])
+        remote = self.remote([commit])
+        remote["semantic_payload"]["failures"][0]["reason"] = "different"
+        with self.assertRaisesRegex(MODULE.WorkflowError, "runtime-bound payload"):
+            MODULE.validate_ci_fix_semantic_artifact(content, remote=remote)
+
+    def test_rejects_unreferenced_commit_and_clean_outcome_with_commits(self):
+        commits = ["5" * 40, "6" * 40]
+        payload = self.semantic_payload(
+            commits,
+            changed_paths=["src/widget.py"],
+        )
+        payload["failures"][0]["fixes"] = [{"commit_index": 1}]
+        bound = MODULE.bind_ci_fix_semantic_payload(payload, commits=commits)
+        remote = self.remote(commits)
+        report_content = MODULE.canonical_ci_fix_report(
+            preflight=self.preflight,
+            request_id=remote["request_id"],
+            iteration_allowance=1,
+            semantic_payload=bound,
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "every fix commit"):
+            MODULE.validate_ci_fix_report(
+                report_content,
+                request_id=remote["request_id"],
+                preflight=self.preflight,
+                remote=remote,
+                iteration_allowance=1,
+            )
+
+        clean_payload = self.semantic_payload(
+            [commits[0]],
+            outcome="no_change",
+            disposition="fixed",
+            changed_paths=[],
+        )
+        clean_bound = MODULE.bind_ci_fix_semantic_payload(
+            clean_payload,
+            commits=[commits[0]],
+        )
+        clean_remote = self.remote([commits[0]])
+        clean_report = MODULE.canonical_ci_fix_report(
+            preflight=self.preflight,
+            request_id=clean_remote["request_id"],
+            iteration_allowance=1,
+            semantic_payload=clean_bound,
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "outcome"):
+            MODULE.validate_ci_fix_report(
+                clean_report,
+                request_id=clean_remote["request_id"],
+                preflight=self.preflight,
+                remote=clean_remote,
+                iteration_allowance=1,
+            )
+
+    def test_rejects_pre_semantic_agent_task_result_schema(self):
+        old = self.result()
+        old["schema"] = {"id": "github.copilot.agent-task-result", "version": 2}
+        path = self.root / "old-result.json"
+        path.write_text(json.dumps(old), encoding="utf-8")
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "unsupported schema"):
+            MODULE.load_agent_task_result(path)
+
     def test_rejects_worker_validation_claim_and_incomplete_attestation(self):
         report = json.loads(self.report())
         report["validation"] = [
@@ -5054,25 +5238,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "status": "not_applied",
             "final_local_head": self.head,
         }
-        failed["report"]["commit"] = None
-        failed["report"]["sha256"] = None
+        failed["semantic_output"] = None
         failed["attestation"]["structural_complete"] = False
         failed["error"] = {"code": "worker_failed", "message": "transient failure"}
-        self.assertEqual(
-            {
-                "task_id": "task-1",
-                "request_id": "request-1",
-                "generated_branch": "copilot/agent-task",
-                "generated_head": self.artifact,
-            },
-            MODULE.validate_recovery_result_identity(
-                failed,
-                preflight=self.preflight,
-                requested_model="gpt-5.6-sol",
-            ),
-        )
-        failed["pull_request"]["head_sha"] = "9" * 40
-        with self.assertRaisesRegex(MODULE.WorkflowError, "pinned task identity"):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "cannot prove"):
             MODULE.validate_recovery_result_identity(
                 failed,
                 preflight=self.preflight,
@@ -5093,8 +5262,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "status": "not_applied",
             "final_local_head": self.head,
         }
-        failed["report"]["commit"] = None
-        failed["report"]["sha256"] = None
+        failed["semantic_output"] = None
         failed["attestation"]["structural_complete"] = False
         failed["error"] = {"code": "worker_failed", "message": "transient failure"}
         helper_commands = []
@@ -5139,7 +5307,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.WorkflowError, "transient failure"):
                 MODULE.command_agent_task(MODULE.build_parser().parse_args(arguments))
             with self.assertRaisesRegex(
-                MODULE.WorkflowError, "recovery is not permitted"
+                MODULE.WorkflowError, "resume is disabled"
             ):
                 MODULE.command_agent_task(
                     MODULE.build_parser().parse_args([*arguments, "--resume"])
@@ -5155,7 +5323,40 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertTrue(Path(state["agent_task"]["result_file"]).is_file())
         emit.assert_not_called()
 
-    def test_taskless_failure_allows_one_fresh_replacement_without_recharging(self):
+    def test_legacy_resume_fails_before_tools_state_or_checkout(self):
+        state_path = self.root / "resume-must-not-exist.json"
+        arguments = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(self.root),
+                "--state",
+                str(state_path),
+                "--resume",
+            ]
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools") as require_tools,
+            mock.patch.object(MODULE, "resolve_repo_root") as resolve_repo_root,
+            mock.patch.object(MODULE, "resolve_target") as resolve_target,
+            mock.patch.object(MODULE, "checkout_pr") as checkout_pr,
+            mock.patch.object(MODULE, "save_state") as save_state,
+            self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "start a fresh sealed CI Fix invocation",
+            ),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        require_tools.assert_not_called()
+        resolve_repo_root.assert_not_called()
+        resolve_target.assert_not_called()
+        checkout_pr.assert_not_called()
+        save_state.assert_not_called()
+        self.assertFalse(state_path.exists())
+
+    def test_taskless_failure_is_terminal_for_its_invocation(self):
         repo = self.root / "repo"
         repo.mkdir()
         state_path = self.root / "state.json"
@@ -5214,20 +5415,25 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             ),
             mock.patch.object(MODULE, "require_live_check_snapshot"),
         ):
-            for _ in range(2):
-                with self.assertRaisesRegex(MODULE.WorkflowError, "CCA enabled"):
-                    MODULE.command_agent_task(
-                        MODULE.build_parser().parse_args(arguments)
-                    )
+            with self.assertRaisesRegex(MODULE.WorkflowError, "CCA enabled"):
+                MODULE.command_agent_task(
+                    MODULE.build_parser().parse_args(arguments)
+                )
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "unfinished Agent Task",
+            ):
+                MODULE.command_agent_task(
+                    MODULE.build_parser().parse_args(arguments)
+                )
 
-        self.assertEqual(2, len(helper_commands))
-        self.assertNotIn("--resume", helper_commands[1])
+        self.assertEqual(1, len(helper_commands))
         self.assertEqual(1, self.triage_worker_mock.call_count)
-        self.assertEqual(1, self.retained_triage_mock.call_count)
+        self.assertEqual(0, self.retained_triage_mock.call_count)
         state = MODULE.load_state(state_path)
         self.assertEqual(1, state["iterations"])
         self.assertEqual("not_created", state["agent_task"]["task_id_status"])
-        self.assertEqual(1, len(state["managed_task_history"]))
+        self.assertNotIn("managed_task_history", state)
 
     def test_taskless_retry_exemption_requires_the_same_stable_snapshot(self):
         task = {"preflight": copy.deepcopy(self.preflight)}
@@ -5282,7 +5488,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertEqual(
             "not_created", state["agent_task"]["task_id_status"]
         )
-        self.assertIn("retry_command", state["agent_task"])
+        self.assertNotIn("retry_command", state["agent_task"])
 
     def test_hosted_timeout_with_known_task_has_no_generic_recovery(self):
         repo = self.root / "repo"
@@ -5361,14 +5567,11 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         preflight = copy.deepcopy(self.preflight)
         preflight["repository_root"] = str(repo)
         commit = "5" * 40
-        report = self.report(
-            commits=[commit],
-            outcome="fixed",
-            disposition="fixed",
+        semantic = self.semantic_artifact(
+            [commit],
             changed_paths=["src/widget.py"],
         )
-        result = self.result([commit])
-        result["report"]["sha256"] = MODULE.sha256_text(report)
+        result = self.result([commit], changed_paths=["src/widget.py"])
         commands = []
 
         def run_command(command, **kwargs):
@@ -5400,9 +5603,19 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(MODULE, "agent_task_preflight", return_value=preflight),
             mock.patch.object(MODULE, "discover_cloud_task", return_value=self.root / "cloud_task.py"),
             mock.patch.object(MODULE, "run", side_effect=run_command),
-            mock.patch.object(MODULE, "local_identity", return_value=imported_identity),
             mock.patch.object(
-                MODULE, "fetch_committed_text", return_value=report
+                MODULE,
+                "local_identity",
+                side_effect=[
+                    preflight["identity"],
+                    preflight["identity"],
+                    preflight["identity"],
+                    imported_identity,
+                    imported_identity,
+                ],
+            ),
+            mock.patch.object(
+                MODULE, "fetch_committed_text", return_value=semantic
             ),
             mock.patch.object(MODULE, "validate_generated_history"),
             mock.patch.object(MODULE, "refuse_test_suppression"),
@@ -5436,26 +5649,40 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             ],
             pushes,
         )
+        hosted = next(command for command in commands if "--apply-with-report" in command)
+        self.assertEqual(
+            MODULE.CI_FIX_SEMANTIC_KIND,
+            hosted[hosted.index("--semantic-kind") + 1],
+        )
         self.assertEqual("published", emit.call_args.args[0]["result"])
         state = MODULE.load_state(state_path)
         self.assertEqual(commit, state["agent_task"]["published_head_sha"])
         self.assertEqual([commit], state["agent_task"]["ordered_commits"])
+        self.assertEqual(
+            MODULE.CI_FIX_CONSUMER_RECEIPT_SCHEMA,
+            state["agent_task"]["consumer_receipt"]["schema"],
+        )
+        self.assertEqual(
+            result["semantic_output"]["sha256"],
+            state["agent_task"]["semantic_output_sha256"],
+        )
+        self.assertRegex(
+            state["agent_task"]["consumer_receipt_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
 
-    def test_managed_fix_recovers_an_uncertain_push_without_pushing_twice(self):
+    def test_concurrent_cas_loser_stops_before_local_import(self):
         repo = self.root / "repo"
         repo.mkdir()
-        state_path = self.root / "state.json"
+        state_path = self.root / "concurrent-loser.json"
         preflight = copy.deepcopy(self.preflight)
         preflight["repository_root"] = str(repo)
         commit = "5" * 40
-        report = self.report(
-            commits=[commit],
-            outcome="fixed",
-            disposition="fixed",
+        semantic = self.semantic_artifact(
+            [commit],
             changed_paths=["src/widget.py"],
         )
-        result = self.result([commit])
-        result["report"]["sha256"] = MODULE.sha256_text(report)
+        result = self.result([commit], changed_paths=["src/widget.py"])
         commands = []
 
         def run_command(command, **kwargs):
@@ -5464,6 +5691,88 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 Path(command[command.index("--result-file") + 1]).write_text(
                     json.dumps(result), encoding="utf-8"
                 )
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        arguments = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                self.preflight["pr"]["pr_url"],
+                "--repo-root",
+                str(repo),
+                "--state",
+                str(state_path),
+            ]
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value={"repo_name": "owner/repo", "number": 7},
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=preflight
+            ),
+            mock.patch.object(
+                MODULE,
+                "discover_cloud_task",
+                return_value=self.root / "cloud_task.py",
+            ),
+            mock.patch.object(MODULE, "run", side_effect=run_command),
+            mock.patch.object(
+                MODULE, "local_identity", return_value=preflight["identity"]
+            ),
+            mock.patch.object(
+                MODULE, "fetch_committed_text", return_value=semantic
+            ),
+            mock.patch.object(MODULE, "validate_generated_history"),
+            mock.patch.object(MODULE, "refuse_test_suppression"),
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
+            mock.patch.object(
+                MODULE, "metadata_for", return_value=preflight["pr"]
+            ),
+            mock.patch.object(MODULE, "remote_head", return_value=commit),
+            mock.patch.object(
+                MODULE, "apply_verified_import"
+            ) as apply_import,
+            self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "moved before verified local import",
+            ),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        apply_import.assert_not_called()
+        self.assertFalse(
+            any(
+                command[:4] == ["git", "-C", str(repo), "push"]
+                for command in commands
+            )
+        )
+
+    def test_managed_fix_accepts_lost_push_response_without_duplicate_apply(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        state_path = self.root / "state.json"
+        preflight = copy.deepcopy(self.preflight)
+        preflight["repository_root"] = str(repo)
+        commit = "5" * 40
+        semantic = self.semantic_artifact(
+            [commit],
+            changed_paths=["src/widget.py"],
+        )
+        result = self.result([commit], changed_paths=["src/widget.py"])
+        commands = []
+
+        def run_command(command, **kwargs):
+            commands.append(command)
+            if "--result-file" in command:
+                Path(command[command.index("--result-file") + 1]).write_text(
+                    json.dumps(result), encoding="utf-8"
+                )
+            if command[:3] == ["git", "-C", str(repo)] and "push" in command:
+                raise MODULE.WorkflowError("push response lost")
             return MODULE.subprocess.CompletedProcess(command, 0, "", "")
 
         raw_arguments = [
@@ -5485,36 +5794,40 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(MODULE, "agent_task_preflight", return_value=preflight),
             mock.patch.object(MODULE, "discover_cloud_task", return_value=self.root / "cloud_task.py"),
             mock.patch.object(MODULE, "run", side_effect=run_command),
-            mock.patch.object(MODULE, "local_identity", return_value=imported_identity),
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                side_effect=[
+                    preflight["identity"],
+                    preflight["identity"],
+                    preflight["identity"],
+                    imported_identity,
+                ],
+            ),
             mock.patch.object(
                 MODULE,
                 "fetch_committed_text",
-                side_effect=[report, report],
+                side_effect=[semantic, semantic],
             ),
             mock.patch.object(MODULE, "validate_generated_history"),
             mock.patch.object(MODULE, "refuse_test_suppression"),
             mock.patch.object(MODULE, "require_live_check_snapshot") as check_snapshot,
-            mock.patch.object(
-                MODULE,
-                "metadata_for",
-                side_effect=[
-                    preflight["pr"],
-                    MODULE.WorkflowError("PR head lookup failed"),
-                    live_after_push,
-                    live_after_push,
-                ],
-            ),
+            mock.patch.object(MODULE, "metadata_for", return_value=preflight["pr"]),
             mock.patch.object(MODULE, "remote_head", side_effect=[self.head, commit]),
             mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
             mock.patch.object(MODULE, "wait_for_remote_head", return_value=commit),
+            mock.patch.object(
+                MODULE,
+                "wait_for_live_pr_snapshot",
+                return_value=live_after_push,
+            ),
+            mock.patch.object(
+                MODULE, "apply_verified_import", return_value=True
+            ) as apply_import,
             mock.patch.object(MODULE, "emit") as emit,
         ):
-            with self.assertRaisesRegex(MODULE.WorkflowError, "lookup failed"):
-                MODULE.command_agent_task(
-                    MODULE.build_parser().parse_args(raw_arguments)
-                )
             MODULE.command_agent_task(
-                MODULE.build_parser().parse_args([*raw_arguments, "--resume"])
+                MODULE.build_parser().parse_args(raw_arguments)
             )
 
         pushes = [
@@ -5523,6 +5836,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             if command[:4] == ["git", "-C", str(repo), "push"]
         ]
         self.assertEqual(1, len(pushes))
+        apply_import.assert_called_once()
         self.assertEqual(1, check_snapshot.call_count)
         self.assertEqual("published", emit.call_args.args[0]["result"])
         self.assertEqual(
@@ -5534,7 +5848,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         repo.mkdir()
         state_path = self.root / "state.json"
         preflights = []
-        reports = []
+        semantic_artifacts = []
         results = []
         for iteration in range(3):
             preflight = copy.deepcopy(self.preflight)
@@ -5555,15 +5869,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             preflight["check_snapshot"]["sha256"] = MODULE.check_snapshot_sha256(
                 preflight["check_snapshot"]
             )
-            report_payload = json.loads(self.report())
-            report_payload["pull_request"]["check_snapshot_sha256"] = preflight[
-                "check_snapshot"
-            ]["sha256"]
-            report = json.dumps(report_payload, separators=(",", ":"), sort_keys=True)
             result = self.result()
-            result["report"]["sha256"] = MODULE.sha256_text(report)
             preflights.append(preflight)
-            reports.append(report)
+            semantic_artifacts.append(self.semantic_artifact())
             results.append(result)
         helper_calls = 0
 
@@ -5601,7 +5909,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "fetch_committed_text",
-                side_effect=reports,
+                side_effect=semantic_artifacts,
             ),
             mock.patch.object(MODULE, "validate_generated_history"),
             mock.patch.object(MODULE, "refuse_test_suppression"),
@@ -6032,8 +6340,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "status": "not_applied",
             "final_local_head": self.head,
         }
-        failed["report"]["commit"] = None
-        failed["report"]["sha256"] = None
+        failed["semantic_output"] = None
         failed["attestation"]["structural_complete"] = False
         failed["error"] = {"code": "worker_failed", "message": "worker stopped"}
         helper_commands = []
@@ -10496,7 +10803,7 @@ class PreflightCommandTest(unittest.TestCase):
         )
         self.metadata["head_sha"] = "standalone-head"
         with contextlib.ExitStack() as stack:
-            standalone = self.preflight(
+            self.preflight(
                 stack,
                 head="standalone-head",
                 state_path=path,
@@ -12544,31 +12851,26 @@ class PreflightHelpTest(unittest.TestCase):
     then arrives only after the launch it wasted.
     """
 
-    def test_the_target_help_repeats_the_agent_file_hint(self):
-        """Deriving the clause keeps one sentence across both surfaces.
-
-        The agent file's own guard fixes what that clause says; this one stops
-        the two from drifting apart.
-        """
+    def test_agent_hint_matches_the_sealed_entrypoint(self):
         hint = re.search(
             r'^argument-hint: "(.+)"$', AGENT.read_text(encoding="utf-8"), re.M
         )
         self.assertIsNotNone(hint)
-        clause = hint.group(1).split("; ", 1)[1]
+        self.assertEqual(
+            "Absolute path to a fresh sealed CI Fix invocation artifact",
+            hint.group(1),
+        )
         subparsers = next(
             action
             for action in MODULE.build_parser()._actions
             if isinstance(action, argparse._SubParsersAction)
         )
-        target = next(
+        artifact = next(
             action
-            for action in subparsers.choices["preflight"]._actions
-            if action.dest == "target"
+            for action in subparsers.choices["run-sealed-ci-fix"]._actions
+            if action.dest == "invocation_artifact"
         )
-        self.assertTrue(
-            target.help.endswith(f"; {clause}"),
-            f"preflight target help {target.help!r} does not end with {clause!r}",
-        )
+        self.assertTrue(artifact.required)
 
 
 if __name__ == "__main__":

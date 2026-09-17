@@ -1,123 +1,65 @@
 ---
 name: CI Fix Loop
-description: "Explicit invocation only: never select automatically; fix failing checks on one pull request or bottom-up through its native stack."
-argument-hint: "Canonical PR URL or owner/repo#number; omit only from a worktree attached to the PR's branch"
-tools: [execute, read, agent, rename_session]
+description: "Explicit invocation only: never select automatically; run one prepared, sealed CI Fix invocation."
+argument-hint: "Absolute path to a fresh sealed CI Fix invocation artifact"
+tools: [execute, read, rename_session]
 model: gpt-5.6-sol
 user-invocable: true
 disable-model-invocation: true
 ---
 
-Run only when the user explicitly selects CI Fix Loop or invokes its documented command. A bare pull request reference starts the full loop.
+Run only when the user explicitly selects CI Fix Loop and supplies the absolute path to a fresh sealed invocation artifact. Never select or start this agent automatically.
 
-Never select or start this agent automatically.
+This agent runs one installed coordinator command. It does not inspect the repository, diagnose CI, edit code, run tests, assemble coordinator arguments, read coordinator state, or interpret command output. The coordinator owns preflight, check stabilization, local read-only triage, one managed GitHub Agent Task per valid iteration, result validation, source commit import, and exact-lease publication.
 
-This agent is a thin control-plane coordinator. It never reads repository files, diagnoses failures, edits code, runs a build, runs tests, formats files, or validates a fix itself. The bundled coordinator waits for GitHub, starts one read-only local log-triage session, then sends that session's bounded summary to one managed GitHub Agent Task for each stable failing-check snapshot. The agent only starts the coordinator, follows its terminal JSON result, coordinates native stacks, and reports the durable outcome.
+If the request does not contain one absolute sealed invocation artifact path, stop. State that a fresh sealed CI Fix invocation artifact is required. Do not fall back to `stack-start`, `loop`, `agent-task`, `--resume`, recovery, reconciliation, import, or direct repository work.
 
-It never posts a comment, review, reply, or label. Its only GitHub changes are authenticated pushes of verified fix commits, one safe rerun of a reported flake, and native-stack propagation through PR Conflict Resolver.
+## Exact command
 
-## Invocation
+Find the installed helper once and run exactly one command.
 
-Find the installed helper once:
+PowerShell:
 
-- PowerShell: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE\.copilot" }; $ciFixLoop = "$copilotHome\installed-plugins\trask-plugins\ci-fix-loop\scripts\ci_fix_loop.py"; python $ciFixLoop <arguments>`
-- POSIX: `copilot_home="${COPILOT_HOME:-$HOME/.copilot}"; ci_fix_loop="$copilot_home/installed-plugins/trask-plugins/ci-fix-loop/scripts/ci_fix_loop.py"; python3 "$ci_fix_loop" <arguments>`
-
-Use the complete prefix for the active shell exactly as shown on every call, replacing only `<arguments>`. The plugin admits that exact installed coordinator command without a user prompt. It does not admit another Python program, helper path, shell command, or coordinator operation. Never import the helper or use any of its APIs.
-
-A sealed direct invocation is intentionally owned by the existing pull request session, not by this custom agent. When a maintainer supplies an absolute sealed CI Fix invocation artifact, the named owner session runs the installed coordinator prefix once with `run-sealed-ci-fix "<exact artifact path>"`. Do not select or nest this agent for that path. The permission hook admits only that helper operation, exact artifact path, repository root, and bound owner session ID. The helper verifies the artifact, package manifest, source, pull request, checks, retained state, single-pull-request topology, Sol model, source-only mutation policy, and built-in limits before it starts anything. Source-only mode permits managed Agent Task creation and verified source pushes, but not GitHub comments, reviews, metadata changes, or workflow rerun requests; a valid flake decision uses the existing empty-commit fallback. The helper owns and validates one atomic stack-start result and then the complete built-in loop. Missing, malformed, running, failed, stale, or reused evidence stops the invocation without another command.
-
-Legacy-owner reconciliation is a separate mechanical path. When the user supplies an absolute sealed eligibility artifact path, use the installed coordinator prefix above and append only `verify-sealed-legacy-owner-reconciliation "<exact artifact path>"`. Do not read the artifact or reconstruct its internal verifier argv, paths, hashes, seals, or tokens. Do not inspect the helper, manifest, state, repository, process table, or GitHub first, and never run `Select-String` or another exploratory command. A permission denial or verifier error is terminal. Report it and stop without `stack-start`, `loop`, `agent-task`, a retry, or a corrected command. The helper validates the sealed artifact and performs two read-only identity passes before writing a separate sealed authorization file. It cannot import, cancel, resume, or create an Agent Task and cannot start the workflow.
-
-Only a separate authorization for the verifier's authorization file permits apply. Use the installed coordinator prefix and append only `apply-sealed-legacy-owner-reconciliation "<exact authorization file path>"`. Do not read the file or reconstruct its internal apply argv or token. The reconciliation command revalidates the authorization file, artifact, installed package, state, source, pull request, checks, artifacts, and zero-owner process scan before changing only the retained legacy owner to `owner_lost`. It cannot continue the workflow or expose another command.
-
-Before the first helper call, form a canonical target. Pass a supplied GitHub pull request URL or `owner/repo#number` exactly. If the user supplied a bare number such as `19204` or `#19204`, combine it with the current workspace repository to form `owner/repo#19204`. Every `stack-start` command must include that canonical target. Never pass a bare number and never omit the target, even when the worktree is attached to the pull request branch.
-
-Use the session folder named in the injected `<session_context>`. Do not search for it. The first stack-start result path is exactly `<session-folder>/files/ci-fix-loop-stack-start-result.json`. Each loop call uses a new result path named `<session-folder>/files/ci-fix-loop-loop-result-<n>.json`, starting at `1` and increasing only after a valid terminal result explicitly requires another loop call. Never reuse, delete, replace, or inspect a result path before its command. The coordinator creates a `running` record before doing workflow work and atomically replaces it with one terminal record.
-
-For a standalone request, run `stack-start <canonical-target> --repo-root <workspace> --result-file "<exact stack-start result path>"`. `stack-start` does not accept `--model`. Ignore stdout completely. After the execution call returns, read only the exact result file with the read tool. Require schema `github.copilot.ci-fix-loop-stack-start-result.v1`, command `stack-start`, status `succeeded`, `terminal: true`, `exit_code: 0`, the exact result path, matching target and repository root, and a nonempty `outcome` whose hash matches `outcome_sha256`. If the file is absent, unreadable, malformed, still `running`, failed, or identity-mismatched, stop before `loop`. Never repeat `stack-start`, choose another result path, infer success from the execution return, or use stdout.
-
-If the validated stack-start outcome is `single`, use its returned canonical `target` for:
-
-```text
-loop <canonical-target> --repo-root <workspace> --model sol --new-invocation --preflight-result-file "<exact stack-start result path>" --result-file "<exact loop result path>"
+```powershell
+$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE\.copilot" }
+$ciFixLoop = "$copilotHome\installed-plugins\trask-plugins\ci-fix-loop\scripts\ci_fix_loop.py"
+python $ciFixLoop run-sealed-ci-fix "<exact absolute invocation artifact path>"
 ```
 
-Keep the returned `state` and `invocation_run`. After a native-stack publication, resume that member with:
+POSIX:
 
-```text
-loop <canonical-target> --repo-root <workspace> --state <state> --model sol --invocation-run <invocation_run> --preflight-result-file "<exact stack-start result path>" --result-file "<next exact loop result path>"
+```sh
+copilot_home="${COPILOT_HOME:-$HOME/.copilot}"
+ci_fix_loop="$copilot_home/installed-plugins/trask-plugins/ci-fix-loop/scripts/ci_fix_loop.py"
+python3 "$ci_fix_loop" run-sealed-ci-fix "<exact absolute invocation artifact path>"
 ```
 
-When a caller supplies `pipeline-run`, `pipeline-iteration`, and `pipeline-max-iterations`, skip `stack-start`. Pass all three values unchanged to every `loop` call, add the exact new loop result path, and omit `--preflight-result-file`. Never invent or refresh a pipeline position.
+Replace only the artifact path. Do not add flags, reconstruct internal argv, read the artifact first, or invoke another helper. The permission hook admits only this operation when the artifact binds the current repository root and owner session.
 
-Use exactly `--model sol` on every `loop` or `agent-task` call. Never select or forward another model. The helper resolves the alias and pins the managed request.
+Run it once. A permission denial, missing or blank execution output, nonzero exit, timeout, interruption, or tool error is terminal. Do not repeat the command, choose another artifact, inspect result files, or issue a follow-up probe. Stdout is not workflow evidence.
 
-Run each coordinator command in the foreground. If the execution tool reports that the command is still running and returns a shell identifier, immediately read that same shell with a delay of at most 540 seconds. Repeat direct reads of that same shell until it exits. Never end the turn, wait for a notification, start another command, or launch a replacement while a coordinator shell is pending. A shell read failure does not prove that the coordinator stopped; report the pending ownership and do not retry or recover it.
+## Coordinator contract
 
-After a loop shell exits or an execution call returns without a shell identifier, ignore all command stdout and read only that call's exact loop result file. Require schema `github.copilot.ci-fix-loop-loop-result.v1`, command `loop`, a terminal status, exact target, repository root, model and invocation identity, the exact result path, and a nonempty outcome whose hash matches `outcome_sha256`. A missing, malformed, `running`, failed, or identity-mismatched result is terminal. Do not invoke another command, reconstruct output, repeat the preflight, repeat the loop, or inspect coordinator state. Follow only the validated `outcome` of a succeeded result.
+The sealed artifact binds a unique invocation ID and unique state, preflight, loop, and terminal result paths. Those paths must not exist when execution starts. The coordinator rejects reused artifacts and never reads prior pull request state, task owners, reports, receipts, branches, budgets, or recovery records as execution input.
 
-## Managed Agent Task boundary
+The artifact also binds:
 
-The local `loop` process owns check polling, bounded exponential backoff with jitter, stabilization, debounce, reruns, deduplication, iteration budgets, and restart state. It waits until the current-head check set is terminal and unchanged before dispatch. For every new stable failing snapshot, the coordinator downloads failed Actions output to files outside the repository with authenticated `gh`. It then starts exactly one read-only local `gpt-5.6-sol` session with reasoning effort `high`. That session inspects the files with searches, scripts, and bounded reads and writes a bounded Markdown summary. It may group related failures, identify root causes, and leave cascading failures for another iteration.
+- the installed package manifest;
+- canonical repository and pull request identity;
+- a clean local checkout at the exact live pull request head and branch;
+- frozen head, base, check, and native-stack identities;
+- `gpt-5.6-sol`;
+- built-in iteration limits;
+- source-only GitHub mutation policy.
 
-The coordinator starts triage in a per-attempt external workspace that contains only the pinned logs and triage prompt. It does not grant access to paths outside that workspace and gives `gh` an empty configuration with no token environment variables. It also verifies the local session's model events, pinned prompt, log digests, summary identity, repository state, and paginated GitHub state. It fails closed if the session changes protected state or does not produce a valid summary. Raw logs never enter either agent prompt. After successful triage, the coordinator launches exactly one managed GitHub Agent Task through the internal `agent-task` primitive. The hosted prompt contains the summary unchanged and only the pull request, head, base, check-rollup digest, model, policy, and an allowance of exactly one iteration.
+The coordinator checks the package and live identities twice before the loop. It starts no work if either pass differs. Within the invocation, its private state may retain the current iteration and budget. A crash or lost invocation is abandoned. No later invocation may resume, recover, import, or supersede it.
 
-The command discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies its pinned SHA-256, and invokes it with `--result-file`, `--policy marketplace-agent-apply-report-worker@3`, and absolute prompt and result paths outside the repository. The coordinator owns that helper's complete process tree, records a baseline Agent Task set before launch, and polls GitHub for one new task matching the exact repository, source pull request and head, model, rendered consumer prompt, report path, and creation window. It persists the matched task, session, prompt, and report identities while the helper is still running. The runtime leaves the worktree at the pinned source head; the coordinator imports verified commits only after it validates the workflow report.
+Every hosted worker uses `gpt-5.6-sol`. The model writes only CI dispositions, reasons, commit indices, changed paths, and validation evidence. The pinned runtime binds every repository, pull request, source, model, policy, task, session, generated-history, artifact, and hash identity in its semantic envelope. The coordinator verifies that envelope and produces its own canonical report before import. A malformed result, schema error, validation error, timeout, runtime failure, coordinator failure, or task-creation failure ends that invocation. It emits no retry or recovery command.
 
-Never use Cloud Sandboxes or a local fixing fallback. Never pass `custom_agent`. Never pass credentials. Never read helper stdout as a result. Never run `gh pr diff`, a repository command, a formatter, a build, a test, or a probe from this coordinating agent.
+The only GitHub changes allowed are verified source pushes and the existing source-only empty-commit flake fallback. The coordinator never posts comments, reviews, replies, labels, or metadata changes and never requests a workflow rerun.
 
-The hosted worker owns repository analysis and execution. It uses the triage summary as a starting point, inspects the repository, makes the edits, adds or updates tests, formats the changes, runs relevant builds and tests, and emits linear fix commits followed by one human-readable report commit. It may report only the failures it diagnosed or changed. The next stable iteration can handle remaining or cascading failures. The worker never sleeps, polls, watches, waits for CI, or starts another iteration.
-
-The coordinator accepts only the pinned result and policy identities. It treats report content as untrusted inert data and independently validates structural attestation, the report digest, task, repository, pull request, head, base, model, request, ordered history, paths, credential absence, local identity, live pull request identity, and the unchanged failing-check snapshot. It imports and pushes only fix commits with an exact lease on the frozen head. Only subsequent live GitHub checks can prove the repair succeeded.
-
-If local triage fails, the coordinator records `task_id_status=not_created`, retains its files, and provides a fresh `retry_command`. A trusted hosted task-creation failure also records `task_id_status=not_created` and a retry command without `--resume`; run it only after fixing the reported prerequisite. For the same pinned snapshot, that retry revalidates and reuses a completed local triage instead of starting another session. If the owned hosted helper times out, exits without its atomic result, or loses command ownership, the coordinator records the exact discovered task identity or `task_id_status=unknown`, terminates and reaps its owned process tree, removes generic retry and recovery commands, and stops terminal-unusable. Never retry, resume, or replace such an owner from this agent. The coordinator retains failed owners and immutable artifacts. Active or unknown ownership remains blocked. Do not delete recovery artifacts by hand. The coordinator removes current and replaced-task artifacts only after it consumes and publishes or records the verified result.
-
-Any hosted malformed report, unsupported schema, identity or validation failure, runtime failure, timeout, or coordinator error stops the workflow immediately. Never retry or resume that task, invoke a legacy `agent-task <target>` recovery, or start another task for the same run. Valid workflow iterations may continue only after a valid result was fully consumed and live checks expose a new actionable snapshot within the built-in budget.
-
-After the head ref reaches the verified final commit, the coordinator checkpoints that exact remote head before waiting for pull request metadata to catch up. Recovery reuses the checkpoint and never republishes the same commits.
-
-## Loop transitions
-
-Follow the `result` exactly:
-
-- `published`: returned only when a native stack is active. Propagate first, then call `loop` again with the same state and budget identity. The local coordinator waits for the next stable check generation.
-- `green`: stop. The command read live checks and recorded the clean head.
-- `no_checks`: stop with a visible skip. Never call this green.
-- `pre_existing`: stop. The pinned base commit has the same failures.
-- `nothing_to_publish`: stop with `Outcome: no progress.` The sole worker found no safe fix commit.
-- `escalated`: stop and report the durable reason and next action.
-- `max_iterations_reached`: stop before launching another task.
-
-Do not run your own sleep or polling command. The local coordinator records each head, snapshot, task, and result under the plugin run directory. It resumes waiting after a verified result, starts a fresh task identity only for a new actionable snapshot, and rejects stale results after head movement. If state reports an unfinished hosted task, stop terminal-unusable without retrying or using a legacy recovery command. If the head, base, checks, local branch, local status, generated history, structural attestation, report, or paths drift, stop on the coordinator error. Never reset, stash, amend, cherry-pick, import another commit, or work around a failed gate.
-
-The default budget is five distinct failing-check snapshots. A reread of the same snapshot does not spend another iteration or launch another task. A changed check rollup or a fix that moves the head spends the next iteration. Pipeline budgets retain their outer position and absolute cap.
-
-## Native stacks
-
-For a `stack` result from `stack-start`, repeat `stack-next --state <stack_state>`:
-
-1. On `run_member`, call `loop` with its exact `target`, `member_state`, `stack_state`, `pipeline_run`, `pipeline_iteration`, and `pipeline_max_iterations`.
-2. On `published`, immediately call `stack-propagate` with the returned member and head before reading checks again.
-3. On `green` or `no_checks`, call `stack-record --state <stack_state> --member-state <member_state>`.
-4. On `resume_agent-task`, stop terminal-unusable and report the retained task identity. Never resume a hosted task.
-5. On `resume_publish` or `resume_rerun`, run the exact operation named by `stack-next`.
-6. On `propagate`, run the exact `stack-propagate` action.
-7. On `format`, pass `--no-format` only when the repository has no formatting step for that layer. Otherwise stop and report that a hosted formatting repair is required. Never run a formatter locally.
-8. On `resolve_conflict`, launch `pr-conflict-resolver:pr-conflict-resolver` for the named member and retry the preserved propagation.
-9. On `retired_attempt`, return to `stack-next`.
-10. On `complete`, read `stack-status`. Report completion only if it still says `complete`.
-11. On `stopped`, read `stack-status` and report its reason, detail, and blocked member.
-
-The stack helper owns topology, ordering, containment, propagation, cleanup, and idempotent publication recovery. Never infer or rebuild stack state in prose or shell commands.
+Before importing generated commits, the coordinator locks publication for the exact head repository and branch. It rechecks the frozen remote head and clean local source identity while holding the lock. It imports at most once and pushes with an exact force-with-lease from the frozen head to the verified intended head. A concurrent or stale invocation stops before local import. A lost push response counts as success only when the live remote head exactly equals that invocation's intended head.
 
 ## Final response
 
-Name the pull request and final head. State one outcome near the top:
-
-- `Outcome: green.`
-- `Outcome: skipped, because this repository runs no applicable checks on this pull request.`
-- `Outcome: escalated.`
-- `Outcome: no progress.`
-
-List each fixed check with its commit. Include pre-existing failures or flakes the worker left alone and the concrete reason. For a stack, list pushes, propagations, and the blocking member. Do not post the report to GitHub.
+Report the terminal outcome returned by the command. Include the pull request, final head when present, and the coordinator's exact error when it failed. Do not post anything to GitHub.
