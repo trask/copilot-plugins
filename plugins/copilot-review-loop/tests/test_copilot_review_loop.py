@@ -108,6 +108,7 @@ SPEC = importlib.util.spec_from_file_location("copilot_review_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+RUN_LOCAL_DECISION_WORKER = MODULE.run_local_decision_worker
 
 
 class WindowsSubprocessTest(unittest.TestCase):
@@ -1084,6 +1085,154 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "head_review_id": 29,
             "copilot_bot_id": "BOT_1",
         }
+        self.source_fingerprint = {
+            "branch": "feature",
+            "head": self.head,
+            "status": "",
+            "refs": {"refs/heads/feature": self.head},
+            "refs_sha256": MODULE.sha256_text(
+                json.dumps(
+                    {"refs/heads/feature": self.head},
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            ),
+        }
+        self.github_fingerprint = {
+            "pr_sha256": "a" * 64,
+            "threads_sha256": "b" * 64,
+            "reviews_sha256": "c" * 64,
+            "head_ref_sha": self.head,
+            "base_ref_sha": self.base,
+        }
+        source_patch = mock.patch.object(
+            MODULE,
+            "local_source_fingerprint",
+            return_value=self.source_fingerprint,
+        )
+        github_patch = mock.patch.object(
+            MODULE,
+            "github_decision_fingerprint",
+            return_value=self.github_fingerprint,
+        )
+        worker_patch = mock.patch.object(
+            MODULE,
+            "run_local_decision_worker",
+            side_effect=self.local_worker_result,
+        )
+        source_patch.start()
+        github_patch.start()
+        self.local_worker = worker_patch.start()
+        self.addCleanup(source_patch.stop)
+        self.addCleanup(github_patch.stop)
+        self.addCleanup(worker_patch.stop)
+
+    def source_for_preflight(self, preflight):
+        identity = preflight["identity"]
+        refs = {f"refs/heads/{identity['branch']}": identity["head"]}
+        return {
+            **identity,
+            "refs": refs,
+            "refs_sha256": MODULE.sha256_text(
+                json.dumps(refs, separators=(",", ":"), sort_keys=True)
+            ),
+        }
+
+    def local_worker_result(self, **arguments):
+        preflight = arguments["preflight"]
+        run_id = arguments["run_id"]
+        session_id = arguments["session_id"]
+        decision_path = arguments["decision_path"]
+        result_path = arguments["result_path"]
+        canonical_path = arguments["canonical_path"]
+        source = self.source_for_preflight(preflight)
+        github = arguments["before_github"]
+        decision = {
+            "schema": MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
+            "contract_id": MODULE.decision_report_contract(preflight),
+            "decisions": [
+                {
+                    "finding_key": MODULE.decision_finding_key(identity),
+                    "disposition": "no_change",
+                    "reason": "The current implementation already handles this case.",
+                    "commit": None,
+                    "reply": "No change is needed because the case is already handled.",
+                    "changed_paths": [],
+                }
+                for identity in preflight["comment_identities"]
+            ],
+        }
+        decision_content = json.dumps(decision, indent=2, sort_keys=True) + "\n"
+        decision_path.write_text(decision_content, encoding="utf-8", newline="\n")
+        remote = {
+            "request_id": run_id,
+            "task_id": session_id,
+            "task_url": None,
+            "generated_branch": source["branch"],
+            "generated_head": source["head"],
+            "commits": [],
+            "final_local_head": source["head"],
+            "requires_apply": False,
+            "report_path": str(canonical_path),
+            "report_sha256": "",
+            "structural_attestation": True,
+        }
+        report = MODULE.validate_copilot_review_report(
+            decision_content,
+            request_id=run_id,
+            preflight=preflight,
+            remote=remote,
+            paths_by_commit={},
+        )
+        canonical_content = MODULE.render_canonical_review_report(report)
+        canonical_path.write_text(canonical_content, encoding="utf-8", newline="\n")
+        remote["report_sha256"] = MODULE.sha256_text(canonical_content)
+        result = {
+            "schema": MODULE.LOCAL_DECISION_RESULT_SCHEMA,
+            "status": "success",
+            "validation_complete": True,
+            "producer": "local",
+            "policy": MODULE.LOCAL_DECISION_POLICY,
+            "requested_model": arguments["requested_model"],
+            "reasoning_effort": MODULE.LOCAL_DECISION_REASONING_EFFORT,
+            "session_id": session_id,
+            "run_id": run_id,
+            "prompt": {
+                "path": str(arguments["prompt_path"]),
+                "sha256": MODULE.sha256_file(arguments["prompt_path"]),
+            },
+            "decision": {
+                "path": str(decision_path),
+                "sha256": MODULE.sha256_file(decision_path),
+            },
+            "canonical_report": {
+                "path": str(canonical_path),
+                "sha256": remote["report_sha256"],
+            },
+            "source_before": arguments["before_source"],
+            "source_after": source,
+            "github_before": arguments["before_github"],
+            "github_after": github,
+            "command": MODULE.local_decision_command(
+                arguments["repo_root"],
+                session_id=session_id,
+                run_id=run_id,
+                pr_number=preflight["pr"]["number"],
+            ),
+            "remote": remote,
+            "paths_by_commit": {},
+        }
+        result_path.write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return {
+            "result": result,
+            "remote": remote,
+            "report": report,
+            "report_content": canonical_content,
+            "paths_by_commit": {},
+        }
 
     def result(self, commits=None):
         commits = [] if commits is None else commits
@@ -1265,15 +1414,202 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             }
         )
 
+    def local_decision(self, *, contract_id=None):
+        return {
+            "schema": MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
+            "contract_id": contract_id
+            if contract_id is not None
+            else MODULE.decision_report_contract(self.preflight),
+            "decisions": [
+                {
+                    "finding_key": MODULE.decision_finding_key(
+                        self.preflight["comment_identities"][0]
+                    ),
+                    "disposition": "no_change",
+                    "reason": "The current implementation already handles this case.",
+                    "commit": None,
+                    "reply": "No change is needed because the case is already handled.",
+                    "changed_paths": [],
+                }
+            ],
+        }
+
+    def run_actual_local_worker(self, writer, *, requested_model="gpt-5.6-sol"):
+        prompt_path = self.directory / "prompt.txt"
+        decision_path = self.directory / "decisions.json"
+        result_path = self.directory / "result.json"
+        canonical_path = self.directory / "canonical.json"
+        prompt_path.write_text("pinned prompt\n", encoding="utf-8", newline="\n")
+
+        def run(command, **kwargs):
+            if writer is not None:
+                writer(
+                    prompt_path=prompt_path,
+                    decision_path=decision_path,
+                    command=command,
+                    kwargs=kwargs,
+                )
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(MODULE, "run", side_effect=run) as runner:
+            bundle = RUN_LOCAL_DECISION_WORKER(
+                repo_root=self.repo_root,
+                target=MODULE.parse_target("owner/repo#7"),
+                preflight=self.preflight,
+                prompt_path=prompt_path,
+                decision_path=decision_path,
+                result_path=result_path,
+                canonical_path=canonical_path,
+                run_id="run-1",
+                session_id="local-session",
+                requested_model=requested_model,
+                before_source=self.source_fingerprint,
+                before_github=self.github_fingerprint,
+            )
+        return bundle, runner, {
+            "prompt": prompt_path,
+            "decision": decision_path,
+            "result": result_path,
+            "canonical": canonical_path,
+        }
+
+    def write_valid_local_decision(self, *, decision_path, **_kwargs):
+        decision_path.write_text(
+            json.dumps(self.local_decision(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+    def test_local_worker_accepts_valid_sol_high_decisions(self):
+        bundle, runner, paths = self.run_actual_local_worker(
+            self.write_valid_local_decision
+        )
+
+        self.assertTrue(bundle["result"]["validation_complete"])
+        self.assertEqual("gpt-5.6-sol", bundle["result"]["requested_model"])
+        self.assertEqual("high", bundle["result"]["reasoning_effort"])
+        self.assertEqual([], bundle["remote"]["commits"])
+        self.assertTrue(paths["result"].is_file())
+        self.assertTrue(paths["canonical"].is_file())
+        command = runner.call_args.args[0]
+        self.assertEqual("sol", command[command.index("--model") + 1])
+        self.assertEqual(
+            "high",
+            command[command.index("--reasoning-effort") + 1],
+        )
+
+    def test_local_worker_rejects_missing_decision_report(self):
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "produced no decision report",
+        ) as failure:
+            self.run_actual_local_worker(None)
+
+        self.assertEqual(
+            self.source_fingerprint,
+            failure.exception.details["source_after"],
+        )
+
+    def test_local_worker_rejects_malformed_decision_report(self):
+        def write_malformed(*, decision_path, **_kwargs):
+            decision_path.write_text("{", encoding="utf-8", newline="\n")
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "valid JSON"):
+            self.run_actual_local_worker(write_malformed)
+
+    def test_local_worker_rejects_model_and_contract_identity_mismatch(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "requires gpt-5.6-sol"):
+            self.run_actual_local_worker(
+                self.write_valid_local_decision,
+                requested_model="gpt-6-astra",
+            )
+
+        def write_wrong_contract(*, decision_path, **_kwargs):
+            decision_path.write_text(
+                json.dumps(
+                    self.local_decision(contract_id="0" * 64),
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "contract"):
+            self.run_actual_local_worker(write_wrong_contract)
+
+    def test_local_worker_rejects_unexpected_source_ref_mutation(self):
+        mutated = copy.deepcopy(self.source_fingerprint)
+        mutated["refs"]["refs/tags/unexpected"] = "f" * 40
+        mutated["refs_sha256"] = MODULE.sha256_text(
+            json.dumps(mutated["refs"], separators=(",", ":"), sort_keys=True)
+        )
+        MODULE.local_source_fingerprint.return_value = mutated
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "unexpected Git ref"):
+            self.run_actual_local_worker(None)
+
+    def test_local_worker_rejects_github_mutation_before_reading_decisions(self):
+        mutated = {**self.github_fingerprint, "reviews_sha256": "f" * 64}
+        MODULE.github_decision_fingerprint.return_value = mutated
+
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "changed GitHub state",
+        ) as failure:
+            self.run_actual_local_worker(self.write_valid_local_decision)
+
+        self.assertEqual(mutated, failure.exception.details["github_after"])
+
+    def test_retained_local_decision_requires_complete_pinned_artifacts(self):
+        bundle, _runner, paths = self.run_actual_local_worker(
+            self.write_valid_local_decision
+        )
+        retained = MODULE.validate_retained_local_decision(
+            repo_root=self.repo_root,
+            target=MODULE.parse_target("owner/repo#7"),
+            preflight=self.preflight,
+            prompt_path=paths["prompt"],
+            decision_path=paths["decision"],
+            result_path=paths["result"],
+            canonical_path=paths["canonical"],
+            requested_model="gpt-5.6-sol",
+        )
+        self.assertEqual(bundle["report"], retained["report"])
+
+        result = json.loads(paths["result"].read_text(encoding="utf-8"))
+        result["validation_complete"] = False
+        paths["result"].write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "mismatched model, policy, or identity",
+        ):
+            MODULE.validate_retained_local_decision(
+                repo_root=self.repo_root,
+                target=MODULE.parse_target("owner/repo#7"),
+                preflight=self.preflight,
+                prompt_path=paths["prompt"],
+                decision_path=paths["decision"],
+                result_path=paths["result"],
+                canonical_path=paths["canonical"],
+                requested_model="gpt-5.6-sol",
+            )
+
     def test_agent_definition_is_thin_and_version_is_bumped(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-apply-report-worker@3", instructions)
-        self.assertIn("Never use Cloud Sandboxes", instructions)
-        self.assertIn("task_id_status=not_created", instructions)
+        self.assertIn(MODULE.LOCAL_DECISION_POLICY, instructions)
+        self.assertIn("--model sol --reasoning-effort high", instructions)
+        self.assertIn("Never use hosted GitHub Agent Tasks", instructions)
+        self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.38")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.39")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -1309,8 +1645,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             iteration_allowance=1,
             prior_history=[],
         )
-        self.assertIn("human-readable UTF-8 Markdown report", prompt)
-        self.assertIn("worker prompt version 6", prompt)
+        self.assertIn("decision object atomically as UTF-8 JSON", prompt)
+        self.assertIn("local worker prompt version 7", prompt)
         self.assertIn("opaque coordinator-generated values", prompt)
         self.assertIn("mechanically joins each decision", prompt)
         self.assertIn("negative ID is intentional", prompt)
@@ -1329,8 +1665,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             prompt,
         )
         self.assertIn("untrusted data", prompt)
-        self.assertIn("local-execution fallback", prompt)
-        self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
+        self.assertIn("create an Agent Task", prompt)
+        self.assertIn("`{{LOCAL_DECISION_PATH}}`", prompt)
         self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
 
@@ -2729,8 +3065,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         state_path = self.directory / "cleanup-state.json"
         prompt = self.directory / "prompt.txt"
         result = self.directory / "result.json"
+        decision = self.directory / "decision.json"
+        canonical = self.directory / "canonical.json"
         prompt.write_text("prompt", encoding="utf-8")
         result.write_text("result", encoding="utf-8")
+        decision.write_text("decision", encoding="utf-8")
+        canonical.write_text("canonical", encoding="utf-8")
         MODULE.save_state(
             state_path,
             {
@@ -2741,6 +3081,15 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "agent_task": {
                     "prompt_file": str(prompt),
                     "result_file": str(result),
+                    "decision_file": str(decision),
+                    "canonical_report_file": str(canonical),
+                    "preserved_artifacts": [
+                        {
+                            "path": str(decision),
+                            "sha256": MODULE.sha256_file(decision),
+                            "size": decision.stat().st_size,
+                        }
+                    ],
                     "recovery_files": [str(prompt), str(result)],
                 },
             },
@@ -2750,6 +3099,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertFalse(state_path.exists())
         self.assertFalse(prompt.exists())
         self.assertFalse(result.exists())
+        self.assertFalse(decision.exists())
+        self.assertFalse(canonical.exists())
 
     def test_prepared_artifact_manifest_rejects_byte_drift(self):
         artifact = self.directory / "prepared-result.json"
@@ -2886,6 +3237,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "wait_for_stable_review_preflight",
                 return_value=preflight,
             ),
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value=preflight["identity"],
+            ),
             mock.patch.object(MODULE, "remote_head") as remote_head,
             mock.patch.object(MODULE, "request_copilot") as request,
             mock.patch.object(MODULE, "discover_cloud_task") as discover,
@@ -2918,6 +3274,55 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             request_review_only=False,
             preserve_artifacts=False,
         )
+
+    def invoke_local_failure(
+        self,
+        state_path,
+        message,
+        *,
+        run_id="run-1",
+        target="owner/repo#7",
+    ):
+        self.local_worker.side_effect = MODULE.WorkflowError(
+            message,
+            details={
+                "source_before": self.source_fingerprint,
+                "source_after": self.source_fingerprint,
+                "github_before": self.github_fingerprint,
+                "github_after": self.github_fingerprint,
+            },
+        )
+        arguments = self.arguments(state_path)
+        arguments.target = target
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target(target),
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_stable_review_preflight",
+                return_value=self.preflight,
+            ),
+            mock.patch.object(
+                MODULE, "local_identity", return_value=self.preflight["identity"]
+            ),
+            mock.patch.object(
+                MODULE,
+                "require_live_comments",
+                return_value=self.preflight["comments"],
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE.secrets, "token_hex", return_value=run_id),
+            mock.patch.object(MODULE.uuid, "uuid4", return_value="local-session"),
+            self.assertRaisesRegex(MODULE.WorkflowError, re.escape(message)),
+        ):
+            MODULE.command_agent_task(arguments)
+        discover.assert_not_called()
+        return MODULE.load_state(state_path)
 
     def test_no_op_task_still_replies_resolves_and_requests_review(self):
         state_path = self.directory / "state.json"
@@ -2979,8 +3384,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         ):
             MODULE.command_agent_task(self.arguments(state_path))
 
-        self.assertIn("--apply-with-report", commands[0])
-        self.assertNotIn("custom_agent", commands[0])
+        self.assertEqual([], commands)
         replies.assert_called_once()
         resolve.assert_called_once()
         continuation.assert_called_once()
@@ -2991,55 +3395,31 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertTrue(state["agent_task"]["artifacts_removed"])
         self.assertEqual(
             state["coordinator"]["processed_snapshots"][0]["task_id"],
-            "task-1",
+            state["agent_task"]["local_session_id"],
+        )
+        worker_command = state["agent_task"]["worker_command"]
+        self.assertEqual(
+            "sol",
+            worker_command[worker_command.index("--model") + 1],
+        )
+        self.assertEqual(
+            "high",
+            worker_command[worker_command.index("--reasoning-effort") + 1],
         )
 
     def test_new_terminal_report_failure_records_fresh_retry(self):
         state_path = self.directory / "terminal-report-state.json"
-        helper = self.directory / "cloud_task.py"
-        helper.write_text("# helper\n", encoding="utf-8")
-        report = "Report\n\n```json\n{\"comments\": []}\n```\n"
-        result = self.result()
-        result["report"]["sha256"] = MODULE.sha256_text(report)
-
-        def run(command, **_kwargs):
-            output = Path(command[command.index("--result-file") + 1])
-            output.write_text(json.dumps(result), encoding="utf-8")
-            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
-
-        with (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
-            mock.patch.object(
-                MODULE,
-                "resolve_target",
-                return_value=MODULE.parse_target("owner/repo#7"),
-            ),
-            mock.patch.object(
-                MODULE,
-                "wait_for_stable_review_preflight",
-                return_value=self.preflight,
-            ),
-            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
-            mock.patch.object(MODULE, "run", side_effect=run),
-            mock.patch.object(
-                MODULE, "local_identity", return_value=self.preflight["identity"]
-            ),
-            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
-            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
-            mock.patch.object(
-                MODULE, "require_live_comments", return_value=[self.comment]
-            ),
-            self.assertRaisesRegex(
-                MODULE.WorkflowError, "report has stale identity"
-            ),
-        ):
-            MODULE.command_agent_task(self.arguments(state_path))
-
-        failed = MODULE.load_state(state_path)["agent_task"]
+        failed = self.invoke_local_failure(
+            state_path,
+            "local decision report has stale identity",
+        )["agent_task"]
         self.assertEqual("failed", failed["status"])
         self.assertEqual("terminal_unusable", failed["task_id_status"])
-        self.assertEqual("task-1", failed["task_id"])
+        self.assertEqual("local-session", failed["task_id"])
+        self.assertEqual(
+            "local decision report has stale identity",
+            failed["error"],
+        )
         self.assertNotIn("recovery_command", failed)
         self.assertNotIn("--resume", failed["retry_command"])
 
@@ -3166,7 +3546,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         ):
             MODULE.command_agent_task(prepare_args)
 
-        self.assertEqual(1, helper_launches)
+        self.assertEqual(0, helper_launches)
         apply_import.assert_not_called()
         replies.assert_not_called()
         resolve.assert_not_called()
@@ -3177,7 +3557,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual("validated_pending_import", prepared["agent_task"]["status"])
         self.assertTrue(prepared["agent_task"]["artifacts_preserved"])
         self.assertEqual(
-            [{"commit": self.fix, "paths": ["src/app.py"]}],
+            [],
             prepared["agent_task"]["preparation"]["paths_by_commit"],
         )
         self.assertEqual([17], prepared["agent_task"]["preparation"]["comment_ids"])
@@ -3225,7 +3605,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         apply_args.apply_prepared = True
         apply_args.preserve_artifacts = True
         apply_args.request_review_only = True
-        apply_import = mock.Mock(return_value=True)
+        apply_import = mock.Mock(return_value=False)
         replies = mock.Mock(return_value={17: 71})
         resolve = mock.Mock()
         request = mock.Mock(return_value={"status": "requested"})
@@ -3289,7 +3669,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
         discover.assert_not_called()
         apply_import.assert_called_once()
-        self.assertEqual(1, pushes)
+        self.assertEqual(0, pushes)
         replies.assert_called_once()
         resolve.assert_called_once()
         request.assert_called_once()
@@ -3343,7 +3723,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 return self.preflight["pr"]
             if metadata_reads == 2:
                 raise MODULE.WorkflowError("PR metadata lookup interrupted")
-            return {**self.preflight["pr"], "head_sha": self.fix}
+            return {**self.preflight["pr"], "head_sha": self.head}
 
         def live_comments(_preflight, *, allow_resolved=False):
             comment_checks.append(allow_resolved)
@@ -3405,7 +3785,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         failed = MODULE.load_state(state_path)
         self.assertEqual(
             failed["agent_task"]["confirmed_remote_head_sha"],
-            self.fix,
+            self.head,
         )
         self.assertIsNone(failed["agent_task"].get("published_head_sha"))
         self.assertEqual(failed["agent_task"]["status"], "failed_after_publication")
@@ -3423,12 +3803,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 stack.enter_context(patcher)
             MODULE.command_agent_task(self.arguments(state_path, resume=True))
 
-        self.assertEqual(helper_launches, 1)
-        self.assertEqual(pushes, 1)
+        self.assertEqual(helper_launches, 0)
+        self.assertEqual(pushes, 0)
         self.assertIn(True, comment_checks)
         completed = MODULE.load_state(state_path)
         self.assertEqual(completed["agent_task"]["status"], "completed")
-        self.assertEqual(completed["pr"]["head_sha"], self.fix)
+        self.assertEqual(completed["pr"]["head_sha"], self.head)
         self.assertNotIn("error", completed["agent_task"])
 
     def test_post_publish_resume_accepts_line_shift_and_preserves_artifacts(self):
@@ -3554,18 +3934,18 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         failed = MODULE.load_state(state_path)
         failed_task = failed["agent_task"]
         self.assertEqual("failed_after_publication", failed_task["status"])
-        self.assertEqual(self.fix, failed_task["published_head_sha"])
+        self.assertEqual(self.head, failed_task["published_head_sha"])
         self.assertTrue(failed_task["artifacts_preserved"])
         self.assertFalse(failed_task["artifacts_removed"])
-        self.assertEqual(2, len(failed_task["preserved_artifacts"]))
+        self.assertEqual(4, len(failed_task["preserved_artifacts"]))
 
         with ExitStack() as stack:
             for patcher in common_patches:
                 stack.enter_context(patcher)
             MODULE.command_agent_task(arguments(resume=True))
 
-        self.assertEqual(1, helper_launches)
-        self.assertEqual(1, pushes)
+        self.assertEqual(0, helper_launches)
+        self.assertEqual(0, pushes)
         replies.assert_called_once()
         resolve.assert_called_once()
         request.assert_called_once()
@@ -3573,118 +3953,32 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual("completed", completed["agent_task"]["status"])
         self.assertTrue(completed["agent_task"]["artifacts_preserved"])
         self.assertFalse(completed["agent_task"]["artifacts_removed"])
-        self.assertEqual(self.fix, completed["pr"]["head_sha"])
+        self.assertEqual(self.head, completed["pr"]["head_sha"])
 
     def test_malformed_report_does_not_import_verified_commits(self):
         state_path = self.directory / "malformed-report-state.json"
-        helper = self.directory / "cloud_task.py"
-        helper.write_text("# helper\n", encoding="utf-8")
-        report_value = json.loads(self.report([self.fix]))
-        report_value["request_id"] = "stale-request"
-        report = json.dumps(report_value)
-        result = self.result([self.fix])
-        result["report"]["sha256"] = MODULE.sha256_text(report)
-        commands = []
+        failed = self.invoke_local_failure(
+            state_path,
+            "local decision report is malformed",
+        )["agent_task"]
 
-        def run(command, **_kwargs):
-            commands.append(command)
-            output = Path(command[command.index("--result-file") + 1])
-            output.write_text(json.dumps(result), encoding="utf-8")
-            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+        self.assertEqual("failed", failed["status"])
+        self.assertEqual("terminal_unusable", failed["task_id_status"])
+        self.assertEqual(1, len(failed["recovery_files"]))
+        self.assertTrue(failed["recovery_files"][0].endswith("local-decision-prompt.txt"))
+        self.assertEqual(self.source_fingerprint, failed["source_before"])
+        self.assertEqual(self.source_fingerprint, failed["source_after"])
 
-        with (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
-            mock.patch.object(
-                MODULE,
-                "resolve_target",
-                return_value=MODULE.parse_target("owner/repo#7"),
-            ),
-            mock.patch.object(
-                MODULE, "agent_task_preflight", return_value=self.preflight
-            ),
-            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
-            mock.patch.object(MODULE, "run", side_effect=run),
-            mock.patch.object(
-                MODULE, "local_identity", return_value=self.preflight["identity"]
-            ),
-            mock.patch.object(
-                MODULE,
-                "validate_generated_history",
-                return_value={self.fix: ["src/app.py"]},
-            ),
-            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
-            mock.patch.object(
-                MODULE, "require_live_comments", return_value=[self.comment]
-            ),
-            mock.patch.object(MODULE.secrets, "token_hex", return_value="run-1"),
-            self.assertRaisesRegex(MODULE.WorkflowError, "malformed or has stale"),
-        ):
-            MODULE.command_agent_task(self.arguments(state_path))
-
-        self.assertEqual(1, len(commands))
-        self.assertEqual(self.preflight["identity"]["head"], self.head)
-
-    def test_task_error_resumes_the_same_task_without_a_replacement(self):
+    def test_failed_local_task_cannot_resume_or_fall_back_to_hosted(self):
         state_path = self.directory / "resume-state.json"
-        helper = self.directory / "cloud_task.py"
-        helper.write_text("# helper\n", encoding="utf-8")
-        failure = self.result()
-        failure["status"] = "interrupted"
-        failure["task"]["state"] = "in_progress"
-        failure["application"] = {
-            "status": "not_applied",
-            "final_local_head": self.head,
-        }
-        failure["report"]["commit"] = None
-        failure["report"]["sha256"] = None
-        failure["attestation"]["structural_complete"] = False
-        failure["error"] = {"code": "interrupted", "message": "Worker interrupted."}
-        commands = []
-
-        def fail_run(command, **kwargs):
-            commands.append(command)
-            output = Path(command[command.index("--result-file") + 1])
-            output.write_text(json.dumps(failure), encoding="utf-8")
-            return MODULE.subprocess.CompletedProcess(command, 1, "", "interrupted")
-
-        common = (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
-            mock.patch.object(
-                MODULE,
-                "resolve_target",
-                return_value=MODULE.parse_target("owner/repo#7"),
-            ),
-            mock.patch.object(
-                MODULE, "agent_task_preflight", return_value=self.preflight
-            ),
-            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
-            mock.patch.object(
-                MODULE, "local_identity", return_value=self.preflight["identity"]
-            ),
-            mock.patch.object(
-                MODULE, "require_live_comments", return_value=[self.comment]
-            ),
-            mock.patch.object(MODULE.secrets, "token_hex", return_value="run-1"),
+        failed_state = self.invoke_local_failure(
+            state_path,
+            "local Copilot decision session was interrupted",
         )
-        with ExitStack() as stack:
-            for patcher in common:
-                stack.enter_context(patcher)
-            stack.enter_context(mock.patch.object(MODULE, "run", side_effect=fail_run))
-            stack.enter_context(
-                self.assertRaisesRegex(MODULE.WorkflowError, "interrupted")
-            )
-            MODULE.command_agent_task(self.arguments(state_path))
-
-        failed_state = MODULE.load_state(state_path)
-        self.assertEqual(failed_state["agent_task"]["status"], "failed")
-        self.assertEqual(failed_state["agent_task"]["task"]["id"], "task-1")
-        self.assertTrue(
-            all(
-                Path(path).is_file()
-                for path in failed_state["agent_task"]["recovery_files"]
-            )
+        self.assertEqual("failed", failed_state["agent_task"]["status"])
+        self.assertEqual(
+            "terminal_unusable",
+            failed_state["agent_task"]["task_id_status"],
         )
 
         with (
@@ -3695,23 +3989,15 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "resolve_target",
                 return_value=MODULE.parse_target("owner/repo#7"),
             ),
-            mock.patch.object(
-                MODULE, "local_identity", return_value=self.preflight["identity"]
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "no longer has its local result artifact",
             ),
-            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
-            mock.patch.object(MODULE, "run", side_effect=fail_run) as resumed_run,
-            self.assertRaisesRegex(MODULE.WorkflowError, "Worker interrupted"),
         ):
             MODULE.command_agent_task(self.arguments(state_path, resume=True))
 
-        self.assertEqual(1, resumed_run.call_count)
-        resumed_command = resumed_run.call_args.args[0]
-        self.assertIn("--resume-apply-with-report", resumed_command)
-        self.assertEqual("task-1", resumed_command[resumed_command.index("--task-id") + 1])
-        self.assertEqual(
-            "request-1", resumed_command[resumed_command.index("--request-id") + 1]
-        )
-        self.assertNotIn("--prompt-file", resumed_command)
+        discover.assert_not_called()
 
     def test_exact_cca_disabled_result_is_a_trusted_task_creation_failure(self):
         result = MODULE.load_agent_task_result(CCA_DISABLED_RESULT)
@@ -4006,59 +4292,18 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     def test_new_completed_no_artifact_failure_records_fresh_retry(self):
         state_path = self.directory / "no-artifact-state.json"
-        helper = self.directory / "cloud_task.py"
-        helper.write_text("# helper\n", encoding="utf-8")
-        result = MODULE.load_agent_task_result(NO_ARTIFACT_383_RESULT)
-        preflight = self.preflight_for_result(result)
-        task_base = preflight["pr"]["base_sha"]
-        preflight["pr"]["base_sha"] = "f" * 40
-
-        def fail_run(command, **_kwargs):
-            output = Path(command[command.index("--result-file") + 1])
-            output.write_text(json.dumps(result), encoding="utf-8")
-            return MODULE.subprocess.CompletedProcess(command, 1, "", "")
-
-        arguments = self.arguments(state_path)
-        arguments.target = "open-telemetry/shared-workflows#383"
-        ancestry = mock.Mock(return_value=True)
-        with (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
-            mock.patch.object(
-                MODULE,
-                "resolve_target",
-                return_value=MODULE.parse_target(arguments.target),
-            ),
-            mock.patch.object(
-                MODULE,
-                "wait_for_stable_review_preflight",
-                return_value=preflight,
-            ),
-            mock.patch.object(
-                MODULE,
-                "require_live_comments",
-                return_value=preflight["comments"],
-            ),
-            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
-            mock.patch.object(MODULE, "base_revision_is_ancestor", ancestry),
-            mock.patch.object(MODULE, "run", side_effect=fail_run),
-            self.assertRaisesRegex(
-                MODULE.WorkflowError,
-                "did not contain a worker validation commit",
-            ),
-        ):
-            MODULE.command_agent_task(arguments)
-
-        failed = MODULE.load_state(state_path)["agent_task"]
+        failed = self.invoke_local_failure(
+            state_path,
+            "local decision worker did not create the decision report",
+        )["agent_task"]
         self.assertEqual("terminal_unusable", failed["task_id_status"])
-        self.assertEqual(result["task"]["id"], failed["task_id"])
+        self.assertEqual("local-session", failed["task_id"])
+        self.assertEqual(
+            "local decision worker did not create the decision report",
+            failed["error"],
+        )
         self.assertNotIn("recovery_command", failed)
         self.assertNotIn("--resume", failed["retry_command"])
-        ancestry.assert_called_once_with(
-            self.repo_root,
-            task_base,
-            "f" * 40,
-        )
 
     def test_retained_no_artifact_owner_is_archived_before_one_replacement(self):
         state_path = self.directory / "retained-no-artifact-state.json"
@@ -4116,6 +4361,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ),
             mock.patch.object(
                 MODULE,
+                "local_identity",
+                return_value=preflight["identity"],
+            ),
+            mock.patch.object(
+                MODULE,
                 "require_live_comments",
                 return_value=preflight["comments"],
             ),
@@ -4127,8 +4377,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         with ExitStack() as stack:
             for patcher in patches:
                 stack.enter_context(patcher)
-            with self.assertRaisesRegex(RuntimeError, "stop after dispatch"):
-                MODULE.command_agent_task(arguments)
+            MODULE.command_agent_task(arguments)
 
         restarted = MODULE.load_state(state_path)
         self.assertEqual(1, len(restarted["managed_task_history"]))
@@ -4137,7 +4386,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("recovery_command", previous)
         self.assertNotIn("--resume", previous["retry_command"])
         self.assertEqual("new-owner", restarted["agent_task"]["run_id"])
-        self.assertEqual(1, len(commands))
+        self.assertEqual([], commands)
+        self.assertEqual("local", restarted["agent_task"]["producer"])
+        self.assertEqual(1, self.local_worker.call_count)
         ancestry.assert_called_once_with(
             self.repo_root,
             result["pull_request"]["base_sha"],
@@ -4149,7 +4400,114 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 stack.enter_context(patcher)
             with self.assertRaisesRegex(MODULE.WorkflowError, "unfinished Agent Task"):
                 MODULE.command_agent_task(arguments)
-        self.assertEqual(1, len(commands))
+        self.assertEqual([], commands)
+
+    def test_exact_20074_and_20050_terminal_states_migrate_once_to_local(self):
+        cases = (
+            ("20074", NO_ARTIFACT_20074_RESULT),
+            ("20050", LEGACY_VALIDATION_20050_RESULT),
+        )
+        for label, fixture in cases:
+            with self.subTest(pr=label):
+                self.local_worker.reset_mock()
+                result = MODULE.load_agent_task_result(fixture)
+                preflight = self.preflight_for_result(result)
+                repository = result["repository"]["name_with_owner"]
+                target_text = f"{repository}#{result['pull_request']['number']}"
+                state_path = self.directory / f"retained-{label}-state.json"
+                prompt_path = self.directory / f"retained-{label}-prompt.txt"
+                prompt_path.write_text(
+                    "immutable retained prompt\n",
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                old_owner = f"retained-{label}-owner"
+                MODULE.save_state(
+                    state_path,
+                    {
+                        "version": MODULE.STATE_VERSION,
+                        "created_at": MODULE.utc_now(),
+                        "iterations": 0,
+                        "history": [],
+                        "pr": preflight["pr"],
+                        "agent_task": {
+                            "run_id": old_owner,
+                            "status": "failed",
+                            "model": "gpt-5.6-sol",
+                            "remaining_iterations": 5,
+                            "resume_attempts": 1,
+                            "preflight": preflight,
+                            "prompt_file": str(prompt_path),
+                            "result_file": str(fixture),
+                            "recovery_command": "must-not-survive",
+                        },
+                    },
+                )
+                arguments = self.arguments(state_path)
+                arguments.target = target_text
+                arguments.prepare_only = True
+                arguments.preserve_artifacts = True
+                patches = (
+                    mock.patch.object(MODULE, "require_tools"),
+                    mock.patch.object(
+                        MODULE,
+                        "resolve_repo_root",
+                        return_value=self.repo_root,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "resolve_target",
+                        return_value=MODULE.parse_target(target_text),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "wait_for_stable_review_preflight",
+                        return_value=preflight,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "local_identity",
+                        return_value=preflight["identity"],
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "require_live_comments",
+                        return_value=preflight["comments"],
+                    ),
+                    mock.patch.object(
+                        MODULE.secrets,
+                        "token_hex",
+                        return_value=f"local-{label}-owner",
+                    ),
+                )
+                with ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    MODULE.command_agent_task(arguments)
+
+                restarted = MODULE.load_state(state_path)
+                self.assertEqual(1, len(restarted["managed_task_history"]))
+                previous = restarted["managed_task_history"][0]
+                self.assertEqual(old_owner, previous["run_id"])
+                self.assertEqual("terminal_unusable", previous["task_id_status"])
+                self.assertNotIn("recovery_command", previous)
+                self.assertNotIn("--resume", previous["retry_command"])
+                self.assertEqual(
+                    f"local-{label}-owner",
+                    restarted["agent_task"]["run_id"],
+                )
+                self.assertEqual("local", restarted["agent_task"]["producer"])
+                self.assertEqual(1, self.local_worker.call_count)
+
+                with ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    with self.assertRaisesRegex(
+                        MODULE.WorkflowError,
+                        "unfinished Agent Task",
+                    ):
+                        MODULE.command_agent_task(arguments)
+                self.assertEqual(1, self.local_worker.call_count)
 
     def test_exact_v1_missing_trailer_replacement_is_fresh_and_deduplicated(self):
         state_path = self.directory / "missing-trailer-state.json"
@@ -4195,6 +4553,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         args = self.arguments(state_path)
         args.target = "open-telemetry/shared-workflows#377"
+        args.prepare_only = True
+        args.preserve_artifacts = True
         commands = []
 
         def stop_after_dispatch(command, **_kwargs):
@@ -4216,6 +4576,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ),
             mock.patch.object(
                 MODULE,
+                "local_identity",
+                return_value=preflight["identity"],
+            ),
+            mock.patch.object(
+                MODULE,
                 "require_live_comments",
                 return_value=preflight["comments"],
             ),
@@ -4226,8 +4591,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         with ExitStack() as stack:
             for patcher in common:
                 stack.enter_context(patcher)
-            with self.assertRaisesRegex(RuntimeError, "stop after dispatch"):
-                MODULE.command_agent_task(args)
+            MODULE.command_agent_task(args)
 
         restarted = MODULE.load_state(state_path)
         self.assertEqual(1, len(restarted["managed_task_history"]))
@@ -4236,18 +4600,16 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("recovery_command", previous)
         self.assertNotIn("--resume", previous["retry_command"])
         self.assertEqual("new-owner", restarted["agent_task"]["run_id"])
-        self.assertIn(
-            "marketplace-agent-apply-report-worker@3",
-            commands[0],
-        )
-        self.assertNotIn("--resume-apply-with-report", commands[0])
+        self.assertEqual([], commands)
+        self.assertEqual("local", restarted["agent_task"]["producer"])
+        self.assertEqual(1, self.local_worker.call_count)
 
         with ExitStack() as stack:
             for patcher in common:
                 stack.enter_context(patcher)
             with self.assertRaisesRegex(MODULE.WorkflowError, "unfinished Agent Task"):
                 MODULE.command_agent_task(args)
-        self.assertEqual(1, len(commands))
+        self.assertEqual([], commands)
 
     def test_exact_383_terminal_report_replacement_is_fresh_and_deduplicated(self):
         state_path = self.directory / "collapsed-suppressed-state.json"
@@ -4399,8 +4761,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         with ExitStack() as stack:
             for patcher in common:
                 stack.enter_context(patcher)
-            with self.assertRaisesRegex(RuntimeError, "stop after dispatch"):
-                MODULE.command_agent_task(arguments)
+            MODULE.command_agent_task(arguments)
 
         restarted = MODULE.load_state(state_path)
         self.assertEqual(1, len(restarted["managed_task_history"]))
@@ -4418,16 +4779,16 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("--prepare-only", previous["retry_command"])
         self.assertIn("--preserve-artifacts", previous["retry_command"])
         self.assertEqual("new-owner", restarted["agent_task"]["run_id"])
-        self.assertEqual(1, len(commands))
-        self.assertIn("marketplace-agent-apply-report-worker@3", commands[0])
-        self.assertNotIn("--resume-apply-with-report", commands[0])
+        self.assertEqual([], commands)
+        self.assertEqual("local", restarted["agent_task"]["producer"])
+        self.assertEqual(1, self.local_worker.call_count)
 
         with ExitStack() as stack:
             for patcher in common:
                 stack.enter_context(patcher)
             with self.assertRaisesRegex(MODULE.WorkflowError, "unfinished Agent Task"):
                 MODULE.command_agent_task(arguments)
-        self.assertEqual(1, len(commands))
+        self.assertEqual([], commands)
 
     def test_completed_owner_is_archived_before_a_new_findings_task(self):
         state_path = self.directory / "completed-owner-state.json"
@@ -4491,82 +4852,30 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     def test_task_creation_failure_records_fresh_retry_and_replaces_legacy_state(self):
         state_path = self.directory / "cca-disabled-state.json"
-        helper = self.directory / "cloud_task.py"
-        helper.write_text("# helper\n", encoding="utf-8")
-        failure = self.task_creation_failure()
-
-        def fail_run(command, **_kwargs):
-            output = Path(command[command.index("--result-file") + 1])
-            output.write_text(json.dumps(failure), encoding="utf-8")
-            return MODULE.subprocess.CompletedProcess(command, 2, "", "HTTP 409")
-
-        common = (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
-            mock.patch.object(
-                MODULE,
-                "resolve_target",
-                return_value=MODULE.parse_target("owner/repo#7"),
-            ),
-            mock.patch.object(
-                MODULE, "agent_task_preflight", return_value=self.preflight
-            ),
-            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
-            mock.patch.object(
-                MODULE, "require_live_comments", return_value=[self.comment]
-            ),
+        failed = self.invoke_local_failure(
+            state_path,
+            "local Copilot decision process exited 2",
+            run_id="run-1",
         )
-        with ExitStack() as stack:
-            for patcher in common:
-                stack.enter_context(patcher)
-            stack.enter_context(mock.patch.object(MODULE, "run", side_effect=fail_run))
-            stack.enter_context(
-                mock.patch.object(MODULE.secrets, "token_hex", return_value="run-1")
-            )
-            stack.enter_context(
-                self.assertRaisesRegex(MODULE.WorkflowError, "api_failure")
-            )
-            MODULE.command_agent_task(self.arguments(state_path))
-
-        failed = MODULE.load_state(state_path)
         task = failed["agent_task"]
         self.assertEqual("failed", task["status"])
-        self.assertEqual("not_created", task["task_id_status"])
-        self.assertEqual("api_failure", task["error"]["code"])
+        self.assertEqual("terminal_unusable", task["task_id_status"])
+        self.assertEqual("local Copilot decision process exited 2", task["error"])
         self.assertNotIn("recovery_command", task)
         self.assertNotIn("--resume", task["retry_command"])
 
-        task.pop("task_id_status")
-        task.pop("retry_command")
-        task["error"] = "Agent Task result has an unsupported schema or fields"
-        task["recovery_command"] = MODULE.agent_task_recovery_command(
-            target=self.preflight["pr"]["pr_url"],
-            repo_root=self.repo_root,
-            state_path=state_path,
-            model="sol",
+        retried = self.invoke_local_failure(
+            state_path,
+            "local Copilot decision process exited 2",
+            run_id="run-2",
         )
-        MODULE.save_state(state_path, failed)
-
-        with ExitStack() as stack:
-            for patcher in common:
-                stack.enter_context(patcher)
-            run = stack.enter_context(
-                mock.patch.object(MODULE, "run", side_effect=fail_run)
-            )
-            stack.enter_context(
-                mock.patch.object(MODULE.secrets, "token_hex", return_value="run-2")
-            )
-            stack.enter_context(
-                self.assertRaisesRegex(MODULE.WorkflowError, "api_failure")
-            )
-            MODULE.command_agent_task(self.arguments(state_path))
-
-        self.assertEqual(1, run.call_count)
-        retried = MODULE.load_state(state_path)
         self.assertEqual(
             "run-1", retried["managed_task_history"][0]["run_id"]
         )
-        self.assertEqual("not_created", retried["agent_task"]["task_id_status"])
+        self.assertEqual(
+            "terminal_unusable",
+            retried["agent_task"]["task_id_status"],
+        )
         self.assertEqual("run-2", retried["agent_task"]["run_id"])
 
     def test_terminal_validation_failure_allows_one_explicit_replacement(self):
@@ -4575,11 +4884,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         helper.write_text("# helper\n", encoding="utf-8")
         failure = self.terminal_validation_failure()
 
-        def fail_run(command, **_kwargs):
-            output = Path(command[command.index("--result-file") + 1])
-            output.write_text(json.dumps(failure), encoding="utf-8")
-            return MODULE.subprocess.CompletedProcess(command, 2, "", "invalid receipt")
-
         common = (
             mock.patch.object(MODULE, "require_tools"),
             mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
@@ -4596,13 +4900,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 MODULE, "require_live_comments", return_value=[self.comment]
             ),
         )
+        self.local_worker.side_effect = MODULE.WorkflowError(
+            "validation_incomplete"
+        )
         for run_id in ("run-1", "run-2"):
             with ExitStack() as stack:
                 for patcher in common:
                     stack.enter_context(patcher)
-                run = stack.enter_context(
-                    mock.patch.object(MODULE, "run", side_effect=fail_run)
-                )
                 stack.enter_context(
                     mock.patch.object(
                         MODULE.secrets, "token_hex", return_value=run_id
@@ -4614,13 +4918,15 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     )
                 )
                 MODULE.command_agent_task(self.arguments(state_path))
-            self.assertEqual(1, run.call_count)
 
         retried = MODULE.load_state(state_path)
         self.assertEqual("terminal_unusable", retried["agent_task"]["task_id_status"])
         self.assertNotIn("recovery_command", retried["agent_task"])
         self.assertNotIn("--resume", retried["agent_task"]["retry_command"])
-        self.assertEqual("task-1", retried["managed_task_history"][0]["task_id"])
+        self.assertEqual(
+            retried["managed_task_history"][0]["local_session_id"],
+            retried["managed_task_history"][0]["task_id"],
+        )
         self.assertEqual("run-2", retried["agent_task"]["run_id"])
 
     def test_fresh_review_comments_start_the_next_managed_iteration(self):

@@ -1,6 +1,6 @@
 ---
 name: Copilot Review Loop
-description: "Explicit invocation only: never select automatically; address Copilot review comments through managed GitHub Agent Tasks."
+description: "Explicit invocation only: never select automatically; address Copilot review comments through a validated local Sol decision session."
 argument-hint: "PR URL or owner/repo#number; omit only from a worktree attached to the PR's branch"
 tools: [execute, rename_session]
 user-invocable: true
@@ -13,9 +13,9 @@ A bare pull request URL or `owner/repo#number` asks you to run the complete Copi
 
 ## Model gate
 
-The primary session must use exactly `gpt-5.6-sol`. When the runtime exposes reasoning effort, require exactly `high`. Stop before changing the pull request when the model guarantee differs.
+The custom-agent session must use exactly `gpt-5.6-sol`. When the runtime exposes reasoning effort, require exactly `high`. Stop before changing the pull request when the model guarantee differs.
 
-Every managed worker uses exactly `gpt-5.6-sol`. Always pass `--model sol`; any other Agent Task model must fail closed.
+The coordinator starts every local decision session with explicit `--model sol --reasoning-effort high`. Any other decision model or effort fails closed. Never use a hosted GitHub Agent Task or silently fall back to one.
 
 ## Required path
 
@@ -23,48 +23,49 @@ Every managed worker uses exactly `gpt-5.6-sol`. Always pass `--model sol`; any 
    - PowerShell: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; $helper = "$copilotHome/installed-plugins/trask-plugins/copilot-review-loop/scripts/copilot_review_loop.py"`
    - Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; helper="$copilot_home/installed-plugins/trask-plugins/copilot-review-loop/scripts/copilot_review_loop.py"`
    - POSIX: `helper="${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/copilot-review-loop/scripts/copilot_review_loop.py"`
-2. Run the local coordinator once with the active Python interpreter: `python "$helper" agent-task <target>`.
+2. Run the local coordinator once with the active Python interpreter: `python "$helper" agent-task <target> --model sol`.
    - Use `python3` on POSIX when needed.
    - Pass a supplied PR URL or `owner/repo#number` exactly. Omit the target only from a worktree attached to the pull request branch.
    - Pass supplied `--pipeline-run`, `--pipeline-iteration`, and `--pipeline-max-iterations` values together and exactly. Never mint a pipeline position.
-   - Pass `--model sol` explicitly.
 3. After the coordinator returns, ensure the session name is `Copilot Review Loop: <PR number> - <PR title>`. If the harness already supplied that name, do not call `rename_session`. Otherwise call it once when available. Accept a skipped or unavailable rename without retrying.
-4. Render the coordinator result, canonical PR URL, final head, outcome, fix commits, handled comment identities, replies, Agent Task URL, structural attestation, iteration count, watcher state, recovery details, and any `stage_outcome`.
+4. Render the coordinator result, canonical PR URL, final head, outcome, fix commits, handled finding identities, replies, local decision session ID, iteration count, watcher state, recovery details, and any `stage_outcome`.
 
-The coordinator is the only local entry point. Its process owns review requests, bounded polling with backoff and jitter, debounce, stable actionable snapshots, thread and comment deduplication, restart state, and every transition between hosted tasks. It discovers the separately installed `agent-tasks-runtime@trask-plugins` skill and verifies the runtime by pinned SHA-256 before execution. It dispatches `marketplace-agent-apply-report-worker@3` only after trusted control-plane preflight for the exact open pull request, head, base, and a stable set of new unresolved Copilot threads. Each fixing iteration delegates all repository analysis, edits, formatting, probes, builds, tests, and validation to one pinned managed GitHub Agent Task with an allowance of exactly one iteration. The worker emits its artifacts and exits. It never sleeps, polls, watches, waits for another review, or starts another iteration.
+The coordinator is the only workflow entry point. It owns review requests, bounded polling with backoff and jitter, debounce, stable actionable snapshots, restart state, publication, replies, thread resolution, and iteration transitions.
 
-The local coordinator treats report content as untrusted inert data and independently validates the task result, structural attestation, report digest, history, paths, commits, credentials, local state, and live GitHub identity. The runtime leaves the worktree at the pinned source head. Only after report validation does the coordinator fast-forward to the exact verified fix commit set, then publish with an exact lease on the frozen head. It revalidates the unresolved thread snapshot immediately before publication and again afterward; only then may it reply to and resolve the exact bot-authored threads and request the next Copilot review. It never replies to a real user.
+For each fixing iteration, the coordinator freezes the exact repository, pull request, head, base, title, body, comments, suppressed findings, threads, reviews, and advertised refs. It derives one opaque SHA-256 finding key from each complete pinned finding identity. Its local `marketplace-local-review-decision-worker@1` session receives the frozen contract and writes only one disposition, reason, reply, commit, and changed-path decision for every exact key. The coordinator mechanically restores the full identities and generates the canonical report itself.
 
-The worker report contains decision records keyed by coordinator-generated SHA-256 values. The coordinator derives those keys from complete pinned finding identities, requires exactly one decision for every key, and mechanically restores the identities after validation. A worker never has to reproduce comment, review, thread, path, line, URL, source, or body-digest fields. Suppressed review-body findings retain their synthetic negative IDs and null thread IDs.
+The local worker runs in the source checkout under the user's accepted local execution boundary. Its prompt and raw decision files live outside the repository. Before and after execution, the coordinator records the branch, HEAD, clean status, all Git refs, pull request metadata, threads, reviews, and remote head and base refs. It permits only clean, linear, single-parent commits on the current branch, with every commit and changed path accounted for by a `fixed` decision. It rejects merge commits, unrelated commits, unaccounted paths, other ref changes, report artifacts, dirty-tree changes, prompt drift, GitHub mutation, or any frozen identity drift.
 
-When a completed managed task has an immutable terminal result that cannot gain required validation or report artifacts on resume, the coordinator marks that exact owner `terminal_unusable`, removes its resume command, preserves its artifacts, and offers only a fresh non-resume retry. A replacement preparation archives the terminal owner before one new dispatch, and an active replacement prevents duplicates.
+The canonical report and local result envelope remain outside the repository. The result must have the exact local schema, policy, model, reasoning effort, session, run, prompt, decision, canonical-report, source, GitHub, history, path, and digest identities with `validation_complete=true`. Retained preparation revalidates all of them before publication.
 
-If a terminal result records an older base revision, the coordinator requires the task-time base to be a Git ancestor of the frozen preflight base. Every other frozen pull request field must still match exactly. A rewritten or unrelated base remains a hard failure.
+Suppressed review-body findings do not require live review threads. They retain their complete synthetic identities in coordinator state and participate in the same exact finding-key contract.
 
-When the user requires a separate mutation authorization, run `agent-task` with `--prepare-only --preserve-artifacts`. This dispatches and validates one managed result, records the exact ordered commits, changed paths, report identity, and comment, thread, and review IDs, then stops before local import or pull request mutation. Report that result and stop. After authorization, run only the returned `apply_command`; `--apply-prepared` revalidates and consumes the checkpoint without launching another managed task.
+When the user requires a separate mutation authorization, run `agent-task` with `--prepare-only --preserve-artifacts`. The local worker may create validated source commits, but the coordinator stops before push, replies, thread resolution, a review request, or any other GitHub mutation. Report the returned checkpoint and stop. After authorization, run only the returned `apply_command`; `--apply-prepared` revalidates the retained local state and frozen GitHub identities without launching another decision session.
 
-When authorization covers only one fresh Copilot review request, run `agent-task` with `--request-review-only`. The coordinator deduplicates an existing request, monitors it with the normal bounded watcher, records current-head clearance when the review is clean, and otherwise persists and returns the exact new bot comments and identities. It never launches a managed task in this mode. Preparing or applying fixes requires a separate invocation and authorization.
+When authorization covers only one fresh Copilot review request, run `agent-task` with `--request-review-only`. The coordinator deduplicates an existing request, monitors it with the normal bounded watcher, records current-head clearance when the review is clean, and otherwise persists and returns the exact new bot findings. It never starts a decision session in this mode.
 
-When apply authorization also covers exactly one subsequent review request, combine `--apply-prepared` with `--request-review-only`. The coordinator imports, publishes, replies to and resolves only the prepared threads, then monitors one review without dispatching another task.
+When apply authorization also covers exactly one subsequent review request, combine `--apply-prepared` with `--request-review-only`. The coordinator publishes the validated local commits, replies to and resolves only the prepared bot-authored threads, then monitors one review without starting another decision session.
 
 If the bounded wait expires, the saved monitor remains requested. A later hash-gated recovery resumes that request instead of asking GitHub for another review.
 
-When a later review produces new findings, the coordinator archives the completed owner before starting the separately authorized preparation task.
+Failed local owners become `terminal_unusable`. The coordinator preserves the local session identity, prompt, raw decision, canonical report, result, and available pre/post fingerprints; removes any resume command; and offers only a fresh non-resume retry. It never resets, adapts, or hides unexpected local commits. A fresh retry archives the terminal owner once before creating one new local owner, and an active replacement prevents duplicates.
 
-The stage's `--max-iterations` value remains the per-iteration limit. An outer loop does not raise or lower that; it bounds what the whole run may spend instead. The coordinator records work equivalent to `progress --state <path> --phase addressing_comments` before dispatch and `progress --state <path> --phase validating` while it validates managed artifacts.
+Immutable completed hosted-task results from older releases may be consumed only through their exact legacy schema and policy validators. Unfinished hosted tasks cannot resume, and all fresh execution is local.
+
+The stage's `--max-iterations` value remains the per-iteration limit. An outer loop does not raise or lower that; it bounds what the whole run may spend instead. The coordinator records work equivalent to `progress --state <path> --phase addressing_comments` before the decision session and `progress --state <path> --phase validating` while it validates local artifacts.
 
 ## Boundaries
 
-- Never run `gh pr diff`, read or search repository files, inspect repository instructions, analyze code, edit files, or run repository programs locally. The managed worker performs every repository action.
-- Never use Cloud Sandboxes, marketplace `custom_agent`, a local agent, local repository execution, or any fallback when the managed helper fails.
-- Never invoke `cloud_task.py` yourself, import helper internals, call helper APIs, scrape standard output, pass credentials, or import the final report commit.
+- Never run `gh pr diff`, read or search repository files, inspect repository instructions, analyze code, edit files, or run repository programs in the coordinator session. The pinned local decision session performs repository work.
+- Never use hosted GitHub Agent Tasks, Cloud Sandboxes, another marketplace custom agent, or any fallback when local execution fails.
+- Never invoke a bundled helper directly, import coordinator internals, call helper APIs, scrape standard output, pass credentials, or hand-edit report or state files.
 - Authentication stays local. Never put credentials, tokens, headers, cookies, or environment data in a prompt, result, report, state, or chat response.
-- Stop on every coordinator error. Report the state path, task ID status, task ID and URL, generated branch and head, ordered commits, report path, retained files, and exact `recovery_command` or `retry_command`.
-- Run only the returned command when the user asks. A recoverable known structural-policy task uses `recovery_command` to revalidate and consume that task. A trusted task-creation failure with `task_id_status=not_created`, or a completed task with an immutable malformed validation artifact or workflow report and `task_id_status=terminal_unusable`, uses `retry_command` without `--resume` after the reported prerequisite is fixed. The coordinator retains the failed owner in history before any replacement, and active or unknown task ownership remains a blocker.
-- A `validated_pending_import` preparation is an authorization boundary. Never replace `--apply-prepared` with `--resume`, import its commits manually, or perform any listed review mutation outside the returned command.
-- A report-only structural result is the successful no-code outcome. The coordinator may still publish replies, resolve the exact validated threads, and request a fresh review.
-- State and recovery artifacts remain durable until verified publication and authenticated reply and resolve work succeeds. The state records every head, actionable snapshot, task identity, and consumed result so restart cannot redispatch the same feedback or attach a stale result to another head. Cleanup happens only after successful consumption.
-- After the head ref reaches the verified final commit, the coordinator checkpoints that exact remote head before waiting for pull request metadata to catch up. Recovery reuses the checkpoint and never republishes the same commits.
+- Stop on every coordinator error. Report the state path, owner status, local session ID, source fingerprints, GitHub fingerprints, retained files, and exact retry command.
+- Run only the returned command when the user asks. A `terminal_unusable` owner uses the fresh `retry_command` without `--resume`. The coordinator retains the failed owner in history before replacement.
+- A `validated_pending_import` preparation is an authorization boundary. Never replace `--apply-prepared` with `--resume`, publish its commits manually, or perform any listed GitHub mutation outside the returned command.
+- A no-code decision result may still produce validated replies, resolve exact bot-authored threads, and request a fresh review after authorization.
+- State and recovery artifacts remain durable until verified publication and authenticated reply and resolution succeed. Cleanup happens only after successful consumption.
+- After the remote head reaches the verified final commit, the coordinator checkpoints that exact head before waiting for pull request metadata to catch up. Recovery reuses the checkpoint and never republishes the same commits.
 - The coordinator preserves PR Flight, pipeline budget, watcher, review-request, maximum-iteration, clean, no-op, and multiple-iteration semantics.
 
 The terminal response is the run's last message. Finish every tool call first, send the complete result once, and do not follow it with a recap.
