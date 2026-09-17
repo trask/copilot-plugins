@@ -271,9 +271,124 @@ class AgentCommandAdmissionTest(unittest.TestCase):
                         )
                     )
 
+    def test_admits_only_minimal_sealed_commands_with_windows_spaces(self):
+        with tempfile.TemporaryDirectory(prefix="sealed admission ") as directory:
+            root = Path(directory)
+            repo = root / "source workspace"
+            repo.mkdir()
+            files = (
+                root
+                / ".copilot"
+                / "session-state"
+                / "12345678-1234-1234-1234-123456789abc"
+                / "files"
+            )
+            files.mkdir(parents=True)
+            artifact = files / "ci-fix-loop eligibility with spaces.json"
+            authorization = Path(f"{artifact}.authorization.json")
+            verifier_argv = [
+                sys.executable,
+                str(SCRIPT.resolve()),
+                "verify-sealed-legacy-owner-reconciliation",
+                str(artifact),
+            ]
+            artifact.write_text(
+                json.dumps(
+                    {
+                        "schema": (
+                            "github.copilot.ci-fix-loop-"
+                            "legacy-owner-eligibility.v3"
+                        ),
+                        "eligibility_artifact": str(artifact),
+                        "snapshot": {
+                            "repo_root": str(repo),
+                            "target": "https://github.com/owner/repo/pull/7",
+                        },
+                        "verifier_command_argv": verifier_argv,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            verify_command = subprocess.list2cmdline(verifier_argv)
+            self.assertTrue(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(verify_command, cwd=str(repo))
+                )
+            )
+            process_options = {}
+            if os.name == "nt":
+                process_options["creationflags"] = subprocess.CREATE_NO_WINDOW
+            completed = subprocess.run(
+                [sys.executable, str(PERMISSION_SCRIPT)],
+                input=json.dumps(
+                    self.payload(verify_command, cwd=str(repo))
+                ),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=True,
+                **process_options,
+            )
+            self.assertEqual('{"behavior":"allow"}\n', completed.stdout)
+            self.assertEqual("", completed.stderr)
+
+            apply_argv = [
+                sys.executable,
+                str(SCRIPT.resolve()),
+                "apply-sealed-legacy-owner-reconciliation",
+                str(authorization),
+            ]
+            authorization.write_text(
+                json.dumps(
+                    {
+                        "schema": (
+                            "github.copilot.ci-fix-loop-"
+                            "legacy-owner-authorization-file.v1"
+                        ),
+                        "authorization_file": str(authorization),
+                        "repo_root": str(repo),
+                        "target": "owner/repo#7",
+                        "apply_command_argv": apply_argv,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            apply_command = subprocess.list2cmdline(apply_argv)
+            self.assertTrue(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(apply_command, cwd=str(repo))
+                )
+            )
+            rejected = [
+                subprocess.list2cmdline(verifier_argv + ["--extra"]),
+                subprocess.list2cmdline(apply_argv + ["--extra"]),
+                verify_command,
+            ]
+            rejected_cwds = [str(repo), str(repo), str(root / "wrong")]
+            for command, cwd in zip(rejected, rejected_cwds):
+                with self.subTest(command=command, cwd=cwd):
+                    self.assertFalse(
+                        PERMISSION_MODULE.admission_allowed(
+                            self.payload(command, cwd=cwd)
+                        )
+                    )
+
     def test_agent_reconciliation_path_is_direct_and_denial_is_terminal(self):
         instructions = AGENT.read_text(encoding="utf-8")
-        self.assertIn("invoke its `verifier_argv` directly", instructions)
+        self.assertIn(
+            'append only `verify-sealed-legacy-owner-reconciliation "<exact artifact path>"`',
+            instructions,
+        )
+        self.assertIn(
+            'append only `apply-sealed-legacy-owner-reconciliation "<exact authorization file path>"`',
+            instructions,
+        )
+        self.assertIn("Do not read the artifact", instructions)
+        self.assertIn("Do not read the file", instructions)
         self.assertIn("never run `Select-String`", instructions)
         self.assertIn("A permission denial or verifier error is terminal", instructions)
         self.assertIn(
@@ -2249,7 +2364,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             ]
             package = {
                 "name": "ci-fix-loop",
-                "version": "1.6.33",
+                "version": "1.6.34",
                 "file_count": 1,
                 "byte_count": helper.stat().st_size,
                 "package_sha256": MODULE.canonical_package_digest(files),
@@ -2317,7 +2432,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "installed_root": str(root / "installed"),
                 "package": {
                     "name": "ci-fix-loop",
-                    "version": "1.6.33",
+                    "version": "1.6.34",
                     "file_count": 8,
                     "package_sha256": "c" * 64,
                 },
@@ -2477,7 +2592,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "installed_root": str(root / "installed"),
                 "package": {
                     "name": "ci-fix-loop",
-                    "version": "1.6.33",
+                    "version": "1.6.34",
                     "file_count": 8,
                     "package_sha256": "c" * 64,
                 },
@@ -2540,7 +2655,133 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             self.assertEqual(
                 result["eligibility_artifact_sha256"], artifact_sha256
             )
-            self.assertEqual(result["verifier_argv"], artifact["verifier_argv"])
+            self.assertEqual(
+                result["verifier_command_argv"],
+                artifact["verifier_command_argv"],
+            )
+
+    def test_minimal_sealed_commands_write_and_consume_authorization_file(self):
+        with tempfile.TemporaryDirectory(prefix="sealed command ") as directory:
+            root = Path(directory)
+            repo = root / "source workspace"
+            repo.mkdir()
+            state_path = root / "state.json"
+            state_path.write_text("{}\n", encoding="utf-8")
+            artifact_path = root / "eligibility artifact.json"
+            digest_path = Path(f"{artifact_path}.sha256")
+            manifest_path = root / "package manifest.json"
+            manifest_path.write_text("{}\n", encoding="utf-8")
+            package = {
+                "path": str(manifest_path),
+                "sha256": "a" * 64,
+                "schema": MODULE.PLUGIN_PACKAGE_MANIFEST_SCHEMA,
+                "source_commit": "b" * 40,
+                "installed_root": str(root / "installed"),
+                "package": {
+                    "name": "ci-fix-loop",
+                    "version": "1.6.34",
+                    "file_count": 8,
+                    "package_sha256": "c" * 64,
+                },
+            }
+            snapshot = {
+                "schema": MODULE.LEGACY_OWNER_RECONCILIATION_SNAPSHOT_SCHEMA,
+                "state": {
+                    "path": str(state_path),
+                    "sha256": MODULE.sha256_file(state_path),
+                },
+                "target": "https://github.com/owner/repo/pull/7",
+                "repo_root": str(repo),
+                "owner": "run-1",
+            }
+            artifact = MODULE.legacy_owner_eligibility_artifact(
+                target=MODULE.parse_target("owner/repo#7"),
+                repo_root=repo,
+                state_path=state_path,
+                eligibility_path=artifact_path,
+                digest_path=digest_path,
+                snapshot=snapshot,
+                package_manifest=package,
+            )
+            artifact_path.write_text(
+                json.dumps(artifact, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            artifact_sha256 = MODULE.sha256_file(artifact_path)
+            digest_path.write_text(
+                f"{artifact_sha256}\n",
+                encoding="ascii",
+                newline="\n",
+            )
+            authorization = {
+                "schema": MODULE.LEGACY_OWNER_AUTHORIZATION_SCHEMA,
+                "result": "authorized",
+                "authorization_token": "d" * 64,
+                "passes": 2,
+                "snapshot_sha256": "e" * 64,
+                "eligibility_artifact_sha256": artifact_sha256,
+                "package_manifest_sha256": package["sha256"],
+                "reconciliation_argv": ["internal", "apply"],
+                "mutation_performed": False,
+                "workflow_started": False,
+            }
+
+            def authorize(_arguments):
+                MODULE._EMIT_CAPTURE.append(authorization)
+
+            emitted = []
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "command_verify_legacy_owner_reconciliation",
+                    side_effect=authorize,
+                ),
+                mock.patch.object(MODULE, "emit", emitted.append),
+            ):
+                MODULE.command_verify_sealed_legacy_owner_reconciliation(
+                    SimpleNamespace(
+                        eligibility_artifact=str(artifact_path)
+                    )
+                )
+
+            result = emitted[-1]
+            self.assertEqual("authorization_written", result["result"])
+            self.assertFalse(result["mutation_performed"])
+            self.assertFalse(result["workflow_started"])
+            self.assertFalse(result["task_created"])
+            self.assertNotIn("authorization_token", result)
+            self.assertNotIn("reconciliation_argv", result)
+            authorization_path = Path(result["authorization_file"])
+            self.assertTrue(authorization_path.is_file())
+            self.assertTrue(
+                Path(result["authorization_sha256_file"]).is_file()
+            )
+            self.assertEqual(
+                "apply-sealed-legacy-owner-reconciliation",
+                result["apply_command_argv"][2],
+            )
+
+            applied = []
+            with mock.patch.object(
+                MODULE,
+                "command_apply_legacy_owner_reconciliation",
+                side_effect=applied.append,
+            ):
+                MODULE.command_apply_sealed_legacy_owner_reconciliation(
+                    SimpleNamespace(
+                        authorization_file=str(authorization_path)
+                    )
+                )
+            self.assertEqual(1, len(applied))
+            self.assertEqual(
+                artifact_sha256,
+                applied[0].expected_artifact_sha256,
+            )
+            self.assertEqual(
+                authorization["authorization_token"],
+                applied[0].expected_authorization_token,
+            )
 
     def test_verifier_rejects_stale_second_pass_without_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2560,7 +2801,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "installed_root": str(root / "installed"),
                 "package": {
                     "name": "ci-fix-loop",
-                    "version": "1.6.33",
+                    "version": "1.6.34",
                     "file_count": 8,
                     "package_sha256": "c" * 64,
                 },
@@ -2916,7 +3157,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("tools: [execute, agent, rename_session]", instructions)
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [execute, agent, todo", instructions)
-        self.assertEqual("1.6.33", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.34", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_canonicalizes_stack_start_target(self):
         instructions = AGENT.read_text(encoding="utf-8")

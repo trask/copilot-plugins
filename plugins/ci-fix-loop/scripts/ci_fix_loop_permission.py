@@ -46,6 +46,16 @@ RECONCILIATION_COMMANDS = {
         "--expected-authorization-token",
     },
 }
+SEALED_RECONCILIATION_COMMANDS = {
+    "verify-sealed-legacy-owner-reconciliation",
+    "apply-sealed-legacy-owner-reconciliation",
+}
+LEGACY_OWNER_ELIGIBILITY_SCHEMA = (
+    "github.copilot.ci-fix-loop-legacy-owner-eligibility.v3"
+)
+LEGACY_OWNER_AUTHORIZATION_FILE_SCHEMA = (
+    "github.copilot.ci-fix-loop-legacy-owner-authorization-file.v1"
+)
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 TARGET_PATTERN = re.compile(
     r"(?:https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*"
@@ -125,7 +135,8 @@ def command_tokens(tool_name: str, command: str) -> list[str] | None:
         )
         is None
         or normalized_path(tokens[1]) != normalized_path(str(expected_helper))
-        or tokens[2] not in RECONCILIATION_COMMANDS
+        or tokens[2]
+        not in set(RECONCILIATION_COMMANDS) | SEALED_RECONCILIATION_COMMANDS
     ):
         return None
     return tokens[2:]
@@ -177,6 +188,85 @@ def reconciliation_admission(
     )
 
 
+def canonical_session_evidence_path(path: Path) -> bool:
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        return False
+    return (
+        path.is_absolute()
+        and resolved == path
+        and path.is_file()
+        and not path.is_symlink()
+        and path.parent.name == "files"
+        and re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            path.parent.parent.name,
+        )
+        is not None
+        and path.parent.parent.parent.name == "session-state"
+    )
+
+
+def read_small_json(path: Path) -> dict[str, Any] | None:
+    try:
+        if path.stat().st_size > 1024 * 1024:
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def sealed_reconciliation_admission(
+    tokens: list[str],
+    *,
+    cwd: str,
+) -> bool:
+    if len(tokens) != 2:
+        return False
+    evidence_path = Path(tokens[1])
+    if not canonical_session_evidence_path(evidence_path):
+        return False
+    payload = read_small_json(evidence_path)
+    if payload is None:
+        return False
+    expected_helper = Path(__file__).with_name("ci_fix_loop.py").resolve()
+    if tokens[0] == "verify-sealed-legacy-owner-reconciliation":
+        snapshot = payload.get("snapshot")
+        verifier = payload.get("verifier_command_argv")
+        return bool(
+            payload.get("schema") == LEGACY_OWNER_ELIGIBILITY_SCHEMA
+            and payload.get("eligibility_artifact") == str(evidence_path)
+            and isinstance(snapshot, dict)
+            and normalized_path(str(snapshot.get("repo_root") or ""))
+            == normalized_path(cwd)
+            and TARGET_PATTERN.fullmatch(str(snapshot.get("target") or ""))
+            is not None
+            and isinstance(verifier, list)
+            and len(verifier) == 4
+            and normalized_path(str(verifier[1]))
+            == normalized_path(str(expected_helper))
+            and verifier[2] == tokens[0]
+            and verifier[3] == str(evidence_path)
+        )
+    apply = payload.get("apply_command_argv")
+    return bool(
+        payload.get("schema") == LEGACY_OWNER_AUTHORIZATION_FILE_SCHEMA
+        and payload.get("authorization_file") == str(evidence_path)
+        and normalized_path(str(payload.get("repo_root") or ""))
+        == normalized_path(cwd)
+        and TARGET_PATTERN.fullmatch(str(payload.get("target") or ""))
+        is not None
+        and isinstance(apply, list)
+        and len(apply) == 4
+        and normalized_path(str(apply[1]))
+        == normalized_path(str(expected_helper))
+        and apply[2] == tokens[0]
+        and apply[3] == str(evidence_path)
+    )
+
+
 def admission_allowed(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -196,8 +286,16 @@ def admission_allowed(payload: Any) -> bool:
     if not tokens or tokens[0] not in ALLOWED_SUBCOMMANDS:
         return bool(
             tokens
-            and tokens[0] in RECONCILIATION_COMMANDS
-            and reconciliation_admission(tokens, cwd=cwd)
+            and (
+                (
+                    tokens[0] in RECONCILIATION_COMMANDS
+                    and reconciliation_admission(tokens, cwd=cwd)
+                )
+                or (
+                    tokens[0] in SEALED_RECONCILIATION_COMMANDS
+                    and sealed_reconciliation_admission(tokens, cwd=cwd)
+                )
+            )
         )
     subcommand = tokens[0]
     if subcommand in TARGET_COMMANDS:

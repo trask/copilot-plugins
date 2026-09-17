@@ -51,13 +51,16 @@ HOSTED_DISPATCH_IDENTITY_SCHEMA = (
     "github.copilot.ci-fix-loop-hosted-dispatch-identity.v1"
 )
 LEGACY_OWNER_RECONCILIATION_SNAPSHOT_SCHEMA = (
-    "github.copilot.ci-fix-loop-legacy-owner-reconciliation-snapshot.v2"
+    "github.copilot.ci-fix-loop-legacy-owner-reconciliation-snapshot.v3"
 )
 LEGACY_OWNER_ELIGIBILITY_SCHEMA = (
-    "github.copilot.ci-fix-loop-legacy-owner-eligibility.v2"
+    "github.copilot.ci-fix-loop-legacy-owner-eligibility.v3"
 )
 LEGACY_OWNER_AUTHORIZATION_SCHEMA = (
-    "github.copilot.ci-fix-loop-legacy-owner-authorization.v2"
+    "github.copilot.ci-fix-loop-legacy-owner-authorization.v3"
+)
+LEGACY_OWNER_AUTHORIZATION_FILE_SCHEMA = (
+    "github.copilot.ci-fix-loop-legacy-owner-authorization-file.v1"
 )
 PLUGIN_PACKAGE_MANIFEST_SCHEMA = {
     "id": "github.copilot.plugin-package-manifest",
@@ -8067,6 +8070,40 @@ def legacy_owner_verifier_argv(
     ]
 
 
+def legacy_owner_authorization_paths(
+    eligibility_path: Path,
+) -> tuple[Path, Path]:
+    authorization_path = eligibility_path.with_name(
+        f"{eligibility_path.name}.authorization.json"
+    )
+    return (
+        authorization_path,
+        authorization_path.with_name(f"{authorization_path.name}.sha256"),
+    )
+
+
+def legacy_owner_verifier_command_argv(
+    eligibility_path: Path,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "verify-sealed-legacy-owner-reconciliation",
+        str(eligibility_path),
+    ]
+
+
+def legacy_owner_apply_command_argv(
+    authorization_path: Path,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "apply-sealed-legacy-owner-reconciliation",
+        str(authorization_path),
+    ]
+
+
 def legacy_owner_apply_argv(
     *,
     target: dict[str, Any],
@@ -8137,6 +8174,9 @@ def legacy_owner_eligibility_artifact(
     package_manifest: dict[str, Any],
 ) -> dict[str, Any]:
     seal = legacy_owner_eligibility_seal(snapshot, package_manifest)
+    authorization_path, authorization_digest_path = (
+        legacy_owner_authorization_paths(eligibility_path)
+    )
     artifact = {
         "schema": LEGACY_OWNER_ELIGIBILITY_SCHEMA,
         "result": "legacy_owner_reconciliation_eligible",
@@ -8146,6 +8186,11 @@ def legacy_owner_eligibility_artifact(
         "package_manifest": package_manifest,
         "eligibility_artifact": str(eligibility_path),
         "eligibility_sha256_file": str(digest_path),
+        "authorization_file": str(authorization_path),
+        "authorization_sha256_file": str(authorization_digest_path),
+        "verifier_command_argv": legacy_owner_verifier_command_argv(
+            eligibility_path
+        ),
         "verifier_argv": legacy_owner_verifier_argv(
             target=target,
             repo_root=repo_root,
@@ -8203,6 +8248,9 @@ def load_legacy_owner_eligibility(
             "package_manifest",
             "eligibility_artifact",
             "eligibility_sha256_file",
+            "authorization_file",
+            "authorization_sha256_file",
+            "verifier_command_argv",
             "verifier_argv",
         }
         or artifact.get("schema") != LEGACY_OWNER_ELIGIBILITY_SCHEMA
@@ -8210,8 +8258,14 @@ def load_legacy_owner_eligibility(
         or artifact.get("seal") != expected_seal
         or artifact.get("eligibility_artifact") != str(eligibility_path)
         or artifact.get("eligibility_sha256_file") != str(digest_path)
+        or artifact.get("authorization_file")
+        != str(legacy_owner_authorization_paths(eligibility_path)[0])
+        or artifact.get("authorization_sha256_file")
+        != str(legacy_owner_authorization_paths(eligibility_path)[1])
         or not isinstance(artifact.get("snapshot"), dict)
         or not isinstance(artifact.get("package_manifest"), dict)
+        or artifact.get("verifier_command_argv")
+        != legacy_owner_verifier_command_argv(eligibility_path)
         or not isinstance(artifact.get("verifier_argv"), list)
         or SHA256_PATTERN.fullmatch(
             str(artifact.get("reconciliation_seal", ""))
@@ -8298,6 +8352,224 @@ def validate_legacy_owner_evidence(
     return artifact_sha256, artifact, package_manifest, expected_verifier
 
 
+def sealed_legacy_owner_arguments(
+    eligibility_path: Path,
+) -> tuple[argparse.Namespace, str, dict[str, Any]]:
+    if not eligibility_path.is_absolute():
+        raise WorkflowError("sealed legacy owner artifact path must be absolute")
+    content, candidate = strict_json_file(
+        eligibility_path,
+        "sealed legacy owner eligibility artifact",
+    )
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get("schema") != LEGACY_OWNER_ELIGIBILITY_SCHEMA
+        or candidate.get("eligibility_artifact") != str(eligibility_path)
+        or not isinstance(candidate.get("seal"), str)
+        or SHA256_PATTERN.fullmatch(candidate["seal"]) is None
+        or not isinstance(candidate.get("snapshot"), dict)
+        or not isinstance(candidate.get("package_manifest"), dict)
+    ):
+        raise WorkflowError("sealed legacy owner eligibility artifact is malformed")
+    snapshot = candidate["snapshot"]
+    state = snapshot.get("state")
+    package_manifest = candidate["package_manifest"]
+    target = snapshot.get("target")
+    repo_root = snapshot.get("repo_root")
+    state_path = state.get("path") if isinstance(state, dict) else None
+    manifest_path = package_manifest.get("path")
+    manifest_sha256 = package_manifest.get("sha256")
+    if (
+        not isinstance(target, str)
+        or not target
+        or not isinstance(repo_root, str)
+        or not repo_root
+        or not isinstance(state_path, str)
+        or not state_path
+        or not isinstance(manifest_path, str)
+        or not manifest_path
+        or not isinstance(manifest_sha256, str)
+        or SHA256_PATTERN.fullmatch(manifest_sha256) is None
+    ):
+        raise WorkflowError("sealed legacy owner invocation identity is malformed")
+    digest_path = eligibility_path.with_name(
+        f"{eligibility_path.name}.sha256"
+    )
+    arguments = argparse.Namespace(
+        target=target,
+        repo_root=repo_root,
+        state=state_path,
+        eligibility_artifact=str(eligibility_path),
+        eligibility_sha256_file=str(digest_path),
+        package_manifest=manifest_path,
+        expected_package_manifest_sha256=manifest_sha256,
+        expected_seal=candidate["seal"],
+    )
+    artifact_sha256 = hashlib.sha256(content).hexdigest()
+    return arguments, artifact_sha256, candidate
+
+
+def write_legacy_owner_authorization_file(
+    *,
+    eligibility_path: Path,
+    artifact_sha256: str,
+    artifact: dict[str, Any],
+    authorization: dict[str, Any],
+) -> dict[str, Any]:
+    authorization_path, authorization_digest_path = (
+        legacy_owner_authorization_paths(eligibility_path)
+    )
+    apply_command_argv = legacy_owner_apply_command_argv(authorization_path)
+    payload = {
+        "schema": LEGACY_OWNER_AUTHORIZATION_FILE_SCHEMA,
+        "result": "legacy_owner_reconciliation_authorized",
+        "target": artifact["snapshot"]["target"],
+        "repo_root": artifact["snapshot"]["repo_root"],
+        "state": artifact["snapshot"]["state"]["path"],
+        "eligibility_artifact": str(eligibility_path),
+        "eligibility_artifact_sha256": artifact_sha256,
+        "eligibility_sha256_file": artifact["eligibility_sha256_file"],
+        "eligibility_seal": artifact["seal"],
+        "package_manifest": artifact["package_manifest"]["path"],
+        "package_manifest_sha256": artifact["package_manifest"]["sha256"],
+        "authorization_file": str(authorization_path),
+        "authorization_sha256_file": str(authorization_digest_path),
+        "authorization": authorization,
+        "apply_command_argv": apply_command_argv,
+    }
+    content = (
+        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    ).encode("utf-8")
+    authorization_sha256 = hashlib.sha256(content).hexdigest()
+    write_new_evidence_file(authorization_path, content)
+    try:
+        write_new_evidence_file(
+            authorization_digest_path,
+            f"{authorization_sha256}\n".encode("ascii"),
+        )
+    except BaseException:
+        authorization_path.unlink(missing_ok=True)
+        raise
+    return {
+        "schema": LEGACY_OWNER_AUTHORIZATION_FILE_SCHEMA,
+        "result": "authorization_written",
+        "authorization_file": str(authorization_path),
+        "authorization_file_sha256": authorization_sha256,
+        "authorization_sha256_file": str(authorization_digest_path),
+        "apply_command_argv": apply_command_argv,
+        "mutation_performed": False,
+        "workflow_started": False,
+        "task_created": False,
+    }
+
+
+def load_legacy_owner_authorization_file(
+    authorization_path: Path,
+) -> tuple[dict[str, Any], argparse.Namespace]:
+    if not authorization_path.is_absolute():
+        raise WorkflowError("sealed legacy owner authorization path must be absolute")
+    digest_path = authorization_path.with_name(
+        f"{authorization_path.name}.sha256"
+    )
+    content, payload = strict_json_file(
+        authorization_path,
+        "sealed legacy owner authorization file",
+    )
+    authorization_sha256 = hashlib.sha256(content).hexdigest()
+    if (
+        not digest_path.is_file()
+        or digest_path.is_symlink()
+        or digest_path.read_bytes()
+        != f"{authorization_sha256}\n".encode("ascii")
+    ):
+        raise WorkflowError("sealed legacy owner authorization SHA-256 drifted")
+    required = {
+        "schema",
+        "result",
+        "target",
+        "repo_root",
+        "state",
+        "eligibility_artifact",
+        "eligibility_artifact_sha256",
+        "eligibility_sha256_file",
+        "eligibility_seal",
+        "package_manifest",
+        "package_manifest_sha256",
+        "authorization_file",
+        "authorization_sha256_file",
+        "authorization",
+        "apply_command_argv",
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != required
+        or payload.get("schema") != LEGACY_OWNER_AUTHORIZATION_FILE_SCHEMA
+        or payload.get("result")
+        != "legacy_owner_reconciliation_authorized"
+        or payload.get("authorization_file") != str(authorization_path)
+        or payload.get("authorization_sha256_file") != str(digest_path)
+        or payload.get("apply_command_argv")
+        != legacy_owner_apply_command_argv(authorization_path)
+        or not isinstance(payload.get("authorization"), dict)
+        or any(
+            not isinstance(payload.get(field), str) or not payload[field]
+            for field in (
+                "target",
+                "repo_root",
+                "state",
+                "eligibility_artifact",
+                "eligibility_artifact_sha256",
+                "eligibility_sha256_file",
+                "eligibility_seal",
+                "package_manifest",
+                "package_manifest_sha256",
+            )
+        )
+        or any(
+            SHA256_PATTERN.fullmatch(payload[field]) is None
+            for field in (
+                "eligibility_artifact_sha256",
+                "eligibility_seal",
+                "package_manifest_sha256",
+            )
+        )
+    ):
+        raise WorkflowError("sealed legacy owner authorization file is malformed")
+    eligibility_path = Path(payload["eligibility_artifact"])
+    arguments, artifact_sha256, artifact = sealed_legacy_owner_arguments(
+        eligibility_path
+    )
+    authorization = payload["authorization"]
+    if (
+        artifact_sha256 != payload["eligibility_artifact_sha256"]
+        or artifact["eligibility_sha256_file"]
+        != payload["eligibility_sha256_file"]
+        or artifact["seal"] != payload["eligibility_seal"]
+        or artifact["package_manifest"]["path"] != payload["package_manifest"]
+        or artifact["package_manifest"]["sha256"]
+        != payload["package_manifest_sha256"]
+        or artifact["authorization_file"] != str(authorization_path)
+        or artifact["authorization_sha256_file"] != str(digest_path)
+        or arguments.target != payload["target"]
+        or arguments.repo_root != payload["repo_root"]
+        or arguments.state != payload["state"]
+        or authorization.get("schema") != LEGACY_OWNER_AUTHORIZATION_SCHEMA
+        or authorization.get("result") != "authorized"
+        or authorization.get("eligibility_artifact_sha256")
+        != artifact_sha256
+        or authorization.get("package_manifest_sha256")
+        != arguments.expected_package_manifest_sha256
+        or not isinstance(authorization.get("authorization_token"), str)
+        or SHA256_PATTERN.fullmatch(authorization["authorization_token"]) is None
+    ):
+        raise WorkflowError("sealed legacy owner authorization identity drifted")
+    arguments.expected_artifact_sha256 = artifact_sha256
+    arguments.expected_authorization_token = authorization[
+        "authorization_token"
+    ]
+    return payload, arguments
+
+
 def command_prepare_legacy_owner_reconciliation(
     args: argparse.Namespace,
 ) -> None:
@@ -8357,10 +8629,40 @@ def command_prepare_legacy_owner_reconciliation(
             "eligibility_artifact_sha256": final_sha256,
             "eligibility_sha256_file": str(digest_path),
             "seal": artifact["seal"],
-            "verifier_argv": artifact["verifier_argv"],
+            "verifier_command_argv": artifact["verifier_command_argv"],
             "mutation_performed": False,
             "workflow_started": False,
         }
+    )
+
+
+def command_verify_sealed_legacy_owner_reconciliation(
+    args: argparse.Namespace,
+) -> None:
+    eligibility_path = cli_path(args.eligibility_artifact)
+    arguments, artifact_sha256, artifact = sealed_legacy_owner_arguments(
+        eligibility_path
+    )
+    captured = capture_command(
+        command_verify_legacy_owner_reconciliation,
+        arguments,
+    )
+    authorization = captured[-1]
+    if (
+        len(captured) != 1
+        or authorization.get("schema") != LEGACY_OWNER_AUTHORIZATION_SCHEMA
+        or authorization.get("result") != "authorized"
+        or authorization.get("eligibility_artifact_sha256")
+        != artifact_sha256
+    ):
+        raise WorkflowError("sealed legacy owner verifier returned invalid evidence")
+    emit(
+        write_legacy_owner_authorization_file(
+            eligibility_path=eligibility_path,
+            artifact_sha256=artifact_sha256,
+            artifact=artifact,
+            authorization=authorization,
+        )
     )
 
 
@@ -8429,6 +8731,16 @@ def command_verify_legacy_owner_reconciliation(
             "workflow_started": False,
         }
     )
+
+
+def command_apply_sealed_legacy_owner_reconciliation(
+    args: argparse.Namespace,
+) -> None:
+    authorization_path = cli_path(args.authorization_file)
+    _payload, arguments = load_legacy_owner_authorization_file(
+        authorization_path
+    )
+    command_apply_legacy_owner_reconciliation(arguments)
 
 
 def command_apply_legacy_owner_reconciliation(
@@ -11986,6 +12298,15 @@ def build_parser() -> argparse.ArgumentParser:
         function=command_prepare_legacy_owner_reconciliation
     )
 
+    verify_sealed_legacy = subparsers.add_parser(
+        "verify-sealed-legacy-owner-reconciliation",
+        help="verify one sealed artifact and write a sealed authorization file",
+    )
+    verify_sealed_legacy.add_argument("eligibility_artifact")
+    verify_sealed_legacy.set_defaults(
+        function=command_verify_sealed_legacy_owner_reconciliation
+    )
+
     verify_legacy = subparsers.add_parser(
         "verify-legacy-owner-reconciliation",
         help="perform two read-only identity passes for sealed legacy evidence",
@@ -12003,6 +12324,15 @@ def build_parser() -> argparse.ArgumentParser:
     verify_legacy.add_argument("--expected-seal", required=True)
     verify_legacy.set_defaults(
         function=command_verify_legacy_owner_reconciliation
+    )
+
+    apply_sealed_legacy = subparsers.add_parser(
+        "apply-sealed-legacy-owner-reconciliation",
+        help="apply one sealed legacy-owner authorization file",
+    )
+    apply_sealed_legacy.add_argument("authorization_file")
+    apply_sealed_legacy.set_defaults(
+        function=command_apply_sealed_legacy_owner_reconciliation
     )
 
     apply_legacy = subparsers.add_parser(

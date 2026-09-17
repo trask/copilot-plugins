@@ -53,7 +53,7 @@
     {
       "name": "ci-fix-loop",
       "description": "Fix continuous integration failures on one pull request or bottom-up through a native stack, propagating each fix through its descendants.",
-      "version": "1.6.33",
+      "version": "1.6.34",
       "source": "./plugins/ci-fix-loop"
     },
     {
