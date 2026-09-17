@@ -1756,6 +1756,9 @@ def pipeline_arguments(
     ]
 
 
+ACTIVE_GITHUB_MUTATION_POLICY = "allow"
+
+
 def stage_prompt(target: dict[str, Any], arguments: list[str]) -> str:
     name = f"{target['repo_name']}#{target['number']}"
     if not arguments:
@@ -1782,10 +1785,24 @@ def stage_command(
     resolve_program: Callable[[str], str] = resolve_launch_program,
 ) -> list[str]:
     validate_stage_route(entry, model, effort)
+    stage_arguments = list(arguments)
+    if entry["stage"] in {STAGE_COPILOT_REVIEW, STAGE_SELF_REVIEW}:
+        stage_arguments.extend(
+            ["--github-mutation-policy", ACTIVE_GITHUB_MUTATION_POLICY]
+        )
+    effective_prompt = (
+        prompt if prompt is not None else stage_prompt(target, stage_arguments)
+    )
+    if prompt is not None and stage_arguments != arguments:
+        effective_prompt += (
+            "\n\nPass this immutable argument to the helper command that owns "
+            "this stage run: --github-mutation-policy "
+            f"{ACTIVE_GITHUB_MUTATION_POLICY}"
+        )
     return [
         resolve_program("copilot"),
         "-p",
-        prompt if prompt is not None else stage_prompt(target, arguments),
+        effective_prompt,
         "--agent",
         entry["agent"],
         "--model",

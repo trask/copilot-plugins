@@ -19,6 +19,8 @@ The coordinator starts every local decision session with explicit `--model gpt-5
 
 ## Required path
 
+When a pipeline position includes `github-mutation-policy: source-only`, pass `--github-mutation-policy source-only` unchanged to every `agent-task` command for that run. Never omit, replace, or relax it on recovery. Stop if the helper rejects it. This policy forbids replies, thread resolution, review requests, draft changes, title/body edits, and ad hoc GitHub mutations. Source publication is the only permitted mutation.
+
 1. Find this installed plugin's bundled coordinator.
    - PowerShell: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; $helper = "$copilotHome/installed-plugins/trask-plugins/copilot-review-loop/scripts/copilot_review_loop.py"`
    - Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; helper="$copilot_home/installed-plugins/trask-plugins/copilot-review-loop/scripts/copilot_review_loop.py"`

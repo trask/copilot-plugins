@@ -921,6 +921,8 @@ def scheduler_command(
         args.effort,
         "--conflict-strategy",
         args.conflict_strategy,
+        "--github-mutation-policy",
+        args.github_mutation_policy,
     ]
     for override in args.stage_model or []:
         command.extend(["--stage-model", override])
@@ -946,6 +948,7 @@ def command_start(args: argparse.Namespace) -> None:
             "started_at": utc_now(),
             "started_at_epoch": started_at_epoch,
             "conflict_strategy": args.conflict_strategy,
+            "github_mutation_policy": args.github_mutation_policy,
         },
     )
     process = common.start_detached(
@@ -965,6 +968,7 @@ def command_start(args: argparse.Namespace) -> None:
                 "started_at": utc_now(),
                 "started_at_epoch": started_at_epoch,
                 "conflict_strategy": args.conflict_strategy,
+                "github_mutation_policy": args.github_mutation_policy,
             },
         )
     except OSError:
@@ -978,6 +982,7 @@ def command_start(args: argparse.Namespace) -> None:
             "pid": process.pid,
             "cursor": 0,
             "conflict_strategy": args.conflict_strategy,
+            "github_mutation_policy": args.github_mutation_policy,
         }
     )
 
@@ -997,6 +1002,7 @@ def command_watch(args: argparse.Namespace) -> None:
 
 
 def command_run(args: argparse.Namespace) -> None:
+    common.ACTIVE_GITHUB_MUTATION_POLICY = args.github_mutation_policy
     require_tools()
     repo_root = resolve_repo_root()
     target = resolve_target(args.target, repo_root)
@@ -1039,6 +1045,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=common.CONFLICT_STRATEGIES,
         default="auto",
     )
+    run_command.add_argument(
+        "--github-mutation-policy",
+        choices=("allow", "source-only"),
+        default="allow",
+    )
     run_command.add_argument("--run-id", help=argparse.SUPPRESS)
     run_command.add_argument("--event-log", help=argparse.SUPPRESS)
     run_command.set_defaults(function=command_run)
@@ -1064,6 +1075,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--conflict-strategy",
         choices=common.CONFLICT_STRATEGIES,
         default="auto",
+    )
+    start.add_argument(
+        "--github-mutation-policy",
+        choices=("allow", "source-only"),
+        default="allow",
     )
     start.set_defaults(function=command_start)
 

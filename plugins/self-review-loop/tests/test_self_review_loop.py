@@ -44,6 +44,78 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+class GithubMutationPolicyTest(unittest.TestCase):
+    def setUp(self):
+        self.previous = MODULE.ACTIVE_GITHUB_MUTATION_POLICY
+        MODULE.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
+        self.addCleanup(
+            setattr,
+            MODULE,
+            "ACTIVE_GITHUB_MUTATION_POLICY",
+            self.previous,
+        )
+
+    def test_source_only_blocks_metadata_patch_before_github_access(self):
+        with (
+            mock.patch.object(MODULE, "metadata_for") as metadata,
+            self.assertRaisesRegex(MODULE.WorkflowError, "metadata updates"),
+        ):
+            MODULE.update_pr_metadata(
+                Path("state.json"),
+                pr={"pr_url": "https://github.com/owner/repo/pull/7"},
+                expected_head="1" * 40,
+                metadata={"title": "Title", "body": "Body"},
+            )
+
+        metadata.assert_not_called()
+
+    def test_pipeline_defaults_source_only_and_requires_explicit_allow(self):
+        self.assertEqual(
+            "source-only",
+            MODULE.github_mutation_policy(
+                argparse.Namespace(
+                    pipeline_run="run-1",
+                    github_mutation_policy=None,
+                )
+            ),
+        )
+        self.assertEqual(
+            "allow",
+            MODULE.github_mutation_policy(
+                argparse.Namespace(
+                    pipeline_run="run-1",
+                    github_mutation_policy="allow",
+                )
+            ),
+        )
+        self.assertIn(
+            "--github-mutation-policy source-only",
+            AGENT.read_text(encoding="utf-8"),
+        )
+
+    def test_recovery_command_and_retained_owner_bind_source_only(self):
+        command = MODULE.agent_task_recovery_command(
+            target="https://github.com/owner/repo/pull/7",
+            repo_root=Path("repo"),
+            state_path=Path("state.json"),
+            model="sol",
+        )
+
+        self.assertIn(
+            '"--github-mutation-policy" "source-only"', command
+        )
+        MODULE.require_retained_github_mutation_policy(
+            {"github_mutation_policy": "source-only"}
+        )
+        MODULE.ACTIVE_GITHUB_MUTATION_POLICY = "allow"
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "does not match the retained owner"
+        ):
+            MODULE.require_retained_github_mutation_policy(
+                {"github_mutation_policy": "source-only"}
+            )
+
+
 class WindowsSubprocessTest(unittest.TestCase):
     def windows_patches(self, completed):
         return (
@@ -1850,7 +1922,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.31")
+        self.assertEqual(plugin["version"], "1.3.32")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -2546,6 +2618,31 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 state=MODULE.load_state(state_path),
                 requested_model="gpt-5.6-sol",
             )
+
+    def test_recovers_canonical_v2_clean_report_through_exact_hash_gate(self):
+        result = self.result()
+        remote = MODULE.validate_success_result(
+            result,
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+        )
+        report = json.loads(self.report())
+
+        recovered = MODULE.validate_self_review_report(
+            json.dumps(report),
+            request_id="request-1",
+            preflight=self.preflight,
+            remote=remote,
+            max_iterations=5,
+            paths_by_commit={},
+            recovery_base_sha=self.preflight["pr"]["base_sha"],
+        )
+
+        self.assertEqual(
+            MODULE.LEGACY_SELF_REVIEW_REPORT_SCHEMA, recovered["schema"]
+        )
+        self.assertEqual([], recovered["findings"])
+        self.assertEqual("keep", recovered["pull_request_metadata"]["decision"])
 
     def test_recovers_nested_runtime_report_only_through_exact_hash_gate(self):
         result = self.result()

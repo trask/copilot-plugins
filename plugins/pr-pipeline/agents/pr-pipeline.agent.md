@@ -31,6 +31,8 @@ Choose the launch command for the active shell:
 - PowerShell on Windows: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; python "$copilotHome/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_pipeline.py" start`
 - POSIX shells: `python3 "${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_pipeline.py" start`
 
+Choose one GitHub mutation policy before `start` and never change it for that run. If the caller forbids any comment, reply, thread resolution, review request, draft change, title/body update, or other GitHub metadata mutation, pass `--github-mutation-policy source-only`. Otherwise pass `--github-mutation-policy allow`. A `source-only` run may publish verified source commits, but every stage must preserve comments, threads, reviews, draft state, title, body, and other pull request metadata exactly.
+
 Append the user's target exactly as given. Omit it only when the user omitted it.
 
 When the user explicitly chooses conflict strategy `merge` or `rebase`, append `--conflict-strategy merge` or `--conflict-strategy rebase` to `start`. Preserve that choice exactly. Otherwise omit the option and let the helper use `auto`.

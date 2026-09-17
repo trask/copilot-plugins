@@ -115,6 +115,91 @@ RUN_LOCAL_DECISION_WORKER = MODULE.run_local_decision_worker
 LOCAL_SOURCE_FINGERPRINT = MODULE.local_source_fingerprint
 
 
+class GithubMutationPolicyTest(unittest.TestCase):
+    def setUp(self):
+        self.previous = MODULE.ACTIVE_GITHUB_MUTATION_POLICY
+        MODULE.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
+        self.addCleanup(
+            setattr,
+            MODULE,
+            "ACTIVE_GITHUB_MUTATION_POLICY",
+            self.previous,
+        )
+
+    def test_source_only_blocks_review_replies_before_github_access(self):
+        with (
+            mock.patch.object(MODULE, "fetch_review_comments") as fetch,
+            self.assertRaisesRegex(MODULE.WorkflowError, "forbids review replies"),
+        ):
+            MODULE.post_missing_replies({}, [])
+
+        fetch.assert_not_called()
+
+    def test_pipeline_defaults_source_only_and_requires_explicit_allow(self):
+        self.assertEqual(
+            "source-only",
+            MODULE.github_mutation_policy(
+                argparse.Namespace(
+                    pipeline_run="run-1",
+                    github_mutation_policy=None,
+                )
+            ),
+        )
+        self.assertEqual(
+            "allow",
+            MODULE.github_mutation_policy(
+                argparse.Namespace(
+                    pipeline_run="run-1",
+                    github_mutation_policy="allow",
+                )
+            ),
+        )
+        self.assertIn(
+            "--github-mutation-policy source-only",
+            AGENT.read_text(encoding="utf-8"),
+        )
+
+    def test_recovery_command_and_retained_owner_bind_source_only(self):
+        command = MODULE.agent_task_recovery_command(
+            target="https://github.com/owner/repo/pull/7",
+            repo_root=Path("repo"),
+            state_path=Path("state.json"),
+            model="sol",
+        )
+
+        self.assertIn(
+            '"--github-mutation-policy" "source-only"', command
+        )
+        MODULE.require_retained_github_mutation_policy(
+            {"github_mutation_policy": "source-only"}
+        )
+        MODULE.ACTIVE_GITHUB_MUTATION_POLICY = "allow"
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "does not match the retained owner"
+        ):
+            MODULE.require_retained_github_mutation_policy(
+                {"github_mutation_policy": "source-only"}
+            )
+
+    def test_source_only_blocks_thread_resolution_before_graphql(self):
+        with (
+            mock.patch.object(MODULE, "graphql") as graphql,
+            self.assertRaisesRegex(MODULE.WorkflowError, "thread resolution"),
+        ):
+            MODULE.resolve_threads([])
+
+        graphql.assert_not_called()
+
+    def test_source_only_blocks_review_requests_before_graphql(self):
+        with (
+            mock.patch.object(MODULE, "graphql") as graphql,
+            self.assertRaisesRegex(MODULE.WorkflowError, "review requests"),
+        ):
+            MODULE.request_copilot({}, Path("state.json"), "1" * 40)
+
+        graphql.assert_not_called()
+
+
 class WindowsSubprocessTest(unittest.TestCase):
     def test_run_hides_windows_console_processes(self):
         completed = MODULE.subprocess.CompletedProcess(["git"], 0, "", "")
@@ -2100,7 +2185,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.51")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.52")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -4157,7 +4242,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "packages": [
                 {
                     "name": "copilot-review-loop",
-                    "version": "1.1.51",
+                    "version": "1.1.52",
                     "file_count": 25,
                     "package_sha256": "c" * 64,
                 }
@@ -4410,7 +4495,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         helper_path.write_text("exact helper bytes\n", encoding="utf-8", newline="\n")
         plugin_path = package_root / "plugin.json"
         plugin_path.write_text(
-            '{"name":"copilot-review-loop","version":"1.1.51"}\n',
+            '{"name":"copilot-review-loop","version":"1.1.52"}\n',
             encoding="utf-8",
             newline="\n",
         )
@@ -4426,7 +4511,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             )
         package = {
             "name": "copilot-review-loop",
-            "version": "1.1.51",
+            "version": "1.1.52",
             "file_count": len(files),
             "byte_count": sum(item["size"] for item in files),
             "package_sha256": MODULE.canonical_package_digest(files),

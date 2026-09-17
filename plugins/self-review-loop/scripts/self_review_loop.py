@@ -4087,7 +4087,7 @@ def normalize_runtime_base_identity_clean_self_review_report(
     }
 
 
-def normalize_nested_runtime_identity_clean_self_review_report(
+def normalize_legacy_nested_runtime_identity_clean_self_review_report(
     report: dict[str, Any],
     *,
     request_id: str,
@@ -4152,6 +4152,132 @@ def normalize_nested_runtime_identity_clean_self_review_report(
         )
     proposed_title = proposed["title"]
     proposed_body = proposed["body"]
+    unchanged = proposed_title == pr["title"] and proposed_body == pr["body"]
+    return {
+        "schema": LEGACY_SELF_REVIEW_REPORT_SCHEMA,
+        "request_id": request_id,
+        "repository": pr["repo_name"],
+        "pull_request": {
+            "number": pr["number"],
+            "head_sha": pr["head_sha"],
+            "base_sha": pr["base_sha"],
+            "title_sha256": sha256_text(pr["title"]),
+            "body_sha256": sha256_text(pr["body"]),
+        },
+        "outcome": "cleared",
+        "iterations_used": iterations_used,
+        "findings": [],
+        "pull_request_metadata": {
+            "decision": "keep" if unchanged else "replace",
+            "title": proposed_title,
+            "body": proposed_body,
+            "reason": (
+                "The nested runtime report "
+                + ("preserved current" if unchanged else "proposed replacement")
+                + " PR metadata."
+            ),
+        },
+    }
+
+
+def normalize_nested_runtime_identity_clean_self_review_report(
+    report: dict[str, Any],
+    *,
+    request_id: str,
+    preflight: dict[str, Any],
+    remote: dict[str, Any],
+    max_iterations: int,
+    paths_by_commit: dict[str, list[str]] | None,
+    recovery_base_sha: str | None,
+) -> dict[str, Any]:
+    if report.get("schema") != SELF_REVIEW_REPORT_SCHEMA:
+        return normalize_legacy_nested_runtime_identity_clean_self_review_report(
+            report,
+            request_id=request_id,
+            preflight=preflight,
+            remote=remote,
+            max_iterations=max_iterations,
+            paths_by_commit=paths_by_commit,
+            recovery_base_sha=recovery_base_sha,
+        )
+    pr = preflight["pr"]
+    iterations_used = report.get("iterations_used")
+    report_base_sha = (
+        recovery_base_sha
+        if recovery_base_sha is not None
+        else pr["base_sha"]
+    )
+    metadata = report.get("pull_request_metadata")
+    pull_request = report.get("pull_request")
+    if (
+        remote.get("requires_apply") is not True
+        or remote.get("commits") != []
+        or paths_by_commit != {}
+        or set(report)
+        != {
+            "schema",
+            "request_id",
+            "repository",
+            "pull_request",
+            "outcome",
+            "iterations_used",
+            "findings",
+            "pull_request_metadata",
+        }
+        or report.get("schema") != SELF_REVIEW_REPORT_SCHEMA
+        or report.get("request_id") != request_id
+        or report.get("repository") != pr["repo_name"]
+        or report.get("outcome") != "cleared"
+        or report.get("findings") != []
+        or not isinstance(pull_request, dict)
+        or set(pull_request)
+        != {
+            "number",
+            "head_sha",
+            "base_sha",
+            "head_ref",
+            "base_ref",
+            "title_sha256",
+            "body_sha256",
+        }
+        or pull_request
+        != {
+            "number": pr["number"],
+            "head_sha": pr["head_sha"],
+            "base_sha": report_base_sha,
+            "head_ref": pr["head_branch"],
+            "base_ref": pr["base_branch"],
+            "title_sha256": sha256_text(pr["title"]),
+            "body_sha256": sha256_text(pr["body"]),
+        }
+        or isinstance(iterations_used, bool)
+        or not isinstance(iterations_used, int)
+        or not 1 <= iterations_used <= max_iterations
+        or not isinstance(metadata, dict)
+        or set(metadata) != {"decision", "title", "body", "reason"}
+        or metadata.get("decision") not in {"keep", "replace"}
+        or not isinstance(metadata.get("title"), str)
+        or not metadata["title"].strip()
+        or "\r" in metadata["title"]
+        or "\n" in metadata["title"]
+        or not isinstance(metadata.get("body"), str)
+        or "\r" in metadata["body"]
+        or not isinstance(metadata.get("reason"), str)
+        or not metadata["reason"].strip()
+        or (
+            metadata.get("decision") == "keep"
+            and (
+                metadata.get("title") != pr["title"]
+                or metadata.get("body") != pr["body"]
+            )
+        )
+    ):
+        raise WorkflowError(
+            "Self Review Loop nested-runtime clean report is malformed "
+            "or has stale identity"
+        )
+    proposed_title = metadata["title"]
+    proposed_body = metadata["body"]
     unchanged = proposed_title == pr["title"] and proposed_body == pr["body"]
     return {
         "schema": LEGACY_SELF_REVIEW_REPORT_SCHEMA,
@@ -4260,6 +4386,32 @@ def wait_for_live_pr_snapshot(
     return actual
 
 
+ACTIVE_GITHUB_MUTATION_POLICY = "allow"
+
+
+def github_mutation_policy(args: argparse.Namespace) -> str:
+    return (
+        getattr(args, "github_mutation_policy", None)
+        or (
+            "source-only"
+            if getattr(args, "pipeline_run", None)
+            else "allow"
+        )
+    )
+
+
+def require_retained_github_mutation_policy(
+    task_state: dict[str, Any],
+) -> None:
+    retained = task_state.get("github_mutation_policy", "allow")
+    if retained not in {"allow", "source-only"}:
+        raise WorkflowError("retained GitHub mutation policy is invalid")
+    if retained != ACTIVE_GITHUB_MUTATION_POLICY:
+        raise WorkflowError(
+            "GitHub mutation policy does not match the retained owner"
+        )
+
+
 def update_pr_metadata(
     state_path: Path,
     *,
@@ -4267,6 +4419,10 @@ def update_pr_metadata(
     expected_head: str,
     metadata: dict[str, str],
 ) -> dict[str, Any]:
+    if ACTIVE_GITHUB_MUTATION_POLICY == "source-only":
+        raise WorkflowError(
+            "github mutation policy source-only forbids pull request metadata updates"
+        )
     target = parse_target(pr["pr_url"])
     expected = {
         **pr,
@@ -4336,6 +4492,7 @@ def agent_task_recovery_command(
     prepare_only: bool = False,
     preserve_artifacts: bool = False,
     apply_prepared: bool = False,
+    github_mutation_policy: str | None = None,
 ) -> str:
     values = [
         sys.executable,
@@ -4348,6 +4505,8 @@ def agent_task_recovery_command(
         str(state_path),
         "--model",
         model,
+        "--github-mutation-policy",
+        github_mutation_policy or ACTIVE_GITHUB_MUTATION_POLICY,
     ]
     values.append("--apply-prepared" if apply_prepared else "--resume")
     if prepare_only:
@@ -4377,6 +4536,8 @@ def agent_task_retry_command(
         args.model,
         "--max-iterations",
         str(args.max_iterations),
+        "--github-mutation-policy",
+        github_mutation_policy(args),
     ]
     pipeline = (
         args.pipeline_run,
@@ -5027,6 +5188,16 @@ def command_archive_stale_agent_task(args: argparse.Namespace) -> None:
     task_state = state.get("agent_task")
     if not isinstance(task_state, dict) or task_state.get("status") != "failed":
         raise WorkflowError("state has no failed Agent Task owner to archive")
+    retained_policy = task_state.get("github_mutation_policy", "allow")
+    requested_policy = (
+        getattr(args, "github_mutation_policy", None) or retained_policy
+    )
+    if retained_policy not in {"allow", "source-only"}:
+        raise WorkflowError("retained GitHub mutation policy is invalid")
+    if requested_policy != retained_policy:
+        raise WorkflowError(
+            "GitHub mutation policy does not match the retained owner"
+        )
     run_id = task_state.get("run_id")
     if not isinstance(run_id, str) or not run_id:
         raise WorkflowError("failed Agent Task owner has no run identity")
@@ -5201,6 +5372,7 @@ def command_archive_stale_agent_task(args: argparse.Namespace) -> None:
         pipeline_run=None,
         pipeline_iteration=None,
         pipeline_max_iterations=None,
+        github_mutation_policy=retained_policy,
         preserve_artifacts=True,
         prepare_only=True,
     )
@@ -5230,6 +5402,9 @@ def command_archive_stale_agent_task(args: argparse.Namespace) -> None:
 
 
 def command_agent_task(args: argparse.Namespace) -> None:
+    global ACTIVE_GITHUB_MUTATION_POLICY
+
+    ACTIVE_GITHUB_MUTATION_POLICY = github_mutation_policy(args)
     prepare_only = bool(getattr(args, "prepare_only", False))
     apply_prepared = bool(getattr(args, "apply_prepared", False))
     preserve_artifacts = bool(getattr(args, "preserve_artifacts", False))
@@ -5247,6 +5422,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
     state_path = cli_path(args.state) if args.state else default_state_path(target)
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
+    retained_task = (
+        existing.get("agent_task") if isinstance(existing, dict) else None
+    )
+    if isinstance(retained_task, dict) and (args.resume or apply_prepared):
+        require_retained_github_mutation_policy(retained_task)
     retained_recovery = validate_retained_result_recovery_gate(
         args,
         state_path=state_path,
@@ -5584,6 +5764,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "status": "preparing",
             "run_id": run_id,
             "model": requested_model,
+            "github_mutation_policy": ACTIVE_GITHUB_MUTATION_POLICY,
             "policy": AGENT_TASK_POLICY,
             "allowed_iterations": allowed_iterations,
             "preflight": preflight,
@@ -6475,6 +6656,10 @@ def build_parser() -> argparse.ArgumentParser:
     agent_task.add_argument("--pipeline-iteration", type=int)
     agent_task.add_argument("--pipeline-max-iterations", type=int)
     agent_task.add_argument(
+        "--github-mutation-policy",
+        choices=("allow", "source-only"),
+    )
+    agent_task.add_argument(
         "--resume",
         action="store_true",
         help="continue verified import or publication from retained recovery state",
@@ -6534,6 +6719,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-iterations",
         type=int,
         default=DEFAULT_MAX_ITERATIONS,
+    )
+    archive_stale.add_argument(
+        "--github-mutation-policy",
+        choices=("allow", "source-only"),
     )
     archive_stale.add_argument(
         "--preserve-artifacts",

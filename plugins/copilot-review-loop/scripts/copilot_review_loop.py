@@ -2735,12 +2735,46 @@ def fetch_review_comments(owner: str, repo: str, number: int) -> list[dict[str, 
     return gh_paginated(f"repos/{owner}/{repo}/pulls/{number}/comments?per_page=100")
 
 
+ACTIVE_GITHUB_MUTATION_POLICY = "allow"
+
+
+def github_mutation_policy(args: argparse.Namespace) -> str:
+    return (
+        getattr(args, "github_mutation_policy", None)
+        or (
+            "source-only"
+            if getattr(args, "pipeline_run", None)
+            else "allow"
+        )
+    )
+
+
+def require_retained_github_mutation_policy(
+    task_state: dict[str, Any],
+) -> None:
+    retained = task_state.get("github_mutation_policy", "allow")
+    if retained not in {"allow", "source-only"}:
+        raise WorkflowError("retained GitHub mutation policy is invalid")
+    if retained != ACTIVE_GITHUB_MUTATION_POLICY:
+        raise WorkflowError(
+            "GitHub mutation policy does not match the retained owner"
+        )
+
+
+def require_github_mutation_allowed(operation: str) -> None:
+    if ACTIVE_GITHUB_MUTATION_POLICY == "source-only":
+        raise WorkflowError(
+            f"github mutation policy source-only forbids {operation}"
+        )
+
+
 def post_missing_replies(
     state: dict[str, Any],
     comments: list[dict[str, Any]],
     *,
     state_path: Path | None = None,
 ) -> dict[int, int]:
+    require_github_mutation_allowed("review replies")
     comments = [
         comment for comment in comments if comment.get("source", "thread") == "thread"
     ]
@@ -2860,6 +2894,7 @@ def resolve_threads(
     state: dict[str, Any] | None = None,
     state_path: Path | None = None,
 ) -> None:
+    require_github_mutation_allowed("review thread resolution")
     for comment in comments:
         if comment.get("source", "thread") != "thread":
             continue
@@ -2937,6 +2972,7 @@ query($owner:String!,$repo:String!,$number:Int!){
 def request_copilot(
     state: dict[str, Any], path: Path, confirmed_remote_head: str
 ) -> dict[str, Any]:
+    require_github_mutation_allowed("Copilot review requests")
     pr = state["pr"]
     local_head = git(Path(state["repo_root"]), "rev-parse", "HEAD")
     existing = state.get("monitoring") or {}
@@ -6993,6 +7029,7 @@ def agent_task_recovery_command(
     preserve_artifacts: bool = False,
     apply_prepared: bool = False,
     publish_prepared_only: bool = False,
+    github_mutation_policy: str | None = None,
 ) -> str:
     values = [
         sys.executable,
@@ -7005,6 +7042,8 @@ def agent_task_recovery_command(
         str(state_path),
         "--model",
         model,
+        "--github-mutation-policy",
+        github_mutation_policy or ACTIVE_GITHUB_MUTATION_POLICY,
     ]
     values.append("--apply-prepared" if apply_prepared else "--resume")
     if publish_prepared_only:
@@ -7036,6 +7075,8 @@ def agent_task_retry_command(
         args.model,
         "--max-iterations",
         str(args.max_iterations),
+        "--github-mutation-policy",
+        github_mutation_policy(args),
     ]
     pipeline = (
         args.pipeline_run,
@@ -8145,6 +8186,9 @@ def rescope_prepared_publication(
 
 
 def command_agent_task(args: argparse.Namespace) -> None:
+    global ACTIVE_GITHUB_MUTATION_POLICY
+
+    ACTIVE_GITHUB_MUTATION_POLICY = github_mutation_policy(args)
     prepare_only = bool(getattr(args, "prepare_only", False))
     apply_prepared = bool(getattr(args, "apply_prepared", False))
     request_review_only = bool(getattr(args, "request_review_only", False))
@@ -8212,6 +8256,19 @@ def command_agent_task(args: argparse.Namespace) -> None:
     require_outside_repository(state_path, repo_root)
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
+    retained_task = (
+        existing.get("agent_task") if isinstance(existing, dict) else None
+    )
+    if (
+        isinstance(retained_task, dict)
+        and (
+            args.resume
+            or apply_prepared
+            or rescope_publish_only
+            or recover_terminal_local
+        )
+    ):
+        require_retained_github_mutation_policy(retained_task)
     if rescope_publish_only:
         if not isinstance(existing, dict):
             raise WorkflowError("prepared local publication state does not exist")
@@ -8826,6 +8883,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "run_id": run_id,
             "producer": "local",
             "model": requested_model,
+            "github_mutation_policy": ACTIVE_GITHUB_MUTATION_POLICY,
             "reasoning_effort": LOCAL_DECISION_REASONING_EFFORT,
             "policy": LOCAL_DECISION_POLICY,
             "remaining_iterations": remaining,
@@ -10399,6 +10457,10 @@ def build_parser() -> argparse.ArgumentParser:
     agent_task.add_argument("--pipeline-run")
     agent_task.add_argument("--pipeline-iteration", type=int)
     agent_task.add_argument("--pipeline-max-iterations", type=int)
+    agent_task.add_argument(
+        "--github-mutation-policy",
+        choices=("allow", "source-only"),
+    )
     agent_task.add_argument("--watch-interval", type=float, default=30.0)
     agent_task.add_argument(
         "--poll-max-interval",

@@ -67,6 +67,76 @@ def uncleared_stage(stage: str, outcome: str | None = "carried") -> dict:
     }
 
 
+class GithubMutationPolicyTest(unittest.TestCase):
+    def setUp(self):
+        self.previous = MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY
+        self.addCleanup(
+            setattr,
+            MODULE.common,
+            "ACTIVE_GITHUB_MUTATION_POLICY",
+            self.previous,
+        )
+
+    def test_scheduler_preserves_source_only_policy(self):
+        args = MODULE.build_parser().parse_args(
+            [
+                "start",
+                "owner/repo#7",
+                "--github-mutation-policy",
+                "source-only",
+            ]
+        )
+        command = MODULE.scheduler_command(
+            args,
+            {"owner": "owner", "repo": "repo", "number": 7},
+            "run-1",
+            Path("progress.jsonl"),
+        )
+
+        index = command.index("--github-mutation-policy")
+        self.assertEqual("source-only", command[index + 1])
+
+    def test_review_stages_receive_source_only_helper_argument(self):
+        MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
+        target = {"repo_name": "owner/repo", "number": 7}
+        for stage in (
+            MODULE.common.STAGE_COPILOT_REVIEW,
+            MODULE.common.STAGE_SELF_REVIEW,
+        ):
+            with self.subTest(stage=stage):
+                entry = next(
+                    item
+                    for item in MODULE.common.STAGES
+                    if item["stage"] == stage
+                )
+                with mock.patch.object(
+                    MODULE.common, "validate_stage_route"
+                ):
+                    command = MODULE.common.stage_command(
+                        entry,
+                        target,
+                        model="gpt-5.6-sol",
+                        effort="high",
+                        arguments=[
+                            "--pipeline-run",
+                            "run-1",
+                            "--pipeline-iteration",
+                            "1",
+                        ],
+                        resolve_program=lambda _name: "copilot",
+                    )
+
+                prompt = command[command.index("-p") + 1]
+                self.assertIn(
+                    "--github-mutation-policy source-only", prompt
+                )
+
+    def test_agent_freezes_caller_mutation_prohibition_at_start(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+        self.assertIn("--github-mutation-policy source-only", instructions)
+        self.assertIn("never change it for that run", instructions)
+
+
 class InstalledRuntimeTest(unittest.TestCase):
     def test_dynamic_common_import_does_not_write_bytecode(self):
         with tempfile.TemporaryDirectory() as raw_directory:
