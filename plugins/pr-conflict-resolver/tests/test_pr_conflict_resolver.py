@@ -886,7 +886,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "4f2b401eb4ebdc0d4cd3dbdb6fec02177c8e8acac0014b9ca9787c2996af0b73",
+            "a117a6ae0c8463e23cf8f1456f75ec67218d77233d18baa0a55ce76db192161a",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -3348,6 +3348,7 @@ class NativeStackSynchronizationMergeIntegrationTest(unittest.TestCase):
         member = {
             "direct_base_sha": current_base,
             "retained_base_sha": self.retained_base,
+            "direct_merge_base": current_base,
             "head_sha": head,
             "old_commits": [
                 MODULE.commit_identity(self.repo, commit, linear=True)
@@ -3355,6 +3356,14 @@ class NativeStackSynchronizationMergeIntegrationTest(unittest.TestCase):
             ],
             "sync_merges": sync_merges,
         }
+        CLOUD_MODULE.verify_frozen_ranges(
+            subprocess.run,
+            mock.Mock(root=self.repo),
+            {
+                "strategy": "native-stack",
+                "native_stack": {"members": [member]},
+            },
+        )
         CLOUD_MODULE.prove_native_stack_member_input(
             subprocess.run,
             self.repo,
@@ -3873,7 +3882,7 @@ class ManagedTaskResultPersistenceTest(unittest.TestCase):
 
 
 class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
-    def test_native_stack_frozen_range_starts_at_its_direct_merge_base(self):
+    def test_native_stack_frozen_range_validates_its_direct_merge_base(self):
         snapshot = mock.Mock(root=Path("C:\\repo"))
         member = {
             "direct_base_sha": "a" * 40,
@@ -3883,16 +3892,26 @@ class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
         }
         request = {"strategy": "native-stack", "native_stack": {"members": [member]}}
 
-        with mock.patch.object(
-            CLOUD_MODULE, "ordered_commits", return_value=[]
-        ) as ordered:
+        with (
+            mock.patch.object(CLOUD_MODULE, "git", return_value="b" * 40) as git,
+            mock.patch.object(
+                CLOUD_MODULE, "prove_native_stack_member_input"
+            ) as prove,
+        ):
             CLOUD_MODULE.verify_frozen_ranges(mock.sentinel.runner, snapshot, request)
 
-        ordered.assert_called_once_with(
+        git.assert_called_once_with(
             mock.sentinel.runner,
             snapshot.root,
-            member["direct_merge_base"],
+            "merge-base",
+            "--all",
+            member["direct_base_sha"],
             member["head_sha"],
+        )
+        prove.assert_called_once_with(
+            mock.sentinel.runner,
+            snapshot.root,
+            member,
         )
 
     def test_code_ref_resolves_branch_or_full_sha_after_artifact_fetch(self):

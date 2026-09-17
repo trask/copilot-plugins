@@ -2590,30 +2590,14 @@ def verify_frozen_ranges(
     snapshot: LocalSnapshot,
     request: Mapping[str, object],
 ) -> None:
-    ranges: list[
-        tuple[str, str, Sequence[Mapping[str, object]], bool]
-    ] = []
     if request["strategy"] in {"merge", "rebase"}:
-        ranges.append(
-            (
-                request["merge_base"],
-                request["pull_request"]["head_sha"],
-                request["head_commits"],
-                request["strategy"] == "rebase",
-            )
+        expected = request["head_commits"]
+        commits = ordered_commits(
+            runner,
+            snapshot.root,
+            request["merge_base"],
+            request["pull_request"]["head_sha"],
         )
-    else:
-        ranges.extend(
-            (
-                member["direct_merge_base"],
-                member["head_sha"],
-                member["old_commits"],
-                True,
-            )
-            for member in request["native_stack"]["members"]
-        )
-    for base, head, expected, require_linear in ranges:
-        commits = ordered_commits(runner, snapshot.root, base, head)
         if commits != [item["sha"] for item in expected]:
             raise ConflictError(
                 "frozen old unique commit range changed",
@@ -2624,7 +2608,38 @@ def verify_frozen_ranges(
                 runner,
                 snapshot.root,
                 item,
-                require_linear=require_linear,
+                require_linear=request["strategy"] == "rebase",
+            )
+        return
+    for member in request["native_stack"]["members"]:
+        merge_bases = [
+            value.strip().lower()
+            for value in git(
+                runner,
+                snapshot.root,
+                "merge-base",
+                "--all",
+                member["direct_base_sha"],
+                member["head_sha"],
+            ).splitlines()
+            if value.strip()
+        ]
+        if merge_bases != [member["direct_merge_base"]]:
+            raise ConflictError(
+                "frozen old unique commit range changed",
+                "stale_target",
+            )
+        prove_native_stack_member_input(
+            runner,
+            snapshot.root,
+            member,
+        )
+        for item in member["old_commits"]:
+            verify_commit_identity(
+                runner,
+                snapshot.root,
+                item,
+                require_linear=True,
             )
 
 

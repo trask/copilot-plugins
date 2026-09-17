@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "4f2b401eb4ebdc0d4cd3dbdb6fec02177c8e8acac0014b9ca9787c2996af0b73"
+    "a117a6ae0c8463e23cf8f1456f75ec67218d77233d18baa0a55ce76db192161a"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@1"

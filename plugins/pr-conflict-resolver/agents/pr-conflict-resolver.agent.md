@@ -45,7 +45,7 @@ The helper performs a trusted local preflight without executing repository code.
 
 A pipeline-owned isolated worktree may stay detached only at the exact frozen pull request head. An attached worktree must hold the pull request branch. Any other branch or commit fails preflight.
 
-The helper records `preparing` ownership at the explicit state path before conflict preflight. A preflight error records failed or interrupted ownership with a null task ID and `not_created` status, so a wrapper exit cannot erase the attempted run. The Agent Tasks runtime is bundled with this plugin. The helper writes the closed `github.copilot.agent-task-conflict-request` version 1 file and a trusted prompt outside the repository. It loads only the adjacent `cloud_conflict_task.py`, verifies SHA-256 `4f2b401eb4ebdc0d4cd3dbdb6fec02177c8e8acac0014b9ca9787c2996af0b73`, and invokes it once with:
+The helper records `preparing` ownership at the explicit state path before conflict preflight. A preflight error records failed or interrupted ownership with a null task ID and `not_created` status, so a wrapper exit cannot erase the attempted run. The Agent Tasks runtime is bundled with this plugin. The helper writes the closed `github.copilot.agent-task-conflict-request` version 1 file and a trusted prompt outside the repository. It loads only the adjacent `cloud_conflict_task.py`, verifies SHA-256 `a117a6ae0c8463e23cf8f1456f75ec67218d77233d18baa0a55ce76db192161a`, and invokes it once with:
 
 ```text
 --conflict-with-report --strategy <merge|rebase|native-stack> --request-file <absolute-path> --prompt-file <absolute-path> --result-file <absolute-path> --policy marketplace-conflict-worker@1 --pr <canonical-url> --model <alias>
@@ -58,7 +58,7 @@ The current base comes from the advertised branch ref, not the pull request's la
 An upper native-stack member may contain a merge that only synchronized its direct base. The coordinator omits that topology marker from the linear replay only when it has exactly two parents, its second parent is in the current direct-base ancestry, and `git show --remerge-diff` is empty. The request retains the exact merge position, parents, tree, subject, trailers, and empty-diff digest. Any merge with manual resolution content, unrelated ancestry, more than two parents, or no later linear tip stops before task creation at a hash-bound owner-normalization boundary. The retained manifest identifies every safe synchronization merge and every merge whose intent a fresh local owner session must preserve while producing linear history. The generated retry command pins the resulting state SHA-256 and cannot consume a managed attempt until normalization passes preflight.
 
 Policy `marketplace-conflict-worker@1` has SHA-256 `30c96b070bed7b652ffd9181fd4f74b052f670226dab9693d595338aaf0a9d6a`.
-The bundled worker helper has SHA-256 `4f2b401eb4ebdc0d4cd3dbdb6fec02177c8e8acac0014b9ca9787c2996af0b73`.
+The bundled worker helper has SHA-256 `a117a6ae0c8463e23cf8f1456f75ec67218d77233d18baa0a55ce76db192161a`.
 
 The full immutable request remains retained outside the repository. The hosted problem statement carries every execution identity and commit SHA, exact evidence for bounded path sets, and canonical SHA-256 summaries plus boundary samples for large path sets. The managed helper refuses a compact statement over 28,000 characters or UTF-8 bytes as `prompt_too_large` before contacting the Agent Tasks API; it never truncates or silently falls back.
 
