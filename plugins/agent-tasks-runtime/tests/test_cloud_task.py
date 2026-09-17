@@ -364,6 +364,39 @@ class PolicyPromptTest(unittest.TestCase):
                 semantic=True,
             )
 
+    def test_clean_semantic_output_cannot_hide_generated_fix_history(self):
+        content = json.dumps(
+            {
+                "schema": MODULE.SEMANTIC_OUTPUT_SCHEMA,
+                "kind": "self-review-loop",
+                "payload": {
+                    "outcome": "cleared",
+                    "iterations_used": 1,
+                    "findings": [],
+                    "pull_request_metadata": {"decision": "keep"},
+                },
+            }
+        )
+        api = mock.Mock()
+        api.request_json.return_value = {
+            "type": "file",
+            "encoding": "base64",
+            "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+        }
+
+        with self.assertRaisesRegex(
+            MODULE.CloudError,
+            "does not account for every generated fix commit",
+        ):
+            MODULE.fetch_semantic_output(
+                api,
+                "owner/repo",
+                ".github/agent-task-semantic/request-1.json",
+                "copilot/task-1",
+                kind="self-review-loop",
+                commits=["1" * 40],
+            )
+
     def test_structural_recovery_requires_request_id_and_rejects_receipt(self):
         result_path = str((Path.cwd().parent / "result.json").resolve())
         base = [

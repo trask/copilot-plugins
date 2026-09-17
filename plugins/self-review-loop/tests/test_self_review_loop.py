@@ -2017,6 +2017,23 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.preflight["pr"]["head_sha"],
         )
 
+    def test_legacy_shaped_semantic_payload_is_not_canonicalized(self):
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "unexpected or missing fields",
+        ):
+            MODULE.canonical_self_review_report(
+                preflight=self.preflight,
+                request_id="request-1",
+                semantic_payload={
+                    "findings": [],
+                    "iterations_used": 1,
+                    "metadata": {"decision": "keep"},
+                    "pull_request": {"number": 392},
+                    "repository": {"name_with_owner": "owner/repo"},
+                },
+            )
+
     def test_clean_semantic_payload_cannot_hide_a_fix_commit(self):
         commit = "4" * 40
         remote = {
