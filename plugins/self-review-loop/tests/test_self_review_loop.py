@@ -1751,7 +1751,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.26")
+        self.assertEqual(plugin["version"], "1.3.27")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -2332,6 +2332,59 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "generated_head": self.artifact,
             },
             identity,
+        )
+        normalized_result = copy.deepcopy(retained)
+        normalized_result["pull_request"]["base_sha"] = self.preflight["pr"][
+            "base_sha"
+        ]
+        remote = MODULE.validate_success_result(
+            normalized_result,
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+        )
+        raw_report = {
+            "repository": self.preflight["pr"]["repo_name"],
+            "pull_request": {
+                "number": self.preflight["pr"]["number"],
+                "url": self.preflight["pr"]["pr_url"],
+                "head_ref": self.preflight["pr"]["head_branch"],
+                "head_sha": self.preflight["pr"]["head_sha"],
+                "base_ref": self.preflight["pr"]["base_branch"],
+                "base_sha": stale_base_ref_oid,
+            },
+            "result": "cleared",
+            "iterations_used": 1,
+            "findings": [],
+            "metadata": {
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+            },
+        }
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "runtime-base clean report",
+        ):
+            MODULE.validate_self_review_report(
+                json.dumps(raw_report),
+                request_id="request-1",
+                preflight=self.preflight,
+                remote=remote,
+                max_iterations=5,
+                paths_by_commit={},
+            )
+        recovered_report = MODULE.validate_self_review_report(
+            json.dumps(raw_report),
+            request_id="request-1",
+            preflight=self.preflight,
+            remote=remote,
+            max_iterations=5,
+            paths_by_commit={},
+            recovery_base_sha=stale_base_ref_oid,
+        )
+        self.assertEqual("cleared", recovered_report["outcome"])
+        self.assertEqual(
+            self.preflight["pr"]["base_sha"],
+            recovered_report["pull_request"]["base_sha"],
         )
         altered = copy.deepcopy(retained)
         altered["pull_request"]["head_sha"] = "8" * 40
