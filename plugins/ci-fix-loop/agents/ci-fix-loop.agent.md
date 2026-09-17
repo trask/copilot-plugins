@@ -25,6 +25,10 @@ Find the installed helper once:
 
 Use the complete prefix for the active shell exactly as shown on every call, replacing only `<arguments>`. The plugin admits that exact installed coordinator command without a user prompt. It does not admit another Python program, helper path, shell command, or coordinator operation. Never import the helper or use any of its APIs.
 
+Legacy-owner reconciliation is a separate mechanical path. When the user supplies a sealed eligibility artifact, invoke its `verifier_argv` directly as an argument array. Do not inspect the helper, artifact, manifest, state, repository, process table, or GitHub first. Do not translate the argv into PowerShell, Bash, or another command, and never run `Select-String` or another exploratory command. A permission denial or verifier error is terminal. Report it and stop without `stack-start`, `loop`, `agent-task`, a retry, or a corrected command. The verifier performs two read-only identity passes and returns strict machine JSON. It cannot query, import, cancel, resume, or create an Agent Task and cannot start the workflow.
+
+Only a separate authorization for the verifier's exact `reconciliation_argv` permits that argv. Invoke it directly and stop after its machine result. The reconciliation command revalidates the artifact, installed package, state, source, pull request, checks, artifacts, and zero-owner process scan before changing only the retained legacy owner to `owner_lost`. It cannot continue the workflow or expose another command.
+
 Before the first helper call, form a canonical target. Pass a supplied GitHub pull request URL or `owner/repo#number` exactly. If the user supplied a bare number such as `19204` or `#19204`, combine it with the current workspace repository to form `owner/repo#19204`. Every `stack-start` command must include that canonical target. Never pass a bare number and never omit the target, even when the worktree is attached to the pull request branch.
 
 For a standalone request, run `stack-start <canonical-target> --repo-root <workspace>`. `stack-start` does not accept `--model`. If it returns `single`, use its returned canonical `target` for:

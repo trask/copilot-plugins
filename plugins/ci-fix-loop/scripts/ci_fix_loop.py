@@ -49,6 +49,40 @@ AGENT_TASK_API_VERSION = "2026-03-10"
 HOSTED_DISPATCH_IDENTITY_SCHEMA = (
     "github.copilot.ci-fix-loop-hosted-dispatch-identity.v1"
 )
+LEGACY_OWNER_RECONCILIATION_SNAPSHOT_SCHEMA = (
+    "github.copilot.ci-fix-loop-legacy-owner-reconciliation-snapshot.v1"
+)
+LEGACY_OWNER_ELIGIBILITY_SCHEMA = (
+    "github.copilot.ci-fix-loop-legacy-owner-eligibility.v1"
+)
+LEGACY_OWNER_AUTHORIZATION_SCHEMA = (
+    "github.copilot.ci-fix-loop-legacy-owner-authorization.v1"
+)
+PLUGIN_PACKAGE_MANIFEST_SCHEMA = {
+    "id": "github.copilot.plugin-package-manifest",
+    "version": 1,
+}
+PLUGIN_PACKAGE_MANIFEST_ALGORITHM = {
+    "aggregate": "sha256",
+    "digest_encoding": "lowercase hexadecimal ASCII",
+    "file_set": (
+        "Every regular Git blob recursively tracked below plugins/<name> at "
+        "source_commit, with no missing or extra installed regular files and "
+        "no symlinks."
+    ),
+    "ordering": (
+        "Ascending lexicographic order of normalized UTF-8 path bytes."
+    ),
+    "path_normalization": (
+        "Plugin-relative Unicode NFC path with forward-slash separators; "
+        "absolute paths, empty components, dot components, backslashes, NUL, "
+        "CR, LF, and normalization collisions are rejected."
+    ),
+    "record_framing": (
+        "path_utf8 + NUL + decimal_byte_size_ascii + NUL + "
+        "file_sha256_lowercase_hex_ascii + LF"
+    ),
+}
 MAX_RERUNS_PER_CHECK = 1
 PR_HEAD_LAG_RETRY_DELAY = 1
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
@@ -118,6 +152,7 @@ MODEL_ALIASES = {
     "astra": "gpt-6-astra",
 }
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 REPORT_PATH_PATTERN = re.compile(
     r"^\.github/agent-task-reports/(?P<request_id>[A-Za-z0-9][A-Za-z0-9._-]*)\.md$"
 )
@@ -1290,6 +1325,239 @@ def require_outside_repository(path: Path, repo_root: Path) -> None:
     except ValueError:
         return
     raise WorkflowError(f"Agent Task artifact must be outside the repository: {path}")
+
+
+def strict_json_file(path: Path, description: str) -> tuple[bytes, Any]:
+    if not path.is_file() or path.is_symlink():
+        raise WorkflowError(f"{description} is not a regular file")
+    try:
+        content = path.read_bytes()
+        text = content.decode("utf-8")
+    except (OSError, UnicodeError) as error:
+        raise WorkflowError(f"could not read {description}: {error}") from error
+    if b"\r" in content or not content.endswith(b"\n"):
+        raise WorkflowError(f"{description} is not canonical UTF-8 JSON")
+    return content, parse_strict_json(text, description=description)
+
+
+def canonical_package_path(value: str) -> str:
+    if (
+        not value
+        or value.startswith("/")
+        or "\\" in value
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+        or any(character in value for character in "\0\r\n")
+        or not value.isascii()
+    ):
+        raise WorkflowError("canonical package path is malformed")
+    return value
+
+
+def canonical_package_digest(files: list[dict[str, Any]]) -> str:
+    if not isinstance(files, list) or not files:
+        raise WorkflowError("canonical package file list is empty")
+    records = []
+    paths = []
+    for item in files:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"path", "size", "sha256"}
+            or not isinstance(item.get("path"), str)
+            or not isinstance(item.get("size"), int)
+            or isinstance(item["size"], bool)
+            or item["size"] < 0
+            or not isinstance(item.get("sha256"), str)
+            or SHA256_PATTERN.fullmatch(item["sha256"]) is None
+        ):
+            raise WorkflowError("canonical package file record is malformed")
+        path = canonical_package_path(item["path"])
+        paths.append(path)
+        records.append(
+            path.encode("utf-8")
+            + b"\0"
+            + str(item["size"]).encode("ascii")
+            + b"\0"
+            + item["sha256"].encode("ascii")
+            + b"\n"
+        )
+    if paths != sorted(paths) or len(paths) != len(set(paths)):
+        raise WorkflowError("canonical package files are not unique and ordered")
+    return hashlib.sha256(b"".join(records)).hexdigest()
+
+
+def installed_package_files(package_root: Path) -> dict[str, Path]:
+    if not package_root.is_dir() or package_root.is_symlink():
+        raise WorkflowError("installed CI Fix package directory is invalid")
+    files: dict[str, Path] = {}
+    for current, directories, names in os.walk(package_root, followlinks=False):
+        current_path = Path(current)
+        for name in directories:
+            path = current_path / name
+            if path.is_symlink() or (
+                hasattr(path, "is_junction") and path.is_junction()
+            ):
+                raise WorkflowError("installed CI Fix package contains a link")
+        for name in names:
+            path = current_path / name
+            if path.is_symlink() or not path.is_file():
+                raise WorkflowError(
+                    "installed CI Fix package contains a non-regular file"
+                )
+            relative = canonical_package_path(
+                "/".join(path.relative_to(package_root).parts)
+            )
+            if relative in files:
+                raise WorkflowError(
+                    "installed CI Fix package paths collide after normalization"
+                )
+            files[relative] = path
+    return files
+
+
+def verify_installed_package_manifest(
+    manifest_path: Path,
+    expected_sha256: str,
+    repo_root: Path,
+) -> dict[str, Any]:
+    require_outside_repository(manifest_path, repo_root)
+    if SHA256_PATTERN.fullmatch(expected_sha256) is None:
+        raise WorkflowError("expected package manifest SHA-256 is malformed")
+    manifest_bytes, manifest = strict_json_file(
+        manifest_path, "canonical package manifest"
+    )
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    if manifest_sha256 != expected_sha256:
+        raise WorkflowError("canonical package manifest SHA-256 drifted")
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest)
+        != {
+            "schema",
+            "generator",
+            "generated_at",
+            "source_commit",
+            "installed_root",
+            "algorithm",
+            "packages",
+        }
+        or manifest.get("schema") != PLUGIN_PACKAGE_MANIFEST_SCHEMA
+        or manifest.get("algorithm") != PLUGIN_PACKAGE_MANIFEST_ALGORITHM
+        or not isinstance(manifest.get("generator"), dict)
+        or set(manifest["generator"])
+        != {"name", "version", "sha256", "command_argv"}
+        or manifest["generator"].get("name")
+        != "trask/copilot-plugins plugin_package_manifest"
+        or manifest["generator"].get("version") != "1.0.0"
+        or SHA256_PATTERN.fullmatch(
+            str(manifest["generator"].get("sha256", ""))
+        )
+        is None
+        or not isinstance(manifest["generator"].get("command_argv"), list)
+        or not all(
+            isinstance(value, str)
+            for value in manifest["generator"]["command_argv"]
+        )
+        or not isinstance(manifest.get("generated_at"), str)
+        or not manifest["generated_at"]
+        or re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}",
+            str(manifest.get("source_commit", "")),
+        )
+        is None
+        or not isinstance(manifest.get("installed_root"), str)
+        or not isinstance(manifest.get("packages"), list)
+        or len(manifest["packages"]) != 1
+    ):
+        raise WorkflowError("canonical package manifest schema or fields are invalid")
+    installed_root = Path(manifest["installed_root"])
+    if (
+        not installed_root.is_absolute()
+        or os.path.normcase(str(installed_root.resolve()))
+        != os.path.normcase(manifest["installed_root"])
+        or not installed_root.is_dir()
+        or installed_root.is_symlink()
+    ):
+        raise WorkflowError("canonical package installed root is invalid")
+    package = manifest["packages"][0]
+    if (
+        not isinstance(package, dict)
+        or set(package)
+        != {
+            "name",
+            "version",
+            "file_count",
+            "byte_count",
+            "package_sha256",
+            "published_git_tree_oid",
+            "files",
+        }
+        or package.get("name") != "ci-fix-loop"
+        or not isinstance(package.get("version"), str)
+        or not package["version"]
+        or not isinstance(package.get("file_count"), int)
+        or isinstance(package["file_count"], bool)
+        or not isinstance(package.get("byte_count"), int)
+        or isinstance(package["byte_count"], bool)
+        or not isinstance(package.get("files"), list)
+        or package["file_count"] != len(package["files"])
+        or package["byte_count"]
+        != sum(
+            item.get("size", -1)
+            for item in package["files"]
+            if isinstance(item, dict)
+        )
+        or SHA256_PATTERN.fullmatch(
+            str(package.get("package_sha256", ""))
+        )
+        is None
+        or re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}",
+            str(package.get("published_git_tree_oid", "")),
+        )
+        is None
+        or canonical_package_digest(package["files"])
+        != package["package_sha256"]
+    ):
+        raise WorkflowError("canonical CI Fix package manifest entry is invalid")
+    expected_files = {item["path"]: item for item in package["files"]}
+    actual_files = installed_package_files(installed_root / "ci-fix-loop")
+    if set(actual_files) != set(expected_files):
+        raise WorkflowError("installed CI Fix package file set drifted")
+    for relative, expected in expected_files.items():
+        content = actual_files[relative].read_bytes()
+        if (
+            len(content) != expected["size"]
+            or hashlib.sha256(content).hexdigest() != expected["sha256"]
+        ):
+            raise WorkflowError(
+                f"installed CI Fix package bytes drifted: {relative}"
+            )
+    helper_record = expected_files.get("scripts/ci_fix_loop.py")
+    expected_helper = (
+        installed_root / "ci-fix-loop" / "scripts" / "ci_fix_loop.py"
+    ).resolve()
+    if (
+        os.path.normcase(str(Path(__file__).resolve()))
+        != os.path.normcase(str(expected_helper))
+        or helper_record is None
+        or helper_record["sha256"] != sha256_file(Path(__file__).resolve())
+    ):
+        raise WorkflowError(
+            "canonical package manifest does not identify this installed helper"
+        )
+    return {
+        "path": str(manifest_path),
+        "sha256": manifest_sha256,
+        "schema": PLUGIN_PACKAGE_MANIFEST_SCHEMA,
+        "source_commit": manifest["source_commit"],
+        "installed_root": manifest["installed_root"],
+        "package": {
+            "name": package["name"],
+            "version": package["version"],
+            "file_count": package["file_count"],
+            "package_sha256": package["package_sha256"],
+        },
+    }
 
 
 def parse_target(target: str) -> dict[str, Any]:
@@ -7049,91 +7317,6 @@ def reconcile_dead_hosted_owner(
             or process_is_running(pid)
         ):
             return state
-    elif monitor is None:
-        legacy_error = (
-            "an unfinished Agent Task already owns this state; "
-            "use its recovery_command"
-        )
-        coordinator = state.get("coordinator")
-        escalation = state.get("escalation")
-        preflight = task.get("preflight")
-        pr = preflight.get("pr") if isinstance(preflight, dict) else None
-        snapshot = (
-            preflight.get("check_snapshot")
-            if isinstance(preflight, dict)
-            else None
-        )
-        identity = (
-            preflight.get("identity") if isinstance(preflight, dict) else None
-        )
-        prompt_path = Path(str(task.get("prompt_file") or ""))
-        result_path = Path(str(task.get("result_file") or ""))
-        triage_result_path = Path(str(task.get("triage_result_file") or ""))
-        if (
-            task.get("phase") != "hosted_fix"
-            or task.get("task_id") is not None
-            or task.get("task_id_status") is not None
-            or task.get("model") != "gpt-5.6-sol"
-            or task.get("policy") != AGENT_TASK_POLICY
-            or task.get("iteration_allowance") != 1
-            or not isinstance(task.get("recovery_command"), str)
-            or "--resume" not in task["recovery_command"].split()
-            or not isinstance(preflight, dict)
-            or not isinstance(pr, dict)
-            or not isinstance(identity, dict)
-            or not isinstance(snapshot, dict)
-            or Path(str(preflight.get("repository_root") or "")).resolve()
-            != repo_root.resolve()
-            or target.get("repo_name") != pr.get("repo_name")
-            or target.get("number") != pr.get("number")
-            or not isinstance(coordinator, dict)
-            or coordinator.get("status") != "blocked"
-            or coordinator.get("detail") != legacy_error
-            or coordinator.get("head_sha") != pr.get("head_sha")
-            or coordinator.get("base_sha") != pr.get("base_sha")
-            or coordinator.get("snapshot_sha256")
-            != snapshot.get("sha256")
-            or not isinstance(escalation, dict)
-            or escalation.get("reason") != "coordinator_error"
-            or escalation.get("detail") != legacy_error
-            or not prompt_path.is_file()
-            or result_path.exists()
-            or not triage_result_path.is_file()
-        ):
-            return state
-        require_outside_repository(prompt_path, repo_root)
-        require_outside_repository(result_path, repo_root)
-        require_outside_repository(triage_result_path, repo_root)
-        if local_identity(repo_root) != identity:
-            raise WorkflowError(
-                "legacy hosted owner source identity changed before finalization"
-            )
-        live = metadata_for(target)
-        require_live_pr_snapshot(pr, live, expected_head=pr["head_sha"])
-        require_live_check_snapshot(preflight)
-        active_pids = command_fragment_process_ids(str(result_path.resolve()))
-        if active_pids:
-            return state
-        monitor = {
-            "schema": "github.copilot.ci-fix-loop-hosted-dispatch-monitor.v1",
-            "status": "owner_lost",
-            "started_at": task.get("started_at"),
-            "timeout_seconds": None,
-            "discovery_interval_seconds": None,
-            "baseline_task_ids": None,
-            "helper_pid": None,
-            "helper_exit_code": None,
-            "finished_at": utc_now(),
-            "failure": "legacy_hosted_helper_owner_lost",
-            "legacy_evidence": {
-                "blocked_coordinator_observed_at": coordinator.get("observed_at"),
-                "prompt_sha256": sha256_file(prompt_path),
-                "triage_result_sha256": sha256_file(triage_result_path),
-                "result_absent": True,
-                "matching_process_ids": [],
-            },
-        }
-        task["dispatch_monitor"] = monitor
     else:
         return state
     identity = task.get("dispatch_identity")
@@ -7158,6 +7341,648 @@ def reconcile_dead_hosted_owner(
     task.pop("recovery_command", None)
     save_state(state_path, state)
     return state
+
+
+def canonical_json_sha256(value: Any) -> str:
+    return sha256_text(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+
+
+def legacy_hosted_owner_reconciliation_snapshot(
+    *,
+    state_path: Path,
+    repo_root: Path,
+    target: dict[str, Any],
+) -> dict[str, Any]:
+    state = load_state(state_path)
+    task = state.get("agent_task")
+    coordinator = state.get("coordinator")
+    escalation = state.get("escalation")
+    preflight = task.get("preflight") if isinstance(task, dict) else None
+    pr = preflight.get("pr") if isinstance(preflight, dict) else None
+    check_snapshot = (
+        preflight.get("check_snapshot") if isinstance(preflight, dict) else None
+    )
+    identity = preflight.get("identity") if isinstance(preflight, dict) else None
+    legacy_error = (
+        "an unfinished Agent Task already owns this state; "
+        "use its recovery_command"
+    )
+    if (
+        not isinstance(task, dict)
+        or task.get("status") != "running"
+        or task.get("phase") != "hosted_fix"
+        or task.get("dispatch_monitor") is not None
+        or task.get("dispatch_identity") is not None
+        or task.get("task_id") is not None
+        or task.get("task_id_status") is not None
+        or task.get("model") != "gpt-5.6-sol"
+        or task.get("policy") != AGENT_TASK_POLICY
+        or task.get("iteration_allowance") != 1
+        or not isinstance(task.get("run_id"), str)
+        or not task["run_id"]
+        or not isinstance(task.get("recovery_command"), str)
+        or "--resume" not in task["recovery_command"].split()
+        or not isinstance(preflight, dict)
+        or not isinstance(pr, dict)
+        or not isinstance(identity, dict)
+        or not isinstance(check_snapshot, dict)
+        or Path(str(preflight.get("repository_root") or "")).resolve()
+        != repo_root.resolve()
+        or target.get("pr_url") != pr.get("pr_url")
+        or target.get("repo_name") != pr.get("repo_name")
+        or target.get("number") != pr.get("number")
+        or not isinstance(coordinator, dict)
+        or coordinator.get("status") != "blocked"
+        or coordinator.get("detail") != legacy_error
+        or coordinator.get("head_sha") != pr.get("head_sha")
+        or coordinator.get("base_sha") != pr.get("base_sha")
+        or coordinator.get("snapshot_sha256")
+        != check_snapshot.get("sha256")
+        or not isinstance(escalation, dict)
+        or escalation.get("reason") != "coordinator_error"
+        or escalation.get("detail") != legacy_error
+    ):
+        raise WorkflowError(
+            "state is not the exact blocked legacy hosted owner"
+        )
+    prompt_path = Path(str(task.get("prompt_file") or ""))
+    result_path = Path(str(task.get("result_file") or ""))
+    triage_result_path = Path(str(task.get("triage_result_file") or ""))
+    for path in (prompt_path, result_path, triage_result_path):
+        require_outside_repository(path, repo_root)
+    if (
+        not prompt_path.is_file()
+        or prompt_path.is_symlink()
+        or result_path.exists()
+        or result_path.is_symlink()
+        or not triage_result_path.is_file()
+        or triage_result_path.is_symlink()
+    ):
+        raise WorkflowError("legacy hosted owner artifact identity is invalid")
+    current_identity = local_identity(repo_root)
+    if current_identity != identity:
+        raise WorkflowError(
+            "legacy hosted owner source identity changed before reconciliation"
+        )
+    live_pr = metadata_for(target)
+    require_live_pr_snapshot(pr, live_pr, expected_head=pr["head_sha"])
+    require_live_check_snapshot(preflight)
+    matching_process_ids = command_fragment_process_ids(
+        str(result_path.resolve())
+    )
+    if matching_process_ids:
+        raise WorkflowError("legacy hosted helper process still owns the result")
+    return {
+        "schema": LEGACY_OWNER_RECONCILIATION_SNAPSHOT_SCHEMA,
+        "helper_sha256": sha256_file(Path(__file__).resolve()),
+        "state": {
+            "path": str(state_path),
+            "sha256": sha256_file(state_path),
+        },
+        "target": target["pr_url"],
+        "repo_root": str(repo_root),
+        "owner": task["run_id"],
+        "model": task["model"],
+        "policy": task["policy"],
+        "iteration_allowance": task["iteration_allowance"],
+        "iterations": state.get("iterations"),
+        "prompt": {
+            "path": str(prompt_path),
+            "sha256": sha256_file(prompt_path),
+            "size": prompt_path.stat().st_size,
+        },
+        "triage_result": {
+            "path": str(triage_result_path),
+            "sha256": sha256_file(triage_result_path),
+            "size": triage_result_path.stat().st_size,
+        },
+        "missing_result": str(result_path),
+        "matching_process_ids": [],
+        "source_identity": current_identity,
+        "preflight_sha256": canonical_json_sha256(preflight),
+        "live_pr_sha256": canonical_json_sha256(live_pr),
+        "blocked_coordinator_observed_at": coordinator.get("observed_at"),
+    }
+
+
+def legacy_owner_reconciliation_seal(snapshot: dict[str, Any]) -> str:
+    return canonical_json_sha256(snapshot)
+
+
+def legacy_owner_eligibility_seal(
+    snapshot: dict[str, Any],
+    package_manifest: dict[str, Any],
+) -> str:
+    return canonical_json_sha256(
+        {
+            "schema": LEGACY_OWNER_ELIGIBILITY_SCHEMA,
+            "snapshot": snapshot,
+            "package_manifest": package_manifest,
+        }
+    )
+
+
+def legacy_owner_verifier_argv(
+    *,
+    target: dict[str, Any],
+    repo_root: Path,
+    state_path: Path,
+    eligibility_path: Path,
+    digest_path: Path,
+    package_manifest_path: Path,
+    package_manifest_sha256: str,
+    seal: str,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "verify-legacy-owner-reconciliation",
+        target["pr_url"],
+        "--repo-root",
+        str(repo_root),
+        "--state",
+        str(state_path),
+        "--eligibility-artifact",
+        str(eligibility_path),
+        "--eligibility-sha256-file",
+        str(digest_path),
+        "--package-manifest",
+        str(package_manifest_path),
+        "--expected-package-manifest-sha256",
+        package_manifest_sha256,
+        "--expected-seal",
+        seal,
+    ]
+
+
+def legacy_owner_apply_argv(
+    *,
+    target: dict[str, Any],
+    repo_root: Path,
+    state_path: Path,
+    eligibility_path: Path,
+    digest_path: Path,
+    artifact_sha256: str,
+    package_manifest_path: Path,
+    package_manifest_sha256: str,
+    seal: str,
+    authorization_token: str,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "apply-legacy-owner-reconciliation",
+        target["pr_url"],
+        "--repo-root",
+        str(repo_root),
+        "--state",
+        str(state_path),
+        "--eligibility-artifact",
+        str(eligibility_path),
+        "--eligibility-sha256-file",
+        str(digest_path),
+        "--expected-artifact-sha256",
+        artifact_sha256,
+        "--package-manifest",
+        str(package_manifest_path),
+        "--expected-package-manifest-sha256",
+        package_manifest_sha256,
+        "--expected-seal",
+        seal,
+        "--expected-authorization-token",
+        authorization_token,
+    ]
+
+
+def write_new_evidence_file(path: Path, content: bytes) -> None:
+    if path.exists() or path.is_symlink():
+        raise WorkflowError(f"refusing to overwrite recovery evidence: {path}")
+    if not path.parent.is_dir() or path.parent.is_symlink():
+        raise WorkflowError("recovery evidence directory is invalid")
+    descriptor = None
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        path.unlink(missing_ok=True)
+        raise
+
+
+def legacy_owner_eligibility_artifact(
+    *,
+    target: dict[str, Any],
+    repo_root: Path,
+    state_path: Path,
+    eligibility_path: Path,
+    digest_path: Path,
+    snapshot: dict[str, Any],
+    package_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    seal = legacy_owner_eligibility_seal(snapshot, package_manifest)
+    artifact = {
+        "schema": LEGACY_OWNER_ELIGIBILITY_SCHEMA,
+        "result": "legacy_owner_reconciliation_eligible",
+        "seal": seal,
+        "reconciliation_seal": legacy_owner_reconciliation_seal(snapshot),
+        "snapshot": snapshot,
+        "package_manifest": package_manifest,
+        "eligibility_artifact": str(eligibility_path),
+        "eligibility_sha256_file": str(digest_path),
+        "verifier_argv": legacy_owner_verifier_argv(
+            target=target,
+            repo_root=repo_root,
+            state_path=state_path,
+            eligibility_path=eligibility_path,
+            digest_path=digest_path,
+            package_manifest_path=Path(package_manifest["path"]),
+            package_manifest_sha256=package_manifest["sha256"],
+            seal=seal,
+        ),
+    }
+    return artifact
+
+
+def load_legacy_owner_eligibility(
+    *,
+    eligibility_path: Path,
+    digest_path: Path,
+    expected_artifact_sha256: str | None,
+    expected_seal: str,
+) -> tuple[str, dict[str, Any]]:
+    if (
+        expected_artifact_sha256 is not None
+        and SHA256_PATTERN.fullmatch(expected_artifact_sha256) is None
+    ) or SHA256_PATTERN.fullmatch(expected_seal) is None:
+        raise WorkflowError("legacy owner eligibility digest is malformed")
+    content, artifact = strict_json_file(
+        eligibility_path, "legacy owner eligibility artifact"
+    )
+    artifact_sha256 = hashlib.sha256(content).hexdigest()
+    if (
+        digest_path != eligibility_path.with_name(
+            f"{eligibility_path.name}.sha256"
+        )
+        or not digest_path.is_file()
+        or digest_path.is_symlink()
+        or digest_path.read_bytes()
+        != f"{artifact_sha256}\n".encode("ascii")
+    ):
+        raise WorkflowError("legacy owner eligibility SHA-256 file drifted")
+    if (
+        expected_artifact_sha256 is not None
+        and artifact_sha256 != expected_artifact_sha256
+    ):
+        raise WorkflowError("legacy owner eligibility artifact SHA-256 drifted")
+    if (
+        not isinstance(artifact, dict)
+        or set(artifact)
+        != {
+            "schema",
+            "result",
+            "seal",
+            "reconciliation_seal",
+            "snapshot",
+            "package_manifest",
+            "eligibility_artifact",
+            "eligibility_sha256_file",
+            "verifier_argv",
+        }
+        or artifact.get("schema") != LEGACY_OWNER_ELIGIBILITY_SCHEMA
+        or artifact.get("result") != "legacy_owner_reconciliation_eligible"
+        or artifact.get("seal") != expected_seal
+        or artifact.get("eligibility_artifact") != str(eligibility_path)
+        or artifact.get("eligibility_sha256_file") != str(digest_path)
+        or not isinstance(artifact.get("snapshot"), dict)
+        or not isinstance(artifact.get("package_manifest"), dict)
+        or not isinstance(artifact.get("verifier_argv"), list)
+        or SHA256_PATTERN.fullmatch(
+            str(artifact.get("reconciliation_seal", ""))
+        )
+        is None
+    ):
+        raise WorkflowError("legacy owner eligibility artifact is malformed")
+    return artifact_sha256, artifact
+
+
+def legacy_owner_authorization_token(
+    *,
+    artifact_sha256: str,
+    eligibility_seal: str,
+    package_manifest_sha256: str,
+    reconciliation_seal: str,
+    snapshot_sha256: str,
+    verifier_argv: list[str],
+) -> str:
+    return canonical_json_sha256(
+        {
+            "schema": LEGACY_OWNER_AUTHORIZATION_SCHEMA,
+            "eligibility_artifact_sha256": artifact_sha256,
+            "eligibility_seal": eligibility_seal,
+            "package_manifest_sha256": package_manifest_sha256,
+            "reconciliation_seal": reconciliation_seal,
+            "snapshot_sha256": snapshot_sha256,
+            "verifier_argv": verifier_argv,
+        }
+    )
+
+
+def validate_legacy_owner_evidence(
+    args: argparse.Namespace,
+    *,
+    repo_root: Path,
+    target: dict[str, Any],
+    state_path: Path,
+) -> tuple[str, dict[str, Any], dict[str, Any], list[str]]:
+    eligibility_path = cli_path(args.eligibility_artifact)
+    digest_path = cli_path(args.eligibility_sha256_file)
+    package_manifest_path = cli_path(args.package_manifest)
+    for path in (
+        state_path,
+        eligibility_path,
+        digest_path,
+        package_manifest_path,
+    ):
+        require_outside_repository(path, repo_root)
+    artifact_sha256, artifact = load_legacy_owner_eligibility(
+        eligibility_path=eligibility_path,
+        digest_path=digest_path,
+        expected_artifact_sha256=getattr(
+            args, "expected_artifact_sha256", None
+        ),
+        expected_seal=args.expected_seal,
+    )
+    package_manifest = verify_installed_package_manifest(
+        package_manifest_path,
+        args.expected_package_manifest_sha256,
+        repo_root,
+    )
+    expected_verifier = legacy_owner_verifier_argv(
+        target=target,
+        repo_root=repo_root,
+        state_path=state_path,
+        eligibility_path=eligibility_path,
+        digest_path=digest_path,
+        package_manifest_path=package_manifest_path,
+        package_manifest_sha256=package_manifest["sha256"],
+        seal=args.expected_seal,
+    )
+    if (
+        artifact["package_manifest"] != package_manifest
+        or artifact["verifier_argv"] != expected_verifier
+        or legacy_owner_eligibility_seal(
+            artifact["snapshot"], package_manifest
+        )
+        != args.expected_seal
+        or legacy_owner_reconciliation_seal(artifact["snapshot"])
+        != artifact["reconciliation_seal"]
+    ):
+        raise WorkflowError("legacy owner eligibility identity drifted")
+    return artifact_sha256, artifact, package_manifest, expected_verifier
+
+
+def command_prepare_legacy_owner_reconciliation(
+    args: argparse.Namespace,
+) -> None:
+    require_tools()
+    repo_root = resolve_repo_root(args.repo_root)
+    target = resolve_target(args.target, repo_root)
+    state_path = cli_path(args.state) if args.state else default_state_path(target)
+    eligibility_path = cli_path(args.eligibility_artifact)
+    digest_path = eligibility_path.with_name(
+        f"{eligibility_path.name}.sha256"
+    )
+    package_manifest_path = cli_path(args.package_manifest)
+    for path in (
+        state_path,
+        eligibility_path,
+        digest_path,
+        package_manifest_path,
+    ):
+        require_outside_repository(path, repo_root)
+    package_manifest = verify_installed_package_manifest(
+        package_manifest_path,
+        args.expected_package_manifest_sha256,
+        repo_root,
+    )
+    snapshot = legacy_hosted_owner_reconciliation_snapshot(
+        state_path=state_path,
+        repo_root=repo_root,
+        target=target,
+    )
+    artifact = legacy_owner_eligibility_artifact(
+        target=target,
+        repo_root=repo_root,
+        state_path=state_path,
+        eligibility_path=eligibility_path,
+        digest_path=digest_path,
+        snapshot=snapshot,
+        package_manifest=package_manifest,
+    )
+    content = (
+        json.dumps(artifact, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    ).encode("utf-8")
+    final_sha256 = hashlib.sha256(content).hexdigest()
+    write_new_evidence_file(eligibility_path, content)
+    try:
+        write_new_evidence_file(
+            digest_path, f"{final_sha256}\n".encode("ascii")
+        )
+    except BaseException:
+        eligibility_path.unlink(missing_ok=True)
+        raise
+    emit(
+        {
+            "schema": LEGACY_OWNER_ELIGIBILITY_SCHEMA,
+            "result": "eligibility_written",
+            "eligibility_artifact": str(eligibility_path),
+            "eligibility_artifact_sha256": final_sha256,
+            "eligibility_sha256_file": str(digest_path),
+            "seal": artifact["seal"],
+            "verifier_argv": artifact["verifier_argv"],
+            "mutation_performed": False,
+            "workflow_started": False,
+        }
+    )
+
+
+def command_verify_legacy_owner_reconciliation(
+    args: argparse.Namespace,
+) -> None:
+    require_tools()
+    repo_root = resolve_repo_root(args.repo_root)
+    target = resolve_target(args.target, repo_root)
+    state_path = cli_path(args.state) if args.state else default_state_path(target)
+    artifact_sha256, artifact, package_manifest, verifier_argv = (
+        validate_legacy_owner_evidence(
+            args,
+            repo_root=repo_root,
+            target=target,
+            state_path=state_path,
+        )
+    )
+    snapshots = [
+        legacy_hosted_owner_reconciliation_snapshot(
+            state_path=state_path,
+            repo_root=repo_root,
+            target=target,
+        )
+        for _ in range(2)
+    ]
+    if snapshots != [artifact["snapshot"], artifact["snapshot"]]:
+        raise WorkflowError(
+            "legacy owner eligibility changed during two-pass verification"
+        )
+    snapshot_sha256 = legacy_owner_reconciliation_seal(snapshots[1])
+    authorization_token = legacy_owner_authorization_token(
+        artifact_sha256=artifact_sha256,
+        eligibility_seal=args.expected_seal,
+        package_manifest_sha256=package_manifest["sha256"],
+        reconciliation_seal=artifact["reconciliation_seal"],
+        snapshot_sha256=snapshot_sha256,
+        verifier_argv=verifier_argv,
+    )
+    apply_argv = legacy_owner_apply_argv(
+        target=target,
+        repo_root=repo_root,
+        state_path=state_path,
+        eligibility_path=cli_path(args.eligibility_artifact),
+        digest_path=cli_path(args.eligibility_sha256_file),
+        artifact_sha256=artifact_sha256,
+        package_manifest_path=cli_path(args.package_manifest),
+        package_manifest_sha256=package_manifest["sha256"],
+        seal=args.expected_seal,
+        authorization_token=authorization_token,
+    )
+    emit(
+        {
+            "schema": LEGACY_OWNER_AUTHORIZATION_SCHEMA,
+            "result": "authorized",
+            "authorization_token": authorization_token,
+            "passes": 2,
+            "snapshot_sha256": snapshot_sha256,
+            "eligibility_artifact_sha256": artifact_sha256,
+            "package_manifest_sha256": package_manifest["sha256"],
+            "reconciliation_argv": apply_argv,
+            "mutation_performed": False,
+            "workflow_started": False,
+        }
+    )
+
+
+def command_apply_legacy_owner_reconciliation(
+    args: argparse.Namespace,
+) -> None:
+    require_tools()
+    repo_root = resolve_repo_root(args.repo_root)
+    target = resolve_target(args.target, repo_root)
+    state_path = cli_path(args.state) if args.state else default_state_path(target)
+    artifact_sha256, artifact, package_manifest, verifier_argv = (
+        validate_legacy_owner_evidence(
+            args,
+            repo_root=repo_root,
+            target=target,
+            state_path=state_path,
+        )
+    )
+    snapshots = [
+        legacy_hosted_owner_reconciliation_snapshot(
+            state_path=state_path,
+            repo_root=repo_root,
+            target=target,
+        )
+        for _ in range(2)
+    ]
+    if snapshots != [artifact["snapshot"], artifact["snapshot"]]:
+        raise WorkflowError(
+            "legacy owner changed before authorized reconciliation"
+        )
+    snapshot_sha256 = legacy_owner_reconciliation_seal(snapshots[1])
+    expected_token = legacy_owner_authorization_token(
+        artifact_sha256=artifact_sha256,
+        eligibility_seal=args.expected_seal,
+        package_manifest_sha256=package_manifest["sha256"],
+        reconciliation_seal=artifact["reconciliation_seal"],
+        snapshot_sha256=snapshot_sha256,
+        verifier_argv=verifier_argv,
+    )
+    if args.expected_authorization_token != expected_token:
+        raise WorkflowError("legacy owner authorization token drifted")
+    state = load_state(state_path)
+    final_snapshot = legacy_hosted_owner_reconciliation_snapshot(
+        state_path=state_path,
+        repo_root=repo_root,
+        target=target,
+    )
+    if final_snapshot != artifact["snapshot"]:
+        raise WorkflowError("legacy owner changed at reconciliation boundary")
+    task = state["agent_task"]
+    coordinator = state["coordinator"]
+    prompt_path = Path(task["prompt_file"])
+    triage_result_path = Path(task["triage_result_file"])
+    finished_at = utc_now()
+    task["dispatch_monitor"] = {
+        "schema": "github.copilot.ci-fix-loop-hosted-dispatch-monitor.v1",
+        "status": "owner_lost",
+        "started_at": task.get("started_at"),
+        "timeout_seconds": None,
+        "discovery_interval_seconds": None,
+        "baseline_task_ids": None,
+        "helper_pid": None,
+        "helper_exit_code": None,
+        "finished_at": finished_at,
+        "failure": "legacy_hosted_helper_owner_lost",
+        "legacy_evidence": {
+            "blocked_coordinator_observed_at": coordinator.get("observed_at"),
+            "prompt_sha256": sha256_file(prompt_path),
+            "triage_result_sha256": sha256_file(triage_result_path),
+            "result_absent": True,
+            "matching_process_ids": [],
+            "eligibility_artifact_sha256": artifact_sha256,
+            "package_manifest_sha256": package_manifest["sha256"],
+            "authorization_token": expected_token,
+            "snapshot_sha256": snapshot_sha256,
+        },
+    }
+    task["status"] = "failed"
+    task["task_id_status"] = "unknown"
+    task["task_id"] = None
+    task["error"] = (
+        "legacy hosted Agent Task helper owner is no longer running; "
+        "task identity unknown"
+    )
+    task["failed_at"] = finished_at
+    task.pop("retry_command", None)
+    task.pop("recovery_command", None)
+    if sha256_file(state_path) != artifact["snapshot"]["state"]["sha256"]:
+        raise WorkflowError("legacy owner state changed before atomic save")
+    save_state(state_path, state)
+    emit(
+        {
+            "schema": LEGACY_OWNER_AUTHORIZATION_SCHEMA,
+            "result": "owner_lost",
+            "state": str(state_path),
+            "owner": artifact["snapshot"]["owner"],
+            "task_id_status": "unknown",
+            "authorization_token": expected_token,
+            "mutation_performed": True,
+            "workflow_started": False,
+            "task_created": False,
+            "continuation": None,
+        }
+    )
 
 
 def command_agent_task(args: argparse.Namespace) -> None:
@@ -10565,6 +11390,66 @@ def command_cleanup(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    prepare_legacy = subparsers.add_parser(
+        "prepare-legacy-owner-reconciliation",
+        help="write sealed read-only evidence for one exact blocked legacy owner",
+    )
+    prepare_legacy.add_argument("target")
+    prepare_legacy.add_argument("--repo-root", required=True)
+    prepare_legacy.add_argument("--state", required=True)
+    prepare_legacy.add_argument("--eligibility-artifact", required=True)
+    prepare_legacy.add_argument("--package-manifest", required=True)
+    prepare_legacy.add_argument(
+        "--expected-package-manifest-sha256",
+        required=True,
+    )
+    prepare_legacy.set_defaults(
+        function=command_prepare_legacy_owner_reconciliation
+    )
+
+    verify_legacy = subparsers.add_parser(
+        "verify-legacy-owner-reconciliation",
+        help="perform two read-only identity passes for sealed legacy evidence",
+    )
+    verify_legacy.add_argument("target")
+    verify_legacy.add_argument("--repo-root", required=True)
+    verify_legacy.add_argument("--state", required=True)
+    verify_legacy.add_argument("--eligibility-artifact", required=True)
+    verify_legacy.add_argument("--eligibility-sha256-file", required=True)
+    verify_legacy.add_argument("--package-manifest", required=True)
+    verify_legacy.add_argument(
+        "--expected-package-manifest-sha256",
+        required=True,
+    )
+    verify_legacy.add_argument("--expected-seal", required=True)
+    verify_legacy.set_defaults(
+        function=command_verify_legacy_owner_reconciliation
+    )
+
+    apply_legacy = subparsers.add_parser(
+        "apply-legacy-owner-reconciliation",
+        help="finalize only the exact verifier-authorized legacy owner",
+    )
+    apply_legacy.add_argument("target")
+    apply_legacy.add_argument("--repo-root", required=True)
+    apply_legacy.add_argument("--state", required=True)
+    apply_legacy.add_argument("--eligibility-artifact", required=True)
+    apply_legacy.add_argument("--eligibility-sha256-file", required=True)
+    apply_legacy.add_argument("--expected-artifact-sha256", required=True)
+    apply_legacy.add_argument("--package-manifest", required=True)
+    apply_legacy.add_argument(
+        "--expected-package-manifest-sha256",
+        required=True,
+    )
+    apply_legacy.add_argument("--expected-seal", required=True)
+    apply_legacy.add_argument(
+        "--expected-authorization-token",
+        required=True,
+    )
+    apply_legacy.set_defaults(
+        function=command_apply_legacy_owner_reconciliation
+    )
 
     agent_task = subparsers.add_parser(
         "agent-task",

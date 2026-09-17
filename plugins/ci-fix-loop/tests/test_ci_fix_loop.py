@@ -163,6 +163,123 @@ class AgentCommandAdmissionTest(unittest.TestCase):
             "ci_fix_loop_permission.py", permission_hooks[0]["powershell"]
         )
 
+    def test_admits_exact_reconciliation_argv_with_windows_spaces(self):
+        with tempfile.TemporaryDirectory(prefix="ci fix admission ") as directory:
+            root = Path(directory)
+            repo = root / "source workspace"
+            repo.mkdir()
+            state = root / "legacy state.json"
+            artifact = root / "sealed eligibility.json"
+            digest = root / "sealed eligibility.json.sha256"
+            manifest = root / "package manifest.json"
+            for path in (state, artifact, digest, manifest):
+                path.write_text("{}\n", encoding="utf-8")
+            argv = [
+                sys.executable,
+                str(SCRIPT.resolve()),
+                "verify-legacy-owner-reconciliation",
+                "https://github.com/owner/repo/pull/7",
+                "--repo-root",
+                str(repo),
+                "--state",
+                str(state),
+                "--eligibility-artifact",
+                str(artifact),
+                "--eligibility-sha256-file",
+                str(digest),
+                "--package-manifest",
+                str(manifest),
+                "--expected-package-manifest-sha256",
+                "1" * 64,
+                "--expected-seal",
+                "2" * 64,
+            ]
+            command = subprocess.list2cmdline(argv)
+
+            self.assertTrue(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(command, cwd=str(repo))
+                )
+            )
+
+    def test_reconciliation_admission_rejects_exploration_and_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            paths = [
+                root / name
+                for name in (
+                    "state.json",
+                    "artifact.json",
+                    "artifact.json.sha256",
+                    "manifest.json",
+                )
+            ]
+            for path in paths:
+                path.write_text("{}\n", encoding="utf-8")
+            valid = [
+                sys.executable,
+                str(SCRIPT.resolve()),
+                "apply-legacy-owner-reconciliation",
+                "owner/repo#7",
+                "--repo-root",
+                str(repo),
+                "--state",
+                str(paths[0]),
+                "--eligibility-artifact",
+                str(paths[1]),
+                "--eligibility-sha256-file",
+                str(paths[2]),
+                "--expected-artifact-sha256",
+                "1" * 64,
+                "--package-manifest",
+                str(paths[3]),
+                "--expected-package-manifest-sha256",
+                "2" * 64,
+                "--expected-seal",
+                "3" * 64,
+                "--expected-authorization-token",
+                "4" * 64,
+            ]
+            self.assertTrue(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(
+                        subprocess.list2cmdline(valid),
+                        cwd=str(repo),
+                    )
+                )
+            )
+            rejected = [
+                "Select-String -Path helper.py -Pattern reconcile",
+                subprocess.list2cmdline(valid[:-2]),
+                subprocess.list2cmdline(
+                    [
+                        value if value != "3" * 64 else "invalid"
+                        for value in valid
+                    ]
+                ),
+                subprocess.list2cmdline(
+                    valid + ["--model", "sol"]
+                ),
+            ]
+            for command in rejected:
+                with self.subTest(command=command):
+                    self.assertFalse(
+                        PERMISSION_MODULE.admission_allowed(
+                            self.payload(command, cwd=str(repo))
+                        )
+                    )
+
+    def test_agent_reconciliation_path_is_direct_and_denial_is_terminal(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+        self.assertIn("invoke its `verifier_argv` directly", instructions)
+        self.assertIn("never run `Select-String`", instructions)
+        self.assertIn("A permission denial or verifier error is terminal", instructions)
+        self.assertIn(
+            "stop without `stack-start`, `loop`, `agent-task`", instructions
+        )
+
     @unittest.skipUnless(
         os.environ.get("COPILOT_CI_FIX_AGENT_INTEGRATION") == "1",
         "set COPILOT_CI_FIX_AGENT_INTEGRATION=1 to exercise Copilot admission",
@@ -1622,21 +1739,15 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             },
         }
 
-    def test_legacy_dead_owner_finalizes_after_exact_blocked_entry(self):
+    def test_normal_agent_task_entry_does_not_finalize_legacy_owner(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
             repo, identity, state = self.legacy_owner_state(directory)
             MODULE.save_state(state_path, state)
             with (
-                mock.patch.object(MODULE, "local_identity", return_value=identity),
                 mock.patch.object(
-                    MODULE, "metadata_for", return_value=state["agent_task"]["preflight"]["pr"]
-                ),
-                mock.patch.object(MODULE, "require_live_pr_snapshot"),
-                mock.patch.object(MODULE, "require_live_check_snapshot"),
-                mock.patch.object(
-                    MODULE, "command_fragment_process_ids", return_value=[]
-                ),
+                    MODULE, "metadata_for"
+                ) as metadata,
             ):
                 reconciled = MODULE.reconcile_dead_hosted_owner(
                     state_path,
@@ -1646,17 +1757,12 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 )
 
             task = reconciled["agent_task"]
-            self.assertEqual("failed", task["status"])
-            self.assertEqual("unknown", task["task_id_status"])
-            self.assertEqual(
-                "legacy_hosted_helper_owner_lost",
-                task["dispatch_monitor"]["failure"],
-            )
-            self.assertTrue(
-                task["dispatch_monitor"]["legacy_evidence"]["result_absent"]
-            )
+            self.assertEqual("running", task["status"])
+            self.assertNotIn("dispatch_monitor", task)
+            self.assertNotIn("task_id_status", task)
             self.assertEqual(1, reconciled["iterations"])
-            self.assertNotIn("recovery_command", task)
+            self.assertIn("recovery_command", task)
+            metadata.assert_not_called()
 
     def test_legacy_owner_stays_active_while_exact_helper_process_exists(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1683,6 +1789,455 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
 
             self.assertEqual("running", reconciled["agent_task"]["status"])
             self.assertIn("recovery_command", reconciled["agent_task"])
+
+    def test_legacy_owner_snapshot_requires_exact_zero_owner_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            repo, identity, state = self.legacy_owner_state(directory)
+            MODULE.save_state(state_path, state)
+            with (
+                mock.patch.object(MODULE, "local_identity", return_value=identity),
+                mock.patch.object(
+                    MODULE,
+                    "metadata_for",
+                    return_value=state["agent_task"]["preflight"]["pr"],
+                ),
+                mock.patch.object(MODULE, "require_live_pr_snapshot"),
+                mock.patch.object(MODULE, "require_live_check_snapshot"),
+                mock.patch.object(
+                    MODULE, "command_fragment_process_ids", return_value=[]
+                ),
+            ):
+                snapshot = MODULE.legacy_hosted_owner_reconciliation_snapshot(
+                    state_path=state_path,
+                    repo_root=repo,
+                    target=MODULE.parse_target("owner/repo#7"),
+                )
+
+            self.assertEqual(
+                MODULE.LEGACY_OWNER_RECONCILIATION_SNAPSHOT_SCHEMA,
+                snapshot["schema"],
+            )
+            self.assertEqual(MODULE.sha256_file(state_path), snapshot["state"]["sha256"])
+            self.assertEqual([], snapshot["matching_process_ids"])
+            self.assertEqual("run-1", snapshot["owner"])
+
+            with (
+                mock.patch.object(MODULE, "local_identity", return_value=identity),
+                mock.patch.object(
+                    MODULE,
+                    "metadata_for",
+                    return_value=state["agent_task"]["preflight"]["pr"],
+                ),
+                mock.patch.object(MODULE, "require_live_pr_snapshot"),
+                mock.patch.object(MODULE, "require_live_check_snapshot"),
+                mock.patch.object(
+                    MODULE, "command_fragment_process_ids", return_value=[77]
+                ),
+                self.assertRaisesRegex(MODULE.WorkflowError, "still owns"),
+            ):
+                MODULE.legacy_hosted_owner_reconciliation_snapshot(
+                    state_path=state_path,
+                    repo_root=repo,
+                    target=MODULE.parse_target("owner/repo#7"),
+                )
+
+    def test_package_manifest_verifies_exact_installed_helper_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "source"
+            repo.mkdir()
+            installed_root = root / "installed plugins"
+            helper = (
+                installed_root
+                / "ci-fix-loop"
+                / "scripts"
+                / "ci_fix_loop.py"
+            )
+            helper.parent.mkdir(parents=True)
+            helper.write_text("exact helper\n", encoding="utf-8", newline="\n")
+            files = [
+                {
+                    "path": "scripts/ci_fix_loop.py",
+                    "size": helper.stat().st_size,
+                    "sha256": MODULE.sha256_file(helper),
+                }
+            ]
+            package = {
+                "name": "ci-fix-loop",
+                "version": "1.6.31",
+                "file_count": 1,
+                "byte_count": helper.stat().st_size,
+                "package_sha256": MODULE.canonical_package_digest(files),
+                "published_git_tree_oid": "1" * 40,
+                "files": files,
+            }
+            manifest = {
+                "schema": MODULE.PLUGIN_PACKAGE_MANIFEST_SCHEMA,
+                "generator": {
+                    "name": "trask/copilot-plugins plugin_package_manifest",
+                    "version": "1.0.0",
+                    "sha256": "2" * 64,
+                    "command_argv": [],
+                },
+                "generated_at": "2026-09-17T00:00:00Z",
+                "source_commit": "3" * 40,
+                "installed_root": str(installed_root.resolve()),
+                "algorithm": MODULE.PLUGIN_PACKAGE_MANIFEST_ALGORITHM,
+                "packages": [package],
+            }
+            manifest_path = root / "package manifest.json"
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            with mock.patch.object(MODULE, "__file__", str(helper)):
+                verified = MODULE.verify_installed_package_manifest(
+                    manifest_path,
+                    MODULE.sha256_file(manifest_path),
+                    repo,
+                )
+
+            self.assertEqual("ci-fix-loop", verified["package"]["name"])
+            self.assertEqual(MODULE.sha256_file(helper), files[0]["sha256"])
+
+            (installed_root / "ci-fix-loop" / "unexpected").write_text(
+                "drift\n", encoding="utf-8"
+            )
+            with (
+                mock.patch.object(MODULE, "__file__", str(helper)),
+                self.assertRaisesRegex(MODULE.WorkflowError, "file set drifted"),
+            ):
+                MODULE.verify_installed_package_manifest(
+                    manifest_path,
+                    MODULE.sha256_file(manifest_path),
+                    repo,
+                )
+
+    def test_sealed_verifier_authorizes_only_exact_two_pass_snapshot(self):
+        with tempfile.TemporaryDirectory(prefix="legacy owner ") as directory:
+            root = Path(directory)
+            state_path = root / "state.json"
+            artifact_path = root / "eligibility artifact.json"
+            digest_path = root / "eligibility artifact.json.sha256"
+            manifest_path = root / "package manifest.json"
+            repo, _identity, state = self.legacy_owner_state(directory)
+            MODULE.save_state(state_path, state)
+            manifest_path.write_text("{}\n", encoding="utf-8")
+            package = {
+                "path": str(manifest_path),
+                "sha256": "a" * 64,
+                "schema": MODULE.PLUGIN_PACKAGE_MANIFEST_SCHEMA,
+                "source_commit": "b" * 40,
+                "installed_root": str(root / "installed"),
+                "package": {
+                    "name": "ci-fix-loop",
+                    "version": "1.6.31",
+                    "file_count": 8,
+                    "package_sha256": "c" * 64,
+                },
+            }
+            snapshot = {
+                "schema": MODULE.LEGACY_OWNER_RECONCILIATION_SNAPSHOT_SCHEMA,
+                "state": {
+                    "path": str(state_path),
+                    "sha256": MODULE.sha256_file(state_path),
+                },
+                "owner": "run-1",
+            }
+            artifact = MODULE.legacy_owner_eligibility_artifact(
+                target=MODULE.parse_target("owner/repo#7"),
+                repo_root=repo,
+                state_path=state_path,
+                eligibility_path=artifact_path,
+                digest_path=digest_path,
+                snapshot=snapshot,
+                package_manifest=package,
+            )
+            artifact_path.write_text(
+                json.dumps(artifact, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            artifact_sha256 = MODULE.sha256_file(artifact_path)
+            digest_path.write_text(
+                f"{artifact_sha256}\n", encoding="ascii", newline="\n"
+            )
+            arguments = SimpleNamespace(
+                target="owner/repo#7",
+                repo_root=str(repo),
+                state=str(state_path),
+                eligibility_artifact=str(artifact_path),
+                eligibility_sha256_file=str(digest_path),
+                package_manifest=str(manifest_path),
+                expected_package_manifest_sha256=package["sha256"],
+                expected_seal=artifact["seal"],
+            )
+            emitted = []
+            forbidden = [
+                "listed_agent_task_ids",
+                "run_hosted_helper",
+                "apply_verified_import",
+                "publish_empty_rerun_commit",
+            ]
+            with contextlib.ExitStack() as stack:
+                forbidden_mocks = [
+                    stack.enter_context(mock.patch.object(MODULE, name))
+                    for name in forbidden
+                ]
+                with (
+                    mock.patch.object(MODULE, "require_tools"),
+                    mock.patch.object(
+                        MODULE, "resolve_repo_root", return_value=repo
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "resolve_target",
+                        return_value=MODULE.parse_target("owner/repo#7"),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "verify_installed_package_manifest",
+                        return_value=package,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "legacy_hosted_owner_reconciliation_snapshot",
+                        side_effect=[snapshot, snapshot],
+                    ) as live,
+                    mock.patch.object(MODULE, "emit", emitted.append),
+                ):
+                    MODULE.command_verify_legacy_owner_reconciliation(
+                        arguments
+                    )
+                for forbidden_mock in forbidden_mocks:
+                    forbidden_mock.assert_not_called()
+
+            self.assertEqual(2, live.call_count)
+            authorization = emitted[-1]
+            self.assertEqual("authorized", authorization["result"])
+            self.assertEqual(2, authorization["passes"])
+            self.assertFalse(authorization["mutation_performed"])
+            self.assertFalse(authorization["workflow_started"])
+            self.assertEqual(
+                "apply-legacy-owner-reconciliation",
+                authorization["reconciliation_argv"][2],
+            )
+            apply_arguments = copy.copy(arguments)
+            apply_arguments.expected_artifact_sha256 = artifact_sha256
+            apply_arguments.expected_authorization_token = authorization[
+                "authorization_token"
+            ]
+            applied = []
+            with contextlib.ExitStack() as stack:
+                forbidden_mocks = [
+                    stack.enter_context(mock.patch.object(MODULE, name))
+                    for name in forbidden
+                ]
+                with (
+                    mock.patch.object(MODULE, "require_tools"),
+                    mock.patch.object(
+                        MODULE, "resolve_repo_root", return_value=repo
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "resolve_target",
+                        return_value=MODULE.parse_target("owner/repo#7"),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "verify_installed_package_manifest",
+                        return_value=package,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "legacy_hosted_owner_reconciliation_snapshot",
+                        side_effect=[snapshot, snapshot, snapshot],
+                    ),
+                    mock.patch.object(MODULE, "emit", applied.append),
+                ):
+                    MODULE.command_apply_legacy_owner_reconciliation(
+                        apply_arguments
+                    )
+                for forbidden_mock in forbidden_mocks:
+                    forbidden_mock.assert_not_called()
+
+            final = MODULE.load_state(state_path)
+            self.assertEqual(1, final["iterations"])
+            self.assertEqual("failed", final["agent_task"]["status"])
+            self.assertEqual("unknown", final["agent_task"]["task_id_status"])
+            self.assertIsNone(final["agent_task"]["task_id"])
+            self.assertNotIn("recovery_command", final["agent_task"])
+            self.assertEqual("owner_lost", applied[-1]["result"])
+            self.assertFalse(applied[-1]["workflow_started"])
+            self.assertFalse(applied[-1]["task_created"])
+            self.assertIsNone(applied[-1]["continuation"])
+
+    def test_prepare_writes_one_sealed_nonexecuted_artifact(self):
+        with tempfile.TemporaryDirectory(prefix="legacy prepare ") as directory:
+            root = Path(directory)
+            state_path = root / "state.json"
+            artifact_path = root / "eligibility artifact.json"
+            digest_path = root / "eligibility artifact.json.sha256"
+            manifest_path = root / "package manifest.json"
+            repo, _identity, state = self.legacy_owner_state(directory)
+            MODULE.save_state(state_path, state)
+            state_sha256 = MODULE.sha256_file(state_path)
+            manifest_path.write_text("{}\n", encoding="utf-8", newline="\n")
+            package = {
+                "path": str(manifest_path),
+                "sha256": "a" * 64,
+                "schema": MODULE.PLUGIN_PACKAGE_MANIFEST_SCHEMA,
+                "source_commit": "b" * 40,
+                "installed_root": str(root / "installed"),
+                "package": {
+                    "name": "ci-fix-loop",
+                    "version": "1.6.31",
+                    "file_count": 8,
+                    "package_sha256": "c" * 64,
+                },
+            }
+            snapshot = {
+                "schema": MODULE.LEGACY_OWNER_RECONCILIATION_SNAPSHOT_SCHEMA,
+                "state": {
+                    "path": str(state_path),
+                    "sha256": state_sha256,
+                },
+                "owner": "run-1",
+            }
+            arguments = SimpleNamespace(
+                target="owner/repo#7",
+                repo_root=str(repo),
+                state=str(state_path),
+                eligibility_artifact=str(artifact_path),
+                eligibility_sha256_file=str(digest_path),
+                package_manifest=str(manifest_path),
+                expected_package_manifest_sha256=package["sha256"],
+            )
+            emitted = []
+            with (
+                mock.patch.object(MODULE, "require_tools"),
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=repo
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "resolve_target",
+                    return_value=MODULE.parse_target("owner/repo#7"),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "verify_installed_package_manifest",
+                    return_value=package,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "legacy_hosted_owner_reconciliation_snapshot",
+                    return_value=snapshot,
+                ),
+                mock.patch.object(MODULE, "emit", emitted.append),
+            ):
+                MODULE.command_prepare_legacy_owner_reconciliation(arguments)
+
+            result = emitted[-1]
+            self.assertEqual("eligibility_written", result["result"])
+            self.assertFalse(result["mutation_performed"])
+            self.assertFalse(result["workflow_started"])
+            self.assertEqual(state_sha256, MODULE.sha256_file(state_path))
+            artifact_sha256, artifact = MODULE.load_legacy_owner_eligibility(
+                eligibility_path=artifact_path,
+                digest_path=digest_path,
+                expected_artifact_sha256=result[
+                    "eligibility_artifact_sha256"
+                ],
+                expected_seal=result["seal"],
+            )
+            self.assertEqual(
+                result["eligibility_artifact_sha256"], artifact_sha256
+            )
+            self.assertEqual(result["verifier_argv"], artifact["verifier_argv"])
+
+    def test_verifier_rejects_stale_second_pass_without_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.json"
+            artifact_path = root / "artifact.json"
+            digest_path = root / "artifact.json.sha256"
+            manifest_path = root / "manifest.json"
+            repo, _identity, state = self.legacy_owner_state(directory)
+            MODULE.save_state(state_path, state)
+            manifest_path.write_text("{}\n", encoding="utf-8")
+            package = {
+                "path": str(manifest_path),
+                "sha256": "a" * 64,
+                "schema": MODULE.PLUGIN_PACKAGE_MANIFEST_SCHEMA,
+                "source_commit": "b" * 40,
+                "installed_root": str(root / "installed"),
+                "package": {
+                    "name": "ci-fix-loop",
+                    "version": "1.6.31",
+                    "file_count": 8,
+                    "package_sha256": "c" * 64,
+                },
+            }
+            snapshot = {"state": {"sha256": MODULE.sha256_file(state_path)}}
+            artifact = MODULE.legacy_owner_eligibility_artifact(
+                target=MODULE.parse_target("owner/repo#7"),
+                repo_root=repo,
+                state_path=state_path,
+                eligibility_path=artifact_path,
+                digest_path=digest_path,
+                snapshot=snapshot,
+                package_manifest=package,
+            )
+            artifact_path.write_text(
+                json.dumps(artifact, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            digest_path.write_text(
+                f"{MODULE.sha256_file(artifact_path)}\n",
+                encoding="ascii",
+                newline="\n",
+            )
+            arguments = SimpleNamespace(
+                target="owner/repo#7",
+                repo_root=str(repo),
+                state=str(state_path),
+                eligibility_artifact=str(artifact_path),
+                eligibility_sha256_file=str(digest_path),
+                package_manifest=str(manifest_path),
+                expected_package_manifest_sha256=package["sha256"],
+                expected_seal=artifact["seal"],
+            )
+            with (
+                mock.patch.object(MODULE, "require_tools"),
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=repo
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "resolve_target",
+                    return_value=MODULE.parse_target("owner/repo#7"),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "verify_installed_package_manifest",
+                    return_value=package,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "legacy_hosted_owner_reconciliation_snapshot",
+                    side_effect=[snapshot, {"state": {"sha256": "d" * 64}}],
+                ),
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError, "two-pass verification"
+                ),
+            ):
+                MODULE.command_verify_legacy_owner_reconciliation(arguments)
+
+            self.assertEqual("running", MODULE.load_state(state_path)["agent_task"]["status"])
 
 
 class ManagedAgentTaskContractTest(unittest.TestCase):
@@ -1977,7 +2532,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("tools: [execute, agent, rename_session]", instructions)
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [execute, agent, todo", instructions)
-        self.assertEqual("1.6.30", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.31", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_canonicalizes_stack_start_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
