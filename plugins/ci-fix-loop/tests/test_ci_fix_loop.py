@@ -44,9 +44,16 @@ PERMISSION_SPEC.loader.exec_module(PERMISSION_MODULE)
 
 
 class AgentCommandAdmissionTest(unittest.TestCase):
-    def payload(self, command, *, cwd=None, tool_name="powershell"):
+    def payload(
+        self,
+        command,
+        *,
+        cwd=None,
+        tool_name="powershell",
+        session_id="87654321-4321-4321-4321-cba987654321",
+    ):
         return {
-            "sessionId": "session",
+            "sessionId": session_id,
             "timestamp": 1,
             "cwd": cwd or str(Path.cwd()),
             "hookName": "permissionRequest",
@@ -120,6 +127,81 @@ class AgentCommandAdmissionTest(unittest.TestCase):
             encoding="utf-8",
             newline="\n",
         )
+
+    def write_sealed_ci_fix_artifact(self, root, cwd):
+        files = (
+            root
+            / ".copilot"
+            / "session-state"
+            / "12345678-1234-1234-1234-123456789abc"
+            / "files"
+        )
+        files.mkdir(parents=True, exist_ok=True)
+        artifact_path = files / "ci-fix-loop-1.6.37-7-sealed-invocation.json"
+        manifest_path = files / "ci-fix-loop-1.6.37-package-manifest.json"
+        manifest_path.write_text("{}\n", encoding="utf-8", newline="\n")
+        package = {
+            "path": str(manifest_path),
+            "sha256": "a" * 64,
+            "schema": MODULE.PLUGIN_PACKAGE_MANIFEST_SCHEMA,
+            "source_commit": "b" * 40,
+            "installed_root": str(root / "installed"),
+            "package": {
+                "name": "ci-fix-loop",
+                "version": "1.6.37",
+                "file_count": 8,
+                "package_sha256": "c" * 64,
+            },
+        }
+        snapshot = {
+            "schema": MODULE.SEALED_CI_FIX_SNAPSHOT_SCHEMA,
+            "target": "https://github.com/owner/repo/pull/7",
+            "repo_root": str(cwd.resolve()),
+            "state": {
+                "path": str((root / "state.json").resolve()),
+                "exists": False,
+                "size": None,
+                "sha256": None,
+            },
+            "source": {"branch": "feature", "head": "d" * 40, "status": ""},
+            "pull_request": {
+                "number": 7,
+                "head_sha": "d" * 40,
+                "title": "Résumé",
+            },
+            "checks": {
+                "head_sha": "d" * 40,
+                "rollup": [],
+                "decision": {"decision": "green"},
+            },
+            "native_stack": None,
+            "active_owner": None,
+        }
+        snapshot["checks"]["sha256"] = MODULE.canonical_json_sha256(
+            {
+                "head_sha": snapshot["checks"]["head_sha"],
+                "rollup": snapshot["checks"]["rollup"],
+                "decision": snapshot["checks"]["decision"],
+            }
+        )
+        artifact = MODULE.sealed_ci_fix_artifact(
+            artifact_path=artifact_path,
+            package_manifest=package,
+            snapshot=snapshot,
+            invocation_id="f" * 32,
+            owner_session_id="87654321-4321-4321-4321-cba987654321",
+        )
+        artifact_path.write_text(
+            json.dumps(artifact, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        artifact_path.with_name(f"{artifact_path.name}.sha256").write_text(
+            f"{MODULE.sha256_file(artifact_path)}\n",
+            encoding="ascii",
+            newline="\n",
+        )
+        return artifact_path, artifact
 
     def test_admits_only_exact_coordinator_commands_for_current_workspace(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -196,6 +278,87 @@ class AgentCommandAdmissionTest(unittest.TestCase):
                         ),
                         cwd=str(cwd),
                     )
+                )
+            )
+
+    def test_admits_one_sealed_direct_command_and_rejects_reuse(self):
+        with tempfile.TemporaryDirectory(prefix="sealed owner path ") as directory:
+            root = Path(directory)
+            cwd = root / "repo with spaces"
+            cwd.mkdir()
+            artifact_path, artifact = self.write_sealed_ci_fix_artifact(
+                root,
+                cwd,
+            )
+            command = self.powershell_command(
+                f'run-sealed-ci-fix "{artifact_path}"'
+            )
+            self.assertTrue(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(command, cwd=str(cwd))
+                )
+            )
+            process_options = {}
+            if os.name == "nt":
+                process_options["creationflags"] = subprocess.CREATE_NO_WINDOW
+            admitted = subprocess.run(
+                [sys.executable, str(PERMISSION_SCRIPT)],
+                input=json.dumps(self.payload(command, cwd=str(cwd))),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=True,
+                **process_options,
+            )
+            self.assertEqual('{"behavior":"allow"}\n', admitted.stdout)
+            self.assertEqual("", admitted.stderr)
+            self.assertFalse(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(
+                        f'{command} "extra"',
+                        cwd=str(cwd),
+                    )
+                )
+            )
+            self.assertFalse(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(command, cwd=str(root))
+                )
+            )
+            self.assertFalse(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(
+                        command,
+                        cwd=str(cwd),
+                        session_id="11111111-1111-1111-1111-111111111111",
+                    )
+                )
+            )
+
+            result_path = Path(artifact["outputs"]["result"])
+            result_path.write_text("{}\n", encoding="utf-8", newline="\n")
+            self.assertFalse(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(command, cwd=str(cwd))
+                )
+            )
+            result_path.unlink()
+
+            payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+            payload["request"]["model"] = "gpt-6-astra"
+            artifact_path.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            artifact_path.with_name(f"{artifact_path.name}.sha256").write_text(
+                f"{MODULE.sha256_file(artifact_path)}\n",
+                encoding="ascii",
+                newline="\n",
+            )
+            self.assertFalse(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(command, cwd=str(cwd))
                 )
             )
 
@@ -647,6 +810,541 @@ class AgentCommandAdmissionTest(unittest.TestCase):
             "denied",
             json.dumps(permissions, sort_keys=True).lower(),
         )
+
+
+class SealedCiFixCommandTest(unittest.TestCase):
+    def setUp(self):
+        self.previous_policy = MODULE.ACTIVE_GITHUB_MUTATION_POLICY
+        MODULE.ACTIVE_GITHUB_MUTATION_POLICY = "allow"
+
+    def tearDown(self):
+        MODULE.ACTIVE_GITHUB_MUTATION_POLICY = self.previous_policy
+
+    def fixture(self, root, *, write_artifact=True):
+        repo = root / "source workspace"
+        repo.mkdir()
+        files = (
+            root
+            / ".copilot"
+            / "session-state"
+            / "12345678-1234-1234-1234-123456789abc"
+            / "files"
+        )
+        files.mkdir(parents=True)
+        artifact_path = files / "ci-fix-loop-1.6.37-7-sealed-invocation.json"
+        manifest_path = files / "ci-fix-loop-1.6.37-package-manifest.json"
+        manifest_path.write_text("{}\n", encoding="utf-8", newline="\n")
+        state_path = root / "ci-fix-state.json"
+        package = {
+            "path": str(manifest_path),
+            "sha256": "a" * 64,
+            "schema": MODULE.PLUGIN_PACKAGE_MANIFEST_SCHEMA,
+            "source_commit": "b" * 40,
+            "installed_root": str(root / "installed"),
+            "package": {
+                "name": "ci-fix-loop",
+                "version": "1.6.37",
+                "file_count": 8,
+                "package_sha256": "c" * 64,
+            },
+        }
+        snapshot = {
+            "schema": MODULE.SEALED_CI_FIX_SNAPSHOT_SCHEMA,
+            "target": "https://github.com/owner/repo/pull/7",
+            "repo_root": str(repo.resolve()),
+            "state": {
+                "path": str(state_path.resolve()),
+                "exists": False,
+                "size": None,
+                "sha256": None,
+            },
+            "source": {"branch": "feature", "head": "d" * 40, "status": ""},
+            "pull_request": {
+                "number": 7,
+                "head_sha": "d" * 40,
+                "base_sha": "e" * 40,
+            },
+            "checks": {
+                "head_sha": "d" * 40,
+                "rollup": [],
+                "decision": {"decision": "green"},
+            },
+            "native_stack": None,
+            "active_owner": None,
+        }
+        snapshot["checks"]["sha256"] = MODULE.canonical_json_sha256(
+            {
+                "head_sha": snapshot["checks"]["head_sha"],
+                "rollup": snapshot["checks"]["rollup"],
+                "decision": snapshot["checks"]["decision"],
+            }
+        )
+        artifact = MODULE.sealed_ci_fix_artifact(
+            artifact_path=artifact_path,
+            package_manifest=package,
+            snapshot=snapshot,
+            invocation_id="f" * 32,
+            owner_session_id="87654321-4321-4321-4321-cba987654321",
+        )
+        if write_artifact:
+            artifact_path.write_text(
+                json.dumps(artifact, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            artifact_path.with_name(f"{artifact_path.name}.sha256").write_text(
+                f"{MODULE.sha256_file(artifact_path)}\n",
+                encoding="ascii",
+                newline="\n",
+            )
+        return repo, state_path, artifact_path, package, snapshot, artifact
+
+    def run_patches(self, repo, package, snapshot):
+        return (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "verify_installed_package_manifest",
+                return_value=package,
+            ),
+            mock.patch.object(
+                MODULE,
+                "sealed_ci_fix_live_snapshot",
+                return_value=snapshot,
+            ),
+        )
+
+    def test_prepare_writes_one_nonexecuted_direct_invocation(self):
+        with tempfile.TemporaryDirectory(prefix="sealed prepare ") as directory:
+            root = Path(directory)
+            (
+                repo,
+                state_path,
+                artifact_path,
+                package,
+                snapshot,
+                _artifact,
+            ) = self.fixture(root, write_artifact=False)
+            emitted = []
+            arguments = SimpleNamespace(
+                target="owner/repo#7",
+                repo_root=str(repo),
+                state=str(state_path),
+                owner_session_id="87654321-4321-4321-4321-cba987654321",
+                invocation_artifact=str(artifact_path),
+                package_manifest=package["path"],
+                expected_package_manifest_sha256=package["sha256"],
+            )
+            with contextlib.ExitStack() as stack:
+                for patch in self.run_patches(repo, package, snapshot):
+                    stack.enter_context(patch)
+                execute = stack.enter_context(
+                    mock.patch.object(MODULE, "execute_managed_command")
+                )
+                stack.enter_context(mock.patch.object(MODULE, "emit", emitted.append))
+                MODULE.command_prepare_sealed_ci_fix(arguments)
+
+            execute.assert_not_called()
+            self.assertFalse(state_path.exists())
+            self.assertEqual("sealed_ci_fix_prepared", emitted[-1]["result"])
+            self.assertFalse(emitted[-1]["workflow_started"])
+            self.assertFalse(emitted[-1]["task_created"])
+            artifact_sha256, loaded = MODULE.load_sealed_ci_fix_artifact(
+                artifact_path
+            )
+            self.assertEqual(
+                emitted[-1]["invocation_artifact_sha256"],
+                artifact_sha256,
+            )
+            self.assertEqual(
+                ["run-sealed-ci-fix", str(artifact_path)],
+                loaded["run_command_argv"][2:],
+            )
+            self.assertEqual(4, len(loaded["run_command_argv"]))
+            self.assertNotIn("agent", loaded["run_command_argv"])
+            self.assertNotIn("copilot", loaded["run_command_argv"])
+
+    def test_direct_command_owns_preflight_and_complete_loop(self):
+        with tempfile.TemporaryDirectory(prefix="sealed run ") as directory:
+            root = Path(directory)
+            (
+                repo,
+                state_path,
+                artifact_path,
+                package,
+                snapshot,
+                artifact,
+            ) = self.fixture(root)
+            stack_calls = []
+            loop_calls = []
+
+            def stack_start(arguments):
+                stack_calls.append(arguments)
+                MODULE.emit(
+                    {
+                        "result": "single",
+                        "target": "https://github.com/owner/repo/pull/7",
+                        "reason": "sealed_single_pull_request",
+                        "pr": {
+                            "number": 7,
+                            "pr_url": "https://github.com/owner/repo/pull/7",
+                            "repo_name": "owner/repo",
+                        },
+                    }
+                )
+
+            def loop(arguments):
+                loop_calls.append(arguments)
+                self.assertEqual(
+                    "source-only",
+                    MODULE.ACTIVE_GITHUB_MUTATION_POLICY,
+                )
+                MODULE.emit(
+                    {
+                        "result": "green",
+                        "state": str(state_path),
+                        "head_sha": "d" * 40,
+                    }
+                )
+
+            with contextlib.ExitStack() as stack:
+                for patch in self.run_patches(repo, package, snapshot):
+                    stack.enter_context(patch)
+                stack.enter_context(
+                    mock.patch.object(MODULE, "command_stack_start", stack_start)
+                )
+                stack.enter_context(mock.patch.object(MODULE, "command_loop", loop))
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    MODULE.command_run_sealed_ci_fix(
+                        SimpleNamespace(invocation_artifact=str(artifact_path))
+                    )
+
+            self.assertEqual(1, len(stack_calls))
+            self.assertEqual(1, len(loop_calls))
+            self.assertEqual("sol", loop_calls[0].model)
+            self.assertTrue(loop_calls[0].new_invocation)
+            self.assertEqual(
+                artifact["outputs"]["stack_start_result"],
+                loop_calls[0].preflight_result_file,
+            )
+            result = json.loads(
+                Path(artifact["outputs"]["result"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(MODULE.SEALED_CI_FIX_RESULT_SCHEMA, result["schema"])
+            self.assertEqual(artifact["outputs"]["result"], result["result_file"])
+            self.assertEqual("succeeded", result["status"])
+            self.assertTrue(result["terminal"])
+            self.assertEqual(0, result["exit_code"])
+            self.assertEqual(2, result["steps"]["identity_passes"])
+            self.assertEqual(2, result["steps"]["package_passes"])
+            self.assertEqual(
+                "sealed_ci_fix_completed",
+                result["outcome"]["result"],
+            )
+            self.assertEqual("green", result["outcome"]["workflow"]["result"])
+            self.assertEqual("allow", MODULE.ACTIVE_GITHUB_MUTATION_POLICY)
+            self.assertEqual(
+                "sealed_ci_fix_completed",
+                json.loads(output.getvalue())["result"],
+            )
+
+    def test_missing_preflight_result_stops_before_loop_and_cannot_repeat(self):
+        with tempfile.TemporaryDirectory(prefix="sealed missing ") as directory:
+            root = Path(directory)
+            repo, _, artifact_path, package, snapshot, artifact = self.fixture(root)
+            fake = {
+                "status": "succeeded",
+                "outcome": {"result": "single"},
+            }
+            loop = mock.Mock()
+            with contextlib.ExitStack() as stack:
+                for patch in self.run_patches(repo, package, snapshot):
+                    stack.enter_context(patch)
+                stack.enter_context(
+                    mock.patch.object(
+                        MODULE,
+                        "execute_managed_command",
+                        side_effect=[fake],
+                    )
+                )
+                stack.enter_context(mock.patch.object(MODULE, "command_loop", loop))
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "stopped during stack_start",
+                ):
+                    MODULE.command_run_sealed_ci_fix(
+                        SimpleNamespace(invocation_artifact=str(artifact_path))
+                    )
+
+            loop.assert_not_called()
+            result_path = Path(artifact["outputs"]["result"])
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual("failed", result["status"])
+            self.assertEqual("stack_start", result["stage"])
+            with contextlib.ExitStack() as stack:
+                for patch in self.run_patches(repo, package, snapshot):
+                    stack.enter_context(patch)
+                execute = stack.enter_context(
+                    mock.patch.object(MODULE, "execute_managed_command")
+                )
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "one-time file",
+                ):
+                    MODULE.command_run_sealed_ci_fix(
+                        SimpleNamespace(invocation_artifact=str(artifact_path))
+                    )
+            execute.assert_not_called()
+
+    def test_stale_second_identity_pass_stops_before_loop(self):
+        with tempfile.TemporaryDirectory(prefix="sealed stale ") as directory:
+            root = Path(directory)
+            repo, _, artifact_path, package, snapshot, artifact = self.fixture(root)
+            stale = copy.deepcopy(snapshot)
+            stale["checks"]["sha256"] = "0" * 64
+            loop = mock.Mock()
+
+            def stack_start(_arguments):
+                MODULE.emit(
+                    {
+                        "result": "single",
+                        "target": "https://github.com/owner/repo/pull/7",
+                    }
+                )
+
+            patches = list(self.run_patches(repo, package, snapshot))
+            patches[-1] = mock.patch.object(
+                MODULE,
+                "sealed_ci_fix_live_snapshot",
+                side_effect=[snapshot, stale],
+            )
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                stack.enter_context(
+                    mock.patch.object(MODULE, "command_stack_start", stack_start)
+                )
+                stack.enter_context(mock.patch.object(MODULE, "command_loop", loop))
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "identity_pass_2",
+                ):
+                    MODULE.command_run_sealed_ci_fix(
+                        SimpleNamespace(invocation_artifact=str(artifact_path))
+                    )
+
+            loop.assert_not_called()
+            result = json.loads(
+                Path(artifact["outputs"]["result"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual("failed", result["status"])
+            self.assertEqual("identity_pass_2", result["stage"])
+            self.assertEqual(1, result["steps"]["identity_passes"])
+
+    def test_package_drift_after_preflight_stops_before_loop(self):
+        with tempfile.TemporaryDirectory(prefix="sealed package drift ") as directory:
+            root = Path(directory)
+            repo, _, artifact_path, package, snapshot, artifact = self.fixture(root)
+            drifted = copy.deepcopy(package)
+            drifted["package"]["package_sha256"] = "0" * 64
+            loop = mock.Mock()
+
+            def stack_start(_arguments):
+                MODULE.emit(
+                    {
+                        "result": "single",
+                        "target": "https://github.com/owner/repo/pull/7",
+                    }
+                )
+
+            with (
+                mock.patch.object(MODULE, "require_tools"),
+                mock.patch.object(
+                    MODULE,
+                    "resolve_repo_root",
+                    return_value=repo,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "resolve_target",
+                    return_value=MODULE.parse_target("owner/repo#7"),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "verify_installed_package_manifest",
+                    side_effect=[package, drifted],
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "sealed_ci_fix_live_snapshot",
+                    return_value=snapshot,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "command_stack_start",
+                    stack_start,
+                ),
+                mock.patch.object(MODULE, "command_loop", loop),
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "package_pass_2",
+                ),
+            ):
+                MODULE.command_run_sealed_ci_fix(
+                    SimpleNamespace(invocation_artifact=str(artifact_path))
+                )
+
+            loop.assert_not_called()
+            result = json.loads(
+                Path(artifact["outputs"]["result"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual("failed", result["status"])
+            self.assertEqual("package_pass_2", result["stage"])
+            self.assertEqual(1, result["steps"]["package_passes"])
+
+    def test_timeout_is_terminal_and_unexpected_loss_retains_running_owner(self):
+        with tempfile.TemporaryDirectory(prefix="sealed timeout ") as directory:
+            root = Path(directory)
+            repo, _, artifact_path, package, snapshot, artifact = self.fixture(root)
+            with contextlib.ExitStack() as stack:
+                for patch in self.run_patches(repo, package, snapshot):
+                    stack.enter_context(patch)
+                stack.enter_context(
+                    mock.patch.object(
+                        MODULE,
+                        "command_stack_start",
+                        side_effect=MODULE.WorkflowError("owned timeout"),
+                    )
+                )
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "stopped during stack_start",
+                ):
+                    MODULE.command_run_sealed_ci_fix(
+                        SimpleNamespace(invocation_artifact=str(artifact_path))
+                    )
+            result = json.loads(
+                Path(artifact["outputs"]["result"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual("failed", result["status"])
+            self.assertTrue(result["terminal"])
+            self.assertEqual(os.getpid(), result["owner"]["process_id"])
+            self.assertIsNone(result["steps"]["loop"])
+
+        with tempfile.TemporaryDirectory(prefix="sealed owner loss ") as directory:
+            root = Path(directory)
+            repo, _, artifact_path, package, snapshot, artifact = self.fixture(root)
+            with contextlib.ExitStack() as stack:
+                for patch in self.run_patches(repo, package, snapshot):
+                    stack.enter_context(patch)
+                stack.enter_context(
+                    mock.patch.object(
+                        MODULE,
+                        "sealed_ci_fix_live_snapshot",
+                        side_effect=RuntimeError("unexpected owner loss"),
+                    )
+                )
+                with self.assertRaisesRegex(RuntimeError, "unexpected owner loss"):
+                    MODULE.command_run_sealed_ci_fix(
+                        SimpleNamespace(invocation_artifact=str(artifact_path))
+                    )
+            result = json.loads(
+                Path(artifact["outputs"]["result"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual("running", result["status"])
+            self.assertFalse(result["terminal"])
+            self.assertEqual(os.getpid(), result["owner"]["process_id"])
+
+    def test_source_only_policy_uses_source_rerun_fallback(self):
+        MODULE.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
+        with (
+            mock.patch.object(MODULE, "run") as run,
+            self.assertRaisesRegex(
+                MODULE.RerunPermissionDenied,
+                "empty-commit",
+            ),
+        ):
+            MODULE.rerun_failed_jobs(
+                {"upstream_owner": "owner", "upstream_repo": "repo"},
+                7,
+            )
+        run.assert_not_called()
+
+    def test_loop_consumes_only_the_pinned_initial_pr_and_checks(self):
+        with tempfile.TemporaryDirectory(prefix="sealed preflight ") as directory:
+            root = Path(directory)
+            _, _, _, _, snapshot, _ = self.fixture(root)
+            preflight = {
+                "pr": copy.deepcopy(snapshot["pull_request"]),
+                "check_snapshot": {
+                    "head_sha": snapshot["checks"]["head_sha"],
+                    "rollup": copy.deepcopy(snapshot["checks"]["rollup"]),
+                    "decision": copy.deepcopy(snapshot["checks"]["decision"]),
+                },
+            }
+            arguments = SimpleNamespace(
+                _sealed_initial_snapshot=copy.deepcopy(snapshot)
+            )
+            MODULE.require_sealed_initial_preflight(arguments, preflight)
+            self.assertIsNone(arguments._sealed_initial_snapshot)
+
+            arguments._sealed_initial_snapshot = copy.deepcopy(snapshot)
+            stale = copy.deepcopy(preflight)
+            stale["check_snapshot"]["rollup"] = [{"key": "new"}]
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "changed during loop preflight",
+            ):
+                MODULE.require_sealed_initial_preflight(arguments, stale)
+
+    def test_sealed_state_rejects_active_or_recoverable_ownership(self):
+        with tempfile.TemporaryDirectory(prefix="sealed state ") as directory:
+            state_path = Path(directory) / "state.json"
+            state = {
+                "version": MODULE.STATE_VERSION,
+                "agent_task": {"status": "running"},
+            }
+            MODULE.save_state(state_path, state)
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "active workflow ownership",
+            ):
+                MODULE.sealed_ci_fix_state_identity(state_path)
+
+            state["agent_task"] = {
+                "status": "failed",
+                "recovery_command": "do not supersede",
+            }
+            MODULE.save_state(state_path, state)
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "active workflow ownership",
+            ):
+                MODULE.sealed_ci_fix_state_identity(state_path)
+
+            state["agent_task"] = {
+                "status": "failed",
+                "phase": "hosted_fix",
+                "task_id": None,
+                "task_id_status": "unknown",
+                "error": (
+                    "legacy hosted Agent Task helper owner was superseded by an "
+                    "independently advanced forward pull request head; old task "
+                    "result was not imported"
+                ),
+            }
+            state["coordinator"] = {"status": "blocked"}
+            MODULE.save_state(state_path, state)
+            identity = MODULE.sealed_ci_fix_state_identity(state_path)
+            self.assertTrue(identity["exists"])
+            self.assertEqual(MODULE.sha256_file(state_path), identity["sha256"])
 
 
 class WindowsSubprocessTest(unittest.TestCase):
@@ -3413,7 +4111,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [execute, agent, todo", instructions)
-        self.assertEqual("1.6.36", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.37", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_canonicalizes_stack_start_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -3458,6 +4156,12 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("`stack-start` does not accept `--model`", invocation)
         self.assertIn("Use exactly `--model sol`", invocation)
         self.assertIn("Ignore stdout completely", invocation)
+        self.assertIn(
+            'runs the installed coordinator prefix once with '
+            '`run-sealed-ci-fix "<exact artifact path>"`',
+            invocation,
+        )
+        self.assertIn("Do not select or nest this agent for that path", invocation)
         self.assertIn("Never repeat `stack-start`", invocation)
         self.assertIn("--preflight-result-file", invocation)
         self.assertIn("read only the exact result file", invocation)

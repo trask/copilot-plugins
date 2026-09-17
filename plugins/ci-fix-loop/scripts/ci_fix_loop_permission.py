@@ -51,12 +51,32 @@ SEALED_RECONCILIATION_COMMANDS = {
     "verify-sealed-legacy-owner-reconciliation",
     "apply-sealed-legacy-owner-reconciliation",
 }
+SEALED_CI_FIX_COMMANDS = {"run-sealed-ci-fix"}
 LEGACY_OWNER_ELIGIBILITY_SCHEMA = (
     "github.copilot.ci-fix-loop-legacy-owner-eligibility.v3"
 )
 LEGACY_OWNER_AUTHORIZATION_FILE_SCHEMA = (
     "github.copilot.ci-fix-loop-legacy-owner-authorization-file.v1"
 )
+SEALED_CI_FIX_INVOCATION_SCHEMA = (
+    "github.copilot.ci-fix-loop-sealed-invocation.v1"
+)
+SEALED_CI_FIX_MUTATION_POLICY = {
+    "id": "source-only",
+    "allowed": [
+        "create_managed_agent_task",
+        "push_verified_fix_commits",
+        "push_empty_ci_rerun_commit",
+    ],
+    "forbidden": [
+        "github_comments",
+        "github_reviews",
+        "github_review_threads",
+        "github_labels",
+        "github_pull_request_metadata",
+        "github_workflow_rerun",
+    ],
+}
 COMMAND_RESULT_SCHEMAS = {
     "stack-start": "github.copilot.ci-fix-loop-stack-start-result.v1",
     "loop": "github.copilot.ci-fix-loop-loop-result.v1",
@@ -177,7 +197,11 @@ def command_tokens(tool_name: str, command: str) -> list[str] | None:
         is None
         or normalized_path(tokens[1]) != normalized_path(str(expected_helper))
         or tokens[2]
-        not in set(RECONCILIATION_COMMANDS) | SEALED_RECONCILIATION_COMMANDS
+        not in (
+            set(RECONCILIATION_COMMANDS)
+            | SEALED_RECONCILIATION_COMMANDS
+            | SEALED_CI_FIX_COMMANDS
+        )
     ):
         return None
     return tokens[2:]
@@ -278,7 +302,7 @@ def read_small_json(path: Path) -> dict[str, Any] | None:
 def canonical_json_sha256(value: Any) -> str:
     content = json.dumps(
         value,
-        ensure_ascii=False,
+        ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
@@ -415,16 +439,150 @@ def sealed_reconciliation_admission(
     )
 
 
+def sealed_ci_fix_admission(
+    tokens: list[str],
+    *,
+    cwd: str,
+    session_id: str,
+) -> bool:
+    if len(tokens) != 2:
+        return False
+    artifact_path = Path(tokens[1])
+    if not canonical_session_evidence_path(artifact_path):
+        return False
+    payload = read_small_json(artifact_path)
+    if payload is None:
+        return False
+    digest_path = artifact_path.with_name(f"{artifact_path.name}.sha256")
+    try:
+        content = artifact_path.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        digest_valid = (
+            digest_path.is_file()
+            and not digest_path.is_symlink()
+            and digest_path.read_bytes() == f"{digest}\n".encode("ascii")
+        )
+    except OSError:
+        return False
+    required = {
+        "schema",
+        "result",
+        "created_at",
+        "invocation_id",
+        "invocation_artifact",
+        "invocation_sha256_file",
+        "package_manifest",
+        "request",
+        "outputs",
+        "inner_argv",
+        "run_command_argv",
+        "seal",
+    }
+    if (
+        not digest_valid
+        or set(payload) != required
+        or payload.get("schema") != SEALED_CI_FIX_INVOCATION_SCHEMA
+        or payload.get("result") != "sealed_ci_fix_ready"
+        or payload.get("invocation_artifact") != str(artifact_path)
+        or payload.get("invocation_sha256_file") != str(digest_path)
+        or not isinstance(payload.get("invocation_id"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", payload["invocation_id"]) is None
+        or not isinstance(payload.get("seal"), str)
+        or SHA256_PATTERN.fullmatch(payload["seal"]) is None
+    ):
+        return False
+    identity = dict(payload)
+    identity.pop("seal")
+    if canonical_json_sha256(identity) != payload["seal"]:
+        return False
+    request = payload.get("request")
+    snapshot = request.get("initial_snapshot") if isinstance(request, dict) else None
+    state = snapshot.get("state") if isinstance(snapshot, dict) else None
+    package_manifest = payload.get("package_manifest")
+    manifest_path = (
+        Path(str(package_manifest.get("path") or ""))
+        if isinstance(package_manifest, dict)
+        else None
+    )
+    if (
+        not isinstance(request, dict)
+        or request.get("repo_root") is None
+        or normalized_path(str(request["repo_root"])) != normalized_path(cwd)
+        or request.get("owner_session_id") != session_id
+        or request.get("execution_mode") != "direct_owner_session"
+        or TARGET_PATTERN.fullmatch(str(request.get("target") or "")) is None
+        or request.get("model_alias") != "sol"
+        or request.get("model") != "gpt-5.6-sol"
+        or request.get("fresh_invocation") is not True
+        or request.get("topology") != "single_pull_request"
+        or request.get("github_mutation_policy")
+        != SEALED_CI_FIX_MUTATION_POLICY
+        or not isinstance(snapshot, dict)
+        or snapshot.get("target") != request.get("target")
+        or normalized_path(str(snapshot.get("repo_root") or ""))
+        != normalized_path(cwd)
+        or not isinstance(state, dict)
+        or not isinstance(state.get("path"), str)
+        or not Path(state["path"]).is_absolute()
+        or manifest_path is None
+        or not manifest_path.is_absolute()
+        or not manifest_path.is_file()
+        or manifest_path.is_symlink()
+        or not isinstance(package_manifest.get("sha256"), str)
+        or SHA256_PATTERN.fullmatch(package_manifest["sha256"]) is None
+    ):
+        return False
+    run_argv = payload.get("run_command_argv")
+    expected_helper = Path(__file__).with_name("ci_fix_loop.py").resolve()
+    if (
+        not isinstance(run_argv, list)
+        or len(run_argv) != 4
+        or not all(isinstance(value, str) for value in run_argv)
+        or normalized_path(run_argv[1])
+        != normalized_path(str(expected_helper))
+        or run_argv[2] != "run-sealed-ci-fix"
+        or run_argv[3] != str(artifact_path)
+    ):
+        return False
+    outputs = payload.get("outputs")
+    invocation_id = payload["invocation_id"]
+    expected_outputs = {
+        "result": artifact_path.with_name(
+            f"ci-fix-loop-sealed-{invocation_id}-result.json"
+        ),
+        "stack_start_result": artifact_path.with_name(
+            f"ci-fix-loop-sealed-{invocation_id}-stack-start-result.json"
+        ),
+        "loop_result": artifact_path.with_name(
+            f"ci-fix-loop-sealed-{invocation_id}-loop-result.json"
+        ),
+    }
+    if (
+        not isinstance(outputs, dict)
+        or set(outputs) != set(expected_outputs)
+        or any(
+            outputs[name] != str(path)
+            or path.exists()
+            or path.is_symlink()
+            for name, path in expected_outputs.items()
+        )
+    ):
+        return False
+    return True
+
+
 def admission_allowed(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
     tool_name = payload.get("toolName")
     tool_input = payload.get("toolInput")
     cwd = payload.get("cwd")
+    session_id = payload.get("sessionId")
     if (
         payload.get("hookName") != "permissionRequest"
         or not isinstance(tool_name, str)
         or not isinstance(cwd, str)
+        or not isinstance(session_id, str)
         or not isinstance(tool_input, dict)
         or set(tool_input) != {"command"}
         or not isinstance(tool_input["command"], str)
@@ -436,6 +594,14 @@ def admission_allowed(payload: Any) -> bool:
             tokens
             and (
                 (
+                    tokens[0] in SEALED_CI_FIX_COMMANDS
+                    and sealed_ci_fix_admission(
+                        tokens,
+                        cwd=cwd,
+                        session_id=session_id,
+                    )
+                )
+                or (
                     tokens[0] in RECONCILIATION_COMMANDS
                     and reconciliation_admission(tokens, cwd=cwd)
                 )
