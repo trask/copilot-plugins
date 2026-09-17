@@ -1,7 +1,7 @@
 ---
 name: CI Fix Loop
 description: "Explicit invocation only: never select automatically; fix failing checks on one pull request or bottom-up through its native stack."
-argument-hint: "PR URL, PR number, or owner/repo#number; omit only from a worktree attached to the PR's branch"
+argument-hint: "Canonical PR URL or owner/repo#number; omit only from a worktree attached to the PR's branch"
 tools: [execute, agent, todo, rename_session]
 user-invocable: true
 disable-model-invocation: true
@@ -25,16 +25,18 @@ Find the installed helper once:
 
 Invoke it with the active Python interpreter. Never import the helper or use any of its APIs.
 
-For a standalone request, run `stack-start <target> --repo-root <workspace>`. If it returns `single`, run:
+Before the first helper call, form a canonical target. Pass a supplied GitHub pull request URL or `owner/repo#number` exactly. If the user supplied a bare number such as `19204` or `#19204`, combine it with the current workspace repository to form `owner/repo#19204`. Every `stack-start` command must include that canonical target. Never pass a bare number and never omit the target, even when the worktree is attached to the pull request branch.
+
+For a standalone request, run `stack-start <canonical-target> --repo-root <workspace>`. If it returns `single`, use its returned canonical `target` for:
 
 ```text
-loop <target> --repo-root <workspace> --new-invocation
+loop <canonical-target> --repo-root <workspace> --new-invocation
 ```
 
 Keep the returned `state` and `invocation_run`. After a native-stack publication, resume that member with:
 
 ```text
-loop <target> --repo-root <workspace> --state <state> --invocation-run <invocation_run>
+loop <canonical-target> --repo-root <workspace> --state <state> --invocation-run <invocation_run>
 ```
 
 When a caller supplies `pipeline-run`, `pipeline-iteration`, and `pipeline-max-iterations`, skip `stack-start`. Pass all three values unchanged to every `loop` call. Never invent or refresh a pipeline position.

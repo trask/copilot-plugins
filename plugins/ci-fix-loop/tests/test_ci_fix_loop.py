@@ -1188,14 +1188,43 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("loop <target>", instructions)
+        self.assertIn("loop <canonical-target>", instructions)
         self.assertIn("marketplace-agent-apply-report-worker@3", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("`custom_agent`", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.26", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.27", json.loads(PLUGIN.read_text())["version"])
+
+    def test_agent_canonicalizes_stack_start_target(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+        frontmatter = instructions.split("---", 2)[1]
+        invocation = _agent_section(instructions, "## Invocation")
+
+        self.assertIn(
+            "argument-hint: \"Canonical PR URL or owner/repo#number; "
+            "omit only from a worktree attached to the PR's branch\"",
+            frontmatter,
+        )
+        self.assertIn(
+            "combine it with the current workspace repository to form "
+            "`owner/repo#19204`",
+            invocation,
+        )
+        self.assertIn(
+            "`stack-start <canonical-target> --repo-root <workspace>`",
+            invocation,
+        )
+        self.assertIn(
+            "Every `stack-start` command must include that canonical target",
+            invocation,
+        )
+        self.assertIn(
+            "Never pass a bare number and never omit the target",
+            invocation,
+        )
+        self.assertNotIn("stack-start <target>", invocation)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
