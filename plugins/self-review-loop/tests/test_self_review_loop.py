@@ -1751,7 +1751,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.25")
+        self.assertEqual(plugin["version"], "1.3.26")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -2342,6 +2342,56 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             MODULE.successful_result_runtime_recovery_identity(
                 altered,
                 preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+            )
+
+        prompt_path = self.directory / "retained-prompt.txt"
+        result_path = self.directory / "retained-result.json"
+        state_path = self.directory / "retained-state.json"
+        prompt_path.write_text("retained prompt\n", encoding="utf-8")
+        result_path.write_text(
+            json.dumps(retained, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "agent_task": {
+                    "status": "failed",
+                    "model": "gpt-5.6-sol",
+                    "preflight": self.preflight,
+                    "prompt_file": str(prompt_path),
+                    "result_file": str(result_path),
+                }
+            },
+        )
+        args = SimpleNamespace(
+            resume=True,
+            prepare_only=True,
+            preserve_artifacts=True,
+            apply_prepared=False,
+            recovery_state_sha256=MODULE.sha256_file(state_path),
+            recovery_prompt_sha256=MODULE.sha256_file(prompt_path),
+            recovery_result_sha256=MODULE.sha256_file(result_path),
+            recovery_task_id="task-1",
+            recovery_request_id="request-1",
+        )
+        MODULE.validate_retained_result_recovery_gate(
+            args,
+            state_path=state_path,
+            state=MODULE.load_state(state_path),
+            requested_model="gpt-5.6-sol",
+        )
+        args.recovery_result_sha256 = "0" * 64
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "artifact identity drifted",
+        ):
+            MODULE.validate_retained_result_recovery_gate(
+                args,
+                state_path=state_path,
+                state=MODULE.load_state(state_path),
                 requested_model="gpt-5.6-sol",
             )
 

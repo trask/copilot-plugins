@@ -3100,6 +3100,78 @@ def successful_result_runtime_recovery_identity(
     }
 
 
+def validate_retained_result_recovery_gate(
+    args: argparse.Namespace,
+    *,
+    state_path: Path,
+    state: dict[str, Any] | None,
+    requested_model: str,
+) -> None:
+    expected = {
+        "state": getattr(args, "recovery_state_sha256", None),
+        "prompt": getattr(args, "recovery_prompt_sha256", None),
+        "result": getattr(args, "recovery_result_sha256", None),
+        "task_id": getattr(args, "recovery_task_id", None),
+        "request_id": getattr(args, "recovery_request_id", None),
+    }
+    if not any(value is not None for value in expected.values()):
+        return
+    if (
+        not all(isinstance(value, str) and value for value in expected.values())
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", expected[name]) is None
+            for name in ("state", "prompt", "result")
+        )
+        or not args.resume
+        or not bool(getattr(args, "prepare_only", False))
+        or not bool(getattr(args, "preserve_artifacts", False))
+        or bool(getattr(args, "apply_prepared", False))
+        or not state_path.is_file()
+        or sha256_file(state_path) != expected["state"]
+        or not isinstance(state, dict)
+    ):
+        raise WorkflowError(
+            "retained result recovery gate is incomplete or stale"
+        )
+    task_state = state.get("agent_task")
+    if (
+        not isinstance(task_state, dict)
+        or task_state.get("status") != "failed"
+        or task_state.get("model") != requested_model
+        or not isinstance(task_state.get("preflight"), dict)
+        or not isinstance(task_state.get("prompt_file"), str)
+        or not isinstance(task_state.get("result_file"), str)
+    ):
+        raise WorkflowError(
+            "retained result recovery owner identity is malformed"
+        )
+    prompt_path = Path(task_state["prompt_file"])
+    result_path = Path(task_state["result_file"])
+    if (
+        not prompt_path.is_file()
+        or not result_path.is_file()
+        or sha256_file(prompt_path) != expected["prompt"]
+        or sha256_file(result_path) != expected["result"]
+    ):
+        raise WorkflowError(
+            "retained result recovery artifact identity drifted"
+        )
+    result = load_agent_task_result(result_path)
+    identity = successful_result_runtime_recovery_identity(
+        result,
+        preflight=task_state["preflight"],
+        requested_model=requested_model,
+    )
+    if (
+        identity is None
+        or identity["task_id"] != expected["task_id"]
+        or identity["request_id"] != expected["request_id"]
+    ):
+        raise WorkflowError(
+            "retained result recovery managed task identity drifted"
+        )
+
+
 def fetch_committed_text(
     repository: str, path: str, commit: str, *, description: str
 ) -> str:
@@ -4445,6 +4517,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
     state_path = cli_path(args.state) if args.state else default_state_path(target)
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
+    validate_retained_result_recovery_gate(
+        args,
+        state_path=state_path,
+        state=existing,
+        requested_model=requested_model,
+    )
     if apply_prepared:
         prepared_task = (
             existing.get("agent_task") if isinstance(existing, dict) else None
@@ -5624,6 +5702,11 @@ def build_parser() -> argparse.ArgumentParser:
             "another managed task"
         ),
     )
+    agent_task.add_argument("--recovery-state-sha256")
+    agent_task.add_argument("--recovery-prompt-sha256")
+    agent_task.add_argument("--recovery-result-sha256")
+    agent_task.add_argument("--recovery-task-id")
+    agent_task.add_argument("--recovery-request-id")
     agent_task.set_defaults(function=command_agent_task)
 
     archive_stale = subparsers.add_parser(
