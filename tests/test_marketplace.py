@@ -24,6 +24,9 @@ ORDINARY_AGENT_TASK_PLUGINS = {
 ORDINARY_HELPER_SHA256 = (
     "db635350935f8115e9313b2e81f2ae2b089967036be8f0470bc9cf284b2a679a"
 )
+CI_FIX_RELEASE_BOUNDARY_HELPER_SHA256 = (
+    "89af27721dff40933bee1db100fa52eb9fafc65024b342a41a91c7fdee8959f4"
+)
 RUNTIME_PLUGIN = "agent-tasks-runtime"
 RUNTIME_SKILL = ROOT / "plugins" / RUNTIME_PLUGIN / "skills" / RUNTIME_PLUGIN
 CONFLICT_HELPER_SHA256 = (
@@ -184,6 +187,12 @@ class MarketplaceTest(unittest.TestCase):
                 sys.modules[module_name] = module
                 try:
                     spec.loader.exec_module(module)
+                    if plugin_name == "ci-fix-loop":
+                        self.assertEqual(
+                            module.REQUIRED_CLOUD_TASK_SHA256,
+                            CI_FIX_RELEASE_BOUNDARY_HELPER_SHA256,
+                        )
+                        continue
                     inventory = json.dumps(
                         [
                             {
