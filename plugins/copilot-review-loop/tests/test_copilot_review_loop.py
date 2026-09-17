@@ -1548,7 +1548,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
         with (
             mock.patch.dict(os.environ, {"COPILOT_HOME": str(copilot_home)}),
-            mock.patch.object(MODULE, "run", side_effect=run) as runner,
+            mock.patch.object(
+                MODULE, "run_owned_local_worker", side_effect=run
+            ) as runner,
         ):
             bundle = RUN_LOCAL_DECISION_WORKER(
                 repo_root=self.repo_root,
@@ -1571,6 +1573,74 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "canonical": canonical_path,
             "copilot_home": copilot_home,
         }
+
+    def test_owned_local_worker_timeout_terminates_and_reaps(self):
+        process = mock.Mock()
+        process.pid = 42
+        process.returncode = 1
+        process.poll.side_effect = [None, 1]
+        process.communicate.side_effect = [
+            MODULE.subprocess.TimeoutExpired(["copilot"], 0.01),
+            ("", ""),
+        ]
+        owner = mock.Mock()
+        with (
+            mock.patch.object(
+                MODULE,
+                "popen_owned_local_worker",
+                return_value=(process, owner),
+            ),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "timed out after 0.01 seconds",
+            ),
+        ):
+            MODULE.run_owned_local_worker(
+                ["copilot"],
+                cwd=self.repo_root,
+                input_text="prompt",
+                timeout=0.01,
+            )
+
+        owner.terminate.assert_called_once()
+        process.wait.assert_called_once_with(
+            timeout=MODULE.LOCAL_DECISION_TERMINATION_TIMEOUT_SECONDS
+        )
+        owner.close.assert_called_once()
+
+    def test_local_timeout_preserves_intended_and_generated_dirty_paths(self):
+        intended = self.repo_root / "docs" / "guide.md"
+        generated = self.repo_root / "conventions" / "generated.kotlin"
+        intended.parent.mkdir(parents=True)
+        generated.parent.mkdir(parents=True)
+        intended.write_text("intended\n", encoding="utf-8")
+        generated.write_text("generated\n", encoding="utf-8")
+        dirty = {
+            **self.source_fingerprint,
+            "status": " M docs/guide.md\n?? conventions/generated.kotlin",
+        }
+        state_path = self.directory / "timeout-state.json"
+        self.invoke_local_failure(
+            state_path,
+            "local Copilot decision process timed out after 540 seconds",
+            details={
+                "source_before": self.source_fingerprint,
+                "source_after": dirty,
+                "github_before": self.github_fingerprint,
+                "github_after": self.github_fingerprint,
+            },
+        )
+
+        task = MODULE.load_state(state_path)["agent_task"]
+        self.assertEqual("failed", task["status"])
+        self.assertEqual("terminal_unusable", task["task_id_status"])
+        self.assertIn("docs/guide.md", task["source_after"]["status"])
+        self.assertIn(
+            "conventions/generated.kotlin",
+            task["source_after"]["status"],
+        )
+        self.assertEqual("intended\n", intended.read_text(encoding="utf-8"))
+        self.assertEqual("generated\n", generated.read_text(encoding="utf-8"))
 
     def write_valid_local_decision(self, *, decision_path, **_kwargs):
         decision_path.write_text(
@@ -2030,7 +2100,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.48")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.49")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -4624,10 +4694,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         *,
         run_id="run-1",
         target="owner/repo#7",
+        details=None,
     ):
         self.local_worker.side_effect = MODULE.WorkflowError(
             message,
-            details={
+            details=details
+            or {
                 "source_before": self.source_fingerprint,
                 "source_after": self.source_fingerprint,
                 "github_before": self.github_fingerprint,

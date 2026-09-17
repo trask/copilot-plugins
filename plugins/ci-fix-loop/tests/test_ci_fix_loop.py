@@ -1195,7 +1195,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.25", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.26", json.loads(PLUGIN.read_text())["version"])
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1254,6 +1254,83 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("--job", run.call_args.args[0])
         self.assertIn("2", run.call_args.args[0])
         self.assertNotIn("--allow-escape-sequences", run.call_args.args[0])
+
+    def test_failed_log_redacts_real_credentials_before_persistence(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        destination = self.root.parent / f"{self.root.name}-redacted.log"
+        self.addCleanup(destination.unlink, missing_ok=True)
+        secret = "github_pat_abcdefghijklmnopqrstuvwxyz"
+        completed = MODULE.subprocess.CompletedProcess(
+            ["gh"], 0, f"before {secret} after\n", ""
+        )
+        with (
+            mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+            mock.patch.object(MODULE, "run", return_value=completed),
+        ):
+            content = MODULE.fetch_failed_check_log(
+                self.preflight["pr"],
+                check,
+                destination=destination,
+                repo_root=self.root,
+            )
+
+        self.assertEqual(
+            f"before {MODULE.REDACTED_CREDENTIAL} after\n",
+            content,
+        )
+        self.assertNotIn(secret, content)
+        self.assertEqual(content, destination.read_text(encoding="utf-8"))
+        MODULE.require_no_credentials(content, source="redacted test log")
+
+    def test_failed_log_redacts_complete_private_key_material(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        completed = MODULE.subprocess.CompletedProcess(
+            ["gh"],
+            0,
+            (
+                "before\n"
+                "-----BEGIN PRIVATE KEY-----\n"
+                "private-base64-material\n"
+                "-----END PRIVATE KEY-----\n"
+                "after\n"
+            ),
+            "",
+        )
+        with (
+            mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+            mock.patch.object(MODULE, "run", return_value=completed),
+        ):
+            content = MODULE.fetch_failed_check_log(self.preflight["pr"], check)
+
+        self.assertEqual(
+            f"before\n{MODULE.REDACTED_CREDENTIAL}\nafter\n",
+            content,
+        )
+        self.assertNotIn("private-base64-material", content)
+        MODULE.require_no_credentials(content, source="redacted private key log")
+
+    def test_failed_log_retains_masked_and_placeholder_diagnostics(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        completed = MODULE.subprocess.CompletedProcess(
+            ["gh"],
+            0,
+            (
+                "checkout Authorization: Basic ******\n"
+                "test TOKEN=CONFIGURATION_SERVER failed\n"
+            ),
+            "",
+        )
+        with (
+            mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+            mock.patch.object(MODULE, "run", return_value=completed),
+        ):
+            content = MODULE.fetch_failed_check_log(self.preflight["pr"], check)
+
+        self.assertEqual(2, content.count(MODULE.REDACTED_CREDENTIAL))
+        self.assertIn("checkout ", content)
+        self.assertIn("test ", content)
+        self.assertIn(" failed", content)
+        MODULE.require_no_credentials(content, source="redacted test log")
 
     def test_failed_log_download_error_never_includes_raw_output(self):
         check = self.preflight["check_snapshot"]["failures"][0]

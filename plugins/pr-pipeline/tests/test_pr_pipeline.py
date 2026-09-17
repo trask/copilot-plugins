@@ -987,6 +987,125 @@ class SweepTest(unittest.TestCase):
             MODULE.stage_blocker(changed, after_launch=False)[0],
         )
 
+    def test_replaces_exact_legacy_malformed_self_review_owner_prelaunch(self):
+        original = self.inspect
+        inspections = 0
+
+        def retained_failure(entry, *arguments):
+            nonlocal inspections
+            if entry["stage"] == MODULE.STAGE_SELF_REVIEW and inspections == 0:
+                inspections += 1
+                return self.legacy_malformed_self_review_stage()
+            return original(entry, *arguments)
+
+        MODULE.inspect_stage.side_effect = retained_failure
+
+        result = self.execute()
+
+        self.assertEqual("complete", result["result"])
+        self.assertEqual(
+            [(stage, 1) for stage in MODULE.STAGE_NAMES],
+            self.launched,
+        )
+
+    def legacy_malformed_self_review_stage(self):
+        request_id = "legacy-request-1"
+        owner = "legacy-owner"
+        source_head = "1" * 40
+        return {
+            **uncleared_stage(MODULE.STAGE_SELF_REVIEW),
+            "status": {
+                "agent_task": {
+                    "status": "failed",
+                    "run_id": owner,
+                    "model": "gpt-5.6-sol",
+                    "policy": "marketplace-agent-worker@4",
+                    "error": "Agent Task result has an unsupported schema or fields",
+                },
+                "review": {
+                    "id": f"pr-7-agent-task-{owner}",
+                    "status": "active",
+                    "head_sha": source_head,
+                },
+                "malformed_owner_recovery": {
+                    "status": "ready",
+                    "kind": "legacy_v1_validation_incomplete",
+                    "run_id": owner,
+                    "task_id": "legacy-task-1",
+                    "request_id": request_id,
+                    "source_head_sha": source_head,
+                    "direct_base_sha": "2" * 40,
+                    "generated_head_sha": "3" * 40,
+                    "prompt_sha256": "4" * 64,
+                    "result_sha256": "5" * 64,
+                    "report_path": (
+                        f".github/agent-task-reports/{request_id}.md"
+                    ),
+                    "validation_path": (
+                        f".github/agent-task-validations/{request_id}.json"
+                    ),
+                    "remaining_iterations": 5,
+                },
+            },
+        }
+
+    def test_legacy_malformed_self_review_replacement_fails_closed(self):
+        stage_result = self.legacy_malformed_self_review_stage()
+        self.assertIsNone(
+            MODULE.stage_blocker(stage_result, after_launch=False)
+        )
+        self.assertEqual(
+            "stage_recovery_required",
+            MODULE.stage_blocker(stage_result, after_launch=True)[0],
+        )
+        mutations = {
+            "wrong_stage": lambda value: value.update(
+                stage=MODULE.STAGE_COPILOT_REVIEW
+            ),
+            "owner": lambda value: value["status"][
+                "malformed_owner_recovery"
+            ].update(run_id="other-owner"),
+            "model": lambda value: value["status"]["agent_task"].update(
+                model="gpt-6-astra"
+            ),
+            "policy": lambda value: value["status"]["agent_task"].update(
+                policy="marketplace-agent-apply-report-worker@3"
+            ),
+            "generated_head": lambda value: value["status"][
+                "malformed_owner_recovery"
+            ].update(generated_head_sha="not-a-sha"),
+            "path": lambda value: value["status"][
+                "malformed_owner_recovery"
+            ].update(
+                validation_path=(
+                    ".github/agent-task-validations/other-request.json"
+                )
+            ),
+            "review_head": lambda value: value["status"]["review"].update(
+                head_sha="6" * 40
+            ),
+            "ambiguous": lambda value: value["status"][
+                "malformed_owner_recovery"
+            ].update(extra=True),
+            "exhausted": lambda value: value["status"][
+                "malformed_owner_recovery"
+            ].update(remaining_iterations=0),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                changed = copy.deepcopy(stage_result)
+                mutate(changed)
+                self.assertEqual(
+                    "stage_recovery_required",
+                    MODULE.stage_blocker(changed, after_launch=False)[0],
+                )
+        active = copy.deepcopy(stage_result)
+        active["status"]["agent_task"]["status"] = "running"
+        self.assertEqual(
+            "stage_still_active",
+            MODULE.stage_blocker(active, after_launch=False)[0],
+        )
+
     def test_reports_sweep_and_stage_progress_in_order(self):
         self.execute()
         self.assertEqual(

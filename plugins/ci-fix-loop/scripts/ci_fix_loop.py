@@ -583,17 +583,32 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+CREDENTIAL_PATTERNS = (
+    r"(?i)\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}\b",
+    r"(?i)\b(?:xox[baprs]|sk-[A-Za-z0-9]+)-[A-Za-z0-9-]{12,}\b",
+    r"\bAKIA[0-9A-Z]{16}\b",
+    r"(?i)\bAuthorization\s*:\s*(?:Bearer|Basic)\s+\S+",
+    r"(?i)\b(?:password|passwd|token|api[_-]?key|secret)\s*[:=]\s*\S+",
+    r"(?i)https?://[^/\s:@]+:[^/\s@]+@",
+    r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+)
+REDACTED_CREDENTIAL = "[REDACTED]"
+PRIVATE_KEY_BLOCK_PATTERN = re.compile(
+    r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
+    r".*?(?:-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\Z)",
+    re.DOTALL,
+)
+
+
 def contains_credentials(value: str) -> bool:
-    patterns = (
-        r"(?i)\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}\b",
-        r"(?i)\b(?:xox[baprs]|sk-[A-Za-z0-9]+)-[A-Za-z0-9-]{12,}\b",
-        r"\bAKIA[0-9A-Z]{16}\b",
-        r"(?i)\bAuthorization\s*:\s*(?:Bearer|Basic)\s+\S+",
-        r"(?i)\b(?:password|passwd|token|api[_-]?key|secret)\s*[:=]\s*\S+",
-        r"(?i)https?://[^/\s:@]+:[^/\s@]+@",
-        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-    )
-    return any(re.search(pattern, value) for pattern in patterns)
+    return any(re.search(pattern, value) for pattern in CREDENTIAL_PATTERNS)
+
+
+def redact_credentials(value: str) -> str:
+    redacted = PRIVATE_KEY_BLOCK_PATTERN.sub(REDACTED_CREDENTIAL, value)
+    for pattern in CREDENTIAL_PATTERNS:
+        redacted = re.sub(pattern, REDACTED_CREDENTIAL, redacted)
+    return redacted
 
 
 def require_no_credentials(value: str, *, source: str) -> None:
@@ -4482,7 +4497,8 @@ def fetch_failed_check_log(
             f"stderr bytes={len(stderr_bytes)} "
             f"sha256={hashlib.sha256(stderr_bytes).hexdigest()}"
         )
-    require_no_credentials(process.stdout, source=f"failing log for {check['key']}")
+    content = redact_credentials(process.stdout)
+    require_no_credentials(content, source=f"redacted failing log for {check['key']}")
     if destination is not None:
         if repo_root is not None:
             require_outside_repository(destination, repo_root)
@@ -4490,8 +4506,8 @@ def fetch_failed_check_log(
             raise WorkflowError(
                 f"refusing to replace symlinked failing log: {destination}"
             )
-        atomic_write_text(destination, process.stdout)
-    return process.stdout
+        atomic_write_text(destination, content)
+    return content
 
 
 def agent_task_preflight(

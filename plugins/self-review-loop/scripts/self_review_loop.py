@@ -4567,6 +4567,439 @@ def require_github_ancestor(repository: str, older: str, newer: str) -> None:
         )
 
 
+def validate_legacy_malformed_owner_result(
+    result: dict[str, Any],
+    *,
+    preflight: dict[str, Any],
+    requested_model: str,
+) -> dict[str, Any]:
+    pr = preflight["pr"]
+    task = result.get("task")
+    generated = result.get("generated")
+    application = result.get("application")
+    report = result.get("report")
+    receipt = result.get("worker_receipt")
+    validation = result.get("validation")
+    error = result.get("error")
+    expected_pull_request = expected_cloud_pull_request(preflight)
+    actual_pull_request = result.get("pull_request")
+    stable_pull_request = (
+        isinstance(actual_pull_request, dict)
+        and set(actual_pull_request) == set(expected_pull_request)
+        and all(
+            actual_pull_request.get(field) == value
+            for field, value in expected_pull_request.items()
+            if field != "base_sha"
+        )
+        and isinstance(actual_pull_request.get("base_sha"), str)
+        and SHA_PATTERN.fullmatch(actual_pull_request["base_sha"]) is not None
+    )
+    expected_base_ref = pr["head_sha"] if pr["cross_repository"] else pr["head_branch"]
+    if (
+        result.get("schema") != LEGACY_AGENT_TASK_RESULT_SCHEMA
+        or result.get("status") != "error"
+        or result.get("mode") != "apply_with_report"
+        or result.get("requested_model") != requested_model
+        or result.get("policy") != LEGACY_AGENT_TASK_POLICY_V4
+        or result.get("repository") != {"name_with_owner": pr["repo_name"]}
+        or not stable_pull_request
+        or not isinstance(task, dict)
+        or set(task) != {"id", "url", "state", "base_ref", "base_sha"}
+        or not isinstance(task.get("id"), str)
+        or not task["id"]
+        or task.get("url")
+        != f"https://github.com/{pr['repo_name']}/tasks/{task.get('id')}"
+        or task.get("state") != "completed"
+        or task.get("base_ref") != expected_base_ref
+        or task.get("base_sha") != pr["head_sha"]
+        or not isinstance(generated, dict)
+        or set(generated) != {"branch", "head_sha", "commits"}
+        or not isinstance(generated.get("branch"), str)
+        or not generated["branch"]
+        or not isinstance(generated.get("head_sha"), str)
+        or SHA_PATTERN.fullmatch(generated["head_sha"]) is None
+        or generated.get("commits") != []
+        or application != {"status": "not_applied", "final_local_head": pr["head_sha"]}
+        or not isinstance(report, dict)
+        or set(report) != {"path", "commit", "sha256"}
+        or report.get("commit") != generated["head_sha"]
+        or report.get("sha256") is not None
+        or not isinstance(receipt, dict)
+        or set(receipt) != {"path", "commit", "sha256"}
+        or receipt.get("commit") != generated["head_sha"]
+        or receipt.get("sha256") is not None
+        or validation != {"complete": False, "outcomes": []}
+        or error
+        != {
+            "code": "validation_incomplete",
+            "message": "marketplace worker validation outcome is malformed",
+        }
+    ):
+        raise WorkflowError(
+            "failed Agent Task owner is not an exact legacy malformed completion"
+        )
+    report_match = REPORT_PATH_PATTERN.fullmatch(report.get("path", ""))
+    receipt_match = RECEIPT_PATH_PATTERN.fullmatch(receipt.get("path", ""))
+    if (
+        report_match is None
+        or receipt_match is None
+        or report_match.group("request_id") != receipt_match.group("request_id")
+    ):
+        raise WorkflowError(
+            "failed Agent Task owner has mismatched request-scoped artifacts"
+        )
+    return {
+        "task_id": task["id"],
+        "request_id": report_match.group("request_id"),
+        "source_head": pr["head_sha"],
+        "direct_base": actual_pull_request["base_sha"],
+        "generated_branch": generated["branch"],
+        "generated_head": generated["head_sha"],
+        "report_path": report["path"],
+        "validation_path": receipt["path"],
+    }
+
+
+def legacy_malformed_owner_projection(
+    state: dict[str, Any],
+    *,
+    repo_root: Path | None = None,
+) -> dict[str, Any] | None:
+    task_state = state.get("agent_task")
+    if not isinstance(task_state, dict) or task_state.get("status") != "failed":
+        return None
+    run_id = task_state.get("run_id")
+    preflight = task_state.get("preflight")
+    requested_model = task_state.get("model")
+    allowed_iterations = task_state.get("allowed_iterations")
+    iterations = state.get("iterations", 0)
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or any(
+            isinstance(item, dict) and item.get("run_id") == run_id
+            for item in (state.get("managed_task_history") or [])
+        )
+        or requested_model != MODEL_ALIASES["sol"]
+        or task_state.get("policy") != "marketplace-agent-worker@4"
+        or not isinstance(preflight, dict)
+        or not isinstance(preflight.get("pr"), dict)
+        or not isinstance(preflight.get("identity"), dict)
+        or isinstance(allowed_iterations, bool)
+        or not isinstance(allowed_iterations, int)
+        or allowed_iterations < 1
+        or isinstance(iterations, bool)
+        or not isinstance(iterations, int)
+        or iterations >= allowed_iterations
+    ):
+        return None
+    prompt_value = task_state.get("prompt_file")
+    result_value = task_state.get("result_file")
+    if not isinstance(prompt_value, str) or not isinstance(result_value, str):
+        return None
+    prompt_path = Path(prompt_value)
+    result_path = Path(result_value)
+    if repo_root is not None:
+        try:
+            require_outside_repository(prompt_path, repo_root)
+            require_outside_repository(result_path, repo_root)
+        except WorkflowError:
+            return None
+    if not prompt_path.is_file() or not result_path.is_file():
+        return None
+    try:
+        result = load_agent_task_result(result_path)
+        identity = validate_legacy_malformed_owner_result(
+            result,
+            preflight=preflight,
+            requested_model=requested_model,
+        )
+        prompt = prompt_path.read_text(encoding="utf-8")
+        require_no_credentials(prompt, source="retained Agent Task prompt")
+    except (OSError, UnicodeError, WorkflowError):
+        return None
+    retained_identity_fields = (
+        ("task", result["task"]),
+        ("generated", result["generated"]),
+        ("report", result["report"]),
+        ("worker_receipt", result["worker_receipt"]),
+    )
+    if (
+        task_state.get("task_id_status") not in {None, "completed"}
+        or task_state.get("task_id") not in {None, identity["task_id"]}
+        or any(
+            task_state.get(field) is not None
+            and task_state.get(field) != expected
+            for field, expected in retained_identity_fields
+        )
+    ):
+        return None
+    required_prompt_identities = (
+        identity["source_head"],
+        preflight["pr"]["repo_name"],
+        preflight["pr"]["pr_url"],
+        "Self Review Loop Agent Tasks worker prompt version 2.",
+        "{{MARKETPLACE_REPORT_PATH}}",
+        "{{MARKETPLACE_VALIDATION_PATH}}",
+    )
+    if any(value not in prompt for value in required_prompt_identities):
+        return None
+    review = state.get("review")
+    expected_review_id = f"pr-{preflight['pr']['number']}-agent-task-{run_id}"
+    if (
+        not isinstance(review, dict)
+        or review.get("id") != expected_review_id
+        or review.get("status") != "active"
+        or review.get("head_sha") != identity["source_head"]
+    ):
+        return None
+    return {
+        "status": "ready",
+        "kind": "legacy_v1_validation_incomplete",
+        "run_id": run_id,
+        "task_id": identity["task_id"],
+        "request_id": identity["request_id"],
+        "source_head_sha": identity["source_head"],
+        "direct_base_sha": identity["direct_base"],
+        "generated_head_sha": identity["generated_head"],
+        "prompt_sha256": sha256_file(prompt_path),
+        "result_sha256": sha256_file(result_path),
+        "report_path": identity["report_path"],
+        "validation_path": identity["validation_path"],
+        "remaining_iterations": allowed_iterations - iterations,
+    }
+
+
+def require_legacy_malformed_generated_commit(
+    repository: str,
+    *,
+    source_head: str,
+    generated_head: str,
+    expected_paths: set[str],
+) -> None:
+    payload = gh_json(["api", f"repos/{repository}/commits/{generated_head}"])
+    parents = payload.get("parents") if isinstance(payload, dict) else None
+    files = payload.get("files") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("sha") != generated_head
+        or not isinstance(parents, list)
+        or len(parents) != 1
+        or not isinstance(parents[0], dict)
+        or parents[0].get("sha") != source_head
+        or not isinstance(files, list)
+        or {item.get("filename") for item in files if isinstance(item, dict)}
+        != expected_paths
+        or len(files) != len(expected_paths)
+        or any(
+            not isinstance(item, dict)
+            or item.get("status") != "added"
+            or item.get("previous_filename") is not None
+            for item in files
+        )
+    ):
+        raise WorkflowError(
+            "legacy malformed Agent Task generated history is not artifact-only"
+        )
+
+
+def legacy_validation_artifact_is_complete(content: str) -> bool:
+    try:
+        payload = parse_strict_json(
+            content, description="legacy Agent Task validation artifact"
+        )
+    except WorkflowError:
+        return False
+    return (
+        isinstance(payload, list)
+        and bool(payload)
+        and all(
+            isinstance(item, dict)
+            and set(item) == {"command", "outcome"}
+            and isinstance(item.get("command"), str)
+            and bool(item["command"])
+            and item.get("outcome") == "passed"
+            for item in payload
+        )
+    )
+
+
+def archive_legacy_malformed_owner(
+    state: dict[str, Any],
+    *,
+    state_path: Path,
+    repo_root: Path,
+    live_preflight: dict[str, Any],
+) -> bool:
+    projection = legacy_malformed_owner_projection(state, repo_root=repo_root)
+    if projection is None:
+        return False
+    task_state = state["agent_task"]
+    preflight = task_state["preflight"]
+    old_pr = preflight["pr"]
+    live_pr = live_preflight["pr"]
+    result_path = Path(task_state["result_file"])
+    prompt_path = Path(task_state["prompt_file"])
+    result = load_agent_task_result(result_path)
+    identity = validate_legacy_malformed_owner_result(
+        result,
+        preflight=preflight,
+        requested_model=task_state["model"],
+    )
+    stable_fields = (
+        "number",
+        "repo_name",
+        "pr_url",
+        "title",
+        "body",
+        "head_owner",
+        "head_repo",
+        "head_branch",
+        "base_branch",
+        "state",
+    )
+    mismatches = [
+        snapshot_mismatch_detail(field, old_pr.get(field), live_pr.get(field))
+        for field in stable_fields
+        if old_pr.get(field) != live_pr.get(field)
+    ]
+    if mismatches:
+        raise WorkflowError(
+            "cannot replace legacy malformed owner after unrelated PR drift: "
+            + "; ".join(mismatches)
+        )
+    if (
+        live_pr["head_sha"] != identity["source_head"]
+        or live_pr["base_sha"] != identity["direct_base"]
+    ):
+        raise WorkflowError(
+            "cannot replace legacy malformed owner after source identity drift"
+        )
+    task_payload = gh_json(
+        [
+            "api",
+            f"agents/repos/{old_pr['repo_name']}/tasks/{identity['task_id']}",
+        ]
+    )
+    if (
+        not isinstance(task_payload, dict)
+        or task_payload.get("id") != identity["task_id"]
+        or task_payload.get("state") != "completed"
+    ):
+        raise WorkflowError(
+            "legacy malformed Agent Task is not a known completed task"
+        )
+    artifact_paths = {identity["report_path"], identity["validation_path"]}
+    require_legacy_malformed_generated_commit(
+        old_pr["repo_name"],
+        source_head=identity["source_head"],
+        generated_head=identity["generated_head"],
+        expected_paths=artifact_paths,
+    )
+    report_content = fetch_committed_text(
+        old_pr["repo_name"],
+        identity["report_path"],
+        identity["generated_head"],
+        description="legacy Self Review report",
+    )
+    validation_content = fetch_committed_text(
+        old_pr["repo_name"],
+        identity["validation_path"],
+        identity["generated_head"],
+        description="legacy Self Review validation",
+    )
+    require_no_credentials(report_content, source="legacy Self Review report")
+    require_no_credentials(validation_content, source="legacy Self Review validation")
+    if legacy_validation_artifact_is_complete(validation_content):
+        raise WorkflowError(
+            "legacy Agent Task validation artifact is complete and cannot be replaced"
+        )
+    archived_at = utc_now()
+    report_sha256 = sha256_text(report_content)
+    validation_sha256 = sha256_text(validation_content)
+    archived_task = copy.deepcopy(task_state)
+    archived_task.update(
+        {
+            "status": "archived_malformed",
+            "archive_reason": "legacy_v1_validation_incomplete",
+            "archived_at": archived_at,
+            "task": result["task"],
+            "task_id": identity["task_id"],
+            "task_id_status": "completed",
+            "generated": result["generated"],
+            "report": {
+                **result["report"],
+                "sha256": report_sha256,
+            },
+            "worker_receipt": {
+                **result["worker_receipt"],
+                "sha256": validation_sha256,
+            },
+            "request_id": identity["request_id"],
+            "prompt_sha256": projection["prompt_sha256"],
+            "result_sha256": projection["result_sha256"],
+            "report_sha256": report_sha256,
+            "validation_sha256": validation_sha256,
+            "ordered_commits": [],
+            "paths_by_commit": [
+                {
+                    "commit": identity["generated_head"],
+                    "paths": sorted(artifact_paths),
+                }
+            ],
+            "preserved_artifacts": sorted(
+                [
+                    {
+                        "path": str(prompt_path),
+                        "sha256": projection["prompt_sha256"],
+                        "size": prompt_path.stat().st_size,
+                    },
+                    {
+                        "path": str(result_path),
+                        "sha256": projection["result_sha256"],
+                        "size": result_path.stat().st_size,
+                    },
+                    {
+                        "path": identity["report_path"],
+                        "commit": identity["generated_head"],
+                        "sha256": report_sha256,
+                        "size": len(report_content.encode("utf-8")),
+                    },
+                    {
+                        "path": identity["validation_path"],
+                        "commit": identity["generated_head"],
+                        "sha256": validation_sha256,
+                        "size": len(validation_content.encode("utf-8")),
+                    },
+                ],
+                key=lambda artifact: artifact["path"],
+            ),
+            "artifacts_removed": False,
+            "artifacts_preserved": True,
+        }
+    )
+    state.setdefault("managed_task_history", []).append(archived_task)
+    review = state["review"]
+    archived_review = copy.deepcopy(review)
+    archived_review.update(
+        {
+            "status": "failed",
+            "failure_reason": "legacy_v1_validation_incomplete",
+            "failed_at": archived_at,
+        }
+    )
+    state.setdefault("managed_review_history", []).append(archived_review)
+    consumed_task = copy.deepcopy(archived_task)
+    consumed_task["status"] = "consumed"
+    consumed_task["consumed_at"] = archived_at
+    state["agent_task"] = consumed_task
+    state["review"] = archived_review
+    state["pr"] = live_pr
+    state["repo_root"] = str(repo_root)
+    save_state(state_path, state)
+    return True
+
+
 def command_archive_stale_agent_task(args: argparse.Namespace) -> None:
     if not args.preserve_artifacts:
         raise WorkflowError(
@@ -5001,6 +5434,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
             }
         else:
             state = existing
+            archive_legacy_malformed_owner(
+                state,
+                state_path=state_path,
+                repo_root=repo_root,
+                live_preflight=preflight,
+            )
             active_task = state.get("agent_task")
             if isinstance(active_task, dict) and active_task.get("status") not in {
                 "completed",
@@ -5915,6 +6354,12 @@ def command_status(args: argparse.Namespace) -> None:
     pr = state["pr"]
     review = state.get("review")
     history = state.get("history") or []
+    malformed_owner_recovery = legacy_malformed_owner_projection(state)
+    malformed_owner_fields = (
+        {"malformed_owner_recovery": malformed_owner_recovery}
+        if malformed_owner_recovery is not None
+        else {}
+    )
     payload = {
         "result": "ready",
         "state": str(path),
@@ -5924,6 +6369,7 @@ def command_status(args: argparse.Namespace) -> None:
         "history": history,
         "local_validation": state.get("local_validation") or [],
         **stage_outcome_fields(state),
+        **malformed_owner_fields,
         "iterations": int(state.get("iterations", 0)),
         "last_helper_activity": last_helper_activity(state),
     }
@@ -5966,6 +6412,7 @@ def command_status(args: argparse.Namespace) -> None:
             },
             "local_validation": state.get("local_validation") or [],
             **stage_outcome_fields(state),
+            **malformed_owner_fields,
             "iterations": int(state.get("iterations", 0)),
             "last_helper_activity": last_helper_activity(state),
         }

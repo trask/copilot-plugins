@@ -1282,6 +1282,105 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "error": None,
         }
 
+    def legacy_malformed_owner_state(self, state_path):
+        request_id = "legacy-request-1"
+        generated_head = "3" * 40
+        direct_base = "4" * 40
+        prompt_path = self.directory / "legacy-prompt.txt"
+        result_path = self.directory / "legacy-result.json"
+        prompt_path.write_text(
+            "\n".join(
+                [
+                    "Self Review Loop Agent Tasks worker prompt version 2.",
+                    self.head,
+                    self.preflight["pr"]["repo_name"],
+                    self.preflight["pr"]["pr_url"],
+                    "{{MARKETPLACE_REPORT_PATH}}",
+                    "{{MARKETPLACE_VALIDATION_PATH}}",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        pull_request = MODULE.expected_cloud_pull_request(self.preflight)
+        pull_request["base_sha"] = direct_base
+        result = {
+            "schema": MODULE.LEGACY_AGENT_TASK_RESULT_SCHEMA,
+            "status": "error",
+            "mode": "apply_with_report",
+            "repository": {"name_with_owner": "owner/repo"},
+            "pull_request": pull_request,
+            "requested_model": "gpt-5.6-sol",
+            "policy": MODULE.LEGACY_AGENT_TASK_POLICY_V4,
+            "task": {
+                "id": "legacy-task-1",
+                "url": "https://github.com/owner/repo/tasks/legacy-task-1",
+                "state": "completed",
+                "base_ref": "feature",
+                "base_sha": self.head,
+            },
+            "generated": {
+                "branch": "copilot/legacy-owner",
+                "head_sha": generated_head,
+                "commits": [],
+            },
+            "application": {
+                "status": "not_applied",
+                "final_local_head": self.head,
+            },
+            "report": {
+                "path": f".github/agent-task-reports/{request_id}.md",
+                "commit": generated_head,
+                "sha256": None,
+            },
+            "worker_receipt": {
+                "path": f".github/agent-task-validations/{request_id}.json",
+                "commit": generated_head,
+                "sha256": None,
+            },
+            "validation": {"complete": False, "outcomes": []},
+            "error": {
+                "code": "validation_incomplete",
+                "message": "marketplace worker validation outcome is malformed",
+            },
+        }
+        result_path.write_text(
+            json.dumps(result, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+        owner = "legacy-owner"
+        state = {
+            "version": 1,
+            "created_at": "2026-09-17T00:00:00Z",
+            "iterations": 0,
+            "next_candidate_id": 1,
+            "history": [],
+            "managed_task_history": [],
+            "managed_review_history": [],
+            "repo_root": str(self.repo_root),
+            "pr": self.preflight["pr"],
+            "review": {
+                "id": f"pr-7-agent-task-{owner}",
+                "status": "active",
+                "iteration": 1,
+                "head_sha": self.head,
+                "candidates": [],
+                "batches": [],
+            },
+            "agent_task": {
+                "status": "failed",
+                "run_id": owner,
+                "model": "gpt-5.6-sol",
+                "policy": "marketplace-agent-worker@4",
+                "allowed_iterations": 5,
+                "preflight": self.preflight,
+                "prompt_file": str(prompt_path),
+                "result_file": str(result_path),
+                "error": "Agent Task result has an unsupported schema or fields",
+            },
+        }
+        MODULE.save_state(state_path, state)
+        return state, result, prompt_path, result_path
+
     def test_taskless_api_failure_keeps_its_trusted_error(self):
         failure = self.result()
         failure.update(
@@ -1751,7 +1850,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.29")
+        self.assertEqual(plugin["version"], "1.3.30")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -4040,6 +4139,217 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(2, len(replaced["managed_task_history"]))
         self.assertEqual(2, len(replaced["managed_review_history"]))
         publish_shared.assert_not_called()
+
+    def test_archives_exact_legacy_malformed_owner_before_replacement(self):
+        state_path = self.directory / "legacy-malformed-owner.json"
+        state, result, prompt_path, result_path = self.legacy_malformed_owner_state(
+            state_path
+        )
+        live_preflight = copy.deepcopy(self.preflight)
+        live_preflight["pr"]["base_sha"] = result["pull_request"]["base_sha"]
+        report = "Untrusted legacy report\n"
+        malformed_validation = json.dumps(
+            [
+                {
+                    "command": "python -m pytest",
+                    "outcome": "not-run",
+                }
+            ]
+        )
+        task_payload = {
+            "id": result["task"]["id"],
+            "state": "completed",
+        }
+        commit_payload = {
+            "sha": result["generated"]["head_sha"],
+            "parents": [{"sha": self.head}],
+            "files": [
+                {"filename": result["report"]["path"], "status": "added"},
+                {
+                    "filename": result["worker_receipt"]["path"],
+                    "status": "added",
+                },
+            ],
+        }
+        with (
+            mock.patch.object(
+                MODULE,
+                "gh_json",
+                side_effect=[task_payload, commit_payload],
+            ),
+            mock.patch.object(
+                MODULE,
+                "fetch_committed_text",
+                side_effect=[report, malformed_validation],
+            ),
+        ):
+            self.assertTrue(
+                MODULE.archive_legacy_malformed_owner(
+                    state,
+                    state_path=state_path,
+                    repo_root=self.repo_root,
+                    live_preflight=live_preflight,
+                )
+            )
+
+        archived = MODULE.load_state(state_path)
+        self.assertEqual("consumed", archived["agent_task"]["status"])
+        self.assertEqual(1, len(archived["managed_task_history"]))
+        task = archived["managed_task_history"][0]
+        self.assertEqual("archived_malformed", task["status"])
+        self.assertEqual(
+            "legacy_v1_validation_incomplete", task["archive_reason"]
+        )
+        self.assertEqual(result["task"]["id"], task["task_id"])
+        self.assertEqual(MODULE.sha256_file(prompt_path), task["prompt_sha256"])
+        self.assertEqual(MODULE.sha256_file(result_path), task["result_sha256"])
+        self.assertEqual(MODULE.sha256_text(report), task["report_sha256"])
+        self.assertEqual(
+            MODULE.sha256_text(malformed_validation), task["validation_sha256"]
+        )
+        self.assertEqual(4, len(task["preserved_artifacts"]))
+        self.assertEqual(
+            sorted([result["report"]["path"], result["worker_receipt"]["path"]]),
+            task["paths_by_commit"][0]["paths"],
+        )
+        self.assertEqual("failed", archived["review"]["status"])
+        self.assertEqual(1, len(archived["managed_review_history"]))
+
+    def test_legacy_malformed_owner_projection_fails_closed(self):
+        mutations = {
+            "policy": lambda state, result: state["agent_task"].update(
+                policy=MODULE.AGENT_TASK_POLICY
+            ),
+            "model": lambda state, result: state["agent_task"].update(
+                model="gpt-6-astra"
+            ),
+            "active_task": lambda state, result: result["task"].update(
+                state="in_progress"
+            ),
+            "source_commit": lambda state, result: result["generated"].update(
+                commits=["5" * 40]
+            ),
+            "path": lambda state, result: result["worker_receipt"].update(
+                path=".github/agent-task-validations/other.json"
+            ),
+            "result_error": lambda state, result: result["error"].update(
+                code="unexpected_history"
+            ),
+            "application": lambda state, result: result["application"].update(
+                status="applied"
+            ),
+            "budget": lambda state, result: state.update(iterations=5),
+            "duplicate": lambda state, result: state[
+                "managed_task_history"
+            ].append({"run_id": state["agent_task"]["run_id"]}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                state_path = self.directory / f"legacy-{name}.json"
+                state, result, _, result_path = self.legacy_malformed_owner_state(
+                    state_path
+                )
+                mutate(state, result)
+                result_path.write_text(
+                    json.dumps(result, separators=(",", ":"), sort_keys=True),
+                    encoding="utf-8",
+                )
+                self.assertIsNone(
+                    MODULE.legacy_malformed_owner_projection(
+                        state, repo_root=self.repo_root
+                    )
+                )
+
+    def test_legacy_malformed_owner_live_checks_fail_closed(self):
+        state_path = self.directory / "legacy-live-drift.json"
+        state, result, _, _ = self.legacy_malformed_owner_state(state_path)
+        live_preflight = copy.deepcopy(self.preflight)
+        live_preflight["pr"]["base_sha"] = result["pull_request"]["base_sha"]
+        live_preflight["pr"]["head_sha"] = "6" * 40
+        with self.assertRaisesRegex(MODULE.WorkflowError, "source identity drift"):
+            MODULE.archive_legacy_malformed_owner(
+                state,
+                state_path=state_path,
+                repo_root=self.repo_root,
+                live_preflight=live_preflight,
+            )
+
+        state, result, _, _ = self.legacy_malformed_owner_state(state_path)
+        live_preflight = copy.deepcopy(self.preflight)
+        live_preflight["pr"]["base_sha"] = result["pull_request"]["base_sha"]
+        with (
+            mock.patch.object(
+                MODULE,
+                "gh_json",
+                return_value={"id": result["task"]["id"], "state": "in_progress"},
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "known completed task"),
+        ):
+            MODULE.archive_legacy_malformed_owner(
+                state,
+                state_path=state_path,
+                repo_root=self.repo_root,
+                live_preflight=live_preflight,
+            )
+
+    def test_legacy_malformed_owner_rejects_source_paths_and_valid_receipt(self):
+        state_path = self.directory / "legacy-source-path.json"
+        state, result, _, _ = self.legacy_malformed_owner_state(state_path)
+        live_preflight = copy.deepcopy(self.preflight)
+        live_preflight["pr"]["base_sha"] = result["pull_request"]["base_sha"]
+        task_payload = {"id": result["task"]["id"], "state": "completed"}
+        source_commit = {
+            "sha": result["generated"]["head_sha"],
+            "parents": [{"sha": self.head}],
+            "files": [{"filename": "src/main.py", "status": "added"}],
+        }
+        with (
+            mock.patch.object(
+                MODULE, "gh_json", side_effect=[task_payload, source_commit]
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "artifact-only"),
+        ):
+            MODULE.archive_legacy_malformed_owner(
+                state,
+                state_path=state_path,
+                repo_root=self.repo_root,
+                live_preflight=live_preflight,
+            )
+
+        state, result, _, _ = self.legacy_malformed_owner_state(state_path)
+        artifact_commit = {
+            "sha": result["generated"]["head_sha"],
+            "parents": [{"sha": self.head}],
+            "files": [
+                {"filename": result["report"]["path"], "status": "added"},
+                {
+                    "filename": result["worker_receipt"]["path"],
+                    "status": "added",
+                },
+            ],
+        }
+        valid_validation = json.dumps(
+            [{"command": "python -m pytest", "outcome": "passed"}]
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "gh_json",
+                side_effect=[task_payload, artifact_commit],
+            ),
+            mock.patch.object(
+                MODULE,
+                "fetch_committed_text",
+                side_effect=["Legacy report\n", valid_validation],
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "is complete"),
+        ):
+            MODULE.archive_legacy_malformed_owner(
+                state,
+                state_path=state_path,
+                repo_root=self.repo_root,
+                live_preflight=live_preflight,
+            )
 
     def test_archive_requires_fast_forward_head_and_base_movement(self):
         with mock.patch.object(
