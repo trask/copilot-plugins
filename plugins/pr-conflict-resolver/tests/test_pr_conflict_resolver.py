@@ -886,7 +886,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "112fc4d1524d367a9d8fcc00b6f2192770980daa7192512d1f1789313d07e946",
+            "992b7a64c5d45155a9bbb95984691f21e202f406501fcf7d30e7158e8d55ff09",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -1062,6 +1062,134 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--resume", payload["retry_command"])
         self.assertEqual(state, json.loads(state_path.read_text(encoding="utf-8")))
         preflight.assert_not_called()
+
+    def test_completed_task_resume_keeps_owner_and_managed_attempt_count(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        request_path = directory / "request.json"
+        prompt_path = directory / "prompt.txt"
+        prior_result_path = directory / "result-0.json"
+        request = self.request()
+        prior_result = self.success_result(request)
+        prior_result.update(
+            {
+                "status": "error",
+                "error": {
+                    "code": "unexpected_history",
+                    "message": "generated code SHA was treated as a branch",
+                },
+                "application": {"status": "not_started"},
+                "validation": {"complete": False, "outcomes": []},
+            }
+        )
+        task_id = "6d20f0f2-cc3f-446e-b0bc-acbf3a1e5a30"
+        prior_result["task"].update({"id": task_id, "state": "completed"})
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        prompt_path.write_text("prompt", encoding="utf-8")
+        prior_result_path.write_text(json.dumps(prior_result), encoding="utf-8")
+        owner = "aa0645fb1a049d35"
+        state = {
+            "version": 1,
+            "created_at": "2026-09-17T00:00:00Z",
+            "attempts": 5,
+            "managed_attempts": 5,
+            "managed_task_history": [
+                {"run_id": f"prior-{number}"} for number in range(4)
+            ],
+            "history": [],
+            "escalation": None,
+            "agent_task": {
+                "run_id": owner,
+                "status": "interrupted",
+                "task_id": task_id,
+                "task_id_status": "known",
+                "model": "gpt-5.6-sol",
+                "policy": MODULE.CONFLICT_POLICY,
+                "preflight": {
+                    "pr": {
+                        **MODULE.parse_target("owner/repo#7"),
+                        "head_sha": "b" * 40,
+                        "base_sha": "a" * 40,
+                    },
+                    "request": request,
+                    "strategy": "merge",
+                    "repository_root": str(directory),
+                },
+                "request_file": str(request_path),
+                "prompt_file": str(prompt_path),
+                "result_file": str(prior_result_path),
+                "result": prior_result,
+                "resume_attempts": 0,
+                "recovery_files": [
+                    str(request_path),
+                    str(prompt_path),
+                    str(prior_result_path),
+                ],
+            },
+        }
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+                "--model",
+                "sol",
+                "--resume",
+            ]
+        )
+        result = self.success_result(request)
+        result["task"].update({"id": task_id, "state": "completed"})
+
+        def run_helper(command, **_kwargs):
+            self.assertIn("--input-result-file", command)
+            self.assertEqual(
+                str(prior_result_path),
+                command[command.index("--input-result-file") + 1],
+            )
+            result_path = Path(command[command.index("--result-file") + 1])
+            result_path.write_text("{}", encoding="utf-8")
+            return completed(0)
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(MODULE, "conflict_preflight") as preflight,
+            mock.patch.object(
+                MODULE, "discover_conflict_task", return_value=directory / "helper.py"
+            ),
+            mock.patch.object(MODULE, "run", side_effect=run_helper),
+            mock.patch.object(MODULE, "load_conflict_result", return_value=result),
+            mock.patch.object(MODULE, "verify_quarantined_result"),
+            mock.patch.object(MODULE, "require_live_conflict_guards"),
+            mock.patch.object(
+                MODULE,
+                "publish_conflict_result",
+                return_value={"result": "published"},
+            ),
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(args)
+
+        preflight.assert_not_called()
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(owner, saved["agent_task"]["run_id"])
+        self.assertEqual(task_id, saved["agent_task"]["result"]["task"]["id"])
+        self.assertEqual("verified", saved["agent_task"]["status"])
+        self.assertEqual(1, saved["agent_task"]["resume_attempts"])
+        self.assertEqual(5, saved["attempts"])
+        self.assertEqual(5, saved["managed_attempts"])
+        self.assertEqual(state["managed_task_history"], saved["managed_task_history"])
+        self.assertEqual("published", emitted(emit)["result"])
 
     def test_hash_gated_unidentified_owner_replacement_archives_exact_owner(self):
         directory = temporary_directory(self)
@@ -3421,6 +3549,86 @@ class ManagedTaskResultPersistenceTest(unittest.TestCase):
 
 
 class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
+    def test_code_ref_resolves_branch_or_full_sha_after_artifact_fetch(self):
+        directory = temporary_directory(self)
+        remote = directory / "remote.git"
+        producer = directory / "producer"
+        consumer = directory / "consumer"
+        GitTestCase.git_in(directory, "init", "--bare", str(remote))
+        producer.mkdir()
+        GitTestCase.git_in(producer, "init")
+        GitTestCase.git_in(producer, "config", "user.name", "Test User")
+        GitTestCase.git_in(producer, "config", "user.email", "test@example.com")
+        GitTestCase.write_in(producer, "code.txt", "resolved\n")
+        GitTestCase.commit_in(producer, "Resolved code")
+        code_sha = GitTestCase.git_in(producer, "rev-parse", "HEAD")
+        GitTestCase.write_in(producer, "report.md", "receipt\n")
+        GitTestCase.commit_in(producer, "Artifact")
+        artifact_sha = GitTestCase.git_in(producer, "rev-parse", "HEAD")
+        GitTestCase.git_in(
+            producer,
+            "push",
+            str(remote),
+            f"{code_sha}:refs/heads/generated",
+            f"{artifact_sha}:refs/heads/artifact",
+        )
+        consumer.mkdir()
+        GitTestCase.git_in(consumer, "init")
+        GitTestCase.git_in(consumer, "remote", "add", "origin", str(remote))
+        snapshot = CLOUD_MODULE.LocalSnapshot(
+            root=consumer,
+            control_root=directory,
+            repository="owner/repo",
+            remote="origin",
+            branch="feature",
+            head="b" * 40,
+            status="",
+            operation=None,
+        )
+
+        def runner(command, **kwargs):
+            return subprocess.run(command, **kwargs)
+
+        CLOUD_MODULE.fetch_quarantined(
+            runner,
+            snapshot,
+            CLOUD_MODULE.RemoteRef("artifact", None, "owner/repo", "artifact"),
+            "request-1",
+        )
+        sha_target, resolved_sha = CLOUD_MODULE.fetch_quarantined(
+            runner,
+            snapshot,
+            CLOUD_MODULE.RemoteRef("code", 7, "owner/repo", code_sha),
+            "request-1",
+            allow_commit_sha=True,
+        )
+        branch_target, resolved_branch = CLOUD_MODULE.fetch_quarantined(
+            runner,
+            snapshot,
+            CLOUD_MODULE.RemoteRef("member-8", 8, "owner/repo", "generated"),
+            "request-1",
+            allow_commit_sha=True,
+        )
+
+        self.assertEqual(code_sha, resolved_sha)
+        self.assertEqual(code_sha, resolved_branch)
+        self.assertEqual(
+            code_sha, GitTestCase.git_in(consumer, "rev-parse", sha_target)
+        )
+        self.assertEqual(
+            code_sha, GitTestCase.git_in(consumer, "rev-parse", branch_target)
+        )
+        self.assertEqual(
+            "",
+            GitTestCase.git_in(
+                consumer,
+                "ls-remote",
+                "--heads",
+                "origin",
+                f"refs/heads/{code_sha}",
+            ),
+        )
+
     def test_unchanged_check_reuses_stable_control_and_repository_identity(self):
         snapshot = CLOUD_MODULE.LocalSnapshot(
             root=Path("C:/repo"),

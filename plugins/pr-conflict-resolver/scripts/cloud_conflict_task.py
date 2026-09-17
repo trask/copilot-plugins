@@ -2162,28 +2162,48 @@ def fetch_quarantined(
     snapshot: LocalSnapshot,
     remote_ref: RemoteRef,
     request_id: str,
+    *,
+    allow_commit_sha: bool = False,
 ) -> tuple[str, str]:
     if remote_ref.repository.casefold() != snapshot.repository.casefold():
         raise ConflictError(
             "generated ref repository is not the authenticated repository",
             "unexpected_history",
         )
-    check = run_process(
-        runner,
-        ["git", "check-ref-format", f"refs/heads/{remote_ref.ref}"],
-        cwd=snapshot.root,
-    )
-    if check.returncode != 0:
-        raise ConflictError("generated branch name is invalid", "unexpected_history")
     target = quarantine_ref(request_id, remote_ref.role)
-    git(
-        runner,
-        snapshot.root,
-        "fetch",
-        "--no-tags",
-        snapshot.remote,
-        f"+refs/heads/{remote_ref.ref}:{target}",
-    )
+    if allow_commit_sha and SHA_RE.fullmatch(remote_ref.ref):
+        resolved = git(
+            runner,
+            snapshot.root,
+            "rev-parse",
+            "--verify",
+            f"{remote_ref.ref}^{{commit}}",
+        ).strip().lower()
+        if resolved != remote_ref.ref:
+            raise ConflictError(
+                "generated commit SHA does not resolve exactly",
+                "unexpected_history",
+            )
+        git(runner, snapshot.root, "update-ref", target, resolved)
+    else:
+        check = run_process(
+            runner,
+            ["git", "check-ref-format", f"refs/heads/{remote_ref.ref}"],
+            cwd=snapshot.root,
+        )
+        if check.returncode != 0:
+            raise ConflictError(
+                "generated branch name is invalid",
+                "unexpected_history",
+            )
+        git(
+            runner,
+            snapshot.root,
+            "fetch",
+            "--no-tags",
+            snapshot.remote,
+            f"+refs/heads/{remote_ref.ref}:{target}",
+        )
     sha = git(runner, snapshot.root, "rev-parse", "--verify", target).strip().lower()
     require_sha(sha, "quarantined ref")
     return target, sha
@@ -2771,7 +2791,13 @@ def prove_generated(
         raise ConflictError("artifact and code refs are not distinct", "unexpected_history")
     fetched_code: list[tuple[RemoteRef, str]] = []
     for remote in remote_code:
-        target, sha = fetch_quarantined(runner, snapshot, remote, request_id)
+        target, sha = fetch_quarantined(
+            runner,
+            snapshot,
+            remote,
+            request_id,
+            allow_commit_sha=True,
+        )
         quarantine.append(target)
         fetched_code.append((remote, sha))
     require_local_unchanged(runner, snapshot, quarantine)
