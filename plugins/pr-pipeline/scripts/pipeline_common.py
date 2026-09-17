@@ -1491,7 +1491,7 @@ def stage_blocker(
         if (
             not after_launch
             and stage_result.get("stage") == STAGE_CONFLICT
-            and task_state == "failed"
+            and task_state in {"failed", "normalization_required"}
             and "task_id" in task
             and task.get("task_id") is None
             and task.get("task_id_status") == "not_created"

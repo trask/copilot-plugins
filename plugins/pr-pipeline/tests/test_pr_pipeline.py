@@ -947,6 +947,17 @@ class SweepTest(unittest.TestCase):
                 conflict_strategy="auto",
             )[0],
         )
+        normalization = copy.deepcopy(stage_result)
+        normalization["status"]["agent_task"]["status"] = "normalization_required"
+        normalization["status"]["agent_task"]["error"] = {
+            "code": "native_stack_normalization_required",
+            "message": "native stack member requires explicit owner normalization",
+        }
+        self.assertIsNone(MODULE.stage_blocker(normalization, after_launch=False))
+        self.assertEqual(
+            "stage_recovery_required",
+            MODULE.stage_blocker(normalization, after_launch=True)[0],
+        )
         for field, value in (
             ("task_id", "task-1"),
             ("task_id_status", "created"),

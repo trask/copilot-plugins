@@ -1026,10 +1026,11 @@ class StackRunTest(StackFixture):
             request["arguments"],
         )
 
-    def test_launches_past_failed_not_created_resolver_preflights(self):
+    def test_launches_past_taskless_resolver_preflights(self):
         failures = (
             (
                 "normalized_stack",
+                "failed",
                 {
                     "code": "conflict_preflight_failed",
                     "message": (
@@ -1041,6 +1042,7 @@ class StackRunTest(StackFixture):
             ),
             (
                 "updated_plugin",
+                "failed",
                 {
                     "code": "stale_target",
                     "message": "a checked-out branch is required",
@@ -1049,32 +1051,23 @@ class StackRunTest(StackFixture):
             ),
             (
                 "changed_descendant",
+                "normalization_required",
                 {
-                    "code": "conflict_preflight_failed",
+                    "code": "native_stack_normalization_required",
                     "message": (
-                        "commit 056730d000000000000000000000000000000000 "
-                        "is not a supported linear commit"
+                        "native stack member requires explicit owner normalization "
+                        "for merge commits: "
+                        "056730d0fe9f0d57dcf8ebcf3e4e9c8689c515dc"
                     ),
                 },
                 {
-                    "preflight": {
-                        "request": {
-                            "native_stack": {
-                                "members": [
-                                    {
-                                        "pr_number": 12,
-                                        "head_sha": (
-                                            "056730d000000000000000000000000000000000"
-                                        ),
-                                    }
-                                ]
-                            }
-                        }
-                    }
+                    "normalization_sha256": (
+                        "b3b4adfa42790ccc60becc91e28492ce1578cc259706298784fa2b2a032954d6"
+                    ),
                 },
             ),
         )
-        for case, error, retained in failures:
+        for case, status, error, retained in failures:
             with self.subTest(case=case):
                 pipeline = self.pipeline()
                 member = self.stack["members"][0]
@@ -1082,7 +1075,7 @@ class StackRunTest(StackFixture):
                     {
                         "status": {
                             "agent_task": {
-                                "status": "failed",
+                                "status": status,
                                 "task_id": None,
                                 "task_id_status": "not_created",
                                 "error": error,
