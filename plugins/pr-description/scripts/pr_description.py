@@ -1265,6 +1265,26 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def live_branch_tip(repository: str, branch: str) -> str:
+    encoded_branch = urllib.parse.quote(branch, safe="")
+    payload = gh_json(
+        ["api", f"repos/{repository}/git/ref/heads/{encoded_branch}"]
+    )
+    expected_ref = f"refs/heads/{branch}"
+    obj = payload.get("object") if isinstance(payload, dict) else None
+    sha = obj.get("sha") if isinstance(obj, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("ref") != expected_ref
+        or not isinstance(obj, dict)
+        or obj.get("type") != "commit"
+        or not isinstance(sha, str)
+        or SHA_PATTERN.fullmatch(sha.lower()) is None
+    ):
+        raise WorkflowError("GitHub API returned an invalid live base branch identity")
+    return sha.lower()
+
+
 def agent_task_preflight(
     repo_root: Path, target: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1313,6 +1333,10 @@ def agent_task_preflight(
         }
 
     base_identity = branch_identity(base, "base")
+    base_identity["sha"] = live_branch_tip(
+        base_identity["repository"],
+        base_identity["ref"],
+    )
     head_identity = branch_identity(head, "head")
     if (
         base_identity["repository"].casefold() != target["repo_name"].casefold()
@@ -1705,6 +1729,121 @@ def validate_success_result(
     }
 
 
+def validate_retained_live_base_recovery_gate(
+    args: argparse.Namespace,
+    *,
+    state_path: Path,
+    state: dict[str, Any],
+    preflight: dict[str, Any],
+    identity: dict[str, str],
+    requested_model: str,
+) -> dict[str, str] | None:
+    expected = {
+        "state": getattr(args, "recovery_state_sha256", None),
+        "prompt": getattr(args, "recovery_prompt_sha256", None),
+        "result": getattr(args, "recovery_result_sha256", None),
+        "task_id": getattr(args, "recovery_task_id", None),
+        "request_id": getattr(args, "recovery_request_id", None),
+        "generated_head": getattr(args, "recovery_generated_head", None),
+        "report": getattr(args, "recovery_report_sha256", None),
+    }
+    if not any(value is not None for value in expected.values()):
+        return None
+    if (
+        not all(isinstance(value, str) and value for value in expected.values())
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", expected[name]) is None
+            for name in ("state", "prompt", "result", "report")
+        )
+        or SHA_PATTERN.fullmatch(expected["generated_head"]) is None
+        or not args.resume
+        or not bool(getattr(args, "prepare_only", False))
+        or not bool(getattr(args, "preserve_artifacts", False))
+        or bool(getattr(args, "apply_prepared", False))
+        or sha256_file(state_path) != expected["state"]
+    ):
+        raise WorkflowError("retained live-base recovery gate is incomplete or stale")
+    task_state = state.get("agent_task")
+    if (
+        not isinstance(task_state, dict)
+        or task_state.get("status") != "failed"
+        or task_state.get("model") != requested_model
+        or task_state.get("policy") != AGENT_TASK_POLICY
+        or task_state.get("preflight")
+        != {**preflight, "identity": identity}
+        or not isinstance(task_state.get("prompt_file"), str)
+        or not isinstance(task_state.get("result_file"), str)
+    ):
+        raise WorkflowError("retained live-base recovery owner identity is malformed")
+    prompt_path = Path(task_state["prompt_file"])
+    result_path = Path(task_state["result_file"])
+    if (
+        not prompt_path.is_file()
+        or not result_path.is_file()
+        or sha256_file(prompt_path) != expected["prompt"]
+        or sha256_file(result_path) != expected["result"]
+    ):
+        raise WorkflowError("retained live-base recovery artifact identity drifted")
+    result = load_agent_task_result(result_path)
+    expected_pr = expected_cloud_pull_request(preflight)
+    actual_pr = result.get("pull_request")
+    if (
+        not isinstance(actual_pr, dict)
+        or set(actual_pr) != set(expected_pr)
+        or not isinstance(actual_pr.get("base_sha"), str)
+        or SHA_PATTERN.fullmatch(actual_pr["base_sha"]) is None
+        or actual_pr["base_sha"] == expected_pr["base_sha"]
+        or {
+            key: value
+            for key, value in actual_pr.items()
+            if key != "base_sha"
+        }
+        != {
+            key: value
+            for key, value in expected_pr.items()
+            if key != "base_sha"
+        }
+    ):
+        validate_success_result(
+            result,
+            preflight=preflight,
+            requested_model=requested_model,
+            identity=identity,
+        )
+        raise WorkflowError(
+            "retained result does not contain the exact live-base identity mismatch"
+        )
+    live_base_sha = live_branch_tip(
+        preflight["pr"]["base"]["repository"],
+        preflight["pr"]["base"]["ref"],
+    )
+    if actual_pr["base_sha"] != live_base_sha:
+        raise WorkflowError("retained live-base recovery no longer matches GitHub")
+    normalized = copy.deepcopy(preflight)
+    normalized["pr"]["base"]["sha"] = live_base_sha
+    remote = validate_success_result(
+        result,
+        preflight=normalized,
+        requested_model=requested_model,
+        identity=identity,
+    )
+    task = result["task"]
+    if (
+        task["id"] != expected["task_id"]
+        or remote["request_id"] != expected["request_id"]
+        or remote["generated_head"] != expected["generated_head"]
+        or remote["report_sha256"] != expected["report"]
+    ):
+        raise WorkflowError("retained live-base recovery task identity drifted")
+    return {
+        "base_sha": live_base_sha,
+        "task_id": task["id"],
+        "request_id": remote["request_id"],
+        "generated_head": remote["generated_head"],
+        "report_sha256": remote["report_sha256"],
+    }
+
+
 def fetch_committed_text(
     repository: str, path: str, commit: str, *, description: str
 ) -> str:
@@ -1766,6 +1905,7 @@ def validate_proposal_report(
     preflight: dict[str, Any],
     changed_files: list[str],
     proposal_count: int | None = None,
+    retained_recovery: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     require_no_credentials(content, source="Agent Task proposal report")
     report = parse_markdown_report(content, description="Agent Task proposal report")
@@ -1780,6 +1920,27 @@ def validate_proposal_report(
         "proposal",
         "identity",
     }
+    retained_top_level_keep = (
+        retained_recovery is not None
+        and isinstance(report, dict)
+        and set(report)
+        == {
+            "request",
+            "repository",
+            "pull_request",
+            "head",
+            "base",
+            "decision",
+            "evidence",
+            "proposal",
+        }
+    )
+    retained_scalar_identity_keep = (
+        retained_recovery is not None
+        and forward_identity_keep
+        and isinstance(report.get("identity"), dict)
+        and isinstance(report["identity"].get("head"), str)
+    )
     if forward_keep:
         report = normalize_forward_keep_proposal_report(
             report,
@@ -1788,6 +1949,15 @@ def validate_proposal_report(
             changed_files=changed_files,
             proposal_count=proposal_count,
         )
+    elif retained_scalar_identity_keep:
+        report = normalize_retained_scalar_identity_keep_report(
+            report,
+            request_id=request_id,
+            preflight=preflight,
+            changed_files=changed_files,
+            proposal_count=proposal_count,
+            retained_recovery=retained_recovery,
+        )
     elif forward_identity_keep:
         report = normalize_forward_identity_keep_proposal_report(
             report,
@@ -1795,6 +1965,15 @@ def validate_proposal_report(
             preflight=preflight,
             changed_files=changed_files,
             proposal_count=proposal_count,
+        )
+    elif retained_top_level_keep:
+        report = normalize_retained_top_level_keep_report(
+            report,
+            request_id=request_id,
+            preflight=preflight,
+            changed_files=changed_files,
+            proposal_count=proposal_count,
+            retained_recovery=retained_recovery,
         )
     if not isinstance(report, dict) or set(report) != {
         "schema",
@@ -1876,6 +2055,199 @@ def validate_proposal_report(
     if (report["decision"] == "keep") != unchanged:
         raise WorkflowError("Agent Task proposal decision does not match its title and body")
     return report
+
+
+def retained_recovery_matches_request(
+    retained_recovery: dict[str, str],
+    *,
+    request_id: str,
+    preflight: dict[str, Any],
+) -> bool:
+    return (
+        set(retained_recovery)
+        == {
+            "base_sha",
+            "task_id",
+            "request_id",
+            "generated_head",
+            "report_sha256",
+        }
+        and retained_recovery.get("request_id") == request_id
+        and retained_recovery.get("base_sha") == preflight["pr"]["base"]["sha"]
+        and isinstance(retained_recovery.get("task_id"), str)
+        and bool(retained_recovery["task_id"])
+        and SHA_PATTERN.fullmatch(
+            str(retained_recovery.get("generated_head", ""))
+        )
+        is not None
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(retained_recovery.get("report_sha256", "")),
+        )
+        is not None
+    )
+
+
+def normalized_recovery_keep_report(
+    *,
+    request_id: str,
+    preflight: dict[str, Any],
+    evidence_paths: list[str],
+    body_basis: str,
+    detail: str,
+) -> dict[str, Any]:
+    pr = preflight["pr"]
+    return {
+        "schema": LEGACY_PR_DESCRIPTION_PROPOSAL_SCHEMA,
+        "request_id": request_id,
+        "repository": pr["repo_name"],
+        "pull_request": {
+            "number": pr["number"],
+            "head_sha": pr["head_sha"],
+            "current_title_sha256": sha256_text(pr["title"]),
+            "current_body_sha256": sha256_text(pr["body"]),
+        },
+        "decision": "keep",
+        "proposal": {
+            "title": pr["title"],
+            "body": pr["body"],
+        },
+        "evidence": {
+            "changed_files": [
+                {"path": path, "detail": detail} for path in evidence_paths
+            ],
+            "title_basis": "The retained keep decision preserves the pinned title.",
+            "body_basis": body_basis,
+        },
+    }
+
+
+def normalize_retained_top_level_keep_report(
+    report: dict[str, Any],
+    *,
+    request_id: str,
+    preflight: dict[str, Any],
+    changed_files: list[str],
+    proposal_count: int | None,
+    retained_recovery: dict[str, str],
+) -> dict[str, Any]:
+    pr = preflight["pr"]
+    evidence = report.get("evidence")
+    if (
+        not retained_recovery_matches_request(
+            retained_recovery,
+            request_id=request_id,
+            preflight=preflight,
+        )
+        or proposal_count != 0
+        or report.get("request") != {"type": "pull_request_description"}
+        or report.get("repository")
+        != {"owner": pr["owner"], "name": pr["repo"]}
+        or report.get("pull_request")
+        != {"number": pr["number"], "url": pr["url"]}
+        or report.get("head")
+        != {
+            "repository": pr["head"]["repository"],
+            "branch": pr["head"]["ref"],
+            "sha": pr["head_sha"],
+        }
+        or report.get("base")
+        != {
+            "repository": pr["base"]["repository"],
+            "branch": pr["base"]["ref"],
+        }
+        or report.get("decision") != "keep"
+        or report.get("proposal") != {"title": pr["title"], "body": pr["body"]}
+        or not isinstance(evidence, dict)
+        or set(evidence) != {"body_basis", "changed_files"}
+        or not isinstance(evidence.get("body_basis"), str)
+        or not 1 <= len(evidence["body_basis"].strip()) <= 4000
+        or "\r" in evidence["body_basis"]
+        or not isinstance(evidence.get("changed_files"), list)
+        or any(
+            not isinstance(path, str)
+            or not path
+            or Path(path).is_absolute()
+            or ".." in Path(path).parts
+            for path in evidence["changed_files"]
+        )
+        or len(evidence["changed_files"]) != len(set(evidence["changed_files"]))
+        or set(evidence["changed_files"]) != set(changed_files)
+    ):
+        raise WorkflowError(
+            "retained top-level keep report is malformed or has stale identity"
+        )
+    return normalized_recovery_keep_report(
+        request_id=request_id,
+        preflight=preflight,
+        evidence_paths=evidence["changed_files"],
+        body_basis=evidence["body_basis"],
+        detail="The retained report included this exact changed path.",
+    )
+
+
+def normalize_retained_scalar_identity_keep_report(
+    report: dict[str, Any],
+    *,
+    request_id: str,
+    preflight: dict[str, Any],
+    changed_files: list[str],
+    proposal_count: int | None,
+    retained_recovery: dict[str, str],
+) -> dict[str, Any]:
+    pr = preflight["pr"]
+    evidence = report.get("evidence")
+    if (
+        not retained_recovery_matches_request(
+            retained_recovery,
+            request_id=request_id,
+            preflight=preflight,
+        )
+        or proposal_count != 0
+        or report.get("identity")
+        != {
+            "request": request_id,
+            "repository": pr["repo_name"],
+            "pull_request": pr["number"],
+            "head": pr["head_sha"],
+            "base": pr["base"]["ref"],
+            "title": pr["title"],
+            "body": pr["body"],
+        }
+        or report.get("decision") != "keep"
+        or report.get("proposal") != {"title": pr["title"], "body": pr["body"]}
+        or not isinstance(evidence, dict)
+        or set(evidence) != {"body_basis", "changed_files"}
+        or not isinstance(evidence.get("body_basis"), str)
+        or not 1 <= len(evidence["body_basis"].strip()) <= 4000
+        or "\r" in evidence["body_basis"]
+        or not isinstance(evidence.get("changed_files"), list)
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"path", "detail"}
+            or not isinstance(item.get("path"), str)
+            or not item["path"]
+            or Path(item["path"]).is_absolute()
+            or ".." in Path(item["path"]).parts
+            or not isinstance(item.get("detail"), str)
+            or not 1 <= len(item["detail"].strip()) <= 4000
+            or "\r" in item["detail"]
+            for item in evidence["changed_files"]
+        )
+        or len({item["path"] for item in evidence["changed_files"]})
+        != len(evidence["changed_files"])
+        or {item["path"] for item in evidence["changed_files"]} != set(changed_files)
+    ):
+        raise WorkflowError(
+            "retained scalar-identity keep report is malformed or has stale identity"
+        )
+    return normalized_recovery_keep_report(
+        request_id=request_id,
+        preflight=preflight,
+        evidence_paths=[item["path"] for item in evidence["changed_files"]],
+        body_basis=evidence["body_basis"],
+        detail="The retained report included this exact changed path.",
+    )
 
 
 def normalize_forward_keep_proposal_report(
@@ -2533,6 +2905,7 @@ def record_agent_task_preparation(
     artifacts: list[Path],
     report_content: str,
     model: str,
+    retained_recovery: dict[str, str] | None = None,
 ) -> None:
     task_state = state["agent_task"]
     preparation = proposal_preparation(
@@ -2557,6 +2930,10 @@ def record_agent_task_preparation(
             "validated_at": utc_now(),
         }
     )
+    if retained_recovery is None:
+        task_state.pop("report_identity_recovery", None)
+    else:
+        task_state["report_identity_recovery"] = retained_recovery
     finalize_agent_task_artifacts(
         task_state,
         artifacts,
@@ -2594,6 +2971,31 @@ def record_agent_task_preparation(
             "apply_command": apply_command,
         }
     )
+
+
+def prepared_report_identity_recovery(
+    task_state: dict[str, Any],
+    *,
+    preflight: dict[str, Any],
+    result: dict[str, Any],
+    remote: dict[str, Any],
+) -> dict[str, str] | None:
+    recovery = task_state.get("report_identity_recovery")
+    if recovery is None:
+        return None
+    if (
+        not isinstance(recovery, dict)
+        or not retained_recovery_matches_request(
+            recovery,
+            request_id=remote["request_id"],
+            preflight=preflight,
+        )
+        or result["task"]["id"] != recovery["task_id"]
+        or remote["generated_head"] != recovery["generated_head"]
+        or remote["report_sha256"] != recovery["report_sha256"]
+    ):
+        raise WorkflowError("prepared report identity recovery drifted")
+    return recovery
 
 
 def validated_action_from_checkpoint(
@@ -2743,6 +3145,12 @@ def apply_prepared_agent_task(args: argparse.Namespace) -> None:
             requested_model=MODEL_ALIASES[args.model],
             identity=identity,
         )
+        retained_recovery = prepared_report_identity_recovery(
+            task_state,
+            preflight=preflight,
+            result=result,
+            remote=remote,
+        )
         report_content = fetch_committed_text(
             preflight["pr"]["repo_name"],
             remote["report_path"],
@@ -2761,6 +3169,7 @@ def apply_prepared_agent_task(args: argparse.Namespace) -> None:
             preflight=preflight,
             changed_files=changed_files,
             proposal_count=proposal_count(state),
+            retained_recovery=retained_recovery,
         )
         expected = proposal_preparation(
             preflight=preflight,
@@ -2935,6 +3344,18 @@ def resume_agent_task(args: argparse.Namespace) -> None:
         "viewer": state["viewer"],
     }
     identity = local_identity(repo_root)
+    retained_recovery = validate_retained_live_base_recovery_gate(
+        args,
+        state_path=path,
+        state=state,
+        preflight=preflight,
+        identity=identity,
+        requested_model=MODEL_ALIASES[args.model],
+    )
+    if retained_recovery is not None:
+        preflight = copy.deepcopy(preflight)
+        preflight["pr"]["base"]["sha"] = retained_recovery["base_sha"]
+        state["pr"]["base"]["sha"] = retained_recovery["base_sha"]
     run_id = state["run_id"]
     index_path = Path(state["index_path"])
     task_state["resume_attempts"] = int(task_state.get("resume_attempts", 0)) + 1
@@ -2972,6 +3393,7 @@ def resume_agent_task(args: argparse.Namespace) -> None:
             preflight=preflight,
             changed_files=changed_files,
             proposal_count=proposal_count(state),
+            retained_recovery=retained_recovery,
         )
         if getattr(args, "prepare_only", False):
             current = load_run_state(path)
@@ -2987,6 +3409,7 @@ def resume_agent_task(args: argparse.Namespace) -> None:
                 artifacts=artifacts,
                 report_content=report_content,
                 model=args.model,
+                retained_recovery=retained_recovery,
             )
             return
         if report["decision"] != "keep":
@@ -3496,6 +3919,22 @@ def reserve_agent_task_run(
 def command_agent_task(args: argparse.Namespace) -> None:
     prepare_only = bool(getattr(args, "prepare_only", False))
     apply_prepared = bool(getattr(args, "apply_prepared", False))
+    has_recovery_gate = any(
+        getattr(args, name, None) is not None
+        for name in (
+            "recovery_state_sha256",
+            "recovery_prompt_sha256",
+            "recovery_result_sha256",
+            "recovery_task_id",
+            "recovery_request_id",
+            "recovery_generated_head",
+            "recovery_report_sha256",
+        )
+    )
+    if has_recovery_gate and not getattr(args, "resume", False):
+        raise WorkflowError(
+            "retained live-base recovery gates require --resume"
+        )
     if apply_prepared and (args.resume or prepare_only):
         raise WorkflowError(
             "--apply-prepared cannot be combined with --resume or --prepare-only"
@@ -3985,6 +4424,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(MODEL_ALIASES),
         default="sol",
     )
+    agent_task.add_argument("--recovery-state-sha256")
+    agent_task.add_argument("--recovery-prompt-sha256")
+    agent_task.add_argument("--recovery-result-sha256")
+    agent_task.add_argument("--recovery-task-id")
+    agent_task.add_argument("--recovery-request-id")
+    agent_task.add_argument("--recovery-generated-head")
+    agent_task.add_argument("--recovery-report-sha256")
     agent_task.add_argument("--pipeline-run", help=argparse.SUPPRESS)
     agent_task.add_argument("--pipeline-iteration", help=argparse.SUPPRESS)
     agent_task.add_argument("--pipeline-max-iterations", help=argparse.SUPPRESS)

@@ -714,7 +714,7 @@ class LegacyAgentInstructions:
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.53")
+        self.assertEqual(plugin["version"], "1.0.54")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
@@ -1040,11 +1040,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.53")
+        self.assertEqual(plugin["version"], "1.0.54")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
         head_sha = self.preflight["pr"]["head_sha"]
+        stale_base_sha = "9" * 40
+        live_base_sha = "2" * 40
         payload = {
             "state": "open",
             "title": "Current title",
@@ -1052,7 +1054,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "base": {
                 "repo": {"full_name": "owner/repo"},
                 "ref": "main",
-                "sha": "2" * 40,
+                "sha": stale_base_sha,
             },
             "head": {
                 "repo": {"full_name": "owner/repo"},
@@ -1070,6 +1072,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "pull": True,
             },
         }
+        live_base = {
+            "ref": "refs/heads/main",
+            "object": {"type": "commit", "sha": live_base_sha},
+        }
         with (
             mock.patch.object(
                 MODULE,
@@ -1077,18 +1083,74 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 return_value=pr_metadata(head_sha=head_sha),
             ),
             mock.patch.object(
-                MODULE, "gh_json", side_effect=[payload, repository, {"login": "viewer"}]
+                MODULE,
+                "gh_json",
+                side_effect=[payload, repository, {"login": "viewer"}, live_base],
             ),
         ):
             context = MODULE.agent_task_preflight(
                 self.repo_root, MODULE.parse_target("owner/repo#7")
             )
 
-        self.assertEqual(context["pr"]["base"]["sha"], "2" * 40)
+        self.assertEqual(context["pr"]["base"]["sha"], live_base_sha)
         self.assertEqual(context["pr"]["head"]["sha"], head_sha)
         self.assertEqual(context["viewer"]["login"], "viewer")
         self.assertIsNone(context["viewer"]["repository_role"])
         self.assertTrue(context["viewer"]["permissions"]["push"])
+
+    def test_authenticated_preflight_rejects_mismatched_live_base_ref(self):
+        head_sha = self.preflight["pr"]["head_sha"]
+        payload = {
+            "state": "open",
+            "title": "Current title",
+            "body": "Current body",
+            "base": {
+                "repo": {"full_name": "owner/repo"},
+                "ref": "main",
+                "sha": "2" * 40,
+            },
+            "head": {
+                "repo": {"full_name": "owner/repo"},
+                "ref": "feature",
+                "sha": head_sha,
+            },
+        }
+        repository = {
+            "role_name": "write",
+            "permissions": {
+                "admin": False,
+                "maintain": False,
+                "push": True,
+                "triage": True,
+                "pull": True,
+            },
+        }
+        with (
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                return_value=pr_metadata(head_sha=head_sha),
+            ),
+            mock.patch.object(
+                MODULE,
+                "gh_json",
+                side_effect=[
+                    payload,
+                    repository,
+                    {"login": "viewer"},
+                    {
+                        "ref": "refs/heads/release",
+                        "object": {"type": "commit", "sha": "2" * 40},
+                    },
+                ],
+            ),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "invalid live base branch identity"
+            ),
+        ):
+            MODULE.agent_task_preflight(
+                self.repo_root, MODULE.parse_target("owner/repo#7")
+            )
 
     def test_validates_success_envelope_receipt_report_and_proposal(self):
         report_content = self.proposal_report()
@@ -1441,6 +1503,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "status": "failed",
                 "model": "gpt-5.6-sol",
                 "policy": "marketplace-agent-report-worker@1",
+                "preflight": {
+                    "repository_root": str(self.repo_root),
+                    "pr": self.preflight["pr"],
+                    "viewer": self.preflight["viewer"],
+                    "identity": self.identity,
+                },
                 "prompt_file": str(prompt),
                 "result_file": str(result_path),
                 "error": "report mismatch",
@@ -1516,6 +1584,273 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertTrue(result_path.is_file())
         self.assertEqual("validated", emitted[-1]["result"])
         self.assertEqual("keep", emitted[-1]["decision"])
+
+    def test_stale_preflight_base_recovery_prepares_same_completed_task(self):
+        stale_base_sha = self.preflight["pr"]["base"]["sha"]
+        live_base_sha = "5" * 40
+        path = self.directory / "owner--repo--7--stale-base.json"
+        index = self.directory / "owner--repo--7.json"
+        prompt = self.directory / "stale-base-prompt.txt"
+        result_path = self.directory / "stale-base-result.json"
+        prompt.write_text("retained prompt", encoding="utf-8")
+        report_payload = {
+            "request": {"type": "pull_request_description"},
+            "repository": {"owner": "owner", "name": "repo"},
+            "pull_request": {
+                "number": 7,
+                "url": self.preflight["pr"]["url"],
+            },
+            "head": {
+                "repository": "owner/repo",
+                "branch": "feature",
+                "sha": self.preflight["pr"]["head_sha"],
+            },
+            "base": {
+                "repository": "owner/repo",
+                "branch": "main",
+            },
+            "decision": "keep",
+            "evidence": {
+                "body_basis": "The current body covers the changed behavior.",
+                "changed_files": ["src/app.py"],
+            },
+            "proposal": {
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+            },
+        }
+        report_content = f"```json\n{json.dumps(report_payload)}\n```"
+        result = self.result(report_content)
+        result["pull_request"]["base_sha"] = live_base_sha
+        result_path.write_text(json.dumps(result), encoding="utf-8")
+        state = {
+            "version": 2,
+            "kind": "run",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "run_id": "run-1",
+            "repo_root": str(self.repo_root),
+            "pr": self.preflight["pr"],
+            "viewer": self.preflight["viewer"],
+            "proposal_count": 0,
+            "pinned_at": "2026-01-01T00:00:00Z",
+            "index_path": str(index),
+            "agent_task": {
+                "status": "failed",
+                "model": "gpt-5.6-sol",
+                "policy": "marketplace-agent-report-worker@1",
+                "preflight": {
+                    "repository_root": str(self.repo_root),
+                    "pr": self.preflight["pr"],
+                    "viewer": self.preflight["viewer"],
+                    "identity": self.identity,
+                },
+                "prompt_file": str(prompt),
+                "result_file": str(result_path),
+                "error": (
+                    "Agent Task result policy, repository, pull request, model, "
+                    "or local identity does not match the pinned request"
+                ),
+            },
+        }
+        MODULE.save_state(path, state)
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "does not match the pinned request"
+        ):
+            MODULE.validate_success_result(
+                result,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+                identity=self.identity,
+            )
+        arguments = SimpleNamespace(
+            target="owner/repo#7",
+            repo_root=str(self.repo_root),
+            state=str(path),
+            resume=True,
+            preserve_artifacts=True,
+            prepare_only=True,
+            apply_prepared=False,
+            model="sol",
+            recovery_state_sha256=MODULE.sha256_file(path),
+            recovery_prompt_sha256=MODULE.sha256_file(prompt),
+            recovery_result_sha256=MODULE.sha256_file(result_path),
+            recovery_task_id="task-1",
+            recovery_request_id="request-1",
+            recovery_generated_head="3" * 40,
+            recovery_report_sha256=MODULE.sha256_text(report_content),
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "refresh_run_index"),
+            mock.patch.object(MODULE, "local_identity", return_value=self.identity),
+            mock.patch.object(MODULE, "live_branch_tip", return_value=live_base_sha),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "run") as run,
+            mock.patch.object(
+                MODULE, "fetch_committed_text", return_value=report_content
+            ),
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                return_value=pr_metadata(
+                    head_sha=self.preflight["pr"]["head_sha"]
+                ),
+            ),
+            mock.patch.object(
+                MODULE, "pull_request_file_paths", return_value=["src/app.py"]
+            ),
+            mock.patch.object(MODULE, "emit"),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        discover.assert_not_called()
+        run.assert_not_called()
+        prepared = MODULE.load_run_state(path)
+        self.assertEqual("validated_pending_apply", prepared["agent_task"]["status"])
+        self.assertEqual(live_base_sha, prepared["pr"]["base"]["sha"])
+        self.assertEqual(
+            live_base_sha,
+            prepared["agent_task"]["preflight"]["pr"]["base"]["sha"],
+        )
+        self.assertEqual(
+            stale_base_sha,
+            self.preflight["pr"]["base"]["sha"],
+        )
+        self.assertEqual("task-1", prepared["agent_task"]["task"]["id"])
+        self.assertEqual(1, prepared["agent_task"]["resume_attempts"])
+        self.assertEqual(
+            {
+                "base_sha": live_base_sha,
+                "task_id": "task-1",
+                "request_id": "request-1",
+                "generated_head": "3" * 40,
+                "report_sha256": MODULE.sha256_text(report_content),
+            },
+            prepared["agent_task"]["report_identity_recovery"],
+        )
+
+        def validated_no_change(state_path, current, **_kwargs):
+            current["validated_head_sha"] = self.preflight["pr"]["head_sha"]
+            current["validation"] = {
+                "mode": "no_change",
+                "head_sha": self.preflight["pr"]["head_sha"],
+            }
+            MODULE.save_state(state_path, current)
+            return {
+                "result": "validated",
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+                "validated_head_sha": self.preflight["pr"]["head_sha"],
+            }
+
+        apply_arguments = SimpleNamespace(
+            target="owner/repo#7",
+            repo_root=str(self.repo_root),
+            state=str(path),
+            resume=False,
+            preserve_artifacts=True,
+            prepare_only=False,
+            apply_prepared=True,
+            model="sol",
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "refresh_run_index"),
+            mock.patch.object(MODULE, "local_identity", return_value=self.identity),
+            mock.patch.object(
+                MODULE, "fetch_committed_text", return_value=report_content
+            ),
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                return_value=pr_metadata(
+                    head_sha=self.preflight["pr"]["head_sha"]
+                ),
+            ),
+            mock.patch.object(
+                MODULE, "pull_request_file_paths", return_value=["src/app.py"]
+            ),
+            mock.patch.object(
+                MODULE, "validate_no_change", side_effect=validated_no_change
+            ),
+            mock.patch.object(MODULE, "emit"),
+        ):
+            MODULE.command_agent_task(apply_arguments)
+        completed = MODULE.load_run_state(path)
+        self.assertEqual("completed", completed["agent_task"]["status"])
+        self.assertEqual(
+            live_base_sha,
+            completed["agent_task"]["preflight"]["pr"]["base"]["sha"],
+        )
+
+    def test_retained_scalar_identity_keep_report_requires_exact_recovery(self):
+        report = {
+            "decision": "keep",
+            "evidence": {
+                "body_basis": "The current body covers the changed behavior.",
+                "changed_files": [
+                    {
+                        "path": "src/app.py",
+                        "detail": "Adds the public behavior.",
+                    }
+                ],
+            },
+            "proposal": {
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+            },
+            "identity": {
+                "request": "request-1",
+                "repository": "owner/repo",
+                "pull_request": 7,
+                "head": self.preflight["pr"]["head_sha"],
+                "base": "main",
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+            },
+        }
+        content = f"```json\n{json.dumps(report)}\n```"
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "identity keep report"
+        ):
+            MODULE.validate_proposal_report(
+                content,
+                request_id="request-1",
+                preflight=self.preflight,
+                changed_files=["src/app.py"],
+                proposal_count=0,
+            )
+        normalized = MODULE.validate_proposal_report(
+            content,
+            request_id="request-1",
+            preflight=self.preflight,
+            changed_files=["src/app.py"],
+            proposal_count=0,
+            retained_recovery={
+                "base_sha": self.preflight["pr"]["base"]["sha"],
+                "task_id": "task-1",
+                "request_id": "request-1",
+                "generated_head": "3" * 40,
+                "report_sha256": MODULE.sha256_text(content),
+            },
+        )
+        self.assertEqual("keep", normalized["decision"])
+        self.assertEqual(
+            self.preflight["pr"]["title"], normalized["proposal"]["title"]
+        )
 
     def test_exact_forward_identity_resume_prepares_same_task_without_mutation(self):
         preflight = self.forward_identity_preflight()
