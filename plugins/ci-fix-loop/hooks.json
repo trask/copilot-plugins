@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "hooks": {
+    "permissionRequest": [
+      {
+        "type": "command",
+        "matcher": "bash|powershell",
+        "bash": "python3 \"${PLUGIN_ROOT}/scripts/ci_fix_loop_permission.py\"",
+        "powershell": "pythonw \"${PLUGIN_ROOT}\\scripts\\ci_fix_loop_permission.py\"",
+        "timeoutSec": 10
+      }
+    ]
+  }
+}

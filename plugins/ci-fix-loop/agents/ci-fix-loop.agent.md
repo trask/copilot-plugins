@@ -2,7 +2,8 @@
 name: CI Fix Loop
 description: "Explicit invocation only: never select automatically; fix failing checks on one pull request or bottom-up through its native stack."
 argument-hint: "Canonical PR URL or owner/repo#number; omit only from a worktree attached to the PR's branch"
-tools: [execute, agent, todo, rename_session]
+tools: [execute, agent, rename_session]
+model: gpt-5.6-sol
 user-invocable: true
 disable-model-invocation: true
 ---
@@ -19,29 +20,28 @@ It never posts a comment, review, reply, or label. Its only GitHub changes are a
 
 Find the installed helper once:
 
-- PowerShell: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; $ciFixLoop = "$copilotHome/installed-plugins/trask-plugins/ci-fix-loop/scripts/ci_fix_loop.py"`
-- Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; ci_fix_loop="$copilot_home/installed-plugins/trask-plugins/ci-fix-loop/scripts/ci_fix_loop.py"`
-- POSIX: `ci_fix_loop="${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/ci-fix-loop/scripts/ci_fix_loop.py"`
+- PowerShell: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE\.copilot" }; $ciFixLoop = "$copilotHome\installed-plugins\trask-plugins\ci-fix-loop\scripts\ci_fix_loop.py"; python $ciFixLoop <arguments>`
+- POSIX: `copilot_home="${COPILOT_HOME:-$HOME/.copilot}"; ci_fix_loop="$copilot_home/installed-plugins/trask-plugins/ci-fix-loop/scripts/ci_fix_loop.py"; python3 "$ci_fix_loop" <arguments>`
 
-Invoke it with the active Python interpreter. Never import the helper or use any of its APIs.
+Use the complete prefix for the active shell exactly as shown on every call, replacing only `<arguments>`. The plugin admits that exact installed coordinator command without a user prompt. It does not admit another Python program, helper path, shell command, or coordinator operation. Never import the helper or use any of its APIs.
 
 Before the first helper call, form a canonical target. Pass a supplied GitHub pull request URL or `owner/repo#number` exactly. If the user supplied a bare number such as `19204` or `#19204`, combine it with the current workspace repository to form `owner/repo#19204`. Every `stack-start` command must include that canonical target. Never pass a bare number and never omit the target, even when the worktree is attached to the pull request branch.
 
-For a standalone request, run `stack-start <canonical-target> --repo-root <workspace>`. If it returns `single`, use its returned canonical `target` for:
+For a standalone request, run `stack-start <canonical-target> --repo-root <workspace>`. `stack-start` does not accept `--model`. If it returns `single`, use its returned canonical `target` for:
 
 ```text
-loop <canonical-target> --repo-root <workspace> --new-invocation
+loop <canonical-target> --repo-root <workspace> --model sol --new-invocation
 ```
 
 Keep the returned `state` and `invocation_run`. After a native-stack publication, resume that member with:
 
 ```text
-loop <canonical-target> --repo-root <workspace> --state <state> --invocation-run <invocation_run>
+loop <canonical-target> --repo-root <workspace> --state <state> --model sol --invocation-run <invocation_run>
 ```
 
 When a caller supplies `pipeline-run`, `pipeline-iteration`, and `pipeline-max-iterations`, skip `stack-start`. Pass all three values unchanged to every `loop` call. Never invent or refresh a pipeline position.
 
-Use `--model sol` unless the caller selected another supported model. The helper resolves the alias and pins the managed request.
+Use exactly `--model sol` on every `loop` or `agent-task` call. Never select or forward another model. The helper resolves the alias and pins the managed request.
 
 ## Managed Agent Task boundary
 

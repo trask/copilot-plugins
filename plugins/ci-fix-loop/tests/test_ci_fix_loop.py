@@ -8,14 +8,22 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+import uuid
 from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "ci_fix_loop.py"
+PERMISSION_SCRIPT = (
+    Path(__file__).parents[1] / "scripts" / "ci_fix_loop_permission.py"
+)
 AGENT = Path(__file__).parents[1] / "agents" / "ci-fix-loop.agent.md"
+HOOKS = Path(__file__).parents[1] / "hooks.json"
 PLUGIN = Path(__file__).parents[1] / "plugin.json"
 EXTERNAL_ZIZMOR_CHECK = (
     Path(__file__).parent / "fixtures" / "external-zizmor-check-run.json"
@@ -27,6 +35,219 @@ SPEC = importlib.util.spec_from_file_location("ci_fix_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+PERMISSION_SPEC = importlib.util.spec_from_file_location(
+    "ci_fix_loop_permission", PERMISSION_SCRIPT
+)
+assert PERMISSION_SPEC is not None and PERMISSION_SPEC.loader is not None
+PERMISSION_MODULE = importlib.util.module_from_spec(PERMISSION_SPEC)
+PERMISSION_SPEC.loader.exec_module(PERMISSION_MODULE)
+
+
+class AgentCommandAdmissionTest(unittest.TestCase):
+    def payload(self, command, *, cwd=None, tool_name="powershell"):
+        return {
+            "sessionId": "session",
+            "timestamp": 1,
+            "cwd": cwd or str(Path.cwd()),
+            "hookName": "permissionRequest",
+            "toolName": tool_name,
+            "toolInput": {"command": command},
+            "permissionSuggestions": [],
+        }
+
+    def powershell_command(self, arguments):
+        return f"{PERMISSION_MODULE.POWERSHELL_PREFIX}{arguments}"
+
+    def test_admits_only_exact_coordinator_commands_for_current_workspace(self):
+        cwd = str(Path.cwd())
+        self.assertTrue(
+            PERMISSION_MODULE.admission_allowed(
+                self.payload(
+                    self.powershell_command(
+                        f'stack-start owner/repo#7 --repo-root "{cwd}"'
+                    ),
+                    cwd=cwd,
+                )
+            )
+        )
+        self.assertTrue(
+            PERMISSION_MODULE.admission_allowed(
+                self.payload(
+                    (
+                        f"{PERMISSION_MODULE.BASH_PREFIX}"
+                        "loop owner/repo#7 --repo-root '/tmp/repo' "
+                        "--model sol --new-invocation"
+                    ),
+                    cwd="/tmp/repo",
+                    tool_name="bash",
+                )
+            )
+        )
+        self.assertTrue(
+            PERMISSION_MODULE.admission_allowed(
+                self.payload(
+                    self.powershell_command(
+                        f'loop owner/repo#7 --repo-root "{cwd}" '
+                        "--model sol --new-invocation"
+                    ),
+                    cwd=cwd,
+                )
+            )
+        )
+
+    def test_rejects_broader_or_drifted_shell_commands(self):
+        cwd = str(Path.cwd())
+        rejected = [
+            "python -c \"print('unrelated')\"",
+            self.powershell_command(
+                f'stack-start 7 --repo-root "{cwd}"'
+            ),
+            self.powershell_command(
+                f'stack-start owner/repo#7 --repo-root "{cwd}" --model sol'
+            ),
+            self.powershell_command(
+                f'loop owner/repo#7 --repo-root "{cwd}" --model astra'
+            ),
+            self.powershell_command(
+                f'loop owner/repo#7 --repo-root "{cwd}\\other" --model sol'
+            ),
+            self.powershell_command(
+                f'stack-cleanup --state "{cwd}\\state.json"'
+            ),
+            self.powershell_command(
+                f'stack-status --state "{cwd}\\state.json"; whoami'
+            ),
+        ]
+        for command in rejected:
+            with self.subTest(command=command):
+                self.assertFalse(
+                    PERMISSION_MODULE.admission_allowed(
+                        self.payload(command, cwd=cwd)
+                    )
+                )
+
+    def test_hook_process_emits_only_the_permission_decision(self):
+        cwd = str(Path.cwd())
+        payload = self.payload(
+            self.powershell_command(
+                f'agent-task owner/repo#7 --repo-root "{cwd}" --model sol'
+            ),
+            cwd=cwd,
+        )
+        process_options = {}
+        if os.name == "nt":
+            process_options["creationflags"] = subprocess.CREATE_NO_WINDOW
+        completed = subprocess.run(
+            [sys.executable, str(PERMISSION_SCRIPT)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=True,
+            **process_options,
+        )
+
+        self.assertEqual('{"behavior":"allow"}\n', completed.stdout)
+        self.assertEqual("", completed.stderr)
+
+    def test_plugin_declares_narrow_permission_hook(self):
+        plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
+        hooks = json.loads(HOOKS.read_text(encoding="utf-8"))
+        permission_hooks = hooks["hooks"]["permissionRequest"]
+
+        self.assertEqual("hooks.json", plugin["hooks"])
+        self.assertEqual(1, len(permission_hooks))
+        self.assertEqual("bash|powershell", permission_hooks[0]["matcher"])
+        self.assertIn("ci_fix_loop_permission.py", permission_hooks[0]["bash"])
+        self.assertIn(
+            "ci_fix_loop_permission.py", permission_hooks[0]["powershell"]
+        )
+
+    @unittest.skipUnless(
+        os.environ.get("COPILOT_CI_FIX_AGENT_INTEGRATION") == "1",
+        "set COPILOT_CI_FIX_AGENT_INTEGRATION=1 to exercise Copilot admission",
+    )
+    def test_user_facing_agent_command_passes_runtime_admission(self):
+        plugin_root = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            probe_plugin = Path(directory) / "plugin"
+            shutil.copytree(plugin_root, probe_plugin)
+            plugin = json.loads(
+                (probe_plugin / "plugin.json").read_text(encoding="utf-8")
+            )
+            plugin["name"] = "ci-fix-loop-admission-test"
+            (probe_plugin / "plugin.json").write_text(
+                json.dumps(plugin, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment.pop("COPILOT_ALLOW_ALL", None)
+            environment["COPILOT_AUTO_UPDATE"] = "false"
+            process_options = {}
+            if os.name == "nt":
+                process_options["creationflags"] = subprocess.CREATE_NO_WINDOW
+            session_id = str(uuid.uuid4())
+            completed = subprocess.run(
+                [
+                    "copilot",
+                    "-p",
+                    "owner/repo#1",
+                    "--agent",
+                    "ci-fix-loop-admission-test:ci-fix-loop",
+                    "--plugin-dir",
+                    str(probe_plugin),
+                    "--model",
+                    "gpt-5.6-sol",
+                    "--reasoning-effort",
+                    "high",
+                    "--no-ask-user",
+                    "--no-color",
+                    "--silent",
+                    "--session-id",
+                    session_id,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
+                timeout=180,
+                **process_options,
+            )
+            copilot_home = Path(
+                environment.get("COPILOT_HOME", Path.home() / ".copilot")
+            )
+            events_path = copilot_home / "session-state" / session_id / "events.jsonl"
+            events = [
+                json.loads(line)
+                for line in events_path.read_text(encoding="utf-8").splitlines()
+            ]
+        output = f"{completed.stdout}\n{completed.stderr}"
+        self.assertNotIn("Permission denied", output)
+        self.assertNotIn("could not request permission", output)
+        self.assertIn("owner/repo#1", output)
+        starts = [
+            event["data"]
+            for event in events
+            if event.get("type") == "tool.execution_start"
+        ]
+        self.assertEqual(1, len(starts))
+        self.assertEqual("powershell", starts[0]["toolName"])
+        self.assertTrue(
+            starts[0]["arguments"]["command"].startswith(
+                PERMISSION_MODULE.POWERSHELL_PREFIX
+            )
+        )
+        permissions = [
+            event["data"]
+            for event in events
+            if event.get("type") == "permission.completed"
+        ]
+        self.assertTrue(permissions)
+        self.assertNotIn(
+            "denied",
+            json.dumps(permissions, sort_keys=True).lower(),
+        )
 
 
 class WindowsSubprocessTest(unittest.TestCase):
@@ -1195,7 +1416,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.27", json.loads(PLUGIN.read_text())["version"])
+        self.assertIn("tools: [execute, agent, rename_session]", instructions)
+        self.assertIn("model: gpt-5.6-sol", instructions)
+        self.assertNotIn("tools: [execute, agent, todo", instructions)
+        self.assertEqual("1.6.28", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_canonicalizes_stack_start_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -1225,6 +1449,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             invocation,
         )
         self.assertNotIn("stack-start <target>", invocation)
+        self.assertIn("`stack-start` does not accept `--model`", invocation)
+        self.assertIn("Use exactly `--model sol`", invocation)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
