@@ -1609,7 +1609,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.39")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.40")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -5234,7 +5234,103 @@ class MetadataTest(unittest.TestCase):
             result = MODULE.metadata_for(target)
 
         self.assertEqual(result["title"], "Fix the review loop")
+        self.assertEqual(result["head_repository"], "owner/repo")
         self.assertIn("title", gh_json.call_args.args[0][-1].split(","))
+
+    def test_normalizes_same_repository_and_fork_head_identity(self):
+        self.assertEqual(
+            "owner/repo",
+            MODULE.head_repository_identity(
+                {"head_owner": "owner", "head_repo": "repo"}
+            ),
+        )
+        self.assertEqual(
+            "contributor/fork",
+            MODULE.head_repository_identity(
+                {
+                    "head_owner": "contributor",
+                    "head_repo": "fork",
+                    "head_repository": "contributor/fork",
+                }
+            ),
+        )
+
+    def test_rejects_missing_or_inconsistent_head_repository_identity(self):
+        for metadata in (
+            {"head_owner": "owner"},
+            {"head_repo": "repo"},
+            {
+                "head_owner": "contributor",
+                "head_repo": "fork",
+                "head_repository": "owner/repo",
+            },
+        ):
+            with self.subTest(metadata=metadata), self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "head repository identity",
+            ):
+                MODULE.head_repository_identity(metadata)
+
+    def test_live_metadata_reaches_github_decision_fingerprint(self):
+        target = MODULE.parse_target("owner/repo#42")
+        raw = {
+            "id": "PR_1",
+            "number": 42,
+            "title": "Fix the review loop",
+            "body": "Pinned body",
+            "state": "OPEN",
+            "isDraft": False,
+            "url": target["pr_url"],
+            "headRepositoryOwner": {"login": "contributor"},
+            "headRepository": {"name": "fork"},
+            "headRefName": "feature",
+            "headRefOid": "1" * 40,
+            "baseRefName": "main",
+        }
+        expected = {
+            "pr_node_id": "PR_1",
+            "number": 42,
+            "title": "Fix the review loop",
+            "body": "Pinned body",
+            "state": "OPEN",
+            "is_draft": False,
+            "url": target["pr_url"],
+            "pr_url": target["pr_url"],
+            "repo_name": "owner/repo",
+            "upstream_owner": "owner",
+            "upstream_repo": "repo",
+            "head_owner": "contributor",
+            "head_repo": "fork",
+            "head_repository": "contributor/fork",
+            "head_branch": "feature",
+            "head_sha": "1" * 40,
+            "base_branch": "main",
+            "base_sha": "2" * 40,
+        }
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value=raw),
+            mock.patch.object(MODULE, "base_ref_tip", return_value="2" * 40),
+            mock.patch.object(MODULE, "require_live_comments"),
+            mock.patch.object(
+                MODULE,
+                "fetch_copilot_threads",
+                return_value=([], "BOT_1"),
+            ),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
+            mock.patch.object(
+                MODULE,
+                "remote_head",
+                side_effect=["1" * 40, "2" * 40],
+            ),
+        ):
+            fingerprint = MODULE.github_decision_fingerprint(
+                target,
+                {"pr": expected},
+            )
+
+        self.assertEqual("1" * 40, fingerprint["head_ref_sha"])
+        self.assertEqual("2" * 40, fingerprint["base_ref_sha"])
+        self.assertRegex(fingerprint["pr_sha256"], r"^[0-9a-f]{64}$")
 
     def test_base_sha_is_the_live_base_branch_tip_not_the_frozen_base_ref_oid(self):
         target = MODULE.parse_target("owner/repo#42")

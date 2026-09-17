@@ -1039,6 +1039,25 @@ def suppressed_queue(
     ]
 
 
+def head_repository_identity(metadata: dict[str, Any]) -> str:
+    owner = metadata.get("head_owner")
+    repo = metadata.get("head_repo")
+    if (
+        not isinstance(owner, str)
+        or not owner
+        or "/" in owner
+        or not isinstance(repo, str)
+        or not repo
+        or "/" in repo
+    ):
+        raise WorkflowError("pull request head repository identity is malformed")
+    derived = f"{owner}/{repo}"
+    combined = metadata.get("head_repository")
+    if combined is not None and combined != derived:
+        raise WorkflowError("pull request head repository identity is inconsistent")
+    return derived
+
+
 def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     fields = (
         "id,number,title,body,state,isDraft,url,headRefName,headRefOid,"
@@ -1070,7 +1089,7 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(base_branch, str) or not base_branch:
         raise WorkflowError("resolved PR metadata has no base branch")
     base_sha = base_ref_tip(f"{target['owner']}/{target['repo']}", base_branch)
-    return {
+    result = {
         "pr_node_id": metadata["id"],
         "number": metadata["number"],
         "title": metadata["title"],
@@ -1089,6 +1108,8 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
         "base_branch": base_branch,
         "base_sha": base_sha,
     }
+    result["head_repository"] = head_repository_identity(result)
+    return result
 
 
 def verify_checkout_head(repo_root: Path, local_head: str, pr_head: str) -> None:
@@ -4808,7 +4829,7 @@ def github_decision_fingerprint(
         "base_sha": actual["base_sha"],
         "head_branch": actual["head_branch"],
         "base_branch": actual["base_branch"],
-        "head_repository": actual["head_repository"],
+        "head_repository": head_repository_identity(actual),
         "title_sha256": sha256_text(actual["title"]),
         "body_sha256": sha256_text(actual["body"]),
     }
