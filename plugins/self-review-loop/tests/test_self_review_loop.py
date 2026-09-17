@@ -2597,10 +2597,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             )
 
     def test_runtime_base_recovery_survives_prepare_apply_process_boundary(self):
-        state_path = self.directory / "runtime-base-prepared.json"
-        prompt_path = self.directory / "runtime-base-prompt.txt"
-        result_path = self.directory / "runtime-base-result.json"
-        prompt_path.write_text("retained prompt\n", encoding="utf-8")
         stale_base_ref_oid = "9" * 40
         raw_report = {
             "repository": self.preflight["pr"]["repo_name"],
@@ -2620,6 +2616,78 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "body": self.preflight["pr"]["body"],
             },
         }
+        self.assert_report_recovery_survives_prepare_apply_process_boundary(
+            raw_report,
+            expected_metadata={
+                "decision": "keep",
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+                "reason": (
+                    "The runtime-base clean report preserved the pinned "
+                    "title and body."
+                ),
+            },
+            name="runtime-base",
+        )
+
+    def test_nested_runtime_recovery_survives_prepare_apply_process_boundary(self):
+        stale_base_ref_oid = "9" * 40
+        proposed_body = self.preflight["pr"]["body"] + "\n\nBounded targets."
+        raw_report = {
+            "findings": [],
+            "repository": {
+                "owner": self.preflight["pr"]["owner"],
+                "name": self.preflight["pr"]["repo"],
+                "head": {
+                    "ref": self.preflight["pr"]["head_branch"],
+                    "sha": self.preflight["pr"]["head_sha"],
+                },
+                "base": {
+                    "ref": self.preflight["pr"]["base_branch"],
+                    "sha": stale_base_ref_oid,
+                },
+            },
+            "pull_request": {
+                "number": self.preflight["pr"]["number"],
+                "url": self.preflight["pr"]["pr_url"],
+            },
+            "iterations_used": 1,
+            "metadata": {
+                "current": {
+                    "title": self.preflight["pr"]["title"],
+                    "body": self.preflight["pr"]["body"],
+                },
+                "proposed": {
+                    "title": self.preflight["pr"]["title"],
+                    "body": proposed_body,
+                },
+            },
+        }
+        self.assert_report_recovery_survives_prepare_apply_process_boundary(
+            raw_report,
+            expected_metadata={
+                "decision": "replace",
+                "title": self.preflight["pr"]["title"],
+                "body": proposed_body,
+                "reason": (
+                    "The nested runtime report proposed replacement PR metadata."
+                ),
+            },
+            name="nested-runtime",
+        )
+
+    def assert_report_recovery_survives_prepare_apply_process_boundary(
+        self,
+        raw_report,
+        *,
+        expected_metadata,
+        name,
+    ):
+        state_path = self.directory / f"{name}-prepared.json"
+        prompt_path = self.directory / f"{name}-prompt.txt"
+        result_path = self.directory / f"{name}-result.json"
+        prompt_path.write_text("retained prompt\n", encoding="utf-8")
+        stale_base_ref_oid = "9" * 40
         report = json.dumps(raw_report)
         result = self.result()
         result["report"]["sha256"] = MODULE.sha256_text(report)
@@ -2709,6 +2777,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         publish_shared.assert_not_called()
         prepared = MODULE.load_state(state_path)
         self.assertEqual(3, prepared["agent_task"]["resume_attempts"])
+        self.assertEqual(
+            expected_metadata,
+            prepared["agent_task"]["preparation"]["pull_request_metadata"],
+        )
         recovery = prepared["agent_task"]["preparation"][
             "report_identity_recovery"
         ]
@@ -2726,6 +2798,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         apply_args = self.arguments(state_path)
         apply_args.apply_prepared = True
         apply_args.preserve_artifacts = True
+        update_metadata = mock.Mock(
+            return_value={
+                **self.preflight["pr"],
+                "title": expected_metadata["title"],
+                "body": expected_metadata["body"],
+            }
+        )
         with (
             mock.patch.object(MODULE, "require_tools"),
             mock.patch.object(
@@ -2756,7 +2835,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "wait_for_live_pr_snapshot",
                 return_value=self.preflight["pr"],
             ),
-            mock.patch.object(MODULE, "update_pr_metadata") as update_metadata,
+            mock.patch.object(MODULE, "update_pr_metadata", new=update_metadata),
             mock.patch.object(MODULE, "publish_shared_state") as publish_shared,
             mock.patch.object(MODULE, "emit"),
         ):
@@ -2765,7 +2844,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         discover.assert_not_called()
         run.assert_not_called()
         apply_import.assert_called_once()
-        update_metadata.assert_not_called()
+        if expected_metadata["decision"] == "replace":
+            update_metadata.assert_called_once()
+        else:
+            update_metadata.assert_not_called()
         self.assertEqual(
             [self.head],
             [call.kwargs["value"] for call in publish_shared.call_args_list],
@@ -2773,6 +2855,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         completed = MODULE.load_state(state_path)
         self.assertEqual("completed", completed["agent_task"]["status"])
         self.assertEqual(self.head, completed["review"]["clean_at_head_sha"])
+        self.assertEqual(expected_metadata["body"], completed["pr"]["body"])
 
     def test_rejects_stale_body_and_live_identity_drift(self):
         report = json.loads(self.report())
