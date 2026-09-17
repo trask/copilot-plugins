@@ -1062,6 +1062,173 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual(state, json.loads(state_path.read_text(encoding="utf-8")))
         preflight.assert_not_called()
 
+    def test_hash_gated_unidentified_owner_replacement_archives_exact_owner(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        old_owner = {
+            "run_id": "old-owner",
+            "status": "interrupted",
+            "task_id": None,
+            "task_id_status": "unknown",
+            "model": "gpt-5.6-sol",
+            "error": {
+                "code": "managed_task_result_missing",
+                "message": "managed conflict helper returned no result file",
+            },
+        }
+        state = {
+            "version": 1,
+            "created_at": "2026-09-17T00:00:00Z",
+            "attempts": 1,
+            "managed_attempts": 1,
+            "history": [],
+            "escalation": None,
+            "agent_task": old_owner,
+        }
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        state_sha256 = MODULE.sha256_file(state_path)
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+                "--replace-unidentified-owner",
+                "old-owner",
+                "--expected-state-sha256",
+                state_sha256,
+            ]
+        )
+        target = MODULE.parse_target("owner/repo#7")
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(
+                MODULE,
+                "conflict_preflight",
+                return_value={
+                    "already_mergeable": True,
+                    "pr": pr_metadata(mergeable="MERGEABLE"),
+                    "strategy": "merge",
+                },
+            ),
+            mock.patch.object(MODULE.secrets, "token_hex", return_value="new-owner"),
+            mock.patch.object(MODULE, "emit"),
+        ):
+            MODULE.command_agent_task(args)
+
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual([old_owner], saved["managed_task_history"])
+        self.assertEqual("new-owner", saved["agent_task"]["run_id"])
+        self.assertEqual(
+            {
+                "run_id": "old-owner",
+                "state_sha256": state_sha256,
+                "basis": "operator-verified-no-hosted-task",
+            },
+            saved["agent_task"]["replaces_unidentified_owner"],
+        )
+        self.assertEqual("completed", saved["agent_task"]["status"])
+
+    def test_unidentified_owner_replacement_rejects_a_changed_state(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        state = {
+            "version": 1,
+            "attempts": 1,
+            "managed_attempts": 1,
+            "history": [],
+            "agent_task": {
+                "run_id": "old-owner",
+                "status": "interrupted",
+                "task_id": None,
+                "task_id_status": "unknown",
+                "error": {"code": "managed_task_result_missing", "message": "missing"},
+            },
+        }
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+                "--replace-unidentified-owner",
+                "old-owner",
+                "--expected-state-sha256",
+                "0" * 64,
+            ]
+        )
+        before = state_path.read_bytes()
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "require_external_path"),
+            self.assertRaisesRegex(MODULE.WorkflowError, "state hash does not match"),
+        ):
+            MODULE.command_agent_task(args)
+
+        self.assertEqual(before, state_path.read_bytes())
+
+    def test_unidentified_owner_replacement_rejects_a_known_task(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        state = {
+            "version": 1,
+            "attempts": 1,
+            "managed_attempts": 1,
+            "history": [],
+            "agent_task": {
+                "run_id": "old-owner",
+                "status": "interrupted",
+                "task_id": "task-1",
+                "task_id_status": "known",
+                "error": {"code": "managed_task_result_missing", "message": "missing"},
+            },
+        }
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        state_sha256 = MODULE.sha256_file(state_path)
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+                "--replace-unidentified-owner",
+                "old-owner",
+                "--expected-state-sha256",
+                state_sha256,
+            ]
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "require_external_path"),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "not an exact unidentified result failure",
+            ),
+        ):
+            MODULE.command_agent_task(args)
+
     def test_task_creation_failure_persists_structured_terminal_state(self):
         directory = temporary_directory(self)
         state_path = directory / "state.json"

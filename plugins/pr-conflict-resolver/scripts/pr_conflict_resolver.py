@@ -8121,6 +8121,43 @@ def command_agent_task(args: argparse.Namespace) -> None:
     existing = load_state(state_path) if state_path.is_file() else None
     iteration_budget = args.pipeline_max_iterations or args.max_iterations
     replaced_task: dict[str, Any] | None = None
+    replacement_identity: dict[str, str] | None = None
+    if args.replace_unidentified_owner is not None:
+        if args.resume:
+            raise WorkflowError(
+                "--replace-unidentified-owner cannot be combined with --resume"
+            )
+        if args.expected_state_sha256 is None:
+            raise WorkflowError(
+                "--replace-unidentified-owner requires --expected-state-sha256"
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", args.expected_state_sha256):
+            raise WorkflowError("replacement state hash must be lowercase SHA-256")
+        if existing is None:
+            raise WorkflowError("replacement state does not exist")
+        if sha256_file(state_path) != args.expected_state_sha256:
+            raise WorkflowError("replacement state hash does not match")
+        active = existing.get("agent_task")
+        error = active.get("error") if isinstance(active, dict) else None
+        if (
+            not isinstance(active, dict)
+            or active.get("run_id") != args.replace_unidentified_owner
+            or active.get("status") != "interrupted"
+            or active.get("task_id") is not None
+            or active.get("task_id_status") != "unknown"
+            or not isinstance(error, dict)
+            or error.get("code")
+            not in {"managed_task_result_missing", "managed_task_result_unreadable"}
+        ):
+            raise WorkflowError(
+                "replacement owner is not an exact unidentified result failure"
+            )
+        replaced_task = active
+        replacement_identity = {
+            "run_id": args.replace_unidentified_owner,
+            "state_sha256": args.expected_state_sha256,
+            "basis": "operator-verified-no-hosted-task",
+        }
     if args.resume:
         if existing is None or not isinstance(existing.get("agent_task"), dict):
             raise WorkflowError("recovery state has no managed conflict task")
@@ -8158,6 +8195,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             if (
                 isinstance(active, dict)
                 and active.get("status") not in {"completed", "consumed"}
+                and replacement_identity is None
                 and not (
                     active.get("status") == "failed"
                     and active.get("task_id_status") == "not_created"
@@ -8254,6 +8292,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "budget": iteration_budget,
             },
         }
+        if replacement_identity is not None:
+            state["agent_task"]["replaces_unidentified_owner"] = replacement_identity
         save_state(state_path, state)
         try:
             preflight = conflict_preflight(
@@ -8635,6 +8675,8 @@ def build_parser() -> argparse.ArgumentParser:
     agent_task.add_argument("--pipeline-iteration", type=int)
     agent_task.add_argument("--pipeline-max-iterations", type=int)
     agent_task.add_argument("--resume", action="store_true")
+    agent_task.add_argument("--replace-unidentified-owner")
+    agent_task.add_argument("--expected-state-sha256")
     agent_task.set_defaults(function=command_agent_task)
 
     preflight = subparsers.add_parser(
