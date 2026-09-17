@@ -10,9 +10,11 @@ import copy
 import datetime as dt
 import fnmatch
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
+import py_compile
 import random
 import re
 import secrets
@@ -1418,6 +1420,57 @@ def installed_package_files(package_root: Path) -> dict[str, Path]:
     return files
 
 
+def verified_runtime_cache_paths(
+    expected_files: dict[str, dict[str, Any]],
+    actual_files: dict[str, Path],
+) -> set[str]:
+    verified = set()
+    for relative in sorted(set(actual_files) - set(expected_files)):
+        parts = relative.split("/")
+        if (
+            len(parts) < 3
+            or parts[-2] != "__pycache__"
+            or not parts[-1].endswith(".pyc")
+        ):
+            continue
+        source_name = parts[-1].split(".", 1)[0] + ".py"
+        source_relative = "/".join([*parts[:-2], source_name])
+        source_path = actual_files.get(source_relative)
+        if (
+            source_relative not in expected_files
+            or source_path is None
+            or source_path.suffix != ".py"
+            or source_path.is_symlink()
+            or not source_path.is_file()
+        ):
+            continue
+        expected_cache = Path(
+            importlib.util.cache_from_source(str(source_path))
+        ).name
+        if parts[-1] != expected_cache:
+            continue
+        with tempfile.TemporaryDirectory(
+            prefix="ci-fix-runtime-cache-"
+        ) as directory:
+            compiled = Path(directory) / expected_cache
+            try:
+                py_compile.compile(
+                    str(source_path),
+                    cfile=str(compiled),
+                    dfile=str(source_path),
+                    doraise=True,
+                    optimize=-1,
+                )
+            except py_compile.PyCompileError as error:
+                raise WorkflowError(
+                    f"could not verify installed runtime cache {relative}: {error}"
+                ) from error
+            if compiled.read_bytes() != actual_files[relative].read_bytes():
+                continue
+        verified.add(relative)
+    return verified
+
+
 def verify_installed_package_manifest(
     manifest_path: Path,
     expected_sha256: str,
@@ -1524,9 +1577,20 @@ def verify_installed_package_manifest(
     ):
         raise WorkflowError("canonical CI Fix package manifest entry is invalid")
     expected_files = {item["path"]: item for item in package["files"]}
-    actual_files = installed_package_files(installed_root / "ci-fix-loop")
-    if set(actual_files) != set(expected_files):
-        raise WorkflowError("installed CI Fix package file set drifted")
+    package_root = installed_root / "ci-fix-loop"
+    actual_files = installed_package_files(package_root)
+    runtime_cache = verified_runtime_cache_paths(
+        expected_files,
+        actual_files,
+    )
+    comparable_files = set(actual_files) - runtime_cache
+    if comparable_files != set(expected_files):
+        missing = sorted(set(expected_files) - comparable_files)
+        extra = sorted(comparable_files - set(expected_files))
+        raise WorkflowError(
+            "installed CI Fix package file set drifted: "
+            f"missing={missing}, extra={extra}"
+        )
     for relative, expected in expected_files.items():
         content = actual_files[relative].read_bytes()
         if (

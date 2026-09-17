@@ -2354,7 +2354,11 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 / "ci_fix_loop.py"
             )
             helper.parent.mkdir(parents=True)
-            helper.write_text("exact helper\n", encoding="utf-8", newline="\n")
+            helper.write_text(
+                "VALUE = 'exact helper'\n",
+                encoding="utf-8",
+                newline="\n",
+            )
             files = [
                 {
                     "path": "scripts/ci_fix_loop.py",
@@ -2364,7 +2368,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             ]
             package = {
                 "name": "ci-fix-loop",
-                "version": "1.6.34",
+                "version": "1.6.35",
                 "file_count": 1,
                 "byte_count": helper.stat().st_size,
                 "package_sha256": MODULE.canonical_package_digest(files),
@@ -2401,6 +2405,47 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             self.assertEqual("ci-fix-loop", verified["package"]["name"])
             self.assertEqual(MODULE.sha256_file(helper), files[0]["sha256"])
 
+            cache = Path(importlib.util.cache_from_source(str(helper)))
+            cache.parent.mkdir()
+            MODULE.py_compile.compile(
+                str(helper),
+                cfile=str(cache),
+                dfile=str(helper),
+                doraise=True,
+                optimize=-1,
+            )
+            cache_sha256 = MODULE.sha256_file(cache)
+            with mock.patch.object(MODULE, "__file__", str(helper)):
+                first = MODULE.verify_installed_package_manifest(
+                    manifest_path,
+                    MODULE.sha256_file(manifest_path),
+                    repo,
+                )
+                second = MODULE.verify_installed_package_manifest(
+                    manifest_path,
+                    MODULE.sha256_file(manifest_path),
+                    repo,
+                )
+            self.assertEqual(first, second)
+            self.assertEqual(cache_sha256, MODULE.sha256_file(cache))
+
+            corrupted = bytearray(cache.read_bytes())
+            corrupted[-1] ^= 1
+            cache.write_bytes(corrupted)
+            with (
+                mock.patch.object(MODULE, "__file__", str(helper)),
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "file set drifted.*__pycache__",
+                ),
+            ):
+                MODULE.verify_installed_package_manifest(
+                    manifest_path,
+                    MODULE.sha256_file(manifest_path),
+                    repo,
+                )
+            cache.unlink()
+
             (installed_root / "ci-fix-loop" / "unexpected").write_text(
                 "drift\n", encoding="utf-8"
             )
@@ -2413,6 +2458,48 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                     MODULE.sha256_file(manifest_path),
                     repo,
                 )
+
+    def test_verifier_process_does_not_create_package_bytecode(self):
+        with tempfile.TemporaryDirectory(prefix="verifier package ") as directory:
+            scripts = Path(directory) / "ci-fix-loop" / "scripts"
+            scripts.mkdir(parents=True)
+            helper = scripts / "ci_fix_loop.py"
+            permission = scripts / "ci_fix_loop_permission.py"
+            shutil.copy2(SCRIPT, helper)
+            shutil.copy2(PERMISSION_SCRIPT, permission)
+            artifact = Path(directory) / "missing eligibility.json"
+            options = {}
+            if os.name == "nt":
+                options["creationflags"] = subprocess.CREATE_NO_WINDOW
+            for _ in range(2):
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(helper),
+                        "verify-sealed-legacy-owner-reconciliation",
+                        str(artifact),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    check=False,
+                    **options,
+                )
+                self.assertEqual(1, completed.returncode)
+                self.assertIn('"result": "error"', completed.stdout)
+                self.assertFalse((scripts / "__pycache__").exists())
+
+                permission_result = subprocess.run(
+                    [sys.executable, str(permission)],
+                    input="{}\n",
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    check=True,
+                    **options,
+                )
+                self.assertEqual("{}\n", permission_result.stdout)
+                self.assertFalse((scripts / "__pycache__").exists())
 
     def test_sealed_verifier_authorizes_only_exact_two_pass_snapshot(self):
         with tempfile.TemporaryDirectory(prefix="legacy owner ") as directory:
@@ -2432,7 +2519,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "installed_root": str(root / "installed"),
                 "package": {
                     "name": "ci-fix-loop",
-                    "version": "1.6.34",
+                    "version": "1.6.35",
                     "file_count": 8,
                     "package_sha256": "c" * 64,
                 },
@@ -2592,7 +2679,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "installed_root": str(root / "installed"),
                 "package": {
                     "name": "ci-fix-loop",
-                    "version": "1.6.34",
+                    "version": "1.6.35",
                     "file_count": 8,
                     "package_sha256": "c" * 64,
                 },
@@ -2679,7 +2766,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "installed_root": str(root / "installed"),
                 "package": {
                     "name": "ci-fix-loop",
-                    "version": "1.6.34",
+                    "version": "1.6.35",
                     "file_count": 8,
                     "package_sha256": "c" * 64,
                 },
@@ -2801,7 +2888,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "installed_root": str(root / "installed"),
                 "package": {
                     "name": "ci-fix-loop",
-                    "version": "1.6.34",
+                    "version": "1.6.35",
                     "file_count": 8,
                     "package_sha256": "c" * 64,
                 },
@@ -3157,7 +3244,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("tools: [execute, agent, rename_session]", instructions)
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [execute, agent, todo", instructions)
-        self.assertEqual("1.6.34", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.35", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_canonicalizes_stack_start_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
