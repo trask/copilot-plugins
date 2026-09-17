@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -56,6 +57,46 @@ LEGACY_OWNER_ELIGIBILITY_SCHEMA = (
 LEGACY_OWNER_AUTHORIZATION_FILE_SCHEMA = (
     "github.copilot.ci-fix-loop-legacy-owner-authorization-file.v1"
 )
+COMMAND_RESULT_SCHEMAS = {
+    "stack-start": "github.copilot.ci-fix-loop-stack-start-result.v1",
+    "loop": "github.copilot.ci-fix-loop-loop-result.v1",
+}
+COMMAND_RESULT_KEYS = {
+    "command",
+    "command_id",
+    "exit_code",
+    "finished_at",
+    "outcome",
+    "outcome_sha256",
+    "owner",
+    "request",
+    "result_file",
+    "schema",
+    "started_at",
+    "state_identity",
+    "status",
+    "terminal",
+}
+COMMAND_REQUEST_KEYS = {
+    "argv_sha256",
+    "invocation_run",
+    "model",
+    "new_invocation",
+    "pipeline_iteration",
+    "pipeline_max_iterations",
+    "pipeline_run",
+    "preflight_result_file",
+    "repo_root",
+    "stack_state",
+    "state",
+    "target",
+}
+COMMAND_OWNER_KEYS = {"executable", "parent_process_id", "process_id"}
+COMMAND_RESULT_FILE_PATTERNS = {
+    "stack-start": re.compile(r"^ci-fix-loop-stack-start-result\.json$"),
+    "loop": re.compile(r"^ci-fix-loop-loop-result-[1-9][0-9]*\.json$"),
+}
+COMMAND_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 TARGET_PATTERN = re.compile(
     r"(?:https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*"
@@ -209,13 +250,120 @@ def canonical_session_evidence_path(path: Path) -> bool:
 
 
 def read_small_json(path: Path) -> dict[str, Any] | None:
+    def object_without_duplicates(
+        pairs: list[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key: {key}")
+            value[key] = item
+        return value
+
     try:
         if path.stat().st_size > 1024 * 1024:
             return None
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        content = path.read_bytes()
+        if b"\r" in content or not content.endswith(b"\n"):
+            return None
+        value = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=object_without_duplicates,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def canonical_json_sha256(value: Any) -> str:
+    content = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
+def command_result_path(value: str, command: str, *, must_exist: bool) -> Path | None:
+    supplied = Path(value)
+    if not supplied.is_absolute():
+        return None
+    path = supplied.resolve()
+    session = path.parent.parent
+    if (
+        COMMAND_RESULT_FILE_PATTERNS[command].fullmatch(path.name) is None
+        or path.parent.name != "files"
+        or path.parent.parent.parent.name != "session-state"
+        or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            session.name,
+        )
+        is None
+        or not path.parent.is_dir()
+        or path.parent.is_symlink()
+        or session.is_symlink()
+    ):
+        return None
+    if must_exist:
+        return path if path.is_file() and not path.is_symlink() else None
+    return None if path.exists() else path
+
+
+def target_identity(value: str) -> tuple[str, str, int] | None:
+    match = TARGET_PATTERN.fullmatch(value)
+    if match is None:
+        return None
+    if value.startswith("https://"):
+        parts = value.removeprefix("https://github.com/").split("/")
+        return parts[0].lower(), parts[1].lower(), int(parts[3])
+    repository, number = value.rsplit("#", 1)
+    owner, repo = repository.split("/", 1)
+    return owner.lower(), repo.lower(), int(number)
+
+
+def valid_stack_start_result(
+    path: Path,
+    *,
+    target: str,
+    cwd: str,
+    stack_state: str | None,
+) -> bool:
+    payload = read_small_json(path)
+    if (
+        payload is None
+        or set(payload) != COMMAND_RESULT_KEYS
+        or payload.get("schema") != COMMAND_RESULT_SCHEMAS["stack-start"]
+        or payload.get("command") != "stack-start"
+        or COMMAND_ID_PATTERN.fullmatch(str(payload.get("command_id") or "")) is None
+        or payload.get("status") != "succeeded"
+        or payload.get("terminal") is not True
+        or payload.get("exit_code") != 0
+        or normalized_path(str(payload.get("result_file") or ""))
+        != normalized_path(str(path))
+        or not isinstance(payload.get("request"), dict)
+        or set(payload["request"]) != COMMAND_REQUEST_KEYS
+        or not isinstance(payload.get("owner"), dict)
+        or set(payload["owner"]) != COMMAND_OWNER_KEYS
+        or not isinstance(payload.get("outcome"), dict)
+        or payload.get("outcome_sha256")
+        != canonical_json_sha256(payload["outcome"])
+        or normalized_path(str(payload["request"].get("repo_root") or ""))
+        != normalized_path(cwd)
+        or target_identity(str(payload["request"].get("target") or ""))
+        != target_identity(target)
+    ):
+        return False
+    outcome = payload["outcome"]
+    if target_identity(str(outcome.get("target") or "")) != target_identity(target):
+        return False
+    if outcome.get("result") == "single":
+        return stack_state is None
+    if outcome.get("result") != "stack" or stack_state is None:
+        return False
+    return normalized_path(str(outcome.get("state") or "")) == normalized_path(
+        stack_state
+    )
 
 
 def sealed_reconciliation_admission(
@@ -304,6 +452,44 @@ def admission_allowed(payload: Any) -> bool:
         roots = option_values(tokens, "--repo-root")
         if len(roots) != 1 or normalized_path(roots[0]) != normalized_path(cwd):
             return False
+    if subcommand in COMMAND_RESULT_SCHEMAS:
+        result_files = option_values(tokens, "--result-file")
+        if len(result_files) != 1:
+            return False
+        result_path = command_result_path(
+            result_files[0],
+            subcommand,
+            must_exist=False,
+        )
+        if result_path is None:
+            return False
+        if subcommand == "loop":
+            pipeline_runs = option_values(tokens, "--pipeline-run")
+            preflight_files = option_values(tokens, "--preflight-result-file")
+            if pipeline_runs:
+                if len(pipeline_runs) != 1 or preflight_files:
+                    return False
+            else:
+                if len(preflight_files) != 1:
+                    return False
+                preflight_path = command_result_path(
+                    preflight_files[0],
+                    "stack-start",
+                    must_exist=True,
+                )
+                stack_states = option_values(tokens, "--stack-state")
+                if (
+                    preflight_path is None
+                    or preflight_path.parent != result_path.parent
+                    or len(stack_states) > 1
+                    or not valid_stack_start_result(
+                        preflight_path,
+                        target=tokens[1],
+                        cwd=cwd,
+                        stack_state=stack_states[0] if stack_states else None,
+                    )
+                ):
+                    return False
     models = option_values(tokens, "--model")
     if subcommand in MODEL_COMMANDS:
         if models != ["sol"]:

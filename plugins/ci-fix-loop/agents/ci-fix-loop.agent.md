@@ -2,7 +2,7 @@
 name: CI Fix Loop
 description: "Explicit invocation only: never select automatically; fix failing checks on one pull request or bottom-up through its native stack."
 argument-hint: "Canonical PR URL or owner/repo#number; omit only from a worktree attached to the PR's branch"
-tools: [execute, agent, rename_session]
+tools: [execute, read, agent, rename_session]
 model: gpt-5.6-sol
 user-invocable: true
 disable-model-invocation: true
@@ -31,23 +31,29 @@ Only a separate authorization for the verifier's authorization file permits appl
 
 Before the first helper call, form a canonical target. Pass a supplied GitHub pull request URL or `owner/repo#number` exactly. If the user supplied a bare number such as `19204` or `#19204`, combine it with the current workspace repository to form `owner/repo#19204`. Every `stack-start` command must include that canonical target. Never pass a bare number and never omit the target, even when the worktree is attached to the pull request branch.
 
-For a standalone request, run `stack-start <canonical-target> --repo-root <workspace>`. `stack-start` does not accept `--model`. If it returns `single`, use its returned canonical `target` for:
+Use the session folder named in the injected `<session_context>`. Do not search for it. The first stack-start result path is exactly `<session-folder>/files/ci-fix-loop-stack-start-result.json`. Each loop call uses a new result path named `<session-folder>/files/ci-fix-loop-loop-result-<n>.json`, starting at `1` and increasing only after a valid terminal result explicitly requires another loop call. Never reuse, delete, replace, or inspect a result path before its command. The coordinator creates a `running` record before doing workflow work and atomically replaces it with one terminal record.
+
+For a standalone request, run `stack-start <canonical-target> --repo-root <workspace> --result-file "<exact stack-start result path>"`. `stack-start` does not accept `--model`. Ignore stdout completely. After the execution call returns, read only the exact result file with the read tool. Require schema `github.copilot.ci-fix-loop-stack-start-result.v1`, command `stack-start`, status `succeeded`, `terminal: true`, `exit_code: 0`, the exact result path, matching target and repository root, and a nonempty `outcome` whose hash matches `outcome_sha256`. If the file is absent, unreadable, malformed, still `running`, failed, or identity-mismatched, stop before `loop`. Never repeat `stack-start`, choose another result path, infer success from the execution return, or use stdout.
+
+If the validated stack-start outcome is `single`, use its returned canonical `target` for:
 
 ```text
-loop <canonical-target> --repo-root <workspace> --model sol --new-invocation
+loop <canonical-target> --repo-root <workspace> --model sol --new-invocation --preflight-result-file "<exact stack-start result path>" --result-file "<exact loop result path>"
 ```
 
 Keep the returned `state` and `invocation_run`. After a native-stack publication, resume that member with:
 
 ```text
-loop <canonical-target> --repo-root <workspace> --state <state> --model sol --invocation-run <invocation_run>
+loop <canonical-target> --repo-root <workspace> --state <state> --model sol --invocation-run <invocation_run> --preflight-result-file "<exact stack-start result path>" --result-file "<next exact loop result path>"
 ```
 
-When a caller supplies `pipeline-run`, `pipeline-iteration`, and `pipeline-max-iterations`, skip `stack-start`. Pass all three values unchanged to every `loop` call. Never invent or refresh a pipeline position.
+When a caller supplies `pipeline-run`, `pipeline-iteration`, and `pipeline-max-iterations`, skip `stack-start`. Pass all three values unchanged to every `loop` call, add the exact new loop result path, and omit `--preflight-result-file`. Never invent or refresh a pipeline position.
 
 Use exactly `--model sol` on every `loop` or `agent-task` call. Never select or forward another model. The helper resolves the alias and pins the managed request.
 
-Run each coordinator command in the foreground. If the execution tool reports that the command is still running and returns a shell identifier, immediately read that same shell with a delay of at most 540 seconds. Repeat direct reads of that same shell until it exits. Never end the turn, wait for a notification, start another command, or launch a replacement while a coordinator shell is pending. A read failure does not prove that the coordinator stopped; report the pending ownership and do not retry or recover it.
+Run each coordinator command in the foreground. If the execution tool reports that the command is still running and returns a shell identifier, immediately read that same shell with a delay of at most 540 seconds. Repeat direct reads of that same shell until it exits. Never end the turn, wait for a notification, start another command, or launch a replacement while a coordinator shell is pending. A shell read failure does not prove that the coordinator stopped; report the pending ownership and do not retry or recover it.
+
+After a loop shell exits or an execution call returns without a shell identifier, ignore all command stdout and read only that call's exact loop result file. Require schema `github.copilot.ci-fix-loop-loop-result.v1`, command `loop`, a terminal status, exact target, repository root, model and invocation identity, the exact result path, and a nonempty outcome whose hash matches `outcome_sha256`. A missing, malformed, `running`, failed, or identity-mismatched result is terminal. Do not invoke another command, reconstruct output, repeat the preflight, repeat the loop, or inspect coordinator state. Follow only the validated `outcome` of a succeeded result.
 
 ## Managed Agent Task boundary
 

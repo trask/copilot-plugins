@@ -58,73 +58,201 @@ class AgentCommandAdmissionTest(unittest.TestCase):
     def powershell_command(self, arguments):
         return f"{PERMISSION_MODULE.POWERSHELL_PREFIX}{arguments}"
 
-    def test_admits_only_exact_coordinator_commands_for_current_workspace(self):
-        cwd = str(Path.cwd())
-        self.assertTrue(
-            PERMISSION_MODULE.admission_allowed(
-                self.payload(
-                    self.powershell_command(
-                        f'stack-start owner/repo#7 --repo-root "{cwd}"'
-                    ),
-                    cwd=cwd,
-                )
-            )
+    def command_result_paths(self, root):
+        files = (
+            root
+            / ".copilot"
+            / "session-state"
+            / "12345678-1234-1234-1234-123456789abc"
+            / "files"
         )
-        self.assertTrue(
-            PERMISSION_MODULE.admission_allowed(
-                self.payload(
-                    (
-                        f"{PERMISSION_MODULE.BASH_PREFIX}"
-                        "loop owner/repo#7 --repo-root '/tmp/repo' "
-                        "--model sol --new-invocation"
-                    ),
-                    cwd="/tmp/repo",
-                    tool_name="bash",
-                )
-            )
-        )
-        self.assertTrue(
-            PERMISSION_MODULE.admission_allowed(
-                self.payload(
-                    self.powershell_command(
-                        f'loop owner/repo#7 --repo-root "{cwd}" '
-                        "--model sol --new-invocation"
-                    ),
-                    cwd=cwd,
-                )
-            )
+        files.mkdir(parents=True)
+        return (
+            files / "ci-fix-loop-stack-start-result.json",
+            files / "ci-fix-loop-loop-result-1.json",
         )
 
-    def test_rejects_broader_or_drifted_shell_commands(self):
-        cwd = str(Path.cwd())
-        rejected = [
-            "python -c \"print('unrelated')\"",
-            self.powershell_command(
-                f'stack-start 7 --repo-root "{cwd}"'
-            ),
-            self.powershell_command(
-                f'stack-start owner/repo#7 --repo-root "{cwd}" --model sol'
-            ),
-            self.powershell_command(
-                f'loop owner/repo#7 --repo-root "{cwd}" --model astra'
-            ),
-            self.powershell_command(
-                f'loop owner/repo#7 --repo-root "{cwd}\\other" --model sol'
-            ),
-            self.powershell_command(
-                f'stack-cleanup --state "{cwd}\\state.json"'
-            ),
-            self.powershell_command(
-                f'stack-status --state "{cwd}\\state.json"; whoami'
-            ),
-        ]
-        for command in rejected:
-            with self.subTest(command=command):
-                self.assertFalse(
-                    PERMISSION_MODULE.admission_allowed(
-                        self.payload(command, cwd=cwd)
+    def write_stack_start_result(self, path, *, cwd, target="owner/repo#7"):
+        outcome = {
+            "result": "single",
+            "target": "https://github.com/owner/repo/pull/7",
+            "pr": {
+                "number": 7,
+                "pr_url": "https://github.com/owner/repo/pull/7",
+                "repo_name": "owner/repo",
+            },
+        }
+        payload = {
+            "command": "stack-start",
+            "command_id": "a" * 32,
+            "exit_code": 0,
+            "finished_at": "2026-01-01T00:00:01Z",
+            "outcome": outcome,
+            "outcome_sha256": PERMISSION_MODULE.canonical_json_sha256(outcome),
+            "owner": {
+                "executable": sys.executable,
+                "parent_process_id": 1,
+                "process_id": 2,
+            },
+            "request": {
+                "argv_sha256": "b" * 64,
+                "invocation_run": None,
+                "model": None,
+                "new_invocation": False,
+                "pipeline_iteration": None,
+                "pipeline_max_iterations": None,
+                "pipeline_run": None,
+                "preflight_result_file": None,
+                "repo_root": str(Path(cwd).resolve()),
+                "stack_state": None,
+                "state": None,
+                "target": target,
+            },
+            "result_file": str(path.resolve()),
+            "schema": PERMISSION_MODULE.COMMAND_RESULT_SCHEMAS["stack-start"],
+            "started_at": "2026-01-01T00:00:00Z",
+            "state_identity": None,
+            "status": "succeeded",
+            "terminal": True,
+        }
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+    def test_admits_only_exact_coordinator_commands_for_current_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cwd = root / "repo"
+            cwd.mkdir()
+            preflight, result = self.command_result_paths(root)
+            self.assertTrue(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(
+                        self.powershell_command(
+                            f'stack-start owner/repo#7 --repo-root "{cwd}" '
+                            f'--result-file "{preflight}"'
+                        ),
+                        cwd=str(cwd),
                     )
                 )
+            )
+            self.write_stack_start_result(preflight, cwd=cwd)
+            self.assertFalse(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(
+                        self.powershell_command(
+                            f'stack-start owner/repo#7 --repo-root "{cwd}" '
+                            f'--result-file "{preflight}"'
+                        ),
+                        cwd=str(cwd),
+                    )
+                )
+            )
+            loop_arguments = (
+                f'loop https://github.com/owner/repo/pull/7 --repo-root "{cwd}" '
+                "--model sol --new-invocation "
+                f'--preflight-result-file "{preflight}" '
+                f'--result-file "{result}"'
+            )
+            self.assertTrue(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(
+                        f"{PERMISSION_MODULE.BASH_PREFIX}{loop_arguments}",
+                        cwd=str(cwd),
+                        tool_name="bash",
+                    )
+                )
+            )
+            self.assertTrue(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(
+                        self.powershell_command(loop_arguments),
+                        cwd=str(cwd),
+                    )
+                )
+            )
+            preflight.write_text("{}\n", encoding="utf-8", newline="\n")
+            self.assertFalse(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(
+                        self.powershell_command(loop_arguments),
+                        cwd=str(cwd),
+                    )
+                )
+            )
+            pipeline_result = result.with_name(
+                "ci-fix-loop-loop-result-2.json"
+            )
+            self.assertTrue(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(
+                        self.powershell_command(
+                            f'loop owner/repo#7 --repo-root "{cwd}" '
+                            "--model sol --pipeline-run pipeline "
+                            "--pipeline-iteration 1 --pipeline-max-iterations 2 "
+                            f'--result-file "{pipeline_result}"'
+                        ),
+                        cwd=str(cwd),
+                    )
+                )
+            )
+
+    def test_rejects_broader_or_drifted_shell_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cwd_path = root / "repo"
+            cwd_path.mkdir()
+            cwd = str(cwd_path)
+            preflight, result = self.command_result_paths(root)
+            malformed = root / "malformed.json"
+            rejected = [
+                "python -c \"print('unrelated')\"",
+                self.powershell_command(
+                    f'stack-start 7 --repo-root "{cwd}" '
+                    f'--result-file "{preflight}"'
+                ),
+                self.powershell_command(
+                    f'stack-start owner/repo#7 --repo-root "{cwd}" --model sol '
+                    f'--result-file "{preflight}"'
+                ),
+                self.powershell_command(
+                    f'stack-start owner/repo#7 --repo-root "{cwd}"'
+                ),
+                self.powershell_command(
+                    f'loop owner/repo#7 --repo-root "{cwd}" --model astra '
+                    f'--preflight-result-file "{preflight}" '
+                    f'--result-file "{result}"'
+                ),
+                self.powershell_command(
+                    f'loop owner/repo#7 --repo-root "{cwd}\\other" --model sol '
+                    f'--preflight-result-file "{preflight}" '
+                    f'--result-file "{result}"'
+                ),
+                self.powershell_command(
+                    f'loop owner/repo#7 --repo-root "{cwd}" --model sol '
+                    f'--result-file "{result}"'
+                ),
+                self.powershell_command(
+                    f'loop owner/repo#7 --repo-root "{cwd}" --model sol '
+                    f'--preflight-result-file "{malformed}" '
+                    f'--result-file "{result}"'
+                ),
+                self.powershell_command(
+                    f'stack-cleanup --state "{cwd}\\state.json"'
+                ),
+                self.powershell_command(
+                    f'stack-status --state "{cwd}\\state.json"; whoami'
+                ),
+            ]
+            for command in rejected:
+                with self.subTest(command=command):
+                    self.assertFalse(
+                        PERMISSION_MODULE.admission_allowed(
+                            self.payload(command, cwd=cwd)
+                        )
+                    )
 
     def test_hook_process_emits_only_the_permission_decision(self):
         cwd = str(Path.cwd())
@@ -402,7 +530,8 @@ class AgentCommandAdmissionTest(unittest.TestCase):
     def test_user_facing_agent_command_passes_runtime_admission(self):
         plugin_root = Path(__file__).parents[1]
         with tempfile.TemporaryDirectory() as directory:
-            probe_plugin = Path(directory) / "plugin"
+            root = Path(directory)
+            probe_plugin = root / "plugin"
             shutil.copytree(plugin_root, probe_plugin)
             plugin = json.loads(
                 (probe_plugin / "plugin.json").read_text(encoding="utf-8")
@@ -415,6 +544,14 @@ class AgentCommandAdmissionTest(unittest.TestCase):
             environment = os.environ.copy()
             environment.pop("COPILOT_ALLOW_ALL", None)
             environment["COPILOT_AUTO_UPDATE"] = "false"
+            environment["COPILOT_HOME"] = str(root / ".copilot")
+            installed_plugin = (
+                Path(environment["COPILOT_HOME"])
+                / "installed-plugins"
+                / "trask-plugins"
+                / "ci-fix-loop"
+            )
+            shutil.copytree(plugin_root, installed_plugin)
             process_options = {}
             if os.name == "nt":
                 process_options["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -454,21 +591,51 @@ class AgentCommandAdmissionTest(unittest.TestCase):
                 json.loads(line)
                 for line in events_path.read_text(encoding="utf-8").splitlines()
             ]
+            result_path = (
+                copilot_home
+                / "session-state"
+                / session_id
+                / "files"
+                / "ci-fix-loop-stack-start-result.json"
+            )
+            self.assertTrue(result_path.is_file())
+            result = json.loads(result_path.read_text(encoding="utf-8"))
         output = f"{completed.stdout}\n{completed.stderr}"
         self.assertNotIn("Permission denied", output)
         self.assertNotIn("could not request permission", output)
-        self.assertIn("owner/repo#1", output)
         starts = [
             event["data"]
             for event in events
             if event.get("type") == "tool.execution_start"
         ]
-        self.assertEqual(1, len(starts))
-        self.assertEqual("powershell", starts[0]["toolName"])
+        shell_starts = [
+            event for event in starts if event["toolName"] == "powershell"
+        ]
+        self.assertEqual(1, len(shell_starts))
         self.assertTrue(
-            starts[0]["arguments"]["command"].startswith(
+            shell_starts[0]["arguments"]["command"].startswith(
                 PERMISSION_MODULE.POWERSHELL_PREFIX
             )
+        )
+        command = shell_starts[0]["arguments"]["command"]
+        self.assertIn("stack-start owner/repo#1", command)
+        self.assertIn(f'--result-file "{result_path}"', command)
+        self.assertNotIn(" loop ", command)
+        self.assertEqual(
+            "github.copilot.ci-fix-loop-stack-start-result.v1",
+            result["schema"],
+        )
+        self.assertTrue(result["terminal"])
+        self.assertEqual("failed", result["status"])
+        read_starts = [
+            event
+            for event in starts
+            if event["toolName"] in {"read", "view"}
+        ]
+        self.assertEqual(1, len(read_starts))
+        self.assertEqual(
+            str(result_path),
+            read_starts[0]["arguments"]["path"],
         )
         permissions = [
             event["data"]
@@ -2815,7 +2982,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             }
 
             def authorize(_arguments):
-                MODULE._EMIT_CAPTURE.append(authorization)
+                MODULE._EMIT_CAPTURE_STACK[-1].append(authorization)
 
             emitted = []
             with (
@@ -3239,12 +3406,14 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("`custom_agent`", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
-        self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertIn("tools: [execute, agent, rename_session]", instructions)
+        self.assertIn(
+            "tools: [execute, read, agent, rename_session]",
+            instructions,
+        )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [execute, agent, todo", instructions)
-        self.assertEqual("1.6.35", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.36", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_canonicalizes_stack_start_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -3262,7 +3431,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             invocation,
         )
         self.assertIn(
-            "`stack-start <canonical-target> --repo-root <workspace>`",
+            "`stack-start <canonical-target> --repo-root <workspace> "
+            '--result-file "<exact stack-start result path>"`',
             invocation,
         )
         self.assertIn(
@@ -3287,6 +3457,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("stack-start <target>", invocation)
         self.assertIn("`stack-start` does not accept `--model`", invocation)
         self.assertIn("Use exactly `--model sol`", invocation)
+        self.assertIn("Ignore stdout completely", invocation)
+        self.assertIn("Never repeat `stack-start`", invocation)
+        self.assertIn("--preflight-result-file", invocation)
+        self.assertIn("read only the exact result file", invocation)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -9634,6 +9808,297 @@ class PreflightCommandTest(unittest.TestCase):
 
 
 class MainTest(unittest.TestCase):
+    def command_files(self, root):
+        files = (
+            root
+            / ".copilot"
+            / "session-state"
+            / "12345678-1234-1234-1234-123456789abc"
+            / "files"
+        )
+        files.mkdir(parents=True)
+        return (
+            files / "ci-fix-loop-stack-start-result.json",
+            files / "ci-fix-loop-loop-result-1.json",
+        )
+
+    def run_main(self, args):
+        parser = mock.Mock()
+        parser.parse_args.return_value = args
+        output = io.StringIO()
+        with (
+            mock.patch.object(MODULE, "build_parser", return_value=parser),
+            mock.patch.object(MODULE.sys, "argv", ["ci_fix_loop.py", args.command]),
+            contextlib.redirect_stdout(output),
+        ):
+            code = MODULE.main()
+        return code, output.getvalue()
+
+    def stack_args(self, result_file, function):
+        return argparse.Namespace(
+            command="stack-start",
+            function=function,
+            invocation_run=None,
+            model=None,
+            new_invocation=False,
+            pipeline_iteration=None,
+            pipeline_max_iterations=None,
+            pipeline_run=None,
+            repo_root=str(Path.cwd()),
+            result_file=(
+                str(result_file) if result_file is not None else None
+            ),
+            stack_state=None,
+            state=None,
+            target="owner/repo#7",
+        )
+
+    def loop_args(self, result_file, preflight_file, function):
+        return argparse.Namespace(
+            command="loop",
+            function=function,
+            invocation_run=None,
+            model="sol",
+            new_invocation=True,
+            pipeline_iteration=None,
+            pipeline_max_iterations=None,
+            pipeline_run=None,
+            preflight_result_file=str(preflight_file),
+            repo_root=str(Path.cwd()),
+            result_file=str(result_file),
+            stack_state=None,
+            state=None,
+            target="https://github.com/owner/repo/pull/7",
+        )
+
+    def test_stack_start_result_survives_blank_execution_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            preflight, _ = self.command_files(Path(directory))
+            called = []
+
+            def command(_args):
+                called.append(True)
+                MODULE.emit(
+                    {
+                        "result": "single",
+                        "target": "https://github.com/owner/repo/pull/7",
+                    }
+                )
+
+            code, _ignored_stdout = self.run_main(
+                self.stack_args(preflight, command)
+            )
+
+            self.assertEqual(0, code)
+            self.assertEqual([True], called)
+            payload = json.loads(preflight.read_text(encoding="utf-8"))
+            self.assertEqual(
+                "github.copilot.ci-fix-loop-stack-start-result.v1",
+                payload["schema"],
+            )
+            self.assertEqual("succeeded", payload["status"])
+            self.assertTrue(payload["terminal"])
+            self.assertEqual(0, payload["exit_code"])
+            self.assertEqual("single", payload["outcome"]["result"])
+            self.assertEqual(
+                MODULE.canonical_json_sha256(payload["outcome"]),
+                payload["outcome_sha256"],
+            )
+
+    def test_missing_result_file_stops_before_stack_start(self):
+        called = mock.Mock()
+        args = self.stack_args(None, called)
+
+        code, output = self.run_main(args)
+
+        self.assertEqual(1, code)
+        called.assert_not_called()
+        self.assertIn("requires --result-file", output)
+
+    def test_result_file_inside_repository_stops_before_stack_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            files = (
+                repo
+                / ".copilot"
+                / "session-state"
+                / "12345678-1234-1234-1234-123456789abc"
+                / "files"
+            )
+            files.mkdir(parents=True)
+            result = files / "ci-fix-loop-stack-start-result.json"
+            called = mock.Mock()
+            args = self.stack_args(result, called)
+            args.repo_root = str(repo)
+
+            code, output = self.run_main(args)
+
+            self.assertEqual(1, code)
+            called.assert_not_called()
+            self.assertFalse(result.exists())
+            self.assertIn("must be outside the repository", output)
+
+    def test_running_owner_exists_before_command_and_missing_outcome_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            preflight, _ = self.command_files(Path(directory))
+            observed = []
+
+            def command(_args):
+                observed.append(
+                    json.loads(preflight.read_text(encoding="utf-8"))
+                )
+
+            code, _ = self.run_main(
+                self.stack_args(preflight, command)
+            )
+
+            self.assertEqual(1, code)
+            self.assertEqual(1, len(observed))
+            self.assertEqual("running", observed[0]["status"])
+            self.assertFalse(observed[0]["terminal"])
+            self.assertIsNone(observed[0]["exit_code"])
+            terminal = json.loads(preflight.read_text(encoding="utf-8"))
+            self.assertEqual("failed", terminal["status"])
+            self.assertTrue(terminal["terminal"])
+            self.assertIn(
+                "coordinator subcommand returned no result",
+                terminal["outcome"]["error"],
+            )
+
+    def test_unexpected_process_failure_leaves_owned_running_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            preflight, _ = self.command_files(Path(directory))
+
+            def command(_args):
+                raise RuntimeError("process transport failed")
+
+            with self.assertRaisesRegex(RuntimeError, "process transport failed"):
+                self.run_main(self.stack_args(preflight, command))
+
+            payload = json.loads(preflight.read_text(encoding="utf-8"))
+            self.assertEqual("running", payload["status"])
+            self.assertFalse(payload["terminal"])
+            self.assertIsNone(payload["finished_at"])
+            self.assertIsNone(payload["outcome"])
+
+    def test_duplicate_stack_start_result_is_rejected_before_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            preflight, _ = self.command_files(Path(directory))
+            called = mock.Mock(
+                side_effect=lambda _args: MODULE.emit(
+                    {
+                        "result": "single",
+                        "target": "https://github.com/owner/repo/pull/7",
+                    }
+                )
+            )
+            args = self.stack_args(preflight, called)
+
+            first_code, _ = self.run_main(args)
+            first_bytes = preflight.read_bytes()
+            second_code, second_output = self.run_main(args)
+
+            self.assertEqual(0, first_code)
+            self.assertEqual(1, second_code)
+            self.assertEqual(1, called.call_count)
+            self.assertEqual(first_bytes, preflight.read_bytes())
+            self.assertIn("already exists", second_output)
+
+    def test_missing_preflight_result_stops_before_loop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            preflight, result = self.command_files(Path(directory))
+            loop = mock.Mock()
+
+            code, _ = self.run_main(self.loop_args(result, preflight, loop))
+
+            self.assertEqual(1, code)
+            loop.assert_not_called()
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            self.assertEqual("failed", payload["status"])
+            self.assertTrue(payload["terminal"])
+            self.assertIn(
+                "stack-start command result is not a regular file",
+                payload["outcome"]["error"],
+            )
+
+    def test_malformed_preflight_result_stops_before_loop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            preflight, result = self.command_files(Path(directory))
+            preflight.write_text("{}\n", encoding="utf-8", newline="\n")
+            loop = mock.Mock()
+
+            code, _ = self.run_main(self.loop_args(result, preflight, loop))
+
+            self.assertEqual(1, code)
+            loop.assert_not_called()
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            self.assertEqual("failed", payload["status"])
+            self.assertEqual(
+                "stack-start command result is malformed",
+                payload["outcome"]["error"],
+            )
+
+    def test_valid_preflight_authorizes_one_file_backed_loop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            preflight, result = self.command_files(Path(directory))
+
+            def stack_start(_args):
+                MODULE.emit(
+                    {
+                        "result": "single",
+                        "target": "https://github.com/owner/repo/pull/7",
+                    }
+                )
+
+            stack_code, _ = self.run_main(
+                self.stack_args(preflight, stack_start)
+            )
+            loop = mock.Mock(
+                side_effect=lambda _args: MODULE.emit(
+                    {
+                        "result": "green",
+                        "state": str(Path(directory) / "state.json"),
+                    }
+                )
+            )
+
+            loop_code, _ = self.run_main(
+                self.loop_args(result, preflight, loop)
+            )
+
+            self.assertEqual(0, stack_code)
+            self.assertEqual(0, loop_code)
+            loop.assert_called_once()
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            self.assertEqual(
+                "github.copilot.ci-fix-loop-loop-result.v1",
+                payload["schema"],
+            )
+            self.assertEqual("green", payload["outcome"]["result"])
+            self.assertEqual("succeeded", payload["status"])
+            self.assertTrue(payload["terminal"])
+
+    def test_pipeline_loop_uses_result_file_without_stack_start_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, result = self.command_files(Path(directory))
+            loop = mock.Mock(
+                side_effect=lambda _args: MODULE.emit({"result": "green"})
+            )
+            args = self.loop_args(result, Path(directory) / "absent.json", loop)
+            args.pipeline_run = "pipeline-run"
+            args.pipeline_iteration = 1
+            args.pipeline_max_iterations = 2
+            args.preflight_result_file = None
+            args.new_invocation = False
+
+            code, _ = self.run_main(args)
+
+            self.assertEqual(0, code)
+            loop.assert_called_once()
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            self.assertEqual("pipeline-run", payload["request"]["pipeline_run"])
+            self.assertIsNone(payload["request"]["preflight_result_file"])
+
     def test_reports_a_workflow_error_as_json_and_a_failure_code(self):
         stream = io.StringIO()
         with mock.patch.object(

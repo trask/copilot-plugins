@@ -64,6 +64,46 @@ LEGACY_OWNER_AUTHORIZATION_SCHEMA = (
 LEGACY_OWNER_AUTHORIZATION_FILE_SCHEMA = (
     "github.copilot.ci-fix-loop-legacy-owner-authorization-file.v1"
 )
+COMMAND_RESULT_SCHEMAS = {
+    "stack-start": "github.copilot.ci-fix-loop-stack-start-result.v1",
+    "loop": "github.copilot.ci-fix-loop-loop-result.v1",
+}
+COMMAND_RESULT_KEYS = {
+    "command",
+    "command_id",
+    "exit_code",
+    "finished_at",
+    "outcome",
+    "outcome_sha256",
+    "owner",
+    "request",
+    "result_file",
+    "schema",
+    "started_at",
+    "state_identity",
+    "status",
+    "terminal",
+}
+COMMAND_REQUEST_KEYS = {
+    "argv_sha256",
+    "invocation_run",
+    "model",
+    "new_invocation",
+    "pipeline_iteration",
+    "pipeline_max_iterations",
+    "pipeline_run",
+    "preflight_result_file",
+    "repo_root",
+    "stack_state",
+    "state",
+    "target",
+}
+COMMAND_OWNER_KEYS = {"executable", "parent_process_id", "process_id"}
+COMMAND_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+COMMAND_RESULT_FILE_PATTERNS = {
+    "stack-start": re.compile(r"^ci-fix-loop-stack-start-result\.json$"),
+    "loop": re.compile(r"^ci-fix-loop-loop-result-[1-9][0-9]*\.json$"),
+}
 PLUGIN_PACKAGE_MANIFEST_SCHEMA = {
     "id": "github.copilot.plugin-package-manifest",
     "version": 1,
@@ -843,12 +883,12 @@ def git_z_paths(repo_root: Path, *arguments: str) -> list[str]:
     return [os.fsdecode(path) for path in output.split(b"\0") if path]
 
 
-_EMIT_CAPTURE: list[dict[str, Any]] | None = None
+_EMIT_CAPTURE_STACK: list[list[dict[str, Any]]] = []
 
 
 def emit(payload: dict[str, Any]) -> None:
-    if _EMIT_CAPTURE is not None:
-        _EMIT_CAPTURE.append(payload)
+    if _EMIT_CAPTURE_STACK:
+        _EMIT_CAPTURE_STACK[-1].append(payload)
         return
     print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
 
@@ -856,15 +896,14 @@ def emit(payload: dict[str, Any]) -> None:
 def capture_command(
     function: Any, args: argparse.Namespace
 ) -> list[dict[str, Any]]:
-    global _EMIT_CAPTURE
-    if _EMIT_CAPTURE is not None:
-        raise WorkflowError("cannot nest coordinator command capture")
     captured: list[dict[str, Any]] = []
-    _EMIT_CAPTURE = captured
+    _EMIT_CAPTURE_STACK.append(captured)
     try:
         function(args)
     finally:
-        _EMIT_CAPTURE = None
+        popped = _EMIT_CAPTURE_STACK.pop()
+        if popped is not captured:
+            raise WorkflowError("coordinator command capture stack is corrupt")
     if not captured:
         raise WorkflowError("coordinator subcommand returned no result")
     return captured
@@ -1325,6 +1364,32 @@ def atomic_write_text(path: Path, value: str) -> None:
         raise
 
 
+def atomic_create_text(path: Path, value: str) -> None:
+    if not path.parent.is_dir() or path.parent.is_symlink():
+        raise WorkflowError(
+            f"result file parent is not a regular directory: {path.parent}"
+        )
+    handle, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary_name, path)
+        except FileExistsError as error:
+            raise WorkflowError(
+                f"command result file already exists: {path}"
+            ) from error
+    finally:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+
+
 def require_outside_repository(path: Path, repo_root: Path) -> None:
     try:
         path.resolve().relative_to(repo_root.resolve())
@@ -1691,16 +1756,272 @@ def status_path_for(state_path: Path) -> Path:
 
 def write_result_file(path: Path, payload: dict[str, Any], label: str) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
+        atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     except OSError as error:
         raise WorkflowError(
             f"could not write the {label} result file: {error}"
         ) from error
+
+
+def canonical_json_sha256(value: Any) -> str:
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256_text(canonical)
+
+
+def command_result_path(value: str | None, command: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise WorkflowError(f"{command} requires --result-file")
+    supplied = Path(normalize_cli_path(value, windows=IS_WINDOWS))
+    if not supplied.is_absolute():
+        raise WorkflowError("command result file path must be absolute")
+    path = supplied.resolve()
+    pattern = COMMAND_RESULT_FILE_PATTERNS[command]
+    session = path.parent.parent
+    if (
+        pattern.fullmatch(path.name) is None
+        or path.parent.name != "files"
+        or path.parent.parent.parent.name != "session-state"
+        or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            session.name,
+        )
+        is None
+        or not path.parent.is_dir()
+        or path.parent.is_symlink()
+        or session.is_symlink()
+    ):
+        raise WorkflowError(
+            "command result file must use the command's canonical name in a "
+            "Copilot session files directory"
+        )
+    return path
+
+
+def command_request(args: argparse.Namespace) -> dict[str, Any]:
+    def path_argument(name: str) -> str | None:
+        value = getattr(args, name, None)
+        return str(cli_path(value)) if isinstance(value, str) else None
+
+    return {
+        "argv_sha256": canonical_json_sha256(sys.argv[1:]),
+        "invocation_run": getattr(args, "invocation_run", None),
+        "model": getattr(args, "model", None),
+        "new_invocation": bool(getattr(args, "new_invocation", False)),
+        "pipeline_iteration": getattr(args, "pipeline_iteration", None),
+        "pipeline_max_iterations": getattr(args, "pipeline_max_iterations", None),
+        "pipeline_run": getattr(args, "pipeline_run", None),
+        "preflight_result_file": path_argument("preflight_result_file"),
+        "repo_root": (
+            str(cli_path(args.repo_root))
+            if isinstance(getattr(args, "repo_root", None), str)
+            else None
+        ),
+        "stack_state": path_argument("stack_state"),
+        "state": path_argument("state"),
+        "target": getattr(args, "target", None),
+    }
+
+
+def command_result_state_identity(outcome: dict[str, Any]) -> dict[str, Any] | None:
+    value = outcome.get("state")
+    if not isinstance(value, str) or not value:
+        return None
+    path = cli_path(value)
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    return {
+        "path": str(path),
+        "sha256": sha256_file(path),
+        "size": size,
+    }
+
+
+def command_result_payload(
+    *,
+    args: argparse.Namespace,
+    command_id: str,
+    result_path: Path,
+    started_at: str,
+    status: str,
+    terminal: bool,
+    exit_code: int | None,
+    outcome: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "command": args.command,
+        "command_id": command_id,
+        "exit_code": exit_code,
+        "finished_at": utc_now() if terminal else None,
+        "outcome": outcome,
+        "outcome_sha256": (
+            canonical_json_sha256(outcome) if outcome is not None else None
+        ),
+        "owner": {
+            "executable": str(Path(sys.executable).resolve()),
+            "parent_process_id": os.getppid(),
+            "process_id": os.getpid(),
+        },
+        "request": command_request(args),
+        "result_file": str(result_path),
+        "schema": COMMAND_RESULT_SCHEMAS[args.command],
+        "started_at": started_at,
+        "state_identity": (
+            command_result_state_identity(outcome)
+            if outcome is not None and terminal
+            else None
+        ),
+        "status": status,
+        "terminal": terminal,
+    }
+
+
+def begin_command_result(
+    args: argparse.Namespace,
+) -> tuple[Path, str, str]:
+    path = command_result_path(getattr(args, "result_file", None), args.command)
+    if isinstance(getattr(args, "repo_root", None), str):
+        require_outside_repository(path, cli_path(args.repo_root))
+    command_id = uuid.uuid4().hex
+    started_at = utc_now()
+    payload = command_result_payload(
+        args=args,
+        command_id=command_id,
+        result_path=path,
+        started_at=started_at,
+        status="running",
+        terminal=False,
+        exit_code=None,
+        outcome=None,
+    )
+    atomic_create_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return path, command_id, started_at
+
+
+def finish_command_result(
+    *,
+    args: argparse.Namespace,
+    result_path: Path,
+    command_id: str,
+    started_at: str,
+    exit_code: int,
+    outcome: dict[str, Any],
+) -> dict[str, Any]:
+    _, current = strict_json_file(result_path, "running command result")
+    if (
+        not isinstance(current, dict)
+        or set(current) != COMMAND_RESULT_KEYS
+        or current.get("schema") != COMMAND_RESULT_SCHEMAS[args.command]
+        or current.get("command") != args.command
+        or current.get("command_id") != command_id
+        or current.get("status") != "running"
+        or current.get("terminal") is not False
+        or current.get("started_at") != started_at
+        or current.get("result_file") != str(result_path)
+    ):
+        raise WorkflowError("running command result identity changed")
+    payload = command_result_payload(
+        args=args,
+        command_id=command_id,
+        result_path=result_path,
+        started_at=started_at,
+        status="succeeded" if exit_code == 0 else "failed",
+        terminal=True,
+        exit_code=exit_code,
+        outcome=outcome,
+    )
+    atomic_write_text(
+        result_path,
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    )
+    return payload
+
+
+def require_stack_start_result(
+    args: argparse.Namespace,
+    loop_result_path: Path,
+) -> dict[str, Any]:
+    value = getattr(args, "preflight_result_file", None)
+    if getattr(args, "pipeline_run", None):
+        if value is not None:
+            raise WorkflowError(
+                "pipeline-owned loop must not supply --preflight-result-file"
+            )
+        return {}
+    if not isinstance(value, str) or not value:
+        raise WorkflowError(
+            "standalone or stack loop requires --preflight-result-file"
+        )
+    path = command_result_path(value, "stack-start")
+    if path.parent != loop_result_path.parent:
+        raise WorkflowError(
+            "stack-start and loop result files must belong to the same session"
+        )
+    _, payload = strict_json_file(path, "stack-start command result")
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != COMMAND_RESULT_KEYS
+        or payload.get("schema") != COMMAND_RESULT_SCHEMAS["stack-start"]
+        or payload.get("command") != "stack-start"
+        or COMMAND_ID_PATTERN.fullmatch(str(payload.get("command_id") or "")) is None
+        or payload.get("status") != "succeeded"
+        or payload.get("terminal") is not True
+        or payload.get("exit_code") != 0
+        or payload.get("result_file") != str(path)
+        or not isinstance(payload.get("request"), dict)
+        or set(payload["request"]) != COMMAND_REQUEST_KEYS
+        or not isinstance(payload.get("owner"), dict)
+        or set(payload["owner"]) != COMMAND_OWNER_KEYS
+        or not isinstance(payload.get("outcome"), dict)
+        or payload.get("outcome_sha256")
+        != canonical_json_sha256(payload["outcome"])
+    ):
+        raise WorkflowError("stack-start command result is malformed")
+    request = payload["request"]
+    if (
+        request.get("repo_root") != str(cli_path(args.repo_root))
+        or parse_target(str(request.get("target") or ""))
+        != parse_target(str(args.target or ""))
+    ):
+        raise WorkflowError(
+            "stack-start command result does not match the loop request"
+        )
+    outcome = payload["outcome"]
+    result = outcome.get("result")
+    if parse_target(str(outcome.get("target") or "")) != parse_target(
+        str(args.target or "")
+    ):
+        raise WorkflowError(
+            "stack-start command result resolved a different pull request"
+        )
+    if result == "single":
+        if getattr(args, "stack_state", None):
+            raise WorkflowError(
+                "single-pull-request stack-start result cannot authorize stack loop"
+            )
+    elif result == "stack":
+        stack_state = outcome.get("state")
+        if (
+            not isinstance(getattr(args, "stack_state", None), str)
+            or not isinstance(stack_state, str)
+            or str(cli_path(args.stack_state)) != str(cli_path(stack_state))
+        ):
+            raise WorkflowError(
+                "stack-start command result does not authorize this stack state"
+            )
+    else:
+        raise WorkflowError(
+            "stack-start command result did not authorize a loop invocation"
+        )
+    return payload
 
 
 def count_by_status(items: list[dict[str, Any]] | None) -> dict[str, int]:
@@ -10988,6 +11309,7 @@ def command_stack_start(args: argparse.Namespace) -> None:
     emit(
         {
             "result": "stack",
+            "target": target["pr_url"],
             "state": str(path),
             "run_id": run_id,
             "repository": target["repo_name"],
@@ -12493,6 +12815,8 @@ def build_parser() -> argparse.ArgumentParser:
     loop.add_argument("--repo-root")
     loop.add_argument("--state")
     loop.add_argument("--stack-state")
+    loop.add_argument("--preflight-result-file")
+    loop.add_argument("--result-file")
     loop.add_argument(
         "--model",
         choices=sorted(MODEL_ALIASES),
@@ -12567,6 +12891,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stack_start.add_argument("--repo-root")
     stack_start.add_argument("--state")
+    stack_start.add_argument("--result-file")
     stack_start.add_argument(
         "--pipeline-run",
         help="return the single-PR path when another orchestrator owns stack scope",
@@ -12810,12 +13135,58 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    managed_result = args.command in COMMAND_RESULT_SCHEMAS
+    result_path: Path | None = None
+    command_id: str | None = None
+    started_at: str | None = None
     try:
-        args.function(args)
+        if managed_result:
+            result_path, command_id, started_at = begin_command_result(args)
+            if args.command == "loop":
+                require_stack_start_result(args, result_path)
+            captured = capture_command(args.function, args)
+            if len(captured) != 1:
+                raise WorkflowError(
+                    f"{args.command} returned {len(captured)} terminal results"
+                )
+            outcome = captured[0]
+            finish_command_result(
+                args=args,
+                result_path=result_path,
+                command_id=command_id,
+                started_at=started_at,
+                exit_code=0,
+                outcome=outcome,
+            )
+            emit(outcome)
+        else:
+            args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:
         details = error.details if isinstance(error, WorkflowError) else {}
-        emit({"result": "error", "error": str(error), **details})
+        outcome = {"result": "error", "error": str(error), **details}
+        if (
+            managed_result
+            and result_path is not None
+            and command_id is not None
+            and started_at is not None
+        ):
+            try:
+                finish_command_result(
+                    args=args,
+                    result_path=result_path,
+                    command_id=command_id,
+                    started_at=started_at,
+                    exit_code=1,
+                    outcome=outcome,
+                )
+            except (WorkflowError, json.JSONDecodeError, OSError) as result_error:
+                outcome = {
+                    "result": "error",
+                    "error": str(error),
+                    "result_file_error": str(result_error),
+                }
+        emit(outcome)
         return 1
 
 
