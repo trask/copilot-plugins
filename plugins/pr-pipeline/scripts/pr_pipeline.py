@@ -360,9 +360,15 @@ def settle_after_stage(
 
 
 def read_stage_status(
-    entry: dict[str, Any], target: dict[str, Any]
+    entry: dict[str, Any], target: dict[str, Any], run_id: str | None = None
 ) -> dict[str, Any]:
-    return common.read_stage_status(entry, target)
+    return common.read_stage_status(
+        entry,
+        target,
+        state_for=lambda current, selected: stage_state_path(
+            current, selected, run_id
+        ),
+    )
 
 
 def inspect_stage(
@@ -370,20 +376,45 @@ def inspect_stage(
     target: dict[str, Any],
     head_sha: str,
     base_sha: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     return common.inspect_stage(
-        entry, target, head_sha, base_sha, read_status=read_stage_status
+        entry,
+        target,
+        head_sha,
+        base_sha,
+        read_status=lambda current, selected: read_stage_status(
+            current, selected, run_id
+        ),
     )
 
 
 def inspect_stages(
-    target: dict[str, Any], head_sha: str, base_sha: str
+    target: dict[str, Any], head_sha: str, base_sha: str, run_id: str | None = None
 ) -> list[dict[str, Any]]:
-    return common.inspect_stages(target, head_sha, base_sha, inspect=inspect_stage)
+    return common.inspect_stages(
+        target,
+        head_sha,
+        base_sha,
+        inspect=lambda entry, selected, head, base: inspect_stage(
+            entry, selected, head, base, run_id
+        ),
+    )
 
 
 def stage_accepts_pipeline_position(entry: dict[str, Any]) -> bool:
     return common.stage_accepts_pipeline_position(entry)
+
+
+DEFAULT_INSPECT_STAGES = inspect_stages
+
+
+def inspect_stages_for_run(
+    target: dict[str, Any], head_sha: str, base_sha: str, run_id: str
+) -> list[dict[str, Any]]:
+    if inspect_stages is DEFAULT_INSPECT_STAGES:
+        return inspect_stages(target, head_sha, base_sha, run_id)
+    return inspect_stages(target, head_sha, base_sha)
 
 
 def pipeline_arguments(entry: dict[str, Any], run_id: str, sweep: int) -> list[str]:
@@ -407,11 +438,15 @@ def stage_command(
     conflict_strategy: str = "auto",
 ) -> list[str]:
     arguments = pipeline_arguments(entry, run_id, sweep)
+    arguments.extend(
+        [
+            "--state",
+            str(stage_state_path(entry, target, run_id)),
+        ]
+    )
     if entry["stage"] == STAGE_CONFLICT:
         arguments.extend(
             [
-                "--state",
-                str(stage_state_path(entry, target)),
                 "--strategy",
                 conflict_strategy,
             ]
@@ -741,7 +776,9 @@ def run_pipeline(
                 )
                 pr_head = settled.get("pr_head_sha") or current_head
                 current_pr = read_pull_request(target)
-                stages = inspect_stages(target, pr_head, current_pr["base_sha"])
+                stages = inspect_stages_for_run(
+                    target, pr_head, current_pr["base_sha"], run_id
+                )
                 stage_result = next(
                     result for result in stages if result["stage"] == entry["stage"]
                 )
@@ -852,7 +889,7 @@ def run_pipeline(
         known_safe_head = final_head
         head_changed = head_changed or final_head != sweep_started_head
         base_changed = base_changed or pr["base_sha"] != sweep_started_base
-        stages = inspect_stages(target, final_head, pr["base_sha"])
+        stages = inspect_stages_for_run(target, final_head, pr["base_sha"], run_id)
         report_event(
             report,
             "sweep_finished",

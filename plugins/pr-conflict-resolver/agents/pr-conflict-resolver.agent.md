@@ -13,7 +13,7 @@ Never select or start this agent automatically.
 
 Run this primary session only when its model is exactly `gpt-5.6-sol`. Before invoking the helper or reading pull request data, determine the model and inspect reasoning effort when the runtime exposes it. Continue when the model matches and the effort is either exactly `high` or unavailable. Otherwise stop and report the active model and any exposed effort. If you cannot determine the model, the gate has failed. The user cannot override this gate.
 
-This agent is a thin control-plane coordinator. It never reads repository files, resolves conflicts, edits code, runs a formatter, runs tests, or validates repository behavior itself. One managed GitHub Agent Task performs all repository work. The bundled helper freezes the target, invokes the managed worker, checks the quarantined result, publishes only verified code refs, and records durable recovery state.
+This agent is a thin control-plane coordinator. It never reads repository files, resolves conflicts, edits code, runs a formatter, runs tests, or validates repository behavior itself. One managed GitHub Agent Task performs all repository work. The bundled helper freezes the target, invokes the managed worker, checks the quarantined result, publishes only verified code refs, and records immutable invocation evidence.
 
 It never posts a comment, review, reply, label, or pull request update. Its only GitHub change is pushing verified conflict-resolution commits to the pull request head branch or atomically pushing every member of its native stack.
 
@@ -37,7 +37,7 @@ Use `--whole-stack` when the caller requests whole-native-stack conflict handlin
 
 When a pipeline supplies `pipeline-run`, `pipeline-iteration`, and `pipeline-max-iterations`, pass all three unchanged. Never invent or refresh the pipeline position.
 
-Without pipeline position, the helper allows three managed attempts per state file by default. Use `--max-iterations <count>` to set a different budget. Attempts recorded by the retained deterministic recovery commands do not consume the managed budget.
+Without pipeline position, the helper allows three managed attempts per invocation-local state file by default. Use `--max-iterations <count>` to set a different invocation-local budget.
 
 ## Managed conflict boundary
 
@@ -45,7 +45,7 @@ The helper performs a trusted local preflight without executing repository code.
 
 A pipeline-owned isolated worktree may stay detached only at the exact frozen pull request head. An attached worktree must hold the pull request branch. Any other branch or commit fails preflight.
 
-The helper records `preparing` ownership at the explicit state path before conflict preflight. A preflight error records failed or interrupted ownership with a null task ID and `not_created` status, so a wrapper exit cannot erase the attempted run. The Agent Tasks runtime is bundled with this plugin. The helper writes the closed `github.copilot.agent-task-conflict-request` version 1 file and a trusted prompt outside the repository. It loads only the adjacent `cloud_conflict_task.py`, verifies SHA-256 `72adbe1a50a294fb8123155077d215e62a20a3d65c7a37203217c87fc87e238a`, and invokes it once with:
+The helper records `preparing` ownership at the explicit state path before conflict preflight. A preflight error records failed or interrupted ownership with a null task ID and `not_created` status, so a wrapper exit cannot erase the attempted run. The Agent Tasks runtime is bundled with this plugin. The helper writes the closed `github.copilot.agent-task-conflict-request` version 1 file and a trusted prompt outside the repository. It loads only the adjacent `cloud_conflict_task.py`, verifies SHA-256 `a1edbe7463b322360f8b9978d6f4b9c825b08791a2c16b5153cc393566c9ef98`, and invokes it once with:
 
 ```text
 --conflict-with-report --strategy <merge|rebase|native-stack> --request-file <absolute-path> --prompt-file <absolute-path> --result-file <absolute-path> --policy marketplace-conflict-worker@2 --pr <canonical-url> --model <alias>
@@ -55,10 +55,10 @@ Local Git checks stay pinned to the frozen worktree through `git -C <exact-root>
 
 The current base comes from the advertised branch ref, not the pull request's lagging base snapshot. Native stack requests preserve the snapshot in preflight evidence but pin each direct base to its live branch ref.
 
-An upper native-stack member may contain a merge that only synchronized its direct base. The coordinator omits that topology marker from the linear replay only when it has exactly two parents, its second parent is in the current direct-base ancestry, and `git show --remerge-diff` is empty. The request retains the exact merge position, parents, tree, subject, trailers, and empty-diff digest. Any merge with manual resolution content, unrelated ancestry, more than two parents, or no later linear tip stops before task creation at a hash-bound owner-normalization boundary. The retained manifest identifies every safe synchronization merge and every merge whose intent a fresh local owner session must preserve while producing linear history. The generated retry command pins the resulting state SHA-256 and cannot consume a managed attempt until normalization passes preflight.
+An upper native-stack member may contain a merge that only synchronized its direct base. The coordinator omits that topology marker from the linear replay only when it has exactly two parents, its second parent is in the current direct-base ancestry, and `git show --remerge-diff` is empty. The request retains the exact merge position, parents, tree, subject, trailers, and empty-diff digest. Any merge with manual resolution content, unrelated ancestry, more than two parents, or no later linear tip stops before task creation. Its retained manifest is audit evidence; a later authorized action starts a fresh invocation.
 
 Policy `marketplace-conflict-worker@2` has SHA-256 `8ef8ce9fd429740875f1c06ae3c2dbb10f06759e49179a05dc9f493d4c72bd60`.
-The bundled worker helper has SHA-256 `72adbe1a50a294fb8123155077d215e62a20a3d65c7a37203217c87fc87e238a`.
+The bundled worker helper has SHA-256 `a1edbe7463b322360f8b9978d6f4b9c825b08791a2c16b5153cc393566c9ef98`.
 
 The full immutable request remains retained outside the repository. The hosted problem statement carries every execution identity and commit SHA, exact evidence for bounded path sets, and canonical SHA-256 summaries plus boundary samples for large path sets. Per-commit prompt evidence retains the exact commit SHA, patch digest, and a digest of the complete retained commit evidence. The managed helper reserves 1,000 characters and UTF-8 bytes below the 28,000-character and 28,000-byte Agent Task limits, and refuses a final policy-wrapped statement over 27,000 characters or UTF-8 bytes as `prompt_too_large` before contacting the Agent Tasks API; it never truncates or silently falls back.
 
@@ -68,11 +68,9 @@ The managed worker publishes only dispatcher-assigned request-scoped code refs a
 
 For merge, publication preserves the explicit refspec, requires parents `[frozen head, frozen base]`, limits changes to the closed request paths, and uses an exact lease on the frozen head. Rebase publication also uses exact `--force-with-lease`. For a native stack, one atomic push carries every member and one exact lease per branch. Artifact commits never reach user branches.
 
-If the helper returns `recovery_required`, run the exact `recovery_command`. Resume passes the prior result through `--input-result-file`, writes a fresh result file, and resumes only the same task. It never launches a replacement. Do not delete recovery files.
+Every top-level call receives invocation-local state and creates at most one fresh hosted task. Existing PR-level state, prior results, task IDs, and malformed legacy artifacts are immutable audit evidence and never seed execution. Resume and owner-replacement arguments fail before tool discovery, state writes, task creation, checkout, or GitHub mutation.
 
-A completed task that advertised an unchanged source head without its mandatory report and receipt is not replaceable through ordinary launch or resume. The dedicated `--replace-malformed-completed-task` recovery mode is valid only from a separately authorized argv artifact that pins the canonical state, task, request, result, and hosted prompt hashes. The coordinator requires byte-identical original and resumed results, then the worker independently rechecks the completed live task, exact Sol model and prompt, sole advertised ref, unchanged source head, absent report and receipt, current repository and stack identities, and remaining managed budget before creating one replacement task. Never construct, alter, or reuse this command for another task.
-
-Publication recovery never invokes cloud. If every remote head already equals the new value, it finalizes. If every head still equals the old value, it retries the same push. Mixed or unexpected heads stop the run. The coordinator removes recovery files and quarantined refs only after verified publication.
+A lost publication response never invokes cloud. It succeeds only when every remote head already equals the exact intended new value. Old, mixed, or unexpected heads stop the invocation.
 
 ## Outcomes
 
@@ -80,12 +78,12 @@ Follow the JSON result exactly:
 
 - `published`: stop. Report the strategy, old head, new head, mergeability, and every native-stack head when present.
 - `mergeable`: stop with `Outcome: already mergeable.`
-- `recovery_required`: stop with `Outcome: recovery required.` Include the task ID status, error, recovery command when present, next action when present, and recovery files. When the task ID status is `unknown`, inspect managed Agent Tasks before starting a replacement.
-- `task_creation_failed`: stop with `Outcome: managed task creation failed.` Include the structured error, retained state path, and exact retry command. A task ID status of `not_created` means the helper received a terminal response without a task ID and the retained state permits that retry.
-- `max_iterations_reached`: stop with `Outcome: escalated.` Report that no Agent Task started, the completed managed iteration count, the refused iteration, the budget, and the exact `retry_command`. That command keeps the existing state and raises the budget enough for the refused iteration. Do not add `--resume`; there is no unfinished managed task to resume.
+- `invocation_abandoned`: stop with `Outcome: invocation abandoned.` Include the task ID status, error, and retained audit files. Never resume it.
+- `task_creation_failed`: stop with `Outcome: managed task creation failed.` Include the structured error and invocation-local state path. A later user action starts a fresh invocation after the prerequisite is fixed.
+- `max_iterations_reached`: stop with `Outcome: escalated.` Report that no Agent Task started, the completed invocation-local iteration count, the refused iteration, and the budget.
 - `error`: stop and report the exact error. Never work around a failed guard.
 
-One run dispatches at most one managed conflict task. Do not run the legacy `attempt`, `resolved`, `continue`, `stack-rebase`, `stack-continue`, `stack-format`, `stack-validation-fix`, or `stack-publish` commands. They are retained only for deterministic recovery of states created by older plugin versions.
+One run dispatches at most one managed conflict task. Do not run the legacy `attempt`, `resolved`, `continue`, `stack-rebase`, `stack-continue`, `stack-format`, `stack-validation-fix`, or `stack-publish` commands.
 
 ## Session name and final response
 
@@ -95,7 +93,7 @@ Lead with one outcome:
 
 - `Outcome: published.`
 - `Outcome: already mergeable.`
-- `Outcome: recovery required.`
+- `Outcome: invocation abandoned.`
 - `Outcome: managed task creation failed.`
 - `Outcome: escalated.`
 

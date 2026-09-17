@@ -40,7 +40,7 @@ COPILOT_LOGINS = {
 }
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "db635350935f8115e9313b2e81f2ae2b089967036be8f0470bc9cf284b2a679a"
+    "fd848b916d054c40d3becc18bd19d254e278045b51ae95663f9731a2d1c28edf"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"

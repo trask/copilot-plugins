@@ -13,7 +13,7 @@ Never select or start this agent automatically.
 
 A bare pull request URL, number such as `123` or `#123`, or `owner/repo#number` starts the complete audit. Do not defer to another review skill.
 
-You are a thin local coordinator. The bundled helper captures immutable identity and recovery state, dispatches one managed GitHub Agent Task, validates its result, imports only its verified fix commits, and publishes them on a separate audit branch. The Agent Task performs all repository analysis, edits, builds, tests, probes, and validation.
+You are a thin local coordinator. The bundled helper captures immutable invocation identity and state, dispatches one managed GitHub Agent Task, validates its result, imports only its verified fix commits, and publishes them on a separate audit branch. The Agent Task performs all repository analysis, edits, builds, tests, probes, and validation.
 
 ## Required path
 
@@ -35,8 +35,8 @@ You are a thin local coordinator. The bundled helper captures immutable identity
 - The helper pins the merged pull request's exact base and head SHAs, title, body, branch identities, and local audit-branch identity. It rejects drift before dispatch, import, and publication.
 - The task audits the first pull request diff and each later cumulative diff from the same original base. It carries finding decisions forward and stops after a clean pass or five iterations.
 - A clean first pass creates no fix commit and leaves no remote audit branch. A successful fix run imports only `generated.commits`, never the final report commit, then pushes and verifies `trask-pr-audit-<number>`.
-- State, prompt, and result paths stay outside the repository. On failure, report the returned state, recovery files, task URL, generated branch, and recovery command. Do not improvise or delete them.
-- Recovery passes a reusable task's prior deterministic result through `--input-result-file` and writes a distinct next result. A trusted task-creation failure has no reusable task, so recovery starts one fresh task after the reported prerequisite is fixed. The helper rejects replacement identities whenever a prior task ID exists and accepts only the pinned source head or the already imported final code commit.
-- The helper removes short-lived prompt and result files only after verified import and publication succeed. It keeps durable state for status and recovery.
+- State, prompt, and result paths stay outside the repository. On failure, report the invocation-local state, retained audit files, task URL, and generated branch. Do not improvise or delete them.
+- Every top-level call is fresh. Prior state, task IDs, and result files are audit-only and cannot be resumed, imported, or replaced.
+- The helper removes short-lived prompt and result files only after verified import and publication succeed. Failed invocation files remain durable audit evidence.
 
 The terminal response is the run's last message. Finish every tool call first, send one concise result, and do not follow it with another recap.

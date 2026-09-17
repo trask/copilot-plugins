@@ -123,14 +123,22 @@ def stage_script_path(entry: dict[str, Any]) -> Path:
     return common.stage_script_path(entry)
 
 
-def stage_state_path(entry: dict[str, Any], target: dict[str, Any]) -> Path:
-    return common.stage_state_path(entry, target)
+def stage_state_path(
+    entry: dict[str, Any], target: dict[str, Any], run_id: str | None = None
+) -> Path:
+    return common.stage_state_path(entry, target, run_id)
 
 
 def read_stage_status(
-    entry: dict[str, Any], target: dict[str, Any]
+    entry: dict[str, Any], target: dict[str, Any], run_id: str | None = None
 ) -> dict[str, Any]:
-    return common.read_stage_status(entry, target)
+    return common.read_stage_status(
+        entry,
+        target,
+        state_for=lambda current, selected: stage_state_path(
+            current, selected, run_id
+        ),
+    )
 
 
 def inspect_stage(
@@ -138,9 +146,16 @@ def inspect_stage(
     target: dict[str, Any],
     head_sha: str,
     base_sha: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     return common.inspect_stage(
-        entry, target, head_sha, base_sha, read_status=read_stage_status
+        entry,
+        target,
+        head_sha,
+        base_sha,
+        read_status=lambda current, selected: read_stage_status(
+            current, selected, run_id
+        ),
     )
 
 
@@ -1475,20 +1490,29 @@ def accepted_push_checkpoints(
     repository: str,
     number: int,
     *,
+    run_id: str,
     state_for: Callable[..., Path] = stage_state_path,
 ) -> list[dict[str, Any]]:
     """Read the CI stage's own record of the pushes it has published."""
     target = common.target_for(repository, number)
-    payload = common.read_json(state_for(STAGE_BY_NAME[STAGE_CI], target))
+    payload = common.read_json(
+        state_for(STAGE_BY_NAME[STAGE_CI], target, run_id)
+    )
     pushes = payload.get("accepted_pushes") if isinstance(payload, dict) else None
     return [push for push in pushes or [] if isinstance(push, dict)]
 
 
 def worker_live_progress(
-    repository: str, number: int, stage: str
+    repository: str, number: int, stage: str, *, run_id: str
 ) -> dict[str, Any] | None:
     target = common.target_for(repository, number)
-    return common.stage_live_progress(STAGE_BY_NAME[stage], target)
+    return common.stage_live_progress(
+        STAGE_BY_NAME[stage],
+        target,
+        state_for=lambda entry, current: stage_state_path(
+            entry, current, run_id
+        ),
+    )
 
 
 def propagate_descendants(
@@ -1616,15 +1640,39 @@ class StackPipeline:
             effort=effort,
         )
         self.read_stack = read_stack
-        self.inspect = inspect
+        self.inspect = (
+            (
+                lambda entry, target, head, base: inspect_stage(
+                    entry, target, head, base, self.run_id
+                )
+            )
+            if inspect is inspect_stage
+            else inspect
+        )
         self.base_tip = base_tip
         self.contains = contains or (
             lambda _root, ancestor, descendant: commit_contains(
                 self.repository, ancestor, descendant
             )
         )
-        self.checkpoints = checkpoints
-        self.worker_progress = worker_progress
+        self.checkpoints = (
+            (
+                lambda repository, number: checkpoints(
+                    repository, number, run_id=self.run_id
+                )
+            )
+            if checkpoints is accepted_push_checkpoints
+            else checkpoints
+        )
+        self.worker_progress = (
+            (
+                lambda repository, number, stage: worker_progress(
+                    repository, number, stage, run_id=self.run_id
+                )
+            )
+            if worker_progress is worker_live_progress
+            else worker_progress
+        )
         self.propagate = propagate
         self.dependencies = dependencies
         self.sleep = sleep
@@ -1781,11 +1829,15 @@ class StackPipeline:
             MAX_PASSES,
             accepts=common.stage_accepts_pipeline_position,
         )
+        arguments.extend(
+            [
+                "--state",
+                str(stage_state_path(entry, target, self.run_id)),
+            ]
+        )
         if stage == STAGE_CONFLICT:
             arguments.extend(
                 [
-                    "--state",
-                    str(stage_state_path(entry, target)),
                     "--strategy",
                     self.conflict_strategy,
                 ]
@@ -2026,6 +2078,7 @@ class StackPipeline:
                     stage_state_path(
                         STAGE_BY_NAME[request["stage"]],
                         common.target_for(self.repository, request["number"]),
+                        self.run_id,
                     )
                 ),
                 "status": {},
@@ -2050,6 +2103,7 @@ class StackPipeline:
                     stage_state_path(
                         STAGE_BY_NAME[request["stage"]],
                         common.target_for(self.repository, request["number"]),
+                        self.run_id,
                     )
                 ),
                 "status": {},

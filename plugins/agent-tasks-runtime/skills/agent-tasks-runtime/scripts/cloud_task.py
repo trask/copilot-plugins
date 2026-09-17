@@ -726,6 +726,17 @@ def parse_args(args: Sequence[str]) -> Options:
             continue
         raise CloudError(f"unknown option: {token}")
 
+    if (
+        resume_apply_with_report
+        or input_result_file is not None
+        or task_id is not None
+        or monitor_only
+    ):
+        raise CloudError(
+            "resume, monitor-only, and prior-result import are disabled; start a "
+            "fresh invocation",
+            "recovery_disabled",
+        )
     if prompt_start is None:
         prompt_start = len(args)
     inline_prompt = " ".join(args[prompt_start:]).strip()
@@ -4209,6 +4220,32 @@ def _missing_report_context(
     return CloudError("; ".join(parts), error.code)
 
 
+def _bind_requested_artifact_identity(
+    result: ResultEnvelope,
+    options: Options,
+    *,
+    report_path: str | None,
+    receipt: str | None,
+) -> None:
+    if receipt is not None:
+        result.receipt_path = receipt
+    if (
+        report_path is not None
+        and options.policy
+        in {
+            MARKETPLACE_REPORT_POLICY_SELECTOR,
+            *LEGACY_MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
+        }
+    ):
+        result.report_path = report_path
+    elif (
+        report_path is not None
+        and options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
+    ):
+        result.semantic_kind = options.semantic_kind
+        result.semantic_path = report_path
+
+
 def execute(
     options: Options,
     *,
@@ -4399,24 +4436,13 @@ def execute(
     if options.policy is not None:
         validate_policy_before_post(options, root, options.result_file)
         policy_identity = git.identity(root)
-        if result is not None:
-            if receipt is not None:
-                result.receipt_path = receipt
-            if (
-                report_path is not None
-                and options.policy
-                in {
-                    MARKETPLACE_REPORT_POLICY_SELECTOR,
-                    *LEGACY_MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
-                }
-            ):
-                result.report_path = report_path
-            elif (
-                report_path is not None
-                and options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
-            ):
-                result.semantic_kind = options.semantic_kind
-                result.semantic_path = report_path
+        if result is not None and options.task_id is not None:
+            _bind_requested_artifact_identity(
+                result,
+                options,
+                report_path=report_path,
+                receipt=receipt,
+            )
     if options.task_id is not None:
         initial = get_task(api, repository, options.task_id)
         if options.resume_apply_with_report:
@@ -4450,6 +4476,13 @@ def execute(
             ),
         )
     if result is not None:
+        if options.task_id is None:
+            _bind_requested_artifact_identity(
+                result,
+                options,
+                report_path=report_path,
+                receipt=receipt,
+            )
         result.task_id = str(initial["id"])
         result.task_state = str(initial["state"])
         link = initial.get("html_url") or initial.get("url")

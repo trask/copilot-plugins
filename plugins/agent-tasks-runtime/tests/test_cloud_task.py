@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -215,7 +216,7 @@ class PolicyPromptTest(unittest.TestCase):
             with self.subTest(mode=mode):
                 with self.assertRaisesRegex(
                     MODULE.CloudError,
-                    "marketplace-agent-report-worker@1 requires",
+                    "requires|disabled",
                 ):
                     MODULE.parse_args(
                         [
@@ -397,7 +398,7 @@ class PolicyPromptTest(unittest.TestCase):
                 commits=["1" * 40],
             )
 
-    def test_structural_recovery_requires_request_id_and_rejects_receipt(self):
+    def test_structural_recovery_is_disabled(self):
         result_path = str((Path.cwd().parent / "result.json").resolve())
         base = [
             "--resume-apply-with-report",
@@ -410,9 +411,9 @@ class PolicyPromptTest(unittest.TestCase):
             "--policy",
             MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
         ]
-        with self.assertRaisesRegex(MODULE.CloudError, "--request-id"):
+        with self.assertRaisesRegex(MODULE.CloudError, "disabled"):
             MODULE.parse_args(base)
-        with self.assertRaisesRegex(MODULE.CloudError, "--worker-receipt"):
+        with self.assertRaisesRegex(MODULE.CloudError, "disabled"):
             MODULE.parse_args(
                 [
                     *base,
@@ -422,9 +423,8 @@ class PolicyPromptTest(unittest.TestCase):
                     ".github/agent-task-validations/request-1.json",
                 ]
             )
-        options = MODULE.parse_args([*base, "--request-id", "request-1"])
-        self.assertEqual(options.request_id, "request-1")
-        self.assertIsNone(options.worker_receipt)
+        with self.assertRaisesRegex(MODULE.CloudError, "disabled"):
+            MODULE.parse_args([*base, "--request-id", "request-1"])
 
 
 class PullRequestResolutionTest(unittest.TestCase):
@@ -662,56 +662,47 @@ class InterruptedApplyRecoveryTest(unittest.TestCase):
                 policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
             )
 
-    def test_parse_requires_complete_recovery_identity(self):
+    def test_parse_rejects_complete_recovery_identity(self):
         result_path = str((Path.cwd().parent / "result.json").resolve())
-        options = MODULE.parse_args(
-            [
-                "--resume-apply-with-report",
-                "--model",
-                "sol",
-                "--pr",
-                "owner/repo#7",
-                "--task-id",
-                self.task_id,
-                "--worker-receipt",
-                self.validation_path,
-                "--result-file",
-                result_path,
-                "--policy",
-                MODULE.MARKETPLACE_POLICY_SELECTOR,
-            ]
-        )
+        with self.assertRaisesRegex(MODULE.CloudError, "disabled"):
+            MODULE.parse_args(
+                [
+                    "--resume-apply-with-report",
+                    "--model",
+                    "sol",
+                    "--pr",
+                    "owner/repo#7",
+                    "--task-id",
+                    self.task_id,
+                    "--worker-receipt",
+                    self.validation_path,
+                    "--result-file",
+                    result_path,
+                    "--policy",
+                    MODULE.MARKETPLACE_POLICY_SELECTOR,
+                ]
+            )
 
-        self.assertTrue(options.apply_with_report)
-        self.assertTrue(options.resume_apply_with_report)
-        self.assertFalse(options.monitor_only)
-        self.assertEqual(options.prompt, "")
-        self.assertEqual(MODULE.mode_name(options), "apply_with_report")
-
-    def test_parse_preserves_current_monitor_mode(self):
+    def test_parse_rejects_monitor_mode(self):
         result_path = str((Path.cwd().parent / "result.json").resolve())
-        options = MODULE.parse_args(
-            [
-                "--monitor-only",
-                "--model",
-                "sol",
-                "--pr",
-                "owner/repo#7",
-                "--task-id",
-                self.task_id,
-                "--worker-receipt",
-                self.validation_path,
-                "--result-file",
-                result_path,
-                "--policy",
-                MODULE.MARKETPLACE_POLICY_SELECTOR,
-            ]
-        )
-
-        self.assertTrue(options.monitor_only)
-        self.assertFalse(options.apply_with_report)
-        self.assertFalse(options.resume_apply_with_report)
-        self.assertEqual(MODULE.mode_name(options), "monitor_only")
+        with self.assertRaisesRegex(MODULE.CloudError, "monitor-only.*disabled"):
+            MODULE.parse_args(
+                [
+                    "--monitor-only",
+                    "--model",
+                    "sol",
+                    "--pr",
+                    "owner/repo#7",
+                    "--task-id",
+                    self.task_id,
+                    "--worker-receipt",
+                    self.validation_path,
+                    "--result-file",
+                    result_path,
+                    "--policy",
+                    MODULE.MARKETPLACE_POLICY_SELECTOR,
+                ]
+            )
 
     def test_rejects_mode_path_and_policy_prompt_mismatches(self):
         cases = {
@@ -1366,6 +1357,118 @@ class DispatcherFinalizationTest(unittest.TestCase):
         envelope = result.as_dict()
         self.assertEqual(envelope["attestation"]["kind"], "dispatcher_semantic")
         self.assertIsNone(envelope["report"])
+
+    def creation_failure(self, options):
+        repository = self.repository()
+        failure = MODULE.CloudError(
+            "start Agent Task failed with HTTP 409: "
+            "user or repo does not have CCA enabled; "
+            "the request cannot be completed",
+            "api_failure",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result_path = Path(directory) / "result.json"
+            options = MODULE.Options(
+                **{
+                    **options.__dict__,
+                    "result_file": result_path,
+                }
+            )
+            with (
+                mock.patch.object(MODULE, "parse_args", return_value=options),
+                mock.patch.object(MODULE, "GitRepository", return_value=repository),
+                mock.patch.object(MODULE, "ApiClient"),
+                mock.patch.object(
+                    MODULE,
+                    "repository_base",
+                    return_value=SimpleNamespace(branch="main", sha="4" * 40),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "resolve_pull_request",
+                    return_value=self.pull_request,
+                ),
+                mock.patch.object(MODULE, "validate_policy_before_post"),
+                mock.patch.object(
+                    MODULE,
+                    "start_task",
+                    side_effect=failure,
+                ) as start,
+            ):
+                code = MODULE.main(
+                    [],
+                    cwd=self.root,
+                    uuid_factory=lambda: "request-1",
+                    stderr=io.StringIO(),
+                )
+            envelope = json.loads(result_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(2, code)
+        self.assertEqual(
+            {
+                "code": "api_failure",
+                "message": str(failure),
+            },
+            envelope["error"],
+        )
+        self.assertEqual({"name_with_owner": "owner/repo"}, envelope["repository"])
+        self.assertEqual(
+            "https://github.com/owner/repo/pull/7",
+            envelope["pull_request"]["url"],
+        )
+        self.assertEqual("gpt-5.6-sol", envelope["requested_model"])
+        self.assertEqual(MODULE.policy_metadata(options), envelope["policy"])
+        self.assertEqual(
+            {
+                "id": None,
+                "url": None,
+                "state": None,
+                "base_ref": None,
+                "base_sha": None,
+            },
+            envelope["task"],
+        )
+        self.assertEqual(
+            {"branch": None, "head_sha": None, "commits": []},
+            envelope["generated"],
+        )
+        self.assertIn("request-1", start.call_args.args[2]["prompt"])
+        return envelope
+
+    def test_structural_v3_creation_failure_has_no_report_identity(self):
+        options = MODULE.Options(
+            report=False,
+            model="gpt-5.6-sol",
+            prompt="Review the pull request.",
+            pull_request=MODULE.PrReference(7, "owner/repo", "owner/repo#7"),
+            apply_with_report=True,
+            result_file=Path("C:/state/result.json"),
+            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V3_SELECTOR,
+            prompt_file=Path("C:/state/prompt.txt"),
+        )
+
+        envelope = self.creation_failure(options)
+
+        self.assertIsNone(envelope["report"])
+        self.assertNotIn("semantic_output", envelope)
+
+    def test_semantic_v4_creation_failure_has_no_output_identity(self):
+        options = MODULE.Options(
+            report=False,
+            model="gpt-5.6-sol",
+            prompt="Write {{MARKETPLACE_SEMANTIC_PATH}}.",
+            pull_request=MODULE.PrReference(7, "owner/repo", "owner/repo#7"),
+            apply_with_report=True,
+            result_file=Path("C:/state/result.json"),
+            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR,
+            prompt_file=Path("C:/state/prompt.txt"),
+            semantic_kind="self-review-loop",
+        )
+
+        envelope = self.creation_failure(options)
+
+        self.assertIsNone(envelope["report"])
+        self.assertIsNone(envelope["semantic_output"])
 
     def test_structural_v1_keeps_commit_trailer_correlation(self):
         repository = self.repository()

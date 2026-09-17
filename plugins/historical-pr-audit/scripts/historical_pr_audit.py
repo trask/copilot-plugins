@@ -45,7 +45,7 @@ GITHUB_PR_DIFF = "github_pr_diff"
 CUMULATIVE_GIT_DIFF = "cumulative_git_diff"
 BARE_TARGET_PATTERN = re.compile(r"^#?(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "db635350935f8115e9313b2e81f2ae2b089967036be8f0470bc9cf284b2a679a"
+    "fd848b916d054c40d3becc18bd19d254e278045b51ae95663f9731a2d1c28edf"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -334,6 +334,32 @@ def audit_branch_number(branch: str) -> int | None:
 def default_state_path(target: dict[str, Any]) -> Path:
     name = f"{target['owner']}--{target['repo']}--{target['number']}.json"
     return Path.home() / ".copilot" / "run" / "historical-pr-audit" / name
+
+
+def invocation_state_path(
+    target: dict[str, Any], args: argparse.Namespace
+) -> tuple[Path, str]:
+    pipeline = getattr(args, "pipeline_run", None)
+    continued = getattr(args, "invocation_run", None)
+    fresh = bool(getattr(args, "new_invocation", False))
+    selected = sum(
+        (
+            isinstance(pipeline, str) and bool(pipeline),
+            isinstance(continued, str) and bool(continued),
+            fresh,
+        )
+    )
+    if selected > 1:
+        raise WorkflowError(
+            "choose only one invocation scope: pipeline arguments, "
+            "--new-invocation, or --invocation-run"
+        )
+    run = uuid.uuid4().hex if fresh or selected == 0 else str(pipeline or continued)
+    if getattr(args, "state", None):
+        return cli_path(args.state), run
+    base = default_state_path(target)
+    digest = hashlib.sha256(run.encode("utf-8")).hexdigest()[:16]
+    return base.with_name(f"{base.stem}--invocation-{digest}{base.suffix}"), run
 
 
 def diff_path_for(state_path: Path) -> Path:
@@ -3425,6 +3451,11 @@ def finish_agent_task(
 
 
 def command_agent_task(args: argparse.Namespace) -> None:
+    if getattr(args, "recover", False):
+        raise WorkflowError(
+            "resume and recovery are disabled; start a fresh invocation with "
+            "--new-invocation"
+        )
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
     target = parse_target(
@@ -3433,7 +3464,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         if BARE_TARGET_PATTERN.fullmatch(args.target)
         else None,
     )
-    state_path = cli_path(args.state) if args.state else default_state_path(target)
+    state_path, invocation_id = invocation_state_path(target, args)
     require_outside_repository(state_path, repo_root)
 
     # Helper integrity is checked before branch preparation or publication can mutate git.
@@ -3445,12 +3476,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
         "iteration": args.pipeline_iteration,
         "max_iterations": args.pipeline_max_iterations,
     }
-    recovery_command = agent_task_recovery_command(
-        target=target,
-        repo_root=repo_root,
-        state_path=state_path,
-    )
-
     if state_path.is_file():
         state = load_state(state_path)
         metadata = state.get("pr")
@@ -3460,6 +3485,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             or not isinstance(agent_task, dict)
             or metadata.get("pr_url") != target["pr_url"]
             or state.get("max_iterations") != max_iterations
+            or agent_task.get("invocation_id") != invocation_id
             or agent_task.get("model") != requested_model
             or agent_task.get("pipeline") != pipeline
         ):
@@ -3483,17 +3509,9 @@ def command_agent_task(args: argparse.Namespace) -> None:
             return
         if status == "failed_without_result":
             raise WorkflowError(
-                "the helper produced no deterministic result, so this state cannot "
-                "resume without risking a replacement task",
+                "this invocation was abandoned without a deterministic result; "
+                "start a fresh invocation",
                 details={"state": str(state_path)},
-            )
-        if not args.recover:
-            raise WorkflowError(
-                f"an incomplete audit state already exists: {state_path}",
-                details={
-                    "state": str(state_path),
-                    "recovery_command": agent_task.get("recovery_command"),
-                },
             )
         live = merged_metadata_for(target)
         if not same_snapshot(metadata, live):
@@ -3510,6 +3528,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
             )
             emit(envelope)
             return
+        raise WorkflowError(
+            "this invocation was abandoned with unfinished work; start a fresh "
+            "invocation instead of recovering it",
+            details={"state": str(state_path)},
+        )
     else:
         metadata = merged_metadata_for(target)
         refreshed = merged_metadata_for(target)
@@ -3554,6 +3577,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             },
             "agent_task": {
                 "status": "preparing",
+                "invocation_id": invocation_id,
                 "model": requested_model,
                 "model_alias": args.model,
                 "policy": AGENT_TASK_POLICY,
@@ -3563,7 +3587,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "prompt_sha256": sha256_text(prompt),
                 "result_files": [],
                 "attempt": 0,
-                "recovery_command": recovery_command,
                 "created_at": utc_now(),
             },
         }
@@ -3610,7 +3633,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
             save_state(state_path, failed)
             if isinstance(error, WorkflowError):
                 error.details.setdefault("state", str(state_path))
-                error.details.setdefault("recovery_command", recovery_command)
             raise
         state["audit"]["status"] = "active"
         state["audit"]["branch_action"] = branch_state["branch_action"]
@@ -3768,7 +3790,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
         save_state(state_path, failed)
         if isinstance(error, WorkflowError):
             error.details.setdefault("state", str(state_path))
-            error.details.setdefault("recovery_command", recovery_command)
             error.details.setdefault(
                 "recovery_files",
                 [str(prompt_path), *(failed["agent_task"].get("result_files") or [])],
@@ -3798,7 +3819,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "task_id": (result.get("task") or {}).get("id"),
                 "task_url": (result.get("task") or {}).get("url"),
                 "generated_branch": (result.get("generated") or {}).get("branch"),
-                "recovery_command": recovery_command,
                 "recovery_files": [
                     str(prompt_path),
                     *(state["agent_task"].get("result_files") or []),
@@ -3899,7 +3919,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
             save_state(state_path, failed)
         if isinstance(error, WorkflowError):
             error.details.setdefault("state", str(state_path))
-            error.details.setdefault("recovery_command", recovery_command)
             error.details.setdefault(
                 "recovery_files",
                 [str(prompt_path), *(state["agent_task"].get("result_files") or [])],
@@ -3937,6 +3956,9 @@ def build_parser() -> argparse.ArgumentParser:
     agent_task.add_argument("--pipeline-iteration", help=argparse.SUPPRESS)
     agent_task.add_argument("--pipeline-max-iterations", help=argparse.SUPPRESS)
     agent_task.add_argument("--recover", action="store_true", help=argparse.SUPPRESS)
+    invocation = agent_task.add_mutually_exclusive_group()
+    invocation.add_argument("--new-invocation", action="store_true")
+    invocation.add_argument("--invocation-run")
     agent_task.set_defaults(function=command_agent_task)
 
     preflight = subparsers.add_parser(
@@ -4071,6 +4093,11 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
+        if args.command not in {"agent-task", "status", "cleanup"}:
+            raise WorkflowError(
+                f"legacy command {args.command!r} is disabled; start a fresh "
+                "agent-task invocation"
+            )
         args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:

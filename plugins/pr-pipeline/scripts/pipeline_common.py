@@ -1268,8 +1268,13 @@ def stage_script_path(entry: dict[str, Any]) -> Path:
     )
 
 
-def stage_state_path(entry: dict[str, Any], target: dict[str, Any]) -> Path:
+def stage_state_path(
+    entry: dict[str, Any], target: dict[str, Any], run_id: str | None = None
+) -> Path:
     name = f"{target['owner']}--{target['repo']}--{target['number']}.json"
+    if run_id is not None:
+        digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:16]
+        name = f"{name[:-5]}--invocation-{digest}.json"
     return Path.home() / ".copilot" / "run" / entry["plugin"] / name
 
 
@@ -1396,7 +1401,6 @@ STAGE_STATUS_FIELDS = (
     "iterations",
     "last_helper_activity",
     "local_validation",
-    "malformed_owner_recovery",
     "mergeable_at_head_sha",
     "monitoring",
     "outcome",
@@ -1441,83 +1445,6 @@ def stage_status_summary(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
     return {key: payload[key] for key in STAGE_STATUS_FIELDS if key in payload}
-
-
-def is_legacy_malformed_owner_recovery(
-    status: dict[str, Any],
-    task: dict[str, Any],
-) -> bool:
-    recovery = status.get("malformed_owner_recovery")
-    review = status.get("review")
-    sha_fields = ("source_head_sha", "direct_base_sha", "generated_head_sha")
-    digest_fields = ("prompt_sha256", "result_sha256")
-    return (
-        isinstance(recovery, dict)
-        and set(recovery)
-        == {
-            "status",
-            "kind",
-            "run_id",
-            "task_id",
-            "request_id",
-            "source_head_sha",
-            "direct_base_sha",
-            "generated_head_sha",
-            "prompt_sha256",
-            "result_sha256",
-            "report_path",
-            "validation_path",
-            "remaining_iterations",
-        }
-        and recovery.get("status") == "ready"
-        and recovery.get("kind") == "legacy_v1_validation_incomplete"
-        and task.get("model") == SELF_REVIEW_MODEL
-        and task.get("policy") == "marketplace-agent-worker@4"
-        and isinstance(recovery.get("run_id"), str)
-        and recovery["run_id"] == task.get("run_id")
-        and isinstance(recovery.get("task_id"), str)
-        and bool(recovery["task_id"])
-        and isinstance(recovery.get("request_id"), str)
-        and bool(recovery["request_id"])
-        and all(
-            isinstance(recovery.get(field), str)
-            and re.fullmatch(r"[0-9a-f]{40}", recovery[field]) is not None
-            for field in sha_fields
-        )
-        and all(
-            isinstance(recovery.get(field), str)
-            and re.fullmatch(r"[0-9a-f]{64}", recovery[field]) is not None
-            for field in digest_fields
-        )
-        and isinstance(recovery.get("report_path"), str)
-        and re.fullmatch(
-            r"\.github/agent-task-reports/[A-Za-z0-9][A-Za-z0-9._-]*\.md",
-            recovery["report_path"],
-        )
-        is not None
-        and isinstance(recovery.get("validation_path"), str)
-        and re.fullmatch(
-            r"\.github/agent-task-validations/[A-Za-z0-9][A-Za-z0-9._-]*\.json",
-            recovery["validation_path"],
-        )
-        is not None
-        and recovery["report_path"].rsplit("/", 1)[-1][:-3]
-        == recovery["request_id"]
-        and recovery["validation_path"].rsplit("/", 1)[-1][:-5]
-        == recovery["request_id"]
-        and not isinstance(recovery.get("remaining_iterations"), bool)
-        and isinstance(recovery.get("remaining_iterations"), int)
-        and recovery["remaining_iterations"] > 0
-        and isinstance(review, dict)
-        and review.get("status") == "active"
-        and review.get("head_sha") == recovery["source_head_sha"]
-        and isinstance(review.get("id"), str)
-        and re.fullmatch(
-            rf"pr-[1-9][0-9]*-agent-task-{re.escape(recovery['run_id'])}",
-            review["id"],
-        )
-        is not None
-    )
 
 
 def stage_blocker(
@@ -1566,24 +1493,6 @@ def stage_blocker(
             ),
         )
     if task_state in RECOVERY_TASK_STATES:
-        if (
-            not after_launch
-            and stage_result.get("stage") == STAGE_CONFLICT
-            and task_state in {"failed", "normalization_required"}
-            and "task_id" in task
-            and task.get("task_id") is None
-            and task.get("task_id_status") == "not_created"
-        ):
-            return None
-        if (
-            not after_launch
-            and stage_result.get("stage") == STAGE_SELF_REVIEW
-            and task_state == "failed"
-            and isinstance(status, dict)
-            and is_legacy_malformed_owner_recovery(status, task)
-        ):
-            return None
-        error = task.get("error") if isinstance(task, dict) else None
         detail = task.get("error")
         if isinstance(detail, dict):
             code = detail.get("code")
@@ -1595,9 +1504,9 @@ def stage_blocker(
             detail = (
                 f"{stage_result['stage']} records Agent Task state "
                 f"{task_state}{task_identity}; "
-                "use its retained recovery details"
+                "the invocation is abandoned"
             )
-        return "stage_recovery_required", detail
+        return "stage_invocation_abandoned", detail
     coordinator = status.get("coordinator") if isinstance(status, dict) else None
     escalation = status.get("escalation") if isinstance(status, dict) else None
     if (

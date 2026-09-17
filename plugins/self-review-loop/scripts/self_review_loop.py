@@ -76,7 +76,7 @@ VALIDATION_SOURCE_NAMES = {
     "tox.ini",
 }
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "db635350935f8115e9313b2e81f2ae2b089967036be8f0470bc9cf284b2a679a"
+    "fd848b916d054c40d3becc18bd19d254e278045b51ae95663f9731a2d1c28edf"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -662,6 +662,39 @@ def parse_target(target: str) -> dict[str, Any]:
 def default_state_path(target: dict[str, Any]) -> Path:
     name = f"{target['owner']}--{target['repo']}--{target['number']}.json"
     return Path.home() / ".copilot" / "run" / "self-review-loop" / name
+
+
+def invocation_run(args: argparse.Namespace) -> str:
+    pipeline = getattr(args, "pipeline_run", None)
+    continued = getattr(args, "invocation_run", None)
+    fresh = bool(getattr(args, "new_invocation", False))
+    selected = sum(
+        (
+            isinstance(pipeline, str) and bool(pipeline),
+            isinstance(continued, str) and bool(continued),
+            fresh,
+        )
+    )
+    if selected > 1:
+        raise WorkflowError(
+            "choose only one invocation scope: pipeline arguments, "
+            "--new-invocation, or --invocation-run"
+        )
+    if fresh or selected == 0:
+        generated = uuid.uuid4().hex
+        setattr(args, "_new_invocation_run", generated)
+        return generated
+    return str(pipeline or continued)
+
+
+def invocation_state_path(
+    target: dict[str, Any], args: argparse.Namespace, run: str
+) -> Path:
+    if getattr(args, "state", None):
+        return cli_path(args.state)
+    base = default_state_path(target)
+    digest = hashlib.sha256(run.encode("utf-8")).hexdigest()[:16]
+    return base.with_name(f"{base.stem}--invocation-{digest}{base.suffix}")
 
 
 def diff_path_for(state_path: Path) -> Path:
@@ -1928,7 +1961,7 @@ def invocation_scope(
     if getattr(args, "new_invocation", False):
         spent = int(state.get("iterations", 0))
         return {
-            "run": uuid.uuid4().hex,
+            "run": getattr(args, "_new_invocation_run", None) or uuid.uuid4().hex,
             "iteration": None,
             "baseline": spent,
             "run_baseline": spent,
@@ -5593,19 +5626,26 @@ def command_agent_task(args: argparse.Namespace) -> None:
     ACTIVE_GITHUB_MUTATION_POLICY = github_mutation_policy(args)
     prepare_only = bool(getattr(args, "prepare_only", False))
     apply_prepared = bool(getattr(args, "apply_prepared", False))
-    preserve_artifacts = bool(getattr(args, "preserve_artifacts", False))
-    if apply_prepared and (args.resume or prepare_only):
+    recovery_values = (
+        getattr(args, "recovery_state_sha256", None),
+        getattr(args, "recovery_prompt_sha256", None),
+        getattr(args, "recovery_result_sha256", None),
+        getattr(args, "recovery_task_id", None),
+        getattr(args, "recovery_request_id", None),
+        getattr(args, "recovery_report_base_sha", None),
+    )
+    if args.resume or prepare_only or apply_prepared or any(
+        value is not None for value in recovery_values
+    ):
         raise WorkflowError(
-            "--apply-prepared cannot be combined with --resume or --prepare-only"
+            "resume, recovery, and prepared-result import are disabled; start a "
+            "fresh invocation with --new-invocation"
         )
-    if prepare_only and not preserve_artifacts:
-        raise WorkflowError("--prepare-only requires --preserve-artifacts")
-    if apply_prepared and not preserve_artifacts:
-        raise WorkflowError("--apply-prepared requires --preserve-artifacts")
+    run_scope = invocation_run(args)
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
     target = resolve_target(args.target, repo_root)
-    state_path = cli_path(args.state) if args.state else default_state_path(target)
+    state_path = invocation_state_path(target, args, run_scope)
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
     retained_task = (
@@ -5927,14 +5967,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 raise WorkflowError(
                     f"refusing to overwrite existing Agent Task artifact: {artifact}"
                 )
-        recovery = agent_task_recovery_command(
-            target=pr["pr_url"],
-            repo_root=repo_root,
-            state_path=state_path,
-            model=args.model,
-            prepare_only=prepare_only,
-            preserve_artifacts=preserve_artifacts,
-        )
         clear_shared_state_on_apply = (
             existing is None or previous_clean_at_head_sha is not None
         )
@@ -5956,7 +5988,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "preflight": preflight,
             "prompt_file": str(prompt_path),
             "result_file": str(result_path),
-            "recovery_command": recovery,
             "clear_shared_state_on_apply": clear_shared_state_on_apply,
             "started_at": utc_now(),
         }
@@ -6022,7 +6053,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     {
                         "state": str(state_path),
                         "recovery_files": state["agent_task"]["recovery_files"],
-                        "recovery_command": recovery,
                     }
                 )
             raise
@@ -6112,7 +6142,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     {
                         "state": str(state_path),
                         "recovery_files": task_state["recovery_files"],
-                        "recovery_command": recovery,
                     }
                 )
             raise
@@ -6173,12 +6202,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
                         "task_id": None,
                         "task_id_status": "not_created",
                         "error": failure,
-                        "retry_command": agent_task_retry_command(
-                            args,
-                            target=pr["pr_url"],
-                            repo_root=repo_root,
-                            state_path=state_path,
-                        ),
                     }
                 )
                 state["agent_task"].pop("recovery_command", None)
@@ -7088,6 +7111,11 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
+        if args.command not in {"agent-task", "status", "cleanup"}:
+            raise WorkflowError(
+                f"legacy command {args.command!r} is disabled; start a fresh "
+                "agent-task invocation"
+            )
         args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:

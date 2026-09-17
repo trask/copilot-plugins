@@ -21,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 import unicodedata
 import urllib.parse
 import uuid
@@ -170,7 +170,7 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "db635350935f8115e9313b2e81f2ae2b089967036be8f0470bc9cf284b2a679a"
+    "fd848b916d054c40d3becc18bd19d254e278045b51ae95663f9731a2d1c28edf"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -759,6 +759,32 @@ def parse_target(target: str) -> dict[str, Any]:
 def default_state_path(target: dict[str, Any]) -> Path:
     name = f"{target['owner']}--{target['repo']}--{target['number']}.json"
     return Path.home() / ".copilot" / "run" / "copilot-review-loop" / name
+
+
+def invocation_state_path(
+    target: dict[str, Any], args: argparse.Namespace
+) -> tuple[Path, str]:
+    pipeline = getattr(args, "pipeline_run", None)
+    continued = getattr(args, "invocation_run", None)
+    fresh = bool(getattr(args, "new_invocation", False))
+    selected = sum(
+        (
+            isinstance(pipeline, str) and bool(pipeline),
+            isinstance(continued, str) and bool(continued),
+            fresh,
+        )
+    )
+    if selected > 1:
+        raise WorkflowError(
+            "choose only one invocation scope: pipeline arguments, "
+            "--new-invocation, or --invocation-run"
+        )
+    run = secrets.token_hex(16) if fresh or selected == 0 else str(pipeline or continued)
+    if getattr(args, "state", None):
+        return cli_path(args.state), run
+    base = default_state_path(target)
+    digest = hashlib.sha256(run.encode("utf-8")).hexdigest()[:16]
+    return base.with_name(f"{base.stem}--invocation-{digest}{base.suffix}"), run
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -7135,11 +7161,6 @@ def _task_failure_details(
             "report_path": task_state.get("report_path") or report.get("path"),
             "recovery_files": task_state.get("recovery_files") or [],
             "task_id_status": task_state.get("task_id_status"),
-            **(
-                {"retry_command": task_state["retry_command"]}
-                if isinstance(task_state.get("retry_command"), str)
-                else {"recovery_command": task_state.get("recovery_command")}
-            ),
         }
     )
 
@@ -8202,6 +8223,19 @@ def command_agent_task(args: argparse.Namespace) -> None:
     rescope_publish_only = bool(
         getattr(args, "rescope_prepared_publish_only", False)
     )
+    if (
+        args.resume
+        or prepare_only
+        or apply_prepared
+        or recover_terminal_local
+        or publish_prepared_only
+        or rescope_publish_only
+        or getattr(args, "recovery_manifest_sha256", None) is not None
+    ):
+        raise WorkflowError(
+            "resume, recovery, and prepared-result import are disabled; start a "
+            "fresh invocation with --new-invocation"
+        )
     if rescope_publish_only and (
         prepare_only
         or apply_prepared
@@ -8252,13 +8286,21 @@ def command_agent_task(args: argparse.Namespace) -> None:
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
     target = resolve_target(args.target, repo_root)
-    state_path = cli_path(args.state) if args.state else default_state_path(target)
+    state_path, invocation_id = invocation_state_path(target, args)
     require_outside_repository(state_path, repo_root)
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
     retained_task = (
         existing.get("agent_task") if isinstance(existing, dict) else None
     )
+    if (
+        isinstance(retained_task, dict)
+        and retained_task.get("status") not in {"completed", "consumed"}
+    ):
+        raise WorkflowError(
+            "this invocation was abandoned with unfinished work; start a fresh "
+            "invocation instead of recovering it"
+        )
     if (
         isinstance(retained_task, dict)
         and (
@@ -8872,15 +8914,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     "refusing to overwrite existing local decision artifact: "
                     f"{artifact}"
                 )
-        recovery = agent_task_retry_command(
-            args,
-            target=pr["pr_url"],
-            repo_root=repo_root,
-            state_path=state_path,
-        )
         state["agent_task"] = {
             "status": "preparing",
             "run_id": run_id,
+            "invocation_id": invocation_id,
             "producer": "local",
             "model": requested_model,
             "github_mutation_policy": ACTIVE_GITHUB_MUTATION_POLICY,
@@ -8892,7 +8929,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "result_file": str(result_path),
             "decision_file": str(decision_path),
             "canonical_report_file": str(canonical_path),
-            "recovery_command": recovery,
             "started_at": utc_now(),
             "resume_attempts": 0,
         }
@@ -8901,7 +8937,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
         save_state(state_path, state)
 
     task_state = state["agent_task"]
-    recovery = task_state["recovery_command"]
     local_bundle: dict[str, Any] | None = None
     try:
         if local_execution:
@@ -9025,12 +9060,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
                         "task_id": None,
                         "task_id_status": "not_created",
                         "error": failure,
-                        "retry_command": agent_task_retry_command(
-                            args,
-                            target=pr["pr_url"],
-                            repo_root=repo_root,
-                            state_path=state_path,
-                        ),
                     }
                 )
                 task_state.pop("recovery_command", None)
@@ -9063,12 +9092,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
                         "task_id": result_task_id,
                         "task_id_status": "terminal_unusable",
                         "error": failure,
-                        "retry_command": agent_task_retry_command(
-                            args,
-                            target=pr["pr_url"],
-                            repo_root=repo_root,
-                            state_path=state_path,
-                        ),
                     }
                 )
                 task_state.pop("recovery_command", None)
@@ -9090,12 +9113,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
                         "task_id": result_task_id,
                         "task_id_status": "terminal_unusable",
                         "error": failure,
-                        "retry_command": agent_task_retry_command(
-                            args,
-                            target=pr["pr_url"],
-                            repo_root=repo_root,
-                            state_path=state_path,
-                        ),
                     }
                 )
                 task_state.pop("recovery_command", None)
@@ -9577,12 +9594,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
                         "task_id": current_task.get("local_session_id"),
                         "task_id_status": "terminal_unusable",
                         "error": str(error),
-                        "retry_command": agent_task_retry_command(
-                            args,
-                            target=target["pr_url"],
-                            repo_root=repo_root,
-                            state_path=state_path,
-                        ),
                     }
                 )
                 current_task.pop("recovery_command", None)
@@ -10265,9 +10276,6 @@ def command_reconcile_dead_local_owner(args: argparse.Namespace) -> None:
         target=target,
     )
     seal = dead_local_owner_reconciliation_seal(snapshot)
-    command = dead_local_owner_reconciliation_command(
-        target, repo_root, state_path, seal
-    )
     if args.expected_seal is None:
         artifact_arg = getattr(args, "eligibility_artifact", None)
         manifest_arg = getattr(args, "package_manifest", None)
@@ -10522,6 +10530,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="revalidate the same retained local decision result",
     )
+    invocation = agent_task.add_mutually_exclusive_group()
+    invocation.add_argument("--new-invocation", action="store_true")
+    invocation.add_argument("--invocation-run")
     agent_task.add_argument(
         "--recover-terminal-local",
         metavar="MANIFEST",
@@ -10772,6 +10783,20 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
+        if args.command in {
+            "preflight",
+            "plan",
+            "refresh",
+            "record",
+            "skip",
+            "publish",
+            "reconcile-dead-local-owner",
+            "verify-dead-local-owner-eligibility",
+        }:
+            raise WorkflowError(
+                f"legacy command {args.command!r} is disabled; start a fresh "
+                "agent-task invocation"
+            )
         args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:

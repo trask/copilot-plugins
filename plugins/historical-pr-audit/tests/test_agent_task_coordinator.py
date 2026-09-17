@@ -160,6 +160,125 @@ def report(commits=None, outcome=None):
 
 
 class AgentTaskCoordinatorTest(unittest.TestCase):
+    def test_recovery_is_rejected_before_tools_or_state_access(self):
+        args = MODULE.build_parser().parse_args(
+            ["agent-task", "owner/repo#7", "--recover"]
+        )
+        with mock.patch.object(MODULE, "require_tools") as require_tools:
+            with self.assertRaisesRegex(MODULE.WorkflowError, "disabled"):
+                MODULE.command_agent_task(args)
+        require_tools.assert_not_called()
+
+    def test_fresh_invocation_cannot_publish_a_retained_validated_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_root = root / "repo"
+            repo_root.mkdir()
+            state_path = root / "state.json"
+            MODULE.save_state(
+                state_path,
+                {
+                    "version": MODULE.STATE_VERSION,
+                    "max_iterations": 5,
+                    "pr": METADATA,
+                    "agent_task": {
+                        "status": "validated",
+                        "invocation_id": "original-run",
+                        "model": "gpt-5.6-sol",
+                        "pipeline": {
+                            "run": None,
+                            "iteration": None,
+                            "max_iterations": None,
+                        },
+                        "validated": {},
+                    },
+                },
+            )
+            args = MODULE.build_parser().parse_args(
+                [
+                    "agent-task",
+                    METADATA["pr_url"],
+                    "--repo-root",
+                    str(repo_root),
+                    "--state",
+                    str(state_path),
+                ]
+            )
+            with (
+                mock.patch.object(MODULE, "require_tools"),
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=repo_root
+                ),
+                mock.patch.object(
+                    MODULE, "discover_cloud_task", return_value=root / "helper.py"
+                ),
+                mock.patch.object(MODULE, "finish_agent_task") as finish,
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError, "stored audit identity"
+                ),
+            ):
+                MODULE.command_agent_task(args)
+
+            finish.assert_not_called()
+
+    def test_same_invocation_can_reconcile_exact_validated_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_root = root / "repo"
+            repo_root.mkdir()
+            state_path = root / "state.json"
+            pipeline = {
+                "run": None,
+                "iteration": None,
+                "max_iterations": None,
+            }
+            state = {
+                "version": MODULE.STATE_VERSION,
+                "max_iterations": 5,
+                "pr": METADATA,
+                "agent_task": {
+                    "status": "validated",
+                    "invocation_id": "original-run",
+                    "model": "gpt-5.6-sol",
+                    "pipeline": pipeline,
+                    "validated": {"head_sha": "4" * 40},
+                },
+            }
+            MODULE.save_state(state_path, state)
+            args = MODULE.build_parser().parse_args(
+                [
+                    "agent-task",
+                    METADATA["pr_url"],
+                    "--repo-root",
+                    str(repo_root),
+                    "--state",
+                    str(state_path),
+                    "--invocation-run",
+                    "original-run",
+                ]
+            )
+            envelope = {"result": "published"}
+            with (
+                mock.patch.object(MODULE, "require_tools"),
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=repo_root
+                ),
+                mock.patch.object(
+                    MODULE, "discover_cloud_task", return_value=root / "helper.py"
+                ),
+                mock.patch.object(
+                    MODULE, "merged_metadata_for", return_value=METADATA
+                ),
+                mock.patch.object(
+                    MODULE, "finish_agent_task", return_value=envelope
+                ) as finish,
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_agent_task(args)
+
+            finish.assert_called_once()
+            emit.assert_called_once_with(envelope)
+
     def test_agent_is_thin_and_explicit(self):
         instructions = AGENT.read_text(encoding="utf-8")
         for text in (
@@ -177,7 +296,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pins_shared_helper_and_policy_integrity(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "db635350935f8115e9313b2e81f2ae2b089967036be8f0470bc9cf284b2a679a",
+            "fd848b916d054c40d3becc18bd19d254e278045b51ae95663f9731a2d1c28edf",
         )
         self.assertEqual(
             MODULE.AGENT_TASK_POLICY_SHA256,
@@ -563,6 +682,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertTrue(saved["agent_task"]["artifacts_removed"])
             self.assertNotIn("result_files", saved["agent_task"])
 
+    @unittest.skip("hosted task resume is intentionally unavailable")
     def test_command_persists_before_prepare_and_resumes_same_task(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

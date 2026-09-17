@@ -779,6 +779,15 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def setUp(self):
         self.instructions = AGENT.read_text(encoding="utf-8")
 
+    def test_resume_is_rejected_before_tools_or_state_access(self):
+        args = MODULE.build_parser().parse_args(
+            ["agent-task", "owner/repo#7", "--resume"]
+        )
+        with mock.patch.object(MODULE, "require_tools") as require_tools:
+            with self.assertRaisesRegex(MODULE.WorkflowError, "disabled"):
+                MODULE.command_agent_task(args)
+        require_tools.assert_not_called()
+
     def request(self, strategy="merge"):
         value = {
             "schema": MODULE.CONFLICT_REQUEST_SCHEMA,
@@ -887,7 +896,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "72adbe1a50a294fb8123155077d215e62a20a3d65c7a37203217c87fc87e238a",
+            "a1edbe7463b322360f8b9978d6f4b9c825b08791a2c16b5153cc393566c9ef98",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -992,7 +1001,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
                     "strategy": "merge",
                 },
             ) as preflight,
-            mock.patch.object(MODULE, "emit") as emit,
+            mock.patch.object(MODULE, "emit"),
         ):
             MODULE.command_agent_task(args)
 
@@ -1015,7 +1024,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             ),
         )
 
-    def test_budget_exhaustion_reports_an_exact_state_preserving_retry(self):
+    def test_budget_exhaustion_does_not_create_a_recovery_command(self):
         directory = temporary_directory(self)
         state_path = directory / "state.json"
         state = {
@@ -1058,12 +1067,12 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual(3, payload["completed_managed_iterations"])
         self.assertEqual(4, payload["attempted_iteration"])
         self.assertEqual(3, payload["iteration_budget"])
-        self.assertIn('"--state" ' + json.dumps(str(state_path)), payload["retry_command"])
-        self.assertIn('"--max-iterations" "4"', payload["retry_command"])
-        self.assertNotIn("--resume", payload["retry_command"])
+        self.assertNotIn("retry_command", payload)
+        self.assertNotIn("recovery_command", payload)
         self.assertEqual(state, json.loads(state_path.read_text(encoding="utf-8")))
         preflight.assert_not_called()
 
+    @unittest.skip("hosted task resume is intentionally unavailable")
     def test_completed_task_resume_keeps_owner_and_managed_attempt_count(self):
         directory = temporary_directory(self)
         state_path = directory / "state.json"
@@ -1192,6 +1201,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual(state["managed_task_history"], saved["managed_task_history"])
         self.assertEqual("published", emitted(emit)["result"])
 
+    @unittest.skip("legacy owner replacement is intentionally unavailable")
     def test_hash_gated_unidentified_owner_replacement_archives_exact_owner(self):
         directory = temporary_directory(self)
         state_path = directory / "state.json"
@@ -1264,6 +1274,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         )
         self.assertEqual("completed", saved["agent_task"]["status"])
 
+    @unittest.skip("legacy owner replacement is intentionally unavailable")
     def test_unidentified_owner_replacement_rejects_a_changed_state(self):
         directory = temporary_directory(self)
         state_path = directory / "state.json"
@@ -1311,6 +1322,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
 
         self.assertEqual(before, state_path.read_bytes())
 
+    @unittest.skip("legacy owner replacement is intentionally unavailable")
     def test_unidentified_owner_replacement_rejects_a_known_task(self):
         directory = temporary_directory(self)
         state_path = directory / "state.json"
@@ -1359,6 +1371,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         ):
             MODULE.command_agent_task(args)
 
+    @unittest.skip("legacy owner replacement is intentionally unavailable")
     def test_hash_gated_malformed_completed_task_replacement_archives_owner(self):
         directory = temporary_directory(self)
         state_path = directory / "state.json"
@@ -1567,6 +1580,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual("recovery_required", payload["result"])
         self.assertNotIn("retry_command", payload)
 
+    @unittest.skip("legacy owner replacement is intentionally unavailable")
     def test_malformed_completed_task_replacement_rejects_changed_resume_result(self):
         directory = temporary_directory(self)
         state_path = directory / "state.json"
@@ -1726,7 +1740,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual("not_created", payload["task_id_status"])
         self.assertEqual(failed_result["error"], payload["error"])
         self.assertNotIn("recovery_command", payload)
-        self.assertIn("--state", payload["retry_command"])
+        self.assertNotIn("retry_command", payload)
 
     def test_nonzero_helper_without_result_retains_bounded_redacted_diagnostics(self):
         directory = temporary_directory(self)
@@ -1791,7 +1805,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertNotIn("secret-value", task["process"]["stderr"]["text"])
         self.assertIn("<redacted>", task["process"]["stderr"]["text"])
         payload = emitted(emit)
-        self.assertEqual("recovery_required", payload["result"])
+        self.assertEqual("invocation_abandoned", payload["result"])
         self.assertEqual(task["process"], payload["process"])
         self.assertNotIn("retry_command", payload)
 
@@ -1849,7 +1863,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual(2, task["process"]["returncode"])
         self.assertEqual("invalid result", task["process"]["stderr"]["text"])
         payload = emitted(emit)
-        self.assertEqual("recovery_required", payload["result"])
+        self.assertEqual("invocation_abandoned", payload["result"])
         self.assertNotIn("retry_command", payload)
 
     def test_preflight_failure_persists_before_task_creation(self):
@@ -1902,6 +1916,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual("ready", status["result"])
         self.assertEqual("failed", status["agent_task"]["status"])
 
+    @unittest.skip("legacy normalization recovery is intentionally unavailable")
     def test_native_stack_normalization_is_retained_without_task_creation(self):
         directory = temporary_directory(self)
         state_path = directory / "state.json"
@@ -2291,12 +2306,11 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual("not_created", task["task_id_status"])
         self.assertEqual("conflict_preflight_interrupted", task["error"]["code"])
 
-    def test_agent_contract_documents_the_default_and_budget_retry(self):
-        self.assertIn("three managed attempts per state file by default", self.instructions)
+    def test_agent_contract_documents_invocation_local_budget(self):
+        self.assertIn("invocation-local state", self.instructions)
         self.assertIn("`--max-iterations <count>`", self.instructions)
-        self.assertIn("Attempts recorded by the retained deterministic", self.instructions)
-        self.assertIn("the exact `retry_command`", self.instructions)
-        self.assertIn("there is no unfinished managed task to resume", self.instructions)
+        self.assertIn("prior results", self.instructions)
+        self.assertIn("never seed execution", self.instructions)
 
     def test_rejects_malformed_or_failed_validation(self):
         bad_values = [
@@ -2449,9 +2463,8 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertIn("Never call Agent Tasks APIs directly", self.instructions)
         self.assertIn("Never scrape helper stdout", self.instructions)
         self.assertIn("Do not run the legacy", self.instructions)
-        self.assertIn("--input-result-file", self.instructions)
-        self.assertIn("resumes only the same task", self.instructions)
-        self.assertIn("Publication recovery never invokes cloud", self.instructions)
+        self.assertIn("Resume and owner-replacement arguments fail", self.instructions)
+        self.assertIn("lost publication response never invokes cloud", self.instructions)
 
     def test_agent_contract_pins_all_three_strategies_and_artifact_separation(self):
         self.assertIn("<merge|rebase|native-stack>", self.instructions)
@@ -2511,6 +2524,24 @@ class TargetParsingTest(unittest.TestCase):
         self.assertEqual("owner--repo--9.json", path.name)
         self.assertEqual("pr-conflict-resolver", path.parent.name)
         self.assertEqual("run", path.parent.parent.name)
+
+    def test_fresh_invocations_never_select_the_legacy_pr_state(self):
+        target = MODULE.parse_target("owner/repo#16161")
+        args = SimpleNamespace(
+            pipeline_run=None,
+            invocation_run=None,
+            new_invocation=False,
+            state=None,
+        )
+        with mock.patch.object(
+            MODULE.secrets, "token_hex", side_effect=["fresh-1", "fresh-2"]
+        ):
+            first, first_id = MODULE.invocation_state_path(target, args)
+            second, second_id = MODULE.invocation_state_path(target, args)
+
+        self.assertNotEqual(MODULE.default_state_path(target), first)
+        self.assertNotEqual(first, second)
+        self.assertEqual(("fresh-1", "fresh-2"), (first_id, second_id))
 
     def test_sidecar_paths_sit_beside_the_state_file(self):
         state_path = Path("/tmp/owner--repo--9.json")
@@ -4464,7 +4495,7 @@ class MalformedCompletedReplacementTest(unittest.TestCase):
         ):
             self.validate()
 
-    def test_parser_accepts_only_a_complete_byte_identical_replacement_bundle(self):
+    def test_parser_rejects_malformed_task_replacement_bundles(self):
         directory = temporary_directory(self)
         old_request_path = directory / "old-request.json"
         old_prompt_path = directory / "old-prompt.txt"
@@ -4519,12 +4550,14 @@ class MalformedCompletedReplacementTest(unittest.TestCase):
             self.replacement.task_prompt_sha256,
         ]
 
-        parsed = CLOUD_MODULE.parse_args(arguments)
-
-        self.assertEqual(self.result, parsed.replacement.result)
         with self.assertRaisesRegex(
             CLOUD_MODULE.ConflictError,
-            "must be supplied together",
+            "replacement.*disabled",
+        ):
+            CLOUD_MODULE.parse_args(arguments)
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError,
+            "replacement.*disabled",
         ):
             CLOUD_MODULE.parse_args(arguments[:-2])
 
@@ -4896,6 +4929,69 @@ class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
         self.assertEqual("success", result.status)
         self.assertEqual("no_changes", result.application_status)
         self.assertEqual("owner/repo", result.repository)
+
+    def test_task_creation_failure_keeps_all_task_identity_null(self):
+        control_root = temporary_directory(self)
+        repo_root = control_root / "repo"
+        repo_root.mkdir()
+        head = "b" * 40
+        snapshot = CLOUD_MODULE.LocalSnapshot(
+            root=repo_root,
+            control_root=control_root,
+            repository="owner/repo",
+            remote="origin",
+            branch="feature",
+            head=head,
+            status="",
+            operation=None,
+        )
+        request = {
+            "repository": "owner/repo",
+            "request_id": "request-1",
+            "request_sha256": "a" * 64,
+            "pull_request": {
+                "number": 7,
+                "head_ref": "feature",
+                "head_sha": head,
+            },
+        }
+        options = SimpleNamespace(
+            result_file=control_root / "result.json",
+            request_file=control_root / "request.json",
+            prompt_file=control_root / "prompt.txt",
+            input_result_file=None,
+            request=request,
+            model="gpt-5.6-sol",
+            strategy="merge",
+            prior_result=None,
+            replacement=None,
+        )
+        result = CLOUD_MODULE.Result()
+        with (
+            mock.patch.object(
+                CLOUD_MODULE, "local_snapshot", return_value=snapshot
+            ),
+            mock.patch.object(CLOUD_MODULE, "require_target_fresh"),
+            mock.patch.object(CLOUD_MODULE, "require_local_unchanged"),
+            mock.patch.object(CLOUD_MODULE, "already_satisfied", return_value=False),
+            mock.patch.object(CLOUD_MODULE, "fetch_pinned_inputs"),
+            mock.patch.object(CLOUD_MODULE, "verify_frozen_ranges"),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "start_task",
+                side_effect=CLOUD_MODULE.ConflictError(
+                    "HTTP 409: task unavailable", "api_error"
+                ),
+            ),
+            self.assertRaisesRegex(CLOUD_MODULE.ConflictError, "HTTP 409"),
+        ):
+            CLOUD_MODULE.execute(options, cwd=repo_root, result=result)
+
+        self.assertIsNone(result.task_id)
+        self.assertIsNone(result.task_state)
+        self.assertIsNone(result.task_url)
+        self.assertIsNone(result.task_base_ref)
+        self.assertIsNone(result.task_base_sha)
 
     def test_pipeline_detached_head_matches_the_pinned_source(self):
         control_root = temporary_directory(self)

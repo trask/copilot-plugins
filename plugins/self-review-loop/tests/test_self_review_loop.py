@@ -5,7 +5,6 @@ import importlib.util
 import inspect
 import io
 import json
-import os
 from pathlib import Path
 import re
 import tempfile
@@ -1519,6 +1518,139 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
 
         self.assertEqual("api_failure", error["code"])
+        self.assertIsNone(failure["report"])
+        self.assertEqual(
+            "Agent Task failed [api_failure]: user or repo does not have CCA enabled",
+            str(MODULE.task_failure_from_result(failure)),
+        )
+        preallocated = copy.deepcopy(failure)
+        preallocated["report"] = {
+            "path": ".github/agent-task-reports/request-1.md",
+            "commit": None,
+            "sha256": None,
+        }
+        with self.assertRaisesRegex(MODULE.WorkflowError, "mismatched identity"):
+            MODULE.validate_task_creation_failure_result(
+                preallocated,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+            )
+
+    def test_current_creation_failure_is_audit_only_and_later_call_is_fresh(self):
+        state_path = self.directory / "cca-disabled-state.json"
+        helper = self.directory / "cloud_task.py"
+        helper.write_text("# helper\n", encoding="utf-8")
+        failure = self.semantic_result(payload={})
+        failure.update(
+            {
+                "status": "error",
+                "task": {
+                    "id": None,
+                    "url": None,
+                    "state": None,
+                    "base_ref": None,
+                    "base_sha": None,
+                },
+                "generated": {"branch": None, "head_sha": None, "commits": []},
+                "application": {
+                    "status": "not_applied",
+                    "final_local_head": self.head,
+                },
+                "report": None,
+                "semantic_output": None,
+                "attestation": {
+                    "kind": "dispatcher_semantic",
+                    "structural_complete": False,
+                },
+                "error": {
+                    "code": "api_failure",
+                    "message": (
+                        "start Agent Task failed with HTTP 409: "
+                        "user or repo does not have CCA enabled; "
+                        "the request cannot be completed"
+                    ),
+                },
+            }
+        )
+        commands = []
+
+        def helper_run(command, **_kwargs):
+            commands.append(command)
+            output = Path(command[command.index("--result-file") + 1])
+            output.write_text(json.dumps(failure), encoding="utf-8")
+            return MODULE.subprocess.CompletedProcess(command, 2, "", "failed")
+
+        args = self.arguments(state_path)
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target(args.target),
+            ),
+            mock.patch.object(
+                MODULE,
+                "agent_task_preflight",
+                return_value=self.preflight,
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "run", side_effect=helper_run),
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value=self.preflight["identity"],
+            ),
+            mock.patch.object(MODULE, "publish_shared_state"),
+            mock.patch.object(
+                MODULE.secrets,
+                "token_hex",
+                side_effect=[
+                    "invocation-1",
+                    "run-1",
+                    "invocation-2",
+                    "run-2",
+                ],
+            ),
+        ):
+            for _ in range(2):
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "start Agent Task failed with HTTP 409: "
+                    "user or repo does not have CCA enabled",
+                ):
+                    MODULE.command_agent_task(args)
+
+        state = MODULE.load_state(state_path)
+        task = state["agent_task"]
+        self.assertEqual(0, state["iterations"])
+        self.assertEqual([], state["history"])
+        self.assertEqual(
+            {
+                "id": None,
+                "url": None,
+                "state": None,
+                "base_ref": None,
+                "base_sha": None,
+            },
+            task["task"],
+        )
+        self.assertEqual(
+            {"branch": None, "head_sha": None, "commits": []},
+            task["generated"],
+        )
+        self.assertIsNone(task["report"])
+        self.assertIsNone(task["semantic_output"])
+        self.assertEqual("not_created", task["task_id_status"])
+        self.assertNotIn("recovery_command", task)
+        self.assertNotIn("retry_command", task)
+        self.assertEqual(1, len(state["managed_task_history"]))
+        self.assertEqual("run-1", state["managed_task_history"][0]["run_id"])
+        self.assertEqual("run-2", task["run_id"])
+        self.assertTrue(
+            all("--apply-with-report" in command for command in commands)
+        )
+        self.assertTrue(all("--resume" not in command for command in commands))
 
     def test_exact_v4_taskless_failure_is_trusted_only_for_migration(self):
         result = MODULE.load_agent_task_result(CCA_DISABLED_V4_RESULT)
@@ -1577,6 +1709,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     allow_legacy_policy=True,
                 )
 
+    @unittest.skip("legacy owner migration is intentionally unavailable")
     def test_legacy_taskless_state_migrates_once_before_fresh_dispatch(self):
         state_path = self.directory / "legacy-cca-state.json"
         helper = self.directory / "cloud_task.py"
@@ -1888,6 +2021,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             pipeline_max_iterations=None,
         )
 
+    def test_resume_is_rejected_before_tools_or_state_access(self):
+        args = self.arguments(self.directory / "legacy.json", resume=True)
+        with mock.patch.object(MODULE, "require_tools") as require_tools:
+            with self.assertRaisesRegex(MODULE.WorkflowError, "disabled"):
+                MODULE.command_agent_task(args)
+        require_tools.assert_not_called()
+
     def split_identity_preflight(self):
         return {
             **self.preflight,
@@ -1952,7 +2092,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.33")
+        self.assertEqual(plugin["version"], "1.3.34")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -3018,6 +3158,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 requested_model="gpt-5.6-sol",
             )
 
+    @unittest.skip("prepared-result recovery is intentionally unavailable")
     def test_runtime_base_recovery_survives_prepare_apply_process_boundary(self):
         stale_base_ref_oid = "9" * 40
         raw_report = {
@@ -3052,6 +3193,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             name="runtime-base",
         )
 
+    @unittest.skip("prepared-result recovery is intentionally unavailable")
     def test_nested_runtime_recovery_survives_prepare_apply_process_boundary(self):
         stale_base_ref_oid = "9" * 40
         proposed_body = self.preflight["pr"]["body"] + "\n\nBounded targets."
@@ -3527,6 +3669,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             [None, self.head],
         )
 
+    @unittest.skip("prepared-result recovery is intentionally unavailable")
     def test_prepare_only_records_fix_and_metadata_before_authorized_apply(self):
         state_path = self.directory / "prepared-fix.json"
         helper = self.directory / "cloud_task.py"
@@ -3777,6 +3920,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         ):
             MODULE.command_agent_task(consumed)
 
+    @unittest.skip("prepared-result recovery is intentionally unavailable")
     def test_prepare_only_records_clean_keep_result_before_authorized_apply(self):
         state_path = self.directory / "prepared-clean.json"
         helper = self.directory / "cloud_task.py"
@@ -3889,6 +4033,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual("completed", completed["agent_task"]["status"])
         self.assertEqual(self.head, completed["review"]["clean_at_head_sha"])
 
+    @unittest.skip("hosted task resume is intentionally unavailable")
     def test_forward_clean_resume_reuses_task_and_preserves_all_artifacts(self):
         state_path = self.directory / "forward-clean-resume.json"
         prompt_path = self.directory / "retained-prompt.txt"
@@ -4017,6 +4162,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual("nothing_to_publish", emitted[-1]["result"])
         self.assertEqual("cleared", emitted[-1]["stage_outcome"])
 
+    @unittest.skip("hosted task resume is intentionally unavailable")
     def test_split_identity_clean_resume_prepares_retained_owner_without_mutation(self):
         state_path = self.directory / "split-identity-clean-resume.json"
         prompt_path = self.directory / "retained-prompt.txt"
@@ -4150,6 +4296,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn('"--resume"', task["apply_command"])
         self.assertEqual("validated_pending_import", emitted[-1]["result"])
 
+    @unittest.skip("hosted task resume is intentionally unavailable")
     def test_nested_identity_clean_resume_prepares_retained_owner_without_mutation(self):
         state_path = self.directory / "nested-identity-clean-resume.json"
         prompt_path = self.directory / "retained-prompt.txt"
@@ -4280,6 +4427,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn('"--resume"', task["apply_command"])
         self.assertEqual("validated_pending_import", emitted[-1]["result"])
 
+    @unittest.skip("legacy owner replacement is intentionally unavailable")
     def test_archives_stale_clean_owner_once_before_fresh_preparation(self):
         state_path = self.directory / "stale-clean-owner.json"
         prompt_path = self.directory / "retained-prompt.txt"
@@ -4902,6 +5050,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(verified, live)
         run.assert_not_called()
 
+    @unittest.skip("failed invocations are abandoned rather than recovered")
     def test_task_failure_preserves_durable_recovery_identity_and_artifacts(self):
         state_path = self.directory / "failed-state.json"
         helper = self.directory / "cloud_task.py"
@@ -7289,6 +7438,30 @@ class StatusTest(unittest.TestCase):
         self.assertFalse(
             MODULE.status_path_for(self.directory / "missing.json").exists()
         )
+
+    def test_fresh_invocations_never_select_the_legacy_pr_state(self):
+        target = MODULE.parse_target("owner/repo#20075")
+        args = SimpleNamespace(
+            pipeline_run=None,
+            invocation_run=None,
+            new_invocation=False,
+            state=None,
+        )
+        with mock.patch.object(
+            MODULE.uuid,
+            "uuid4",
+            side_effect=[
+                SimpleNamespace(hex="fresh-1"),
+                SimpleNamespace(hex="fresh-2"),
+            ],
+        ):
+            first_run = MODULE.invocation_run(args)
+            second_run = MODULE.invocation_run(args)
+        first = MODULE.invocation_state_path(target, args, first_run)
+        second = MODULE.invocation_state_path(target, args, second_run)
+
+        self.assertNotEqual(MODULE.default_state_path(target), first)
+        self.assertNotEqual(first, second)
 
     def test_cleanup_removes_the_state_file(self):
         path = write_state(self.directory)

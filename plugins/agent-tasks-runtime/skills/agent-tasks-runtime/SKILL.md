@@ -63,32 +63,33 @@ Validation evidence remains semantic worker output because the dispatcher
 cannot truthfully claim commands it did not execute. It is never promoted to a
 dispatcher validation claim or inferred from prose or standard output.
 
-Policy `marketplace-agent-apply-report-worker@3` remains dispatchable for
-existing consumers and recoverable for tasks created under that immutable
-contract. It permits zero or more ordered fix commits followed by exactly one
+Policy `marketplace-agent-apply-report-worker@3` remains parseable only as
+immutable legacy evidence under that exact contract. It permits zero or more
+ordered fix commits followed by exactly one
 dispatcher-assigned Markdown report commit. The dispatcher records result schema version 2 with
 `attestation.kind=dispatcher_structural` and
 `application.status=not_applied`. Legacy report content stays untrusted and
 must pass the original consumer validation; it is never normalized into a
 version 4 semantic result.
 
-Policy `marketplace-agent-apply-report-worker@2` remains available only for
-recovery of tasks created under that immutable contract. It applies fix commits
-before the consumer validates its workflow-specific report. Consumers may
-recover a successful version 2 result only by validating its exact result,
-report, history, and local imported head before publication.
+Policy `marketplace-agent-apply-report-worker@2` remains parseable only as
+immutable legacy evidence under that exact contract. It applied fix commits
+before the consumer validated its workflow-specific report. It cannot seed or
+resume a current invocation.
 
-Policy `marketplace-agent-apply-report-worker@1` remains available only for
-recovery of tasks created under that immutable contract. It also requires each
+Policy `marketplace-agent-apply-report-worker@1` remains parseable only as
+immutable legacy evidence under that exact contract. It also requires each
 fix commit message to contain exactly one nonempty `Finding:` line. Version 2
 removed that model-authored duplicate because consumers validate the stronger
 report mapping.
 
-If an apply-with-report dispatcher is interrupted after task creation and no
-dispatch result survives, `--resume-apply-with-report` can recover the known
-task. Recovery reads the hosted task session prompt and requires its exact task,
-model, repository, source pull request, policy, and assigned artifact paths
-before normal apply-with-report checks can run. Structural apply-report
-recovery uses its dispatcher request ID and has no validation path. A
-caller-supplied mode or prompt cannot establish that provenance. Tasks created
-under older policy versions cannot be recovered through a newer contract.
+Each dispatcher call is a fresh invocation. It never accepts a task ID, prior
+result, monitor-only mode, or resume mode as execution input. Interrupted and
+failed invocations remain immutable audit evidence; a later call creates a new
+request and task with a new invocation-local result. The caller must still pin
+the current source identity, and all normal structural and semantic checks
+remain fail closed.
+If the creation request itself fails, the caller's pinned result-file path
+keeps request ownership and the result keeps repository, pull request, model,
+and policy identity. Every task, generated branch, report, receipt, and
+semantic-output identity remains null.

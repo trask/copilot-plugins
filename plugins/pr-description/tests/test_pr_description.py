@@ -714,12 +714,86 @@ class LegacyAgentInstructions:
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.55")
+        self.assertEqual(plugin["version"], "1.0.56")
         self.assertEqual(entry["version"], plugin["version"])
         self.assertEqual(entry["source"], "./plugins/pr-description")
 
 
 class AgentTaskCoordinatorTest(unittest.TestCase):
+    def test_resume_is_rejected_before_tools_or_state_access(self):
+        args = MODULE.build_parser().parse_args(
+            ["agent-task", "owner/repo#7", "--resume"]
+        )
+        with mock.patch.object(MODULE, "require_tools") as require_tools:
+            with self.assertRaisesRegex(MODULE.WorkflowError, "disabled"):
+                MODULE.command_agent_task(args)
+        require_tools.assert_not_called()
+
+    def test_existing_explicit_state_is_audit_only_before_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo_root = root / "repo"
+            repo_root.mkdir()
+            state_path = root / "state.json"
+            state_path.write_text("preserve me\n", encoding="utf-8")
+            args = MODULE.build_parser().parse_args(
+                [
+                    "agent-task",
+                    "owner/repo#7",
+                    "--repo-root",
+                    str(repo_root),
+                    "--state",
+                    str(state_path),
+                ]
+            )
+            with (
+                mock.patch.object(MODULE, "require_tools"),
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=repo_root
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "resolve_target",
+                    return_value=MODULE.parse_target("owner/repo#7"),
+                ),
+                mock.patch.object(MODULE, "agent_task_preflight") as preflight,
+                self.assertRaisesRegex(MODULE.WorkflowError, "audit-only"),
+            ):
+                MODULE.command_agent_task(args)
+
+            preflight.assert_not_called()
+            self.assertEqual("preserve me\n", state_path.read_text(encoding="utf-8"))
+
+    def test_explicit_state_inside_repository_is_rejected_before_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo_root = Path(directory).resolve()
+            args = MODULE.build_parser().parse_args(
+                [
+                    "agent-task",
+                    "owner/repo#7",
+                    "--repo-root",
+                    str(repo_root),
+                    "--state",
+                    str(repo_root / "source.py"),
+                ]
+            )
+            with (
+                mock.patch.object(MODULE, "require_tools"),
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=repo_root
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "resolve_target",
+                    return_value=MODULE.parse_target("owner/repo#7"),
+                ),
+                mock.patch.object(MODULE, "agent_task_preflight") as preflight,
+                self.assertRaisesRegex(MODULE.WorkflowError, "outside the repository"),
+            ):
+                MODULE.command_agent_task(args)
+
+            preflight.assert_not_called()
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.directory = Path(self.temporary.name).resolve()
@@ -1040,7 +1114,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.55")
+        self.assertEqual(plugin["version"], "1.0.56")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1465,6 +1539,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             [],
         )
 
+    @unittest.skip("hosted task resume is intentionally unavailable")
     def test_compact_keep_resume_reuses_task_without_github_mutation(self):
         path = self.directory / "owner--repo--7--retained.json"
         index = self.directory / "owner--repo--7.json"
@@ -1585,6 +1660,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual("validated", emitted[-1]["result"])
         self.assertEqual("keep", emitted[-1]["decision"])
 
+    @unittest.skip("hosted task resume is intentionally unavailable")
     def test_stale_preflight_base_recovery_prepares_same_completed_task(self):
         stale_base_sha = self.preflight["pr"]["base"]["sha"]
         live_base_sha = "5" * 40
@@ -1852,6 +1928,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.preflight["pr"]["title"], normalized["proposal"]["title"]
         )
 
+    @unittest.skip("hosted task resume is intentionally unavailable")
     def test_exact_forward_identity_resume_prepares_same_task_without_mutation(self):
         preflight = self.forward_identity_preflight()
         changed_files = self.forward_identity_changed_files()
@@ -2213,6 +2290,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         ):
             MODULE.command_archive_taskless_runs(arguments)
 
+    @unittest.skip("prepared-result recovery is intentionally unavailable")
     def test_prepare_and_restart_apply_replace_without_duplicate_mutation(self):
         self.preflight["repository_root"] = str(self.repo_root)
         report_content = self.proposal_report(
@@ -2371,6 +2449,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual("completed", completed["agent_task"]["status"])
         self.assertEqual("applied", second_emitted[-1]["result"])
 
+    @unittest.skip("prepared-result recovery is intentionally unavailable")
     def test_prepare_and_apply_keep_without_metadata_mutation(self):
         self.preflight["repository_root"] = str(self.repo_root)
         report_content = self.proposal_report()
@@ -2473,7 +2552,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual("no_change", completed["validation"]["mode"])
         self.assertEqual("validated", emitted[-1]["result"])
 
-    def test_fresh_dispatch_refuses_active_and_unarchived_taskless_runs(self):
+    def test_pr_index_is_audit_only_for_fresh_dispatches(self):
         index_path = self.directory / "owner--repo--7.json"
         run_path = self.directory / "owner--repo--7--run-1.json"
         state = {
@@ -2534,17 +2613,18 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         MODULE.save_state(reserved_path, reserved)
         with mock.patch.object(MODULE, "publish_shared_state"):
             MODULE.reserve_agent_task_run(index_path, reserved_path, reserved)
-            with self.assertRaisesRegex(
-                MODULE.WorkflowError, "unfinished PR Description Agent Task"
-            ):
-                MODULE.reserve_agent_task_run(
-                    index_path,
-                    self.directory / "owner--repo--7--run-3.json",
-                    {
-                        **reserved,
-                        "run_id": "run-3",
-                    },
-                )
+            MODULE.reserve_agent_task_run(
+                index_path,
+                self.directory / "owner--repo--7--run-3.json",
+                {
+                    **reserved,
+                    "run_id": "run-3",
+                },
+            )
+        self.assertEqual(
+            ["run-1", "run-2", "run-3"],
+            [item["run_id"] for item in MODULE.load_state(index_path)["runs"]],
+        )
 
     def test_task_failure_keeps_recovery_artifacts_and_never_mutates(self):
         report_content = self.proposal_report()
@@ -2583,7 +2663,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         result = self.result(report_content)
         for label, drift in (("PR head moved", False), ("local repository changed", True)):
             with self.subTest(label=label):
-                patches, _, _ = self.command_patches(
+                patches, _, index = self.command_patches(
                     result, report_content, self.receipt()
                 )
                 patches = tuple(
@@ -2625,6 +2705,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                         )
                 for artifact in self.directory.glob("*--agent-task-*"):
                     artifact.unlink()
+                index.with_name("owner--repo--7--run-1.json").unlink(missing_ok=True)
 
     def test_cleanup_failure_records_verified_partial_failure(self):
         report_content = self.proposal_report()
@@ -3416,7 +3497,7 @@ class ApplyTest(unittest.TestCase):
         )
         parser = mock.Mock()
         parser.parse_args.return_value = SimpleNamespace(
-            function=mock.Mock(side_effect=error)
+            command="agent-task", function=mock.Mock(side_effect=error)
         )
 
         with (

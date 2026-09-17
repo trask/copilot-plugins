@@ -845,6 +845,12 @@ def parse_args(args: Sequence[str]) -> Options:
             f"missing required options: {', '.join(missing)}",
             "policy_rejected",
         )
+    if "--input-result-file" in values or replacement_options & values.keys():
+        raise ConflictError(
+            "resume and malformed-task replacement are disabled; start a fresh "
+            "invocation",
+            "recovery_disabled",
+        )
     if values["--policy"] not in {POLICY_SELECTOR, LEGACY_POLICY_SELECTOR}:
         raise ConflictError("unsupported conflict worker policy", "policy_rejected")
     strategy = str(values["--strategy"])
@@ -1507,9 +1513,7 @@ def require_local_unchanged(
     if current != expected:
         raise ConflictError("local repository state changed", "stale_target")
     for ref in quarantined:
-        if not ref.startswith(
-            f"refs/cloud-conflict-tasks/"
-        ):
+        if not ref.startswith("refs/cloud-conflict-tasks/"):
             raise ConflictError("unsafe quarantine ref", "policy_rejected")
 
 
@@ -4115,8 +4119,6 @@ def execute(
         result.request_id = request["request_id"]
         result.request_sha256 = request["request_sha256"]
         result.pull_request = pull_request_result(request)
-        result.task_base_ref = request["pull_request"]["head_sha"]
-        result.task_base_sha = request["pull_request"]["head_sha"]
     if already_satisfied(runner, snapshot, request):
         require_target_fresh(runner, snapshot, request)
         require_local_unchanged(runner, snapshot)
@@ -4156,6 +4158,8 @@ def execute(
         result.task_id = progress.task_id
         result.task_state = progress.task_state
         result.task_url = task_link(initial)
+        result.task_base_ref = request["pull_request"]["head_sha"]
+        result.task_base_sha = request["pull_request"]["head_sha"]
     final = monitor_task(runner, snapshot, initial, progress, sleep)
     if result is not None:
         result.task_state = str(final["state"])

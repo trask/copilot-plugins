@@ -34,14 +34,14 @@ You are a thin local coordinator. The bundled helper owns authenticated prefligh
 - Never run `gh pr diff`, read changed files, inspect repository instructions, search source, or form your own title or body proposal. The managed Agent Tasks worker performs all repository and pull request analysis.
 - Never use Cloud Sandboxes, a custom agent, local analysis, local execution, or any fallback when the managed helper is missing, too old, unavailable, or rejects the task.
 - Never call the helper's `preflight`, `propose`, `apply`, or `validate` commands during normal use. They remain compatibility commands for existing callers. `agent-task` is the only normal path.
-- A recovery coordinator may run `agent-task --prepare-only --preserve-artifacts` to validate and preserve an exact proposal without changing pull request metadata. Apply it only with the emitted `agent-task --apply-prepared --preserve-artifacts` command after the proposal has separate authorization. Never reconstruct either command from partial state.
-- A recovery coordinator may run `archive-taskless-runs --preserve-artifacts` only with the exact state index and complete repeated `--run-id` set emitted for retained schema-v1 HTTP 409 failures. This archives owners whose tasks were never created, preserves their prompt and result artifacts, and permits one fresh preparation without resuming or redispatching those owners.
+- Every `agent-task` call creates a new invocation-local run. The PR-level index is audit/status data only and never blocks, resumes, or seeds a later run.
+- Resume, prepared-result application, prior-result import, and taskless-owner archival are disabled. Old run files remain immutable audit evidence.
 - Never scrape the managed worker's standard output. The bundled coordinator consumes the atomic result file and committed report.
-- Stop on any helper error. Report its prerequisite or recovery guidance and the returned state and recovery file paths. Do not improvise another path.
+- Stop on any helper error. Report its prerequisite and invocation-local state and artifact paths. A later user action starts fresh.
 - The helper may read GitHub metadata locally for authenticated preflight and verification. It must not execute or analyze repository code.
 - The coordinator discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies its pinned SHA-256 before dispatch, and requires policy `marketplace-agent-report-worker@1`. Authentication stays in local `gh api`.
 - The worker writes one human-readable Markdown report. The dispatcher attests only task and source identity, generated history, the exact report path, and its digest. It rejects stale heads, changed title or body text, local repository drift, malformed reports, credentials, and every identity mismatch before mutation.
 - GitHub's pull request update endpoint has no conditional unsafe request. The helper reads the exact pinned head, title, and body twice immediately before PATCH and verifies them afterward. Another writer can still change metadata inside that final request window.
-- Preserve helper state on completion and failure. Prepared recovery runs preserve the prompt, result, and committed report through finalization. Normal successful runs remove transient prompt and result files; failures retain useful recovery files.
+- Preserve helper state on completion and failure as audit evidence. Normal successful runs remove transient prompt and result files; failures retain their invocation-local artifacts.
 
 The terminal response is the run's last message. Finish every tool call first, send the result once, and do not follow it with another recap.

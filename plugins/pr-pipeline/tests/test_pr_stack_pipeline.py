@@ -1023,6 +1023,14 @@ class StackRunTest(StackFixture):
                 "2",
                 "--pipeline-max-iterations",
                 "2",
+                "--state",
+                str(
+                    MODULE.stage_state_path(
+                        MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
+                        COMMON.target_for("owner/repo", member["number"]),
+                        "run-1",
+                    )
+                ),
             ],
             request["arguments"],
         )
@@ -1043,6 +1051,7 @@ class StackRunTest(StackFixture):
                     MODULE.stage_state_path(
                         MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT],
                         COMMON.target_for("owner/repo", member["number"]),
+                        "run-1",
                     )
                 ),
                 "--strategy",
@@ -1051,7 +1060,7 @@ class StackRunTest(StackFixture):
             request["arguments"],
         )
 
-    def test_launches_past_taskless_resolver_preflights(self):
+    def test_taskless_resolver_failures_abandon_the_invocation(self):
         failures = (
             (
                 "normalized_stack",
@@ -1113,8 +1122,11 @@ class StackRunTest(StackFixture):
 
                 launched = pipeline.dispatch([request], MODULE.STAGE_CONFLICT, 1)
 
-                self.assertIsNone(launched["stopped"])
-                self.assertEqual(1, len(launched["workers"]))
+                self.assertEqual(
+                    "stage_invocation_abandoned",
+                    launched["stopped"]["reason"],
+                )
+                self.assertEqual([], launched["workers"])
 
     # Push propagation ---------------------------------------------------
 
@@ -2392,7 +2404,10 @@ class DependencyTest(unittest.TestCase):
         )
 
         checkpoints = MODULE.accepted_push_checkpoints(
-            "owner/repo", 11, state_for=lambda entry, target: state
+            "owner/repo",
+            11,
+            run_id="run-1",
+            state_for=lambda entry, target, run_id: state,
         )
 
         self.assertEqual([{"id": "push-1", "head_sha": "a" * 40}], checkpoints)
@@ -2401,8 +2416,38 @@ class DependencyTest(unittest.TestCase):
         self.assertEqual(
             [],
             MODULE.accepted_push_checkpoints(
-                "owner/repo", 11, state_for=lambda entry, target: self.root / "absent.json"
+                "owner/repo",
+                11,
+                run_id="run-1",
+                state_for=lambda entry, target, run_id: self.root / "absent.json",
             ),
+        )
+
+    def test_live_progress_reads_the_current_run_state(self):
+        state = self.root / "ci.json"
+        state.write_text(
+            json.dumps(
+                {
+                    "stage_progress": {
+                        "phase": "fixing",
+                        "observed_at": "2026-01-01T00:00:00Z",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            MODULE, "stage_state_path", return_value=state
+        ) as stage_state:
+            progress = MODULE.worker_live_progress(
+                "owner/repo", 11, MODULE.STAGE_CI, run_id="run-1"
+            )
+
+        self.assertEqual("fixing", progress["phase"])
+        stage_state.assert_called_once_with(
+            MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
+            MODULE.common.target_for("owner/repo", 11),
+            "run-1",
         )
 
 

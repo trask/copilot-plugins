@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "72adbe1a50a294fb8123155077d215e62a20a3d65c7a37203217c87fc87e238a"
+    "a1edbe7463b322360f8b9978d6f4b9c825b08791a2c16b5153cc393566c9ef98"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@2"
@@ -753,6 +753,32 @@ def parse_target(target: str) -> dict[str, Any]:
 def default_state_path(target: dict[str, Any]) -> Path:
     name = f"{target['owner']}--{target['repo']}--{target['number']}.json"
     return Path.home() / ".copilot" / "run" / "pr-conflict-resolver" / name
+
+
+def invocation_state_path(
+    target: dict[str, Any], args: argparse.Namespace
+) -> tuple[Path, str]:
+    pipeline = getattr(args, "pipeline_run", None)
+    continued = getattr(args, "invocation_run", None)
+    fresh = bool(getattr(args, "new_invocation", False))
+    selected = sum(
+        (
+            isinstance(pipeline, str) and bool(pipeline),
+            isinstance(continued, str) and bool(continued),
+            fresh,
+        )
+    )
+    if selected > 1:
+        raise WorkflowError(
+            "choose only one invocation scope: pipeline arguments, "
+            "--new-invocation, or --invocation-run"
+        )
+    run = secrets.token_hex(16) if fresh or selected == 0 else str(pipeline or continued)
+    if getattr(args, "state", None):
+        return cli_path(args.state), run
+    base = default_state_path(target)
+    digest = hashlib.sha256(run.encode("utf-8")).hexdigest()[:16]
+    return base.with_name(f"{base.stem}--invocation-{digest}{base.suffix}"), run
 
 
 def preflight_path_for(state_path: Path) -> Path:
@@ -8481,10 +8507,23 @@ def publish_conflict_result(
 
 
 def command_agent_task(args: argparse.Namespace) -> None:
+    replacement_values = (
+        args.replace_unidentified_owner,
+        args.replace_malformed_completed_task,
+        args.expected_malformed_result_sha256,
+        args.expected_malformed_task_prompt_sha256,
+        args.expected_malformed_request_id,
+        args.expected_malformed_request_sha256,
+    )
+    if args.resume or any(value is not None for value in replacement_values):
+        raise WorkflowError(
+            "resume and legacy-owner replacement are disabled; start a fresh "
+            "invocation with --new-invocation"
+        )
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
     target = resolve_target(args.target, repo_root)
-    state_path = cli_path(args.state) if args.state else default_state_path(target)
+    state_path, invocation_id = invocation_state_path(target, args)
     require_external_path(state_path, repo_root)
     model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
@@ -8753,15 +8792,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "iteration_budget": iteration_budget,
                 "stage_outcome": "escalated",
             }
-            if malformed_replacement is None:
-                payload["retry_command"] = managed_retry_command(
-                        args,
-                        repo_root=repo_root,
-                        target=target,
-                        state_path=state_path,
-                        next_budget=iteration_number,
-                )
-            else:
+            if malformed_replacement is not None:
                 payload["next_action"] = (
                     "A new hash-gated malformed-task replacement authorization "
                     "is required."
@@ -8795,6 +8826,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         }
         state["agent_task"] = {
             "run_id": run_id,
+            "invocation_id": invocation_id,
             "status": "preparing",
             "task_id": None,
             "task_id_status": "not_created",
@@ -8862,14 +8894,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 ),
                 "stage_outcome": "escalated",
             }
-            if malformed_replacement is None:
-                payload["retry_command"] = managed_retry_command(
-                        args,
-                        repo_root=repo_root,
-                        target=target,
-                        state_path=state_path,
-                        next_budget=iteration_budget,
-                )
             emit(payload)
             return
         except (WorkflowError, json.JSONDecodeError, OSError) as error:
@@ -8896,15 +8920,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "error": task["error"],
                 "stage_outcome": "escalated",
             }
-            if malformed_replacement is None:
-                payload["retry_command"] = managed_retry_command(
-                        args,
-                        repo_root=repo_root,
-                        target=target,
-                        state_path=state_path,
-                        next_budget=iteration_budget,
-                )
-            else:
+            if malformed_replacement is not None:
                 payload["next_action"] = (
                     "A new hash-gated malformed-task replacement authorization "
                     "is required."
@@ -9009,6 +9025,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         state["pr"] = preflight["pr"]
         state["agent_task"] = {
             "run_id": run_id,
+            "invocation_id": invocation_id,
             "status": "dispatching",
             "model": model,
             "policy": CONFLICT_POLICY,
@@ -9122,13 +9139,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "task_id_status": task["task_id_status"],
                 "error": task["error"],
                 "recovery_files": task["recovery_files"],
-                "retry_command": managed_retry_command(
-                    args,
-                    repo_root=repo_root,
-                    target=target,
-                    state_path=state_path,
-                    next_budget=iteration_budget,
-                ),
                 "stage_outcome": "escalated",
             }
         )
@@ -9144,16 +9154,13 @@ def command_agent_task(args: argparse.Namespace) -> None:
         save_state(state_path, state)
         emit(
             {
-                "result": "recovery_required",
+                "result": "invocation_abandoned",
                 "state": str(state_path),
                 "task_id": None,
                 "task_id_status": task["task_id_status"],
                 "error": task["error"],
                 "recovery_files": task["recovery_files"],
-                "next_action": (
-                    "Inspect managed Agent Tasks for this pull request before "
-                    "starting any replacement."
-                ),
+                "next_action": "Start a fresh invocation.",
                 "stage_outcome": "escalated",
             }
         )
@@ -9170,17 +9177,14 @@ def command_agent_task(args: argparse.Namespace) -> None:
         save_state(state_path, state)
         emit(
             {
-                "result": "recovery_required",
+                "result": "invocation_abandoned",
                 "state": str(state_path),
                 "task_id": None,
                 "task_id_status": task["task_id_status"],
                 "error": task["error"],
                 "process": task["process"],
                 "recovery_files": task["recovery_files"],
-                "next_action": (
-                    "Inspect managed Agent Tasks for this pull request before "
-                    "starting any replacement."
-                ),
+                "next_action": "Start a fresh invocation.",
                 "stage_outcome": "escalated",
             }
         )
@@ -9199,17 +9203,14 @@ def command_agent_task(args: argparse.Namespace) -> None:
         save_state(state_path, state)
         emit(
             {
-                "result": "recovery_required",
+                "result": "invocation_abandoned",
                 "state": str(state_path),
                 "task_id": None,
                 "task_id_status": task["task_id_status"],
                 "error": task["error"],
                 "process": task["process"],
                 "recovery_files": task["recovery_files"],
-                "next_action": (
-                    "Inspect managed Agent Tasks for this pull request before "
-                    "starting any replacement."
-                ),
+                "next_action": "Start a fresh invocation.",
                 "stage_outcome": "escalated",
             }
         )
@@ -9240,7 +9241,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         save_state(state_path, state)
         payload = {
             "result": (
-                "recovery_required"
+                "invocation_abandoned"
                 if task_id or malformed_replacement is not None
                 else "task_creation_failed"
             ),
@@ -9251,22 +9252,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "recovery_files": task["recovery_files"],
             "stage_outcome": "escalated",
         }
-        if task_id:
-            payload["recovery_command"] = (
-                f"{json.dumps(sys.executable)} {json.dumps(str(Path(__file__).resolve()))} "
-                f"agent-task {json.dumps(preflight['pr']['pr_url'])} --repo-root "
-                f"{json.dumps(str(repo_root))} --state {json.dumps(str(state_path))} "
-                f"--model {args.model} --resume"
-            )
-        elif malformed_replacement is None:
-            payload["retry_command"] = managed_retry_command(
-                args,
-                repo_root=repo_root,
-                target=target,
-                state_path=state_path,
-                next_budget=iteration_budget,
-            )
-        else:
+        if malformed_replacement is not None:
             payload["next_action"] = (
                 "A new hash-gated malformed-task replacement authorization "
                 "is required."
@@ -9318,6 +9304,9 @@ def build_parser() -> argparse.ArgumentParser:
     agent_task.add_argument("--pipeline-iteration", type=int)
     agent_task.add_argument("--pipeline-max-iterations", type=int)
     agent_task.add_argument("--resume", action="store_true")
+    invocation = agent_task.add_mutually_exclusive_group()
+    invocation.add_argument("--new-invocation", action="store_true")
+    invocation.add_argument("--invocation-run")
     agent_task.add_argument("--replace-unidentified-owner")
     agent_task.add_argument("--replace-malformed-completed-task")
     agent_task.add_argument("--expected-malformed-result-sha256")
@@ -9542,6 +9531,11 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
+        if args.command not in {"agent-task", "status", "cleanup", "abort", "escalate"}:
+            raise WorkflowError(
+                f"legacy command {args.command!r} is disabled; start a fresh "
+                "agent-task invocation"
+            )
         args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:

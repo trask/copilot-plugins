@@ -674,9 +674,9 @@ class StageContractTest(unittest.TestCase):
         self.assertFalse(MODULE.stage_accepts_pipeline_position(entry))
         self.assertEqual([], MODULE.pipeline_arguments(entry, "run-1", 2))
 
-    def test_conflict_stage_receives_the_canonical_state_path_explicitly(self):
+    def test_conflict_stage_receives_the_invocation_state_path_explicitly(self):
         entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT]
-        expected = MODULE.stage_state_path(entry, target())
+        expected = MODULE.stage_state_path(entry, target(), "run-1")
         command = MODULE.stage_command(
             entry,
             target(),
@@ -978,6 +978,7 @@ class SweepTest(unittest.TestCase):
             self.launched,
         )
 
+    @unittest.skip("failed invocations are abandoned rather than replaced")
     def test_replaces_failed_preflight_when_no_agent_task_was_created(self):
         original = self.inspect
         inspections = 0
@@ -1012,7 +1013,7 @@ class SweepTest(unittest.TestCase):
             self.launched,
         )
 
-    def test_failed_not_created_replacement_is_prelaunch_only(self):
+    def test_failed_not_created_invocation_blocks_without_replacement(self):
         stage_result = {
             **uncleared_stage(MODULE.STAGE_CONFLICT),
             "status": {
@@ -1027,15 +1028,14 @@ class SweepTest(unittest.TestCase):
                 }
             },
         }
-        self.assertIsNone(
+        self.assertEqual(
+            "stage_invocation_abandoned",
             MODULE.stage_blocker(
-                stage_result,
-                after_launch=False,
-                conflict_strategy="auto",
-            )
+                stage_result, after_launch=False, conflict_strategy="auto"
+            )[0],
         )
         self.assertEqual(
-            "stage_recovery_required",
+            "stage_invocation_abandoned",
             MODULE.stage_blocker(
                 stage_result,
                 after_launch=True,
@@ -1048,9 +1048,12 @@ class SweepTest(unittest.TestCase):
             "code": "native_stack_normalization_required",
             "message": "native stack member requires explicit owner normalization",
         }
-        self.assertIsNone(MODULE.stage_blocker(normalization, after_launch=False))
         self.assertEqual(
-            "stage_recovery_required",
+            "stage_invocation_abandoned",
+            MODULE.stage_blocker(normalization, after_launch=False)[0],
+        )
+        self.assertEqual(
+            "stage_invocation_abandoned",
             MODULE.stage_blocker(normalization, after_launch=True)[0],
         )
         for field, value in (
@@ -1062,7 +1065,7 @@ class SweepTest(unittest.TestCase):
                 changed = copy.deepcopy(stage_result)
                 changed["status"]["agent_task"][field] = value
                 self.assertEqual(
-                    "stage_recovery_required",
+                    "stage_invocation_abandoned",
                     MODULE.stage_blocker(
                         changed,
                         after_launch=False,
@@ -1072,16 +1075,17 @@ class SweepTest(unittest.TestCase):
         changed = copy.deepcopy(stage_result)
         del changed["status"]["agent_task"]["task_id"]
         self.assertEqual(
-            "stage_recovery_required",
+            "stage_invocation_abandoned",
             MODULE.stage_blocker(changed, after_launch=False)[0],
         )
         changed = copy.deepcopy(stage_result)
         changed["stage"] = MODULE.STAGE_COPILOT_REVIEW
         self.assertEqual(
-            "stage_recovery_required",
+            "stage_invocation_abandoned",
             MODULE.stage_blocker(changed, after_launch=False)[0],
         )
 
+    @unittest.skip("legacy owner replacement is intentionally unavailable")
     def test_replaces_exact_legacy_malformed_self_review_owner_prelaunch(self):
         original = self.inspect
         inspections = 0
@@ -1144,13 +1148,14 @@ class SweepTest(unittest.TestCase):
             },
         }
 
-    def test_legacy_malformed_self_review_replacement_fails_closed(self):
+    def test_legacy_malformed_self_review_owner_blocks_without_replacement(self):
         stage_result = self.legacy_malformed_self_review_stage()
-        self.assertIsNone(
-            MODULE.stage_blocker(stage_result, after_launch=False)
+        self.assertEqual(
+            "stage_invocation_abandoned",
+            MODULE.stage_blocker(stage_result, after_launch=False)[0],
         )
         self.assertEqual(
-            "stage_recovery_required",
+            "stage_invocation_abandoned",
             MODULE.stage_blocker(stage_result, after_launch=True)[0],
         )
         mutations = {
@@ -1191,7 +1196,7 @@ class SweepTest(unittest.TestCase):
                 changed = copy.deepcopy(stage_result)
                 mutate(changed)
                 self.assertEqual(
-                    "stage_recovery_required",
+                    "stage_invocation_abandoned",
                     MODULE.stage_blocker(changed, after_launch=False)[0],
                 )
         active = copy.deepcopy(stage_result)
@@ -1276,7 +1281,7 @@ class SweepTest(unittest.TestCase):
         result = self.execute()
 
         self.assertEqual("blocked", result["result"])
-        self.assertEqual("stage_recovery_required", result["reason"])
+        self.assertEqual("stage_invocation_abandoned", result["reason"])
         self.assertEqual(MODULE.STAGE_COPILOT_REVIEW, result["stage"])
         self.assertIn("agent_task_http_409", result["detail"])
         self.assertEqual(
@@ -1319,7 +1324,7 @@ class SweepTest(unittest.TestCase):
         result = self.execute()
 
         self.assertEqual("blocked", result["result"])
-        self.assertEqual("stage_recovery_required", result["reason"])
+        self.assertEqual("stage_invocation_abandoned", result["reason"])
         self.assertEqual(MODULE.STAGE_CONFLICT, result["stage"])
         self.assertIn("native_stack_normalization_required", result["detail"])
         self.assertEqual([(MODULE.STAGE_CONFLICT, 1)], self.launched)

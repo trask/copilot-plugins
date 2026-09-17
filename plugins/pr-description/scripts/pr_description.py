@@ -55,7 +55,7 @@ SHARED_STATE_CONFIG = Path(".copilot/extensions/pr-flight/state-repo.json")
 SHARED_STATE_VERSION = 1
 SHARED_STATE_MAX_ATTEMPTS = 3
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "db635350935f8115e9313b2e81f2ae2b089967036be8f0470bc9cf284b2a679a"
+    "fd848b916d054c40d3becc18bd19d254e278045b51ae95663f9731a2d1c28edf"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -474,6 +474,24 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
             os.unlink(temporary_name)
         except FileNotFoundError:
             pass
+        raise
+
+
+def create_state(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state["updated_at"] = utc_now()
+    try:
+        handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as error:
+        raise WorkflowError(
+            f"invocation state already exists and is audit-only: {path}"
+        ) from error
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(state, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+    except BaseException:
+        path.unlink(missing_ok=True)
         raise
 
 
@@ -3357,7 +3375,6 @@ def resume_agent_task(args: argparse.Namespace) -> None:
         preflight["pr"]["base"]["sha"] = retained_recovery["base_sha"]
         state["pr"]["base"]["sha"] = retained_recovery["base_sha"]
     run_id = state["run_id"]
-    index_path = Path(state["index_path"])
     task_state["resume_attempts"] = int(task_state.get("resume_attempts", 0)) + 1
     task_state["status"] = "resuming"
     save_state(path, state)
@@ -3902,7 +3919,6 @@ def reserve_agent_task_run(
     state: dict[str, Any],
 ) -> None:
     with index_lock(index_path):
-        require_no_unfinished_index_runs(index_path)
         index, validation_changed = update_run_index_unlocked(
             index_path, run_path, state
         )
@@ -3931,6 +3947,16 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "recovery_report_sha256",
         )
     )
+    if (
+        getattr(args, "resume", False)
+        or prepare_only
+        or apply_prepared
+        or has_recovery_gate
+    ):
+        raise WorkflowError(
+            "resume, recovery, and prepared-result import are disabled; start a "
+            "fresh invocation"
+        )
     if has_recovery_gate and not getattr(args, "resume", False):
         raise WorkflowError(
             "retained live-base recovery gates require --resume"
@@ -3947,16 +3973,25 @@ def command_agent_task(args: argparse.Namespace) -> None:
     if getattr(args, "resume", False):
         resume_agent_task(args)
         return
-    if getattr(args, "state", None):
-        raise WorkflowError("--state is supported only with --resume")
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
     target = resolve_target(args.target, repo_root)
-    preflight = agent_task_preflight(repo_root, target)
-    pr = preflight["pr"]
     run_id = secrets.token_hex(16)
     index_path = default_state_path(target)
-    path = run_state_path(index_path, run_id)
+    path = (
+        cli_path(args.state)
+        if getattr(args, "state", None)
+        else run_state_path(index_path, run_id)
+    )
+    require_outside_repository(path, repo_root)
+    if path.resolve() == index_path.resolve():
+        raise WorkflowError("invocation state must not replace the PR audit index")
+    if path.exists():
+        raise WorkflowError(
+            f"invocation state already exists and is audit-only: {path}"
+        )
+    preflight = agent_task_preflight(repo_root, target)
+    pr = preflight["pr"]
     requested_model = MODEL_ALIASES[args.model]
     state = {
         "version": STATE_VERSION,
@@ -3974,7 +4009,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "model": requested_model,
         },
     }
-    save_state(path, state)
+    create_state(path, state)
     try:
         reserve_agent_task_run(index_path, path, state)
     except BaseException:
@@ -4522,6 +4557,11 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
+        if args.command not in {"agent-task", "status", "cleanup"}:
+            raise WorkflowError(
+                f"legacy command {args.command!r} is disabled; start a fresh "
+                "agent-task invocation"
+            )
         args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:

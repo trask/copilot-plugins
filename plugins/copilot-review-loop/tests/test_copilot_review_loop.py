@@ -12,6 +12,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 import tempfile
+from typing import Any
 import unittest
 from unittest import mock
 import uuid
@@ -2185,7 +2186,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.53")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.54")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -3879,6 +3880,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(emitted[-1]["result"], "max_iterations_reached")
         discover.assert_not_called()
 
+    @unittest.skip("prepared-result recovery is intentionally unavailable")
     def test_prepare_only_stops_before_requesting_a_missing_review(self):
         state_path = self.directory / "review-request-pending.json"
         preflight = {
@@ -3946,6 +3948,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             rescope_prepared_publish_only=False,
             publish_prepared_only=False,
         )
+
+    def test_resume_is_rejected_before_tools_or_state_access(self):
+        args = self.arguments(self.directory / "legacy.json", resume=True)
+        with mock.patch.object(MODULE, "require_tools") as require_tools:
+            with self.assertRaisesRegex(MODULE.WorkflowError, "disabled"):
+                MODULE.command_agent_task(args)
+        require_tools.assert_not_called()
 
     def dead_local_owner_case(self, state_path):
         run_id = "d" * 32
@@ -4739,6 +4748,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         }
         return arguments, manifest, attestation
 
+    @unittest.skip("terminal recovery is intentionally unavailable")
     def test_terminal_local_recovery_revalidates_without_rerunning_worker(self):
         state_path = self.directory / "terminal-state.json"
         arguments, manifest, attestation = self.terminal_local_recovery_case(
@@ -4829,6 +4839,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
         self.assertEqual([self.fix], retained["remote"]["commits"])
 
+    @unittest.skip("prepared-result recovery is intentionally unavailable")
     def test_rescoped_prepared_publication_stops_before_review_mutation(self):
         state_path = self.directory / "source-only-state.json"
         arguments, manifest, attestation = self.terminal_local_recovery_case(
@@ -5106,6 +5117,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("apply_command", completed["agent_task"])
         self.assertEqual("published_source_only", emit.call_args.args[0]["result"])
 
+    @unittest.skip("prepared-result recovery is intentionally unavailable")
     def test_publish_prepared_only_requires_mechanical_rescope(self):
         state_path = self.directory / "source-only-invalid.json"
         arguments = self.arguments(state_path)
@@ -5259,6 +5271,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 self.repo_root,
             )
 
+    @unittest.skip("terminal recovery is intentionally unavailable")
     def test_retained_terminal_recovery_accepts_only_pinned_legacy_helper(self):
         state_path = self.directory / "legacy-helper-state.json"
         arguments, manifest, attestation = self.terminal_local_recovery_case(
@@ -5375,6 +5388,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ):
                 validate()
 
+    @unittest.skip("terminal recovery is intentionally unavailable")
     def test_terminal_local_recovery_rejects_decision_hash_drift(self):
         state_path = self.directory / "terminal-drift-state.json"
         arguments, _manifest, _attestation = (
@@ -5543,7 +5557,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             worker_command[worker_command.index("--reasoning-effort") + 1],
         )
 
-    def test_new_terminal_report_failure_records_fresh_retry(self):
+    def test_new_terminal_report_failure_is_audit_only(self):
         state_path = self.directory / "terminal-report-state.json"
         failed = self.invoke_local_failure(
             state_path,
@@ -5557,7 +5571,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             failed["error"],
         )
         self.assertNotIn("recovery_command", failed)
-        self.assertNotIn("--resume", failed["retry_command"])
+        self.assertNotIn("retry_command", failed)
 
     def test_retained_valid_success_report_remains_recoverable(self):
         report = self.report()
@@ -5578,6 +5592,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             )
         self.assertIsNone(error)
 
+    @unittest.skip("prepared-result recovery is intentionally unavailable")
     def test_legacy_failure_prepares_without_mutation_then_applies_once(self):
         state_path = self.directory / "prepared-state.json"
         helper = self.directory / "cloud_task.py"
@@ -5822,6 +5837,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         ):
             MODULE.command_agent_task(missing_preservation)
 
+    @unittest.skip("post-publication resume is intentionally unavailable")
     def test_post_push_metadata_lag_resumes_without_another_task_or_push(self):
         state_path = self.directory / "post-push-state.json"
         helper = self.directory / "cloud_task.py"
@@ -5947,6 +5963,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(completed["pr"]["head_sha"], self.head)
         self.assertNotIn("error", completed["agent_task"])
 
+    @unittest.skip("post-publication resume is intentionally unavailable")
     def test_post_publish_resume_accepts_line_shift_and_preserves_artifacts(self):
         state_path = self.directory / "post-publish-state.json"
         helper = self.directory / "cloud_task.py"
@@ -6105,6 +6122,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(self.source_fingerprint, failed["source_before"])
         self.assertEqual(self.source_fingerprint, failed["source_after"])
 
+    @unittest.skip("failed invocations are abandoned rather than recovered")
     def test_failed_local_task_cannot_resume_or_fall_back_to_hosted(self):
         state_path = self.directory / "resume-state.json"
         failed_state = self.invoke_local_failure(
@@ -6426,7 +6444,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 repo_root=self.repo_root,
             )
 
-    def test_new_completed_no_artifact_failure_records_fresh_retry(self):
+    def test_new_completed_no_artifact_failure_is_audit_only(self):
         state_path = self.directory / "no-artifact-state.json"
         failed = self.invoke_local_failure(
             state_path,
@@ -6439,8 +6457,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             failed["error"],
         )
         self.assertNotIn("recovery_command", failed)
-        self.assertNotIn("--resume", failed["retry_command"])
+        self.assertNotIn("retry_command", failed)
 
+    @unittest.skip("legacy owner replacement is intentionally unavailable")
     def test_retained_no_artifact_owner_is_archived_before_one_replacement(self):
         state_path = self.directory / "retained-no-artifact-state.json"
         helper = self.directory / "cloud_task.py"
@@ -6538,6 +6557,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 MODULE.command_agent_task(arguments)
         self.assertEqual([], commands)
 
+    @unittest.skip("legacy owner migration is intentionally unavailable")
     def test_exact_20074_and_20050_terminal_states_migrate_once_to_local(self):
         cases = (
             ("20074", NO_ARTIFACT_20074_RESULT),
@@ -6645,6 +6665,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                         MODULE.command_agent_task(arguments)
                 self.assertEqual(1, self.local_worker.call_count)
 
+    @unittest.skip("legacy owner replacement is intentionally unavailable")
     def test_exact_v1_missing_trailer_replacement_is_fresh_and_deduplicated(self):
         state_path = self.directory / "missing-trailer-state.json"
         helper = self.directory / "cloud_task.py"
@@ -6747,6 +6768,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 MODULE.command_agent_task(args)
         self.assertEqual([], commands)
 
+    @unittest.skip("legacy owner replacement is intentionally unavailable")
     def test_exact_383_terminal_report_replacement_is_fresh_and_deduplicated(self):
         state_path = self.directory / "collapsed-suppressed-state.json"
         helper = self.directory / "cloud_task.py"
@@ -6986,6 +7008,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(completed, restarted["managed_task_history"][1])
         self.assertEqual("new-owner", restarted["agent_task"]["run_id"])
 
+    @unittest.skip("failed invocations are abandoned rather than replaced")
     def test_task_creation_failure_records_fresh_retry_and_replaces_legacy_state(self):
         state_path = self.directory / "cca-disabled-state.json"
         failed = self.invoke_local_failure(
@@ -7014,12 +7037,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         self.assertEqual("run-2", retried["agent_task"]["run_id"])
 
+    @unittest.skip("failed invocations are abandoned rather than replaced")
     def test_terminal_validation_failure_allows_one_explicit_replacement(self):
         state_path = self.directory / "validation-failure-state.json"
         helper = self.directory / "cloud_task.py"
         helper.write_text("# helper\n", encoding="utf-8")
-        failure = self.terminal_validation_failure()
-
         common = (
             mock.patch.object(MODULE, "require_tools"),
             mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
@@ -7253,6 +7275,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "review_comments_pending_preparation", emitted[-1]["result"]
         )
 
+    @unittest.skip("legacy recovery combinations are rejected at the command gate")
     def test_review_only_rejects_other_recovery_modes(self):
         state_path = self.directory / "review-only-invalid.json"
         for field in ("resume", "prepare_only"):
@@ -7814,6 +7837,24 @@ class CurrentPrStatusTest(unittest.TestCase):
         self.assertEqual(payload["result"], "no_state")
         self.assertEqual(payload["pr"]["url"], target["pr_url"])
         self.assertIsNone(payload["monitoring"])
+
+    def test_fresh_invocations_never_select_the_legacy_pr_state(self):
+        target = MODULE.parse_target("owner/repo#20173")
+        args = SimpleNamespace(
+            pipeline_run=None,
+            invocation_run=None,
+            new_invocation=False,
+            state=None,
+        )
+        with mock.patch.object(
+            MODULE.secrets, "token_hex", side_effect=["fresh-1", "fresh-2"]
+        ):
+            first, first_id = MODULE.invocation_state_path(target, args)
+            second, second_id = MODULE.invocation_state_path(target, args)
+
+        self.assertNotEqual(MODULE.default_state_path(target), first)
+        self.assertNotEqual(first, second)
+        self.assertEqual(("fresh-1", "fresh-2"), (first_id, second_id))
 
 
 class QueueSelectionTest(unittest.TestCase):
