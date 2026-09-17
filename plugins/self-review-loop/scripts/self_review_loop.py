@@ -3139,7 +3139,7 @@ def validate_retained_result_recovery_gate(
     task_state = state.get("agent_task")
     if (
         not isinstance(task_state, dict)
-        or task_state.get("status") != "failed"
+        or task_state.get("status") not in {"failed", "validated_pending_import"}
         or task_state.get("model") != requested_model
         or not isinstance(task_state.get("preflight"), dict)
         or not isinstance(task_state.get("prompt_file"), str)
@@ -3207,6 +3207,52 @@ def validate_retained_result_recovery_gate(
         **identity,
         "report_base_sha": report_base_sha,
     }
+
+
+def validated_prepared_report_recovery_base(
+    task_state: dict[str, Any],
+) -> str | None:
+    preparation = task_state.get("preparation")
+    recovery = (
+        preparation.get("report_identity_recovery")
+        if isinstance(preparation, dict)
+        else None
+    )
+    if recovery is None:
+        return None
+    preflight = task_state.get("preflight")
+    pr = preflight.get("pr") if isinstance(preflight, dict) else None
+    report_path = task_state.get("report_path")
+    if (
+        not isinstance(pr, dict)
+        or not isinstance(report_path, str)
+        or not report_path
+    ):
+        raise WorkflowError("prepared report recovery identity is malformed")
+    report_match = REPORT_PATH_PATTERN.fullmatch(report_path)
+    request_id = (
+        report_match.group("request_id")
+        if report_match is not None
+        else None
+    )
+    base_sha = recovery.get("base_sha") if isinstance(recovery, dict) else None
+    expected = {
+        "base_sha": base_sha,
+        "task_id": task_state.get("task_id"),
+        "request_id": request_id,
+        "generated_head": task_state.get("generated_head"),
+        "report_sha256": task_state.get("report_sha256"),
+    }
+    if (
+        not isinstance(recovery, dict)
+        or set(recovery) != set(expected)
+        or recovery != expected
+        or not isinstance(base_sha, str)
+        or SHA_PATTERN.fullmatch(base_sha) is None
+        or base_sha == pr.get("base_sha")
+    ):
+        raise WorkflowError("prepared report recovery identity drifted")
+    return base_sha
 
 
 def fetch_committed_text(
@@ -4760,6 +4806,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         state=existing,
         requested_model=requested_model,
     )
+    prepared_report_recovery_base: str | None = None
     if apply_prepared:
         prepared_task = (
             existing.get("agent_task") if isinstance(existing, dict) else None
@@ -4774,12 +4821,21 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "state has no validated preparation awaiting authorized apply"
             )
         validate_preserved_agent_task_artifacts(prepared_task, repo_root)
+        prepared_report_recovery_base = (
+            validated_prepared_report_recovery_base(prepared_task)
+        )
         args.resume = True
     elif (
         args.resume
         and isinstance(existing, dict)
         and isinstance(existing.get("agent_task"), dict)
         and existing["agent_task"].get("prepared_at") is not None
+        and not (
+            prepare_only
+            and retained_recovery is not None
+            and existing["agent_task"].get("status")
+            in {"failed", "validated_pending_import"}
+        )
     ):
         raise WorkflowError(
             "validated preparation requires --apply-prepared after authorization"
@@ -5345,7 +5401,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             recovery_base_sha=(
                 retained_recovery["report_base_sha"]
                 if retained_recovery is not None
-                else None
+                else prepared_report_recovery_base
             ),
         )
         metadata_result = report["pull_request_metadata"]
@@ -5394,6 +5450,22 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "iterations_used": report["iterations_used"],
             "findings": report["findings"],
             "pull_request_metadata": metadata_result,
+            "report_identity_recovery": (
+                {
+                    "base_sha": (
+                        retained_recovery["report_base_sha"]
+                        if retained_recovery is not None
+                        else prepared_report_recovery_base
+                    ),
+                    "task_id": remote["task_id"],
+                    "request_id": remote["request_id"],
+                    "generated_head": remote["generated_head"],
+                    "report_sha256": remote["report_sha256"],
+                }
+                if retained_recovery is not None
+                or prepared_report_recovery_base is not None
+                else None
+            ),
             "clear_shared_state_on_apply": bool(
                 task_state.get("clear_shared_state_on_apply")
             ),

@@ -1751,7 +1751,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.28")
+        self.assertEqual(plugin["version"], "1.3.29")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -2573,6 +2573,17 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
 
         self.assertEqual(stale_base_ref_oid, gate["report_base_sha"])
+        prepared_state = MODULE.load_state(state_path)
+        prepared_state["agent_task"]["status"] = "validated_pending_import"
+        prepared_state["agent_task"]["prepared_at"] = "2026-09-17T08:10:00Z"
+        MODULE.save_state(state_path, prepared_state)
+        args.recovery_state_sha256 = MODULE.sha256_file(state_path)
+        MODULE.validate_retained_result_recovery_gate(
+            args,
+            state_path=state_path,
+            state=MODULE.load_state(state_path),
+            requested_model="gpt-5.6-sol",
+        )
         args.recovery_report_base_sha = self.preflight["pr"]["base_sha"]
         with self.assertRaisesRegex(
             MODULE.WorkflowError,
@@ -2584,6 +2595,184 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 state=MODULE.load_state(state_path),
                 requested_model="gpt-5.6-sol",
             )
+
+    def test_runtime_base_recovery_survives_prepare_apply_process_boundary(self):
+        state_path = self.directory / "runtime-base-prepared.json"
+        prompt_path = self.directory / "runtime-base-prompt.txt"
+        result_path = self.directory / "runtime-base-result.json"
+        prompt_path.write_text("retained prompt\n", encoding="utf-8")
+        stale_base_ref_oid = "9" * 40
+        raw_report = {
+            "repository": self.preflight["pr"]["repo_name"],
+            "pull_request": {
+                "number": self.preflight["pr"]["number"],
+                "url": self.preflight["pr"]["pr_url"],
+                "head_ref": self.preflight["pr"]["head_branch"],
+                "head_sha": self.preflight["pr"]["head_sha"],
+                "base_ref": self.preflight["pr"]["base_branch"],
+                "base_sha": stale_base_ref_oid,
+            },
+            "result": "cleared",
+            "iterations_used": 1,
+            "findings": [],
+            "metadata": {
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+            },
+        }
+        report = json.dumps(raw_report)
+        result = self.result()
+        result["report"]["sha256"] = MODULE.sha256_text(report)
+        result_path.write_text(json.dumps(result), encoding="utf-8")
+        MODULE.save_state(
+            state_path,
+            {
+                "version": 1,
+                "created_at": "2026-09-17T08:00:00Z",
+                "updated_at": "2026-09-17T08:00:00Z",
+                "iterations": 0,
+                "next_candidate_id": 1,
+                "history": [],
+                "repo_root": str(self.repo_root),
+                "pr": self.preflight["pr"],
+                "review": {
+                    "id": "review-1",
+                    "status": "active",
+                    "iteration": 1,
+                    "head_sha": self.head,
+                    "candidates": [],
+                    "batches": [],
+                },
+                "agent_task": {
+                    "status": "failed",
+                    "run_id": "run-1",
+                    "model": "gpt-5.6-sol",
+                    "policy": MODULE.AGENT_TASK_POLICY,
+                    "allowed_iterations": 5,
+                    "preflight": self.preflight,
+                    "prompt_file": str(prompt_path),
+                    "result_file": str(result_path),
+                    "clear_shared_state_on_apply": False,
+                    "prepared_at": "2026-09-17T08:10:00Z",
+                    "preparation": {"legacy": "missing report recovery identity"},
+                    "resume_attempts": 2,
+                    "error": "runtime-base report identity mismatch",
+                },
+            },
+        )
+        prepare_args = self.arguments(state_path, resume=True)
+        prepare_args.prepare_only = True
+        prepare_args.preserve_artifacts = True
+        prepare_args.recovery_state_sha256 = MODULE.sha256_file(state_path)
+        prepare_args.recovery_prompt_sha256 = MODULE.sha256_file(prompt_path)
+        prepare_args.recovery_result_sha256 = MODULE.sha256_file(result_path)
+        prepare_args.recovery_task_id = "task-1"
+        prepare_args.recovery_request_id = "request-1"
+        prepare_args.recovery_report_base_sha = stale_base_ref_oid
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=self.repo_root
+            ),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "run") as run,
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value=self.preflight["identity"],
+            ),
+            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(
+                MODULE, "metadata_for", return_value=self.preflight["pr"]
+            ),
+            mock.patch.object(MODULE, "apply_verified_import", return_value=False),
+            mock.patch.object(
+                MODULE,
+                "wait_for_live_pr_snapshot",
+                return_value=self.preflight["pr"],
+            ),
+            mock.patch.object(MODULE, "update_pr_metadata") as update_metadata,
+            mock.patch.object(MODULE, "publish_shared_state") as publish_shared,
+            mock.patch.object(MODULE, "emit"),
+        ):
+            MODULE.command_agent_task(prepare_args)
+
+        discover.assert_not_called()
+        run.assert_not_called()
+        update_metadata.assert_not_called()
+        publish_shared.assert_not_called()
+        prepared = MODULE.load_state(state_path)
+        self.assertEqual(3, prepared["agent_task"]["resume_attempts"])
+        recovery = prepared["agent_task"]["preparation"][
+            "report_identity_recovery"
+        ]
+        self.assertEqual(
+            {
+                "base_sha": stale_base_ref_oid,
+                "task_id": "task-1",
+                "request_id": "request-1",
+                "generated_head": self.artifact,
+                "report_sha256": result["report"]["sha256"],
+            },
+            recovery,
+        )
+
+        apply_args = self.arguments(state_path)
+        apply_args.apply_prepared = True
+        apply_args.preserve_artifacts = True
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=self.repo_root
+            ),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            mock.patch.object(MODULE, "run") as run,
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value=self.preflight["identity"],
+            ),
+            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
+            mock.patch.object(
+                MODULE, "metadata_for", return_value=self.preflight["pr"]
+            ),
+            mock.patch.object(
+                MODULE, "apply_verified_import", return_value=False
+            ) as apply_import,
+            mock.patch.object(
+                MODULE,
+                "wait_for_live_pr_snapshot",
+                return_value=self.preflight["pr"],
+            ),
+            mock.patch.object(MODULE, "update_pr_metadata") as update_metadata,
+            mock.patch.object(MODULE, "publish_shared_state") as publish_shared,
+            mock.patch.object(MODULE, "emit"),
+        ):
+            MODULE.command_agent_task(apply_args)
+
+        discover.assert_not_called()
+        run.assert_not_called()
+        apply_import.assert_called_once()
+        update_metadata.assert_not_called()
+        self.assertEqual(
+            [self.head],
+            [call.kwargs["value"] for call in publish_shared.call_args_list],
+        )
+        completed = MODULE.load_state(state_path)
+        self.assertEqual("completed", completed["agent_task"]["status"])
+        self.assertEqual(self.head, completed["review"]["clean_at_head_sha"])
 
     def test_rejects_stale_body_and_live_identity_drift(self):
         report = json.loads(self.report())
