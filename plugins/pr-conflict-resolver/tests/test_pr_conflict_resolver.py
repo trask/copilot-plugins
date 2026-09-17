@@ -884,7 +884,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "b80e75b53692b8cba30cec3c237951e87817e62c7c4fe57467cecb68e230e14b",
+            "f3dc6ca6179920292e7fdc98089fe98e99a94d2737d9fe4a447f3046c57d88c6",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -2005,6 +2005,15 @@ class BaseRefTipTest(unittest.TestCase):
             run.call_args.args[0],
         )
 
+    def test_encodes_a_stacked_base_branch_as_one_ref_name(self):
+        response = completed(0, json.dumps({"object": {"sha": "live-tip"}}))
+        with mock.patch.object(MODULE, "run", return_value=response) as run:
+            MODULE.base_ref_tip("owner/repo", "stack/lower")
+        self.assertEqual(
+            ["gh", "api", "repos/owner/repo/git/ref/heads/stack%2Flower"],
+            run.call_args.args[0],
+        )
+
     def test_a_deleted_base_branch_raises_rather_than_falling_back(self):
         response = completed(1, "", "gh: Not Found (HTTP 404)")
         with mock.patch.object(MODULE, "run", return_value=response):
@@ -2430,6 +2439,115 @@ class StrategyChoiceTest(unittest.TestCase):
             preflight["request"]["guards"]["merge_methods"],
         )
 
+    def test_native_stack_uses_live_direct_base_refs_not_pr_snapshots(self):
+        trunk = "a" * 40
+        lower = "b" * 40
+        upper = "c" * 40
+        metadata = pr_metadata(
+            mergeable="CONFLICTING",
+            head_branch="lower",
+            head_sha=lower,
+            base_branch="main",
+            base_sha=trunk,
+        )
+        stack = {
+            "trunk": "main",
+            "members": [
+                {
+                    "number": 20073,
+                    "head_branch": "lower",
+                    "head_sha": lower,
+                    "base_branch": "main",
+                    "base_sha": "stale-pr-snapshot",
+                },
+                {
+                    "number": 20084,
+                    "head_branch": "upper",
+                    "head_sha": upper,
+                    "base_branch": "lower",
+                    "base_sha": "stale-dependent-snapshot",
+                },
+            ],
+            "inactive_members": [],
+        }
+
+        def git_result(_root, *arguments):
+            if arguments == ("rev-parse", "HEAD"):
+                return lower
+            if arguments == ("branch", "--show-current"):
+                return ""
+            if arguments[0] == "merge-base":
+                return "merge-base"
+            raise AssertionError(arguments)
+
+        def live_tip(_repository, branch):
+            return {"main": trunk, "lower": lower}[branch]
+
+        with (
+            mock.patch.object(MODULE, "require_clean_worktree"),
+            mock.patch.object(MODULE, "require_no_integration_in_progress"),
+            mock.patch.object(MODULE, "live_mergeability", return_value=metadata),
+            mock.patch.object(MODULE, "checkout_pr_branch"),
+            mock.patch.object(MODULE, "git", side_effect=git_result),
+            mock.patch.object(MODULE, "find_remote", return_value="origin"),
+            mock.patch.object(MODULE, "fetch_preflight_ref"),
+            mock.patch.object(
+                MODULE,
+                "stack_membership",
+                return_value={"default_branch": "main", "stack": stack},
+            ),
+            mock.patch.object(MODULE, "stack_relations", return_value=NO_RELATIONS),
+            mock.patch.object(
+                MODULE,
+                "repository_merge_methods",
+                return_value=ALL_MERGE_METHODS,
+            ),
+            mock.patch.object(MODULE, "merge_tree_conflicts", return_value=set()),
+            mock.patch.object(
+                MODULE,
+                "ordered_commits",
+                side_effect=[[], [lower], [upper]],
+            ),
+            mock.patch.object(
+                MODULE,
+                "commit_identity",
+                side_effect=lambda _root, sha, linear: {
+                    "sha": sha,
+                    "subject": "Change",
+                    "trailers": [],
+                    "patch_sha256": "d" * 64,
+                    "paths": ["src/File.java"],
+                },
+            ),
+            mock.patch.object(MODULE, "base_ref_tip", side_effect=live_tip) as tip,
+            mock.patch.object(MODULE, "external_stack_dependents", return_value=[]),
+        ):
+            preflight = MODULE.conflict_preflight(
+                Path("C:/repo"),
+                MODULE.parse_target("owner/repo#20073"),
+                requested_strategy="merge",
+                whole_stack=True,
+                iteration_id="iteration-1",
+                iteration_number=1,
+                iteration_budget=1,
+                model="gpt-5.6-sol",
+            )
+
+        members = preflight["request"]["native_stack"]["members"]
+        self.assertEqual([trunk, lower], [member["direct_base_sha"] for member in members])
+        self.assertEqual(
+            ["stale-pr-snapshot", "stale-dependent-snapshot"],
+            [member["base_sha"] for member in preflight["stack"]["members"]],
+        )
+        self.assertEqual(
+            [
+                mock.call("owner/repo", "main"),
+                mock.call("owner/repo", "main"),
+                mock.call("owner/repo", "lower"),
+            ],
+            tip.call_args_list,
+        )
+
 
 class ManagedRequestStrategyTest(unittest.TestCase):
     def request(self, methods):
@@ -2560,6 +2678,48 @@ class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
         self.assertEqual(control_root, snapshot.control_root)
         github_calls = [kwargs for command, kwargs in calls if command[0] == "gh"]
         self.assertEqual([str(control_root)], [call["cwd"] for call in github_calls])
+
+    def test_live_pr_uses_the_branch_ref_instead_of_the_pr_base_snapshot(self):
+        control_root = Path("C:/control")
+        commands = []
+
+        def runner(command, **kwargs):
+            commands.append((command, kwargs))
+            if command[:3] == ["gh", "pr", "view"]:
+                payload = {
+                    "number": 7,
+                    "url": "https://github.com/owner/repo/pull/7",
+                    "state": "OPEN",
+                    "headRepository": {"nameWithOwner": "fork/repo"},
+                    "headRefName": "feature",
+                    "headRefOid": "b" * 40,
+                    "baseRefName": "stack/lower",
+                    "baseRefOid": "c" * 40,
+                }
+                return subprocess.CompletedProcess(
+                    command, 0, json.dumps(payload), ""
+                )
+            if command[:3] == [
+                "gh",
+                "api",
+                "repos/owner/repo/git/ref/heads/stack%2Flower",
+            ]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    json.dumps({"object": {"sha": "a" * 40}}),
+                    "",
+                )
+            self.fail(f"unexpected command: {command}")
+
+        live = CLOUD_MODULE.resolve_pr(runner, control_root, "owner/repo", 7)
+
+        self.assertEqual("a" * 40, live.base_sha)
+        self.assertNotEqual("c" * 40, live.base_sha)
+        self.assertEqual(
+            [str(control_root), str(control_root)],
+            [kwargs["cwd"] for _, kwargs in commands],
+        )
 
 
 class PushSafetyTest(unittest.TestCase):

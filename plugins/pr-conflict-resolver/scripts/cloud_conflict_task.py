@@ -1248,6 +1248,29 @@ def resolve_pr(
             if isinstance(owner, str) and isinstance(name, str)
             else ""
         )
+    base_ref = data.get("baseRefName")
+    if not isinstance(base_ref, str) or not base_ref:
+        raise ConflictError("open pull request identity is invalid", "stale_target")
+    base_data = parse_json_output(
+        checked(
+            runner,
+            [
+                "gh",
+                "api",
+                f"repos/{repository}/git/ref/heads/"
+                f"{urllib.parse.quote(base_ref, safe='')}",
+            ],
+            cwd=root,
+            code="stale_target",
+        ),
+        "base branch data",
+    )
+    base_object = base_data.get("object")
+    base_sha = (
+        base_object.get("sha")
+        if isinstance(base_object, dict)
+        else None
+    )
     live = LivePr(
         data.get("number"),
         data.get("url"),
@@ -1257,8 +1280,8 @@ def resolve_pr(
         data.get("headRefName"),
         str(data.get("headRefOid", "")).lower(),
         repository,
-        data.get("baseRefName"),
-        str(data.get("baseRefOid", "")).lower(),
+        base_ref,
+        str(base_sha or "").lower(),
     )
     if (
         live.number != number

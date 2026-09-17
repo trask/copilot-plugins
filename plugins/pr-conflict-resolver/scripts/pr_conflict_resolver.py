@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from typing import Any, Iterable
 
 
@@ -71,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "b80e75b53692b8cba30cec3c237951e87817e62c7c4fe57467cecb68e230e14b"
+    "f3dc6ca6179920292e7fdc98089fe98e99a94d2737d9fe4a447f3046c57d88c6"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@1"
@@ -247,7 +248,12 @@ def base_ref_tip(repo_name: str, base_branch: str) -> str:
     staleness this exists to remove, and nothing downstream would see it happen.
     """
     result = run(
-        ["gh", "api", f"repos/{repo_name}/git/ref/heads/{base_branch}"],
+        [
+            "gh",
+            "api",
+            f"repos/{repo_name}/git/ref/heads/"
+            f"{urllib.parse.quote(base_branch, safe='')}",
+        ],
         check=False,
     )
     if result.returncode != 0:
@@ -7195,9 +7201,12 @@ def conflict_preflight(
         previous_ref = stack["trunk"]
         previous_sha = trunk_sha
         for member in stack["members"]:
+            direct_base_sha = base_ref_tip(
+                metadata["repo_name"], member["base_branch"]
+            )
             if (
                 member["base_branch"] != previous_ref
-                or member["base_sha"] != previous_sha
+                or direct_base_sha != previous_sha
             ):
                 raise WorkflowError(
                     f"native stack member #{member['number']} has a stale direct base"
@@ -7211,7 +7220,7 @@ def conflict_preflight(
             commits = [
                 commit_identity(repo_root, sha, linear=True)
                 for sha in ordered_commits(
-                    repo_root, member["base_sha"], member["head_sha"]
+                    repo_root, direct_base_sha, member["head_sha"]
                 )
             ]
             if not commits:
@@ -7222,7 +7231,7 @@ def conflict_preflight(
                 allowed_paths.update(commit["paths"])
             allowed_paths.update(
                 merge_tree_conflicts(
-                    repo_root, member["head_sha"], member["base_sha"]
+                    repo_root, member["head_sha"], direct_base_sha
                 )
             )
             members.append(
@@ -7232,7 +7241,7 @@ def conflict_preflight(
                     "head_ref": member["head_branch"],
                     "head_sha": member["head_sha"],
                     "direct_base_ref": member["base_branch"],
-                    "direct_base_sha": member["base_sha"],
+                    "direct_base_sha": direct_base_sha,
                     "expected_new_parent": {
                         "role": (
                             "trunk"
