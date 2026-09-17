@@ -884,7 +884,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "f3dc6ca6179920292e7fdc98089fe98e99a94d2737d9fe4a447f3046c57d88c6",
+            "3f70fec9a06b1ee98cfc8e7010f4280360a4cc8ce6c8b7452606d41ec89cedf9",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -2637,34 +2637,39 @@ class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
 
             def runner(command, **kwargs):
                 calls.append((command, kwargs))
-                if command[:3] == ["git", "rev-parse", "--show-toplevel"]:
+                logical = (
+                    ["git", *command[3:]]
+                    if command[:2] == ["git", "-C"]
+                    else command
+                )
+                if logical[:3] == ["git", "rev-parse", "--show-toplevel"]:
                     return subprocess.CompletedProcess(command, 0, "C:/repo\n", "")
-                if command[0] == "gh":
+                if logical[0] == "gh":
                     if kwargs["cwd"] == str(stale_root):
                         raise OSError(267, "The directory name is invalid")
                     return subprocess.CompletedProcess(command, 0, "owner/repo\n", "")
-                if command == ["git", "remote"]:
+                if logical == ["git", "remote"]:
                     return subprocess.CompletedProcess(command, 0, "origin\n", "")
-                if command[:3] == ["git", "remote", "get-url"]:
+                if logical[:3] == ["git", "remote", "get-url"]:
                     return subprocess.CompletedProcess(
                         command, 0, "https://github.com/owner/repo.git\n", ""
                     )
-                if command[:4] == [
+                if logical[:4] == [
                     "git",
                     "symbolic-ref",
                     "--quiet",
                     "--short",
                 ]:
                     return subprocess.CompletedProcess(command, 0, "feature\n", "")
-                if command == ["git", "rev-parse", "--verify", "HEAD"]:
+                if logical == ["git", "rev-parse", "--verify", "HEAD"]:
                     return subprocess.CompletedProcess(command, 0, f"{'b' * 40}\n", "")
-                if command[:3] == ["git", "status", "--porcelain=v1"]:
+                if logical[:3] == ["git", "status", "--porcelain=v1"]:
                     return subprocess.CompletedProcess(command, 0, "", "")
-                if command[:3] == ["git", "rev-parse", "--git-path"]:
+                if logical[:3] == ["git", "rev-parse", "--git-path"]:
                     return subprocess.CompletedProcess(
-                        command, 0, f"missing-{command[-1]}\n", ""
+                        command, 0, f"missing-{logical[-1]}\n", ""
                     )
-                if command[:3] == ["git", "rev-parse", "--verify"]:
+                if logical[:3] == ["git", "rev-parse", "--verify"]:
                     return subprocess.CompletedProcess(command, 1, "", "")
                 self.fail(f"unexpected command: {command}")
 
@@ -2678,6 +2683,68 @@ class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
         self.assertEqual(control_root, snapshot.control_root)
         github_calls = [kwargs for command, kwargs in calls if command[0] == "gh"]
         self.assertEqual([str(control_root)], [call["cwd"] for call in github_calls])
+
+    def test_git_uses_an_explicit_root_from_a_stable_process_directory(self):
+        repository_root = Path("C:/app-owned-worktree")
+        process_root = Path("C:/python")
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append((command, kwargs))
+            if kwargs["cwd"] == str(repository_root):
+                raise OSError(267, "The directory name is invalid")
+            return subprocess.CompletedProcess(command, 0, "clean\n", "")
+
+        with mock.patch.object(
+            CLOUD_MODULE,
+            "stable_process_directory",
+            return_value=process_root,
+        ):
+            result = CLOUD_MODULE.run_process(
+                runner,
+                ["git", "status", "--porcelain=v1"],
+                cwd=repository_root,
+            )
+
+        self.assertEqual(0, result.returncode)
+        self.assertEqual(
+            ["git", "-C", str(repository_root), "status", "--porcelain=v1"],
+            calls[0][0],
+        )
+        self.assertEqual(str(process_root), calls[0][1]["cwd"])
+
+    def test_a_missing_explicit_git_root_still_fails_closed(self):
+        repository_root = Path("C:/deleted-worktree")
+        process_root = Path("C:/python")
+
+        def runner(command, **kwargs):
+            self.assertEqual(
+                ["git", "-C", str(repository_root), "status", "--porcelain=v1"],
+                command,
+            )
+            self.assertEqual(str(process_root), kwargs["cwd"])
+            return subprocess.CompletedProcess(
+                command,
+                128,
+                "",
+                "fatal: cannot change to deleted worktree",
+            )
+
+        with mock.patch.object(
+            CLOUD_MODULE,
+            "stable_process_directory",
+            return_value=process_root,
+        ), self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError,
+            "cannot change to deleted worktree",
+        ) as failure:
+            CLOUD_MODULE.checked(
+                runner,
+                ["git", "status", "--porcelain=v1"],
+                cwd=repository_root,
+            )
+
+        self.assertEqual("stale_target", failure.exception.code)
 
     def test_live_pr_uses_the_branch_ref_instead_of_the_pr_base_snapshot(self):
         control_root = Path("C:/control")

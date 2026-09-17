@@ -1025,6 +1025,16 @@ def _creation_flags() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 
+def stable_process_directory() -> Path:
+    directory = Path(sys.executable).resolve().parent
+    if not directory.is_dir():
+        raise ConflictError(
+            "Python executable directory is unavailable",
+            "stale_target",
+        )
+    return directory
+
+
 def run_process(
     runner: Runner,
     command: Sequence[str],
@@ -1032,19 +1042,24 @@ def run_process(
     cwd: Path | None = None,
     input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    process_command = list(command)
+    process_cwd = cwd
+    if process_command and process_command[0] == "git" and cwd is not None:
+        process_command = ["git", "-C", str(cwd), *process_command[1:]]
+        process_cwd = stable_process_directory()
     kwargs: dict[str, object] = {
         "capture_output": True,
         "text": True,
         "encoding": "utf-8",
         "check": False,
-        "cwd": str(cwd) if cwd is not None else None,
+        "cwd": str(process_cwd) if process_cwd is not None else None,
     }
     if input_text is not None:
         kwargs["input"] = input_text
     if os.name == "nt":
         kwargs["creationflags"] = _creation_flags()
     try:
-        return runner(list(command), **kwargs)
+        return runner(process_command, **kwargs)
     except UnicodeError as error:
         raise ConflictError(
             f"{command[0]} returned invalid UTF-8: {error}",

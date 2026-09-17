@@ -45,13 +45,13 @@ The helper performs a trusted local preflight without executing repository code.
 
 A pipeline-owned isolated worktree may stay detached only at the exact frozen pull request head. An attached worktree must hold the pull request branch. Any other branch or commit fails preflight.
 
-The helper records `preparing` ownership at the explicit state path before conflict preflight. A preflight error records failed or interrupted ownership with a null task ID and `not_created` status, so a wrapper exit cannot erase the attempted run. The Agent Tasks runtime is bundled with this plugin. The helper writes the closed `github.copilot.agent-task-conflict-request` version 1 file and a trusted prompt outside the repository. It loads only the adjacent `cloud_conflict_task.py`, verifies SHA-256 `f3dc6ca6179920292e7fdc98089fe98e99a94d2737d9fe4a447f3046c57d88c6`, and invokes it once with:
+The helper records `preparing` ownership at the explicit state path before conflict preflight. A preflight error records failed or interrupted ownership with a null task ID and `not_created` status, so a wrapper exit cannot erase the attempted run. The Agent Tasks runtime is bundled with this plugin. The helper writes the closed `github.copilot.agent-task-conflict-request` version 1 file and a trusted prompt outside the repository. It loads only the adjacent `cloud_conflict_task.py`, verifies SHA-256 `3f70fec9a06b1ee98cfc8e7010f4280360a4cc8ce6c8b7452606d41ec89cedf9`, and invokes it once with:
 
 ```text
 --conflict-with-report --strategy <merge|rebase|native-stack> --request-file <absolute-path> --prompt-file <absolute-path> --result-file <absolute-path> --policy marketplace-conflict-worker@1 --pr <canonical-url> --model <alias>
 ```
 
-Local Git checks stay pinned to the frozen worktree. GitHub CLI calls run from the outside-repository artifact directory and use explicit repository identities, so a stale inherited process directory cannot redirect them.
+Local Git checks stay pinned to the frozen worktree through `git -C <exact-root>`. Git launches from the verified Python executable directory, and GitHub CLI calls run from the outside-repository artifact directory. A stale inherited process directory cannot redirect either tool.
 
 The current base comes from the advertised branch ref, not the pull request's lagging base snapshot. Native stack requests preserve the snapshot in preflight evidence but pin each direct base to its live branch ref.
 
