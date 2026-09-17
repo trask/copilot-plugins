@@ -372,6 +372,8 @@ def validate_native_stack(value: object) -> Mapping[str, object]:
                 "head_sha",
                 "direct_base_ref",
                 "direct_base_sha",
+                "retained_base_sha",
+                "direct_merge_base",
                 "expected_new_parent",
                 "old_commits",
                 "lease_sha",
@@ -387,6 +389,8 @@ def validate_native_stack(value: object) -> Mapping[str, object]:
         require_sha(member["head_sha"], "native stack head SHA")
         require_ref(member["direct_base_ref"], "native stack direct base ref")
         require_sha(member["direct_base_sha"], "native stack direct base SHA")
+        require_sha(member["retained_base_sha"], "native stack retained base SHA")
+        require_sha(member["direct_merge_base"], "native stack merge base SHA")
         expected_parent = require_exact_keys(
             member["expected_new_parent"],
             {"role", "old_sha"},

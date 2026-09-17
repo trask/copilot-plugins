@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "2d59f00443a4fec7f9bd83df69705823d5d42474424225f4048bbbba6049f9fc"
+    "f23e58a12a8c455da54d7970bfb76eabb5848d0da1024b93154742a52229c0f5"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@1"
@@ -6976,6 +6976,39 @@ def ordered_commits(repo_root: Path, base: str, head: str) -> list[str]:
     return [line for line in output.splitlines() if line]
 
 
+def native_stack_member_history(
+    repo_root: Path,
+    *,
+    current_base: str,
+    retained_base: str,
+    head: str,
+) -> tuple[str, list[str]]:
+    if not is_ancestor(repo_root, retained_base, head):
+        raise WorkflowError(
+            f"retained direct-base snapshot {retained_base} is not an ancestor "
+            f"of native stack head {head}"
+        )
+    merge_bases = [
+        line
+        for line in git(
+            repo_root,
+            "merge-base",
+            "--all",
+            current_base,
+            head,
+        ).splitlines()
+        if line
+    ]
+    if len(merge_bases) != 1 or not SHA_PATTERN.fullmatch(merge_bases[0]):
+        raise WorkflowError(
+            "native stack member has no unique common history with its current base"
+        )
+    commits = ordered_commits(repo_root, retained_base, head)
+    if not commits:
+        raise WorkflowError("native stack member has an empty unique range")
+    return merge_bases[0], commits
+
+
 def conflict_commit_subject(repo_root: Path, commit: str) -> str:
     return git(repo_root, "show", "-s", "--format=%s", commit)
 
@@ -7217,16 +7250,17 @@ def conflict_preflight(
                 f"refs/pull/{member['number']}/head",
                 member["head_sha"],
             )
+            retained_base_sha = member["base_sha"]
+            direct_merge_base, unique_commits = native_stack_member_history(
+                repo_root,
+                current_base=direct_base_sha,
+                retained_base=retained_base_sha,
+                head=member["head_sha"],
+            )
             commits = [
                 commit_identity(repo_root, sha, linear=True)
-                for sha in ordered_commits(
-                    repo_root, direct_base_sha, member["head_sha"]
-                )
+                for sha in unique_commits
             ]
-            if not commits:
-                raise WorkflowError(
-                    f"native stack member #{member['number']} has an empty unique range"
-                )
             for commit in commits:
                 allowed_paths.update(commit["paths"])
             allowed_paths.update(
@@ -7242,6 +7276,8 @@ def conflict_preflight(
                     "head_sha": member["head_sha"],
                     "direct_base_ref": member["base_branch"],
                     "direct_base_sha": direct_base_sha,
+                    "retained_base_sha": retained_base_sha,
+                    "direct_merge_base": direct_merge_base,
                     "expected_new_parent": {
                         "role": (
                             "trunk"
@@ -7830,10 +7866,18 @@ def require_live_conflict_guards(
                     member["head_ref"],
                     member["head_sha"],
                     member["direct_base_ref"],
-                    member["direct_base_sha"],
+                    member["retained_base_sha"],
                 )
                 for member in expected["members"]
             ]
+            or any(
+                base_ref_tip(
+                    request["repository"],
+                    member["direct_base_ref"],
+                )
+                != member["direct_base_sha"]
+                for member in expected["members"]
+            )
         ):
             raise WorkflowError("native stack topology changed after cloud resolution")
         current_outside = []

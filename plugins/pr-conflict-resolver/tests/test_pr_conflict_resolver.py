@@ -884,7 +884,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "2d59f00443a4fec7f9bd83df69705823d5d42474424225f4048bbbba6049f9fc",
+            "f23e58a12a8c455da54d7970bfb76eabb5848d0da1024b93154742a52229c0f5",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -2443,6 +2443,8 @@ class StrategyChoiceTest(unittest.TestCase):
         trunk = "a" * 40
         lower = "b" * 40
         upper = "c" * 40
+        lower_snapshot = "d" * 40
+        upper_snapshot = "e" * 40
         metadata = pr_metadata(
             mergeable="CONFLICTING",
             head_branch="lower",
@@ -2458,14 +2460,14 @@ class StrategyChoiceTest(unittest.TestCase):
                     "head_branch": "lower",
                     "head_sha": lower,
                     "base_branch": "main",
-                    "base_sha": "stale-pr-snapshot",
+                    "base_sha": lower_snapshot,
                 },
                 {
                     "number": 20084,
                     "head_branch": "upper",
                     "head_sha": upper,
                     "base_branch": "lower",
-                    "base_sha": "stale-dependent-snapshot",
+                    "base_sha": upper_snapshot,
                 },
             ],
             "inactive_members": [],
@@ -2476,8 +2478,10 @@ class StrategyChoiceTest(unittest.TestCase):
                 return lower
             if arguments == ("branch", "--show-current"):
                 return ""
+            if arguments[:2] == ("merge-base", "--all"):
+                return "f" * 40
             if arguments[0] == "merge-base":
-                return "merge-base"
+                return "0" * 40
             raise AssertionError(arguments)
 
         def live_tip(_repository, branch):
@@ -2503,6 +2507,7 @@ class StrategyChoiceTest(unittest.TestCase):
                 return_value=ALL_MERGE_METHODS,
             ),
             mock.patch.object(MODULE, "merge_tree_conflicts", return_value=set()),
+            mock.patch.object(MODULE, "is_ancestor", return_value=True),
             mock.patch.object(
                 MODULE,
                 "ordered_commits",
@@ -2536,8 +2541,16 @@ class StrategyChoiceTest(unittest.TestCase):
         members = preflight["request"]["native_stack"]["members"]
         self.assertEqual([trunk, lower], [member["direct_base_sha"] for member in members])
         self.assertEqual(
-            ["stale-pr-snapshot", "stale-dependent-snapshot"],
+            [lower_snapshot, upper_snapshot],
+            [member["retained_base_sha"] for member in members],
+        )
+        self.assertEqual(
+            [lower_snapshot, upper_snapshot],
             [member["base_sha"] for member in preflight["stack"]["members"]],
+        )
+        self.assertEqual(
+            ["f" * 40, "f" * 40],
+            [member["direct_merge_base"] for member in members],
         )
         self.assertEqual(
             [
@@ -2547,6 +2560,111 @@ class StrategyChoiceTest(unittest.TestCase):
             ],
             tip.call_args_list,
         )
+
+
+class NativeStackMemberHistoryTest(unittest.TestCase):
+    def validate(self, *, current_base, retained_base, head, merge_bases, ancestor=True):
+        def git_call(_root, *arguments):
+            if arguments == (
+                "merge-base",
+                "--all",
+                current_base,
+                head,
+            ):
+                return merge_bases
+            if arguments == (
+                "rev-list",
+                "--reverse",
+                "--topo-order",
+                f"{retained_base}..{head}",
+            ):
+                return head
+            raise AssertionError(arguments)
+
+        with mock.patch.object(
+            MODULE,
+            "git",
+            side_effect=git_call,
+        ), mock.patch.object(
+            MODULE,
+            "is_ancestor",
+            return_value=ancestor,
+        ):
+            return MODULE.native_stack_member_history(
+                Path("C:/repo"),
+                current_base=current_base,
+                retained_base=retained_base,
+                head=head,
+            )
+
+    def test_bottom_member_may_be_behind_or_diverged_from_current_trunk(self):
+        current = "a" * 40
+        retained = "b" * 40
+        head = "c" * 40
+        common = "d" * 40
+
+        merge_base, commits = self.validate(
+            current_base=current,
+            retained_base=retained,
+            head=head,
+            merge_bases=common,
+        )
+
+        self.assertEqual(common, merge_base)
+        self.assertEqual([head], commits)
+
+    def test_dependent_base_may_have_advanced_beyond_the_child(self):
+        current_parent = "e" * 40
+        retained_parent = "f" * 40
+        child = "1" * 40
+        common = "2" * 40
+
+        merge_base, commits = self.validate(
+            current_base=current_parent,
+            retained_base=retained_parent,
+            head=child,
+            merge_bases=common,
+        )
+
+        self.assertEqual(common, merge_base)
+        self.assertEqual([child], commits)
+
+    def test_member_requires_common_history_with_current_base(self):
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "no unique common history",
+        ):
+            self.validate(
+                current_base="3" * 40,
+                retained_base="4" * 40,
+                head="5" * 40,
+                merge_bases="",
+            )
+
+    def test_member_rejects_multiple_current_merge_bases(self):
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "no unique common history",
+        ):
+            self.validate(
+                current_base="6" * 40,
+                retained_base="7" * 40,
+                head="8" * 40,
+                merge_bases=f"{'9' * 40}\n{'a' * 40}",
+            )
+
+    def test_member_rejects_rewritten_retained_snapshot_history(self):
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "retained direct-base snapshot",
+        ):
+            self.validate(
+                current_base="b" * 40,
+                retained_base="c" * 40,
+                head="d" * 40,
+                merge_bases="e" * 40,
+                ancestor=False,
+            )
 
 
 class ManagedRequestStrategyTest(unittest.TestCase):
@@ -2611,6 +2729,60 @@ class ManagedRequestStrategyTest(unittest.TestCase):
         self.assertTrue(CLOUD_MODULE.strategy_can_land("merge", methods))
         self.assertTrue(CLOUD_MODULE.strategy_can_land("rebase", methods))
         self.assertTrue(CLOUD_MODULE.strategy_can_land("native-stack", methods))
+
+    def test_native_stack_request_binds_current_and_retained_base_history(self):
+        request = self.request(
+            {
+                "merge_commit": False,
+                "rebase_merge": False,
+                "squash_merge": True,
+            }
+        )
+        request["strategy"] = "native-stack"
+        request["head_commits"] = []
+        request["native_stack"] = {
+            "trunk": {"ref": "main", "sha": "a" * 40},
+            "members": [
+                {
+                    "pr_number": 7,
+                    "repository": "owner/repo",
+                    "head_ref": "feature",
+                    "head_sha": "b" * 40,
+                    "direct_base_ref": "main",
+                    "direct_base_sha": "a" * 40,
+                    "retained_base_sha": "d" * 40,
+                    "direct_merge_base": "e" * 40,
+                    "expected_new_parent": {
+                        "role": "trunk",
+                        "old_sha": "a" * 40,
+                    },
+                    "old_commits": [
+                        {
+                            "sha": "b" * 40,
+                            "subject": "Feature",
+                            "trailers": [],
+                            "patch_sha256": "c" * 64,
+                            "paths": ["app.py"],
+                        }
+                    ],
+                    "lease_sha": "b" * 40,
+                }
+            ],
+            "outside_dependents": [],
+        }
+        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
+
+        validated = CLOUD_MODULE.validate_request(
+            request,
+            expected_strategy="native-stack",
+            expected_model="gpt-5.6-sol",
+            expected_pr_url="https://github.com/owner/repo/pull/7",
+        )
+
+        member = validated["native_stack"]["members"][0]
+        self.assertEqual("a" * 40, member["direct_base_sha"])
+        self.assertEqual("d" * 40, member["retained_base_sha"])
+        self.assertEqual("e" * 40, member["direct_merge_base"])
 
     def test_rebase_only_repository_rejects_merge_integration_history(self):
         request = self.request(
