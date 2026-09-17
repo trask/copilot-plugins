@@ -7,11 +7,14 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
 from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest import mock
+import uuid
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "copilot_review_loop.py"
@@ -1010,6 +1013,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.repo_root = self.directory / "repo"
         self.repo_root.mkdir()
+        self.copilot_home = self.directory / "copilot-home"
+        environment_patch = mock.patch.dict(
+            os.environ, {"COPILOT_HOME": str(self.copilot_home)}
+        )
+        environment_patch.start()
+        self.addCleanup(environment_patch.stop)
         self.head = "1" * 40
         self.base = "2" * 40
         self.artifact = "3" * 40
@@ -1188,6 +1197,43 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         canonical_content = MODULE.render_canonical_review_report(report)
         canonical_path.write_text(canonical_content, encoding="utf-8", newline="\n")
         remote["report_sha256"] = MODULE.sha256_text(canonical_content)
+        events_path = (
+            self.copilot_home
+            / "session-state"
+            / session_id
+            / "events.jsonl"
+        )
+        events_path.parent.mkdir(parents=True, exist_ok=True)
+        events_path.write_text(
+            "".join(
+                json.dumps(event) + "\n"
+                for event in (
+                    {
+                        "type": "session.start",
+                        "data": {
+                            "sessionId": session_id,
+                            "selectedModel": MODULE.LOCAL_DECISION_MODEL,
+                            "reasoningEffort": (
+                                MODULE.LOCAL_DECISION_REASONING_EFFORT
+                            ),
+                        },
+                    },
+                    {
+                        "type": "assistant.message",
+                        "data": {
+                            "model": MODULE.LOCAL_DECISION_MODEL,
+                            "content": "complete",
+                        },
+                    },
+                )
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        model_attestation = MODULE.local_session_model_attestation(
+            session_id,
+            require_assistant_message=True,
+        )
         result = {
             "schema": MODULE.LOCAL_DECISION_RESULT_SCHEMA,
             "status": "success",
@@ -1222,6 +1268,16 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ),
             "remote": remote,
             "paths_by_commit": {},
+            "worker": {
+                "agent_id": MODULE.LOCAL_DECISION_AGENT_ID,
+                "custom_agent": None,
+                "authorization_flags": list(
+                    MODULE.LOCAL_DECISION_AUTHORIZATION_FLAGS
+                ),
+                "model": MODULE.LOCAL_DECISION_MODEL,
+                "reasoning_effort": MODULE.LOCAL_DECISION_REASONING_EFFORT,
+            },
+            "model_attestation": model_attestation,
         }
         result_path.write_text(
             json.dumps(result, indent=2, sort_keys=True) + "\n",
@@ -1435,12 +1491,21 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ],
         }
 
-    def run_actual_local_worker(self, writer, *, requested_model="gpt-5.6-sol"):
+    def run_actual_local_worker(
+        self,
+        writer,
+        *,
+        requested_model="gpt-5.6-sol",
+        returncode=0,
+        stdout="",
+        stderr="",
+    ):
         prompt_path = self.directory / "prompt.txt"
         decision_path = self.directory / "decisions.json"
         result_path = self.directory / "result.json"
         canonical_path = self.directory / "canonical.json"
         prompt_path.write_text("pinned prompt\n", encoding="utf-8", newline="\n")
+        copilot_home = self.directory / "copilot-home"
 
         def run(command, **kwargs):
             if writer is not None:
@@ -1450,9 +1515,41 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     command=command,
                     kwargs=kwargs,
                 )
-            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+            events_path = (
+                copilot_home
+                / "session-state"
+                / command[command.index("--session-id") + 1]
+                / "events.jsonl"
+            )
+            events_path.parent.mkdir(parents=True, exist_ok=True)
+            model = command[command.index("--model") + 1]
+            events = [
+                {
+                    "type": "session.start",
+                    "data": {
+                        "sessionId": "local-session",
+                        "selectedModel": model,
+                        "reasoningEffort": "high",
+                    },
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {"model": model, "content": "complete"},
+                },
+            ]
+            events_path.write_text(
+                "".join(json.dumps(event) + "\n" for event in events),
+                encoding="utf-8",
+                newline="\n",
+            )
+            return MODULE.subprocess.CompletedProcess(
+                command, returncode, stdout, stderr
+            )
 
-        with mock.patch.object(MODULE, "run", side_effect=run) as runner:
+        with (
+            mock.patch.dict(os.environ, {"COPILOT_HOME": str(copilot_home)}),
+            mock.patch.object(MODULE, "run", side_effect=run) as runner,
+        ):
             bundle = RUN_LOCAL_DECISION_WORKER(
                 repo_root=self.repo_root,
                 target=MODULE.parse_target("owner/repo#7"),
@@ -1472,6 +1569,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "decision": decision_path,
             "result": result_path,
             "canonical": canonical_path,
+            "copilot_home": copilot_home,
         }
 
     def write_valid_local_decision(self, *, decision_path, **_kwargs):
@@ -1493,11 +1591,139 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertTrue(paths["result"].is_file())
         self.assertTrue(paths["canonical"].is_file())
         command = runner.call_args.args[0]
-        self.assertEqual("sol", command[command.index("--model") + 1])
+        self.assertEqual(
+            "gpt-5.6-sol", command[command.index("--model") + 1]
+        )
         self.assertEqual(
             "high",
             command[command.index("--reasoning-effort") + 1],
         )
+        self.assertEqual(
+            "copilot-cli-default",
+            bundle["result"]["worker"]["agent_id"],
+        )
+        self.assertEqual(
+            ["gpt-5.6-sol"],
+            bundle["result"]["model_attestation"]["observed_models"],
+        )
+
+    def test_local_worker_command_never_uses_agent_task_model_alias(self):
+        command = MODULE.local_decision_command(
+            self.repo_root,
+            session_id="local-session",
+            run_id="run-1",
+            pr_number=7,
+        )
+
+        self.assertEqual(
+            "gpt-5.6-sol", command[command.index("--model") + 1]
+        )
+        self.assertNotIn("sol", command)
+        self.assertEqual(
+            list(MODULE.LOCAL_DECISION_AUTHORIZATION_FLAGS),
+            [
+                flag
+                for flag in command
+                if flag in MODULE.LOCAL_DECISION_AUTHORIZATION_FLAGS
+            ],
+        )
+
+    def test_local_worker_command_passes_installed_cli_parser(self):
+        if shutil.which("copilot") is None:
+            self.skipTest("copilot CLI is not installed")
+        command = MODULE.local_decision_command(
+            self.repo_root,
+            session_id=f"parser-smoke-{uuid.uuid4()}",
+            run_id="run-1",
+            pr_number=7,
+        )
+
+        process = subprocess.run(
+            [*command, "--help"],
+            cwd=self.repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            **MODULE.windows_no_window_options(),
+        )
+
+        self.assertEqual(0, process.returncode, process.stderr)
+        self.assertIn("--model <model>", process.stdout)
+
+    def test_local_worker_rejects_agent_task_alias_fallback_events(self):
+        copilot_home = self.directory / "alias-copilot-home"
+        events_path = (
+            copilot_home
+            / "session-state"
+            / "alias-session"
+            / "events.jsonl"
+        )
+        events_path.parent.mkdir(parents=True)
+        events_path.write_text(
+            "\n".join(
+                json.dumps(event)
+                for event in (
+                    {
+                        "type": "session.start",
+                        "data": {
+                            "sessionId": "alias-session",
+                            "selectedModel": "sol",
+                            "reasoningEffort": None,
+                        },
+                    },
+                    {
+                        "type": "session.model_change",
+                        "data": {
+                            "newModel": "claude-sonnet-5",
+                            "previousModel": "sol",
+                            "reasoningEffort": None,
+                        },
+                    },
+                    {
+                        "type": "session.shutdown",
+                        "data": {"totalApiDurationMs": 0},
+                    },
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        with (
+            mock.patch.dict(os.environ, {"COPILOT_HOME": str(copilot_home)}),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "model attestation mismatch"
+            ) as failure,
+        ):
+            MODULE.local_session_model_attestation(
+                "alias-session",
+                require_assistant_message=False,
+            )
+
+        self.assertEqual("sol", failure.exception.details["startup_model"])
+        self.assertEqual(
+            [{"model": "claude-sonnet-5", "reasoning_effort": None}],
+            failure.exception.details["mismatched_model_changes"],
+        )
+
+    def test_local_worker_nonzero_exit_includes_safe_stderr(self):
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "exited 2; stderr: model is unavailable",
+        ):
+            self.run_actual_local_worker(
+                None,
+                returncode=2,
+                stderr="model is unavailable",
+            )
+
+    def test_local_worker_no_report_includes_safe_stdout(self):
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "produced no decision report; stdout: no report written",
+        ):
+            self.run_actual_local_worker(None, stdout="no report written")
 
     def test_local_worker_rejects_missing_decision_report(self):
         with self.assertRaisesRegex(
@@ -1655,16 +1881,19 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         bundle, _runner, paths = self.run_actual_local_worker(
             self.write_valid_local_decision
         )
-        retained = MODULE.validate_retained_local_decision(
-            repo_root=self.repo_root,
-            target=MODULE.parse_target("owner/repo#7"),
-            preflight=self.preflight,
-            prompt_path=paths["prompt"],
-            decision_path=paths["decision"],
-            result_path=paths["result"],
-            canonical_path=paths["canonical"],
-            requested_model="gpt-5.6-sol",
-        )
+        with mock.patch.dict(
+            os.environ, {"COPILOT_HOME": str(paths["copilot_home"])}
+        ):
+            retained = MODULE.validate_retained_local_decision(
+                repo_root=self.repo_root,
+                target=MODULE.parse_target("owner/repo#7"),
+                preflight=self.preflight,
+                prompt_path=paths["prompt"],
+                decision_path=paths["decision"],
+                result_path=paths["result"],
+                canonical_path=paths["canonical"],
+                requested_model="gpt-5.6-sol",
+            )
         self.assertEqual(bundle["report"], retained["report"])
 
         result = json.loads(paths["result"].read_text(encoding="utf-8"))
@@ -1689,16 +1918,55 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 requested_model="gpt-5.6-sol",
             )
 
+    def test_retained_v1_local_decision_uses_only_legacy_alias_contract(self):
+        _bundle, _runner, paths = self.run_actual_local_worker(
+            self.write_valid_local_decision
+        )
+        result = json.loads(paths["result"].read_text(encoding="utf-8"))
+        result["schema"] = MODULE.LEGACY_LOCAL_DECISION_RESULT_SCHEMA
+        result["policy"] = MODULE.LEGACY_LOCAL_DECISION_POLICY
+        result["command"] = MODULE.local_decision_command(
+            self.repo_root,
+            session_id=result["session_id"],
+            run_id=result["run_id"],
+            pr_number=self.preflight["pr"]["number"],
+            legacy_model_alias=True,
+        )
+        result.pop("worker")
+        result.pop("model_attestation")
+        paths["result"].write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        retained = MODULE.validate_retained_local_decision(
+            repo_root=self.repo_root,
+            target=MODULE.parse_target("owner/repo#7"),
+            preflight=self.preflight,
+            prompt_path=paths["prompt"],
+            decision_path=paths["decision"],
+            result_path=paths["result"],
+            canonical_path=paths["canonical"],
+            requested_model="gpt-5.6-sol",
+        )
+
+        self.assertEqual(MODULE.LEGACY_LOCAL_DECISION_POLICY, result["policy"])
+        self.assertEqual("sol", result["command"][4])
+        self.assertEqual(result["run_id"], retained["result"]["run_id"])
+
     def test_agent_definition_is_thin_and_version_is_bumped(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
         self.assertIn(MODULE.LOCAL_DECISION_POLICY, instructions)
-        self.assertIn("--model sol --reasoning-effort high", instructions)
+        self.assertIn(
+            "--model gpt-5.6-sol --reasoning-effort high", instructions
+        )
         self.assertIn("Never use hosted GitHub Agent Tasks", instructions)
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.41")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.42")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -3488,7 +3756,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         worker_command = state["agent_task"]["worker_command"]
         self.assertEqual(
-            "sol",
+            "gpt-5.6-sol",
             worker_command[worker_command.index("--model") + 1],
         )
         self.assertEqual(

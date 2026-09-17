@@ -118,9 +118,24 @@ AGENT_TASK_POLICY = "marketplace-agent-apply-report-worker@3"
 AGENT_TASK_POLICY_SHA256 = (
     "7d48868140710139939cabc803a99f2122305e97dedbffa747e5f69903c16af1"
 )
-LOCAL_DECISION_POLICY = "marketplace-local-review-decision-worker@1"
+LOCAL_DECISION_POLICY = "marketplace-local-review-decision-worker@2"
+LEGACY_LOCAL_DECISION_POLICY = "marketplace-local-review-decision-worker@1"
+LOCAL_DECISION_MODEL = "gpt-5.6-sol"
 LOCAL_DECISION_REASONING_EFFORT = "high"
+LOCAL_DECISION_AGENT_ID = "copilot-cli-default"
+LOCAL_DECISION_AUTHORIZATION_FLAGS = (
+    "--allow-all-tools",
+    "--allow-all-paths",
+    "--no-ask-user",
+    "--no-custom-instructions",
+    "--no-auto-update",
+    "--no-remote",
+)
 LOCAL_DECISION_RESULT_SCHEMA = {
+    "id": "github.copilot.copilot-review-loop-local-result",
+    "version": 2,
+}
+LEGACY_LOCAL_DECISION_RESULT_SCHEMA = {
     "id": "github.copilot.copilot-review-loop-local-result",
     "version": 1,
 }
@@ -4957,13 +4972,14 @@ def local_decision_command(
     session_id: str,
     run_id: str,
     pr_number: int,
+    legacy_model_alias: bool = False,
 ) -> list[str]:
     return [
         "copilot",
         "-C",
         str(repo_root),
         "--model",
-        "sol",
+        "sol" if legacy_model_alias else LOCAL_DECISION_MODEL,
         "--reasoning-effort",
         LOCAL_DECISION_REASONING_EFFORT,
         "--mode",
@@ -4974,16 +4990,124 @@ def local_decision_command(
         session_id,
         "--name",
         f"copilot-review-{pr_number}-{run_id}",
-        "--allow-all-tools",
-        "--allow-all-paths",
-        "--no-ask-user",
-        "--no-custom-instructions",
-        "--no-auto-update",
-        "--no-remote",
+        *LOCAL_DECISION_AUTHORIZATION_FLAGS,
         "--no-color",
         "--stream",
         "off",
     ]
+
+
+def local_session_events_path(session_id: str) -> Path:
+    home = Path(
+        os.environ.get("COPILOT_HOME", str(Path.home() / ".copilot"))
+    ).resolve()
+    return home / "session-state" / session_id / "events.jsonl"
+
+
+def local_session_model_attestation(
+    session_id: str,
+    *,
+    require_assistant_message: bool,
+) -> dict[str, Any]:
+    path = local_session_events_path(session_id)
+    if not path.is_file() or path.is_symlink():
+        if require_assistant_message:
+            raise WorkflowError(
+                "local Copilot decision session has no model attestation events",
+                details={"session_id": session_id, "events_path": str(path)},
+            )
+        return {
+            "status": "missing",
+            "session_id": session_id,
+            "events_path": str(path),
+            "events_sha256": None,
+            "startup_model": None,
+            "startup_reasoning_effort": None,
+            "observed_models": [],
+            "assistant_message_count": 0,
+        }
+    startup: dict[str, Any] | None = None
+    observed_models: list[str] = []
+    assistant_message_count = 0
+    model_changes: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                event = json.loads(line)
+                if not isinstance(event, dict) or not isinstance(
+                    event.get("data"), dict
+                ):
+                    raise ValueError("event is not an object with data")
+                data = event["data"]
+                if event.get("type") == "session.start":
+                    if startup is not None:
+                        raise ValueError("multiple session.start events")
+                    startup = data
+                elif event.get("type") == "session.model_change":
+                    model_changes.append(data)
+                elif event.get("type") == "assistant.message":
+                    model = data.get("model")
+                    if isinstance(model, str):
+                        observed_models.append(model)
+                    assistant_message_count += 1
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise WorkflowError(
+            f"local Copilot decision model attestation is malformed: {error}",
+            details={"session_id": session_id, "events_path": str(path)},
+        ) from error
+    attestation = {
+        "status": "complete",
+        "session_id": session_id,
+        "events_path": str(path),
+        "events_sha256": sha256_file(path),
+        "startup_model": startup.get("selectedModel") if startup else None,
+        "startup_reasoning_effort": (
+            startup.get("reasoningEffort") if startup else None
+        ),
+        "observed_models": sorted(set(observed_models)),
+        "assistant_message_count": assistant_message_count,
+    }
+    bad_changes = [
+        {
+            "model": change.get("newModel"),
+            "reasoning_effort": change.get("reasoningEffort"),
+        }
+        for change in model_changes
+        if change.get("newModel") != LOCAL_DECISION_MODEL
+        or change.get("reasoningEffort")
+        not in {None, LOCAL_DECISION_REASONING_EFFORT}
+    ]
+    if (
+        startup is None
+        or attestation["startup_model"] != LOCAL_DECISION_MODEL
+        or attestation["startup_reasoning_effort"]
+        != LOCAL_DECISION_REASONING_EFFORT
+        or bad_changes
+        or any(model != LOCAL_DECISION_MODEL for model in observed_models)
+        or (require_assistant_message and assistant_message_count == 0)
+    ):
+        raise WorkflowError(
+            "local Copilot decision session model attestation mismatch",
+            details={**attestation, "mismatched_model_changes": bad_changes},
+        )
+    return attestation
+
+
+def local_process_diagnostic(process: subprocess.CompletedProcess[str]) -> str:
+    for name, value in (("stderr", process.stderr), ("stdout", process.stdout)):
+        detail = value.strip()
+        if not detail:
+            continue
+        encoded = detail.encode("utf-8")
+        if contains_credentials(detail):
+            return f"{name} omitted because it appears to contain credentials"
+        if len(encoded) > 4096:
+            return (
+                f"{name} omitted because it is {len(encoded)} UTF-8 bytes; "
+                f"SHA-256 {hashlib.sha256(encoded).hexdigest()}"
+            )
+        return f"{name}: {detail}"
+    return "no stdout or stderr"
 
 
 def run_local_decision_worker(
@@ -5001,7 +5125,7 @@ def run_local_decision_worker(
     before_source: dict[str, Any],
     before_github: dict[str, str],
 ) -> dict[str, Any]:
-    if requested_model != "gpt-5.6-sol":
+    if requested_model != LOCAL_DECISION_MODEL:
         raise WorkflowError("local decision worker requires gpt-5.6-sol")
     prompt_sha256 = sha256_file(prompt_path)
     command = local_decision_command(
@@ -5043,15 +5167,29 @@ def run_local_decision_worker(
     except WorkflowError as error:
         error.details.update(fingerprints)
         raise
+    try:
+        model_attestation = local_session_model_attestation(
+            session_id,
+            require_assistant_message=process.returncode == 0,
+        )
+    except WorkflowError as error:
+        error.details.update(fingerprints)
+        error.details["process"] = {
+            "returncode": process.returncode,
+            "diagnostic": local_process_diagnostic(process),
+        }
+        raise
     if process.returncode != 0:
         raise WorkflowError(
-            f"local Copilot decision session exited {process.returncode}",
-            details=fingerprints,
+            f"local Copilot decision session exited {process.returncode}; "
+            f"{local_process_diagnostic(process)}",
+            details={**fingerprints, "model_attestation": model_attestation},
         )
     if not decision_path.is_file():
         raise WorkflowError(
-            "local Copilot decision session produced no decision report",
-            details=fingerprints,
+            "local Copilot decision session produced no decision report; "
+            f"{local_process_diagnostic(process)}",
+            details={**fingerprints, "model_attestation": model_attestation},
         )
     decision_content = decision_path.read_text(encoding="utf-8")
     require_no_credentials(
@@ -5114,6 +5252,14 @@ def run_local_decision_worker(
         "command": command,
         "remote": remote,
         "paths_by_commit": paths_by_commit,
+        "worker": {
+            "agent_id": LOCAL_DECISION_AGENT_ID,
+            "custom_agent": None,
+            "authorization_flags": list(LOCAL_DECISION_AUTHORIZATION_FLAGS),
+            "model": LOCAL_DECISION_MODEL,
+            "reasoning_effort": LOCAL_DECISION_REASONING_EFFORT,
+        },
+        "model_attestation": model_attestation,
     }
     atomic_write_text(
         result_path,
@@ -5143,6 +5289,10 @@ def validate_retained_local_decision(
         result_path,
         description="local Copilot decision result",
     )
+    legacy_result = (
+        result.get("schema") == LEGACY_LOCAL_DECISION_RESULT_SCHEMA
+        and result.get("policy") == LEGACY_LOCAL_DECISION_POLICY
+    )
     expected_keys = {
         "schema",
         "status",
@@ -5164,13 +5314,26 @@ def validate_retained_local_decision(
         "remote",
         "paths_by_commit",
     }
+    if not legacy_result:
+        expected_keys.update({"worker", "model_attestation"})
     if (
         set(result) != expected_keys
-        or result.get("schema") != LOCAL_DECISION_RESULT_SCHEMA
+        or (
+            result.get("schema")
+            not in (
+                LOCAL_DECISION_RESULT_SCHEMA,
+                LEGACY_LOCAL_DECISION_RESULT_SCHEMA,
+            )
+        )
         or result.get("status") != "success"
         or result.get("validation_complete") is not True
         or result.get("producer") != "local"
-        or result.get("policy") != LOCAL_DECISION_POLICY
+        or result.get("policy")
+        not in {LOCAL_DECISION_POLICY, LEGACY_LOCAL_DECISION_POLICY}
+        or (
+            (result.get("schema") == LOCAL_DECISION_RESULT_SCHEMA)
+            != (result.get("policy") == LOCAL_DECISION_POLICY)
+        )
         or result.get("requested_model") != requested_model
         or result.get("reasoning_effort") != LOCAL_DECISION_REASONING_EFFORT
         or not isinstance(result.get("session_id"), str)
@@ -5187,8 +5350,29 @@ def validate_retained_local_decision(
         session_id=result["session_id"],
         run_id=result["run_id"],
         pr_number=preflight["pr"]["number"],
+        legacy_model_alias=legacy_result,
     ):
         raise WorkflowError("retained local decision command identity drifted")
+    if not legacy_result:
+        expected_worker = {
+            "agent_id": LOCAL_DECISION_AGENT_ID,
+            "custom_agent": None,
+            "authorization_flags": list(LOCAL_DECISION_AUTHORIZATION_FLAGS),
+            "model": LOCAL_DECISION_MODEL,
+            "reasoning_effort": LOCAL_DECISION_REASONING_EFFORT,
+        }
+        if result.get("worker") != expected_worker:
+            raise WorkflowError(
+                "retained local decision worker authorization identity drifted"
+            )
+        model_attestation = local_session_model_attestation(
+            result["session_id"],
+            require_assistant_message=True,
+        )
+        if result.get("model_attestation") != model_attestation:
+            raise WorkflowError(
+                "retained local decision model attestation drifted"
+            )
     expected_files = (
         ("prompt", prompt_path),
         ("decision", decision_path),

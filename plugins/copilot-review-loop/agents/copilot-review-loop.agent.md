@@ -15,7 +15,7 @@ A bare pull request URL or `owner/repo#number` asks you to run the complete Copi
 
 The custom-agent session must use exactly `gpt-5.6-sol`. When the runtime exposes reasoning effort, require exactly `high`. Stop before changing the pull request when the model guarantee differs.
 
-The coordinator starts every local decision session with explicit `--model sol --reasoning-effort high`. Any other decision model or effort fails closed. Never use a hosted GitHub Agent Task or silently fall back to one.
+The coordinator starts every local decision session with explicit `--model gpt-5.6-sol --reasoning-effort high`. It never passes the hosted Agent Task alias `sol` to the local CLI. Any other decision model or effort fails closed. Never use a hosted GitHub Agent Task or silently fall back to one.
 
 ## Required path
 
@@ -32,11 +32,11 @@ The coordinator starts every local decision session with explicit `--model sol -
 
 The coordinator is the only workflow entry point. It owns review requests, bounded polling with backoff and jitter, debounce, stable actionable snapshots, restart state, publication, replies, thread resolution, and iteration transitions.
 
-For each fixing iteration, the coordinator freezes the exact repository, pull request, head, base, title, body, comments, suppressed findings, threads, reviews, and advertised refs. It derives one opaque SHA-256 finding key from each complete pinned finding identity. Its local `marketplace-local-review-decision-worker@1` session receives the frozen contract and writes only one disposition, reason, reply, commit, and changed-path decision for every exact key. The coordinator mechanically restores the full identities and generates the canonical report itself.
+For each fixing iteration, the coordinator freezes the exact repository, pull request, head, base, title, body, comments, suppressed findings, threads, reviews, and advertised refs. It derives one opaque SHA-256 finding key from each complete pinned finding identity. Its local `marketplace-local-review-decision-worker@2` session receives the frozen contract and writes only one disposition, reason, reply, commit, and changed-path decision for every exact key. The coordinator mechanically restores the full identities and generates the canonical report itself.
 
 The local worker runs in the source checkout under the user's accepted local execution boundary. Its prompt and raw decision files live outside the repository. Before and after execution, the coordinator records the branch, HEAD, clean status, source Git refs, pull request metadata, threads, reviews, and remote head and base refs. Runtime-owned `refs/copilot/checkpoints/` bookkeeping is excluded because both the source session and local worker create it; heads, tags, remotes, stash, notes, replace refs, and every other namespace remain protected. The coordinator permits only clean, linear, single-parent commits on the current branch, with every commit and changed path accounted for by a `fixed` decision. It rejects merge commits, unrelated commits, unaccounted paths, protected ref changes, report artifacts, dirty-tree changes, prompt drift, GitHub mutation, or any frozen identity drift.
 
-The canonical report and local result envelope remain outside the repository. The result must have the exact local schema, policy, model, reasoning effort, session, run, prompt, decision, canonical-report, source, GitHub, history, path, and digest identities with `validation_complete=true`. Retained preparation revalidates all of them before publication.
+The canonical report and local result envelope remain outside the repository. The result must have the exact local schema, policy, model, reasoning effort, session, run, prompt, decision, canonical-report, source, GitHub, history, path, and digest identities with `validation_complete=true`. It also records the default local CLI agent identifier, the exact authorization flags, and a SHA-256-bound session event attestation. That attestation requires startup and every assistant message to use `gpt-5.6-sol` with high reasoning effort. Retained preparation revalidates all of them before publication.
 
 Suppressed review-body findings do not require live review threads. They retain their complete synthetic identities in coordinator state and participate in the same exact finding-key contract.
 
