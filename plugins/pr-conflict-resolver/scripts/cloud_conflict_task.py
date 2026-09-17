@@ -1249,7 +1249,12 @@ def local_snapshot(
 def require_local_unchanged(
     runner: Runner, expected: LocalSnapshot, quarantined: Sequence[str] = ()
 ) -> None:
-    current = local_snapshot(runner, expected.root)
+    current = local_snapshot(
+        runner,
+        expected.root,
+        control_root=expected.control_root,
+        expected_repository=expected.repository,
+    )
     if current != expected:
         raise ConflictError("local repository state changed", "stale_target")
     for ref in quarantined:

@@ -885,7 +885,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "c66f40f82d193667165f9ae46d5ed36f62039d3fbe867e126479951a754d807e",
+            "4859dc705ef36c41959f7ca5f4abbb7485e146c829b767cf032ef852a74ce7bb",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -3193,6 +3193,115 @@ class ManagedTaskResultPersistenceTest(unittest.TestCase):
 
 
 class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
+    def test_unchanged_check_reuses_stable_control_and_repository_identity(self):
+        snapshot = CLOUD_MODULE.LocalSnapshot(
+            root=Path("C:/repo"),
+            control_root=Path("C:/control"),
+            repository="owner/repo",
+            remote="origin",
+            branch="feature",
+            head="b" * 40,
+            status="",
+            operation=None,
+        )
+        with mock.patch.object(
+            CLOUD_MODULE,
+            "local_snapshot",
+            return_value=snapshot,
+        ) as local_snapshot:
+            CLOUD_MODULE.require_local_unchanged(mock.sentinel.runner, snapshot)
+
+        local_snapshot.assert_called_once_with(
+            mock.sentinel.runner,
+            snapshot.root,
+            control_root=snapshot.control_root,
+            expected_repository=snapshot.repository,
+        )
+
+    def test_local_snapshot_rejects_authenticated_repository_mismatch(self):
+        def runner(command, **_kwargs):
+            if command[:4] == ["git", "-C", "C:\\repo", "rev-parse"]:
+                return subprocess.CompletedProcess(command, 0, "C:/repo\n", "")
+            if command[:3] == ["git", "-C", "C:/repo"]:
+                return subprocess.CompletedProcess(command, 0, "C:/repo\n", "")
+            if command[0] == "gh":
+                return subprocess.CompletedProcess(command, 0, "other/repo\n", "")
+            return subprocess.CompletedProcess(command, 0, "C:/repo\n", "")
+
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError,
+            "authenticated repository changed",
+        ) as failure:
+            CLOUD_MODULE.local_snapshot(
+                runner,
+                Path("C:\\repo"),
+                control_root=Path("C:\\control"),
+                expected_repository="owner/repo",
+            )
+
+        self.assertEqual("stale_target", failure.exception.code)
+
+    def test_execute_rechecks_local_identity_through_the_exact_start_path(self):
+        control_root = temporary_directory(self)
+        repo_root = control_root / "repo"
+        repo_root.mkdir()
+        GitTestCase.git_in(repo_root, "init")
+        GitTestCase.git_in(repo_root, "config", "user.name", "Test User")
+        GitTestCase.git_in(repo_root, "config", "user.email", "test@example.com")
+        GitTestCase.write_in(repo_root, "app.py", "value = 1\n")
+        GitTestCase.commit_in(repo_root, "Initial")
+        GitTestCase.git_in(repo_root, "branch", "-M", "feature")
+        GitTestCase.git_in(
+            repo_root,
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        )
+        head = GitTestCase.git_in(repo_root, "rev-parse", "HEAD")
+        result_path = control_root / "result.json"
+        request = {
+            "repository": "owner/repo",
+            "request_id": "request-1",
+            "request_sha256": "a" * 64,
+            "pull_request": {
+                "number": 7,
+                "head_sha": head,
+            },
+        }
+        options = SimpleNamespace(
+            result_file=result_path,
+            request_file=control_root / "request.json",
+            prompt_file=control_root / "prompt.txt",
+            input_result_file=None,
+            request=request,
+            model="gpt-5.6-sol",
+            strategy="merge",
+            prior_result=None,
+        )
+
+        def runner(command, **kwargs):
+            if command[0] == "gh":
+                return subprocess.CompletedProcess(command, 0, "owner/repo\n", "")
+            return subprocess.run(command, **kwargs)
+
+        result = CLOUD_MODULE.Result()
+        with (
+            mock.patch.object(CLOUD_MODULE, "require_target_fresh"),
+            mock.patch.object(CLOUD_MODULE, "already_satisfied", return_value=True),
+        ):
+            exit_code = CLOUD_MODULE.execute(
+                options,
+                cwd=repo_root,
+                runner=runner,
+                result=result,
+            )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("success", result.status)
+        self.assertEqual("no_changes", result.application_status)
+        self.assertEqual("owner/repo", result.repository)
+
     def test_repository_root_accepts_one_lf_or_crlf_terminated_path(self):
         for terminator in ("\n", "\r\n"):
             calls = []
