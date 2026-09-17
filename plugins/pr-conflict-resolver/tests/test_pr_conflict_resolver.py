@@ -884,7 +884,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "77abae8c334fd02c13f0e950d0d8c312151fa34adeaf8cea249cd3e80ed27d48",
+            "b80e75b53692b8cba30cec3c237951e87817e62c7c4fe57467cecb68e230e14b",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -2360,7 +2360,7 @@ class StrategyChoiceTest(unittest.TestCase):
             if arguments == ("rev-parse", "HEAD"):
                 return metadata["head_sha"]
             if arguments == ("branch", "--show-current"):
-                return metadata["head_branch"]
+                return ""
             if arguments[0] == "merge-base":
                 return "merge-base"
             raise AssertionError(arguments)
@@ -2419,6 +2419,7 @@ class StrategyChoiceTest(unittest.TestCase):
 
         self.assertEqual("merge", preflight["strategy"])
         self.assertEqual("merge", preflight["strategy_choice"]["strategy"])
+        self.assertEqual("", preflight["identity"]["branch"])
         self.assertEqual("merge", preflight["request"]["strategy"])
         self.assertEqual(
             {
@@ -2507,6 +2508,58 @@ class ManagedRequestStrategyTest(unittest.TestCase):
             "does not allow merge publication",
         ):
             self.validate(request)
+
+
+class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
+    def test_github_identity_uses_the_stable_artifact_directory(self):
+        stale_root = Path("C:/deleted-worktree")
+        with tempfile.TemporaryDirectory() as directory:
+            control_root = Path(directory)
+            calls = []
+
+            def runner(command, **kwargs):
+                calls.append((command, kwargs))
+                if command[:3] == ["git", "rev-parse", "--show-toplevel"]:
+                    return subprocess.CompletedProcess(command, 0, "C:/repo\n", "")
+                if command[0] == "gh":
+                    if kwargs["cwd"] == str(stale_root):
+                        raise OSError(267, "The directory name is invalid")
+                    return subprocess.CompletedProcess(command, 0, "owner/repo\n", "")
+                if command == ["git", "remote"]:
+                    return subprocess.CompletedProcess(command, 0, "origin\n", "")
+                if command[:3] == ["git", "remote", "get-url"]:
+                    return subprocess.CompletedProcess(
+                        command, 0, "https://github.com/owner/repo.git\n", ""
+                    )
+                if command[:4] == [
+                    "git",
+                    "symbolic-ref",
+                    "--quiet",
+                    "--short",
+                ]:
+                    return subprocess.CompletedProcess(command, 0, "feature\n", "")
+                if command == ["git", "rev-parse", "--verify", "HEAD"]:
+                    return subprocess.CompletedProcess(command, 0, f"{'b' * 40}\n", "")
+                if command[:3] == ["git", "status", "--porcelain=v1"]:
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                if command[:3] == ["git", "rev-parse", "--git-path"]:
+                    return subprocess.CompletedProcess(
+                        command, 0, f"missing-{command[-1]}\n", ""
+                    )
+                if command[:3] == ["git", "rev-parse", "--verify"]:
+                    return subprocess.CompletedProcess(command, 1, "", "")
+                self.fail(f"unexpected command: {command}")
+
+            snapshot = CLOUD_MODULE.local_snapshot(
+                runner,
+                stale_root,
+                control_root=control_root,
+                expected_repository="owner/repo",
+            )
+
+        self.assertEqual(control_root, snapshot.control_root)
+        github_calls = [kwargs for command, kwargs in calls if command[0] == "gh"]
+        self.assertEqual([str(control_root)], [call["cwd"] for call in github_calls])
 
 
 class PushSafetyTest(unittest.TestCase):
@@ -3349,6 +3402,52 @@ class CheckoutTest(unittest.TestCase):
     def test_a_detached_head_is_not_read_as_another_line_of_work(self):
         with mock.patch.object(MODULE, "git", return_value=""):
             self.assertIsNone(MODULE.attached_to_other_branch(Path("."), "feature"))
+
+
+class ConflictPreflightIdentityTest(unittest.TestCase):
+    def setUp(self):
+        self.metadata = pr_metadata(
+            head_branch="trask-redis-jedis-2-0-targets",
+            head_sha="df77b87c42407cba6dedfe7019f69f66ff508a1e",
+        )
+
+    def identity(self, branch, head=None):
+        with mock.patch.object(
+            MODULE,
+            "git",
+            side_effect=[
+                head or self.metadata["head_sha"],
+                branch,
+            ],
+        ):
+            return MODULE.conflict_preflight_identity(Path("."), self.metadata)
+
+    def test_exact_pipeline_detached_head_is_accepted(self):
+        self.assertEqual(
+            {
+                "branch": "",
+                "head": "df77b87c42407cba6dedfe7019f69f66ff508a1e",
+                "status": "",
+            },
+            self.identity(""),
+        )
+
+    def test_exact_pull_request_branch_is_accepted(self):
+        self.assertEqual(
+            "trask-redis-jedis-2-0-targets",
+            self.identity("trask-redis-jedis-2-0-targets")["branch"],
+        )
+
+    def test_any_other_branch_or_commit_is_rejected(self):
+        for branch, head in (
+            ("trask-redis-jedis-2-peers", self.metadata["head_sha"]),
+            ("", "f" * 40),
+        ):
+            with self.subTest(branch=branch, head=head), self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "does not match the exact pull request head",
+            ):
+                self.identity(branch, head)
 
 
 class PreflightTest(unittest.TestCase):

@@ -71,7 +71,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "77abae8c334fd02c13f0e950d0d8c312151fa34adeaf8cea249cd3e80ed27d48"
+    "b80e75b53692b8cba30cec3c237951e87817e62c7c4fe57467cecb68e230e14b"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@1"
@@ -7082,6 +7082,25 @@ def fetch_preflight_ref(
         )
 
 
+def conflict_preflight_identity(
+    repo_root: Path, metadata: dict[str, Any]
+) -> dict[str, str]:
+    local_head = git(repo_root, "rev-parse", "HEAD").lower()
+    local_branch = git(repo_root, "branch", "--show-current")
+    if (
+        local_head != metadata["head_sha"].lower()
+        or local_branch not in {"", metadata["head_branch"]}
+    ):
+        raise WorkflowError(
+            "local checkout does not match the exact pull request head"
+        )
+    return {
+        "branch": local_branch,
+        "head": local_head,
+        "status": "",
+    }
+
+
 def conflict_preflight(
     repo_root: Path,
     target: dict[str, Any],
@@ -7099,10 +7118,7 @@ def conflict_preflight(
     require_open_pull_request(metadata)
     checkout_pr_branch(repo_root, target, metadata)
     require_clean_worktree(repo_root)
-    local_head = git(repo_root, "rev-parse", "HEAD").lower()
-    local_branch = git(repo_root, "branch", "--show-current")
-    if local_head != metadata["head_sha"].lower() or local_branch != metadata["head_branch"]:
-        raise WorkflowError("local branch does not match the exact pull request head")
+    identity = conflict_preflight_identity(repo_root, metadata)
     remote = find_remote(repo_root, metadata["repo_name"], push=False)
     fetch_preflight_ref(
         repo_root,
@@ -7304,11 +7320,7 @@ def conflict_preflight(
     return {
         "already_mergeable": False,
         "repository_root": str(repo_root),
-        "identity": {
-            "branch": local_branch,
-            "head": local_head,
-            "status": "",
-        },
+        "identity": identity,
         "pr": metadata,
         "relations": relations,
         "merge_methods": methods,

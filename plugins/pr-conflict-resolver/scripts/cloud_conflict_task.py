@@ -105,6 +105,7 @@ class Options:
 @dataclass(frozen=True)
 class LocalSnapshot:
     root: Path
+    control_root: Path
     repository: str
     remote: str
     branch: str
@@ -1118,14 +1119,31 @@ def operation(runner: Runner, root: Path) -> str | None:
     return None
 
 
-def local_snapshot(runner: Runner, cwd: Path) -> LocalSnapshot:
+def local_snapshot(
+    runner: Runner,
+    cwd: Path,
+    *,
+    control_root: Path,
+    expected_repository: str,
+) -> LocalSnapshot:
     root = Path(git(runner, cwd, "rev-parse", "--show-toplevel")).resolve()
     repository = checked(
         runner,
-        ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
-        cwd=root,
+        [
+            "gh",
+            "repo",
+            "view",
+            expected_repository,
+            "--json",
+            "nameWithOwner",
+            "--jq",
+            ".nameWithOwner",
+        ],
+        cwd=control_root,
     ).strip()
     require_repo(repository, "authenticated repository")
+    if repository.casefold() != expected_repository.casefold():
+        raise ConflictError("authenticated repository changed", "stale_target")
     remote = ""
     for candidate in git(runner, root, "remote").splitlines():
         url = git(runner, root, "remote", "get-url", candidate).strip()
@@ -1159,7 +1177,14 @@ def local_snapshot(runner: Runner, cwd: Path) -> LocalSnapshot:
             "stale_target",
         )
     return LocalSnapshot(
-        root, repository, remote, branch, head, status, current_operation
+        root,
+        control_root,
+        repository,
+        remote,
+        branch,
+        head,
+        status,
+        current_operation,
     )
 
 
@@ -1288,7 +1313,7 @@ def require_target_fresh(
 ) -> None:
     expected = request_pr_as_live(request)
     current = resolve_pr(
-        runner, snapshot.root, expected.repository, expected.number
+        runner, snapshot.control_root, expected.repository, expected.number
     )
     if current != expected:
         raise ConflictError("pull request target changed", "stale_target")
@@ -1303,7 +1328,7 @@ def require_target_fresh(
                 "--json",
                 "mergeCommitAllowed,rebaseMergeAllowed,squashMergeAllowed",
             ],
-            cwd=snapshot.root,
+            cwd=snapshot.control_root,
             code="stale_target",
         ),
         "repository merge-method data",
@@ -1326,7 +1351,7 @@ def require_target_fresh(
                 f"{request['pull_request']['base_sha']}..."
                 f"{request['pull_request']['head_sha']}",
             ],
-            cwd=snapshot.root,
+            cwd=snapshot.control_root,
             code="stale_target",
         ),
         "merge-base data",
@@ -1349,7 +1374,7 @@ def require_target_fresh(
                     f"repos/{request['repository']}/git/ref/heads/"
                     f"{urllib.parse.quote(expected_trunk['ref'], safe='')}",
                 ],
-                cwd=snapshot.root,
+                cwd=snapshot.control_root,
                 code="stale_target",
             ),
             "native stack trunk data",
@@ -1363,7 +1388,7 @@ def require_target_fresh(
         for item in [*stack["members"], *stack["outside_dependents"]]:
             live = resolve_pr(
                 runner,
-                snapshot.root,
+                snapshot.control_root,
                 item["repository"],
                 item["pr_number"],
             )
@@ -1632,7 +1657,7 @@ def start_task(
     return validate_task(
         api_json(
             runner,
-            snapshot.root,
+            snapshot.control_root,
             "POST",
             f"agents/repos/{snapshot.repository}/tasks",
             payload,
@@ -1646,7 +1671,7 @@ def get_task(
     return validate_task(
         api_json(
             runner,
-            snapshot.root,
+            snapshot.control_root,
             "GET",
             f"agents/repos/{snapshot.repository}/tasks/"
             f"{urllib.parse.quote(task_id, safe='')}",
@@ -2636,8 +2661,19 @@ def execute(
     result: Result | None = None,
 ) -> int:
     progress = progress or Progress()
-    snapshot = local_snapshot(runner, cwd)
     request = options.request
+    control_root = options.result_file.parent.resolve()
+    if not control_root.is_dir():
+        raise ConflictError(
+            "result artifact directory is unavailable",
+            "stale_target",
+        )
+    snapshot = local_snapshot(
+        runner,
+        cwd,
+        control_root=control_root,
+        expected_repository=request["repository"],
+    )
     if snapshot.repository != request["repository"]:
         raise ConflictError("request repository does not match cwd", "stale_target")
     for path, description in (
