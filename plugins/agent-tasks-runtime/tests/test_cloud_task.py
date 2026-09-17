@@ -276,6 +276,106 @@ class PolicyPromptTest(unittest.TestCase):
         self.assertIsNone(options.worker_receipt)
 
 
+class PullRequestResolutionTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path.cwd()
+        self.stale_base = "1" * 40
+        self.live_base = "2" * 40
+        self.head = "3" * 40
+        self.metadata = {
+            "number": 7,
+            "url": "https://github.com/owner/repo/pull/7",
+            "state": "OPEN",
+            "baseRefName": "release/next",
+            "baseRefOid": self.stale_base,
+            "headRepository": {"nameWithOwner": "owner/repo"},
+            "headRepositoryOwner": {"login": "owner"},
+            "headRefName": "feature",
+            "headRefOid": self.head,
+            "isCrossRepository": False,
+        }
+
+    def test_uses_live_base_ref_tip_instead_of_stale_base_ref_oid(self):
+        def runner(command, **_kwargs):
+            if command[:3] == ["gh", "pr", "view"]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=json.dumps(self.metadata),
+                    stderr="",
+                )
+            if command[:2] == ["git", "check-ref-format"]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout="",
+                    stderr="",
+                )
+            if command[:2] == ["gh", "api"]:
+                self.assertEqual(
+                    command[2],
+                    "repos/owner/repo/git/ref/heads/release%2Fnext",
+                )
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "ref": "refs/heads/release/next",
+                            "object": {"sha": self.live_base},
+                        }
+                    ),
+                    stderr="",
+                )
+            self.fail(f"unexpected command: {command}")
+
+        pull_request = MODULE.resolve_pull_request(
+            runner,
+            self.root,
+            "owner/repo",
+            MODULE.parse_pr_reference("owner/repo#7"),
+        )
+
+        self.assertEqual(self.live_base, pull_request.base_sha)
+        self.assertNotEqual(self.stale_base, pull_request.base_sha)
+
+    def test_rejects_mismatched_live_base_ref_identity(self):
+        runner = mock.Mock(
+            side_effect=[
+                subprocess.CompletedProcess(
+                    [],
+                    0,
+                    stdout=json.dumps(self.metadata),
+                    stderr="",
+                ),
+                subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+                subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+                subprocess.CompletedProcess(
+                    [],
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "ref": "refs/heads/main",
+                            "object": {"sha": self.live_base},
+                        }
+                    ),
+                    stderr="",
+                ),
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.CloudError,
+            "invalid base branch identity",
+        ):
+            MODULE.resolve_pull_request(
+                runner,
+                self.root,
+                "owner/repo",
+                MODULE.parse_pr_reference("owner/repo#7"),
+            )
+
+
 class InterruptedApplyRecoveryTest(unittest.TestCase):
     def setUp(self):
         self.task_id = "task-1"

@@ -2948,6 +2948,41 @@ def _pr_repository_name(value: object, field: str) -> str:
     raise CloudError(f"GitHub returned invalid {field} repository metadata")
 
 
+def pull_request_base_tip(
+    runner: Runner,
+    root: Path,
+    repository: str,
+    base_ref: str,
+) -> str:
+    encoded_ref = urllib.parse.quote(base_ref, safe="")
+    command = [
+        "gh",
+        "api",
+        f"repos/{repository}/git/ref/heads/{encoded_ref}",
+    ]
+    result = run_process(runner, command, cwd=root)
+    if result.returncode != 0:
+        raise CloudError(_command_error(command, result))
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise CloudError(
+            f"gh returned invalid base branch JSON: {error.msg}"
+        ) from None
+    target = data.get("object") if isinstance(data, dict) else None
+    sha = target.get("sha") if isinstance(target, dict) else None
+    if (
+        not isinstance(data, dict)
+        or data.get("ref") != f"refs/heads/{base_ref}"
+        or not isinstance(sha, str)
+        or SHA_PATTERN.fullmatch(sha) is None
+    ):
+        raise CloudError(
+            f"GitHub returned invalid base branch identity for {base_ref!r}"
+        )
+    return sha.lower()
+
+
 def resolve_pull_request(
     runner: Runner,
     root: Path,
@@ -2992,7 +3027,7 @@ def resolve_pull_request(
     url = data.get("url")
     state = data.get("state")
     base_ref = data.get("baseRefName")
-    base_sha = data.get("baseRefOid")
+    reported_base_sha = data.get("baseRefOid")
     head_ref = data.get("headRefName")
     head_sha = data.get("headRefOid")
     cross_repository = data.get("isCrossRepository")
@@ -3048,9 +3083,15 @@ def resolve_pull_request(
             raise CloudError(
                 f"pull request #{number} has an invalid {name} branch: {value!r}"
             )
-    for name, value in (("base", base_sha), ("head", head_sha)):
+    for name, value in (("base", reported_base_sha), ("head", head_sha)):
         if not isinstance(value, str) or not SHA_PATTERN.fullmatch(value):
             raise CloudError(f"pull request #{number} has an invalid {name} SHA")
+    base_sha = pull_request_base_tip(
+        runner,
+        root,
+        repository,
+        base_ref,
+    )
     return PullRequestSnapshot(
         number,
         url,

@@ -1751,7 +1751,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.24")
+        self.assertEqual(plugin["version"], "1.3.25")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -2302,6 +2302,47 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             MODULE.require_no_credentials(
                 "Authorization: Bearer secret-value",
                 source="test",
+            )
+
+    def test_recovers_base_ref_oid_only_through_the_same_runtime_task(self):
+        retained = self.result()
+        stale_base_ref_oid = "9" * 40
+        retained["pull_request"]["base_sha"] = stale_base_ref_oid
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "does not match the pinned request",
+        ):
+            MODULE.validate_success_result(
+                retained,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+            )
+
+        identity = MODULE.successful_result_runtime_recovery_identity(
+            retained,
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+        )
+
+        self.assertEqual(
+            {
+                "task_id": "task-1",
+                "request_id": "request-1",
+                "generated_branch": "copilot/agent-task",
+                "generated_head": self.artifact,
+            },
+            identity,
+        )
+        altered = copy.deepcopy(retained)
+        altered["pull_request"]["head_sha"] = "8" * 40
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "does not match the pinned request",
+        ):
+            MODULE.successful_result_runtime_recovery_identity(
+                altered,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
             )
 
     def test_rejects_stale_body_and_live_identity_drift(self):

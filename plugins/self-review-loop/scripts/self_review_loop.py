@@ -76,7 +76,7 @@ VALIDATION_SOURCE_NAMES = {
     "tox.ini",
 }
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "ce12f19bd6dd547945e319b2db612533090daa1782f4c3def8ff62cd85cf3c6a"
+    "89af27721dff40933bee1db100fa52eb9fafc65024b342a41a91c7fdee8959f4"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -3052,6 +3052,54 @@ def validate_success_result(
     }
 
 
+def successful_result_runtime_recovery_identity(
+    result: dict[str, Any],
+    *,
+    preflight: dict[str, Any],
+    requested_model: str,
+) -> dict[str, str] | None:
+    expected_pr = expected_cloud_pull_request(preflight)
+    actual_pr = result.get("pull_request")
+    if actual_pr == expected_pr:
+        return None
+    if (
+        not isinstance(actual_pr, dict)
+        or set(actual_pr) != set(expected_pr)
+        or not isinstance(actual_pr.get("base_sha"), str)
+        or SHA_PATTERN.fullmatch(actual_pr["base_sha"]) is None
+        or actual_pr["base_sha"] == expected_pr["base_sha"]
+        or {
+            key: value
+            for key, value in actual_pr.items()
+            if key != "base_sha"
+        }
+        != {
+            key: value
+            for key, value in expected_pr.items()
+            if key != "base_sha"
+        }
+    ):
+        validate_success_result(
+            result,
+            preflight=preflight,
+            requested_model=requested_model,
+        )
+        raise AssertionError("mismatched Agent Task result unexpectedly validated")
+    normalized = copy.deepcopy(result)
+    normalized["pull_request"]["base_sha"] = expected_pr["base_sha"]
+    remote = validate_success_result(
+        normalized,
+        preflight=preflight,
+        requested_model=requested_model,
+    )
+    return {
+        "task_id": remote["task_id"],
+        "request_id": remote["request_id"],
+        "generated_branch": remote["generated_branch"],
+        "generated_head": remote["generated_head"],
+    }
+
+
 def fetch_committed_text(
     repository: str, path: str, commit: str, *, description: str
 ) -> str:
@@ -4463,21 +4511,33 @@ def command_agent_task(args: argparse.Namespace) -> None:
         state = existing
         prior_result = load_agent_task_result(result_path)
         if prior_result.get("status") == "success":
-            prior_task = prior_result.get("task")
-            prior_generated = prior_result.get("generated")
-            resumed_task_id = (
-                prior_task.get("id") if isinstance(prior_task, dict) else None
+            resume_identity = successful_result_runtime_recovery_identity(
+                prior_result,
+                preflight=preflight,
+                requested_model=requested_model,
             )
-            resumed_generated_branch = (
-                prior_generated.get("branch")
-                if isinstance(prior_generated, dict)
-                else None
-            )
-            resumed_generated_head = (
-                prior_generated.get("head_sha")
-                if isinstance(prior_generated, dict)
-                else None
-            )
+            if resume_identity is None:
+                prior_task = prior_result.get("task")
+                prior_generated = prior_result.get("generated")
+                resumed_task_id = (
+                    prior_task.get("id")
+                    if isinstance(prior_task, dict)
+                    else None
+                )
+                resumed_generated_branch = (
+                    prior_generated.get("branch")
+                    if isinstance(prior_generated, dict)
+                    else None
+                )
+                resumed_generated_head = (
+                    prior_generated.get("head_sha")
+                    if isinstance(prior_generated, dict)
+                    else None
+                )
+            else:
+                resumed_task_id = resume_identity["task_id"]
+                resumed_generated_branch = resume_identity["generated_branch"]
+                resumed_generated_head = resume_identity["generated_head"]
         else:
             resume_identity = validate_structural_recovery_result(
                 prior_result,

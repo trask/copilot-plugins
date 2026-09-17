@@ -1,7 +1,7 @@
 {
   "name": "pr-description",
   "description": "Review and update a pull request title and description through a managed GitHub Agent Task.",
-  "version": "1.0.52",
+  "version": "1.0.53",
   "author": {
     "name": "Trask Stalnaker"
   },
