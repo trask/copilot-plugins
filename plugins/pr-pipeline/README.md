@@ -82,7 +82,9 @@ Each stage has a local coordinator. For hosted stages, the local Agent Tasks Run
 
 The CI coordinator owns polling, reruns, stabilization, and snapshot deduplication. Stable means all relevant checks are terminal and the check rollup remains unchanged after debounce. Repeated observations of the same current-head stable final check set do not start another hosted session. It does not deduplicate log content across checks or matrix jobs.
 
-For every failing check, the current coordinator runs `gh run view <run-id> [--job <job-id>] --log-failed --allow-escape-sequences`. It embeds the complete returned standard output for that check and its SHA-256 digest in the worker prompt. There is no cross-matrix log deduplication, truncation, excerpting, or aggregate prompt budget.
+For every failing check, the current coordinator runs `gh run view <run> [--job <job>] --log-failed --allow-escape-sequences`. It stores the complete returned standard output as `failures[].log` with its SHA-256 digest, then JSON-serializes the entire check snapshot into the hosted worker prompt. It does not pass successful-job logs, and `--log-failed` usually limits output to failed steps.
+
+No log compaction exists today. The coordinator does not deduplicate or normalize logs across matrix jobs, truncate them, extract excerpts, or enforce an aggregate prompt byte or token budget. One hundred similar failing matrix jobs can therefore duplicate substantial text in one worker prompt. This is a known scalability gap.
 
 PR Reviewer is a standalone workflow that runs only when invoked directly. PR Pipeline does not call it as a stage or worker. Its local coordinator dispatches one hosted `marketplace-agent-report-worker@1` task for the whole-pull-request authoritative report, verifies the result, and extracts the candidate set against the authoritative diff.
 
