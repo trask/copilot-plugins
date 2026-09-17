@@ -886,7 +886,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "a4adaf76ba30aa6b3c3d9d6f816969cb5284933f650d05cd9c857022b2725c46",
+            "4f2b401eb4ebdc0d4cd3dbdb6fec02177c8e8acac0014b9ca9787c2996af0b73",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -3873,6 +3873,28 @@ class ManagedTaskResultPersistenceTest(unittest.TestCase):
 
 
 class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
+    def test_native_stack_frozen_range_starts_at_its_direct_merge_base(self):
+        snapshot = mock.Mock(root=Path("C:\\repo"))
+        member = {
+            "direct_base_sha": "a" * 40,
+            "direct_merge_base": "b" * 40,
+            "head_sha": "c" * 40,
+            "old_commits": [],
+        }
+        request = {"strategy": "native-stack", "native_stack": {"members": [member]}}
+
+        with mock.patch.object(
+            CLOUD_MODULE, "ordered_commits", return_value=[]
+        ) as ordered:
+            CLOUD_MODULE.verify_frozen_ranges(mock.sentinel.runner, snapshot, request)
+
+        ordered.assert_called_once_with(
+            mock.sentinel.runner,
+            snapshot.root,
+            member["direct_merge_base"],
+            member["head_sha"],
+        )
+
     def test_code_ref_resolves_branch_or_full_sha_after_artifact_fetch(self):
         directory = temporary_directory(self)
         remote = directory / "remote.git"

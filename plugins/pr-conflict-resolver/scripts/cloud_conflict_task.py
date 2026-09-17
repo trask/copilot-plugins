@@ -2605,7 +2605,7 @@ def verify_frozen_ranges(
     else:
         ranges.extend(
             (
-                member["direct_base_sha"],
+                member["direct_merge_base"],
                 member["head_sha"],
                 member["old_commits"],
                 True,
