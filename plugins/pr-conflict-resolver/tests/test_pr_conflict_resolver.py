@@ -884,7 +884,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "3f70fec9a06b1ee98cfc8e7010f4280360a4cc8ce6c8b7452606d41ec89cedf9",
+            "2d59f00443a4fec7f9bd83df69705823d5d42474424225f4048bbbba6049f9fc",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -2629,6 +2629,56 @@ class ManagedRequestStrategyTest(unittest.TestCase):
 
 
 class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
+    def test_repository_root_accepts_one_lf_or_crlf_terminated_path(self):
+        for terminator in ("\n", "\r\n"):
+            calls = []
+
+            def runner(command, **kwargs):
+                calls.append((command, kwargs))
+                return subprocess.CompletedProcess(
+                    command, 0, f"C:/repo{terminator}", ""
+                )
+
+            self.assertEqual(
+                Path("C:/repo").resolve(),
+                CLOUD_MODULE.repository_root(runner, Path("C:/input")),
+            )
+            self.assertEqual(2, len(calls))
+            self.assertEqual(
+                str(Path("C:/repo").resolve()),
+                calls[1][0][2],
+            )
+
+    def test_repository_root_rejects_malformed_path_output(self):
+        for value in (
+            "",
+            "C:/repo",
+            "C:/repo \n",
+            "C:/repo\t\n",
+            "C:/repo\0\n",
+            "C:/repo\nC:/other\n",
+            "C:/repo\n\n",
+        ):
+            with self.subTest(value=repr(value)), self.assertRaises(
+                CLOUD_MODULE.ConflictError
+            ) as failure:
+                CLOUD_MODULE.parse_git_root_output(value)
+            self.assertEqual("stale_target", failure.exception.code)
+
+    def test_repository_root_rejects_a_changed_verified_root(self):
+        outputs = iter(("C:/repo\n", "C:/other\n"))
+
+        def runner(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, next(outputs), "")
+
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError,
+            "repository root changed during preflight",
+        ) as failure:
+            CLOUD_MODULE.repository_root(runner, Path("C:/input"))
+
+        self.assertEqual("stale_target", failure.exception.code)
+
     def test_github_identity_uses_the_stable_artifact_directory(self):
         stale_root = Path("C:/deleted-worktree")
         with tempfile.TemporaryDirectory() as directory:
@@ -2681,8 +2731,19 @@ class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
             )
 
         self.assertEqual(control_root, snapshot.control_root)
+        self.assertEqual(Path("C:/repo").resolve(), snapshot.root)
         github_calls = [kwargs for command, kwargs in calls if command[0] == "gh"]
         self.assertEqual([str(control_root)], [call["cwd"] for call in github_calls])
+        git_calls = [
+            command
+            for command, _ in calls
+            if command[:2] == ["git", "-C"]
+            and command[3:] != ["rev-parse", "--show-toplevel"]
+        ]
+        self.assertTrue(git_calls)
+        self.assertTrue(
+            all(command[2] == str(Path("C:/repo").resolve()) for command in git_calls)
+        )
 
     def test_git_uses_an_explicit_root_from_a_stable_process_directory(self):
         repository_root = Path("C:/app-owned-worktree")

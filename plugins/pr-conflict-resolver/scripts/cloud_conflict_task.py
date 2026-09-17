@@ -1096,6 +1096,45 @@ def git(
     return checked(runner, ["git", *args], cwd=root, code=code)
 
 
+def parse_git_root_output(value: str) -> Path:
+    if value.endswith("\r\n"):
+        path = value[:-2]
+    elif value.endswith("\n"):
+        path = value[:-1]
+    else:
+        raise ConflictError(
+            "git returned a repository root without a terminal line ending",
+            "stale_target",
+        )
+    if (
+        not path
+        or "\0" in path
+        or "\r" in path
+        or "\n" in path
+        or path.endswith((" ", "\t"))
+    ):
+        raise ConflictError(
+            "git returned a malformed repository root",
+            "stale_target",
+        )
+    return Path(path).resolve()
+
+
+def repository_root(runner: Runner, cwd: Path) -> Path:
+    root = parse_git_root_output(
+        git(runner, cwd, "rev-parse", "--show-toplevel")
+    )
+    verified = parse_git_root_output(
+        git(runner, root, "rev-parse", "--show-toplevel")
+    )
+    if verified != root:
+        raise ConflictError(
+            "repository root changed during preflight",
+            "stale_target",
+        )
+    return root
+
+
 def repository_from_url(value: str) -> str:
     patterns = (
         r"https?://github\.com/([^/]+/[^/]+?)(?:\.git)?/?\Z",
@@ -1141,7 +1180,7 @@ def local_snapshot(
     control_root: Path,
     expected_repository: str,
 ) -> LocalSnapshot:
-    root = Path(git(runner, cwd, "rev-parse", "--show-toplevel")).resolve()
+    root = repository_root(runner, cwd)
     repository = checked(
         runner,
         [
