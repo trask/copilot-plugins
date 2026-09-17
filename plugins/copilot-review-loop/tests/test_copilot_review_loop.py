@@ -2030,7 +2030,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.46")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.47")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -3158,6 +3158,98 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                         paths_by_commit={self.fix: ["src/app.py"]},
                     )
 
+    def test_decision_report_recovers_exact_historical_source_fix(self):
+        preflight = copy.deepcopy(self.preflight)
+        preflight["pr"]["head_sha"] = self.fix
+        preflight["identity"]["head"] = self.fix
+        preflight["comment_identities"][0]["line"] = 9
+        finding_key = MODULE.decision_finding_key(
+            preflight["comment_identities"][0]
+        )
+        historical = {
+            "schema": MODULE.HISTORICAL_SOURCE_FIX_SCHEMA,
+            "publication": {
+                "task_id": "session-1",
+                "source_head_sha": self.head,
+                "published_head_sha": self.fix,
+                "completed_at": "2026-09-17T06:33:59Z",
+                "record_sha256": "a" * 64,
+            },
+            "owner": {
+                "run_id": "request-1",
+                "policy": MODULE.LOCAL_DECISION_POLICY,
+                "model": MODULE.LOCAL_DECISION_MODEL,
+                "reasoning_effort": MODULE.LOCAL_DECISION_REASONING_EFFORT,
+                "record_sha256": "b" * 64,
+            },
+            "commits": [
+                {"sha": self.fix, "changed_paths": ["src/app.py"]}
+            ],
+            "findings": [
+                {"finding_key": finding_key, "commit": self.fix}
+            ],
+            "report": {
+                "path": "prior-report.json",
+                "sha256": "c" * 64,
+                "size": 1,
+            },
+            "result": {
+                "path": "prior-result.json",
+                "sha256": "d" * 64,
+                "size": 1,
+            },
+        }
+        decision = {
+            "schema": MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
+            "contract_id": MODULE.decision_report_contract(preflight),
+            "decisions": [
+                {
+                    "finding_key": finding_key,
+                    "disposition": "fixed",
+                    "reason": "The published source commit contains the fix.",
+                    "commit": self.fix,
+                    "reply": "The existing source commit fixes this finding.",
+                    "changed_paths": ["src/app.py"],
+                }
+            ],
+        }
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "fixed comment does not name",
+        ):
+            MODULE.validate_copilot_review_report(
+                json.dumps(decision),
+                request_id="request-1",
+                preflight=preflight,
+                remote={"commits": [], "requires_apply": False},
+                paths_by_commit={},
+            )
+
+        preflight["historical_fixes"] = historical
+        report = MODULE.validate_copilot_review_report(
+            json.dumps(decision),
+            request_id="request-1",
+            preflight=preflight,
+            remote={"commits": [], "requires_apply": False},
+            paths_by_commit={},
+        )
+
+        self.assertEqual("addressed", report["outcome"])
+        self.assertEqual(self.fix, report["comments"][0]["commit"])
+        changed = copy.deepcopy(preflight)
+        changed["historical_fixes"]["findings"][0]["finding_key"] = "e" * 64
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "stale identity",
+        ):
+            MODULE.validate_copilot_review_report(
+                json.dumps(decision),
+                request_id="request-1",
+                preflight=changed,
+                remote={"commits": [], "requires_apply": False},
+                paths_by_commit={},
+            )
+
     def test_exact_v2_path_correlated_report_recovers_applied_local_commits(self):
         result = MODULE.load_agent_task_result(APPLIED_PATH_CORRELATED_V2_RESULT)
         preflight = copy.deepcopy(self.preflight)
@@ -4231,6 +4323,149 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "--publish-prepared-only requires --apply-prepared",
         ):
             MODULE.command_agent_task(arguments)
+
+    def test_historical_source_fix_revalidates_publication_owner(self):
+        report_path = self.directory / "historical-report.json"
+        result_path = self.directory / "historical-result.json"
+        old_report = MODULE.validate_copilot_review_report(
+            self.report([self.fix]),
+            request_id="request-1",
+            preflight=self.preflight,
+            remote={"commits": [self.fix], "requires_apply": False},
+            paths_by_commit={self.fix: ["src/app.py"]},
+        )
+        report_content = MODULE.render_canonical_review_report(old_report)
+        report_path.write_text(report_content, encoding="utf-8", newline="\n")
+        attestation = {
+            "session_id": "session-1",
+            "status": "complete",
+            "startup_model": MODULE.LOCAL_DECISION_MODEL,
+            "startup_reasoning_effort": MODULE.LOCAL_DECISION_REASONING_EFFORT,
+            "observed_models": [MODULE.LOCAL_DECISION_MODEL],
+            "assistant_message_count": 1,
+            "events_path": str(self.directory / "events.jsonl"),
+            "events_sha256": "e" * 64,
+        }
+        result = {
+            "schema": MODULE.LOCAL_DECISION_RESULT_SCHEMA,
+            "status": "success",
+            "validation_complete": True,
+            "producer": "local",
+            "policy": MODULE.LOCAL_DECISION_POLICY,
+            "requested_model": MODULE.LOCAL_DECISION_MODEL,
+            "reasoning_effort": MODULE.LOCAL_DECISION_REASONING_EFFORT,
+            "session_id": "session-1",
+            "run_id": "request-1",
+            "paths_by_commit": {self.fix: ["src/app.py"]},
+            "model_attestation": attestation,
+            "remote": {
+                "commits": [self.fix],
+                "final_local_head": self.fix,
+                "generated_head": self.fix,
+                "requires_apply": False,
+                "report_sha256": MODULE.sha256_file(report_path),
+            },
+        }
+        result_path.write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        publication = {
+            "task_id": "session-1",
+            "source_head_sha": self.head,
+            "published_head_sha": self.fix,
+            "commits": [self.fix],
+            "completed_at": "2026-09-17T06:33:59Z",
+            "scope": "source_only",
+        }
+        paths_checkpoint = [
+            {"commit": self.fix, "paths": ["src/app.py"]}
+        ]
+        owner = {
+            "status": "completed",
+            "run_id": "request-1",
+            "task_id": "session-1",
+            "producer": "local",
+            "policy": MODULE.LOCAL_DECISION_POLICY,
+            "model": MODULE.LOCAL_DECISION_MODEL,
+            "reasoning_effort": MODULE.LOCAL_DECISION_REASONING_EFFORT,
+            "publication_scope": "source_only",
+            "publication_source_head_sha": self.head,
+            "published_head_sha": self.fix,
+            "ordered_commits": [self.fix],
+            "paths_by_commit": paths_checkpoint,
+            "report_sha256": MODULE.sha256_file(report_path),
+            "result_sha256": MODULE.sha256_file(result_path),
+            "canonical_report_file": str(report_path),
+            "result_file": str(result_path),
+            "preparation": {
+                "source_head_sha": self.head,
+                "final_head_sha": self.fix,
+                "generated_head_sha": self.fix,
+                "ordered_commits": [self.fix],
+                "paths_by_commit": paths_checkpoint,
+            },
+            "preflight": copy.deepcopy(self.preflight),
+            "artifacts_preserved": True,
+            "preserved_artifacts": [
+                {
+                    "path": str(report_path),
+                    "sha256": MODULE.sha256_file(report_path),
+                    "size": report_path.stat().st_size,
+                },
+                {
+                    "path": str(result_path),
+                    "sha256": MODULE.sha256_file(result_path),
+                    "size": result_path.stat().st_size,
+                },
+            ],
+        }
+        state = {
+            "source_publication_history": [publication],
+            "managed_task_history": [owner],
+        }
+        current = copy.deepcopy(self.preflight)
+        current["pr"]["head_sha"] = self.fix
+        current["identity"]["head"] = self.fix
+        current["comment_identities"][0]["line"] = 9
+        with (
+            mock.patch.object(
+                MODULE,
+                "validate_local_source_transition",
+                return_value=([self.fix], {self.fix: ["src/app.py"]}),
+            ),
+            mock.patch.object(
+                MODULE,
+                "local_session_model_attestation",
+                return_value=attestation,
+            ),
+        ):
+            historical = MODULE.historical_source_fixes(
+                state,
+                current,
+                self.repo_root,
+            )
+
+        self.assertEqual(
+            [self.fix],
+            [item["sha"] for item in historical["commits"]],
+        )
+        self.assertEqual(
+            MODULE.decision_finding_key(current["comment_identities"][0]),
+            historical["findings"][0]["finding_key"],
+        )
+        changed = copy.deepcopy(state)
+        changed["source_publication_history"][0]["commits"] = ["9" * 40]
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "history entry is malformed",
+        ):
+            MODULE.historical_source_fixes(
+                changed,
+                current,
+                self.repo_root,
+            )
 
     def test_retained_terminal_recovery_accepts_only_pinned_legacy_helper(self):
         state_path = self.directory / "legacy-helper-state.json"

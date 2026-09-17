@@ -139,6 +139,10 @@ TERMINAL_LOCAL_RECOVERY_MANIFEST_SCHEMA = {
     "id": "github.copilot.copilot-review-loop-terminal-local-recovery",
     "version": 1,
 }
+HISTORICAL_SOURCE_FIX_SCHEMA = {
+    "id": "github.copilot.copilot-review-loop-historical-source-fix",
+    "version": 1,
+}
 TERMINAL_LOCAL_RECOVERY_POLICY = (
     "marketplace-terminal-local-review-validator@1"
 )
@@ -3666,6 +3670,159 @@ def apply_verified_import(
     return bool(remote["commits"])
 
 
+def historical_fix_context(
+    preflight: dict[str, Any],
+) -> tuple[list[str], dict[str, list[str]], dict[str, str]]:
+    retained = preflight.get("historical_fixes")
+    if retained is None:
+        return [], {}, {}
+    expected_keys = {
+        "schema",
+        "publication",
+        "owner",
+        "commits",
+        "findings",
+        "report",
+        "result",
+    }
+    if (
+        not isinstance(retained, dict)
+        or set(retained) != expected_keys
+        or retained.get("schema") != HISTORICAL_SOURCE_FIX_SCHEMA
+        or not isinstance(retained.get("commits"), list)
+        or not retained["commits"]
+        or not isinstance(retained.get("findings"), list)
+        or not retained["findings"]
+    ):
+        raise WorkflowError("historical source fix identity is malformed")
+    publication = retained.get("publication")
+    owner = retained.get("owner")
+    if (
+        not isinstance(publication, dict)
+        or set(publication)
+        != {
+            "task_id",
+            "source_head_sha",
+            "published_head_sha",
+            "completed_at",
+            "record_sha256",
+        }
+        or not isinstance(publication.get("task_id"), str)
+        or not publication["task_id"]
+        or not isinstance(publication.get("source_head_sha"), str)
+        or SHA_PATTERN.fullmatch(publication["source_head_sha"]) is None
+        or publication.get("published_head_sha")
+        != preflight["pr"]["head_sha"]
+        or not isinstance(publication.get("completed_at"), str)
+        or not publication["completed_at"]
+        or not isinstance(publication.get("record_sha256"), str)
+        or SHA256_PATTERN.fullmatch(publication["record_sha256"]) is None
+        or not isinstance(owner, dict)
+        or set(owner)
+        != {
+            "run_id",
+            "policy",
+            "model",
+            "reasoning_effort",
+            "record_sha256",
+        }
+        or not isinstance(owner.get("run_id"), str)
+        or not owner["run_id"]
+        or owner.get("policy") != LOCAL_DECISION_POLICY
+        or owner.get("model") != LOCAL_DECISION_MODEL
+        or owner.get("reasoning_effort") != LOCAL_DECISION_REASONING_EFFORT
+        or not isinstance(owner.get("record_sha256"), str)
+        or SHA256_PATTERN.fullmatch(owner["record_sha256"]) is None
+    ):
+        raise WorkflowError("historical source fix publication is malformed")
+    for description in ("report", "result"):
+        artifact = retained.get(description)
+        if (
+            not isinstance(artifact, dict)
+            or set(artifact) != {"path", "sha256", "size"}
+            or not isinstance(artifact.get("path"), str)
+            or not artifact["path"]
+            or not isinstance(artifact.get("sha256"), str)
+            or SHA256_PATTERN.fullmatch(artifact["sha256"]) is None
+            or not isinstance(artifact.get("size"), int)
+            or isinstance(artifact["size"], bool)
+            or artifact["size"] < 1
+        ):
+            raise WorkflowError(
+                f"historical source fix {description} identity is malformed"
+            )
+    commits: list[str] = []
+    paths_by_commit: dict[str, list[str]] = {}
+    for item in retained["commits"]:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"sha", "changed_paths"}
+            or not isinstance(item.get("sha"), str)
+            or SHA_PATTERN.fullmatch(item["sha"]) is None
+            or item["sha"] in paths_by_commit
+            or not isinstance(item.get("changed_paths"), list)
+            or item["changed_paths"] != sorted(set(item["changed_paths"]))
+            or not item["changed_paths"]
+            or any(
+                not isinstance(path, str)
+                or not path
+                or Path(path).is_absolute()
+                or ".." in Path(path).parts
+                for path in item["changed_paths"]
+            )
+        ):
+            raise WorkflowError("historical source fix commits are malformed")
+        commits.append(item["sha"])
+        paths_by_commit[item["sha"]] = item["changed_paths"]
+    findings: dict[str, str] = {}
+    expected_finding_keys = {
+        decision_finding_key(identity)
+        for identity in preflight["comment_identities"]
+    }
+    for item in retained["findings"]:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"finding_key", "commit"}
+            or not isinstance(item.get("finding_key"), str)
+            or SHA256_PATTERN.fullmatch(item["finding_key"]) is None
+            or item["finding_key"] in findings
+            or item.get("commit") not in paths_by_commit
+        ):
+            raise WorkflowError("historical source fix findings are malformed")
+        findings[item["finding_key"]] = item["commit"]
+    if not set(findings) <= expected_finding_keys:
+        raise WorkflowError("historical source fix findings have stale identity")
+    return commits, paths_by_commit, findings
+
+
+def review_fix_context(
+    preflight: dict[str, Any],
+    remote: dict[str, Any],
+    paths_by_commit: dict[str, list[str]],
+) -> tuple[list[str], dict[str, list[str]], dict[str, str]]:
+    historical_commits, historical_paths, historical_findings = (
+        historical_fix_context(preflight)
+    )
+    current_commits = remote.get("commits")
+    if (
+        not isinstance(current_commits, list)
+        or any(
+            not isinstance(commit, str)
+            or SHA_PATTERN.fullmatch(commit) is None
+            for commit in current_commits
+        )
+        or len(current_commits) != len(set(current_commits))
+        or set(current_commits) & set(historical_commits)
+        or set(paths_by_commit) != set(current_commits)
+    ):
+        raise WorkflowError("current and historical fix commits are inconsistent")
+    return (
+        [*historical_commits, *current_commits],
+        {**historical_paths, **paths_by_commit},
+        historical_findings,
+    )
+
+
 def validate_copilot_review_report(
     content: str,
     *,
@@ -3676,6 +3833,11 @@ def validate_copilot_review_report(
 ) -> dict[str, Any]:
     require_no_credentials(content, source="Copilot Review Loop report")
     report = parse_markdown_report(content, description="Copilot Review Loop report")
+    fix_commits, verified_paths, historical_findings = review_fix_context(
+        preflight,
+        remote,
+        paths_by_commit,
+    )
     supplemental_commits: list[str] = []
     if isinstance(report, dict) and set(report) == {
         "contract_id",
@@ -3847,28 +4009,36 @@ def validate_copilot_review_report(
         ) or len(paths) != len(set(paths)):
             raise WorkflowError("Copilot Review Loop report contains invalid paths")
         if item["disposition"] == "fixed":
-            if item.get("commit") not in remote["commits"] or not paths:
+            commit = item.get("commit")
+            if commit not in fix_commits or not paths:
                 raise WorkflowError(
                     "fixed comment does not name a fix commit and paths"
                 )
-            if item["commit"] not in accounted_commits:
-                accounted_commits.append(item["commit"])
+            historical_commit = historical_findings.get(
+                decision_finding_key(expected)
+            )
+            if commit in historical_findings.values() and historical_commit != commit:
+                raise WorkflowError(
+                    "fixed comment does not match its historical publication"
+                )
+            if commit not in accounted_commits:
+                accounted_commits.append(commit)
         elif item.get("commit") is not None or paths:
             raise WorkflowError(
                 "no-change comment must not name a commit or changed path"
             )
     if supplemental_commits:
-        if accounted_commits + supplemental_commits != remote["commits"]:
+        if accounted_commits + supplemental_commits != fix_commits:
             raise WorkflowError(
                 "forward repository report does not account for every fix commit"
             )
-    elif accounted_commits != remote["commits"]:
+    elif accounted_commits != fix_commits:
         raise WorkflowError("report comments do not account for every fix commit")
-    declared: dict[str, set[str]] = {commit: set() for commit in remote["commits"]}
+    declared: dict[str, set[str]] = {commit: set() for commit in fix_commits}
     for item in report["comments"]:
         if item["disposition"] == "fixed":
             declared[item["commit"]].update(item["changed_paths"])
-    for commit, actual_paths in paths_by_commit.items():
+    for commit, actual_paths in verified_paths.items():
         actual = set(actual_paths)
         if commit in supplemental_commits:
             declared_paths = set().union(*declared.values())
@@ -3878,7 +4048,7 @@ def validate_copilot_review_report(
                 )
         elif actual != declared.get(commit, set()):
             raise WorkflowError(f"fix commit {commit} changed unexpected paths")
-    if bool(remote["commits"]) != (report["outcome"] == "addressed"):
+    if bool(fix_commits) != (report["outcome"] == "addressed"):
         raise WorkflowError("report outcome does not match its fix commits")
     return report
 
@@ -3996,7 +4166,11 @@ def normalize_decision_review_report(
             "title_sha256": sha256_text(pr["title"]),
             "body_sha256": sha256_text(pr["body"]),
         },
-        "outcome": "addressed" if remote["commits"] else "no_changes",
+        "outcome": (
+            "addressed"
+            if remote["commits"] or preflight.get("historical_fixes")
+            else "no_changes"
+        ),
         "comments": [
             {
                 **identity,
@@ -5080,6 +5254,255 @@ def validate_local_source_transition(
         paths_by_commit[commit] = paths
         previous = commit
     return commits, paths_by_commit
+
+
+def stable_historical_comment_identity(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value.get(key)
+        for key in (
+            "id",
+            "source",
+            "thread_id",
+            "review_id",
+            "url",
+            "path",
+            "original_line",
+            "body_sha256",
+            "side",
+            "author",
+        )
+    }
+
+
+def historical_source_fixes(
+    state: dict[str, Any],
+    preflight: dict[str, Any],
+    repo_root: Path,
+) -> dict[str, Any] | None:
+    current_head = preflight["pr"]["head_sha"]
+    publications = state.get("source_publication_history", [])
+    if not isinstance(publications, list):
+        raise WorkflowError("source publication history is malformed")
+    matches = [
+        item
+        for item in publications
+        if isinstance(item, dict)
+        and item.get("published_head_sha") == current_head
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise WorkflowError("source publication history is ambiguous")
+    publication = matches[0]
+    commits = publication.get("commits")
+    if (
+        set(publication)
+        != {
+            "task_id",
+            "source_head_sha",
+            "published_head_sha",
+            "commits",
+            "completed_at",
+            "scope",
+        }
+        or publication.get("scope") != "source_only"
+        or not isinstance(publication.get("task_id"), str)
+        or not publication["task_id"]
+        or not isinstance(publication.get("source_head_sha"), str)
+        or SHA_PATTERN.fullmatch(publication["source_head_sha"]) is None
+        or not isinstance(commits, list)
+        or not commits
+        or any(
+            not isinstance(commit, str)
+            or SHA_PATTERN.fullmatch(commit) is None
+            for commit in commits
+        )
+        or len(commits) != len(set(commits))
+        or commits[-1] != current_head
+        or not isinstance(publication.get("completed_at"), str)
+        or not publication["completed_at"]
+    ):
+        raise WorkflowError("source publication history entry is malformed")
+    history = state.get("managed_task_history", [])
+    if not isinstance(history, list):
+        raise WorkflowError("managed task history is malformed")
+    owners = [
+        item
+        for item in history
+        if isinstance(item, dict)
+        and item.get("task_id") == publication["task_id"]
+    ]
+    if len(owners) != 1:
+        raise WorkflowError("source publication owner is missing or ambiguous")
+    owner = owners[0]
+    old_preflight = owner.get("preflight")
+    old_pr = (
+        old_preflight.get("pr")
+        if isinstance(old_preflight, dict)
+        else None
+    )
+    if (
+        owner.get("status") != "completed"
+        or owner.get("producer") != "local"
+        or owner.get("policy") != LOCAL_DECISION_POLICY
+        or owner.get("model") != LOCAL_DECISION_MODEL
+        or owner.get("reasoning_effort") != LOCAL_DECISION_REASONING_EFFORT
+        or owner.get("publication_scope") != "source_only"
+        or owner.get("publication_source_head_sha")
+        != publication["source_head_sha"]
+        or owner.get("published_head_sha") != current_head
+        or owner.get("ordered_commits") != commits
+        or not isinstance(old_pr, dict)
+        or old_pr.get("pr_url") != preflight["pr"]["pr_url"]
+        or old_pr.get("head_branch") != preflight["pr"]["head_branch"]
+        or old_pr.get("head_sha") != publication["source_head_sha"]
+        or old_pr.get("base_branch") != preflight["pr"]["base_branch"]
+        or old_preflight.get("historical_fixes") is not None
+    ):
+        raise WorkflowError("source publication owner identity is malformed")
+    actual_commits, actual_paths = validate_local_source_transition(
+        repo_root,
+        before={
+            "branch": old_pr["head_branch"],
+            "head": publication["source_head_sha"],
+            "status": "",
+        },
+        after={
+            "branch": old_pr["head_branch"],
+            "head": current_head,
+            "status": "",
+        },
+    )
+    paths_checkpoint = [
+        {"commit": commit, "paths": actual_paths[commit]}
+        for commit in actual_commits
+    ]
+    preparation = owner.get("preparation")
+    if (
+        actual_commits != commits
+        or owner.get("paths_by_commit") != paths_checkpoint
+        or not isinstance(preparation, dict)
+        or preparation.get("source_head_sha") != publication["source_head_sha"]
+        or preparation.get("final_head_sha") != current_head
+        or preparation.get("generated_head_sha") != current_head
+        or preparation.get("ordered_commits") != commits
+        or preparation.get("paths_by_commit") != paths_checkpoint
+    ):
+        raise WorkflowError("source publication commit or path identity drifted")
+    validate_preserved_agent_task_artifacts(owner, repo_root)
+    report_path = Path(owner.get("canonical_report_file", ""))
+    result_path = Path(owner.get("result_file", ""))
+    for description, path, digest in (
+        ("report", report_path, owner.get("report_sha256")),
+        ("result", result_path, owner.get("result_sha256")),
+    ):
+        require_outside_repository(path, repo_root)
+        if (
+            not path.is_file()
+            or not isinstance(digest, str)
+            or SHA256_PATTERN.fullmatch(digest) is None
+            or sha256_file(path) != digest
+        ):
+            raise WorkflowError(
+                f"source publication {description} artifact identity drifted"
+            )
+    result = load_json_object(
+        result_path,
+        description="source publication local decision result",
+    )
+    remote = result.get("remote")
+    if (
+        result.get("schema") != LOCAL_DECISION_RESULT_SCHEMA
+        or result.get("status") != "success"
+        or result.get("validation_complete") is not True
+        or result.get("producer") != "local"
+        or result.get("policy") != LOCAL_DECISION_POLICY
+        or result.get("requested_model") != LOCAL_DECISION_MODEL
+        or result.get("reasoning_effort") != LOCAL_DECISION_REASONING_EFFORT
+        or result.get("session_id") != publication["task_id"]
+        or result.get("run_id") != owner.get("run_id")
+        or result.get("paths_by_commit") != actual_paths
+        or not isinstance(remote, dict)
+        or remote.get("commits") != commits
+        or remote.get("final_local_head") != current_head
+        or remote.get("generated_head") != current_head
+        or remote.get("requires_apply") is not False
+        or remote.get("report_sha256") != owner["report_sha256"]
+    ):
+        raise WorkflowError("source publication result identity drifted")
+    if result.get("model_attestation") != local_session_model_attestation(
+        publication["task_id"],
+        require_assistant_message=True,
+    ):
+        raise WorkflowError("source publication model attestation drifted")
+    report_content = report_path.read_text(encoding="utf-8")
+    report = validate_copilot_review_report(
+        report_content,
+        request_id=owner["run_id"],
+        preflight=old_preflight,
+        remote={"commits": commits, "requires_apply": False},
+        paths_by_commit=actual_paths,
+    )
+    if report_content != render_canonical_review_report(report):
+        raise WorkflowError("source publication canonical report drifted")
+    old_comments = {
+        tuple(stable_historical_comment_identity(item).items()): item
+        for item in report["comments"]
+    }
+    findings = []
+    for identity in preflight["comment_identities"]:
+        old = old_comments.get(
+            tuple(stable_historical_comment_identity(identity).items())
+        )
+        if isinstance(old, dict) and old.get("disposition") == "fixed":
+            findings.append(
+                {
+                    "finding_key": decision_finding_key(identity),
+                    "commit": old["commit"],
+                }
+            )
+    if not findings:
+        return None
+    canonical = lambda value: sha256_text(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+    return {
+        "schema": HISTORICAL_SOURCE_FIX_SCHEMA,
+        "publication": {
+            "task_id": publication["task_id"],
+            "source_head_sha": publication["source_head_sha"],
+            "published_head_sha": current_head,
+            "completed_at": publication["completed_at"],
+            "record_sha256": canonical(publication),
+        },
+        "owner": {
+            "run_id": owner["run_id"],
+            "policy": owner["policy"],
+            "model": owner["model"],
+            "reasoning_effort": owner["reasoning_effort"],
+            "record_sha256": canonical(owner),
+        },
+        "commits": [
+            {"sha": commit, "changed_paths": actual_paths[commit]}
+            for commit in commits
+        ],
+        "findings": findings,
+        "report": {
+            "path": str(report_path),
+            "sha256": owner["report_sha256"],
+            "size": report_path.stat().st_size,
+        },
+        "result": {
+            "path": str(result_path),
+            "sha256": owner["result_sha256"],
+            "size": result_path.stat().st_size,
+        },
+    }
 
 
 def render_canonical_review_report(report: dict[str, Any]) -> str:
@@ -6737,6 +7160,17 @@ def recover_terminal_local_preparation(
             frozen_fingerprint=frozen_github,
         )
     )
+    historical_fixes = historical_source_fixes(
+        state,
+        effective_preflight,
+        repo_root,
+    )
+    if historical_fixes is not None:
+        preflight = {**preflight, "historical_fixes": historical_fixes}
+        effective_preflight = {
+            **effective_preflight,
+            "historical_fixes": historical_fixes,
+        }
     model_attestation = local_session_model_attestation(
         task_state["local_session_id"],
         require_assistant_message=True,
@@ -7246,6 +7680,16 @@ def command_agent_task(args: argparse.Namespace) -> None:
             raise WorkflowError(
                 "recovery state has invalid or mismatched local decision identity"
             )
+        retained_historical = preflight.get("historical_fixes")
+        base_preflight = dict(preflight)
+        base_preflight.pop("historical_fixes", None)
+        if (
+            historical_source_fixes(existing, base_preflight, repo_root)
+            != retained_historical
+        ):
+            raise WorkflowError(
+                "recovery state historical source fix identity drifted"
+            )
         prompt_path = Path(task_state.get("prompt_file", ""))
         result_path = Path(task_state.get("result_file", ""))
         decision_path = Path(task_state.get("decision_file", ""))
@@ -7600,6 +8044,9 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     for item in history
                 ):
                     history.append(active)
+        historical_fixes = historical_source_fixes(state, preflight, repo_root)
+        if historical_fixes is not None:
+            preflight["historical_fixes"] = historical_fixes
         state["repo_root"] = str(repo_root)
         state["pr"] = pr
         state["queue"] = {
