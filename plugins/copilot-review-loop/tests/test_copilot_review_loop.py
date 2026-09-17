@@ -1766,42 +1766,58 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.WorkflowError, "contract"):
             self.run_actual_local_worker(write_wrong_contract)
 
-    def test_local_worker_rejects_unexpected_source_ref_mutation(self):
-        unexpected_refs = (
-            "refs/heads/unexpected",
-            "refs/tags/unexpected",
-            "refs/remotes/origin/unexpected",
-            "refs/stash",
-            "refs/notes/unexpected",
-            "refs/replace/" + "a" * 40,
-            "refs/copilot/checkpoint/unexpected",
-            "refs/Copilot/checkpoints/unexpected",
+    def test_local_worker_rejects_checked_out_branch_ref_mismatch(self):
+        mutated = copy.deepcopy(self.source_fingerprint)
+        mutated["refs"]["refs/heads/feature"] = "f" * 40
+        mutated["refs_sha256"] = MODULE.sha256_text(
+            json.dumps(mutated["refs"], separators=(",", ":"), sort_keys=True)
         )
-        for unexpected_ref in unexpected_refs:
-            with self.subTest(ref=unexpected_ref):
-                mutated = copy.deepcopy(self.source_fingerprint)
-                mutated["refs"][unexpected_ref] = "f" * 40
-                mutated["refs_sha256"] = MODULE.sha256_text(
-                    json.dumps(
-                        mutated["refs"],
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    )
-                )
-                MODULE.local_source_fingerprint.return_value = mutated
+        MODULE.local_source_fingerprint.return_value = mutated
 
-                with self.assertRaisesRegex(
-                    MODULE.WorkflowError,
-                    "unexpected Git ref",
-                ):
-                    self.run_actual_local_worker(None)
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "does not own its checked-out branch ref",
+        ):
+            self.run_actual_local_worker(None)
 
-    def test_local_worker_ignores_runtime_checkpoint_ref_creation(self):
-        checkpoint_lines = (
-            f"refs/heads/feature\t{self.head}\n"
-            f"refs/copilot/checkpoints/session/1/a\t{'a' * 40}\n"
-            f"refs/copilot/checkpoints/session/2/b\t{'b' * 40}\n"
+    def test_local_worker_ignores_unattributed_shared_repository_ref_churn(self):
+        before = copy.deepcopy(self.source_fingerprint)
+        before["refs"].update(
+            {
+                "refs/copilot/workspace-diffs/other-session/head": "2" * 40,
+                "refs/heads/other-session": "3" * 40,
+                "refs/prefetch/remotes/origin/other-session": "4" * 40,
+            }
         )
+        before["refs_sha256"] = MODULE.sha256_text(
+            json.dumps(before["refs"], separators=(",", ":"), sort_keys=True)
+        )
+        after = copy.deepcopy(before)
+        del after["refs"]["refs/copilot/workspace-diffs/other-session/head"]
+        del after["refs"]["refs/heads/other-session"]
+        after["refs"]["refs/prefetch/remotes/origin/other-session"] = "5" * 40
+        after["refs"][
+            "refs/prefetch/remotes/origin/new-other-session"
+        ] = "6" * 40
+        after["refs_sha256"] = MODULE.sha256_text(
+            json.dumps(after["refs"], separators=(",", ":"), sort_keys=True)
+        )
+        self.source_fingerprint = before
+        MODULE.local_source_fingerprint.return_value = after
+
+        bundle, _runner, _paths = self.run_actual_local_worker(
+            self.write_valid_local_decision
+        )
+
+        self.assertTrue(bundle["result"]["validation_complete"])
+
+    def test_source_fingerprint_matches_recovery_probe_shape(self):
+        shared_refs = {
+            "refs/heads/feature": self.head,
+            "refs/copilot/workspace-diffs/other-session/head": "2" * 40,
+            "refs/heads/other-session": "3" * 40,
+            "refs/prefetch/remotes/origin/other-session": "4" * 40,
+        }
 
         def git(_root, *arguments):
             if arguments == ("branch", "--show-current"):
@@ -1814,56 +1830,25 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "for-each-ref",
                 "--format=%(refname)%09%(objectname)",
             ):
-                return checkpoint_lines
+                return "\n".join(
+                    f"{name}\t{sha}" for name, sha in shared_refs.items()
+                )
+            if arguments == (
+                "rev-parse",
+                "--verify",
+                "refs/heads/feature",
+            ):
+                return self.head
             raise AssertionError(arguments)
 
-        MODULE.local_source_fingerprint.side_effect = LOCAL_SOURCE_FINGERPRINT
         with mock.patch.object(MODULE, "git", side_effect=git):
-            bundle, _runner, _paths = self.run_actual_local_worker(
-                self.write_valid_local_decision
-            )
-
-        self.assertEqual(self.source_fingerprint, bundle["result"]["source_after"])
-
-    def test_ref_snapshot_ignores_only_exact_runtime_checkpoint_churn(self):
-        protected = {
-            "refs/heads/feature": self.head,
-            "refs/tags/release": "2" * 40,
-            "refs/remotes/origin/feature": "3" * 40,
-            "refs/stash": "4" * 40,
-            "refs/notes/review": "5" * 40,
-            "refs/replace/" + "6" * 40: "7" * 40,
-            "refs/copilot/checkpoint/near-match": "8" * 40,
-            "refs/Copilot/checkpoints/case-match": "9" * 40,
-        }
-        before_checkpoints = {
-            "refs/copilot/checkpoints/session/1/a": "a" * 40,
-            "refs/copilot/checkpoints/session/2/b": "b" * 40,
-        }
-        after_checkpoints = {
-            "refs/copilot/checkpoints/session/1/a": "c" * 40,
-            "refs/copilot/checkpoints/session/3/c": "d" * 40,
-            "refs/copilot/checkpoints/other/4/d": "e" * 40,
+            stored = LOCAL_SOURCE_FINGERPRINT(self.repo_root)
+        projected_probe = {
+            key: stored[key]
+            for key in ("branch", "head", "status", "refs_sha256")
         }
 
-        def lines(refs):
-            return "\n".join(
-                f"{name}\t{sha}" for name, sha in sorted(refs.items())
-            )
-
-        with mock.patch.object(
-            MODULE,
-            "git",
-            side_effect=[
-                lines({**protected, **before_checkpoints}),
-                lines({**protected, **after_checkpoints}),
-            ],
-        ):
-            before = MODULE.git_ref_snapshot(self.repo_root)
-            after = MODULE.git_ref_snapshot(self.repo_root)
-
-        self.assertEqual(protected, before)
-        self.assertEqual(protected, after)
+        self.assertEqual(projected_probe, stored)
 
     def test_local_worker_rejects_github_mutation_before_reading_decisions(self):
         mutated = {**self.github_fingerprint, "reviews_sha256": "f" * 64}
@@ -1966,7 +1951,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.42")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.43")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {

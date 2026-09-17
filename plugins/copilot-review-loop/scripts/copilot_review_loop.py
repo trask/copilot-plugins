@@ -139,7 +139,6 @@ LEGACY_LOCAL_DECISION_RESULT_SCHEMA = {
     "id": "github.copilot.copilot-review-loop-local-result",
     "version": 1,
 }
-IGNORED_RUNTIME_REF_PREFIX = "refs/copilot/checkpoints/"
 LEGACY_AGENT_TASK_POLICY_V4 = {
     "id": "marketplace-agent-worker",
     "version": 4,
@@ -4779,43 +4778,57 @@ def local_identity(repo_root: Path) -> dict[str, str]:
     }
 
 
-def git_ref_snapshot(repo_root: Path) -> dict[str, str]:
-    refs: dict[str, str] = {}
-    value = git(
-        repo_root,
-        "for-each-ref",
-        "--format=%(refname)%09%(objectname)",
-    )
-    for line in value.splitlines():
-        fields = line.split("\t")
-        if (
-            len(fields) != 2
-            or not fields[0]
-            or fields[0] in refs
-            or SHA_PATTERN.fullmatch(fields[1].lower()) is None
-        ):
-            raise WorkflowError("local Git refs have malformed identity")
-        if fields[0].startswith(IGNORED_RUNTIME_REF_PREFIX):
-            continue
-        refs[fields[0]] = fields[1].lower()
-    return refs
-
-
-def local_source_fingerprint(repo_root: Path) -> dict[str, Any]:
-    identity = local_identity(repo_root)
-    refs = git_ref_snapshot(repo_root)
+def local_source_owner_fingerprint(
+    fingerprint: dict[str, Any],
+) -> dict[str, str]:
+    branch = fingerprint.get("branch")
+    head = fingerprint.get("head")
+    status = fingerprint.get("status")
+    if (
+        not isinstance(branch, str)
+        or not branch
+        or not isinstance(head, str)
+        or SHA_PATTERN.fullmatch(head.lower()) is None
+        or not isinstance(status, str)
+    ):
+        raise WorkflowError("local source fingerprint has malformed identity")
+    head = head.lower()
+    branch_ref = f"refs/heads/{branch}"
+    refs = fingerprint.get("refs")
+    if refs is not None and (
+        not isinstance(refs, dict) or refs.get(branch_ref) != head
+    ):
+        raise WorkflowError(
+            "local source fingerprint does not own its checked-out branch ref"
+        )
+    owned_refs = {branch_ref: head}
     return {
-        **identity,
-        "refs": refs,
+        "branch": branch,
+        "head": head,
+        "status": status,
         "refs_sha256": sha256_text(
             json.dumps(
-                refs,
+                owned_refs,
                 ensure_ascii=True,
                 separators=(",", ":"),
                 sort_keys=True,
             )
         ),
     }
+
+
+def local_source_fingerprint(repo_root: Path) -> dict[str, Any]:
+    identity = local_identity(repo_root)
+    branch_ref = f"refs/heads/{identity['branch']}"
+    branch_head = git(repo_root, "rev-parse", "--verify", branch_ref).lower()
+    if (
+        SHA_PATTERN.fullmatch(branch_head) is None
+        or branch_head != identity["head"]
+    ):
+        raise WorkflowError(
+            "checked-out branch ref does not match local HEAD"
+        )
+    return local_source_owner_fingerprint(identity)
 
 
 def github_decision_fingerprint(
@@ -4877,29 +4890,18 @@ def validate_local_source_transition(
     before: dict[str, Any],
     after: dict[str, Any],
 ) -> tuple[list[str], dict[str, list[str]]]:
-    branch = before["branch"]
-    branch_ref = f"refs/heads/{branch}"
+    before_owner = local_source_owner_fingerprint(before)
+    after_owner = local_source_owner_fingerprint(after)
+    branch = before_owner["branch"]
     if (
-        after["branch"] != branch
-        or before["status"]
-        or after["status"]
-        or before["refs"].get(branch_ref) != before["head"]
-        or after["refs"].get(branch_ref) != after["head"]
+        after_owner["branch"] != branch
+        or before_owner["status"]
+        or after_owner["status"]
     ):
         raise WorkflowError(
             "local decision worker changed the branch or working tree unexpectedly"
         )
-    changed_refs = {
-        ref
-        for ref in set(before["refs"]) | set(after["refs"])
-        if before["refs"].get(ref) != after["refs"].get(ref)
-    }
-    expected_changed_refs = (
-        {branch_ref} if before["head"] != after["head"] else set()
-    )
-    if changed_refs != expected_changed_refs:
-        raise WorkflowError("local decision worker changed an unexpected Git ref")
-    if before["head"] == after["head"]:
+    if before_owner["head"] == after_owner["head"]:
         return [], {}
     commits = [
         line
@@ -4907,15 +4909,15 @@ def validate_local_source_transition(
             repo_root,
             "rev-list",
             "--reverse",
-            f"{before['head']}..{after['head']}",
+            f"{before_owner['head']}..{after_owner['head']}",
         ).splitlines()
         if line
     ]
-    if not commits or commits[-1] != after["head"]:
+    if not commits or commits[-1] != after_owner["head"]:
         raise WorkflowError(
             "local decision worker did not produce a linear descendant history"
         )
-    previous = before["head"]
+    previous = before_owner["head"]
     paths_by_commit: dict[str, list[str]] = {}
     for commit in commits:
         parents = git(
@@ -5390,8 +5392,15 @@ def validate_retained_local_decision(
             raise WorkflowError(
                 f"retained local decision {field.replace('_', ' ')} drifted"
             )
-    current_source = local_source_fingerprint(repo_root)
-    if current_source != result.get("source_after"):
+    current_source = local_source_owner_fingerprint(
+        local_source_fingerprint(repo_root)
+    )
+    retained_source = result.get("source_after")
+    if (
+        not isinstance(retained_source, dict)
+        or current_source
+        != local_source_owner_fingerprint(retained_source)
+    ):
         raise WorkflowError("local repository drifted from the retained decision")
     current_github = github_decision_fingerprint(target, preflight)
     if (
