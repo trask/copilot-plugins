@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import importlib.util
 import io
@@ -886,7 +887,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "a117a6ae0c8463e23cf8f1456f75ec67218d77233d18baa0a55ce76db192161a",
+            "555fb75dd1454c43f5bc04c3bb61f57315fb6a53c7594ec1be0880a1fdd08e5d",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -991,7 +992,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
                     "strategy": "merge",
                 },
             ) as preflight,
-            mock.patch.object(MODULE, "emit"),
+            mock.patch.object(MODULE, "emit") as emit,
         ):
             MODULE.command_agent_task(args)
 
@@ -1357,6 +1358,303 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             ),
         ):
             MODULE.command_agent_task(args)
+
+    def test_hash_gated_malformed_completed_task_replacement_archives_owner(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        request_path = directory / "request.json"
+        prompt_path = directory / "prompt.txt"
+        original_result_path = directory / "state--old-owner--result-0.json"
+        resumed_result_path = directory / "state--old-owner--result-1.json"
+        request = self.request()
+        request["request_id"] = "pr-7-0123456789abcdef"
+        request["request_sha256"] = MODULE.request_digest(request)
+        prompt = MODULE.build_conflict_prompt({"request": request})
+        report_path = (
+            f".github/agent-task-conflict-reports/{request['request_id']}.md"
+        )
+        receipt_path = (
+            f".github/agent-task-conflict-receipts/{request['request_id']}.json"
+        )
+        task_id = "13e5e9db-b87a-4864-91e2-da14d1adc96c"
+        result = self.success_result(request)
+        result.update(
+            {
+                "status": "error",
+                "error": {
+                    "code": "unexpected_history",
+                    "message": (
+                        f"git show {'b' * 40}:{receipt_path} failed: fatal: path "
+                        f"{receipt_path!r} does not exist"
+                    ),
+                },
+                "generated": {
+                    "artifact": {
+                        "branch": "copilot/resolve-frozen-conflict",
+                        "head_sha": "b" * 40,
+                        "report": {
+                            "path": report_path,
+                            "commit": "b" * 40,
+                            "sha256": None,
+                        },
+                        "receipt": {
+                            "path": receipt_path,
+                            "commit": "b" * 40,
+                        },
+                    },
+                    "code_refs": [],
+                },
+                "application": {"status": "not_started"},
+                "validation": {"complete": False, "outcomes": []},
+            }
+        )
+        result["task"].update({"id": task_id, "state": "completed"})
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        prompt_path.write_text(prompt, encoding="utf-8")
+        result_text = json.dumps(result)
+        original_result_path.write_text(result_text, encoding="utf-8")
+        resumed_result_path.write_text(result_text, encoding="utf-8")
+        old_owner = {
+            "run_id": "old-owner",
+            "status": "interrupted",
+            "task_id": task_id,
+            "task_id_status": "known",
+            "model": "gpt-5.6-sol",
+            "policy": MODULE.CONFLICT_POLICY,
+            "preflight": {
+                "pr": {
+                    **MODULE.parse_target("owner/repo#7"),
+                    "head_sha": "b" * 40,
+                    "base_sha": "a" * 40,
+                },
+                "request": request,
+                "strategy": "merge",
+                "repository_root": str(directory),
+            },
+            "request_file": str(request_path),
+            "prompt_file": str(prompt_path),
+            "result_file": str(resumed_result_path),
+            "result": result,
+            "resume_attempts": 1,
+            "recovery_files": [
+                str(request_path),
+                str(prompt_path),
+                str(original_result_path),
+                str(resumed_result_path),
+            ],
+            "error": result["error"],
+        }
+        state = {
+            "version": 1,
+            "created_at": "2026-09-17T00:00:00Z",
+            "attempts": 1,
+            "managed_attempts": 1,
+            "managed_task_history": [],
+            "history": [],
+            "escalation": None,
+            "agent_task": old_owner,
+        }
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        state_sha256 = MODULE.sha256_file(state_path)
+        result_sha256 = MODULE.sha256_file(resumed_result_path)
+        task_prompt_sha256 = "3" * 64
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+                "--pipeline-run",
+                "pipeline-1",
+                "--pipeline-iteration",
+                "2",
+                "--pipeline-max-iterations",
+                "3",
+                "--replace-malformed-completed-task",
+                task_id,
+                "--expected-state-sha256",
+                state_sha256,
+                "--expected-malformed-result-sha256",
+                result_sha256,
+                "--expected-malformed-task-prompt-sha256",
+                task_prompt_sha256,
+                "--expected-malformed-request-id",
+                request["request_id"],
+                "--expected-malformed-request-sha256",
+                request["request_sha256"],
+            ]
+        )
+        new_request = copy.deepcopy(request)
+        new_request["request_id"] = "pr-7-fedcba9876543210"
+        new_request["iteration"] = {
+            "id": "pipeline-1-2",
+            "number": 2,
+            "budget": 3,
+        }
+        new_request["request_sha256"] = MODULE.request_digest(new_request)
+        target = MODULE.parse_target("owner/repo#7")
+        preflight = {
+            "already_mergeable": False,
+            "pr": {
+                **target,
+                "head_sha": "b" * 40,
+                "base_sha": "a" * 40,
+            },
+            "strategy": "merge",
+            "request": new_request,
+            "repository_root": str(directory),
+        }
+
+        def reject_after_validating_command(command, **_kwargs):
+            expected = {
+                "--replace-malformed-request-file": request_path,
+                "--replace-malformed-prompt-file": prompt_path,
+                "--replace-malformed-original-result-file": original_result_path,
+                "--replace-malformed-resumed-result-file": resumed_result_path,
+            }
+            for option, path in expected.items():
+                self.assertEqual(str(path), command[command.index(option) + 1])
+            self.assertEqual(
+                task_prompt_sha256,
+                command[
+                    command.index("--expected-malformed-task-prompt-sha256") + 1
+                ],
+            )
+            Path(command[command.index("--result-file") + 1]).write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            return completed(2)
+
+        failed_result = {
+            "status": "error",
+            "task": None,
+            "error": {
+                "code": "policy_rejected",
+                "message": "replacement validation stopped before task creation",
+            },
+        }
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(MODULE, "conflict_preflight", return_value=preflight),
+            mock.patch.object(
+                MODULE, "discover_conflict_task", return_value=directory / "helper.py"
+            ),
+            mock.patch.object(MODULE, "run", side_effect=reject_after_validating_command),
+            mock.patch.object(
+                MODULE, "load_conflict_result", return_value=failed_result
+            ),
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(args)
+
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual([old_owner], saved["managed_task_history"])
+        self.assertEqual(2, saved["managed_attempts"])
+        self.assertEqual(2, saved["attempts"])
+        replacement = saved["agent_task"]["replaces_malformed_completed_task"]
+        self.assertEqual(task_id, replacement["task_id"])
+        self.assertEqual(state_sha256, replacement["state_sha256"])
+        self.assertEqual(result_sha256, replacement["result_sha256"])
+        self.assertEqual("replacement_rejected", saved["agent_task"]["status"])
+        self.assertEqual("not_created", saved["agent_task"]["task_id_status"])
+        payload = emitted(emit)
+        self.assertEqual("recovery_required", payload["result"])
+        self.assertNotIn("retry_command", payload)
+
+    def test_malformed_completed_task_replacement_rejects_changed_resume_result(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        request_path = directory / "request.json"
+        prompt_path = directory / "prompt.txt"
+        original_result_path = directory / "state--old-owner--result-0.json"
+        resumed_result_path = directory / "state--old-owner--result-1.json"
+        request = self.request()
+        request["request_id"] = "pr-7-0123456789abcdef"
+        request["request_sha256"] = MODULE.request_digest(request)
+        prompt = MODULE.build_conflict_prompt({"request": request})
+        task_id = "task-1"
+        result = self.success_result(request)
+        result["status"] = "error"
+        result["error"] = {
+            "code": "unexpected_history",
+            "message": "required receipt does not exist",
+        }
+        result["application"] = {"status": "not_started"}
+        result["validation"] = {"complete": False, "outcomes": []}
+        result["task"]["id"] = task_id
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        prompt_path.write_text(prompt, encoding="utf-8")
+        original_result_path.write_text(json.dumps(result), encoding="utf-8")
+        resumed_result_path.write_text(json.dumps({**result, "extra": True}), encoding="utf-8")
+        state = {
+            "version": 1,
+            "attempts": 1,
+            "managed_attempts": 1,
+            "history": [],
+            "agent_task": {
+                "run_id": "old-owner",
+                "status": "interrupted",
+                "task_id": task_id,
+                "task_id_status": "known",
+                "resume_attempts": 1,
+                "error": result["error"],
+                "result": result,
+                "preflight": {"request": request},
+                "request_file": str(request_path),
+                "prompt_file": str(prompt_path),
+                "result_file": str(resumed_result_path),
+                "recovery_files": [
+                    str(original_result_path),
+                    str(resumed_result_path),
+                ],
+            },
+        }
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+                "--replace-malformed-completed-task",
+                task_id,
+                "--expected-state-sha256",
+                MODULE.sha256_file(state_path),
+                "--expected-malformed-result-sha256",
+                MODULE.sha256_file(resumed_result_path),
+                "--expected-malformed-task-prompt-sha256",
+                "2" * 64,
+                "--expected-malformed-request-id",
+                request["request_id"],
+                "--expected-malformed-request-sha256",
+                request["request_sha256"],
+            ]
+        )
+        before = state_path.read_bytes()
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "require_external_path"),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "artifact identity changed",
+            ),
+        ):
+            MODULE.command_agent_task(args)
+        self.assertEqual(before, state_path.read_bytes())
 
     def test_task_creation_failure_persists_structured_terminal_state(self):
         directory = temporary_directory(self)
@@ -3779,6 +4077,239 @@ class ManagedTaskPromptTest(unittest.TestCase):
             CLOUD_MODULE.start_task(runner, mock.sentinel.snapshot, options)
 
         runner.assert_not_called()
+
+
+class MalformedCompletedReplacementTest(unittest.TestCase):
+    def setUp(self):
+        self.request = ManagedTaskPromptTest().request()
+        self.request["iteration"]["budget"] = 3
+        self.request["request_sha256"] = CLOUD_MODULE.request_digest(self.request)
+        self.prompt = MODULE.build_conflict_prompt({"request": self.request})
+        self.task_id = "13e5e9db-b87a-4864-91e2-da14d1adc96c"
+        report_path, receipt_path = CLOUD_MODULE.artifact_paths(
+            self.request["request_id"]
+        )
+        self.result = {
+            "schema": CLOUD_MODULE.RESULT_SCHEMA,
+            "status": "error",
+            "error": {
+                "code": "unexpected_history",
+                "message": (
+                    f"git show {self.request['pull_request']['head_sha']}:"
+                    f"{receipt_path} failed: fatal: path {receipt_path!r} "
+                    "does not exist"
+                ),
+            },
+            "model": self.request["model"],
+            "policy": CLOUD_MODULE.POLICY,
+            "repository": self.request["repository"],
+            "task": {
+                "id": self.task_id,
+                "url": f"https://github.com/owner/repo/tasks/{self.task_id}",
+                "state": "completed",
+                "base_ref": self.request["pull_request"]["head_sha"],
+                "base_sha": self.request["pull_request"]["head_sha"],
+            },
+            "mode": CLOUD_MODULE.MODE,
+            "strategy": self.request["strategy"],
+            "request": {
+                "id": self.request["request_id"],
+                "sha256": self.request["request_sha256"],
+            },
+            "pull_request": self.request["pull_request"],
+            "generated": {
+                "artifact": {
+                    "branch": "copilot/resolve-frozen-conflict",
+                    "head_sha": self.request["pull_request"]["head_sha"],
+                    "report": {
+                        "path": report_path,
+                        "commit": self.request["pull_request"]["head_sha"],
+                        "sha256": None,
+                    },
+                    "receipt": {
+                        "path": receipt_path,
+                        "commit": self.request["pull_request"]["head_sha"],
+                    },
+                },
+                "code_refs": [],
+            },
+            "application": {"status": "not_started"},
+            "validation": {"complete": False, "outcomes": []},
+        }
+        options = SimpleNamespace(
+            request=self.request,
+            prompt=self.prompt,
+            strategy=self.request["strategy"],
+        )
+        self.task_prompt = CLOUD_MODULE.validated_task_prompt(options)
+        self.replacement = CLOUD_MODULE.MalformedCompletedReplacement(
+            Path("C:\\control\\request.json"),
+            Path("C:\\control\\prompt.txt"),
+            Path("C:\\control\\result-0.json"),
+            Path("C:\\control\\result-1.json"),
+            self.request,
+            self.prompt,
+            self.result,
+            hashlib.sha256(self.task_prompt.encode("utf-8")).hexdigest(),
+        )
+        self.snapshot = mock.Mock(root=Path("C:\\repo"))
+        self.task = {
+            "id": self.task_id,
+            "state": "completed",
+            "artifacts": [
+                {
+                    "provider": "github",
+                    "type": "branch",
+                    "data": {
+                        "base_ref": self.request["pull_request"]["head_sha"],
+                        "head_ref": "copilot/resolve-frozen-conflict",
+                    },
+                }
+            ],
+            "sessions": [
+                {
+                    "task_id": self.task_id,
+                    "state": "completed",
+                    "model": "sweagent-capi:gpt-5.6-sol",
+                    "base_ref": self.request["pull_request"]["head_sha"],
+                    "head_ref": "copilot/resolve-frozen-conflict",
+                    "prompt": self.task_prompt,
+                }
+            ],
+        }
+
+    def validate(self, *, task=None, artifact_sha=None, paths=""):
+        with (
+            mock.patch.object(
+                CLOUD_MODULE,
+                "get_task",
+                return_value=self.task if task is None else task,
+            ),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "fetch_quarantined",
+                return_value=(
+                    "refs/copilot-agent-task/quarantine/request/artifact",
+                    (
+                        self.request["pull_request"]["head_sha"]
+                        if artifact_sha is None
+                        else artifact_sha
+                    ),
+                ),
+            ),
+            mock.patch.object(CLOUD_MODULE, "git", return_value=paths),
+        ):
+            CLOUD_MODULE.validate_malformed_completed_replacement(
+                mock.sentinel.runner,
+                self.snapshot,
+                self.replacement,
+            )
+
+    def test_accepts_exact_completed_task_without_generated_changes(self):
+        self.validate()
+
+    def test_parser_accepts_only_a_complete_byte_identical_replacement_bundle(self):
+        directory = temporary_directory(self)
+        old_request_path = directory / "old-request.json"
+        old_prompt_path = directory / "old-prompt.txt"
+        original_path = directory / "result-0.json"
+        resumed_path = directory / "result-1.json"
+        new_request_path = directory / "new-request.json"
+        new_prompt_path = directory / "new-prompt.txt"
+        result_path = directory / "next-result.json"
+        new_request = copy.deepcopy(self.request)
+        new_request["request_id"] = "request-2"
+        new_request["iteration"] = {
+            "id": "iteration-2",
+            "number": self.request["iteration"]["number"] + 1,
+            "budget": self.request["iteration"]["budget"],
+        }
+        new_request["request_sha256"] = CLOUD_MODULE.request_digest(new_request)
+        old_request_path.write_text(json.dumps(self.request), encoding="utf-8")
+        old_prompt_path.write_text(self.prompt, encoding="utf-8")
+        prior_text = json.dumps(self.result)
+        original_path.write_text(prior_text, encoding="utf-8")
+        resumed_path.write_text(prior_text, encoding="utf-8")
+        new_request_path.write_text(json.dumps(new_request), encoding="utf-8")
+        new_prompt_path.write_text(
+            MODULE.build_conflict_prompt({"request": new_request}),
+            encoding="utf-8",
+        )
+        arguments = [
+            "--conflict-with-report",
+            "--strategy",
+            "merge",
+            "--model",
+            "sol",
+            "--pr",
+            "https://github.com/owner/repo/pull/7",
+            "--request-file",
+            str(new_request_path),
+            "--prompt-file",
+            str(new_prompt_path),
+            "--result-file",
+            str(result_path),
+            "--policy",
+            CLOUD_MODULE.POLICY_SELECTOR,
+            "--replace-malformed-request-file",
+            str(old_request_path),
+            "--replace-malformed-prompt-file",
+            str(old_prompt_path),
+            "--replace-malformed-original-result-file",
+            str(original_path),
+            "--replace-malformed-resumed-result-file",
+            str(resumed_path),
+            "--expected-malformed-task-prompt-sha256",
+            self.replacement.task_prompt_sha256,
+        ]
+
+        parsed = CLOUD_MODULE.parse_args(arguments)
+
+        self.assertEqual(self.result, parsed.replacement.result)
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError,
+            "must be supplied together",
+        ):
+            CLOUD_MODULE.parse_args(arguments[:-2])
+
+    def test_rejects_active_or_ambiguous_task_state(self):
+        for state in ("in_progress", "pending"):
+            with self.subTest(state=state):
+                task = copy.deepcopy(self.task)
+                task["state"] = state
+                with self.assertRaisesRegex(
+                    CLOUD_MODULE.ConflictError,
+                    "not exactly completed",
+                ):
+                    self.validate(task=task)
+
+    def test_rejects_prompt_or_model_drift(self):
+        for field, value in (
+            ("prompt", self.task_prompt + "changed"),
+            ("model", "sweagent-capi:gpt-6-astra"),
+        ):
+            with self.subTest(field=field):
+                task = copy.deepcopy(self.task)
+                task["sessions"][0][field] = value
+                with self.assertRaisesRegex(
+                    CLOUD_MODULE.ConflictError,
+                    "session identity changed",
+                ):
+                    self.validate(task=task)
+
+    def test_rejects_generated_changes_or_contract_paths(self):
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError,
+            "generated repository changes",
+        ):
+            self.validate(artifact_sha="c" * 40)
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError,
+            "artifact paths exist",
+        ):
+            self.validate(
+                paths=CLOUD_MODULE.artifact_paths(self.request["request_id"])[1]
+            )
 
 
 class ManagedTaskResultPersistenceTest(unittest.TestCase):

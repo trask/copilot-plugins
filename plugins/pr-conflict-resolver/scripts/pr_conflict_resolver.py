@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "a117a6ae0c8463e23cf8f1456f75ec67218d77233d18baa0a55ce76db192161a"
+    "555fb75dd1454c43f5bc04c3bb61f57315fb6a53c7594ec1be0880a1fdd08e5d"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@1"
@@ -8413,6 +8413,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
     iteration_budget = args.pipeline_max_iterations or args.max_iterations
     replaced_task: dict[str, Any] | None = None
     replacement_identity: dict[str, str] | None = None
+    malformed_replacement: dict[str, str] | None = None
     if args.expected_state_sha256 is not None:
         if not re.fullmatch(r"[0-9a-f]{64}", args.expected_state_sha256):
             raise WorkflowError("expected state hash must be lowercase SHA-256")
@@ -8449,6 +8450,149 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "run_id": args.replace_unidentified_owner,
             "state_sha256": args.expected_state_sha256,
             "basis": "operator-verified-no-hosted-task",
+        }
+    malformed_values = (
+        args.replace_malformed_completed_task,
+        args.expected_malformed_result_sha256,
+        args.expected_malformed_task_prompt_sha256,
+        args.expected_malformed_request_id,
+        args.expected_malformed_request_sha256,
+    )
+    if any(value is not None for value in malformed_values):
+        if not all(value is not None for value in malformed_values):
+            raise WorkflowError(
+                "malformed completed replacement options must be supplied together"
+            )
+        if args.resume or args.replace_unidentified_owner is not None:
+            raise WorkflowError(
+                "malformed completed replacement cannot be combined with another "
+                "recovery mode"
+            )
+        if args.expected_state_sha256 is None:
+            raise WorkflowError(
+                "malformed completed replacement requires --expected-state-sha256"
+            )
+        for value, description in (
+            (
+                args.expected_malformed_result_sha256,
+                "expected malformed result hash",
+            ),
+            (
+                args.expected_malformed_task_prompt_sha256,
+                "expected malformed task prompt hash",
+            ),
+            (
+                args.expected_malformed_request_sha256,
+                "expected malformed request hash",
+            ),
+        ):
+            if not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise WorkflowError(f"{description} must be lowercase SHA-256")
+        if not re.fullmatch(
+            r"pr-[1-9][0-9]*-[0-9a-f]{16}",
+            args.expected_malformed_request_id,
+        ):
+            raise WorkflowError("expected malformed request ID is invalid")
+        active = existing.get("agent_task") if isinstance(existing, dict) else None
+        error = active.get("error") if isinstance(active, dict) else None
+        result = active.get("result") if isinstance(active, dict) else None
+        result_task = result.get("task") if isinstance(result, dict) else None
+        preflight = active.get("preflight") if isinstance(active, dict) else None
+        request = preflight.get("request") if isinstance(preflight, dict) else None
+        if (
+            not isinstance(active, dict)
+            or active.get("status") != "interrupted"
+            or active.get("task_id")
+            != args.replace_malformed_completed_task
+            or active.get("task_id_status") != "known"
+            or not isinstance(active.get("resume_attempts"), int)
+            or active["resume_attempts"] < 1
+            or not isinstance(error, dict)
+            or error.get("code") != "unexpected_history"
+            or not isinstance(result, dict)
+            or result.get("status") != "error"
+            or result.get("application") != {"status": "not_started"}
+            or result.get("validation") != {"complete": False, "outcomes": []}
+            or not isinstance(result_task, dict)
+            or result_task.get("id")
+            != args.replace_malformed_completed_task
+            or result_task.get("state") != "completed"
+            or not isinstance(request, dict)
+            or request.get("request_id")
+            != args.expected_malformed_request_id
+            or request.get("request_sha256")
+            != args.expected_malformed_request_sha256
+        ):
+            raise WorkflowError(
+                "replacement owner is not an exact malformed completed task"
+            )
+        run_id = active.get("run_id")
+        request_path_value = active.get("request_file")
+        prompt_path_value = active.get("prompt_file")
+        resumed_path_value = active.get("result_file")
+        recovery_files = active.get("recovery_files")
+        if (
+            not isinstance(run_id, str)
+            or not isinstance(request_path_value, str)
+            or not isinstance(prompt_path_value, str)
+            or not isinstance(resumed_path_value, str)
+            or not isinstance(recovery_files, list)
+        ):
+            raise WorkflowError("malformed completed replacement files are incomplete")
+        request_path = Path(request_path_value)
+        prompt_path = Path(prompt_path_value)
+        resumed_path = Path(resumed_path_value)
+        original_path = state_path.with_name(
+            f"{state_path.stem}--{run_id}--result-0.json"
+        )
+        try:
+            retained_request = json.loads(request_path.read_text(encoding="utf-8"))
+            retained_result = json.loads(resumed_path.read_text(encoding="utf-8"))
+            retained_prompt = prompt_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError, json.JSONDecodeError) as artifact_error:
+            raise WorkflowError(
+                "malformed completed replacement artifacts are unreadable: "
+                f"{artifact_error}"
+            ) from artifact_error
+        if (
+            any(
+                not path.is_file()
+                for path in (
+                    request_path,
+                    prompt_path,
+                    original_path,
+                    resumed_path,
+                )
+            )
+            or str(original_path) not in recovery_files
+            or str(resumed_path) not in recovery_files
+            or original_path.read_bytes() != resumed_path.read_bytes()
+            or sha256_file(resumed_path)
+            != args.expected_malformed_result_sha256
+            or retained_request != request
+            or retained_result != result
+            or retained_prompt != build_conflict_prompt(preflight)
+        ):
+            raise WorkflowError(
+                "malformed completed replacement artifact identity changed"
+            )
+        replaced_task = active
+        replacement_identity = {
+            "run_id": run_id,
+            "task_id": args.replace_malformed_completed_task,
+            "state_sha256": args.expected_state_sha256,
+            "request_id": args.expected_malformed_request_id,
+            "request_sha256": args.expected_malformed_request_sha256,
+            "result_sha256": args.expected_malformed_result_sha256,
+            "task_prompt_sha256": args.expected_malformed_task_prompt_sha256,
+            "basis": "completed-task-with-no-generated-commit",
+        }
+        malformed_replacement = {
+            "request_file": str(request_path),
+            "prompt_file": str(prompt_path),
+            "original_result_file": str(original_path),
+            "resumed_result_file": str(resumed_path),
+            "task_prompt_sha256": args.expected_malformed_task_prompt_sha256,
         }
     if args.resume:
         if existing is None or not isinstance(existing.get("agent_task"), dict):
@@ -8522,24 +8666,29 @@ def command_agent_task(args: argparse.Namespace) -> None:
             else args.max_iterations
         )
         if iteration_number > iteration_budget:
-            emit(
-                {
-                    "result": "max_iterations_reached",
-                    "state": str(state_path),
-                    "task_id": None,
-                    "completed_managed_iterations": prior_managed_attempts,
-                    "attempted_iteration": iteration_number,
-                    "iteration_budget": iteration_budget,
-                    "retry_command": managed_retry_command(
+            payload = {
+                "result": "max_iterations_reached",
+                "state": str(state_path),
+                "task_id": None,
+                "completed_managed_iterations": prior_managed_attempts,
+                "attempted_iteration": iteration_number,
+                "iteration_budget": iteration_budget,
+                "stage_outcome": "escalated",
+            }
+            if malformed_replacement is None:
+                payload["retry_command"] = managed_retry_command(
                         args,
                         repo_root=repo_root,
                         target=target,
                         state_path=state_path,
                         next_budget=iteration_number,
-                    ),
-                    "stage_outcome": "escalated",
-                }
-            )
+                )
+            else:
+                payload["next_action"] = (
+                    "A new hash-gated malformed-task replacement authorization "
+                    "is required."
+                )
+            emit(payload)
             return
         run_id = secrets.token_hex(8)
         iteration_id = (
@@ -8583,7 +8732,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
             },
         }
         if replacement_identity is not None:
-            state["agent_task"]["replaces_unidentified_owner"] = replacement_identity
+            replacement_field = (
+                "replaces_malformed_completed_task"
+                if malformed_replacement is not None
+                else "replaces_unidentified_owner"
+            )
+            state["agent_task"][replacement_field] = replacement_identity
         save_state(state_path, state)
         try:
             preflight = conflict_preflight(
@@ -8598,7 +8752,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
             )
         except NativeStackNormalizationRequired as error:
             task = state["agent_task"]
-            task["status"] = "normalization_required"
+            task["status"] = (
+                "replacement_rejected"
+                if malformed_replacement is not None
+                else "normalization_required"
+            )
             task["normalization"] = error.manifest
             task["normalization_sha256"] = error.manifest_sha256
             task["error"] = {
@@ -8606,57 +8764,74 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "message": str(error),
             }
             save_state(state_path, state)
-            emit(
-                {
-                    "result": "normalization_required",
-                    "state": str(state_path),
-                    "task_id": None,
-                    "task_id_status": "not_created",
-                    "error": task["error"],
-                    "normalization": error.manifest,
-                    "normalization_sha256": error.manifest_sha256,
-                    "retry_command": managed_retry_command(
+            payload = {
+                "result": (
+                    "recovery_required"
+                    if malformed_replacement is not None
+                    else "normalization_required"
+                ),
+                "state": str(state_path),
+                "task_id": None,
+                "task_id_status": "not_created",
+                "error": task["error"],
+                "normalization": error.manifest,
+                "normalization_sha256": error.manifest_sha256,
+                "next_action": (
+                    "Use a fresh local owner session to linearize the named "
+                    "stack member without pushing, preserving every linear "
+                    "commit and each recorded merge-resolution intent. "
+                    "A new exact replacement authorization is required afterward."
+                ),
+                "stage_outcome": "escalated",
+            }
+            if malformed_replacement is None:
+                payload["retry_command"] = managed_retry_command(
                         args,
                         repo_root=repo_root,
                         target=target,
                         state_path=state_path,
                         next_budget=iteration_budget,
-                    ),
-                    "next_action": (
-                        "Use a fresh local owner session to linearize the named "
-                        "stack member without pushing, preserving every linear "
-                        "commit and each recorded merge-resolution intent. "
-                        "Re-run this command only after reviewing that local result."
-                    ),
-                    "stage_outcome": "escalated",
-                }
-            )
+                )
+            emit(payload)
             return
         except (WorkflowError, json.JSONDecodeError, OSError) as error:
             task = state["agent_task"]
-            task["status"] = "failed"
+            task["status"] = (
+                "replacement_rejected"
+                if malformed_replacement is not None
+                else "failed"
+            )
             task["error"] = {
                 "code": "conflict_preflight_failed",
                 "message": str(error),
             }
             save_state(state_path, state)
-            emit(
-                {
-                    "result": "task_creation_failed",
-                    "state": str(state_path),
-                    "task_id": None,
-                    "task_id_status": "not_created",
-                    "error": task["error"],
-                    "retry_command": managed_retry_command(
+            payload = {
+                "result": (
+                    "recovery_required"
+                    if malformed_replacement is not None
+                    else "task_creation_failed"
+                ),
+                "state": str(state_path),
+                "task_id": None,
+                "task_id_status": "not_created",
+                "error": task["error"],
+                "stage_outcome": "escalated",
+            }
+            if malformed_replacement is None:
+                payload["retry_command"] = managed_retry_command(
                         args,
                         repo_root=repo_root,
                         target=target,
                         state_path=state_path,
                         next_budget=iteration_budget,
-                    ),
-                    "stage_outcome": "escalated",
-                }
-            )
+                )
+            else:
+                payload["next_action"] = (
+                    "A new hash-gated malformed-task replacement authorization "
+                    "is required."
+                )
+            emit(payload)
             return
         except BaseException as error:
             task = state["agent_task"]
@@ -8668,6 +8843,31 @@ def command_agent_task(args: argparse.Namespace) -> None:
             save_state(state_path, state)
             raise
         if preflight["already_mergeable"]:
+            if malformed_replacement is not None:
+                task = state["agent_task"]
+                task["status"] = "replacement_rejected"
+                task["error"] = {
+                    "code": "replacement_target_already_satisfied",
+                    "message": (
+                        "malformed completed replacement target no longer "
+                        "requires conflict work"
+                    ),
+                }
+                save_state(state_path, state)
+                emit(
+                    {
+                        "result": "recovery_required",
+                        "state": str(state_path),
+                        "task_id": None,
+                        "task_id_status": "not_created",
+                        "error": task["error"],
+                        "next_action": (
+                            "A new hash-gated pipeline authorization is required."
+                        ),
+                        "stage_outcome": "escalated",
+                    }
+                )
+                return
             archive_attempt(state)
             attempt_number = int(state.get("attempts", 0)) + 1
             state["attempts"] = attempt_number
@@ -8745,6 +8945,13 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 str(result_path),
             ],
         }
+        if replacement_identity is not None:
+            replacement_field = (
+                "replaces_malformed_completed_task"
+                if malformed_replacement is not None
+                else "replaces_unidentified_owner"
+            )
+            state["agent_task"][replacement_field] = replacement_identity
         save_state(state_path, state)
         input_result_path = None
     task = state["agent_task"]
@@ -8771,6 +8978,21 @@ def command_agent_task(args: argparse.Namespace) -> None:
     ]
     if input_result_path is not None:
         command.extend(["--input-result-file", str(input_result_path)])
+    if malformed_replacement is not None:
+        command.extend(
+            [
+                "--replace-malformed-request-file",
+                malformed_replacement["request_file"],
+                "--replace-malformed-prompt-file",
+                malformed_replacement["prompt_file"],
+                "--replace-malformed-original-result-file",
+                malformed_replacement["original_result_file"],
+                "--replace-malformed-resumed-result-file",
+                malformed_replacement["resumed_result_file"],
+                "--expected-malformed-task-prompt-sha256",
+                malformed_replacement["task_prompt_sha256"],
+            ]
+        )
     task["helper_command"] = command
     task["status"] = "running"
     save_state(state_path, state)
@@ -8925,13 +9147,25 @@ def command_agent_task(args: argparse.Namespace) -> None:
             if isinstance(result.get("task"), dict)
             else None
         )
-        task["status"] = "interrupted" if task_id else "failed"
+        task["status"] = (
+            "interrupted"
+            if task_id
+            else (
+                "replacement_rejected"
+                if malformed_replacement is not None
+                else "failed"
+            )
+        )
         task["task_id"] = task_id
         task["task_id_status"] = "known" if task_id else "not_created"
         task["error"] = {"code": code, "message": message}
         save_state(state_path, state)
         payload = {
-            "result": "recovery_required" if task_id else "task_creation_failed",
+            "result": (
+                "recovery_required"
+                if task_id or malformed_replacement is not None
+                else "task_creation_failed"
+            ),
             "state": str(state_path),
             "task_id": task_id,
             "task_id_status": task["task_id_status"],
@@ -8946,13 +9180,18 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 f"{json.dumps(str(repo_root))} --state {json.dumps(str(state_path))} "
                 f"--model {args.model} --resume"
             )
-        else:
+        elif malformed_replacement is None:
             payload["retry_command"] = managed_retry_command(
                 args,
                 repo_root=repo_root,
                 target=target,
                 state_path=state_path,
                 next_budget=iteration_budget,
+            )
+        else:
+            payload["next_action"] = (
+                "A new hash-gated malformed-task replacement authorization "
+                "is required."
             )
         emit(payload)
         return
@@ -9002,6 +9241,11 @@ def build_parser() -> argparse.ArgumentParser:
     agent_task.add_argument("--pipeline-max-iterations", type=int)
     agent_task.add_argument("--resume", action="store_true")
     agent_task.add_argument("--replace-unidentified-owner")
+    agent_task.add_argument("--replace-malformed-completed-task")
+    agent_task.add_argument("--expected-malformed-result-sha256")
+    agent_task.add_argument("--expected-malformed-task-prompt-sha256")
+    agent_task.add_argument("--expected-malformed-request-id")
+    agent_task.add_argument("--expected-malformed-request-sha256")
     agent_task.add_argument("--expected-state-sha256")
     agent_task.set_defaults(function=command_agent_task)
 

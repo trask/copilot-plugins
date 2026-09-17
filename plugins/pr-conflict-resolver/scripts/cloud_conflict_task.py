@@ -97,6 +97,18 @@ class ConflictError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class MalformedCompletedReplacement:
+    request_file: Path
+    prompt_file: Path
+    original_result_file: Path
+    resumed_result_file: Path
+    request: Mapping[str, object]
+    prompt: str
+    result: Mapping[str, object]
+    task_prompt_sha256: str
+
+
+@dataclass(frozen=True)
 class Options:
     strategy: str
     model: str
@@ -108,6 +120,7 @@ class Options:
     request: Mapping[str, object]
     prompt: str
     prior_result: Mapping[str, object] | None
+    replacement: MalformedCompletedReplacement | None = None
 
 
 @dataclass(frozen=True)
@@ -767,6 +780,11 @@ def parse_args(args: Sequence[str]) -> Options:
         "--prompt-file",
         "--result-file",
         "--input-result-file",
+        "--replace-malformed-request-file",
+        "--replace-malformed-prompt-file",
+        "--replace-malformed-original-result-file",
+        "--replace-malformed-resumed-result-file",
+        "--expected-malformed-task-prompt-sha256",
         "--policy",
     }
     while index < len(args):
@@ -783,7 +801,14 @@ def parse_args(args: Sequence[str]) -> Options:
             raise ConflictError(f"{token} requires one value", "policy_rejected")
         values[token] = args[index + 1]
         index += 2
-    required = flags | (options - {"--input-result-file"})
+    replacement_options = {
+        "--replace-malformed-request-file",
+        "--replace-malformed-prompt-file",
+        "--replace-malformed-original-result-file",
+        "--replace-malformed-resumed-result-file",
+        "--expected-malformed-task-prompt-sha256",
+    }
+    required = flags | (options - {"--input-result-file"} - replacement_options)
     missing = sorted(required - values.keys())
     if missing:
         raise ConflictError(
@@ -810,6 +835,10 @@ def parse_args(args: Sequence[str]) -> Options:
         "--prompt-file",
         "--result-file",
         "--input-result-file",
+        "--replace-malformed-request-file",
+        "--replace-malformed-prompt-file",
+        "--replace-malformed-original-result-file",
+        "--replace-malformed-resumed-result-file",
     ):
         raw = values.get(name)
         path = Path(str(raw)) if raw is not None else None
@@ -838,6 +867,89 @@ def parse_args(args: Sequence[str]) -> Options:
         if paths["--input-result-file"] is not None
         else None
     )
+    supplied_replacement = replacement_options & values.keys()
+    if supplied_replacement and supplied_replacement != replacement_options:
+        raise ConflictError(
+            "malformed completed replacement options must be supplied together",
+            "policy_rejected",
+        )
+    if supplied_replacement and prior is not None:
+        raise ConflictError(
+            "malformed completed replacement cannot resume a prior result",
+            "policy_rejected",
+        )
+    replacement = None
+    if supplied_replacement:
+        expected_prompt_sha256 = str(
+            values["--expected-malformed-task-prompt-sha256"]
+        )
+        if not SHA256_RE.fullmatch(expected_prompt_sha256):
+            raise ConflictError(
+                "expected malformed task prompt hash is invalid",
+                "policy_rejected",
+            )
+        replacement_request_data = read_json_file(
+            paths["--replace-malformed-request-file"],
+            "replacement request file",
+        )
+        replacement_request = validate_request(
+            replacement_request_data,
+            expected_strategy=strategy,
+            expected_model=MODEL_IDS[alias],
+            expected_pr_url=pr_url,
+        )
+        replacement_prompt = read_external_text(
+            paths["--replace-malformed-prompt-file"],
+            "replacement prompt file",
+        )
+        original_path = paths["--replace-malformed-original-result-file"]
+        resumed_path = paths["--replace-malformed-resumed-result-file"]
+        if original_path.read_bytes() != resumed_path.read_bytes():
+            raise ConflictError(
+                "malformed task resume results are not byte-identical",
+                "malformed_result",
+            )
+        replacement_result = validate_prior_result(
+            read_json_file(resumed_path, "replacement resumed result file"),
+            replacement_request,
+        )
+        validate_prior_result(
+            read_json_file(original_path, "replacement original result file"),
+            replacement_request,
+        )
+        comparable_keys = set(request) - {
+            "request_id",
+            "request_sha256",
+            "iteration",
+        }
+        if any(
+            request[key] != replacement_request[key]
+            for key in comparable_keys
+        ):
+            raise ConflictError(
+                "malformed completed replacement request identity changed",
+                "policy_rejected",
+            )
+        old_iteration = replacement_request["iteration"]
+        new_iteration = request["iteration"]
+        if (
+            new_iteration["number"] != old_iteration["number"] + 1
+            or new_iteration["budget"] != old_iteration["budget"]
+        ):
+            raise ConflictError(
+                "malformed completed replacement iteration is invalid",
+                "policy_rejected",
+            )
+        replacement = MalformedCompletedReplacement(
+            paths["--replace-malformed-request-file"],
+            paths["--replace-malformed-prompt-file"],
+            original_path,
+            resumed_path,
+            replacement_request,
+            replacement_prompt,
+            replacement_result,
+            expected_prompt_sha256,
+        )
     return Options(
         strategy,
         MODEL_IDS[alias],
@@ -849,6 +961,7 @@ def parse_args(args: Sequence[str]) -> Options:
         request,
         prompt,
         prior,
+        replacement,
     )
 
 
@@ -2073,6 +2186,143 @@ def validated_task_prompt(options: Options) -> str:
     return prompt
 
 
+def validate_malformed_completed_replacement(
+    runner: Runner,
+    snapshot: LocalSnapshot,
+    replacement: MalformedCompletedReplacement,
+) -> None:
+    request = replacement.request
+    result = replacement.result
+    task_result = result["task"]
+    report_path, receipt_path = artifact_paths(request["request_id"])
+    recorded_artifact = result["generated"]["artifact"]
+    expected_artifact = {
+        "branch": recorded_artifact["branch"],
+        "head_sha": request["pull_request"]["head_sha"],
+        "report": {
+            "path": report_path,
+            "commit": request["pull_request"]["head_sha"],
+            "sha256": None,
+        },
+        "receipt": {
+            "path": receipt_path,
+            "commit": request["pull_request"]["head_sha"],
+        },
+    }
+    error = result["error"]
+    if (
+        result["status"] != "error"
+        or error["code"] != "unexpected_history"
+        or receipt_path not in error["message"]
+        or "does not exist" not in error["message"]
+        or result["generated"]
+        != {"artifact": expected_artifact, "code_refs": []}
+        or result["application"] != {"status": "not_started"}
+        or result["validation"] != {"complete": False, "outcomes": []}
+        or task_result["state"] != "completed"
+    ):
+        raise ConflictError(
+            "replacement result is not an exact malformed completed task",
+            "policy_rejected",
+        )
+    prompt_options = Options(
+        request["strategy"],
+        request["model"],
+        request["pull_request"]["url"],
+        replacement.request_file,
+        replacement.prompt_file,
+        replacement.resumed_result_file,
+        None,
+        request,
+        replacement.prompt,
+        None,
+    )
+    expected_prompt = validated_task_prompt(prompt_options)
+    if (
+        hashlib.sha256(expected_prompt.encode("utf-8")).hexdigest()
+        != replacement.task_prompt_sha256
+    ):
+        raise ConflictError(
+            "replacement task prompt hash does not match",
+            "policy_rejected",
+        )
+    task = get_task(runner, snapshot, task_result["id"])
+    sessions = task.get("sessions")
+    if (
+        task["state"] != "completed"
+        or not isinstance(sessions, list)
+        or len(sessions) != 1
+        or not isinstance(sessions[0], dict)
+    ):
+        raise ConflictError(
+            "replacement Agent Task is not exactly completed",
+            "task_failed",
+        )
+    session = sessions[0]
+    if (
+        session.get("task_id") != task_result["id"]
+        or session.get("state") != "completed"
+        or session.get("model") != f"sweagent-capi:{request['model']}"
+        or session.get("base_ref") != request["pull_request"]["head_sha"]
+        or session.get("prompt") != expected_prompt
+    ):
+        raise ConflictError(
+            "replacement Agent Task session identity changed",
+            "task_failed",
+        )
+    remote_artifact = discover_artifact_ref(task, request)
+    expected_task_artifacts = [
+        {
+            "provider": "github",
+            "type": "branch",
+            "data": {
+                "base_ref": request["pull_request"]["head_sha"],
+                "head_ref": remote_artifact.ref,
+            },
+        }
+    ]
+    if (
+        remote_artifact.ref != recorded_artifact["branch"]
+        or task.get("artifacts") != expected_task_artifacts
+        or session.get("head_ref") != remote_artifact.ref
+    ):
+        raise ConflictError(
+            "replacement Agent Task artifact identity changed",
+            "task_failed",
+        )
+    _, artifact_sha = fetch_quarantined(
+        runner,
+        snapshot,
+        remote_artifact,
+        request["request_id"],
+    )
+    if artifact_sha != request["pull_request"]["head_sha"]:
+        raise ConflictError(
+            "replacement Agent Task generated repository changes",
+            "unexpected_history",
+        )
+    artifact_paths_present = [
+        value
+        for value in git(
+            runner,
+            snapshot.root,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            artifact_sha,
+            "--",
+            report_path,
+            receipt_path,
+        ).splitlines()
+        if value
+    ]
+    if artifact_paths_present:
+        raise ConflictError(
+            "replacement Agent Task artifact paths exist",
+            "unexpected_history",
+        )
+
+
 def start_task(
     runner: Runner, snapshot: LocalSnapshot, options: Options
 ) -> Mapping[str, object]:
@@ -3251,6 +3501,7 @@ def execute(
 ) -> int:
     progress = progress or Progress()
     request = options.request
+    replacement = getattr(options, "replacement", None)
     control_root = options.result_file.parent.resolve()
     if not control_root.is_dir():
         raise ConflictError(
@@ -3273,6 +3524,38 @@ def execute(
         (options.prompt_file, "--prompt-file"),
         (options.result_file, "--result-file"),
         (options.input_result_file, "--input-result-file"),
+        (
+            (
+                replacement.request_file
+                if replacement is not None
+                else None
+            ),
+            "--replace-malformed-request-file",
+        ),
+        (
+            (
+                replacement.prompt_file
+                if replacement is not None
+                else None
+            ),
+            "--replace-malformed-prompt-file",
+        ),
+        (
+            (
+                replacement.original_result_file
+                if replacement is not None
+                else None
+            ),
+            "--replace-malformed-original-result-file",
+        ),
+        (
+            (
+                replacement.resumed_result_file
+                if replacement is not None
+                else None
+            ),
+            "--replace-malformed-resumed-result-file",
+        ),
     ):
         if path is None:
             continue
@@ -3316,6 +3599,14 @@ def execute(
     verify_frozen_ranges(runner, snapshot, request)
     require_target_fresh(runner, snapshot, request)
     require_local_unchanged(runner, snapshot)
+    if replacement is not None:
+        validate_malformed_completed_replacement(
+            runner,
+            snapshot,
+            replacement,
+        )
+        require_target_fresh(runner, snapshot, request)
+        require_local_unchanged(runner, snapshot)
     if options.prior_result is not None:
         task_id = options.prior_result["task"]["id"]
         initial = get_task(runner, snapshot, task_id)
