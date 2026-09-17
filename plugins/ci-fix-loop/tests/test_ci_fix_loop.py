@@ -932,9 +932,12 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "conclusion": "FAILURE",
             "baseline_conclusion": "SUCCESS",
             "baseline_verdict": "pr_caused",
-            "log": "AssertionError: expected 2\n",
+            "log_path": str(self.root / "failed.log"),
             "log_sha256": MODULE.sha256_text("AssertionError: expected 2\n"),
         }
+        (self.root / "failed.log").write_bytes(
+            b"AssertionError: expected 2\n"
+        )
         snapshot = {
             "head_sha": self.head,
             "base_sha": self.base,
@@ -973,6 +976,31 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "stack_guard": None,
             "check_snapshot": snapshot,
         }
+        summary = (
+            f"{MODULE.triage_identity_line(self.preflight)}\n"
+            "The test failure is the root failure.\n"
+        )
+
+        def fake_triage(**kwargs):
+            kwargs["summary_path"].write_text(summary, encoding="utf-8")
+            kwargs["result_path"].write_text("{}\n", encoding="utf-8")
+            return summary
+
+        self.triage_worker = mock.patch.object(
+            MODULE, "run_local_triage_worker", side_effect=fake_triage
+        )
+        self.retained_triage = mock.patch.object(
+            MODULE, "validate_retained_local_triage", return_value=summary
+        )
+        self.github_fingerprint = mock.patch.object(
+            MODULE, "github_triage_fingerprint", return_value={"state": "pinned"}
+        )
+        self.triage_worker_mock = self.triage_worker.start()
+        self.retained_triage_mock = self.retained_triage.start()
+        self.github_fingerprint.start()
+        self.addCleanup(self.triage_worker.stop)
+        self.addCleanup(self.retained_triage.stop)
+        self.addCleanup(self.github_fingerprint.stop)
 
     def result(self, commits=None):
         commits = [] if commits is None else commits
@@ -1092,7 +1120,6 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     {
                         "key": failure["key"],
                         "name": failure["name"],
-                        "log_sha256": failure["log_sha256"],
                         "disposition": disposition,
                         "reason": "The focused test proves the result.",
                         "commits": commits if disposition == "fixed" else [],
@@ -1168,7 +1195,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.23", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.24", json.loads(PLUGIN.read_text())["version"])
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -1185,6 +1212,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             iteration_allowance=1,
             prior_history=[],
             requested_model="gpt-5.6-sol",
+            triage_summary=(
+                f"{MODULE.triage_identity_line(self.preflight)}\n"
+                "The test failure is the root failure.\n"
+            ),
         )
         self.assertIn("human-readable UTF-8 Markdown report", prompt)
         self.assertIn("sole repository worker", prompt)
@@ -1193,7 +1224,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn('"iteration_allowance": 1', prompt)
         self.assertIn("Never select a marketplace `custom_agent`", prompt)
         self.assertIn("use Cloud Sandboxes", prompt)
-        self.assertIn("worker prompt version 3", prompt)
+        self.assertIn("worker prompt version 4", prompt)
+        self.assertNotIn("AssertionError: expected 2", prompt)
         self.assertIn("Never replace a check key with a numeric database ID", prompt)
         self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
         self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
@@ -1201,6 +1233,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
     def test_failed_log_download_is_scoped_to_the_exact_job(self):
         check = self.preflight["check_snapshot"]["failures"][0]
+        destination = self.root.parent / f"{self.root.name}-download.log"
+        self.addCleanup(destination.unlink, missing_ok=True)
         completed = MODULE.subprocess.CompletedProcess(
             ["gh"], 0, "focused failure log\n", ""
         )
@@ -1208,11 +1242,43 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(MODULE, "resolve_run_id", return_value=1),
             mock.patch.object(MODULE, "run", return_value=completed) as run,
         ):
-            content = MODULE.fetch_failed_check_log(self.preflight["pr"], check)
+            content = MODULE.fetch_failed_check_log(
+                self.preflight["pr"],
+                check,
+                destination=destination,
+                repo_root=self.root,
+            )
 
         self.assertEqual("focused failure log\n", content)
+        self.assertEqual(content, destination.read_text(encoding="utf-8"))
         self.assertIn("--job", run.call_args.args[0])
         self.assertIn("2", run.call_args.args[0])
+        self.assertNotIn("--allow-escape-sequences", run.call_args.args[0])
+
+    def test_failed_log_download_error_never_includes_raw_output(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        completed = MODULE.subprocess.CompletedProcess(
+            ["gh"],
+            1,
+            "RAW FAILURE LOG THAT MUST STAY OUT OF THE ERROR\n",
+            "authentication failed\n",
+        )
+        with (
+            mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+            mock.patch.object(MODULE, "run", return_value=completed),
+            self.assertRaises(MODULE.WorkflowError) as raised,
+        ):
+            MODULE.fetch_failed_check_log(self.preflight["pr"], check)
+
+        message = str(raised.exception)
+        self.assertNotIn("RAW FAILURE LOG", message)
+        self.assertNotIn("authentication failed", message)
+        self.assertIn("exit status 1", message)
+        self.assertIn(
+            f"stdout bytes={len(completed.stdout.encode('utf-8'))}",
+            message,
+        )
+        self.assertIn(MODULE.sha256_text(completed.stdout), message)
 
     def test_external_status_context_never_resolves_an_actions_job(self):
         check = {
@@ -1283,6 +1349,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             )
         )
         payload["schema"] = MODULE.LEGACY_CI_FIX_REPORT_SCHEMA
+        payload["failures"][0]["log_sha256"] = self.preflight["check_snapshot"][
+            "failures"
+        ][0]["log_sha256"]
         payload["failures"][0]["commit"] = payload["failures"][0].pop("commits")[0]
 
         report = self.validate_report(
@@ -1292,6 +1361,34 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
         self.assertEqual(MODULE.CI_FIX_REPORT_SCHEMA, report["schema"])
         self.assertEqual([commit], report["failures"][0]["fix_commits"])
+
+    def test_accepts_legacy_v3_report_for_retained_task_recovery(self):
+        payload = json.loads(self.report())
+        payload["schema"] = MODULE.LEGACY_CI_FIX_REPORT_SCHEMA_V3
+        payload["failures"][0]["log_sha256"] = self.preflight["check_snapshot"][
+            "failures"
+        ][0]["log_sha256"]
+
+        report = self.validate_report(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        )
+
+        self.assertEqual(MODULE.CI_FIX_REPORT_SCHEMA, report["schema"])
+
+    def test_current_report_may_omit_cascading_failures(self):
+        second = copy.deepcopy(self.preflight["check_snapshot"]["failures"][0])
+        second.update(
+            {
+                "key": "check:CI/integration",
+                "name": "integration",
+                "log_path": str(self.root / "integration.log"),
+            }
+        )
+        self.preflight["check_snapshot"]["failures"].append(second)
+
+        report = self.validate_report(self.report())
+
+        self.assertEqual(["check:CI/test"], [item["key"] for item in report["failures"]])
 
     def test_accepts_exact_policy_v3_compact_external_check_report(self):
         preflight, remote = self.compact_report_context()
@@ -1713,7 +1810,11 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(
                 MODULE, "resolve_target", return_value={"repo_name": "owner/repo", "number": 7}
             ),
-            mock.patch.object(MODULE, "agent_task_preflight", return_value=preflight),
+            mock.patch.object(
+                MODULE,
+                "agent_task_preflight",
+                return_value=preflight,
+            ),
             mock.patch.object(MODULE, "discover_cloud_task", return_value=self.root / "cloud_task.py"),
             mock.patch.object(MODULE, "run", side_effect=run_helper),
             mock.patch.object(MODULE, "local_identity", return_value=preflight["identity"]),
@@ -1756,8 +1857,16 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         state_path = self.root / "state.json"
         preflight = copy.deepcopy(self.preflight)
         preflight["repository_root"] = str(repo)
+        log_directory = self.root / "state--ci-fix-logs--retry"
+        log_path = log_directory / "failed.log"
+        preflight["check_snapshot"]["failures"][0]["log_path"] = str(log_path)
         failed = self.taskless_failure()
         helper_commands = []
+
+        def preflight_for_retry(*_args, **_kwargs):
+            log_directory.mkdir(exist_ok=True)
+            log_path.write_bytes(b"AssertionError: expected 2\n")
+            return preflight
 
         def run_helper(command, **kwargs):
             helper_commands.append(command)
@@ -1783,7 +1892,11 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 "resolve_target",
                 return_value={"repo_name": "owner/repo", "number": 7},
             ),
-            mock.patch.object(MODULE, "agent_task_preflight", return_value=preflight),
+            mock.patch.object(
+                MODULE,
+                "agent_task_preflight",
+                side_effect=preflight_for_retry,
+            ),
             mock.patch.object(
                 MODULE,
                 "discover_cloud_task",
@@ -1805,10 +1918,67 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
         self.assertEqual(2, len(helper_commands))
         self.assertNotIn("--resume", helper_commands[1])
+        self.assertEqual(1, self.triage_worker_mock.call_count)
+        self.assertEqual(1, self.retained_triage_mock.call_count)
         state = MODULE.load_state(state_path)
         self.assertEqual(1, state["iterations"])
         self.assertEqual("not_created", state["agent_task"]["task_id_status"])
         self.assertEqual(1, len(state["managed_task_history"]))
+
+    def test_taskless_retry_exemption_requires_the_same_stable_snapshot(self):
+        task = {"preflight": copy.deepcopy(self.preflight)}
+        changed = copy.deepcopy(self.preflight)
+        changed["check_snapshot"]["sha256"] = "9" * 64
+
+        self.assertTrue(MODULE.task_matches_preflight(task, self.preflight))
+        self.assertFalse(MODULE.task_matches_preflight(task, changed))
+
+    def test_local_triage_failure_dispatches_no_hosted_task(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        state_path = self.root / "state.json"
+        preflight = copy.deepcopy(self.preflight)
+        preflight["repository_root"] = str(repo)
+        self.triage_worker_mock.side_effect = MODULE.WorkflowError(
+            "triage failed"
+        )
+        arguments = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                self.preflight["pr"]["pr_url"],
+                "--repo-root",
+                str(repo),
+                "--state",
+                str(state_path),
+            ]
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value={"repo_name": "owner/repo", "number": 7},
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=preflight
+            ),
+            mock.patch.object(
+                MODULE, "local_identity", return_value=preflight["identity"]
+            ),
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
+            mock.patch.object(MODULE, "discover_cloud_task") as discover,
+            self.assertRaisesRegex(MODULE.WorkflowError, "triage failed"),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        discover.assert_not_called()
+        state = MODULE.load_state(state_path)
+        self.assertEqual("failed", state["agent_task"]["status"])
+        self.assertEqual(
+            "not_created", state["agent_task"]["task_id_status"]
+        )
+        self.assertIn("retry_command", state["agent_task"])
 
     def test_managed_fix_publishes_only_the_verified_fix_commit(self):
         repo = self.root / "repo"
@@ -1999,7 +2169,12 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 f"2026-01-01T00:00:0{iteration}Z"
             )
             log = f"AssertionError: attempt {iteration}\n"
+            log_path = self.root / f"failed-{iteration}.log"
+            log_path.write_bytes(log.encode("utf-8"))
             preflight["check_snapshot"]["failures"][0]["log"] = log
+            preflight["check_snapshot"]["failures"][0]["log_path"] = str(
+                log_path
+            )
             preflight["check_snapshot"]["failures"][0]["log_sha256"] = (
                 MODULE.sha256_text(log)
             )
@@ -2010,9 +2185,6 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             report_payload["pull_request"]["check_snapshot_sha256"] = preflight[
                 "check_snapshot"
             ]["sha256"]
-            report_payload["failures"][0]["log_sha256"] = preflight[
-                "check_snapshot"
-            ]["failures"][0]["log_sha256"]
             report = json.dumps(report_payload, separators=(",", ":"), sort_keys=True)
             result = self.result()
             result["report"]["sha256"] = MODULE.sha256_text(report)
@@ -2132,7 +2304,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             debounce_seconds=0,
             stack_state=None,
         )
-        state_path = self.root / "coordinator.json"
+        state_path = self.root.parent / f"{self.root.name}-coordinator.json"
+        self.addCleanup(state_path.unlink, missing_ok=True)
         with (
             mock.patch.object(
                 MODULE,
@@ -2233,7 +2406,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
 
     def test_check_detail_failure_retains_pinned_identity(self):
-        state_path = self.root / "coordinator.json"
+        state_path = self.root.parent / f"{self.root.name}-detail.json"
+        self.addCleanup(state_path.unlink, missing_ok=True)
         pr = {
             **self.preflight["pr"],
             "upstream_owner": "owner",
@@ -2254,6 +2428,11 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "started_at": "2026-09-16T07:55:00Z",
             "completed_at": None,
             "description": "zizmor found an issue",
+        }
+        external_second = {
+            **external,
+            "key": "status:zizmor-secondary",
+            "name": "zizmor-secondary",
         }
         passed = {
             **external,
@@ -2277,6 +2456,16 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "role_name": "write",
         }
         identity = self.preflight["identity"]
+        download_attempts = 0
+
+        def fetch_log(_pr, _check, destination, **_kwargs):
+            nonlocal download_attempts
+            download_attempts += 1
+            if download_attempts == 1:
+                MODULE.atomic_write_text(destination, "first failure\n")
+                return "first failure\n"
+            raise MODULE.WorkflowError("check detail lookup failed")
+
         with (
             mock.patch.object(MODULE, "git", return_value=""),
             mock.patch.object(MODULE, "metadata_for", return_value=pr),
@@ -2288,7 +2477,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 MODULE, "gh_json", side_effect=[repository, {"login": "viewer"}]
             ),
             mock.patch.object(
-                MODULE, "fetch_rollup", return_value=(self.head, [passed, external])
+                MODULE,
+                "fetch_rollup",
+                return_value=(self.head, [passed, external, external_second]),
             ),
             mock.patch.object(
                 MODULE,
@@ -2296,7 +2487,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 return_value={
                     "decision": "failures",
                     "reason": "checks_failed",
-                    "checks": [external["key"]],
+                    "checks": [external["key"], external_second["key"]],
                     "pending_checks": [],
                     "detail": "zizmor failed",
                 },
@@ -2305,7 +2496,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "fetch_failed_check_log",
-                side_effect=MODULE.WorkflowError("check detail lookup failed"),
+                side_effect=fetch_log,
             ),
             self.assertRaisesRegex(MODULE.WorkflowError, "check detail lookup failed"),
         ):
@@ -2322,6 +2513,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertEqual(str(self.root), state["repo_root"])
         self.assertEqual(identity, state["preflight_identity"])
         self.assertEqual("preflighting", state["coordinator"]["status"])
+        self.assertEqual(
+            [],
+            list(state_path.parent.glob(f"{state_path.stem}--ci-fix-logs-*")),
+        )
 
     def test_local_coordinator_resumes_waiting_and_dispatches_each_new_snapshot_once(self):
         first = copy.deepcopy(self.preflight)
@@ -2439,11 +2634,13 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                         "baseline_conclusion": None,
                         "baseline_verdict": "unknown",
                         "log": "",
+                        "log_path": str(self.root / "external-failure.log"),
                         "log_sha256": MODULE.sha256_text(""),
                     }
                 ],
             }
         )
+        (self.root / "external-failure.log").write_bytes(b"")
         preflight["check_snapshot"]["rollup_sha256"] = MODULE.sha256_text(
             json.dumps(
                 preflight["check_snapshot"]["rollup"],
@@ -2659,6 +2856,373 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
         self.assertFalse(state_path.exists())
         self.assertTrue(all(not artifact.exists() for artifact in (prompt, result, recovery)))
+
+
+class LocalCiLogTriageTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "repo"
+        self.root.mkdir()
+        self.artifacts = Path(self.temporary.name) / "artifacts"
+        self.artifacts.mkdir()
+        self.log_path = self.artifacts / "failure.log"
+        self.log_text = "FAILED test_widget.py::test_value\nAssertionError: 2 != 3\n"
+        self.log_path.write_text(self.log_text, encoding="utf-8", newline="")
+        failure = {
+            "key": "check:CI/test",
+            "kind": "check_run",
+            "name": "test",
+            "workflow": "CI",
+            "url": "https://github.com/owner/repo/actions/runs/1/job/2",
+            "conclusion": "FAILURE",
+            "baseline_conclusion": "SUCCESS",
+            "baseline_verdict": "pr_caused",
+            "log_path": str(self.log_path),
+            "log_sha256": MODULE.sha256_text(self.log_text),
+        }
+        snapshot = {
+            "head_sha": "1" * 40,
+            "base_sha": "2" * 40,
+            "observed_at": "2026-01-01T00:00:00Z",
+            "rollup": [],
+            "rollup_sha256": MODULE.sha256_text("[]"),
+            "decision": {
+                "decision": "failures",
+                "reason": "checks_failed",
+                "checks": [failure["key"]],
+                "detail": "test failed",
+            },
+            "failures": [failure],
+        }
+        snapshot["sha256"] = MODULE.check_snapshot_sha256(snapshot)
+        self.preflight = {
+            "repository_root": str(self.root),
+            "identity": {"branch": "feature", "head": "1" * 40, "status": ""},
+            "pr": {
+                "repo_name": "owner/repo",
+                "number": 7,
+                "head_sha": "1" * 40,
+                "base_sha": "2" * 40,
+                "pr_url": "https://github.com/owner/repo/pull/7",
+                "base_branch": "main",
+                "head_repository": "owner/repo",
+                "head_branch": "feature",
+            },
+            "check_snapshot": snapshot,
+        }
+        self.summary = (
+            f"{MODULE.triage_identity_line(self.preflight)}\n"
+            "The unit-test assertion is the root failure.\n"
+        )
+
+    def test_prompt_references_log_file_without_embedding_log_text(self):
+        summary_path = self.artifacts / "summary.md"
+
+        prompt = MODULE.build_triage_prompt(
+            self.preflight, summary_path=summary_path
+        )
+
+        self.assertIn(json.dumps(str(self.log_path)), prompt)
+        self.assertIn("rg or grep", prompt)
+        self.assertIn("bounded line ranges", prompt)
+        self.assertNotIn(self.log_text, prompt)
+
+    def test_materialized_workspace_contains_only_pinned_logs(self):
+        state_path = Path(self.temporary.name) / "state.json"
+        state_path.write_text('{"coordinator":"private"}\n', encoding="utf-8")
+
+        workspace = MODULE.materialize_local_triage_workspace(
+            self.preflight,
+            state_path=state_path,
+            run_id="run-1",
+        )
+
+        moved_log = Path(
+            self.preflight["check_snapshot"]["failures"][0]["log_path"]
+        )
+        self.assertEqual(workspace, moved_log.parent)
+        self.assertEqual([moved_log], list(workspace.iterdir()))
+        self.assertFalse(self.log_path.exists())
+        self.assertNotEqual(state_path.parent, workspace)
+
+    def test_summary_is_bounded_nonempty_and_snapshot_bound(self):
+        summary_path = self.artifacts / "summary.md"
+        summary_path.write_text(self.summary, encoding="utf-8", newline="")
+        self.assertEqual(
+            self.summary,
+            MODULE.validate_triage_summary(summary_path, self.preflight),
+        )
+
+        invalid = {
+            "empty": "",
+            "stale": "<!-- ci-fix-loop-triage-v1 snapshot=bad head=bad -->\ntext\n",
+            "marker only": f"{MODULE.triage_identity_line(self.preflight)}\n",
+            "reserved boundary": (
+                f"{MODULE.triage_identity_line(self.preflight)}\n"
+                f"{MODULE.TRIAGE_SUMMARY_BOUNDARIES[1]}\n"
+            ),
+            "oversized": (
+                f"{MODULE.triage_identity_line(self.preflight)}\n"
+                + "x" * MODULE.MAX_TRIAGE_SUMMARY_BYTES
+            ),
+        }
+        for name, content in invalid.items():
+            with self.subTest(name=name):
+                summary_path.write_text(content, encoding="utf-8", newline="")
+                with self.assertRaises(MODULE.WorkflowError):
+                    MODULE.validate_triage_summary(summary_path, self.preflight)
+
+    def test_hosted_prompt_receives_summary_unchanged_and_no_raw_log(self):
+        prompt = MODULE.build_worker_prompt(
+            self.preflight,
+            iteration_allowance=1,
+            prior_history=[],
+            requested_model="gpt-5.6-sol",
+            triage_summary=self.summary,
+        )
+
+        start = "----- BEGIN LOCAL CI TRIAGE SUMMARY -----\n"
+        end = "----- END LOCAL CI TRIAGE SUMMARY -----\n"
+        handed_off = prompt.split(start, 1)[1].split(end, 1)[0]
+        self.assertEqual(self.summary, handed_off)
+        self.assertNotIn(self.log_text, prompt)
+        self.assertNotIn(str(self.log_path), prompt)
+
+    def test_local_worker_uses_default_agent_and_verified_artifacts(self):
+        prompt_path = self.artifacts / "prompt.txt"
+        summary_path = self.artifacts / "summary.md"
+        result_path = self.artifacts / "result.json"
+        prompt_path.write_text(
+            MODULE.build_triage_prompt(
+                self.preflight, summary_path=summary_path
+            ),
+            encoding="utf-8",
+            newline="",
+        )
+        summary_path.write_text(self.summary, encoding="utf-8", newline="")
+        identity = self.preflight["identity"]
+        github = {"pull_request": "pinned"}
+        attestation = {"session_id": "session-1", "events_sha256": "a" * 64}
+        completed = MODULE.subprocess.CompletedProcess(["copilot"], 0, "", "")
+        with (
+            mock.patch.object(MODULE, "run", return_value=completed) as run,
+            mock.patch.object(MODULE, "local_identity", return_value=identity),
+            mock.patch.object(
+                MODULE, "github_triage_fingerprint", return_value=github
+            ),
+            mock.patch.object(
+                MODULE,
+                "local_session_model_attestation",
+                return_value=attestation,
+            ),
+        ):
+            summary = MODULE.run_local_triage_worker(
+                repo_root=self.root,
+                target={"repo_name": "owner/repo", "number": 7},
+                preflight=self.preflight,
+                prompt_path=prompt_path,
+                summary_path=summary_path,
+                result_path=result_path,
+                run_id="run-1",
+                session_id="session-1",
+                before_source=identity,
+                before_github=github,
+            )
+
+        self.assertEqual(self.summary, summary)
+        command = run.call_args.args[0]
+        self.assertEqual("copilot", command[0])
+        self.assertNotIn("--agent", command)
+        self.assertIn("--no-custom-instructions", command)
+        self.assertIn("--no-remote", command)
+        self.assertNotIn("--allow-all-paths", command)
+        self.assertEqual(self.artifacts, run.call_args.kwargs["cwd"])
+        self.assertEqual("", run.call_args.kwargs["env"]["GH_TOKEN"])
+        self.assertEqual("", run.call_args.kwargs["env"]["GITHUB_TOKEN"])
+        self.assertNotEqual(
+            str(Path.home() / ".config" / "gh"),
+            run.call_args.kwargs["env"]["GH_CONFIG_DIR"],
+        )
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        self.assertEqual(MODULE.LOCAL_TRIAGE_RESULT_SCHEMA, result["schema"])
+        self.assertEqual(MODULE.LOCAL_TRIAGE_MODEL, result["worker"]["model"])
+
+    def test_local_worker_fails_closed_on_source_change(self):
+        prompt_path = self.artifacts / "prompt.txt"
+        summary_path = self.artifacts / "summary.md"
+        result_path = self.artifacts / "result.json"
+        prompt_path.write_text("prompt\n", encoding="utf-8", newline="")
+        summary_path.write_text(self.summary, encoding="utf-8", newline="")
+        completed = MODULE.subprocess.CompletedProcess(["copilot"], 0, "", "")
+        with (
+            mock.patch.object(MODULE, "run", return_value=completed),
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value={"branch": "feature", "head": "9" * 40, "status": ""},
+            ),
+            mock.patch.object(
+                MODULE,
+                "github_triage_fingerprint",
+                return_value={"pull_request": "pinned"},
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "repository source"),
+        ):
+            MODULE.run_local_triage_worker(
+                repo_root=self.root,
+                target={"repo_name": "owner/repo", "number": 7},
+                preflight=self.preflight,
+                prompt_path=prompt_path,
+                summary_path=summary_path,
+                result_path=result_path,
+                run_id="run-1",
+                session_id="session-1",
+                before_source=self.preflight["identity"],
+                before_github={"pull_request": "pinned"},
+            )
+
+    def test_local_worker_never_traverses_replaced_gh_config_directory(self):
+        prompt_path = self.artifacts / "prompt.txt"
+        summary_path = self.artifacts / "summary.md"
+        result_path = self.artifacts / "result.json"
+        prompt_path.write_text("prompt\n", encoding="utf-8", newline="")
+        preserved_entry = None
+
+        def replace_config(_command, **kwargs):
+            nonlocal preserved_entry
+            config_dir = Path(kwargs["env"]["GH_CONFIG_DIR"])
+            preserved_entry = config_dir / "keep.txt"
+            preserved_entry.write_text("keep\n", encoding="utf-8")
+            return MODULE.subprocess.CompletedProcess(["copilot"], 0, "", "")
+
+        with (
+            mock.patch.object(MODULE, "run", side_effect=replace_config),
+            mock.patch.object(
+                Path,
+                "is_junction",
+                autospec=True,
+                side_effect=lambda path: path.name.endswith("--gh-config"),
+            ),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "replaced its GitHub configuration directory",
+            ),
+        ):
+            MODULE.run_local_triage_worker(
+                repo_root=self.root,
+                target={"repo_name": "owner/repo", "number": 7},
+                preflight=self.preflight,
+                prompt_path=prompt_path,
+                summary_path=summary_path,
+                result_path=result_path,
+                run_id="run-1",
+                session_id="session-1",
+                before_source=self.preflight["identity"],
+                before_github={"pull_request": "pinned"},
+            )
+
+        self.assertIsNotNone(preserved_entry)
+        self.assertTrue(preserved_entry.is_file())
+
+    def test_local_session_attests_model_effort_and_assistant_event(self):
+        copilot_home = self.artifacts / "copilot-home"
+        events_path = (
+            copilot_home / "session-state" / "session-1" / "events.jsonl"
+        )
+        events_path.parent.mkdir(parents=True)
+        events_path.write_text(
+            "\n".join(
+                json.dumps(event)
+                for event in (
+                    {
+                        "type": "session.start",
+                        "data": {
+                            "sessionId": "session-1",
+                            "selectedModel": MODULE.LOCAL_TRIAGE_MODEL,
+                            "reasoningEffort": (
+                                MODULE.LOCAL_TRIAGE_REASONING_EFFORT
+                            ),
+                        },
+                    },
+                    {
+                        "type": "assistant.message",
+                        "data": {
+                            "model": MODULE.LOCAL_TRIAGE_MODEL,
+                            "content": "complete",
+                        },
+                    },
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+            newline="",
+        )
+
+        with mock.patch.dict(
+            os.environ, {"COPILOT_HOME": str(copilot_home)}
+        ):
+            attestation = MODULE.local_session_model_attestation("session-1")
+
+        self.assertEqual(
+            MODULE.LOCAL_TRIAGE_MODEL, attestation["startup_model"]
+        )
+        self.assertEqual(
+            MODULE.LOCAL_TRIAGE_REASONING_EFFORT,
+            attestation["startup_reasoning_effort"],
+        )
+        self.assertEqual(1, attestation["assistant_message_count"])
+
+    def test_local_session_rejects_model_changes(self):
+        copilot_home = self.artifacts / "changed-model-home"
+        events_path = (
+            copilot_home / "session-state" / "session-2" / "events.jsonl"
+        )
+        events_path.parent.mkdir(parents=True)
+        events_path.write_text(
+            "\n".join(
+                json.dumps(event)
+                for event in (
+                    {
+                        "type": "session.start",
+                        "data": {
+                            "sessionId": "session-2",
+                            "selectedModel": MODULE.LOCAL_TRIAGE_MODEL,
+                            "reasoningEffort": (
+                                MODULE.LOCAL_TRIAGE_REASONING_EFFORT
+                            ),
+                        },
+                    },
+                    {
+                        "type": "session.model_change",
+                        "data": {
+                            "newModel": "claude-sonnet-5",
+                            "reasoningEffort": "high",
+                        },
+                    },
+                    {
+                        "type": "assistant.message",
+                        "data": {
+                            "model": "claude-sonnet-5",
+                            "content": "complete",
+                        },
+                    },
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+            newline="",
+        )
+
+        with (
+            mock.patch.dict(
+                os.environ, {"COPILOT_HOME": str(copilot_home)}
+            ),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "model attestation mismatch"
+            ),
+        ):
+            MODULE.local_session_model_attestation("session-2")
 
 
 class EscalationCatalogTest(unittest.TestCase):
@@ -6263,6 +6827,43 @@ class CleanupCommandTest(unittest.TestCase):
             self.assertFalse(MODULE.preflight_path_for(path).exists())
             self.assertFalse(MODULE.checks_path_for(path).exists())
             self.assertFalse(MODULE.status_path_for(path).exists())
+
+    def test_deletes_artifacts_from_replaced_managed_tasks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "state.json"
+            archived_prompt = root / "state--old--local-triage-prompt.txt"
+            archived_prompt.write_text("prompt", encoding="utf-8")
+            log_directory = root / "state--ci-fix-logs-old"
+            log_directory.mkdir()
+            archived_log = log_directory / "failure.log"
+            archived_log.write_text("failed", encoding="utf-8")
+            MODULE.save_state(
+                path,
+                {
+                    "version": MODULE.STATE_VERSION,
+                    "agent_task": {"status": "completed"},
+                    "managed_task_history": [
+                        {
+                            "triage_prompt_file": str(archived_prompt),
+                            "preflight": {
+                                "check_snapshot": {
+                                    "failures": [
+                                        {"log_path": str(archived_log)}
+                                    ]
+                                }
+                            },
+                        }
+                    ],
+                },
+            )
+
+            payload = call("cleanup", "--state", str(path))
+
+            self.assertEqual("cleaned_up", payload["result"])
+            self.assertFalse(archived_prompt.exists())
+            self.assertFalse(archived_log.exists())
+            self.assertFalse(log_directory.exists())
 
 
 class PreflightCommandTest(unittest.TestCase):

@@ -14,7 +14,7 @@ flowchart LR
         subgraph sweep["Ordered Pipeline sweep"]
             direction TB
 
-            subgraph local["LOCAL coordinators and local worker"]
+            subgraph local["LOCAL coordinators and local workers"]
                 direction LR
                 conflict["1. PR Conflict Resolver<br/>local coordinator"]
                 copilotReview["2. Copilot Review Loop<br/>local coordinator"]
@@ -22,22 +22,24 @@ flowchart LR
                 ciFix["4. CI Fix Loop<br/>local coordinator"]
                 description["5. PR Description<br/>local coordinator"]
                 reviewWorker["Copilot Review worker<br/>1x local decision session / fixing iteration<br/>ALL findings in the stable review snapshot<br/>gpt-5.6-sol, high<br/>marketplace-local-review-decision-worker@2<br/>no hosted fallback"]
+                ciTriage["CI log triage worker<br/>1x read-only local session / stable current-head iteration<br/>reads locally downloaded failed logs<br/>writes one bounded summary<br/>gpt-5.6-sol, high"]
 
                 conflict --> copilotReview --> selfReview --> ciFix --> description
                 copilotReview -. "paired local worker" .-> reviewWorker
+                ciFix -. "failed-log files" .-> ciTriage
             end
 
             subgraph hosted["HOSTED Agent Task workers"]
                 direction LR
                 conflictWorker["Conflict worker<br/>1x / managed attempt<br/>ALL frozen conflict paths and selected stack members<br/>marketplace-conflict-worker@1"]
                 selfReviewWorker["Self Review worker<br/>1x / review iteration<br/>ALL self-review findings<br/>marketplace-agent-apply-report-worker@3"]
-                ciWorker["CI Fix worker<br/>1 HOSTED agent receives ALL failures at the current PR head<br/>A new agent starts only after the head or final check results change<br/>NOT one agent per failed check<br/>marketplace-agent-apply-report-worker@3"]
+                ciWorker["CI Fix worker<br/>1 HOSTED agent receives the local triage summary<br/>A new agent starts only after the head or final check results change<br/>NOT one agent per failed check<br/>marketplace-agent-apply-report-worker@3"]
                 descriptionWorker["PR Description worker<br/>1x report task / whole PR<br/>title and body decision<br/>marketplace-agent-report-worker@1"]
             end
 
             conflict -. "paired worker via local dispatcher/verifier" .-> conflictWorker
             selfReview -. "paired worker via local dispatcher/verifier" .-> selfReviewWorker
-            ciFix -. "paired worker via local dispatcher/verifier" .-> ciWorker
+            ciTriage -. "bounded summary, unchanged" .-> ciWorker
             description -. "paired worker via local dispatcher/verifier" .-> descriptionWorker
         end
 
@@ -70,21 +72,21 @@ flowchart LR
 
 The scheduler runs the five stages in the numbered order. It starts a second sweep only when the pull request head or base changes during the first sweep and a stage is not clear at the final revisions. A completed conflict resolver does not run again in that pipeline run.
 
-Each stage has a local coordinator. For hosted stages, the local Agent Tasks Runtime dispatches the request and verifies the result. It is not a worker session. Copilot Review is different. Its coordinator starts a local `gpt-5.6-sol` session with reasoning effort `high` under `marketplace-local-review-decision-worker@2`, and it has no hosted fallback.
+Each stage has a local coordinator. For hosted stages, the local Agent Tasks Runtime dispatches the request and verifies the result. It is not a worker session. Copilot Review starts a local `gpt-5.6-sol` decision session with reasoning effort `high` and has no hosted fallback. CI Fix starts a separate read-only local session with the same model and effort to triage failed-log files before hosted fixing.
 
 | Stage | Worker cardinality and bundle |
 | --- | --- |
 | PR Conflict Resolver | One hosted Agent Task per managed attempt. It receives every frozen conflict path and all selected stack members in that attempt. |
 | Copilot Review | One local decision session per fixing iteration. It receives all findings in the stable review snapshot. |
 | Self Review | One hosted Agent Task per review iteration. It reviews and handles all self-review findings in that iteration. |
-| CI Fix | One hosted Agent Task receives all failures and logs at the current pull request head. A new task starts only after the head or final check results change. It is not one task per failed check. |
+| CI Fix | One local triage session reads failed-log files for each stable current-head iteration, then one hosted Agent Task receives its bounded summary. A new pair starts only after the head or final check results change. It is not one pair per failed check. |
 | PR Description | One hosted report task for the whole pull request title and body decision. |
 
-The CI coordinator owns polling, reruns, stabilization, and snapshot deduplication. Stable means all relevant checks are terminal and the check rollup remains unchanged after debounce. Repeated observations of the same current-head stable final check set do not start another hosted session. It does not deduplicate log content across checks or matrix jobs.
+The CI coordinator owns polling, reruns, stabilization, and snapshot deduplication. Stable means all relevant checks are terminal and the check rollup remains unchanged after debounce. Repeated observations of the same current-head stable final check set do not start another local triage session or hosted worker.
 
-For every failing check, the current coordinator runs `gh run view <run> [--job <job>] --log-failed --allow-escape-sequences`. It stores the complete returned standard output as `failures[].log` with its SHA-256 digest, then JSON-serializes the entire check snapshot into the hosted worker prompt. It does not pass successful-job logs, and `--log-failed` usually limits output to failed steps.
+For every failing Actions check, the coordinator runs `gh run view <run> [--job <job>] --log-failed` and writes the complete output to a local file outside the repository. The triage prompt contains file paths and digests, not log text. The local session starts in a per-attempt workspace that contains only the pinned logs and triage prompt, without repository path access or authenticated `gh` state. It decides which failures are root causes, related, or cascading and writes the context the fixer needs. It can use `rg`, grep, scripts, and bounded reads without loading whole logs into its context.
 
-No log compaction exists today. The coordinator does not deduplicate or normalize logs across matrix jobs, truncate them, extract excerpts, or enforce an aggregate prompt byte or token budget. One hundred similar failing matrix jobs can therefore duplicate substantial text in one worker prompt. This is a known scalability gap.
+The coordinator verifies a nonempty summary of at most 64 KiB and passes it unchanged to the hosted worker. The hosted prompt contains no raw failing-log output and does not require one diagnosis per check. A later stable iteration can handle failures that remain after the first fix.
 
 PR Reviewer is a standalone workflow that runs only when invoked directly. PR Pipeline does not call it as a stage or worker. Its local coordinator dispatches one hosted `marketplace-agent-report-worker@1` task for the whole-pull-request authoritative report, verifies the result, and extracts the candidate set against the authoritative diff.
 
