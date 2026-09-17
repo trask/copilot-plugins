@@ -1751,7 +1751,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.27")
+        self.assertEqual(plugin["version"], "1.3.28")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -2440,6 +2440,143 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         with self.assertRaisesRegex(
             MODULE.WorkflowError,
             "artifact identity drifted",
+        ):
+            MODULE.validate_retained_result_recovery_gate(
+                args,
+                state_path=state_path,
+                state=MODULE.load_state(state_path),
+                requested_model="gpt-5.6-sol",
+            )
+
+    def test_recovers_nested_runtime_report_only_through_exact_hash_gate(self):
+        result = self.result()
+        remote = MODULE.validate_success_result(
+            result,
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+        )
+        stale_base_ref_oid = "9" * 40
+        proposed_body = self.preflight["pr"]["body"] + "\n\nBounded targets."
+        raw_report = {
+            "findings": [],
+            "repository": {
+                "owner": "owner",
+                "name": "repo",
+                "head": {
+                    "ref": self.preflight["pr"]["head_branch"],
+                    "sha": self.preflight["pr"]["head_sha"],
+                },
+                "base": {
+                    "ref": self.preflight["pr"]["base_branch"],
+                    "sha": stale_base_ref_oid,
+                },
+            },
+            "pull_request": {
+                "number": self.preflight["pr"]["number"],
+                "url": self.preflight["pr"]["pr_url"],
+            },
+            "iterations_used": 1,
+            "metadata": {
+                "current": {
+                    "title": self.preflight["pr"]["title"],
+                    "body": self.preflight["pr"]["body"],
+                },
+                "proposed": {
+                    "title": self.preflight["pr"]["title"],
+                    "body": proposed_body,
+                },
+            },
+        }
+        common = {
+            "request_id": "request-1",
+            "preflight": self.preflight,
+            "remote": remote,
+            "max_iterations": 5,
+            "paths_by_commit": {},
+        }
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "nested-runtime clean report",
+        ):
+            MODULE.validate_self_review_report(json.dumps(raw_report), **common)
+
+        recovered = MODULE.validate_self_review_report(
+            json.dumps(raw_report),
+            **common,
+            recovery_base_sha=stale_base_ref_oid,
+        )
+
+        self.assertEqual("cleared", recovered["outcome"])
+        self.assertEqual("replace", recovered["pull_request_metadata"]["decision"])
+        self.assertEqual(proposed_body, recovered["pull_request_metadata"]["body"])
+
+        for path, field, value in (
+            (("repository", "head"), "sha", "8" * 40),
+            (("repository", "base"), "sha", "8" * 40),
+            (("pull_request",), "number", 2),
+            (("metadata", "current"), "body", "changed"),
+            (("metadata", "proposed"), "title", ""),
+        ):
+            malformed = copy.deepcopy(raw_report)
+            parent = malformed
+            for component in path:
+                parent = parent[component]
+            parent[field] = value
+            with self.subTest(path=path, field=field), self.assertRaises(
+                MODULE.WorkflowError
+            ):
+                MODULE.validate_self_review_report(
+                    json.dumps(malformed),
+                    **common,
+                    recovery_base_sha=stale_base_ref_oid,
+                )
+
+        prompt_path = self.directory / "report-recovery-prompt.txt"
+        result_path = self.directory / "report-recovery-result.json"
+        state_path = self.directory / "report-recovery-state.json"
+        prompt_path.write_text("retained prompt\n", encoding="utf-8")
+        result_path.write_text(
+            json.dumps(result, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "agent_task": {
+                    "status": "failed",
+                    "model": "gpt-5.6-sol",
+                    "preflight": self.preflight,
+                    "prompt_file": str(prompt_path),
+                    "result_file": str(result_path),
+                },
+            },
+        )
+        args = SimpleNamespace(
+            resume=True,
+            prepare_only=True,
+            preserve_artifacts=True,
+            apply_prepared=False,
+            recovery_state_sha256=MODULE.sha256_file(state_path),
+            recovery_prompt_sha256=MODULE.sha256_file(prompt_path),
+            recovery_result_sha256=MODULE.sha256_file(result_path),
+            recovery_task_id="task-1",
+            recovery_request_id="request-1",
+            recovery_report_base_sha=stale_base_ref_oid,
+        )
+
+        gate = MODULE.validate_retained_result_recovery_gate(
+            args,
+            state_path=state_path,
+            state=MODULE.load_state(state_path),
+            requested_model="gpt-5.6-sol",
+        )
+
+        self.assertEqual(stale_base_ref_oid, gate["report_base_sha"])
+        args.recovery_report_base_sha = self.preflight["pr"]["base_sha"]
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "report recovery base identity",
         ):
             MODULE.validate_retained_result_recovery_gate(
                 args,

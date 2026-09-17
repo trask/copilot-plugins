@@ -3114,7 +3114,10 @@ def validate_retained_result_recovery_gate(
         "task_id": getattr(args, "recovery_task_id", None),
         "request_id": getattr(args, "recovery_request_id", None),
     }
-    if not any(value is not None for value in expected.values()):
+    expected_report_base = getattr(args, "recovery_report_base_sha", None)
+    if not any(
+        value is not None for value in (*expected.values(), expected_report_base)
+    ):
         return None
     if (
         not all(isinstance(value, str) and value for value in expected.values())
@@ -3162,9 +3165,39 @@ def validate_retained_result_recovery_gate(
         preflight=task_state["preflight"],
         requested_model=requested_model,
     )
+    if identity is None:
+        remote = validate_success_result(
+            result,
+            preflight=task_state["preflight"],
+            requested_model=requested_model,
+        )
+        pinned_base_sha = task_state["preflight"]["pr"]["base_sha"]
+        if (
+            not isinstance(expected_report_base, str)
+            or SHA_PATTERN.fullmatch(expected_report_base) is None
+            or expected_report_base == pinned_base_sha
+        ):
+            raise WorkflowError(
+                "retained report recovery base identity is incomplete or stale"
+            )
+        identity = {
+            "task_id": remote["task_id"],
+            "request_id": remote["request_id"],
+            "generated_branch": remote["generated_branch"],
+            "generated_head": remote["generated_head"],
+        }
+        report_base_sha = expected_report_base
+    else:
+        report_base_sha = result["pull_request"]["base_sha"]
+        if (
+            expected_report_base is not None
+            and expected_report_base != report_base_sha
+        ):
+            raise WorkflowError(
+                "retained report recovery base identity drifted"
+            )
     if (
-        identity is None
-        or identity["task_id"] != expected["task_id"]
+        identity["task_id"] != expected["task_id"]
         or identity["request_id"] != expected["request_id"]
     ):
         raise WorkflowError(
@@ -3172,7 +3205,7 @@ def validate_retained_result_recovery_gate(
         )
     return {
         **identity,
-        "report_base_sha": result["pull_request"]["base_sha"],
+        "report_base_sha": report_base_sha,
     }
 
 
@@ -3370,6 +3403,13 @@ def validate_self_review_report(
         "repository",
         "result",
     }
+    nested_runtime_identity_clean = isinstance(report, dict) and set(report) == {
+        "findings",
+        "iterations_used",
+        "metadata",
+        "pull_request",
+        "repository",
+    }
     if compact:
         report = normalize_compact_self_review_report(
             report,
@@ -3411,6 +3451,17 @@ def validate_self_review_report(
         compact = True
     elif runtime_base_identity_clean:
         report = normalize_runtime_base_identity_clean_self_review_report(
+            report,
+            request_id=request_id,
+            preflight=preflight,
+            remote=remote,
+            max_iterations=max_iterations,
+            paths_by_commit=paths_by_commit,
+            recovery_base_sha=recovery_base_sha,
+        )
+        compact = True
+    elif nested_runtime_identity_clean:
+        report = normalize_nested_runtime_identity_clean_self_review_report(
             report,
             request_id=request_id,
             preflight=preflight,
@@ -3985,6 +4036,99 @@ def normalize_runtime_base_identity_clean_self_review_report(
             "reason": (
                 "The runtime-base clean report preserved the pinned "
                 "title and body."
+            ),
+        },
+    }
+
+
+def normalize_nested_runtime_identity_clean_self_review_report(
+    report: dict[str, Any],
+    *,
+    request_id: str,
+    preflight: dict[str, Any],
+    remote: dict[str, Any],
+    max_iterations: int,
+    paths_by_commit: dict[str, list[str]] | None,
+    recovery_base_sha: str | None,
+) -> dict[str, Any]:
+    pr = preflight["pr"]
+    owner, name = pr["repo_name"].split("/", 1)
+    iterations_used = report.get("iterations_used")
+    report_base_sha = (
+        recovery_base_sha
+        if recovery_base_sha is not None
+        else pr["base_sha"]
+    )
+    metadata = report.get("metadata")
+    current = metadata.get("current") if isinstance(metadata, dict) else None
+    proposed = metadata.get("proposed") if isinstance(metadata, dict) else None
+    if (
+        remote.get("requires_apply") is not True
+        or remote.get("commits") != []
+        or paths_by_commit != {}
+        or report.get("findings") != []
+        or report.get("repository")
+        != {
+            "owner": owner,
+            "name": name,
+            "head": {
+                "ref": pr["head_branch"],
+                "sha": pr["head_sha"],
+            },
+            "base": {
+                "ref": pr["base_branch"],
+                "sha": report_base_sha,
+            },
+        }
+        or report.get("pull_request")
+        != {
+            "number": pr["number"],
+            "url": pr["pr_url"],
+        }
+        or isinstance(iterations_used, bool)
+        or not isinstance(iterations_used, int)
+        or not 1 <= iterations_used <= max_iterations
+        or not isinstance(metadata, dict)
+        or set(metadata) != {"current", "proposed"}
+        or current != {"title": pr["title"], "body": pr["body"]}
+        or not isinstance(proposed, dict)
+        or set(proposed) != {"title", "body"}
+        or not isinstance(proposed.get("title"), str)
+        or not proposed["title"].strip()
+        or "\r" in proposed["title"]
+        or "\n" in proposed["title"]
+        or not isinstance(proposed.get("body"), str)
+        or "\r" in proposed["body"]
+    ):
+        raise WorkflowError(
+            "Self Review Loop nested-runtime clean report is malformed "
+            "or has stale identity"
+        )
+    proposed_title = proposed["title"]
+    proposed_body = proposed["body"]
+    unchanged = proposed_title == pr["title"] and proposed_body == pr["body"]
+    return {
+        "schema": LEGACY_SELF_REVIEW_REPORT_SCHEMA,
+        "request_id": request_id,
+        "repository": pr["repo_name"],
+        "pull_request": {
+            "number": pr["number"],
+            "head_sha": pr["head_sha"],
+            "base_sha": pr["base_sha"],
+            "title_sha256": sha256_text(pr["title"]),
+            "body_sha256": sha256_text(pr["body"]),
+        },
+        "outcome": "cleared",
+        "iterations_used": iterations_used,
+        "findings": [],
+        "pull_request_metadata": {
+            "decision": "keep" if unchanged else "replace",
+            "title": proposed_title,
+            "body": proposed_body,
+            "reason": (
+                "The nested runtime report preserved the pinned PR metadata."
+                if unchanged
+                else "The nested runtime report proposed replacement PR metadata."
             ),
         },
     }
@@ -4688,23 +4832,30 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 requested_model=requested_model,
             )
             if resume_identity is None:
-                prior_task = prior_result.get("task")
-                prior_generated = prior_result.get("generated")
-                resumed_task_id = (
-                    prior_task.get("id")
-                    if isinstance(prior_task, dict)
-                    else None
+                validated_prior = validate_success_result(
+                    prior_result,
+                    preflight=preflight,
+                    requested_model=requested_model,
                 )
-                resumed_generated_branch = (
-                    prior_generated.get("branch")
-                    if isinstance(prior_generated, dict)
-                    else None
-                )
-                resumed_generated_head = (
-                    prior_generated.get("head_sha")
-                    if isinstance(prior_generated, dict)
-                    else None
-                )
+                resumed_task_id = validated_prior["task_id"]
+                resumed_generated_branch = validated_prior["generated_branch"]
+                resumed_generated_head = validated_prior["generated_head"]
+                if (
+                    retained_recovery is not None
+                    and any(
+                        retained_recovery[field] != validated_prior[field]
+                        for field in (
+                            "task_id",
+                            "request_id",
+                            "generated_branch",
+                            "generated_head",
+                        )
+                    )
+                ):
+                    raise WorkflowError(
+                        "successful retained result recovery requires exact "
+                        "hash gates"
+                    )
             else:
                 if (
                     retained_recovery is None
@@ -5193,8 +5344,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             paths_by_commit=paths_by_commit,
             recovery_base_sha=(
                 retained_recovery["report_base_sha"]
-                if resume_identity is not None
-                and retained_recovery is not None
+                if retained_recovery is not None
                 else None
             ),
         )
@@ -5822,6 +5972,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_task.add_argument("--recovery-result-sha256")
     agent_task.add_argument("--recovery-task-id")
     agent_task.add_argument("--recovery-request-id")
+    agent_task.add_argument("--recovery-report-base-sha")
     agent_task.set_defaults(function=command_agent_task)
 
     archive_stale = subparsers.add_parser(
