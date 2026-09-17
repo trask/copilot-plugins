@@ -1026,34 +1026,77 @@ class StackRunTest(StackFixture):
             request["arguments"],
         )
 
-    def test_explicit_merge_launches_past_exact_prior_auto_preflight_failure(self):
-        pipeline = self.pipeline(conflict_strategy="merge")
-        member = self.stack["members"][0]
-        self.inspect_sequences[(member["number"], MODULE.STAGE_CONFLICT)] = [
-            {
-                "status": {
-                    "agent_task": {
-                        "status": "failed",
-                        "task_id": None,
-                        "task_id_status": "not_created",
-                        "requested_strategy": "auto",
-                        "error": {
-                            "code": "conflict_preflight_failed",
-                            "message": (
-                                "repository merge settings and dependent pull requests "
-                                "leave no supported conflict strategy"
-                            ),
-                        },
+    def test_launches_past_failed_not_created_resolver_preflights(self):
+        failures = (
+            (
+                "normalized_stack",
+                {
+                    "code": "conflict_preflight_failed",
+                    "message": (
+                        "commit 5e98da713ed1c6b2146439fcbeacd32e95c33d36 "
+                        "is not a supported linear commit"
+                    ),
+                },
+                {},
+            ),
+            (
+                "updated_plugin",
+                {
+                    "code": "stale_target",
+                    "message": "a checked-out branch is required",
+                },
+                {},
+            ),
+            (
+                "changed_descendant",
+                {
+                    "code": "conflict_preflight_failed",
+                    "message": (
+                        "commit 056730d000000000000000000000000000000000 "
+                        "is not a supported linear commit"
+                    ),
+                },
+                {
+                    "preflight": {
+                        "request": {
+                            "native_stack": {
+                                "members": [
+                                    {
+                                        "pr_number": 12,
+                                        "head_sha": (
+                                            "056730d000000000000000000000000000000000"
+                                        ),
+                                    }
+                                ]
+                            }
+                        }
                     }
-                }
-            }
-        ]
-        request = pipeline.request_for(member, MODULE.STAGE_CONFLICT, 1)
+                },
+            ),
+        )
+        for case, error, retained in failures:
+            with self.subTest(case=case):
+                pipeline = self.pipeline()
+                member = self.stack["members"][0]
+                self.inspect_sequences[(member["number"], MODULE.STAGE_CONFLICT)] = [
+                    {
+                        "status": {
+                            "agent_task": {
+                                "status": "failed",
+                                "task_id": None,
+                                "task_id_status": "not_created",
+                                "error": error,
+                                **retained,
+                            }
+                        }
+                    }
+                ]
+                request = pipeline.request_for(member, MODULE.STAGE_CONFLICT, 1)
 
-        launched = pipeline.dispatch([request], MODULE.STAGE_CONFLICT, 1)
+                launched = pipeline.dispatch([request], MODULE.STAGE_CONFLICT, 1)
 
-        self.assertIsNone(launched["stopped"])
-        self.assertEqual(1, len(launched["workers"]))
+                self.assertIsNone(launched["stopped"])
+                self.assertEqual(1, len(launched["workers"]))
 
     # Push propagation ---------------------------------------------------
 

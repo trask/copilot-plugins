@@ -883,7 +883,7 @@ class SweepTest(unittest.TestCase):
             self.launched,
         )
 
-    def test_explicit_merge_replaces_exact_prior_auto_preflight_failure(self):
+    def test_replaces_failed_preflight_when_no_agent_task_was_created(self):
         original = self.inspect
         inspections = 0
 
@@ -898,13 +898,9 @@ class SweepTest(unittest.TestCase):
                             "status": "failed",
                             "task_id": None,
                             "task_id_status": "not_created",
-                            "requested_strategy": "auto",
                             "error": {
-                                "code": "conflict_preflight_failed",
-                                "message": (
-                                    "repository merge settings and dependent pull "
-                                    "requests leave no supported conflict strategy"
-                                ),
+                                "code": "stale_target",
+                                "message": "a checked-out branch is required",
                             },
                         }
                     },
@@ -913,7 +909,7 @@ class SweepTest(unittest.TestCase):
 
         MODULE.inspect_stage.side_effect = retained_failure
 
-        result = self.execute(conflict_strategy="merge")
+        result = self.execute()
 
         self.assertEqual("complete", result["result"])
         self.assertEqual(
@@ -921,7 +917,7 @@ class SweepTest(unittest.TestCase):
             self.launched,
         )
 
-    def test_retained_preflight_replacement_stays_exact_and_prelaunch_only(self):
+    def test_failed_not_created_replacement_is_prelaunch_only(self):
         stage_result = {
             **uncleared_stage(MODULE.STAGE_CONFLICT),
             "status": {
@@ -929,13 +925,9 @@ class SweepTest(unittest.TestCase):
                     "status": "failed",
                     "task_id": None,
                     "task_id_status": "not_created",
-                    "requested_strategy": "auto",
                     "error": {
-                        "code": "conflict_preflight_failed",
-                        "message": (
-                            "repository merge settings and dependent pull requests "
-                            "leave no supported conflict strategy"
-                        ),
+                        "code": "stale_target",
+                        "message": "a checked-out branch is required",
                     },
                 }
             },
@@ -944,33 +936,44 @@ class SweepTest(unittest.TestCase):
             MODULE.stage_blocker(
                 stage_result,
                 after_launch=False,
-                conflict_strategy="merge",
+                conflict_strategy="auto",
             )
         )
-        for after_launch, strategy in (
-            (True, "merge"),
-            (False, "auto"),
-            (False, "rebase"),
-        ):
-            with self.subTest(after_launch=after_launch, strategy=strategy):
-                self.assertEqual(
-                    "stage_recovery_required",
-                    MODULE.stage_blocker(
-                        stage_result,
-                        after_launch=after_launch,
-                        conflict_strategy=strategy,
-                    )[0],
-                )
-
-        changed = copy.deepcopy(stage_result)
-        changed["status"]["agent_task"]["error"]["message"] += "."
         self.assertEqual(
             "stage_recovery_required",
             MODULE.stage_blocker(
-                changed,
-                after_launch=False,
-                conflict_strategy="merge",
+                stage_result,
+                after_launch=True,
+                conflict_strategy="auto",
             )[0],
+        )
+        for field, value in (
+            ("task_id", "task-1"),
+            ("task_id_status", "created"),
+            ("status", "interrupted"),
+        ):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(stage_result)
+                changed["status"]["agent_task"][field] = value
+                self.assertEqual(
+                    "stage_recovery_required",
+                    MODULE.stage_blocker(
+                        changed,
+                        after_launch=False,
+                        conflict_strategy="auto",
+                    )[0],
+                )
+        changed = copy.deepcopy(stage_result)
+        del changed["status"]["agent_task"]["task_id"]
+        self.assertEqual(
+            "stage_recovery_required",
+            MODULE.stage_blocker(changed, after_launch=False)[0],
+        )
+        changed = copy.deepcopy(stage_result)
+        changed["stage"] = MODULE.STAGE_COPILOT_REVIEW
+        self.assertEqual(
+            "stage_recovery_required",
+            MODULE.stage_blocker(changed, after_launch=False)[0],
         )
 
     def test_reports_sweep_and_stage_progress_in_order(self):
