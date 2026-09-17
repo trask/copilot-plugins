@@ -45,7 +45,7 @@ The helper performs a trusted local preflight without executing repository code.
 
 A pipeline-owned isolated worktree may stay detached only at the exact frozen pull request head. An attached worktree must hold the pull request branch. Any other branch or commit fails preflight.
 
-The helper records `preparing` ownership at the explicit state path before conflict preflight. A preflight error records failed or interrupted ownership with a null task ID and `not_created` status, so a wrapper exit cannot erase the attempted run. The Agent Tasks runtime is bundled with this plugin. The helper writes the closed `github.copilot.agent-task-conflict-request` version 1 file and a trusted prompt outside the repository. It loads only the adjacent `cloud_conflict_task.py`, verifies SHA-256 `f23e58a12a8c455da54d7970bfb76eabb5848d0da1024b93154742a52229c0f5`, and invokes it once with:
+The helper records `preparing` ownership at the explicit state path before conflict preflight. A preflight error records failed or interrupted ownership with a null task ID and `not_created` status, so a wrapper exit cannot erase the attempted run. The Agent Tasks runtime is bundled with this plugin. The helper writes the closed `github.copilot.agent-task-conflict-request` version 1 file and a trusted prompt outside the repository. It loads only the adjacent `cloud_conflict_task.py`, verifies SHA-256 `112fc4d1524d367a9d8fcc00b6f2192770980daa7192512d1f1789313d07e946`, and invokes it once with:
 
 ```text
 --conflict-with-report --strategy <merge|rebase|native-stack> --request-file <absolute-path> --prompt-file <absolute-path> --result-file <absolute-path> --policy marketplace-conflict-worker@1 --pr <canonical-url> --model <alias>
@@ -56,6 +56,8 @@ Local Git checks stay pinned to the frozen worktree through `git -C <exact-root>
 The current base comes from the advertised branch ref, not the pull request's lagging base snapshot. Native stack requests preserve the snapshot in preflight evidence but pin each direct base to its live branch ref.
 
 Policy `marketplace-conflict-worker@1` has SHA-256 `7fcb65dff47f5dc76f790f999de202e28692c5207dba7d3ff007145a327e6c67`.
+
+The full immutable request remains retained outside the repository. The hosted problem statement carries every execution identity and commit SHA, exact evidence for bounded path sets, and canonical SHA-256 summaries plus boundary samples for large path sets. The managed helper refuses a compact statement over 28,000 characters or UTF-8 bytes as `prompt_too_large` before contacting the Agent Tasks API; it never truncates or silently falls back.
 
 Never import managed helper internals. Never call Agent Tasks APIs directly. Never scrape helper stdout. Never use Cloud Sandboxes, a custom agent, or local fallback. Never run repository commands, formatters, builds, tests, or probes yourself.
 

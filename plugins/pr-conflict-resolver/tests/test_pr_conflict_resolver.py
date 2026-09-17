@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import io
 import json
@@ -885,7 +886,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "4859dc705ef36c41959f7ca5f4abbb7485e146c829b767cf032ef852a74ce7bb",
+            "112fc4d1524d367a9d8fcc00b6f2192770980daa7192512d1f1789313d07e946",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -3090,6 +3091,233 @@ class ManagedRequestStrategyTest(unittest.TestCase):
             "does not allow merge publication",
         ):
             self.validate(request)
+
+
+class ManagedTaskPromptTest(unittest.TestCase):
+    def request(self):
+        return ManagedRequestStrategyTest().request(
+            {
+                "merge_commit": True,
+                "rebase_merge": True,
+                "squash_merge": True,
+            }
+        )
+
+    def options(self, request):
+        return SimpleNamespace(
+            request=request,
+            prompt=MODULE.build_conflict_prompt({"request": request}),
+            strategy=request["strategy"],
+            model=request["model"],
+            pr_url=request["pull_request"]["url"],
+        )
+
+    @staticmethod
+    def commit(number, path):
+        return {
+            "sha": f"{number:040x}",
+            "subject": f"Retained commit {number}",
+            "trailers": [["Finding", f"finding-{number}"]],
+            "patch_sha256": f"{number:064x}",
+            "paths": [path],
+        }
+
+    def test_large_path_corpus_uses_complete_digest_and_boundary_evidence(self):
+        request = self.request()
+        request["allowed_paths"] = [
+            f"instrumentation/library-{number:04d}/src/main/java/Type{number}.java"
+            for number in range(2291)
+        ]
+        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
+
+        prompt = CLOUD_MODULE.validated_task_prompt(self.options(request))
+        compact = CLOUD_MODULE.compact_request_contract(request)
+        evidence = compact["allowed_paths"]
+
+        self.assertLessEqual(
+            len(prompt), CLOUD_MODULE.TASK_PROMPT_MAX_CHARACTERS
+        )
+        self.assertLessEqual(
+            len(prompt.encode("utf-8")),
+            CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES,
+        )
+        self.assertEqual("digest_with_boundary_samples", evidence["representation"])
+        self.assertEqual(2291, evidence["count"])
+        self.assertEqual(
+            CLOUD_MODULE.value_digest(request["allowed_paths"]),
+            evidence["sha256"],
+        )
+        self.assertEqual(
+            request["allowed_paths"][: CLOUD_MODULE.PATH_EVIDENCE_BOUNDARY_COUNT],
+            [
+                item["path"]
+                for item in evidence["boundary"][
+                    : CLOUD_MODULE.PATH_EVIDENCE_BOUNDARY_COUNT
+                ]
+            ],
+        )
+        self.assertNotIn(request["allowed_paths"][1000], prompt)
+        self.assertIn(request["request_sha256"], prompt)
+        self.assertIn(request["pull_request"]["head_sha"], prompt)
+        self.assertIn("complete_values_in_retained_request", prompt)
+
+    def test_small_path_corpus_is_retained_exactly(self):
+        paths = ["src/main.py", "src/café.py"]
+
+        evidence = CLOUD_MODULE.compact_path_evidence(paths)
+
+        self.assertEqual(
+            {
+                "representation": "exact",
+                "count": 2,
+                "sha256": CLOUD_MODULE.value_digest(paths),
+                "paths": paths,
+            },
+            evidence,
+        )
+
+    def test_long_boundary_path_is_hashed_without_substring_truncation(self):
+        long_path = f"src/{'nested-' * 50}file.py"
+        paths = [
+            long_path,
+            *[
+                f"src/module-{number:03d}/file.py"
+                for number in range(
+                    CLOUD_MODULE.EXACT_PATH_EVIDENCE_MAX_COUNT
+                )
+            ],
+        ]
+
+        evidence = CLOUD_MODULE.compact_path_evidence(paths)
+        marker = evidence["boundary"][0]
+
+        self.assertEqual("digest_with_boundary_samples", evidence["representation"])
+        self.assertIsNone(marker["path"])
+        self.assertEqual(len(long_path.encode("utf-8")), marker["utf8_bytes"])
+        self.assertEqual(
+            hashlib.sha256(long_path.encode("utf-8")).hexdigest(),
+            marker["utf8_sha256"],
+        )
+        self.assertNotIn(long_path[: CLOUD_MODULE.PATH_EVIDENCE_VALUE_MAX_BYTES], marker)
+
+    def test_native_stack_retains_every_member_and_commit_identity(self):
+        request = self.request()
+        request["strategy"] = "native-stack"
+        request["head_commits"] = []
+        members = []
+        for member_number, start in ((7, 1), (8, 21)):
+            old_commits = [
+                self.commit(number, f"module-{member_number}/File{number}.java")
+                for number in range(start, start + 20)
+            ]
+            members.append(
+                {
+                    "pr_number": member_number,
+                    "repository": "owner/repo",
+                    "head_ref": f"feature-{member_number}",
+                    "head_sha": old_commits[-1]["sha"],
+                    "direct_base_ref": (
+                        "main" if member_number == 7 else "feature-7"
+                    ),
+                    "direct_base_sha": (
+                        "a" * 40 if member_number == 7 else members[0]["head_sha"]
+                    ),
+                    "retained_base_sha": f"{100 + member_number:040x}",
+                    "direct_merge_base": f"{200 + member_number:040x}",
+                    "expected_new_parent": {
+                        "role": "trunk" if member_number == 7 else "member-7",
+                        "old_sha": (
+                            "a" * 40
+                            if member_number == 7
+                            else members[0]["head_sha"]
+                        ),
+                    },
+                    "old_commits": old_commits,
+                    "lease_sha": old_commits[-1]["sha"],
+                }
+            )
+        request["native_stack"] = {
+            "trunk": {"ref": "main", "sha": "a" * 40},
+            "members": members,
+            "outside_dependents": [],
+        }
+        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
+
+        first = CLOUD_MODULE.validated_task_prompt(self.options(request))
+        second = CLOUD_MODULE.validated_task_prompt(self.options(request))
+        compact = CLOUD_MODULE.compact_request_contract(request)
+
+        self.assertEqual(first, second)
+        self.assertLessEqual(
+            len(first.encode("utf-8")),
+            CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES,
+        )
+        self.assertIn('"commit_mapping_keys"', first)
+        compact_members = compact["native_stack"]["members"]
+        self.assertEqual([7, 8], [member["pr_number"] for member in compact_members])
+        for original, retained in zip(members, compact_members, strict=True):
+            self.assertEqual(original["head_sha"], retained["head_sha"])
+            self.assertEqual(original["lease_sha"], retained["lease_sha"])
+            self.assertEqual(
+                [commit["sha"] for commit in original["old_commits"]],
+                [commit["sha"] for commit in retained["old_commits"]],
+            )
+            for commit, evidence in zip(
+                original["old_commits"], retained["old_commits"], strict=True
+            ):
+                self.assertEqual(
+                    CLOUD_MODULE.value_digest(commit),
+                    evidence["retained_evidence_sha256"],
+                )
+                self.assertIn(commit["sha"], first)
+
+    def test_exact_ascii_character_and_byte_limit_is_accepted(self):
+        options = self.options(self.request())
+        prompt = "a" * CLOUD_MODULE.TASK_PROMPT_MAX_CHARACTERS
+
+        with mock.patch.object(
+            CLOUD_MODULE, "policy_prompt", return_value=prompt
+        ):
+            self.assertEqual(prompt, CLOUD_MODULE.validated_task_prompt(options))
+
+    def test_character_overflow_fails_closed(self):
+        options = self.options(self.request())
+        prompt = "a" * (CLOUD_MODULE.TASK_PROMPT_MAX_CHARACTERS + 1)
+
+        with mock.patch.object(
+            CLOUD_MODULE, "policy_prompt", return_value=prompt
+        ), self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError, "prompt_too_large"
+        ) as failure:
+            CLOUD_MODULE.validated_task_prompt(options)
+
+        self.assertEqual("prompt_too_large", failure.exception.code)
+
+    def test_multibyte_byte_overflow_fails_closed(self):
+        options = self.options(self.request())
+        prompt = "é" * (CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES // 2 + 1)
+
+        self.assertLess(len(prompt), CLOUD_MODULE.TASK_PROMPT_MAX_CHARACTERS)
+        with mock.patch.object(
+            CLOUD_MODULE, "policy_prompt", return_value=prompt
+        ), self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError, "prompt_too_large"
+        ) as failure:
+            CLOUD_MODULE.validated_task_prompt(options)
+
+        self.assertEqual("prompt_too_large", failure.exception.code)
+
+    def test_prompt_overflow_is_rejected_before_api_post(self):
+        options = self.options(self.request())
+        prompt = "a" * (CLOUD_MODULE.TASK_PROMPT_MAX_CHARACTERS + 1)
+        runner = mock.Mock()
+
+        with mock.patch.object(
+            CLOUD_MODULE, "policy_prompt", return_value=prompt
+        ), self.assertRaises(CLOUD_MODULE.ConflictError):
+            CLOUD_MODULE.start_task(runner, mock.sentinel.snapshot, options)
+
+        runner.assert_not_called()
 
 
 class ManagedTaskResultPersistenceTest(unittest.TestCase):

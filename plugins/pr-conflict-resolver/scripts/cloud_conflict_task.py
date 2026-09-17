@@ -21,6 +21,12 @@ from typing import Callable, Mapping, Sequence, TextIO
 API_VERSION = "2026-03-10"
 ACCEPT = "application/vnd.github+json"
 POLL_SECONDS = 60
+TASK_PROMPT_MAX_CHARACTERS = 28_000
+TASK_PROMPT_MAX_UTF8_BYTES = 28_000
+EXACT_PATH_EVIDENCE_MAX_COUNT = 64
+EXACT_PATH_EVIDENCE_MAX_BYTES = 4_096
+PATH_EVIDENCE_BOUNDARY_COUNT = 8
+PATH_EVIDENCE_VALUE_MAX_BYTES = 256
 MODE = "conflict_with_report"
 REQUEST_SCHEMA = {"id": "github.copilot.agent-task-conflict-request", "version": 1}
 RESULT_SCHEMA = {"id": "github.copilot.agent-task-conflict-result", "version": 1}
@@ -69,6 +75,7 @@ ERROR_CODES = {
     "validation_failed",
     "stale_target",
     "unsupported_strategy",
+    "prompt_too_large",
 }
 SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -1633,6 +1640,204 @@ def artifact_paths(request_id: str) -> tuple[str, str]:
     )
 
 
+def value_digest(value: object) -> str:
+    return hashlib.sha256(canonical_json(value)).hexdigest()
+
+
+def compact_path_evidence(paths: Sequence[str]) -> Mapping[str, object]:
+    values = list(paths)
+    digest = value_digest(values)
+    encoded = canonical_json(values)
+    if (
+        len(values) <= EXACT_PATH_EVIDENCE_MAX_COUNT
+        and len(encoded) <= EXACT_PATH_EVIDENCE_MAX_BYTES
+    ):
+        return {
+            "representation": "exact",
+            "count": len(values),
+            "sha256": digest,
+            "paths": values,
+        }
+
+    def marker(path: str) -> Mapping[str, object]:
+        encoded_path = path.encode("utf-8")
+        return {
+            "path": (
+                path
+                if len(encoded_path) <= PATH_EVIDENCE_VALUE_MAX_BYTES
+                else None
+            ),
+            "utf8_sha256": hashlib.sha256(encoded_path).hexdigest(),
+            "utf8_bytes": len(encoded_path),
+        }
+
+    boundary = [
+        *values[:PATH_EVIDENCE_BOUNDARY_COUNT],
+        *values[-PATH_EVIDENCE_BOUNDARY_COUNT:],
+    ]
+    return {
+        "representation": "digest_with_boundary_samples",
+        "count": len(values),
+        "sha256": digest,
+        "boundary": [marker(path) for path in dict.fromkeys(boundary)],
+        "complete_values_in_retained_request": True,
+    }
+
+
+def compact_commit_evidence(commit: Mapping[str, object]) -> Mapping[str, object]:
+    return {
+        "sha": commit["sha"],
+        "patch_sha256": commit["patch_sha256"],
+        "paths": {
+            "count": len(commit["paths"]),
+            "sha256": value_digest(commit["paths"]),
+        },
+        "retained_evidence_sha256": value_digest(commit),
+    }
+
+
+def compact_request_contract(
+    request: Mapping[str, object],
+) -> Mapping[str, object]:
+    stack = request["native_stack"]
+    compact_stack = None
+    if isinstance(stack, Mapping):
+        compact_stack = {
+            "trunk": stack["trunk"],
+            "members": [
+                {
+                    **{
+                        key: member[key]
+                        for key in (
+                            "pr_number",
+                            "repository",
+                            "head_ref",
+                            "head_sha",
+                            "direct_base_ref",
+                            "direct_base_sha",
+                            "retained_base_sha",
+                            "direct_merge_base",
+                            "expected_new_parent",
+                            "lease_sha",
+                        )
+                    },
+                    "old_commits": [
+                        compact_commit_evidence(commit)
+                        for commit in member["old_commits"]
+                    ],
+                }
+                for member in stack["members"]
+            ],
+            "outside_dependents": stack["outside_dependents"],
+        }
+    return {
+        "schema": request["schema"],
+        "request_id": request["request_id"],
+        "request_sha256": request["request_sha256"],
+        "retained_request_utf8_bytes": len(canonical_json(request)),
+        "model": request["model"],
+        "policy": request["policy"],
+        "repository": request["repository"],
+        "pull_request": request["pull_request"],
+        "merge_base": request["merge_base"],
+        "strategy": request["strategy"],
+        "iteration": request["iteration"],
+        "guards": request["guards"],
+        "allowed_paths": compact_path_evidence(request["allowed_paths"]),
+        "head_commits": [
+            compact_commit_evidence(commit)
+            for commit in request["head_commits"]
+        ],
+        "native_stack": compact_stack,
+    }
+
+
+def compact_receipt_contract(
+    request: Mapping[str, object],
+) -> Mapping[str, object]:
+    generated_refs = []
+    for role, pr_number, repository in expected_roles(request):
+        old_sha, base_sha, base_ref, lease_sha, old_commits = code_ref_base(
+            request, role
+        )
+        generated_refs.append(
+            {
+                "role": role,
+                "pr_number": pr_number,
+                "repository": repository,
+                "old_sha": old_sha,
+                "base_ref": base_ref,
+                "base_sha": base_sha,
+                "lease_sha": lease_sha,
+                "old_commit_count": len(old_commits),
+                "commits_contract": (
+                    {
+                        "kind": "ordered_publishable_commit_shas",
+                    }
+                    if request["strategy"] == "merge"
+                    else {
+                        "kind": "ordered_old_to_new_mappings",
+                        "count": len(old_commits),
+                    }
+                ),
+            }
+        )
+    return {
+        "top_level_keys": [
+            "schema",
+            "request",
+            "policy",
+            "model",
+            "mode",
+            "strategy",
+            "repository",
+            "pull_request",
+            "generated_refs",
+            "validation_complete",
+            "validation",
+        ],
+        "schema": RECEIPT_SCHEMA,
+        "request": {
+            "id": request["request_id"],
+            "sha256": request["request_sha256"],
+        },
+        "policy": POLICY,
+        "model": request["model"],
+        "mode": MODE,
+        "strategy": request["strategy"],
+        "repository": request["repository"],
+        "pull_request": request["pull_request"],
+        "generated_refs": generated_refs,
+        "generated_ref_wrapper_keys": ["ref", "sha256"],
+        "generated_ref_keys": [
+            "role",
+            "pr_number",
+            "repository",
+            "ref",
+            "old_sha",
+            "new_sha",
+            "base_ref",
+            "base_sha",
+            "lease_sha",
+            "commits",
+        ],
+        "commit_mapping_keys": [
+            "old_sha",
+            "new_sha",
+            "subject",
+            "trailers",
+            "patch_sha256",
+            "conflict_paths",
+            "companion_paths",
+            "unaffected_path_digests",
+            "rationale",
+        ],
+        "validation_complete": True,
+        "validation_item_keys": ["command", "status", "detail"],
+        "validation_required_status": "passed",
+    }
+
+
 def receipt_contract_template(
     request: Mapping[str, object],
 ) -> Mapping[str, object]:
@@ -1705,6 +1910,8 @@ def receipt_contract_template(
 
 def policy_prompt(options: Options) -> str:
     report_path, receipt_path = artifact_paths(options.request["request_id"])
+    compact_request = compact_request_contract(options.request)
+    compact_receipt = compact_receipt_contract(options.request)
     return (
         f"{options.prompt.rstrip()}\n\n"
         "----- marketplace conflict worker policy -----\n"
@@ -1712,9 +1919,25 @@ def policy_prompt(options: Options) -> str:
         f"Policy SHA-256: {POLICY_SHA256}\n"
         f"Mode: {MODE}\n"
         f"Strategy: {options.strategy}\n"
-        f"Immutable request: {canonical_json(options.request).decode('utf-8')}\n"
-        "Required receipt shape: "
-        f"{canonical_json(receipt_contract_template(options.request)).decode('utf-8')}\n"
+        "The full retained local request is immutable evidence identified by "
+        f"request SHA-256 {options.request['request_sha256']}. The compact contract "
+        "below contains every execution identity plus explicit exact or digest "
+        "representations of larger retained evidence. Never infer a replacement "
+        "identity or treat a digest summary as omitted permission.\n"
+        "Canonical evidence digests use SHA-256 over UTF-8 JSON with sorted keys, "
+        "comma and colon separators, and non-ASCII values preserved. Boundary "
+        "sample utf8_sha256 values hash the raw UTF-8 path bytes.\n"
+        "Compact immutable task contract: "
+        f"{canonical_json(compact_request).decode('utf-8')}\n"
+        "Compact required receipt contract: "
+        f"{canonical_json(compact_receipt).decode('utf-8')}\n"
+        "Reconstruct retained commit subjects, trailers, parents, paths, and patches "
+        "from the exact pinned SHAs with git show, git rev-list, git diff-tree, git "
+        "diff --binary --full-index, and git merge-tree as applicable. Verify their "
+        "compact evidence hashes before resolving. The dispatcher validates the "
+        "complete retained request, generated history, report, receipt, paths, and "
+        "patch identities after the task; compact prompt evidence never weakens that "
+        "validation.\n"
         "Do not read, request, print, persist, or transmit credentials, local "
         "environment values, cookies, tokens, keys, or authorization headers. "
         "Do not invoke a custom_agent or local fallback. Do not update any user "
@@ -1731,11 +1954,29 @@ def policy_prompt(options: Options) -> str:
     )
 
 
+def validated_task_prompt(options: Options) -> str:
+    prompt = policy_prompt(options)
+    characters = len(prompt)
+    utf8_bytes = len(prompt.encode("utf-8"))
+    if (
+        characters > TASK_PROMPT_MAX_CHARACTERS
+        or utf8_bytes > TASK_PROMPT_MAX_UTF8_BYTES
+    ):
+        raise ConflictError(
+            "Agent Task prompt_too_large: compact problem statement is "
+            f"{characters} characters and {utf8_bytes} UTF-8 bytes; limits are "
+            f"{TASK_PROMPT_MAX_CHARACTERS} characters and "
+            f"{TASK_PROMPT_MAX_UTF8_BYTES} UTF-8 bytes",
+            "prompt_too_large",
+        )
+    return prompt
+
+
 def start_task(
     runner: Runner, snapshot: LocalSnapshot, options: Options
 ) -> Mapping[str, object]:
     payload = {
-        "prompt": policy_prompt(options),
+        "prompt": validated_task_prompt(options),
         "model": options.model,
         "create_pull_request": False,
         "base_ref": options.request["pull_request"]["head_sha"],
