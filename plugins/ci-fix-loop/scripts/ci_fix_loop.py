@@ -16,6 +16,7 @@ from pathlib import Path
 import random
 import re
 import secrets
+import signal
 import shutil
 import subprocess
 import sys
@@ -41,6 +42,13 @@ DEFAULT_COORDINATOR_WAIT_TIMEOUT = 7200.0
 DEFAULT_COORDINATOR_STABILITY_POLLS = 2
 DEFAULT_COORDINATOR_DEBOUNCE_SECONDS = 10.0
 DEFAULT_COORDINATOR_JITTER = 0.2
+DEFAULT_HOSTED_HELPER_TIMEOUT = 7200.0
+DEFAULT_HOSTED_DISCOVERY_INTERVAL = 5.0
+HOSTED_HELPER_TERMINATION_TIMEOUT = 10.0
+AGENT_TASK_API_VERSION = "2026-03-10"
+HOSTED_DISPATCH_IDENTITY_SCHEMA = (
+    "github.copilot.ci-fix-loop-hosted-dispatch-identity.v1"
+)
 MAX_RERUNS_PER_CHECK = 1
 PR_HEAD_LAG_RETRY_DELAY = 1
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
@@ -113,6 +121,7 @@ SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 REPORT_PATH_PATTERN = re.compile(
     r"^\.github/agent-task-reports/(?P<request_id>[A-Za-z0-9][A-Za-z0-9._-]*)\.md$"
 )
+REPORT_PATH_PLACEHOLDER = "{{MARKETPLACE_REPORT_PATH}}"
 RECEIPT_PATH_PATTERN = re.compile(
     r"^\.github/agent-task-validations/(?P<request_id>[A-Za-z0-9][A-Za-z0-9._-]*)\.json$"
 )
@@ -361,6 +370,302 @@ def windows_no_window_options() -> dict[str, int]:
     return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
 
 
+class WindowsKillJob:
+    def __init__(self, pid: int) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_uint64),
+                ("WriteOperationCount", ctypes.c_uint64),
+                ("OtherOperationCount", ctypes.c_uint64),
+                ("ReadTransferCount", ctypes.c_uint64),
+                ("WriteTransferCount", ctypes.c_uint64),
+                ("OtherTransferCount", ctypes.c_uint64),
+            ]
+
+        class BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimitInformation),
+                ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            raise ctypes.WinError(ctypes.get_last_error())
+        process = None
+        try:
+            limits = ExtendedLimitInformation()
+            limits.BasicLimitInformation.LimitFlags = 0x00002000
+            if not kernel32.SetInformationJobObject(
+                job, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            process = kernel32.OpenProcess(0x0101, False, pid)
+            if not process:
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not kernel32.AssignProcessToJobObject(job, process):
+                raise ctypes.WinError(ctypes.get_last_error())
+        except BaseException:
+            kernel32.CloseHandle(job)
+            raise
+        finally:
+            if process:
+                kernel32.CloseHandle(process)
+        self._kernel32 = kernel32
+        self._handle = job
+
+    def terminate(self, exit_code: int = 1) -> None:
+        if self._handle and not self._kernel32.TerminateJobObject(
+            self._handle, exit_code
+        ):
+            import ctypes
+
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self) -> None:
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
+def create_windows_kill_job(pid: int) -> WindowsKillJob:
+    return WindowsKillJob(pid)
+
+
+def resume_windows_process(pid: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class ThreadEntry32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ThreadID", wintypes.DWORD),
+            ("th32OwnerProcessID", wintypes.DWORD),
+            ("tpBasePri", wintypes.LONG),
+            ("tpDeltaPri", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Thread32First.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ThreadEntry32),
+    ]
+    kernel32.Thread32First.restype = wintypes.BOOL
+    kernel32.Thread32Next.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ThreadEntry32),
+    ]
+    kernel32.Thread32Next.restype = wintypes.BOOL
+    kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenThread.restype = wintypes.HANDLE
+    kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+    kernel32.ResumeThread.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000004, 0)
+    if snapshot == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    resumed = 0
+    try:
+        entry = ThreadEntry32()
+        entry.dwSize = ctypes.sizeof(entry)
+        has_entry = kernel32.Thread32First(snapshot, ctypes.byref(entry))
+        while has_entry:
+            if entry.th32OwnerProcessID == pid:
+                thread = kernel32.OpenThread(0x0002, False, entry.th32ThreadID)
+                if not thread:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                try:
+                    if kernel32.ResumeThread(thread) == 0xFFFFFFFF:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    resumed += 1
+                finally:
+                    kernel32.CloseHandle(thread)
+            has_entry = kernel32.Thread32Next(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    if resumed == 0:
+        raise OSError(f"could not find a thread to resume for process {pid}")
+
+
+def popen_owned_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    stdout: Any = subprocess.PIPE,
+    stderr: Any = subprocess.PIPE,
+) -> tuple[subprocess.Popen[str], WindowsKillJob | None]:
+    options: dict[str, Any] = {
+        "cwd": str(cwd),
+        "stdin": subprocess.DEVNULL,
+        "stdout": stdout,
+        "stderr": stderr,
+        "text": True,
+        "encoding": "utf-8",
+        "env": subprocess_environment(),
+    }
+    if IS_WINDOWS:
+        breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        options["creationflags"] = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | breakaway
+            | getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+        )
+    else:
+        breakaway = 0
+        options["start_new_session"] = True
+    try:
+        process = subprocess.Popen(command, **options)
+        used_breakaway = IS_WINDOWS
+    except OSError as error:
+        if (
+            not IS_WINDOWS
+            or getattr(error, "winerror", None) != 5
+            or not breakaway
+        ):
+            raise
+        options["creationflags"] &= ~breakaway
+        process = subprocess.Popen(command, **options)
+        used_breakaway = False
+    owner = None
+    try:
+        if IS_WINDOWS:
+            try:
+                owner = create_windows_kill_job(process.pid)
+            except OSError as error:
+                if used_breakaway or getattr(error, "winerror", None) != 5:
+                    raise
+            if owner is None:
+                raise WorkflowError(
+                    "managed helper could not acquire a Windows process-tree owner"
+                )
+            resume_windows_process(process.pid)
+        return process, owner
+    except BaseException:
+        if owner is not None:
+            owner.close()
+        else:
+            process.terminate()
+        process.wait()
+        raise
+
+
+def terminate_owned_process(
+    process: subprocess.Popen[str],
+    owner: WindowsKillJob | None,
+    *,
+    timeout: float = HOSTED_HELPER_TERMINATION_TIMEOUT,
+) -> None:
+    if process.poll() is not None:
+        process.wait()
+        return
+    if owner is not None:
+        owner.terminate()
+    elif IS_WINDOWS:
+        process.terminate()
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if IS_WINDOWS:
+            process.kill()
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        process.wait()
+
+
+def process_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if IS_WINDOWS:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x100000, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == 5:
+                return True
+            if error == 87:
+                return False
+            raise ctypes.WinError(error)
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return exit_code.value == 259
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def subprocess_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
     environment = {**os.environ, **(extra or {})}
     environment["PYTHONIOENCODING"] = "utf-8"
@@ -475,6 +780,194 @@ def gh_json(arguments: list[str]) -> Any:
         return json.loads(output) if output.strip() else None
     except json.JSONDecodeError as error:
         raise WorkflowError(f"gh returned invalid JSON: {error}") from error
+
+
+def agent_task_api_json(endpoint: str) -> Any:
+    return gh_json(
+        [
+            "api",
+            "--method",
+            "GET",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            f"X-GitHub-Api-Version: {AGENT_TASK_API_VERSION}",
+            endpoint,
+        ]
+    )
+
+
+def listed_agent_task_ids(repository: str) -> set[str]:
+    process = run(
+        [
+            "gh",
+            "api",
+            "--method",
+            "GET",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            f"X-GitHub-Api-Version: {AGENT_TASK_API_VERSION}",
+            f"agents/repos/{repository}/tasks",
+            "--jq",
+            ".tasks[].id",
+        ]
+    )
+    identifiers = {
+        task_id.strip() for task_id in process.stdout.splitlines() if task_id.strip()
+    }
+    if any(re.search(r"\s", task_id) for task_id in identifiers):
+        raise WorkflowError("GitHub returned a malformed Agent Task identity")
+    return identifiers
+
+
+def hosted_dispatch_identity(
+    task: Any,
+    *,
+    consumer_prompt: str,
+    preflight: dict[str, Any],
+    requested_model: str,
+    started_at: str,
+) -> dict[str, Any] | None:
+    if not isinstance(task, dict):
+        return None
+    task_id = task.get("id")
+    task_state = task.get("state")
+    sessions = task.get("sessions")
+    created_at = task.get("created_at")
+    updated_at = task.get("updated_at")
+    task_url = task.get("html_url")
+    if (
+        not isinstance(task_id, str)
+        or not task_id
+        or task_state
+        not in {
+            "queued",
+            "in_progress",
+            "completed",
+            "failed",
+            "timed_out",
+            "cancelled",
+            "waiting_for_user",
+            "idle",
+        }
+        or not isinstance(sessions, list)
+        or len(sessions) != 1
+        or not isinstance(created_at, str)
+        or not isinstance(updated_at, str)
+        or not updated_at
+        or not isinstance(task_url, str)
+        or not task_url
+        or parse_timestamp(created_at) < parse_timestamp(started_at)
+    ):
+        return None
+    session = sessions[0]
+    if not isinstance(session, dict):
+        return None
+    prompt = session.get("prompt")
+    model = session.get("model")
+    session_id = session.get("id")
+    session_created_at = session.get("created_at")
+    session_updated_at = session.get("updated_at")
+    session_head_ref = session.get("head_ref")
+    pr = preflight["pr"]
+    expected_base_ref = (
+        pr["head_sha"]
+        if pr.get("cross_repository") or pr.get("state") == "MERGED"
+        else pr["head_branch"]
+    )
+    if (
+        session.get("task_id") != task_id
+        or session.get("state") != task_state
+        or model not in {requested_model, f"sweagent-capi:{requested_model}"}
+        or session.get("base_ref") != expected_base_ref
+        or not isinstance(prompt, str)
+        or not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(session_created_at, str)
+        or not session_created_at
+        or not isinstance(session_updated_at, str)
+        or not session_updated_at
+        or not isinstance(session_head_ref, str)
+        or not session_head_ref
+    ):
+        return None
+    report_paths = sorted(
+        set(
+            re.findall(
+                r"\.github/agent-task-reports/"
+                r"[A-Za-z0-9][A-Za-z0-9._-]*\.md",
+                prompt,
+            )
+        )
+    )
+    if len(report_paths) != 1:
+        return None
+    report_path = report_paths[0]
+    if (
+        REPORT_PATH_PLACEHOLDER not in consumer_prompt
+        or consumer_prompt.replace(REPORT_PATH_PLACEHOLDER, report_path)
+        not in prompt
+        or f"Source PR: {pr['pr_url']}" not in prompt
+        or f"Exact source head SHA: {pr['head_sha']}" not in prompt
+        or f"Policy: {AGENT_TASK_POLICY}" not in prompt
+    ):
+        return None
+    report_match = REPORT_PATH_PATTERN.fullmatch(report_path)
+    if report_match is None:
+        return None
+    return {
+        "schema": HOSTED_DISPATCH_IDENTITY_SCHEMA,
+        "task_id": task_id,
+        "task_state": task_state,
+        "task_url": task_url,
+        "task_created_at": created_at,
+        "task_updated_at": updated_at,
+        "session_id": session_id,
+        "session_state": session["state"],
+        "session_model": model,
+        "session_base_ref": session["base_ref"],
+        "session_head_ref": session_head_ref,
+        "session_created_at": session_created_at,
+        "session_updated_at": session_updated_at,
+        "live_prompt_sha256": sha256_text(prompt),
+        "consumer_prompt_sha256": sha256_text(consumer_prompt),
+        "report_path": report_path,
+        "request_id": report_match.group("request_id"),
+        "observed_at": utc_now(),
+    }
+
+
+def discover_hosted_dispatch(
+    *,
+    repository: str,
+    baseline_task_ids: set[str],
+    consumer_prompt: str,
+    preflight: dict[str, Any],
+    requested_model: str,
+    started_at: str,
+) -> dict[str, Any] | None:
+    current_ids = listed_agent_task_ids(repository)
+    candidates = []
+    for task_id in sorted(current_ids - baseline_task_ids):
+        task = agent_task_api_json(
+            f"agents/repos/{repository}/tasks/"
+            f"{urllib.parse.quote(task_id, safe='')}"
+        )
+        identity = hosted_dispatch_identity(
+            task,
+            consumer_prompt=consumer_prompt,
+            preflight=preflight,
+            requested_model=requested_model,
+            started_at=started_at,
+        )
+        if identity is not None:
+            candidates.append(identity)
+    if len(candidates) > 1:
+        raise WorkflowError(
+            "multiple hosted Agent Tasks match the exact CI dispatch identity"
+        )
+    return candidates[0] if candidates else None
 
 
 def graphql(query: str, variables: dict[str, str | int | None]) -> Any:
@@ -6305,6 +6798,223 @@ def materialize_local_triage_workspace(
     return workspace
 
 
+def update_hosted_dispatch_monitor(
+    state_path: Path,
+    *,
+    run_id: str,
+    monitor: dict[str, Any],
+    identity: dict[str, Any] | None = None,
+) -> None:
+    state = load_state(state_path)
+    task = state.get("agent_task")
+    if (
+        not isinstance(task, dict)
+        or task.get("run_id") != run_id
+        or task.get("status") != "running"
+        or task.get("phase") != "hosted_fix"
+    ):
+        raise WorkflowError("retained hosted dispatch is no longer active")
+    task["dispatch_monitor"] = monitor
+    if identity is not None:
+        current = task.get("dispatch_identity")
+        if current is not None and current != identity:
+            raise WorkflowError("retained hosted dispatch identity changed")
+        task["dispatch_identity"] = identity
+        task["task_id_status"] = "known"
+        task["task_id"] = identity["task_id"]
+        task["task_url"] = identity["task_url"]
+        task["session_id"] = identity["session_id"]
+        task["report"] = {
+            "path": identity["report_path"],
+            "request_id": identity["request_id"],
+            "commit_sha": None,
+            "sha256": None,
+            "content": None,
+        }
+    save_state(state_path, state)
+
+
+def run_hosted_helper(
+    command: list[str],
+    *,
+    repo_root: Path,
+    state_path: Path,
+    run_id: str,
+    preflight: dict[str, Any],
+    consumer_prompt: str,
+    requested_model: str,
+    timeout: float,
+    discovery_interval: float,
+) -> subprocess.CompletedProcess[str]:
+    if timeout <= 0 or discovery_interval <= 0:
+        raise WorkflowError("hosted helper timing values must be positive")
+    repository = preflight["pr"]["repo_name"]
+    baseline_task_ids = listed_agent_task_ids(repository)
+    started_at = utc_now()
+    monitor = {
+        "schema": "github.copilot.ci-fix-loop-hosted-dispatch-monitor.v1",
+        "status": "starting",
+        "started_at": started_at,
+        "timeout_seconds": timeout,
+        "discovery_interval_seconds": discovery_interval,
+        "baseline_task_ids": sorted(baseline_task_ids),
+        "helper_pid": None,
+        "helper_exit_code": None,
+        "finished_at": None,
+        "failure": None,
+    }
+    update_hosted_dispatch_monitor(
+        state_path,
+        run_id=run_id,
+        monitor=monitor,
+    )
+    stdout_file = tempfile.TemporaryFile(
+        mode="w+", encoding="utf-8", newline="\n"
+    )
+    stderr_file = tempfile.TemporaryFile(
+        mode="w+", encoding="utf-8", newline="\n"
+    )
+    try:
+        process, owner = popen_owned_process(
+            command,
+            cwd=repo_root,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+    except BaseException:
+        stdout_file.close()
+        stderr_file.close()
+        raise
+    try:
+        monitor["status"] = "running"
+        monitor["helper_pid"] = process.pid
+        update_hosted_dispatch_monitor(
+            state_path,
+            run_id=run_id,
+            monitor=monitor,
+        )
+        deadline = time.monotonic() + timeout
+        identity = None
+        while True:
+            if identity is None:
+                identity = discover_hosted_dispatch(
+                    repository=repository,
+                    baseline_task_ids=baseline_task_ids,
+                    consumer_prompt=consumer_prompt,
+                    preflight=preflight,
+                    requested_model=requested_model,
+                    started_at=started_at,
+                )
+                if identity is not None:
+                    update_hosted_dispatch_monitor(
+                        state_path,
+                        run_id=run_id,
+                        monitor=monitor,
+                        identity=identity,
+                    )
+            returncode = process.poll()
+            if returncode is not None:
+                process.wait()
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout = stdout_file.read()
+                stderr = stderr_file.read()
+                monitor["status"] = "exited"
+                monitor["helper_exit_code"] = returncode
+                monitor["finished_at"] = utc_now()
+                update_hosted_dispatch_monitor(
+                    state_path,
+                    run_id=run_id,
+                    monitor=monitor,
+                    identity=identity,
+                )
+                return subprocess.CompletedProcess(
+                    command,
+                    returncode,
+                    stdout,
+                    stderr,
+                )
+            if time.monotonic() >= deadline:
+                monitor["status"] = "timed_out"
+                monitor["finished_at"] = utc_now()
+                monitor["failure"] = "hosted_helper_timeout"
+                terminate_owned_process(process, owner)
+                update_hosted_dispatch_monitor(
+                    state_path,
+                    run_id=run_id,
+                    monitor=monitor,
+                    identity=identity,
+                )
+                task_detail = (
+                    f"; known task {identity['task_id']}"
+                    if identity is not None
+                    else "; task identity unknown"
+                )
+                raise WorkflowError(
+                    f"hosted Agent Task helper exceeded {timeout:g} seconds"
+                    f"{task_detail}"
+                )
+            time.sleep(
+                min(discovery_interval, max(0.0, deadline - time.monotonic()))
+            )
+    except BaseException:
+        if process.poll() is None:
+            terminate_owned_process(process, owner)
+        raise
+    finally:
+        if owner is not None:
+            owner.close()
+        elif not IS_WINDOWS:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        stdout_file.close()
+        stderr_file.close()
+
+
+def reconcile_dead_hosted_owner(
+    state_path: Path,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    task = state.get("agent_task")
+    monitor = task.get("dispatch_monitor") if isinstance(task, dict) else None
+    pid = monitor.get("helper_pid") if isinstance(monitor, dict) else None
+    if (
+        not isinstance(task, dict)
+        or task.get("status") != "running"
+        or task.get("phase") != "hosted_fix"
+        or not isinstance(monitor, dict)
+        or monitor.get("status") != "running"
+        or not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or process_is_running(pid)
+    ):
+        return state
+    identity = task.get("dispatch_identity")
+    known = (
+        isinstance(identity, dict)
+        and identity.get("schema") == HOSTED_DISPATCH_IDENTITY_SCHEMA
+        and isinstance(identity.get("task_id"), str)
+        and bool(identity["task_id"])
+    )
+    monitor["status"] = "owner_lost"
+    monitor["finished_at"] = utc_now()
+    monitor["failure"] = "hosted_helper_owner_lost"
+    task["status"] = "failed"
+    task["task_id_status"] = "known" if known else "unknown"
+    task["task_id"] = identity["task_id"] if known else None
+    task["error"] = (
+        f"hosted Agent Task helper process {pid} is no longer running; "
+        f"task identity {'known' if known else 'unknown'}"
+    )
+    task["failed_at"] = utc_now()
+    task.pop("retry_command", None)
+    task.pop("recovery_command", None)
+    save_state(state_path, state)
+    return state
+
+
 def command_agent_task(args: argparse.Namespace) -> None:
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
@@ -6312,6 +7022,26 @@ def command_agent_task(args: argparse.Namespace) -> None:
     state_path = cli_path(args.state) if args.state else default_state_path(target)
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
+    if existing is not None:
+        existing = reconcile_dead_hosted_owner(state_path, existing)
+    existing_task = existing.get("agent_task") if existing is not None else None
+    if (
+        not args.resume
+        and isinstance(existing_task, dict)
+        and existing_task.get("status") not in {"completed", "consumed"}
+        and not (
+            existing_task.get("status") == "failed"
+            and existing_task.get("task_id_status") == "not_created"
+        )
+    ):
+        action = (
+            "use its recovery_command"
+            if existing_task.get("recovery_command")
+            else "no generic retry or recovery is permitted"
+        )
+        raise WorkflowError(
+            f"an unfinished Agent Task already owns this state; {action}"
+        )
     replacing_not_created_task = False
     reusable_triage_task: dict[str, Any] | None = None
     input_result_path: Path | None = None
@@ -6322,6 +7052,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
         task_state = existing.get("agent_task")
         if not isinstance(task_state, dict):
             raise WorkflowError("recovery state has no Agent Task")
+        if not isinstance(task_state.get("recovery_command"), str):
+            raise WorkflowError(
+                "hosted task recovery is not permitted for this terminal owner"
+            )
         preflight = task_state.get("preflight")
         if (
             not isinstance(preflight, dict)
@@ -6407,9 +7141,13 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 active_task.get("status") == "failed"
                 and active_task.get("task_id_status") == "not_created"
             ):
+                action = (
+                    "use its recovery_command"
+                    if active_task.get("recovery_command")
+                    else "no generic retry or recovery is permitted"
+                )
                 raise WorkflowError(
-                    "an unfinished Agent Task already owns this state; use its "
-                    "recovery_command"
+                    f"an unfinished Agent Task already owns this state; {action}"
                 )
             if (
                 isinstance(active_task, dict)
@@ -6874,13 +7612,27 @@ def command_agent_task(args: argparse.Namespace) -> None:
             task_state["phase"] = "hosted_fix"
             task_state["helper"] = str(helper)
             save_state(state_path, state)
-            process = run(command, cwd=repo_root, check=False)
+            process = run_hosted_helper(
+                command,
+                repo_root=repo_root,
+                state_path=state_path,
+                run_id=task_state["run_id"],
+                preflight=preflight,
+                consumer_prompt=prompt,
+                requested_model=requested_model,
+                timeout=args.hosted_timeout,
+                discovery_interval=args.hosted_discovery_interval,
+            )
+            state = load_state(state_path)
+            task_state = state["agent_task"]
             if not result_path.is_file():
                 raise WorkflowError(
                     f"managed helper exited {process.returncode} without an atomic "
                     "result file"
                 )
         except BaseException as error:
+            state = load_state(state_path)
+            task_state = state["agent_task"]
             task_state["status"] = "failed"
             task_state["error"] = str(error)
             task_state["failed_at"] = utc_now()
@@ -6904,6 +7656,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     state_path=state_path,
                 )
                 task_state.pop("recovery_command", None)
+            else:
+                task_state.pop("retry_command", None)
+                if task_state.get("task_id_status") != "known":
+                    task_state["task_id_status"] = "unknown"
+                    task_state["task_id"] = None
+                task_state.pop("recovery_command", None)
             save_state(state_path, state)
             if isinstance(error, WorkflowError):
                 error.details.update(
@@ -6913,14 +7671,32 @@ def command_agent_task(args: argparse.Namespace) -> None:
                         **(
                             {"retry_command": task_state["retry_command"]}
                             if task_state.get("task_id_status") == "not_created"
-                            else {"recovery_command": recovery}
+                            else {}
                         ),
                     }
                 )
             raise
+    validated_hosted_result = False
     try:
         result = load_agent_task_result(result_path)
         result_sha256 = sha256_file(result_path)
+        dispatch_identity = load_state(state_path).get("agent_task", {}).get(
+            "dispatch_identity"
+        )
+        if dispatch_identity is not None:
+            result_task = result.get("task")
+            result_report = result.get("report")
+            if (
+                not isinstance(dispatch_identity, dict)
+                or not isinstance(result_task, dict)
+                or result_task.get("id") != dispatch_identity.get("task_id")
+                or not isinstance(result_report, dict)
+                or result_report.get("path") != dispatch_identity.get("report_path")
+            ):
+                raise WorkflowError(
+                    "managed helper result does not match the retained hosted "
+                    "dispatch identity"
+                )
         if result.get("status") != "success":
             result_task = result.get("task")
             result_task_id = (
@@ -7033,6 +7809,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         if live["head_sha"].lower() == pr["head_sha"]:
             require_live_check_snapshot(preflight)
         require_live_pr_snapshot(pr, live, expected_head=live["head_sha"])
+        validated_hosted_result = True
         task_state.update(
             {
                 "status": "validated_pending_import",
@@ -7345,8 +8122,13 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 if imported
                 else "failed"
             )
-            if task_state.get("task_id_status") != "not_created":
+            if (
+                task_state.get("task_id_status") != "not_created"
+                and not validated_hosted_result
+            ):
                 task_state["error"] = str(error)
+                task_state.pop("retry_command", None)
+                task_state.pop("recovery_command", None)
             task_state["failed_at"] = utc_now()
             task_state["recovery_files"] = [
                 str(path)
@@ -7381,6 +8163,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
                                     "recovery_command"
                                 )
                             }
+                            if isinstance(
+                                task_state.get("recovery_command"), str
+                            )
+                            else {}
                         ),
                     }
                 )
@@ -9662,6 +10448,18 @@ def build_parser() -> argparse.ArgumentParser:
     agent_task.add_argument("--pipeline-iteration", type=int)
     agent_task.add_argument("--pipeline-max-iterations", type=int)
     agent_task.add_argument(
+        "--hosted-timeout",
+        type=float,
+        default=DEFAULT_HOSTED_HELPER_TIMEOUT,
+        help="maximum seconds to own one hosted Agent Task helper process",
+    )
+    agent_task.add_argument(
+        "--hosted-discovery-interval",
+        type=float,
+        default=DEFAULT_HOSTED_DISCOVERY_INTERVAL,
+        help="seconds between exact hosted Agent Task identity probes",
+    )
+    agent_task.add_argument(
         "--resume",
         action="store_true",
         help="continue the same task import or retry it with --input-result-file",
@@ -9704,6 +10502,18 @@ def build_parser() -> argparse.ArgumentParser:
     loop.add_argument("--pipeline-run")
     loop.add_argument("--pipeline-iteration", type=int)
     loop.add_argument("--pipeline-max-iterations", type=int)
+    loop.add_argument(
+        "--hosted-timeout",
+        type=float,
+        default=DEFAULT_HOSTED_HELPER_TIMEOUT,
+        help="maximum seconds to own one hosted Agent Task helper process",
+    )
+    loop.add_argument(
+        "--hosted-discovery-interval",
+        type=float,
+        default=DEFAULT_HOSTED_DISCOVERY_INTERVAL,
+        help="seconds between exact hosted Agent Task identity probes",
+    )
     loop.add_argument(
         "--poll-interval",
         type=float,

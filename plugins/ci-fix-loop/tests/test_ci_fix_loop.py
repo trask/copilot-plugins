@@ -308,6 +308,68 @@ class WindowsSubprocessTest(unittest.TestCase):
             subprocess_run.call_args.kwargs["creationflags"], 0x08000000
         )
 
+    def test_owned_process_is_suspended_until_windows_job_assignment(self):
+        process = mock.Mock(pid=17)
+        owner = mock.Mock()
+        with (
+            mock.patch.object(MODULE, "IS_WINDOWS", True),
+            mock.patch.object(
+                MODULE.subprocess,
+                "CREATE_NO_WINDOW",
+                0x08000000,
+                create=True,
+            ),
+            mock.patch.object(
+                MODULE.subprocess,
+                "CREATE_NEW_PROCESS_GROUP",
+                0x00000200,
+                create=True,
+            ),
+            mock.patch.object(
+                MODULE.subprocess,
+                "CREATE_BREAKAWAY_FROM_JOB",
+                0x01000000,
+                create=True,
+            ),
+            mock.patch.object(
+                MODULE.subprocess,
+                "CREATE_SUSPENDED",
+                0x00000004,
+                create=True,
+            ),
+            mock.patch.object(
+                MODULE.subprocess, "Popen", return_value=process
+            ) as popen,
+            mock.patch.object(
+                MODULE, "create_windows_kill_job", return_value=owner
+            ) as create_job,
+            mock.patch.object(MODULE, "resume_windows_process") as resume,
+        ):
+            actual_process, actual_owner = MODULE.popen_owned_process(
+                ["helper"], cwd=Path.cwd()
+            )
+
+        self.assertIs(process, actual_process)
+        self.assertIs(owner, actual_owner)
+        self.assertEqual(
+            0x09000204,
+            popen.call_args.kwargs["creationflags"],
+        )
+        create_job.assert_called_once_with(17)
+        resume.assert_called_once_with(17)
+
+    def test_termination_uses_the_owned_windows_job(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        owner = mock.Mock()
+
+        MODULE.terminate_owned_process(process, owner, timeout=3)
+
+        owner.terminate.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=3)
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+
 
 NOW = dt.datetime(2026, 1, 1, 12, 0, 0, tzinfo=dt.timezone.utc)
 DIFF = """diff --git a/app.py b/app.py
@@ -1136,6 +1198,361 @@ class LegacyAgentInstructionsReference:
         self.assertNotIn("omit to use the current branch's PR", self.instructions)
 
 
+class HostedDispatchOwnershipTest(unittest.TestCase):
+    def setUp(self):
+        self.preflight = {
+            "pr": {
+                "repository": "owner/repo",
+                "repo_name": "owner/repo",
+                "number": 7,
+                "pr_url": "https://github.com/owner/repo/pull/7",
+                "state": "OPEN",
+                "head_branch": "feature",
+                "head_sha": "1" * 40,
+                "cross_repository": False,
+            }
+        }
+        self.report_path = ".github/agent-task-reports/request-1.md"
+        self.consumer_prompt = (
+            "worker instructions\n"
+            f"write {MODULE.REPORT_PATH_PLACEHOLDER}\n"
+        )
+        rendered = self.consumer_prompt.replace(
+            MODULE.REPORT_PATH_PLACEHOLDER, self.report_path
+        )
+        self.live_prompt = (
+            f"{rendered}\n"
+            f"Source PR: {self.preflight['pr']['pr_url']}\n"
+            f"Exact source head SHA: {self.preflight['pr']['head_sha']}\n"
+            f"Policy: {MODULE.AGENT_TASK_POLICY}\n"
+        )
+        self.task = {
+            "id": "task-1",
+            "state": "in_progress",
+            "html_url": "https://github.com/owner/repo/agent-tasks/task-1",
+            "created_at": "2026-01-01T00:00:01Z",
+            "updated_at": "2026-01-01T00:00:02Z",
+            "sessions": [
+                {
+                    "id": "session-1",
+                    "task_id": "task-1",
+                    "state": "in_progress",
+                    "created_at": "2026-01-01T00:00:01Z",
+                    "updated_at": "2026-01-01T00:00:02Z",
+                    "model": "sweagent-capi:gpt-5.6-sol",
+                    "base_ref": "feature",
+                    "head_ref": "copilot/fix",
+                    "prompt": self.live_prompt,
+                }
+            ],
+        }
+
+    def identity(self, task=None):
+        return MODULE.hosted_dispatch_identity(
+            self.task if task is None else task,
+            consumer_prompt=self.consumer_prompt,
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+            started_at="2026-01-01T00:00:00Z",
+        )
+
+    def test_extracts_one_exact_hosted_dispatch_identity(self):
+        identity = self.identity()
+
+        self.assertEqual("task-1", identity["task_id"])
+        self.assertEqual("session-1", identity["session_id"])
+        self.assertEqual(self.report_path, identity["report_path"])
+        self.assertEqual("request-1", identity["request_id"])
+        self.assertEqual(
+            MODULE.sha256_text(self.live_prompt),
+            identity["live_prompt_sha256"],
+        )
+
+    def test_task_baseline_projects_only_opaque_ids(self):
+        completed = MODULE.subprocess.CompletedProcess(
+            ["gh"], 0, "task-1\ntask-2\n", ""
+        )
+        with mock.patch.object(
+            MODULE, "run", return_value=completed
+        ) as run_command:
+            identifiers = MODULE.listed_agent_task_ids("owner/repo")
+
+        self.assertEqual({"task-1", "task-2"}, identifiers)
+        command = run_command.call_args.args[0]
+        self.assertEqual(".tasks[].id", command[command.index("--jq") + 1])
+
+    def test_rejects_any_material_hosted_identity_drift(self):
+        mutations = {
+            "task": lambda task: task.update(id="other"),
+            "state": lambda task: task["sessions"][0].update(state="completed"),
+            "model": lambda task: task["sessions"][0].update(
+                model="sweagent-capi:gpt-6-astra"
+            ),
+            "base": lambda task: task["sessions"][0].update(base_ref="main"),
+            "prompt": lambda task: task["sessions"][0].update(prompt="other"),
+            "creation": lambda task: task.update(
+                created_at="2025-12-31T23:59:59Z"
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                task = copy.deepcopy(self.task)
+                mutate(task)
+                self.assertIsNone(self.identity(task))
+
+    def test_discovery_rejects_multiple_exact_matches(self):
+        other = copy.deepcopy(self.task)
+        other["id"] = "task-2"
+        other["sessions"][0]["task_id"] = "task-2"
+        with (
+            mock.patch.object(
+                MODULE,
+                "listed_agent_task_ids",
+                return_value={"old", "task-1", "task-2"},
+            ),
+            mock.patch.object(
+                MODULE,
+                "agent_task_api_json",
+                side_effect=[self.task, other],
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "multiple hosted"),
+        ):
+            MODULE.discover_hosted_dispatch(
+                repository="owner/repo",
+                baseline_task_ids={"old"},
+                consumer_prompt=self.consumer_prompt,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+                started_at="2026-01-01T00:00:00Z",
+            )
+
+    def test_timeout_persists_known_task_and_reaps_owned_process(self):
+        class FakeProcess:
+            pid = 19
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            MODULE.save_state(
+                state_path,
+                {
+                    "version": MODULE.STATE_VERSION,
+                    "agent_task": {
+                        "run_id": "run-1",
+                        "status": "running",
+                        "phase": "hosted_fix",
+                    }
+                },
+            )
+            process = FakeProcess()
+            owner = mock.Mock()
+            identity = self.identity()
+
+            def terminate(actual_process, _owner):
+                actual_process.returncode = 1
+
+            with (
+                mock.patch.object(
+                    MODULE, "listed_agent_task_ids", return_value={"old"}
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "popen_owned_process",
+                    return_value=(process, owner),
+                ),
+                mock.patch.object(
+                    MODULE, "discover_hosted_dispatch", return_value=identity
+                ),
+                mock.patch.object(
+                    MODULE.time, "monotonic", side_effect=[0.0, 1.0]
+                ),
+                mock.patch.object(MODULE, "terminate_owned_process", side_effect=terminate),
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError, "known task task-1"
+                ),
+            ):
+                MODULE.run_hosted_helper(
+                    ["helper"],
+                    repo_root=Path(directory),
+                    state_path=state_path,
+                    run_id="run-1",
+                    preflight=self.preflight,
+                    consumer_prompt=self.consumer_prompt,
+                    requested_model="gpt-5.6-sol",
+                    timeout=1,
+                    discovery_interval=1,
+                )
+
+            task = MODULE.load_state(state_path)["agent_task"]
+            self.assertEqual("known", task["task_id_status"])
+            self.assertEqual("task-1", task["task_id"])
+            self.assertEqual("timed_out", task["dispatch_monitor"]["status"])
+            self.assertEqual("hosted_helper_timeout", task["dispatch_monitor"]["failure"])
+            owner.close.assert_called_once_with()
+
+    def test_dead_hosted_owner_is_finalized_without_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state = {
+                "version": MODULE.STATE_VERSION,
+                "agent_task": {
+                    "run_id": "run-1",
+                    "status": "running",
+                    "phase": "hosted_fix",
+                    "recovery_command": "must disappear",
+                    "retry_command": "must disappear",
+                    "dispatch_identity": self.identity(),
+                    "dispatch_monitor": {
+                        "status": "running",
+                        "helper_pid": 19,
+                    },
+                },
+            }
+            MODULE.save_state(state_path, state)
+
+            with mock.patch.object(
+                MODULE, "process_is_running", return_value=False
+            ):
+                reconciled = MODULE.reconcile_dead_hosted_owner(
+                    state_path, MODULE.load_state(state_path)
+                )
+
+            task = reconciled["agent_task"]
+            self.assertEqual("failed", task["status"])
+            self.assertEqual("known", task["task_id_status"])
+            self.assertEqual("task-1", task["task_id"])
+            self.assertEqual("owner_lost", task["dispatch_monitor"]["status"])
+            self.assertNotIn("recovery_command", task)
+            self.assertNotIn("retry_command", task)
+
+    def test_completed_helper_returns_captured_output_and_identity(self):
+        class FakeProcess:
+            pid = 23
+            returncode = 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self):
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            MODULE.save_state(
+                state_path,
+                {
+                    "version": MODULE.STATE_VERSION,
+                    "agent_task": {
+                        "run_id": "run-1",
+                        "status": "running",
+                        "phase": "hosted_fix",
+                    },
+                },
+            )
+            owner = mock.Mock()
+
+            def start(_command, *, stdout, stderr, **_kwargs):
+                stdout.write("stdout")
+                stdout.flush()
+                stderr.write("stderr")
+                stderr.flush()
+                return FakeProcess(), owner
+
+            with (
+                mock.patch.object(
+                    MODULE, "listed_agent_task_ids", return_value={"old"}
+                ),
+                mock.patch.object(
+                    MODULE, "popen_owned_process", side_effect=start
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "discover_hosted_dispatch",
+                    return_value=self.identity(),
+                ),
+                mock.patch.object(MODULE.time, "monotonic", return_value=0.0),
+            ):
+                result = MODULE.run_hosted_helper(
+                    ["helper"],
+                    repo_root=Path(directory),
+                    state_path=state_path,
+                    run_id="run-1",
+                    preflight=self.preflight,
+                    consumer_prompt=self.consumer_prompt,
+                    requested_model="gpt-5.6-sol",
+                    timeout=7200,
+                    discovery_interval=5,
+                )
+
+            self.assertEqual(0, result.returncode)
+            self.assertEqual("stdout", result.stdout)
+            self.assertEqual("stderr", result.stderr)
+            task = MODULE.load_state(state_path)["agent_task"]
+            self.assertEqual("task-1", task["task_id"])
+            self.assertEqual("exited", task["dispatch_monitor"]["status"])
+            owner.close.assert_called_once_with()
+
+    def test_live_hosted_owner_is_not_reclassified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state = {
+                "version": MODULE.STATE_VERSION,
+                "agent_task": {
+                    "run_id": "run-1",
+                    "status": "running",
+                    "phase": "hosted_fix",
+                    "dispatch_monitor": {
+                        "status": "running",
+                        "helper_pid": 19,
+                    },
+                },
+            }
+            MODULE.save_state(state_path, state)
+
+            with mock.patch.object(
+                MODULE, "process_is_running", return_value=True
+            ):
+                reconciled = MODULE.reconcile_dead_hosted_owner(
+                    state_path, MODULE.load_state(state_path)
+                )
+
+            self.assertEqual("running", reconciled["agent_task"]["status"])
+
+    def test_dead_hosted_owner_without_dispatch_identity_stays_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state = {
+                "version": MODULE.STATE_VERSION,
+                "agent_task": {
+                    "run_id": "run-1",
+                    "status": "running",
+                    "phase": "hosted_fix",
+                    "recovery_command": "must disappear",
+                    "dispatch_monitor": {
+                        "status": "running",
+                        "helper_pid": 19,
+                    },
+                },
+            }
+            MODULE.save_state(state_path, state)
+
+            with mock.patch.object(
+                MODULE, "process_is_running", return_value=False
+            ):
+                reconciled = MODULE.reconcile_dead_hosted_owner(
+                    state_path, MODULE.load_state(state_path)
+                )
+
+            task = reconciled["agent_task"]
+            self.assertEqual("failed", task["status"])
+            self.assertEqual("unknown", task["task_id_status"])
+            self.assertIsNone(task["task_id"])
+            self.assertNotIn("recovery_command", task)
+
+
 class ManagedAgentTaskContractTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -1216,12 +1633,21 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.github_fingerprint = mock.patch.object(
             MODULE, "github_triage_fingerprint", return_value={"state": "pinned"}
         )
+        self.hosted_helper = mock.patch.object(
+            MODULE,
+            "run_hosted_helper",
+            side_effect=lambda command, repo_root, **_kwargs: MODULE.run(
+                command, cwd=repo_root, check=False
+            ),
+        )
         self.triage_worker_mock = self.triage_worker.start()
         self.retained_triage_mock = self.retained_triage.start()
         self.github_fingerprint.start()
+        self.hosted_helper_mock = self.hosted_helper.start()
         self.addCleanup(self.triage_worker.stop)
         self.addCleanup(self.retained_triage.stop)
         self.addCleanup(self.github_fingerprint.stop)
+        self.addCleanup(self.hosted_helper.stop)
 
     def result(self, commits=None):
         commits = [] if commits is None else commits
@@ -1419,7 +1845,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("tools: [execute, agent, rename_session]", instructions)
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [execute, agent, todo", instructions)
-        self.assertEqual("1.6.28", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.29", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_canonicalizes_stack_start_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -1444,6 +1870,17 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "Every `stack-start` command must include that canonical target",
             invocation,
         )
+
+    def test_agent_keeps_reading_a_pending_coordinator_shell(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+        invocation = _agent_section(instructions, "## Invocation")
+
+        self.assertIn("delay of at most 540 seconds", invocation)
+        self.assertIn("Repeat direct reads of that same shell until it exits", invocation)
+        self.assertIn("Never end the turn", invocation)
+        self.assertIn("do not retry or recover it", invocation)
+        arguments = MODULE.build_parser().parse_args(["loop", "owner/repo#7"])
+        self.assertGreater(arguments.hosted_timeout, 600)
         self.assertIn(
             "Never pass a bare number and never omit the target",
             invocation,
@@ -2102,7 +2539,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 requested_model="gpt-5.6-sol",
             )
 
-    def test_failed_open_pr_task_resumes_without_a_replacement_task(self):
+    def test_failed_open_pr_task_cannot_resume_or_start_a_replacement(self):
         repo = self.root / "repo"
         repo.mkdir()
         state_path = self.root / "state.json"
@@ -2161,24 +2598,19 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(MODULE.WorkflowError, "transient failure"):
                 MODULE.command_agent_task(MODULE.build_parser().parse_args(arguments))
-            with self.assertRaisesRegex(MODULE.WorkflowError, "transient failure"):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "recovery is not permitted"
+            ):
                 MODULE.command_agent_task(
                     MODULE.build_parser().parse_args([*arguments, "--resume"])
                 )
 
-        self.assertEqual(2, len(helper_commands))
-        self.assertIn("--resume-apply-with-report", helper_commands[1])
-        self.assertEqual(
-            "task-1",
-            helper_commands[1][helper_commands[1].index("--task-id") + 1],
-        )
-        self.assertEqual(
-            "request-1",
-            helper_commands[1][helper_commands[1].index("--request-id") + 1],
-        )
-        self.assertNotIn("--prompt-file", helper_commands[1])
+        self.assertEqual(1, len(helper_commands))
+        self.assertNotIn("--resume-apply-with-report", helper_commands[0])
         state = MODULE.load_state(state_path)
         self.assertEqual("failed", state["agent_task"]["status"])
+        self.assertNotIn("recovery_command", state["agent_task"])
+        self.assertNotIn("retry_command", state["agent_task"])
         self.assertFalse(state["agent_task"].get("artifacts_removed", False))
         self.assertTrue(Path(state["agent_task"]["result_file"]).is_file())
         emit.assert_not_called()
@@ -2311,6 +2743,76 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "not_created", state["agent_task"]["task_id_status"]
         )
         self.assertIn("retry_command", state["agent_task"])
+
+    def test_hosted_timeout_with_known_task_has_no_generic_recovery(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        state_path = self.root / "state.json"
+        preflight = copy.deepcopy(self.preflight)
+        preflight["repository_root"] = str(repo)
+        arguments = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                self.preflight["pr"]["pr_url"],
+                "--repo-root",
+                str(repo),
+                "--state",
+                str(state_path),
+            ]
+        )
+
+        def timeout_with_identity(
+            _command, *, state_path, run_id, **_kwargs
+        ):
+            state = MODULE.load_state(state_path)
+            task = state["agent_task"]
+            task["task_id_status"] = "known"
+            task["task_id"] = "task-timeout"
+            task["dispatch_identity"] = {
+                "schema": MODULE.HOSTED_DISPATCH_IDENTITY_SCHEMA,
+                "task_id": "task-timeout",
+            }
+            MODULE.save_state(state_path, state)
+            raise MODULE.WorkflowError(
+                "hosted Agent Task helper exceeded 7200 seconds; "
+                "known task task-timeout"
+            )
+
+        self.hosted_helper_mock.side_effect = timeout_with_identity
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value={"repo_name": "owner/repo", "number": 7},
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=preflight
+            ),
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value=preflight["identity"],
+            ),
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
+            mock.patch.object(
+                MODULE,
+                "discover_cloud_task",
+                return_value=self.root / "cloud_task.py",
+            ),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "known task task-timeout"
+            ),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        task = MODULE.load_state(state_path)["agent_task"]
+        self.assertEqual("failed", task["status"])
+        self.assertEqual("known", task["task_id_status"])
+        self.assertEqual("task-timeout", task["task_id"])
+        self.assertNotIn("retry_command", task)
+        self.assertNotIn("recovery_command", task)
 
     def test_managed_fix_publishes_only_the_verified_fix_commit(self):
         repo = self.root / "repo"
