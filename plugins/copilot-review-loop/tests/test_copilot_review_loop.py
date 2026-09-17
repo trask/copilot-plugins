@@ -1850,6 +1850,85 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
         self.assertEqual(projected_probe, stored)
 
+    def test_terminal_recovery_refreezes_only_tree_identical_forward_base(self):
+        live_base = "a" * 40
+        actual = {**self.preflight["pr"], "base_sha": live_base}
+        threads = [{"id": "thread"}]
+        reviews = [{"id": 29}]
+        frozen = MODULE.github_fingerprint_from_snapshot(
+            {**actual, "base_sha": self.base},
+            threads=threads,
+            reviews=reviews,
+            head_ref=self.head,
+            base_ref=self.base,
+        )
+        with (
+            mock.patch.object(MODULE, "metadata_for", return_value=actual),
+            mock.patch.object(MODULE, "require_live_comments"),
+            mock.patch.object(
+                MODULE, "fetch_copilot_threads", return_value=(threads, [])
+            ),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=reviews),
+            mock.patch.object(
+                MODULE, "remote_head", side_effect=[self.head, live_base]
+            ),
+            mock.patch.object(
+                MODULE, "base_revision_is_ancestor", return_value=True
+            ) as ancestor,
+            mock.patch.object(MODULE, "git_trees_equal", return_value=True) as trees,
+        ):
+            fingerprint, preflight, rule = (
+                MODULE.terminal_recovery_github_fingerprint(
+                    MODULE.parse_target("owner/repo#7"),
+                    self.preflight,
+                    repo_root=self.repo_root,
+                    frozen_fingerprint=frozen,
+                )
+            )
+
+        self.assertEqual(live_base, fingerprint["base_ref_sha"])
+        self.assertEqual(live_base, preflight["pr"]["base_sha"])
+        self.assertEqual("forward-ancestor-identical-tree", rule)
+        ancestor.assert_called_once_with(self.repo_root, self.base, live_base)
+        trees.assert_called_once_with(self.repo_root, self.base, live_base)
+
+    def test_terminal_recovery_rejects_content_changing_forward_base(self):
+        live_base = "a" * 40
+        actual = {**self.preflight["pr"], "base_sha": live_base}
+        threads = [{"id": "thread"}]
+        reviews = [{"id": 29}]
+        frozen = MODULE.github_fingerprint_from_snapshot(
+            {**actual, "base_sha": self.base},
+            threads=threads,
+            reviews=reviews,
+            head_ref=self.head,
+            base_ref=self.base,
+        )
+        with (
+            mock.patch.object(MODULE, "metadata_for", return_value=actual),
+            mock.patch.object(MODULE, "require_live_comments"),
+            mock.patch.object(
+                MODULE, "fetch_copilot_threads", return_value=(threads, [])
+            ),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=reviews),
+            mock.patch.object(
+                MODULE, "remote_head", side_effect=[self.head, live_base]
+            ),
+            mock.patch.object(
+                MODULE, "base_revision_is_ancestor", return_value=True
+            ),
+            mock.patch.object(MODULE, "git_trees_equal", return_value=False),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "cannot be safely refrozen"
+            ),
+        ):
+            MODULE.terminal_recovery_github_fingerprint(
+                MODULE.parse_target("owner/repo#7"),
+                self.preflight,
+                repo_root=self.repo_root,
+                frozen_fingerprint=frozen,
+            )
+
     def test_local_worker_rejects_github_mutation_before_reading_decisions(self):
         mutated = {**self.github_fingerprint, "reviews_sha256": "f" * 64}
         MODULE.github_decision_fingerprint.return_value = mutated
@@ -1951,7 +2030,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.43")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.44")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -3615,6 +3694,286 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             apply_prepared=False,
             request_review_only=False,
             preserve_artifacts=False,
+            recover_terminal_local=None,
+            recovery_manifest_sha256=None,
+        )
+
+    def terminal_local_recovery_case(self, state_path):
+        prompt_path = self.directory / "terminal-prompt.txt"
+        decision_path = self.directory / "terminal-decisions.json"
+        result_path = self.directory / "terminal-result.json"
+        canonical_path = self.directory / "terminal-canonical.json"
+        prompt_path.write_text("pinned prompt\n", encoding="utf-8", newline="\n")
+        decision = self.local_decision()
+        decision["decisions"][0].update(
+            {
+                "disposition": "fixed",
+                "commit": self.fix,
+                "changed_paths": ["src/app.py"],
+            }
+        )
+        decision_path.write_text(
+            json.dumps(decision, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        session_id = "terminal-local-session"
+        events_path = (
+            self.copilot_home / "session-state" / session_id / "events.jsonl"
+        )
+        events_path.parent.mkdir(parents=True)
+        events_path.write_text(
+            json.dumps(
+                {
+                    "type": "session.start",
+                    "data": {
+                        "sessionId": session_id,
+                        "selectedModel": "gpt-5.6-sol",
+                        "reasoningEffort": "high",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        before_source = copy.deepcopy(self.source_fingerprint)
+        before_source["refs"].update(
+            {
+                "refs/copilot/workspace-diffs/other-session/head": "6" * 40,
+                "refs/heads/other-session": "7" * 40,
+                "refs/prefetch/remotes/origin/other-session": "8" * 40,
+            }
+        )
+        after_source = copy.deepcopy(before_source)
+        after_source["head"] = self.fix
+        after_source["refs"]["refs/heads/feature"] = self.fix
+        del after_source["refs"][
+            "refs/copilot/workspace-diffs/other-session/head"
+        ]
+        del after_source["refs"]["refs/heads/other-session"]
+        after_source["refs"][
+            "refs/prefetch/remotes/origin/other-session"
+        ] = "9" * 40
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "agent_task": {
+                "status": "failed",
+                "task_id_status": "terminal_unusable",
+                "producer": "local",
+                "policy": MODULE.LOCAL_DECISION_POLICY,
+                "model": MODULE.LOCAL_DECISION_MODEL,
+                "reasoning_effort": MODULE.LOCAL_DECISION_REASONING_EFFORT,
+                "run_id": "terminal-owner",
+                "local_session_id": session_id,
+                "preflight": self.preflight,
+                "prompt_file": str(prompt_path),
+                "prompt_sha256": MODULE.sha256_file(prompt_path),
+                "decision_file": str(decision_path),
+                "result_file": str(result_path),
+                "canonical_report_file": str(canonical_path),
+                "source_before": before_source,
+                "source_after": after_source,
+                "github_before": self.github_fingerprint,
+                "github_after": self.github_fingerprint,
+                "worker_command": MODULE.local_decision_command(
+                    self.repo_root,
+                    session_id=session_id,
+                    run_id="terminal-owner",
+                    pr_number=7,
+                ),
+                "error": "local decision worker changed an unexpected Git ref",
+            },
+        }
+        MODULE.save_state(state_path, state)
+        manifest_path = self.directory / "terminal-recovery.json"
+        manifest = {
+            "schema": MODULE.TERMINAL_LOCAL_RECOVERY_MANIFEST_SCHEMA,
+            "helper_sha256": MODULE.sha256_file(SCRIPT),
+            "state": {
+                "path": str(state_path),
+                "sha256": MODULE.sha256_file(state_path),
+            },
+            "target": self.preflight["pr"]["pr_url"],
+            "repo_root": str(self.repo_root),
+            "owner": "terminal-owner",
+            "session_id": session_id,
+            "prompt": {
+                "path": str(prompt_path),
+                "sha256": MODULE.sha256_file(prompt_path),
+                "size": prompt_path.stat().st_size,
+            },
+            "decisions": {
+                "path": str(decision_path),
+                "sha256": MODULE.sha256_file(decision_path),
+                "size": decision_path.stat().st_size,
+            },
+            "events": {
+                "path": str(events_path),
+                "sha256": MODULE.sha256_file(events_path),
+                "size": events_path.stat().st_size,
+            },
+            "findings": [
+                {
+                    key: decision["decisions"][0][key]
+                    for key in (
+                        "finding_key",
+                        "disposition",
+                        "commit",
+                        "changed_paths",
+                    )
+                }
+            ],
+            "source_before": MODULE.local_source_owner_fingerprint(
+                before_source
+            ),
+            "source_after": MODULE.local_source_owner_fingerprint(after_source),
+            "github": self.github_fingerprint,
+        }
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        arguments = self.arguments(state_path)
+        arguments.prepare_only = True
+        arguments.preserve_artifacts = True
+        arguments.recover_terminal_local = str(manifest_path)
+        arguments.recovery_manifest_sha256 = MODULE.sha256_file(manifest_path)
+        attestation = {
+            "status": "complete",
+            "session_id": session_id,
+            "events_path": str(events_path),
+            "events_sha256": MODULE.sha256_file(events_path),
+            "startup_model": "gpt-5.6-sol",
+            "startup_reasoning_effort": "high",
+            "observed_models": ["gpt-5.6-sol"],
+            "assistant_message_count": 42,
+        }
+        return arguments, manifest, attestation
+
+    def test_terminal_local_recovery_revalidates_without_rerunning_worker(self):
+        state_path = self.directory / "terminal-state.json"
+        arguments, manifest, attestation = self.terminal_local_recovery_case(
+            state_path
+        )
+        emitted = []
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=self.repo_root
+            ),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "local_source_fingerprint",
+                return_value=manifest["source_after"],
+            ),
+            mock.patch.object(
+                MODULE,
+                "validate_local_source_transition",
+                return_value=([self.fix], {self.fix: ["src/app.py"]}),
+            ),
+            mock.patch.object(
+                MODULE,
+                "terminal_recovery_github_fingerprint",
+                return_value=(
+                    self.github_fingerprint,
+                    self.preflight,
+                    "exact",
+                ),
+            ),
+            mock.patch.object(
+                MODULE,
+                "local_session_model_attestation",
+                return_value=attestation,
+            ),
+            mock.patch.object(MODULE, "run_local_decision_worker") as worker,
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        worker.assert_not_called()
+        recovered = MODULE.load_state(state_path)["agent_task"]
+        self.assertEqual("validated_pending_import", recovered["status"])
+        self.assertTrue(recovered["validation_complete"])
+        self.assertEqual([self.fix], recovered["ordered_commits"])
+        self.assertNotIn("task_id_status", recovered)
+        self.assertTrue(Path(recovered["result_file"]).is_file())
+        self.assertTrue(Path(recovered["canonical_report_file"]).is_file())
+        self.assertIn("--apply-prepared", recovered["apply_command"])
+        self.assertEqual("validated_pending_import", emitted[-1]["result"])
+        with (
+            mock.patch.object(
+                MODULE,
+                "local_source_fingerprint",
+                return_value=manifest["source_after"],
+            ),
+            mock.patch.object(
+                MODULE,
+                "github_decision_fingerprint",
+                return_value=self.github_fingerprint,
+            ),
+            mock.patch.object(
+                MODULE,
+                "validate_local_source_transition",
+                return_value=([self.fix], {self.fix: ["src/app.py"]}),
+            ),
+            mock.patch.object(
+                MODULE,
+                "local_session_model_attestation",
+                return_value=attestation,
+            ),
+        ):
+            retained = MODULE.validate_retained_local_decision(
+                repo_root=self.repo_root,
+                target=MODULE.parse_target("owner/repo#7"),
+                preflight=recovered["preflight"],
+                prompt_path=Path(recovered["prompt_file"]),
+                decision_path=Path(recovered["decision_file"]),
+                result_path=Path(recovered["result_file"]),
+                canonical_path=Path(recovered["canonical_report_file"]),
+                requested_model=MODULE.LOCAL_DECISION_MODEL,
+            )
+
+        self.assertEqual([self.fix], retained["remote"]["commits"])
+
+    def test_terminal_local_recovery_rejects_decision_hash_drift(self):
+        state_path = self.directory / "terminal-drift-state.json"
+        arguments, _manifest, _attestation = (
+            self.terminal_local_recovery_case(state_path)
+        )
+        decision_path = Path(
+            MODULE.load_state(state_path)["agent_task"]["decision_file"]
+        )
+        decision_path.write_text("{}\n", encoding="utf-8", newline="\n")
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=self.repo_root
+            ),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "run_local_decision_worker") as worker,
+            self.assertRaisesRegex(MODULE.WorkflowError, "decision identity drifted"),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        worker.assert_not_called()
+        self.assertFalse(
+            Path(
+                MODULE.load_state(state_path)["agent_task"][
+                    "canonical_report_file"
+                ]
+            ).exists()
         )
 
     def invoke_local_failure(

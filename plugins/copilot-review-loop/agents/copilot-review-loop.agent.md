@@ -50,6 +50,8 @@ If the bounded wait expires, the saved monitor remains requested. A later hash-g
 
 Failed local owners become `terminal_unusable`. The coordinator preserves the local session identity, prompt, raw decision, canonical report, result, and available pre/post fingerprints; removes any resume command; and offers only a fresh non-resume retry. It never resets, adapts, or hides unexpected local commits. A fresh retry archives the terminal owner once before creating one new local owner, and an active replacement prevents duplicates.
 
+An explicitly authorized `--recover-terminal-local` preparation may consume a terminal owner's existing prompt, raw decisions, session events, and retained commits without rerunning the worker. It requires a separately SHA-256-pinned manifest covering the installed helper, state, owner, session, artifacts, normalized source fingerprints, findings, and GitHub fingerprint. It accepts the frozen base or a descendant with an identical Git tree, revalidates every fixed finding and changed path, rebuilds the canonical report and result, and stops at `validated_pending_import`.
+
 Immutable completed hosted-task results from older releases may be consumed only through their exact legacy schema and policy validators. Unfinished hosted tasks cannot resume, and all fresh execution is local.
 
 The stage's `--max-iterations` value remains the per-iteration limit. An outer loop does not raise or lower that; it bounds what the whole run may spend instead. The coordinator records work equivalent to `progress --state <path> --phase addressing_comments` before the decision session and `progress --state <path> --phase validating` while it validates local artifacts.

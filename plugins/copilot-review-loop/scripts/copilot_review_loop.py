@@ -135,6 +135,13 @@ LOCAL_DECISION_RESULT_SCHEMA = {
     "id": "github.copilot.copilot-review-loop-local-result",
     "version": 2,
 }
+TERMINAL_LOCAL_RECOVERY_MANIFEST_SCHEMA = {
+    "id": "github.copilot.copilot-review-loop-terminal-local-recovery",
+    "version": 1,
+}
+TERMINAL_LOCAL_RECOVERY_POLICY = (
+    "marketplace-terminal-local-review-validator@1"
+)
 LEGACY_LOCAL_DECISION_RESULT_SCHEMA = {
     "id": "github.copilot.copilot-review-loop-local-result",
     "version": 1,
@@ -188,6 +195,7 @@ MODEL_ALIASES = {
     "sol": "gpt-5.6-sol",
 }
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 REPORT_PATH_PATTERN = re.compile(
     r"^\.github/agent-task-reports/(?P<request_id>[A-Za-z0-9][A-Za-z0-9._-]*)\.md$"
 )
@@ -4779,8 +4787,10 @@ def local_identity(repo_root: Path) -> dict[str, str]:
 
 
 def local_source_owner_fingerprint(
-    fingerprint: dict[str, Any],
+    fingerprint: Any,
 ) -> dict[str, str]:
+    if not isinstance(fingerprint, dict):
+        raise WorkflowError("local source fingerprint has malformed identity")
     branch = fingerprint.get("branch")
     head = fingerprint.get("head")
     status = fingerprint.get("status")
@@ -4831,6 +4841,44 @@ def local_source_fingerprint(repo_root: Path) -> dict[str, Any]:
     return local_source_owner_fingerprint(identity)
 
 
+def github_fingerprint_from_snapshot(
+    pr: dict[str, Any],
+    *,
+    threads: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    head_ref: str,
+    base_ref: str,
+) -> dict[str, str]:
+    def digest(value: Any) -> str:
+        return sha256_text(
+            json.dumps(
+                value,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+
+    pr_identity = {
+        "state": pr["state"],
+        "is_draft": pr["is_draft"],
+        "head_sha": pr["head_sha"],
+        "base_sha": pr["base_sha"],
+        "head_branch": pr["head_branch"],
+        "base_branch": pr["base_branch"],
+        "head_repository": head_repository_identity(pr),
+        "title_sha256": sha256_text(pr["title"]),
+        "body_sha256": sha256_text(pr["body"]),
+    }
+    return {
+        "pr_sha256": digest(pr_identity),
+        "threads_sha256": digest(threads),
+        "reviews_sha256": digest(reviews),
+        "head_ref_sha": head_ref,
+        "base_ref_sha": base_ref,
+    }
+
+
 def github_decision_fingerprint(
     target: dict[str, Any],
     preflight: dict[str, Any],
@@ -4853,35 +4901,107 @@ def github_decision_fingerprint(
     )
     if head_ref != pr["head_sha"] or base_ref != pr["base_sha"]:
         raise WorkflowError("live pull request refs drifted from the frozen preflight")
-    pr_identity = {
-        "state": actual["state"],
-        "is_draft": actual["is_draft"],
-        "head_sha": actual["head_sha"],
-        "base_sha": actual["base_sha"],
-        "head_branch": actual["head_branch"],
-        "base_branch": actual["base_branch"],
-        "head_repository": head_repository_identity(actual),
-        "title_sha256": sha256_text(actual["title"]),
-        "body_sha256": sha256_text(actual["body"]),
-    }
+    return github_fingerprint_from_snapshot(
+        actual,
+        threads=threads,
+        reviews=reviews,
+        head_ref=head_ref,
+        base_ref=base_ref,
+    )
 
-    def digest(value: Any) -> str:
-        return sha256_text(
-            json.dumps(
-                value,
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
+
+def git_trees_equal(repo_root: Path, left: str, right: str) -> bool:
+    process = run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "diff",
+            "--quiet",
+            left,
+            right,
+            "--",
+        ],
+        check=False,
+    )
+    if process.returncode in {0, 1}:
+        return process.returncode == 0
+    detail = process.stderr.strip() or process.stdout.strip() or "no output"
+    raise WorkflowError(f"failed to compare frozen and live base trees: {detail}")
+
+
+def terminal_recovery_github_fingerprint(
+    target: dict[str, Any],
+    preflight: dict[str, Any],
+    *,
+    repo_root: Path,
+    frozen_fingerprint: dict[str, str],
+) -> tuple[dict[str, str], dict[str, Any], str]:
+    frozen_pr = preflight["pr"]
+    actual = metadata_for(target)
+    live_base = actual["base_sha"]
+    expected = {**frozen_pr, "base_sha": live_base}
+    require_live_pr_snapshot(expected, actual, expected_head=frozen_pr["head_sha"])
+    require_live_comments(preflight)
+    threads, _ = fetch_copilot_threads(
+        frozen_pr["upstream_owner"],
+        frozen_pr["upstream_repo"],
+        frozen_pr["number"],
+    )
+    reviews = fetch_reviews(
+        frozen_pr["upstream_owner"],
+        frozen_pr["upstream_repo"],
+        frozen_pr["number"],
+    )
+    head_ref = remote_head(
+        frozen_pr["head_owner"],
+        frozen_pr["head_repo"],
+        frozen_pr["head_branch"],
+    )
+    base_ref = remote_head(
+        frozen_pr["upstream_owner"],
+        frozen_pr["upstream_repo"],
+        frozen_pr["base_branch"],
+    )
+    if head_ref != frozen_pr["head_sha"] or base_ref != live_base:
+        raise WorkflowError(
+            "live pull request refs drifted during terminal local recovery"
         )
-
-    return {
-        "pr_sha256": digest(pr_identity),
-        "threads_sha256": digest(threads),
-        "reviews_sha256": digest(reviews),
-        "head_ref_sha": head_ref,
-        "base_ref_sha": base_ref,
+    frozen_base = frozen_pr["base_sha"]
+    if live_base == frozen_base:
+        rule = "exact"
+    elif (
+        base_revision_is_ancestor(repo_root, frozen_base, live_base)
+        and git_trees_equal(repo_root, frozen_base, live_base)
+    ):
+        rule = "forward-ancestor-identical-tree"
+    else:
+        raise WorkflowError(
+            "live base cannot be safely refrozen for terminal local recovery"
+        )
+    effective_preflight = {
+        **preflight,
+        "pr": {**preflight["pr"], "base_sha": live_base},
     }
+    reconstructed_frozen = github_fingerprint_from_snapshot(
+        {**actual, "base_sha": frozen_base},
+        threads=threads,
+        reviews=reviews,
+        head_ref=head_ref,
+        base_ref=frozen_base,
+    )
+    if reconstructed_frozen != frozen_fingerprint:
+        raise WorkflowError(
+            "frozen GitHub mutation fingerprint does not match live recovery state"
+        )
+    fingerprint = github_fingerprint_from_snapshot(
+        actual,
+        threads=threads,
+        reviews=reviews,
+        head_ref=head_ref,
+        base_ref=base_ref,
+    )
+    return fingerprint, effective_preflight, rule
 
 
 def validate_local_source_transition(
@@ -5318,6 +5438,9 @@ def validate_retained_local_decision(
     }
     if not legacy_result:
         expected_keys.update({"worker", "model_attestation"})
+    terminal_recovery = result.get("terminal_recovery")
+    if terminal_recovery is not None:
+        expected_keys.add("terminal_recovery")
     if (
         set(result) != expected_keys
         or (
@@ -5374,6 +5497,69 @@ def validate_retained_local_decision(
         if result.get("model_attestation") != model_attestation:
             raise WorkflowError(
                 "retained local decision model attestation drifted"
+            )
+    if terminal_recovery is not None:
+        recovery_keys = {
+            "policy",
+            "manifest",
+            "helper_sha256",
+            "frozen_base_sha",
+            "live_base_sha",
+            "forward_base_rule",
+            "frozen_github",
+        }
+        manifest_identity = (
+            terminal_recovery.get("manifest")
+            if isinstance(terminal_recovery, dict)
+            else None
+        )
+        if (
+            not isinstance(terminal_recovery, dict)
+            or set(terminal_recovery) != recovery_keys
+            or terminal_recovery.get("policy")
+            != TERMINAL_LOCAL_RECOVERY_POLICY
+            or terminal_recovery.get("helper_sha256")
+            != sha256_file(Path(__file__).resolve())
+            or terminal_recovery.get("live_base_sha")
+            != preflight["pr"]["base_sha"]
+            or terminal_recovery.get("forward_base_rule")
+            not in {"exact", "forward-ancestor-identical-tree"}
+            or not isinstance(terminal_recovery.get("frozen_base_sha"), str)
+            or SHA_PATTERN.fullmatch(terminal_recovery["frozen_base_sha"])
+            is None
+            or not isinstance(manifest_identity, dict)
+            or set(manifest_identity) != {"path", "sha256"}
+            or not isinstance(manifest_identity.get("path"), str)
+            or not isinstance(manifest_identity.get("sha256"), str)
+            or SHA256_PATTERN.fullmatch(manifest_identity["sha256"]) is None
+        ):
+            raise WorkflowError(
+                "retained terminal local recovery identity drifted"
+            )
+        manifest_path = Path(manifest_identity["path"])
+        require_outside_repository(manifest_path, repo_root)
+        if (
+            not manifest_path.is_file()
+            or manifest_path.is_symlink()
+            or sha256_file(manifest_path) != manifest_identity["sha256"]
+        ):
+            raise WorkflowError(
+                "retained terminal local recovery manifest drifted"
+            )
+        recovery_manifest = load_json_object(
+            manifest_path,
+            description="retained terminal local recovery manifest",
+        )
+        if (
+            recovery_manifest.get("schema")
+            != TERMINAL_LOCAL_RECOVERY_MANIFEST_SCHEMA
+            or recovery_manifest.get("helper_sha256")
+            != terminal_recovery["helper_sha256"]
+            or recovery_manifest.get("github")
+            != terminal_recovery["frozen_github"]
+        ):
+            raise WorkflowError(
+                "retained terminal local recovery manifest identity drifted"
             )
     expected_files = (
         ("prompt", prompt_path),
@@ -5435,13 +5621,37 @@ def validate_retained_local_decision(
     ):
         raise WorkflowError("retained local decision history identity drifted")
     decision_content = decision_path.read_text(encoding="utf-8")
+    decision_preflight = preflight
+    if terminal_recovery is not None:
+        decision_preflight = {
+            **preflight,
+            "pr": {
+                **preflight["pr"],
+                "base_sha": terminal_recovery["frozen_base_sha"],
+            },
+        }
     report = validate_copilot_review_report(
         decision_content,
         request_id=result["run_id"],
-        preflight=preflight,
+        preflight=decision_preflight,
         remote=remote,
         paths_by_commit=paths_by_commit,
     )
+    if decision_preflight["pr"]["base_sha"] != preflight["pr"]["base_sha"]:
+        report = {
+            **report,
+            "pull_request": {
+                **report["pull_request"],
+                "base_sha": preflight["pr"]["base_sha"],
+            },
+        }
+        report = validate_copilot_review_report(
+            render_canonical_review_report(report),
+            request_id=result["run_id"],
+            preflight=preflight,
+            remote=remote,
+            paths_by_commit=paths_by_commit,
+        )
     canonical_content = render_canonical_review_report(report)
     if canonical_path.read_text(encoding="utf-8") != canonical_content:
         raise WorkflowError("retained canonical review report drifted")
@@ -6337,11 +6547,430 @@ def mark_terminal_unusable_report(
     task_state.pop("recovery_command", None)
 
 
+def validate_terminal_recovery_artifact(
+    value: Any,
+    *,
+    expected_path: Path,
+    description: str,
+) -> None:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"path", "sha256", "size"}
+        or value.get("path") != str(expected_path)
+        or not isinstance(value.get("sha256"), str)
+        or SHA256_PATTERN.fullmatch(value["sha256"]) is None
+        or not isinstance(value.get("size"), int)
+        or isinstance(value["size"], bool)
+        or value["size"] < 0
+        or not expected_path.is_file()
+        or expected_path.is_symlink()
+        or expected_path.stat().st_size != value["size"]
+        or sha256_file(expected_path) != value["sha256"]
+    ):
+        raise WorkflowError(
+            f"terminal local recovery {description} identity drifted"
+        )
+
+
+def recover_terminal_local_preparation(
+    args: argparse.Namespace,
+    *,
+    target: dict[str, Any],
+    repo_root: Path,
+    state_path: Path,
+    state: dict[str, Any],
+    requested_model: str,
+) -> None:
+    manifest_path = cli_path(args.recover_terminal_local)
+    require_outside_repository(manifest_path, repo_root)
+    expected_manifest_sha = args.recovery_manifest_sha256
+    if (
+        not isinstance(expected_manifest_sha, str)
+        or SHA256_PATTERN.fullmatch(expected_manifest_sha) is None
+        or not manifest_path.is_file()
+        or manifest_path.is_symlink()
+        or sha256_file(manifest_path) != expected_manifest_sha
+    ):
+        raise WorkflowError("terminal local recovery manifest identity drifted")
+    manifest = load_json_object(
+        manifest_path,
+        description="terminal local recovery manifest",
+    )
+    manifest_keys = {
+        "schema",
+        "helper_sha256",
+        "state",
+        "target",
+        "repo_root",
+        "owner",
+        "session_id",
+        "prompt",
+        "decisions",
+        "events",
+        "findings",
+        "source_before",
+        "source_after",
+        "github",
+    }
+    if (
+        set(manifest) != manifest_keys
+        or manifest.get("schema") != TERMINAL_LOCAL_RECOVERY_MANIFEST_SCHEMA
+        or manifest.get("repo_root") != str(repo_root)
+        or manifest.get("target") != target["pr_url"]
+        or not isinstance(manifest.get("helper_sha256"), str)
+        or SHA256_PATTERN.fullmatch(manifest["helper_sha256"]) is None
+        or sha256_file(Path(__file__).resolve()) != manifest["helper_sha256"]
+        or not isinstance(manifest.get("state"), dict)
+        or set(manifest["state"]) != {"path", "sha256"}
+        or manifest["state"].get("path") != str(state_path)
+        or not isinstance(manifest["state"].get("sha256"), str)
+        or SHA256_PATTERN.fullmatch(manifest["state"]["sha256"]) is None
+        or sha256_file(state_path) != manifest["state"]["sha256"]
+    ):
+        raise WorkflowError("terminal local recovery manifest is stale or malformed")
+    require_no_credentials(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+        source="terminal local recovery manifest",
+    )
+    task_state = state.get("agent_task")
+    if (
+        not isinstance(task_state, dict)
+        or task_state.get("status") != "failed"
+        or task_state.get("task_id_status") != "terminal_unusable"
+        or task_state.get("producer") != "local"
+        or task_state.get("policy") != LOCAL_DECISION_POLICY
+        or task_state.get("model") != requested_model
+        or requested_model != LOCAL_DECISION_MODEL
+        or task_state.get("reasoning_effort")
+        != LOCAL_DECISION_REASONING_EFFORT
+        or task_state.get("run_id") != manifest.get("owner")
+        or task_state.get("local_session_id") != manifest.get("session_id")
+    ):
+        raise WorkflowError(
+            "terminal local recovery owner identity is stale or malformed"
+        )
+    preflight = task_state.get("preflight")
+    if (
+        not isinstance(preflight, dict)
+        or preflight.get("repository_root") != str(repo_root)
+        or not isinstance(preflight.get("pr"), dict)
+        or preflight["pr"].get("pr_url") != target["pr_url"]
+    ):
+        raise WorkflowError("terminal local recovery preflight identity drifted")
+    prompt_path = Path(task_state.get("prompt_file", ""))
+    decision_path = Path(task_state.get("decision_file", ""))
+    result_path = Path(task_state.get("result_file", ""))
+    canonical_path = Path(task_state.get("canonical_report_file", ""))
+    for artifact in (prompt_path, decision_path, result_path, canonical_path):
+        require_outside_repository(artifact, repo_root)
+    validate_terminal_recovery_artifact(
+        manifest.get("prompt"),
+        expected_path=prompt_path,
+        description="prompt",
+    )
+    validate_terminal_recovery_artifact(
+        manifest.get("decisions"),
+        expected_path=decision_path,
+        description="decision",
+    )
+    events_path = local_session_events_path(task_state["local_session_id"])
+    validate_terminal_recovery_artifact(
+        manifest.get("events"),
+        expected_path=events_path,
+        description="session events",
+    )
+    if result_path.exists() or canonical_path.exists():
+        raise WorkflowError(
+            "terminal local recovery refuses existing canonical or result artifacts"
+        )
+    if (
+        task_state.get("prompt_sha256") != manifest["prompt"]["sha256"]
+        or task_state.get("worker_command")
+        != local_decision_command(
+            repo_root,
+            session_id=task_state["local_session_id"],
+            run_id=task_state["run_id"],
+            pr_number=preflight["pr"]["number"],
+        )
+    ):
+        raise WorkflowError(
+            "terminal local recovery worker authorization identity drifted"
+        )
+    before_source = local_source_owner_fingerprint(
+        task_state.get("source_before")
+    )
+    after_source = local_source_owner_fingerprint(task_state.get("source_after"))
+    if (
+        before_source != manifest.get("source_before")
+        or after_source != manifest.get("source_after")
+        or local_source_fingerprint(repo_root) != after_source
+    ):
+        raise WorkflowError("terminal local recovery source identity drifted")
+    commits, paths_by_commit = validate_local_source_transition(
+        repo_root,
+        before=before_source,
+        after=after_source,
+    )
+    frozen_github = task_state.get("github_before")
+    if (
+        not isinstance(frozen_github, dict)
+        or frozen_github != task_state.get("github_after")
+        or frozen_github != manifest.get("github")
+    ):
+        raise WorkflowError(
+            "terminal local recovery frozen GitHub fingerprint drifted"
+        )
+    live_github, effective_preflight, base_rule = (
+        terminal_recovery_github_fingerprint(
+            target,
+            preflight,
+            repo_root=repo_root,
+            frozen_fingerprint=frozen_github,
+        )
+    )
+    model_attestation = local_session_model_attestation(
+        task_state["local_session_id"],
+        require_assistant_message=True,
+    )
+    if model_attestation["events_sha256"] != manifest["events"]["sha256"]:
+        raise WorkflowError(
+            "terminal local recovery session attestation identity drifted"
+        )
+    decision_content = decision_path.read_text(encoding="utf-8")
+    require_no_credentials(
+        decision_content,
+        source="terminal local recovery decision report",
+    )
+    decision_value = load_json_object(
+        decision_path,
+        description="terminal local recovery decision report",
+    )
+    decisions = decision_value.get("decisions")
+    findings = (
+        [
+            {
+                key: item.get(key)
+                for key in (
+                    "finding_key",
+                    "disposition",
+                    "commit",
+                    "changed_paths",
+                )
+            }
+            for item in decisions
+        ]
+        if isinstance(decisions, list)
+        and all(isinstance(item, dict) for item in decisions)
+        else None
+    )
+    expected_finding_keys = [
+        decision_finding_key(identity)
+        for identity in preflight["comment_identities"]
+    ]
+    if (
+        findings != manifest.get("findings")
+        or not isinstance(findings, list)
+        or [item["finding_key"] for item in findings] != expected_finding_keys
+        or any(item["disposition"] != "fixed" for item in findings)
+    ):
+        raise WorkflowError(
+            "terminal local recovery finding identity or fixed status drifted"
+        )
+    remote = {
+        "request_id": task_state["run_id"],
+        "task_id": task_state["local_session_id"],
+        "task_url": None,
+        "generated_branch": after_source["branch"],
+        "generated_head": after_source["head"],
+        "commits": commits,
+        "final_local_head": after_source["head"],
+        "requires_apply": False,
+        "report_path": str(canonical_path),
+        "report_sha256": "",
+        "structural_attestation": True,
+    }
+    report = validate_copilot_review_report(
+        decision_content,
+        request_id=task_state["run_id"],
+        preflight=preflight,
+        remote=remote,
+        paths_by_commit=paths_by_commit,
+    )
+    if effective_preflight["pr"]["base_sha"] != preflight["pr"]["base_sha"]:
+        report = {
+            **report,
+            "pull_request": {
+                **report["pull_request"],
+                "base_sha": effective_preflight["pr"]["base_sha"],
+            },
+        }
+        report = validate_copilot_review_report(
+            render_canonical_review_report(report),
+            request_id=task_state["run_id"],
+            preflight=effective_preflight,
+            remote=remote,
+            paths_by_commit=paths_by_commit,
+        )
+    canonical_content = render_canonical_review_report(report)
+    remote["report_sha256"] = sha256_text(canonical_content)
+    recovery_record = {
+        "policy": TERMINAL_LOCAL_RECOVERY_POLICY,
+        "manifest": {
+            "path": str(manifest_path),
+            "sha256": expected_manifest_sha,
+        },
+        "helper_sha256": manifest["helper_sha256"],
+        "frozen_base_sha": preflight["pr"]["base_sha"],
+        "live_base_sha": effective_preflight["pr"]["base_sha"],
+        "forward_base_rule": base_rule,
+        "frozen_github": frozen_github,
+    }
+    result = {
+        "schema": LOCAL_DECISION_RESULT_SCHEMA,
+        "status": "success",
+        "validation_complete": True,
+        "producer": "local",
+        "policy": LOCAL_DECISION_POLICY,
+        "requested_model": requested_model,
+        "reasoning_effort": LOCAL_DECISION_REASONING_EFFORT,
+        "session_id": task_state["local_session_id"],
+        "run_id": task_state["run_id"],
+        "prompt": {
+            "path": str(prompt_path),
+            "sha256": sha256_file(prompt_path),
+        },
+        "decision": {
+            "path": str(decision_path),
+            "sha256": sha256_file(decision_path),
+        },
+        "canonical_report": {
+            "path": str(canonical_path),
+            "sha256": remote["report_sha256"],
+        },
+        "source_before": before_source,
+        "source_after": after_source,
+        "github_before": live_github,
+        "github_after": live_github,
+        "command": task_state["worker_command"],
+        "remote": remote,
+        "paths_by_commit": paths_by_commit,
+        "worker": {
+            "agent_id": LOCAL_DECISION_AGENT_ID,
+            "custom_agent": None,
+            "authorization_flags": list(LOCAL_DECISION_AUTHORIZATION_FLAGS),
+            "model": LOCAL_DECISION_MODEL,
+            "reasoning_effort": LOCAL_DECISION_REASONING_EFFORT,
+        },
+        "model_attestation": model_attestation,
+        "terminal_recovery": recovery_record,
+    }
+    atomic_write_text(canonical_path, canonical_content)
+    atomic_write_text(
+        result_path,
+        json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    result_sha256 = sha256_file(result_path)
+    paths_checkpoint = [
+        {"commit": commit, "paths": paths_by_commit[commit]}
+        for commit in commits
+    ]
+    task_state.update(
+        {
+            "preflight": effective_preflight,
+            "source_before": before_source,
+            "source_after": after_source,
+            "github_before": live_github,
+            "github_after": live_github,
+            "validation_complete": True,
+            "decision_sha256": sha256_file(decision_path),
+            "canonical_report_sha256": remote["report_sha256"],
+            "terminal_recovery": recovery_record,
+            "status": "validated_pending_import",
+            "task_id": remote["task_id"],
+            "task_url": None,
+            "generated_branch": remote["generated_branch"],
+            "generated_head": remote["generated_head"],
+            "ordered_commits": commits,
+            "report_path": str(canonical_path),
+            "structural_attestation": True,
+            "comments": report["comments"],
+            "result_sha256": result_sha256,
+            "report_sha256": remote["report_sha256"],
+            "paths_by_commit": paths_checkpoint,
+            "validated_at": utc_now(),
+        }
+    )
+    checkpoint_preserved_agent_task_artifacts(
+        task_state,
+        {prompt_path, decision_path, canonical_path, result_path},
+    )
+    apply_command = agent_task_recovery_command(
+        target=effective_preflight["pr"]["pr_url"],
+        repo_root=repo_root,
+        state_path=state_path,
+        model=args.model,
+        preserve_artifacts=True,
+        apply_prepared=True,
+    )
+    task_state["prepared_at"] = utc_now()
+    task_state["preparation"] = {
+        "source_head_sha": effective_preflight["pr"]["head_sha"],
+        "final_head_sha": remote["final_local_head"],
+        "generated_head_sha": remote["generated_head"],
+        "ordered_commits": commits,
+        "paths_by_commit": paths_checkpoint,
+        "report_path": str(canonical_path),
+        "report_sha256": remote["report_sha256"],
+        "comment_ids": [item["id"] for item in report["comments"]],
+        "thread_ids": [item["thread_id"] for item in report["comments"]],
+        "review_ids": sorted({item["review_id"] for item in report["comments"]}),
+    }
+    task_state["apply_command"] = apply_command
+    task_state["recovery_command"] = apply_command
+    clear_agent_task_failure(task_state)
+    task_state.pop("task_id_status", None)
+    task_state.pop("retry_command", None)
+    save_state(state_path, state)
+    emit(
+        {
+            "result": "validated_pending_import",
+            "state": str(state_path),
+            "pr": effective_preflight["pr"]["pr_url"],
+            "source_head_sha": effective_preflight["pr"]["head_sha"],
+            "final_head_sha": remote["final_local_head"],
+            "ordered_commits": commits,
+            "paths_by_commit": paths_checkpoint,
+            "report": {
+                "path": str(canonical_path),
+                "sha256": remote["report_sha256"],
+            },
+            "result_sha256": result_sha256,
+            "terminal_recovery": recovery_record,
+            "preserved_artifacts": task_state["preserved_artifacts"],
+            "apply_command": apply_command,
+        }
+    )
+
+
 def command_agent_task(args: argparse.Namespace) -> None:
     prepare_only = bool(getattr(args, "prepare_only", False))
     apply_prepared = bool(getattr(args, "apply_prepared", False))
     request_review_only = bool(getattr(args, "request_review_only", False))
     preserve_artifacts = bool(getattr(args, "preserve_artifacts", False))
+    recover_terminal_local = bool(
+        getattr(args, "recover_terminal_local", None)
+    )
+    if recover_terminal_local and (
+        not prepare_only
+        or not preserve_artifacts
+        or args.resume
+        or apply_prepared
+        or request_review_only
+    ):
+        raise WorkflowError(
+            "--recover-terminal-local requires --prepare-only and "
+            "--preserve-artifacts and cannot resume, apply, or request review"
+        )
     if apply_prepared and (args.resume or prepare_only):
         raise WorkflowError(
             "--apply-prepared cannot be combined with --resume or --prepare-only"
@@ -6362,6 +6991,18 @@ def command_agent_task(args: argparse.Namespace) -> None:
     require_outside_repository(state_path, repo_root)
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
+    if recover_terminal_local:
+        if not isinstance(existing, dict):
+            raise WorkflowError("terminal local recovery state does not exist")
+        recover_terminal_local_preparation(
+            args,
+            target=target,
+            repo_root=repo_root,
+            state_path=state_path,
+            state=existing,
+            requested_model=requested_model,
+        )
+        return
     if apply_prepared:
         prepared_task = (
             existing.get("agent_task") if isinstance(existing, dict) else None
@@ -7765,6 +8406,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         action="store_true",
         help="revalidate the same retained local decision result",
+    )
+    agent_task.add_argument(
+        "--recover-terminal-local",
+        metavar="MANIFEST",
+        help=(
+            "revalidate one hash-pinned terminal local decision without "
+            "rerunning its worker"
+        ),
+    )
+    agent_task.add_argument(
+        "--recovery-manifest-sha256",
+        help="required SHA-256 for --recover-terminal-local",
     )
     agent_task.set_defaults(function=command_agent_task)
 
