@@ -4,59 +4,67 @@ Ask Copilot: **Show the PR Pipeline execution topology.**
 
 ```mermaid
 flowchart LR
+    pipelineAgent["PR Pipeline agent<br/>LOCAL SESSION"]
+    scheduler["PR Pipeline scheduler<br/>LOCAL PROCESS<br/>detached"]
+    pipelineAgent --> scheduler
+
     subgraph pipeline["PR Pipeline, five-stage boundary"]
         direction TB
-        request["Local PR Pipeline session<br/>starts once and watches progress"]
-        scheduler["Detached scheduler<br/>owns durable control flow"]
-        request --> scheduler
 
-        subgraph local["Ordered local stage coordinators"]
-            direction LR
-            conflict["1. pr-conflict-resolver"]
-            copilotReview["2. copilot-review-loop"]
-            selfReview["3. self-review-loop"]
-            ciFix["4. ci-fix-loop"]
-            description["5. pr-description"]
-            clearance["Final head and base clearance"]
+        subgraph sweep["Ordered Pipeline sweep"]
+            direction TB
 
-            conflict --> copilotReview --> selfReview --> ciFix --> description --> clearance
-            reviewWorker["1x local decision session / fixing iteration<br/>ALL findings in the stable review snapshot<br/>gpt-5.6-sol, high<br/>marketplace-local-review-decision-worker@2<br/>no hosted fallback"]
-            copilotReview -. "local worker boundary" .-> reviewWorker
+            subgraph local["LOCAL coordinators and local worker"]
+                direction LR
+                conflict["1. PR Conflict Resolver<br/>local coordinator"]
+                copilotReview["2. Copilot Review Loop<br/>local coordinator"]
+                selfReview["3. Self Review Loop<br/>local coordinator"]
+                ciFix["4. CI Fix Loop<br/>local coordinator"]
+                description["5. PR Description<br/>local coordinator"]
+                reviewWorker["Copilot Review worker<br/>1x local decision session / fixing iteration<br/>ALL findings in the stable review snapshot<br/>gpt-5.6-sol, high<br/>marketplace-local-review-decision-worker@2<br/>no hosted fallback"]
+
+                conflict --> copilotReview --> selfReview --> ciFix --> description
+                copilotReview -. "paired local worker" .-> reviewWorker
+            end
+
+            subgraph hosted["HOSTED Agent Task workers"]
+                direction LR
+                conflictWorker["Conflict worker<br/>1x / managed attempt<br/>ALL frozen conflict paths and selected stack members<br/>marketplace-conflict-worker@1"]
+                selfReviewWorker["Self Review worker<br/>1x / review iteration<br/>ALL self-review findings<br/>marketplace-agent-apply-report-worker@3"]
+                ciWorker["CI Fix worker<br/>1x / distinct stable failing-check snapshot<br/>ALL failures and logs at the current head<br/>marketplace-agent-apply-report-worker@3"]
+                descriptionWorker["PR Description worker<br/>1x report task / whole PR<br/>title and body decision<br/>marketplace-agent-report-worker@1"]
+            end
+
+            conflict -. "paired worker via local dispatcher/verifier" .-> conflictWorker
+            selfReview -. "paired worker via local dispatcher/verifier" .-> selfReviewWorker
+            ciFix -. "paired worker via local dispatcher/verifier" .-> ciWorker
+            description -. "paired worker via local dispatcher/verifier" .-> descriptionWorker
         end
 
-        scheduler --> conflict
-
-        subgraph hosted["GitHub Agent Task REST API and hosted worker sessions"]
-            conflictWorker["1x hosted Agent Task / managed attempt<br/>ALL frozen conflict paths<br/>ALL selected stack members<br/>marketplace-conflict-worker@1"]
-            selfReviewWorker["1x hosted Agent Task / review iteration<br/>ALL self-review findings<br/>marketplace-agent-apply-report-worker@3"]
-            ciWorker["1x hosted Agent Task / distinct stable<br/>failing-check snapshot at current head<br/>ALL failures and logs in that snapshot<br/>marketplace-agent-apply-report-worker@3"]
-            descriptionWorker["1x hosted report task / whole PR<br/>title and body decision<br/>marketplace-agent-report-worker@1"]
-        end
-
-        conflict -. "local Agent Tasks Runtime dispatches and verifies" .-> conflictWorker
-        selfReview -. "local Agent Tasks Runtime dispatches and verifies" .-> selfReviewWorker
-        ciFix -. "local Agent Tasks Runtime dispatches and verifies" .-> ciWorker
-        description -. "local Agent Tasks Runtime dispatches and verifies" .-> descriptionWorker
-
-        clearance -->|"all five stages clear at one revision snapshot"| done["Pipeline complete"]
-        clearance -->|"head or base revision drift leaves a stage uncleared"| second["Optional second sweep<br/>same stage order<br/>may create new workers for uncleared changed revisions<br/>never relaunches a completed conflict resolver"]
-        second --> conflict
+        revision{"Head or base changed<br/>and left a stage uncleared?"}
+        description --> revision
+        revision -->|"no"| done["Pipeline complete"]
+        revision -->|"yes"| second["Optional second sweep<br/>may create new workers for uncleared changed revisions"]
+        second --> conflictComplete{"Conflict Resolver completed?"}
+        conflictComplete -->|"no"| conflict
+        conflictComplete -->|"yes, never relaunch it"| copilotReview
     end
 
     subgraph reviewer["Standalone PR Reviewer, not a pipeline stage"]
         direction TB
-        reviewerCoordinator["Local PR Reviewer coordinator"]
-        reviewerWorker["1x hosted report task / whole PR<br/>marketplace-agent-report-worker@1<br/>produces N candidates"]
+        reviewerCoordinator["PR Reviewer coordinator<br/>LOCAL"]
+        reviewerWorker["Whole-PR report worker<br/>1x HOSTED report task<br/>marketplace-agent-report-worker@1"]
         candidates["Coordinator verifies the report<br/>and extracts N candidates"]
-        evaluators["Nx fresh local evaluator sessions<br/>1x general-purpose session / candidate<br/>gpt-5.6-sol, max<br/>evidence-only, no checkout<br/>at most 1x replacement if that verdict is malformed"]
+        evaluators["N fresh LOCAL evaluator sessions<br/>1x general-purpose session / candidate<br/>gpt-5.6-sol, max<br/>evidence-only, no checkout<br/>at most 1x replacement if that verdict is malformed"]
         pendingReview["1x viewer-owned pending review<br/>ALL surviving findings<br/>never submitted"]
 
         reviewerCoordinator --> reviewerWorker
-        reviewerWorker -->|"authoritative report"| candidates
+        reviewerWorker -->|"one authoritative report"| candidates
         candidates -->|"N candidates"| evaluators
         evaluators -->|"surviving findings"| pendingReview
     end
 
+    scheduler --> conflict
     legend["Cardinality legend<br/>1x/attempt, 1x/iteration, 1x/snapshot, Nx/candidate"]
 ```
 
