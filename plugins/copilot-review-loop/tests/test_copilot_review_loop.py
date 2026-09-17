@@ -2100,7 +2100,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.50")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.51")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -4141,6 +4141,363 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 )
         self.assertEqual("running", MODULE.load_state(state_path)["agent_task"]["status"])
         self.assertEqual([], emitted)
+
+    def dead_local_package_identity(self, manifest_path):
+        return {
+            "path": str(manifest_path),
+            "sha256": "a" * 64,
+            "schema": MODULE.PLUGIN_PACKAGE_MANIFEST_SCHEMA,
+            "source_commit": "1" * 40,
+            "installed_root": str(self.directory / "installed"),
+            "generator": {
+                "name": "trask/copilot-plugins plugin_package_manifest",
+                "version": "1.0.0",
+                "sha256": "b" * 64,
+            },
+            "packages": [
+                {
+                    "name": "copilot-review-loop",
+                    "version": "1.1.51",
+                    "file_count": 25,
+                    "package_sha256": "c" * 64,
+                }
+            ],
+        }
+
+    def test_dead_local_owner_writes_argv_only_mechanical_eligibility(self):
+        state_path = self.directory / "dead-local-owner-artifact.json"
+        case = self.dead_local_owner_case(state_path)
+        eligibility_path = self.directory / "eligibility evidence with spaces.json"
+        manifest_path = self.directory / "package manifest with spaces.json"
+        manifest_path.write_text("{}\n", encoding="utf-8")
+        package_identity = self.dead_local_package_identity(manifest_path)
+        emitted = []
+        state_before = state_path.read_bytes()
+        with ExitStack() as stack:
+            for patcher in self.dead_local_owner_patches(case):
+                stack.enter_context(patcher)
+            stack.enter_context(mock.patch.object(MODULE, "require_tools"))
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=self.repo_root
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE, "resolve_target", return_value=case["target"]
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE,
+                    "verify_installed_package_manifest",
+                    return_value=package_identity,
+                )
+            )
+            stack.enter_context(mock.patch.object(MODULE, "emit", emitted.append))
+            MODULE.command_reconcile_dead_local_owner(
+                SimpleNamespace(
+                    target="owner/repo#7",
+                    repo_root=str(self.repo_root),
+                    state=str(state_path),
+                    expected_seal=None,
+                    eligibility_artifact=str(eligibility_path),
+                    package_manifest=str(manifest_path),
+                    expected_package_manifest_sha256="a" * 64,
+                )
+            )
+
+        artifact = json.loads(eligibility_path.read_text(encoding="utf-8"))
+        digest_path = eligibility_path.with_name(f"{eligibility_path.name}.sha256")
+        self.assertEqual(
+            MODULE.sha256_file(eligibility_path),
+            digest_path.read_text(encoding="ascii").strip(),
+        )
+        self.assertNotIn("reconcile_command", artifact)
+        self.assertNotIn("command_text", json.dumps(artifact))
+        verifier_argv = artifact["verifier_argv"]
+        self.assertIsInstance(verifier_argv, list)
+        parsed = MODULE.build_parser().parse_args(verifier_argv[2:])
+        self.assertEqual(str(eligibility_path), parsed.eligibility_artifact)
+        self.assertEqual(str(manifest_path), parsed.package_manifest)
+        self.assertEqual("a" * 64, parsed.expected_package_manifest_sha256)
+        self.assertEqual(artifact["seal"], parsed.expected_seal)
+        self.assertFalse(emitted[-1]["reconciliation_argv_emitted"])
+        self.assertEqual(state_before, state_path.read_bytes())
+
+    def test_dead_local_owner_inspection_requires_mechanical_artifact(self):
+        state_path = self.directory / "dead-local-owner-no-artifact.json"
+        case = self.dead_local_owner_case(state_path)
+        with ExitStack() as stack:
+            for patcher in self.dead_local_owner_patches(case):
+                stack.enter_context(patcher)
+            stack.enter_context(mock.patch.object(MODULE, "require_tools"))
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=self.repo_root
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE, "resolve_target", return_value=case["target"]
+                )
+            )
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "sealed artifact"
+            ):
+                MODULE.command_reconcile_dead_local_owner(
+                    SimpleNamespace(
+                        target="owner/repo#7",
+                        repo_root=str(self.repo_root),
+                        state=str(state_path),
+                        expected_seal=None,
+                        eligibility_artifact=None,
+                        package_manifest=None,
+                        expected_package_manifest_sha256=None,
+                    )
+                )
+
+    def test_dead_local_owner_verifier_authorizes_two_identical_live_passes(self):
+        state_path = self.directory / "dead-local-owner-verify.json"
+        case = self.dead_local_owner_case(state_path)
+        eligibility_path = self.directory / "eligibility.json"
+        digest_path = eligibility_path.with_name(f"{eligibility_path.name}.sha256")
+        manifest_path = self.directory / "packages.json"
+        manifest_path.write_text("{}\n", encoding="utf-8")
+        package_identity = self.dead_local_package_identity(manifest_path)
+        with ExitStack() as stack:
+            for patcher in self.dead_local_owner_patches(case):
+                stack.enter_context(patcher)
+            snapshot, preflight = MODULE.dead_local_owner_reconciliation_snapshot(
+                state=case["state"],
+                state_path=state_path,
+                repo_root=self.repo_root,
+                target=case["target"],
+            )
+        artifact = MODULE.dead_local_owner_eligibility_artifact(
+            target=case["target"],
+            repo_root=self.repo_root,
+            state_path=state_path,
+            snapshot=snapshot,
+            package_manifest=package_identity,
+            eligibility_path=eligibility_path,
+            digest_path=digest_path,
+        )
+        MODULE.write_dead_local_owner_eligibility(
+            eligibility_path, digest_path, artifact
+        )
+        emitted = []
+        state_before = state_path.read_bytes()
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=self.repo_root
+            ),
+            mock.patch.object(
+                MODULE, "resolve_target", return_value=case["target"]
+            ),
+            mock.patch.object(
+                MODULE,
+                "verify_installed_package_manifest",
+                return_value=package_identity,
+            ),
+            mock.patch.object(
+                MODULE,
+                "dead_local_owner_reconciliation_snapshot",
+                side_effect=[(snapshot, preflight), (snapshot, preflight)],
+            ) as live_snapshot,
+            mock.patch.object(MODULE, "emit", emitted.append),
+            mock.patch.object(MODULE, "save_state") as save_state,
+        ):
+            MODULE.command_verify_dead_local_owner_eligibility(
+                SimpleNamespace(
+                    target="owner/repo#7",
+                    repo_root=str(self.repo_root),
+                    state=str(state_path),
+                    eligibility_artifact=str(eligibility_path),
+                    eligibility_sha256_file=str(digest_path),
+                    package_manifest=str(manifest_path),
+                    expected_package_manifest_sha256="a" * 64,
+                    expected_seal=artifact["seal"],
+                )
+            )
+
+        self.assertEqual(2, live_snapshot.call_count)
+        self.assertEqual("authorized", emitted[-1]["result"])
+        self.assertEqual(2, emitted[-1]["passes"])
+        self.assertFalse(emitted[-1]["mutation_performed"])
+        self.assertRegex(emitted[-1]["authorization_token"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            "reconcile-dead-local-owner",
+            emitted[-1]["reconciliation_argv"][2],
+        )
+        self.assertEqual(state_before, state_path.read_bytes())
+        save_state.assert_not_called()
+
+    def test_dead_local_owner_verifier_rejects_stale_second_live_pass(self):
+        state_path = self.directory / "dead-local-owner-stale.json"
+        case = self.dead_local_owner_case(state_path)
+        eligibility_path = self.directory / "stale-eligibility.json"
+        digest_path = eligibility_path.with_name(f"{eligibility_path.name}.sha256")
+        manifest_path = self.directory / "stale-packages.json"
+        manifest_path.write_text("{}\n", encoding="utf-8")
+        package_identity = self.dead_local_package_identity(manifest_path)
+        with ExitStack() as stack:
+            for patcher in self.dead_local_owner_patches(case):
+                stack.enter_context(patcher)
+            snapshot, preflight = MODULE.dead_local_owner_reconciliation_snapshot(
+                state=case["state"],
+                state_path=state_path,
+                repo_root=self.repo_root,
+                target=case["target"],
+            )
+        artifact = MODULE.dead_local_owner_eligibility_artifact(
+            target=case["target"],
+            repo_root=self.repo_root,
+            state_path=state_path,
+            snapshot=snapshot,
+            package_manifest=package_identity,
+            eligibility_path=eligibility_path,
+            digest_path=digest_path,
+        )
+        MODULE.write_dead_local_owner_eligibility(
+            eligibility_path, digest_path, artifact
+        )
+        stale = copy.deepcopy(snapshot)
+        stale["remaining_iterations"] -= 1
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=self.repo_root
+            ),
+            mock.patch.object(
+                MODULE, "resolve_target", return_value=case["target"]
+            ),
+            mock.patch.object(
+                MODULE,
+                "verify_installed_package_manifest",
+                return_value=package_identity,
+            ),
+            mock.patch.object(
+                MODULE,
+                "dead_local_owner_reconciliation_snapshot",
+                side_effect=[(snapshot, preflight), (stale, preflight)],
+            ),
+            mock.patch.object(MODULE, "save_state") as save_state,
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "changed during verification"
+            ),
+        ):
+            MODULE.command_verify_dead_local_owner_eligibility(
+                SimpleNamespace(
+                    target="owner/repo#7",
+                    repo_root=str(self.repo_root),
+                    state=str(state_path),
+                    eligibility_artifact=str(eligibility_path),
+                    eligibility_sha256_file=str(digest_path),
+                    package_manifest=str(manifest_path),
+                    expected_package_manifest_sha256="a" * 64,
+                    expected_seal=artifact["seal"],
+                )
+            )
+        save_state.assert_not_called()
+
+    def test_dead_local_owner_package_manifest_verifies_every_installed_byte(self):
+        installed_root = (self.directory / "installed").resolve()
+        package_root = installed_root / "copilot-review-loop"
+        helper_path = package_root / "scripts" / "copilot_review_loop.py"
+        helper_path.parent.mkdir(parents=True)
+        helper_path.write_text("exact helper bytes\n", encoding="utf-8", newline="\n")
+        plugin_path = package_root / "plugin.json"
+        plugin_path.write_text(
+            '{"name":"copilot-review-loop","version":"1.1.51"}\n',
+            encoding="utf-8",
+            newline="\n",
+        )
+        files = []
+        for relative in ("plugin.json", "scripts/copilot_review_loop.py"):
+            content = (package_root / Path(relative)).read_bytes()
+            files.append(
+                {
+                    "path": relative,
+                    "size": len(content),
+                    "sha256": MODULE.sha256_file(package_root / Path(relative)),
+                }
+            )
+        package = {
+            "name": "copilot-review-loop",
+            "version": "1.1.51",
+            "file_count": len(files),
+            "byte_count": sum(item["size"] for item in files),
+            "package_sha256": MODULE.canonical_package_digest(files),
+            "published_git_tree_oid": "1" * 40,
+            "files": files,
+        }
+        manifest = {
+            "schema": MODULE.PLUGIN_PACKAGE_MANIFEST_SCHEMA,
+            "generator": {
+                "name": "trask/copilot-plugins plugin_package_manifest",
+                "version": "1.0.0",
+                "sha256": "2" * 64,
+                "command_argv": ["python", "plugin_package_manifest.py", "create"],
+            },
+            "generated_at": "2026-09-17T00:00:00Z",
+            "source_commit": "3" * 40,
+            "installed_root": str(installed_root),
+            "algorithm": MODULE.PLUGIN_PACKAGE_MANIFEST_ALGORITHM,
+            "packages": [package],
+        }
+        manifest_path = self.directory / "canonical-packages.json"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        manifest_sha256 = MODULE.sha256_file(manifest_path)
+        with mock.patch.object(MODULE, "__file__", str(helper_path)):
+            identity = MODULE.verify_installed_package_manifest(
+                manifest_path, manifest_sha256, self.repo_root
+            )
+            self.assertEqual(manifest_sha256, identity["sha256"])
+            self.assertEqual(
+                package["package_sha256"],
+                identity["packages"][0]["package_sha256"],
+            )
+            helper_path.write_text(
+                "drifted helper bytes\n", encoding="utf-8", newline="\n"
+            )
+            with self.assertRaisesRegex(MODULE.WorkflowError, "installed bytes drifted"):
+                MODULE.verify_installed_package_manifest(
+                    manifest_path, manifest_sha256, self.repo_root
+                )
+
+    def test_dead_local_owner_verifier_rejects_artifact_byte_drift(self):
+        eligibility_path = self.directory / "drifted-eligibility.json"
+        digest_path = eligibility_path.with_name(f"{eligibility_path.name}.sha256")
+        artifact = {
+            "schema": MODULE.DEAD_LOCAL_OWNER_ELIGIBILITY_SCHEMA,
+            "result": "dead_local_owner_reconciliation_eligible",
+            "seal": "a" * 64,
+            "reconciliation_seal": "b" * 64,
+            "snapshot": {},
+            "package_manifest": {},
+            "eligibility_artifact": str(eligibility_path),
+            "eligibility_sha256_file": str(digest_path),
+            "verifier_argv": [],
+        }
+        MODULE.write_dead_local_owner_eligibility(
+            eligibility_path, digest_path, artifact
+        )
+        with eligibility_path.open("ab") as stream:
+            stream.write(b" ")
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "artifact SHA-256 drifted"
+        ):
+            MODULE.load_dead_local_owner_eligibility(
+                eligibility_path=eligibility_path,
+                digest_path=digest_path,
+                expected_seal=artifact["seal"],
+            )
 
     def terminal_local_recovery_case(self, state_path):
         prompt_path = self.directory / "terminal-prompt.txt"

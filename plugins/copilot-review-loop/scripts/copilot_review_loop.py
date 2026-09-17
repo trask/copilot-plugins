@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Iterable
+import unicodedata
 import urllib.parse
 import uuid
 
@@ -49,6 +50,37 @@ STAGE_PROGRESS_PHASES = frozenset(
 DEAD_LOCAL_OWNER_RECONCILIATION_SCHEMA = (
     "github.copilot.review-loop-dead-local-owner-reconciliation.v1"
 )
+DEAD_LOCAL_OWNER_ELIGIBILITY_SCHEMA = (
+    "github.copilot.review-loop-dead-local-owner-eligibility.v2"
+)
+DEAD_LOCAL_OWNER_AUTHORIZATION_SCHEMA = (
+    "github.copilot.review-loop-dead-local-owner-authorization.v1"
+)
+PLUGIN_PACKAGE_MANIFEST_SCHEMA = {
+    "id": "github.copilot.plugin-package-manifest",
+    "version": 1,
+}
+PLUGIN_PACKAGE_MANIFEST_ALGORITHM = {
+    "aggregate": "sha256",
+    "digest_encoding": "lowercase hexadecimal ASCII",
+    "file_set": (
+        "Every regular Git blob recursively tracked below plugins/<name> at "
+        "source_commit, with no missing or extra installed regular files and "
+        "no symlinks."
+    ),
+    "ordering": "Ascending lexicographic order of normalized UTF-8 path bytes.",
+    "path_normalization": (
+        "Plugin-relative Unicode NFC path with forward-slash separators; "
+        "absolute paths, empty components, dot components, backslashes, NUL, "
+        "CR, LF, and normalization collisions are rejected."
+    ),
+    "record_framing": (
+        "path_utf8 + NUL + decimal_byte_size_ascii + NUL + "
+        "file_sha256_lowercase_hex_ascii + LF"
+    ),
+}
+PLUGIN_NAME_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 LEGACY_RUNNING_LOCAL_OWNER_FIELDS = frozenset(
     {
         "canonical_report_file",
@@ -815,6 +847,289 @@ def sha256_file(path: Path) -> str:
             f"could not read Agent Tasks runtime helper {path}: {error}"
         ) from error
     return digest.hexdigest()
+
+
+def strict_json_file(path: Path, label: str) -> tuple[bytes, Any]:
+    if not path.is_file() or path.is_symlink():
+        raise WorkflowError(f"{label} is not a regular file: {path}")
+    try:
+        content = path.read_bytes()
+        text = content.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise WorkflowError(f"could not read {label}: {path}: {error}") from error
+
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise WorkflowError(f"{label} contains a duplicate JSON key")
+            result[key] = value
+        return result
+
+    try:
+        return content, json.loads(text, object_pairs_hook=reject_duplicates)
+    except json.JSONDecodeError as error:
+        raise WorkflowError(f"{label} is not valid JSON: {error}") from error
+
+
+def canonical_package_path(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise WorkflowError("canonical package path is malformed")
+    parts = value.split("/")
+    normalized = []
+    for part in parts:
+        if (
+            not part
+            or part in {".", ".."}
+            or "\\" in part
+            or any(character in part for character in "\0\r\n")
+        ):
+            raise WorkflowError("canonical package path is malformed")
+        normalized.append(unicodedata.normalize("NFC", part))
+    result = "/".join(normalized)
+    if result != value:
+        raise WorkflowError("canonical package path is not normalized")
+    return result
+
+
+def canonical_package_record(path: str, size: int, digest: str) -> bytes:
+    if (
+        canonical_package_path(path) != path
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or SHA256_PATTERN.fullmatch(digest) is None
+    ):
+        raise WorkflowError("canonical package record is malformed")
+    return (
+        path.encode("utf-8")
+        + b"\0"
+        + str(size).encode("ascii")
+        + b"\0"
+        + digest.encode("ascii")
+        + b"\n"
+    )
+
+
+def canonical_package_digest(files: list[dict[str, Any]]) -> str:
+    if not isinstance(files, list) or not files:
+        raise WorkflowError("canonical package file list is empty")
+    paths = []
+    for item in files:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"path", "size", "sha256"}
+            or not isinstance(item.get("path"), str)
+            or not isinstance(item.get("size"), int)
+            or isinstance(item["size"], bool)
+            or not isinstance(item.get("sha256"), str)
+        ):
+            raise WorkflowError("canonical package file record is malformed")
+        paths.append(canonical_package_path(item["path"]))
+    ordered = sorted(files, key=lambda item: item["path"].encode("utf-8"))
+    if paths != [item["path"] for item in ordered] or len(set(paths)) != len(paths):
+        raise WorkflowError("canonical package files are not unique and ordered")
+    return hashlib.sha256(
+        b"".join(
+            canonical_package_record(item["path"], item["size"], item["sha256"])
+            for item in ordered
+        )
+    ).hexdigest()
+
+
+def installed_package_files(package_root: Path) -> dict[str, Path]:
+    if not package_root.is_dir() or package_root.is_symlink():
+        raise WorkflowError(f"installed package directory is invalid: {package_root}")
+    files: dict[str, Path] = {}
+    for current, directories, names in os.walk(package_root, followlinks=False):
+        current_path = Path(current)
+        for name in directories:
+            path = current_path / name
+            if path.is_symlink() or (
+                hasattr(path, "is_junction") and path.is_junction()
+            ):
+                raise WorkflowError(f"installed package contains a link: {path}")
+        for name in names:
+            path = current_path / name
+            if path.is_symlink() or not path.is_file():
+                raise WorkflowError(
+                    f"installed package contains a non-regular file: {path}"
+                )
+            relative = canonical_package_path(
+                "/".join(path.relative_to(package_root).parts)
+            )
+            if relative in files:
+                raise WorkflowError(
+                    f"installed package paths collide after normalization: {relative}"
+                )
+            files[relative] = path
+    return files
+
+
+def verify_installed_package_manifest(
+    manifest_path: Path,
+    expected_sha256: str,
+    repo_root: Path,
+) -> dict[str, Any]:
+    require_outside_repository(manifest_path, repo_root)
+    if SHA256_PATTERN.fullmatch(expected_sha256) is None:
+        raise WorkflowError("expected package manifest SHA-256 is malformed")
+    manifest_bytes, manifest = strict_json_file(
+        manifest_path, "canonical package manifest"
+    )
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    if manifest_sha256 != expected_sha256:
+        raise WorkflowError("canonical package manifest SHA-256 drifted")
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest)
+        != {
+            "schema",
+            "generator",
+            "generated_at",
+            "source_commit",
+            "installed_root",
+            "algorithm",
+            "packages",
+        }
+        or manifest.get("schema") != PLUGIN_PACKAGE_MANIFEST_SCHEMA
+        or manifest.get("algorithm") != PLUGIN_PACKAGE_MANIFEST_ALGORITHM
+        or not isinstance(manifest.get("generator"), dict)
+        or set(manifest["generator"])
+        != {"name", "version", "sha256", "command_argv"}
+        or manifest["generator"].get("name")
+        != "trask/copilot-plugins plugin_package_manifest"
+        or manifest["generator"].get("version") != "1.0.0"
+        or SHA256_PATTERN.fullmatch(str(manifest["generator"].get("sha256", "")))
+        is None
+        or not isinstance(manifest["generator"].get("command_argv"), list)
+        or not all(
+            isinstance(value, str)
+            for value in manifest["generator"]["command_argv"]
+        )
+        or not isinstance(manifest.get("generated_at"), str)
+        or not manifest["generated_at"]
+        or re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}",
+            str(manifest.get("source_commit", "")),
+        )
+        is None
+        or not isinstance(manifest.get("installed_root"), str)
+        or not isinstance(manifest.get("packages"), list)
+        or not manifest["packages"]
+    ):
+        raise WorkflowError("canonical package manifest schema or fields are invalid")
+    installed_root = Path(manifest["installed_root"])
+    if (
+        not installed_root.is_absolute()
+        or str(installed_root.resolve()) != manifest["installed_root"]
+        or not installed_root.is_dir()
+        or installed_root.is_symlink()
+    ):
+        raise WorkflowError("canonical package installed root is invalid")
+    package_names = []
+    package_summaries = []
+    helper_record = None
+    for package in manifest["packages"]:
+        if (
+            not isinstance(package, dict)
+            or set(package)
+            != {
+                "name",
+                "version",
+                "file_count",
+                "byte_count",
+                "package_sha256",
+                "published_git_tree_oid",
+                "files",
+            }
+            or not isinstance(package.get("name"), str)
+            or PLUGIN_NAME_PATTERN.fullmatch(package["name"]) is None
+            or not isinstance(package.get("version"), str)
+            or not package["version"]
+            or not isinstance(package.get("file_count"), int)
+            or isinstance(package["file_count"], bool)
+            or not isinstance(package.get("byte_count"), int)
+            or isinstance(package["byte_count"], bool)
+            or not isinstance(package.get("files"), list)
+            or package["file_count"] != len(package["files"])
+            or package["byte_count"]
+            != sum(
+                item.get("size", -1)
+                for item in package["files"]
+                if isinstance(item, dict)
+            )
+            or SHA256_PATTERN.fullmatch(
+                str(package.get("package_sha256", ""))
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                str(package.get("published_git_tree_oid", "")),
+            )
+            is None
+            or canonical_package_digest(package["files"])
+            != package["package_sha256"]
+        ):
+            raise WorkflowError("canonical package manifest entry is invalid")
+        package_names.append(package["name"])
+        expected_files = {item["path"]: item for item in package["files"]}
+        actual_files = installed_package_files(installed_root / package["name"])
+        if set(actual_files) != set(expected_files):
+            raise WorkflowError(
+                f"installed file set drifted for {package['name']}"
+            )
+        for relative, expected in expected_files.items():
+            content = actual_files[relative].read_bytes()
+            if (
+                len(content) != expected["size"]
+                or hashlib.sha256(content).hexdigest() != expected["sha256"]
+            ):
+                raise WorkflowError(
+                    f"installed bytes drifted for {package['name']}/{relative}"
+                )
+        if package["name"] == "copilot-review-loop":
+            helper_record = expected_files.get("scripts/copilot_review_loop.py")
+        package_summaries.append(
+            {
+                "name": package["name"],
+                "version": package["version"],
+                "file_count": package["file_count"],
+                "package_sha256": package["package_sha256"],
+            }
+        )
+    if package_names != sorted(set(package_names)):
+        raise WorkflowError(
+            "canonical package manifest entries are not unique and ordered"
+        )
+    expected_helper = (
+        installed_root
+        / "copilot-review-loop"
+        / "scripts"
+        / "copilot_review_loop.py"
+    ).resolve()
+    current_helper = Path(__file__).resolve()
+    if (
+        current_helper != expected_helper
+        or helper_record is None
+        or helper_record["sha256"] != sha256_file(current_helper)
+    ):
+        raise WorkflowError(
+            "canonical package manifest does not identify this installed helper"
+        )
+    return {
+        "path": str(manifest_path),
+        "sha256": manifest_sha256,
+        "schema": PLUGIN_PACKAGE_MANIFEST_SCHEMA,
+        "source_commit": manifest["source_commit"],
+        "installed_root": manifest["installed_root"],
+        "generator": {
+            "name": manifest["generator"]["name"],
+            "version": manifest["generator"]["version"],
+            "sha256": manifest["generator"]["sha256"],
+        },
+        "packages": package_summaries,
+    }
 
 
 def contains_credentials(value: str) -> bool:
@@ -9555,6 +9870,329 @@ def dead_local_owner_reconciliation_seal(snapshot: dict[str, Any]) -> str:
     )
 
 
+def dead_local_owner_eligibility_seal(
+    snapshot: dict[str, Any],
+    package_manifest: dict[str, Any],
+) -> str:
+    return sha256_text(
+        json.dumps(
+            {
+                "schema": DEAD_LOCAL_OWNER_ELIGIBILITY_SCHEMA,
+                "snapshot": snapshot,
+                "package_manifest": package_manifest,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+
+
+def dead_local_owner_reconciliation_command(
+    target: dict[str, Any],
+    repo_root: Path,
+    state_path: Path,
+    seal: str,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "reconcile-dead-local-owner",
+        target["pr_url"],
+        "--repo-root",
+        str(repo_root),
+        "--state",
+        str(state_path),
+        "--expected-seal",
+        seal,
+    ]
+
+
+def dead_local_owner_verifier_command(
+    target: dict[str, Any],
+    repo_root: Path,
+    state_path: Path,
+    eligibility_path: Path,
+    digest_path: Path,
+    package_manifest_path: Path,
+    package_manifest_sha256: str,
+    eligibility_seal: str,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "verify-dead-local-owner-eligibility",
+        target["pr_url"],
+        "--repo-root",
+        str(repo_root),
+        "--state",
+        str(state_path),
+        "--eligibility-artifact",
+        str(eligibility_path),
+        "--eligibility-sha256-file",
+        str(digest_path),
+        "--package-manifest",
+        str(package_manifest_path),
+        "--expected-package-manifest-sha256",
+        package_manifest_sha256,
+        "--expected-seal",
+        eligibility_seal,
+    ]
+
+
+def write_new_evidence_file(path: Path, content: bytes) -> None:
+    if path.exists() or path.is_symlink():
+        raise WorkflowError(f"refusing to overwrite recovery evidence: {path}")
+    parent = path.parent
+    if not parent.is_dir() or parent.is_symlink():
+        raise WorkflowError(f"recovery evidence directory is invalid: {parent}")
+    descriptor = None
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        path.unlink(missing_ok=True)
+        raise
+
+
+def write_dead_local_owner_eligibility(
+    eligibility_path: Path,
+    digest_path: Path,
+    artifact: dict[str, Any],
+) -> str:
+    if digest_path != eligibility_path.with_name(
+        f"{eligibility_path.name}.sha256"
+    ):
+        raise WorkflowError("eligibility digest path is not canonical")
+    if (
+        eligibility_path.exists()
+        or eligibility_path.is_symlink()
+        or digest_path.exists()
+        or digest_path.is_symlink()
+    ):
+        raise WorkflowError("refusing to overwrite dead owner eligibility evidence")
+    content = (
+        json.dumps(artifact, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    ).encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    write_new_evidence_file(eligibility_path, content)
+    try:
+        write_new_evidence_file(digest_path, f"{digest}\n".encode("ascii"))
+    except BaseException:
+        eligibility_path.unlink(missing_ok=True)
+        raise
+    return digest
+
+
+def dead_local_owner_eligibility_artifact(
+    *,
+    target: dict[str, Any],
+    repo_root: Path,
+    state_path: Path,
+    snapshot: dict[str, Any],
+    package_manifest: dict[str, Any],
+    eligibility_path: Path,
+    digest_path: Path,
+) -> dict[str, Any]:
+    reconciliation_seal = dead_local_owner_reconciliation_seal(snapshot)
+    eligibility_seal = dead_local_owner_eligibility_seal(
+        snapshot, package_manifest
+    )
+    verifier_argv = dead_local_owner_verifier_command(
+        target,
+        repo_root,
+        state_path,
+        eligibility_path,
+        digest_path,
+        Path(package_manifest["path"]),
+        package_manifest["sha256"],
+        eligibility_seal,
+    )
+    return {
+        "schema": DEAD_LOCAL_OWNER_ELIGIBILITY_SCHEMA,
+        "result": "dead_local_owner_reconciliation_eligible",
+        "seal": eligibility_seal,
+        "reconciliation_seal": reconciliation_seal,
+        "snapshot": snapshot,
+        "package_manifest": package_manifest,
+        "eligibility_artifact": str(eligibility_path),
+        "eligibility_sha256_file": str(digest_path),
+        "verifier_argv": verifier_argv,
+    }
+
+
+def load_dead_local_owner_eligibility(
+    *,
+    eligibility_path: Path,
+    digest_path: Path,
+    expected_seal: str,
+) -> tuple[str, dict[str, Any]]:
+    if SHA256_PATTERN.fullmatch(expected_seal) is None:
+        raise WorkflowError("expected dead owner eligibility seal is malformed")
+    if digest_path != eligibility_path.with_name(
+        f"{eligibility_path.name}.sha256"
+    ):
+        raise WorkflowError("eligibility digest path is not canonical")
+    content, artifact = strict_json_file(
+        eligibility_path, "dead owner eligibility artifact"
+    )
+    if not digest_path.is_file() or digest_path.is_symlink():
+        raise WorkflowError("dead owner eligibility SHA-256 file is invalid")
+    artifact_sha256 = hashlib.sha256(content).hexdigest()
+    try:
+        digest_content = digest_path.read_bytes()
+    except OSError as error:
+        raise WorkflowError(
+            f"could not read dead owner eligibility SHA-256 file: {error}"
+        ) from error
+    if digest_content != f"{artifact_sha256}\n".encode("ascii"):
+        raise WorkflowError("dead owner eligibility artifact SHA-256 drifted")
+    if (
+        not isinstance(artifact, dict)
+        or set(artifact)
+        != {
+            "schema",
+            "result",
+            "seal",
+            "reconciliation_seal",
+            "snapshot",
+            "package_manifest",
+            "eligibility_artifact",
+            "eligibility_sha256_file",
+            "verifier_argv",
+        }
+        or artifact.get("schema") != DEAD_LOCAL_OWNER_ELIGIBILITY_SCHEMA
+        or artifact.get("result")
+        != "dead_local_owner_reconciliation_eligible"
+        or artifact.get("seal") != expected_seal
+        or artifact.get("eligibility_artifact") != str(eligibility_path)
+        or artifact.get("eligibility_sha256_file") != str(digest_path)
+        or not isinstance(artifact.get("snapshot"), dict)
+        or not isinstance(artifact.get("package_manifest"), dict)
+        or not isinstance(artifact.get("verifier_argv"), list)
+        or SHA256_PATTERN.fullmatch(
+            str(artifact.get("reconciliation_seal", ""))
+        )
+        is None
+    ):
+        raise WorkflowError("dead owner eligibility artifact is malformed")
+    return artifact_sha256, artifact
+
+
+def command_verify_dead_local_owner_eligibility(args: argparse.Namespace) -> None:
+    require_tools()
+    repo_root = resolve_repo_root(args.repo_root)
+    target = resolve_target(args.target, repo_root)
+    state_path = cli_path(args.state) if args.state else default_state_path(target)
+    eligibility_path = cli_path(args.eligibility_artifact)
+    digest_path = cli_path(args.eligibility_sha256_file)
+    package_manifest_path = cli_path(args.package_manifest)
+    for path in (
+        state_path,
+        eligibility_path,
+        digest_path,
+        package_manifest_path,
+    ):
+        require_outside_repository(path, repo_root)
+    artifact_sha256, artifact = load_dead_local_owner_eligibility(
+        eligibility_path=eligibility_path,
+        digest_path=digest_path,
+        expected_seal=args.expected_seal,
+    )
+    package_manifest = verify_installed_package_manifest(
+        package_manifest_path,
+        args.expected_package_manifest_sha256,
+        repo_root,
+    )
+    expected_verifier_argv = dead_local_owner_verifier_command(
+        target,
+        repo_root,
+        state_path,
+        eligibility_path,
+        digest_path,
+        package_manifest_path,
+        args.expected_package_manifest_sha256,
+        args.expected_seal,
+    )
+    if (
+        artifact["package_manifest"] != package_manifest
+        or artifact["verifier_argv"] != expected_verifier_argv
+        or dead_local_owner_eligibility_seal(
+            artifact["snapshot"], package_manifest
+        )
+        != args.expected_seal
+        or dead_local_owner_reconciliation_seal(artifact["snapshot"])
+        != artifact["reconciliation_seal"]
+    ):
+        raise WorkflowError("dead owner eligibility identity drifted")
+    snapshots = []
+    preflights = []
+    for _ in range(2):
+        state = load_state(state_path)
+        snapshot, preflight = dead_local_owner_reconciliation_snapshot(
+            state=state,
+            state_path=state_path,
+            repo_root=repo_root,
+            target=target,
+        )
+        snapshots.append(snapshot)
+        preflights.append(preflight)
+    if (
+        snapshots[0] != artifact["snapshot"]
+        or snapshots[1] != artifact["snapshot"]
+        or preflights[0] != preflights[1]
+        or dead_local_owner_reconciliation_seal(snapshots[0])
+        != artifact["reconciliation_seal"]
+    ):
+        raise WorkflowError("dead owner eligibility changed during verification")
+    reconciliation_argv = dead_local_owner_reconciliation_command(
+        target,
+        repo_root,
+        state_path,
+        artifact["reconciliation_seal"],
+    )
+    token_payload = {
+        "schema": DEAD_LOCAL_OWNER_AUTHORIZATION_SCHEMA,
+        "eligibility_artifact_sha256": artifact_sha256,
+        "eligibility_seal": args.expected_seal,
+        "package_manifest_sha256": package_manifest["sha256"],
+        "reconciliation_seal": artifact["reconciliation_seal"],
+        "snapshot_sha256": dead_local_owner_reconciliation_seal(snapshots[1]),
+        "verifier_argv": expected_verifier_argv,
+    }
+    authorization_token = sha256_text(
+        json.dumps(
+            token_payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+    emit(
+        {
+            "schema": DEAD_LOCAL_OWNER_AUTHORIZATION_SCHEMA,
+            "result": "authorized",
+            "authorization_token": authorization_token,
+            "eligibility_artifact": {
+                "path": str(eligibility_path),
+                "sha256": artifact_sha256,
+                "seal": args.expected_seal,
+            },
+            "package_manifest": package_manifest,
+            "snapshot_sha256": token_payload["snapshot_sha256"],
+            "passes": 2,
+            "mutation_performed": False,
+            "reconciliation_argv": reconciliation_argv,
+        }
+    )
+
+
 def command_reconcile_dead_local_owner(args: argparse.Namespace) -> None:
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
@@ -9569,28 +10207,75 @@ def command_reconcile_dead_local_owner(args: argparse.Namespace) -> None:
         target=target,
     )
     seal = dead_local_owner_reconciliation_seal(snapshot)
-    command = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "reconcile-dead-local-owner",
-        target["pr_url"],
-        "--repo-root",
-        str(repo_root),
-        "--state",
-        str(state_path),
-        "--expected-seal",
-        seal,
-    ]
+    command = dead_local_owner_reconciliation_command(
+        target, repo_root, state_path, seal
+    )
     if args.expected_seal is None:
-        emit(
-            {
-                "result": "dead_local_owner_reconciliation_eligible",
-                "seal": seal,
-                "snapshot": snapshot,
-                "reconcile_command": command,
-            }
+        artifact_arg = getattr(args, "eligibility_artifact", None)
+        manifest_arg = getattr(args, "package_manifest", None)
+        manifest_sha_arg = getattr(
+            args, "expected_package_manifest_sha256", None
         )
-        return
+        if any((artifact_arg, manifest_arg, manifest_sha_arg)):
+            if not all((artifact_arg, manifest_arg, manifest_sha_arg)):
+                raise WorkflowError(
+                    "eligibility artifact generation requires its artifact, "
+                    "package manifest, and expected package manifest SHA-256"
+                )
+            eligibility_path = cli_path(artifact_arg)
+            digest_path = eligibility_path.with_name(
+                f"{eligibility_path.name}.sha256"
+            )
+            package_manifest_path = cli_path(manifest_arg)
+            for path in (
+                eligibility_path,
+                digest_path,
+                package_manifest_path,
+            ):
+                require_outside_repository(path, repo_root)
+            package_manifest = verify_installed_package_manifest(
+                package_manifest_path,
+                manifest_sha_arg,
+                repo_root,
+            )
+            artifact = dead_local_owner_eligibility_artifact(
+                target=target,
+                repo_root=repo_root,
+                state_path=state_path,
+                snapshot=snapshot,
+                package_manifest=package_manifest,
+                eligibility_path=eligibility_path,
+                digest_path=digest_path,
+            )
+            artifact_sha256 = write_dead_local_owner_eligibility(
+                eligibility_path, digest_path, artifact
+            )
+            emit(
+                {
+                    "result": "dead_local_owner_eligibility_written",
+                    "eligibility_artifact": str(eligibility_path),
+                    "eligibility_artifact_sha256": artifact_sha256,
+                    "eligibility_sha256_file": str(digest_path),
+                    "seal": artifact["seal"],
+                    "verifier_argv": artifact["verifier_argv"],
+                    "reconciliation_argv_emitted": False,
+                }
+            )
+            return
+        raise WorkflowError(
+            "dead owner eligibility requires a sealed artifact and canonical "
+            "package manifest"
+        )
+    if any(
+        (
+            getattr(args, "eligibility_artifact", None),
+            getattr(args, "package_manifest", None),
+            getattr(args, "expected_package_manifest_sha256", None),
+        )
+    ):
+        raise WorkflowError(
+            "reconciliation cannot combine mutation with eligibility generation"
+        )
     if args.expected_seal != seal:
         raise WorkflowError("dead local owner reconciliation seal drifted")
     state = load_state(state_path)
@@ -9970,7 +10655,50 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-seal",
         help="apply only the exact SHA-256 eligibility snapshot emitted earlier",
     )
+    reconcile_dead_local.add_argument(
+        "--eligibility-artifact",
+        help=(
+            "write a sealed read-only eligibility artifact and detached SHA-256 "
+            "file instead of emitting a reconciliation command"
+        ),
+    )
+    reconcile_dead_local.add_argument(
+        "--package-manifest",
+        help="canonical installed-plugin package manifest to bind and verify",
+    )
+    reconcile_dead_local.add_argument(
+        "--expected-package-manifest-sha256",
+        help="required SHA-256 of the canonical installed-plugin package manifest",
+    )
     reconcile_dead_local.set_defaults(function=command_reconcile_dead_local_owner)
+
+    verify_dead_local = subparsers.add_parser(
+        "verify-dead-local-owner-eligibility",
+        help=(
+            "mechanically verify one sealed dead-owner artifact twice without "
+            "mutation"
+        ),
+    )
+    verify_dead_local.add_argument(
+        "target",
+        nargs="?",
+        help=(
+            "PR URL or owner/repo#number; omit only from a worktree "
+            "attached to the PR's branch"
+        ),
+    )
+    verify_dead_local.add_argument("--repo-root")
+    verify_dead_local.add_argument("--state")
+    verify_dead_local.add_argument("--eligibility-artifact", required=True)
+    verify_dead_local.add_argument("--eligibility-sha256-file", required=True)
+    verify_dead_local.add_argument("--package-manifest", required=True)
+    verify_dead_local.add_argument(
+        "--expected-package-manifest-sha256", required=True
+    )
+    verify_dead_local.add_argument("--expected-seal", required=True)
+    verify_dead_local.set_defaults(
+        function=command_verify_dead_local_owner_eligibility
+    )
 
     cleanup = subparsers.add_parser("cleanup", help="delete completed external state")
     cleanup.add_argument("--state", required=True)
