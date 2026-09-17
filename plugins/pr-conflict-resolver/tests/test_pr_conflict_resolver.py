@@ -886,7 +886,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "311b4e50da163470ec0991c48ba8f904fc3fa5f645e7ff15ab2e9510d7d4393b",
+            "a4adaf76ba30aa6b3c3d9d6f816969cb5284933f650d05cd9c857022b2725c46",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -3976,6 +3976,9 @@ class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
             snapshot.root,
             control_root=snapshot.control_root,
             expected_repository=snapshot.repository,
+            expected_head=snapshot.head,
+            expected_branch=snapshot.branch,
+            allow_detached=False,
         )
 
     def test_local_snapshot_rejects_authenticated_repository_mismatch(self):
@@ -3997,6 +4000,9 @@ class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
                 Path("C:\\repo"),
                 control_root=Path("C:\\control"),
                 expected_repository="owner/repo",
+                expected_head="b" * 40,
+                expected_branch="feature",
+                allow_detached=True,
             )
 
         self.assertEqual("stale_target", failure.exception.code)
@@ -4026,6 +4032,7 @@ class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
             "request_sha256": "a" * 64,
             "pull_request": {
                 "number": 7,
+                "head_ref": "feature",
                 "head_sha": head,
             },
         }
@@ -4061,6 +4068,71 @@ class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
         self.assertEqual("success", result.status)
         self.assertEqual("no_changes", result.application_status)
         self.assertEqual("owner/repo", result.repository)
+
+    def test_pipeline_detached_head_matches_the_pinned_source(self):
+        control_root = temporary_directory(self)
+        repo_root = control_root / "20070"
+        repo_root.mkdir()
+        GitTestCase.git_in(repo_root, "init")
+        GitTestCase.git_in(repo_root, "config", "user.name", "Test User")
+        GitTestCase.git_in(repo_root, "config", "user.email", "test@example.com")
+        GitTestCase.write_in(repo_root, "app.py", "value = 1\n")
+        GitTestCase.commit_in(repo_root, "Initial")
+        GitTestCase.git_in(repo_root, "branch", "-M", "feature")
+        GitTestCase.git_in(
+            repo_root,
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        )
+        head = GitTestCase.git_in(repo_root, "rev-parse", "HEAD")
+        GitTestCase.git_in(repo_root, "checkout", "--detach", head)
+
+        def runner(command, **kwargs):
+            if command[0] == "gh":
+                return subprocess.CompletedProcess(command, 0, "owner/repo\n", "")
+            return subprocess.run(command, **kwargs)
+
+        snapshot = CLOUD_MODULE.local_snapshot(
+            runner,
+            repo_root,
+            control_root=control_root,
+            expected_repository="owner/repo",
+            expected_head=head,
+            expected_branch="feature",
+            allow_detached=True,
+        )
+
+        self.assertEqual("", snapshot.branch)
+        self.assertEqual(head, snapshot.head)
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError,
+            "local HEAD does not match the pinned source",
+        ):
+            CLOUD_MODULE.local_snapshot(
+                runner,
+                repo_root,
+                control_root=control_root,
+                expected_repository="owner/repo",
+                expected_head="f" * 40,
+                expected_branch="feature",
+                allow_detached=True,
+            )
+        GitTestCase.git_in(repo_root, "switch", "-c", "other")
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError,
+            "local branch does not match the pinned source",
+        ):
+            CLOUD_MODULE.local_snapshot(
+                runner,
+                repo_root,
+                control_root=control_root,
+                expected_repository="owner/repo",
+                expected_head=head,
+                expected_branch="feature",
+                allow_detached=True,
+            )
 
     def test_repository_root_accepts_one_lf_or_crlf_terminated_path(self):
         for terminator in ("\n", "\r\n"):
@@ -4161,6 +4233,9 @@ class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
                 stale_root,
                 control_root=control_root,
                 expected_repository="owner/repo",
+                expected_head="b" * 40,
+                expected_branch="feature",
+                allow_detached=True,
             )
 
         self.assertEqual(control_root, snapshot.control_root)

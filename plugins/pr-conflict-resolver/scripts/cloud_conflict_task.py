@@ -1265,7 +1265,13 @@ def local_snapshot(
     *,
     control_root: Path,
     expected_repository: str,
+    expected_head: str,
+    expected_branch: str | None,
+    allow_detached: bool,
 ) -> LocalSnapshot:
+    require_sha(expected_head, "expected local HEAD")
+    if expected_branch is not None:
+        require_ref(expected_branch, "expected local branch")
     root = repository_root(runner, cwd)
     repository = checked(
         runner,
@@ -1298,10 +1304,20 @@ def local_snapshot(
         cwd=root,
     )
     branch = branch_result.stdout.strip()
-    if branch_result.returncode != 0 or not branch:
-        raise ConflictError("a checked-out branch is required", "stale_target")
     head = git(runner, root, "rev-parse", "--verify", "HEAD").strip().lower()
     require_sha(head, "local HEAD")
+    if head != expected_head:
+        raise ConflictError("local HEAD does not match the pinned source", "stale_target")
+    if branch:
+        if branch_result.returncode != 0 or (
+            expected_branch is not None and branch != expected_branch
+        ):
+            raise ConflictError(
+                "local branch does not match the pinned source",
+                "stale_target",
+            )
+    elif branch_result.returncode == 0 or not allow_detached:
+        raise ConflictError("a checked-out branch is required", "stale_target")
     status = git(
         runner,
         root,
@@ -1336,6 +1352,9 @@ def require_local_unchanged(
         expected.root,
         control_root=expected.control_root,
         expected_repository=expected.repository,
+        expected_head=expected.head,
+        expected_branch=expected.branch or None,
+        allow_detached=not bool(expected.branch),
     )
     if current != expected:
         raise ConflictError("local repository state changed", "stale_target")
@@ -3228,6 +3247,9 @@ def execute(
         cwd,
         control_root=control_root,
         expected_repository=request["repository"],
+        expected_head=request["pull_request"]["head_sha"],
+        expected_branch=request["pull_request"]["head_ref"],
+        allow_detached=True,
     )
     if snapshot.repository != request["repository"]:
         raise ConflictError("request repository does not match cwd", "stale_target")
