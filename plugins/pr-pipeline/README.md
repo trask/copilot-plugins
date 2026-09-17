@@ -31,7 +31,7 @@ flowchart LR
                 direction LR
                 conflictWorker["Conflict worker<br/>1x / managed attempt<br/>ALL frozen conflict paths and selected stack members<br/>marketplace-conflict-worker@1"]
                 selfReviewWorker["Self Review worker<br/>1x / review iteration<br/>ALL self-review findings<br/>marketplace-agent-apply-report-worker@3"]
-                ciWorker["CI Fix worker<br/>1x / distinct stable failing-check snapshot<br/>ALL failures and logs at the current head<br/>marketplace-agent-apply-report-worker@3"]
+                ciWorker["CI Fix worker<br/>1 HOSTED agent receives ALL failures at the current PR head<br/>A new agent starts only after the head or final check results change<br/>NOT one agent per failed check<br/>marketplace-agent-apply-report-worker@3"]
                 descriptionWorker["PR Description worker<br/>1x report task / whole PR<br/>title and body decision<br/>marketplace-agent-report-worker@1"]
             end
 
@@ -65,7 +65,7 @@ flowchart LR
     end
 
     scheduler --> conflict
-    legend["Cardinality legend<br/>1x/attempt, 1x/iteration, 1x/snapshot, Nx/candidate"]
+    legend["Cardinality legend<br/>1x/attempt, 1x/iteration, 1x/current-head CI batch, Nx/candidate"]
 ```
 
 The scheduler runs the five stages in the numbered order. It starts a second sweep only when the pull request head or base changes during the first sweep and a stage is not clear at the final revisions. A completed conflict resolver does not run again in that pipeline run.
@@ -77,10 +77,10 @@ Each stage has a local coordinator. For hosted stages, the local Agent Tasks Run
 | PR Conflict Resolver | One hosted Agent Task per managed attempt. It receives every frozen conflict path and all selected stack members in that attempt. |
 | Copilot Review | One local decision session per fixing iteration. It receives all findings in the stable review snapshot. |
 | Self Review | One hosted Agent Task per review iteration. It reviews and handles all self-review findings in that iteration. |
-| CI Fix | One hosted Agent Task per distinct current-head stable failing-check snapshot. It receives all failures and logs in that snapshot. A new task starts only after the head or final check results change. |
+| CI Fix | One hosted Agent Task receives all failures and logs at the current pull request head. A new task starts only after the head or final check results change. It is not one task per failed check. |
 | PR Description | One hosted report task for the whole pull request title and body decision. |
 
-The CI coordinator owns polling, reruns, stabilization, and snapshot deduplication. Repeated observations of the same current-head stable final check set do not start another hosted session. It does not deduplicate log content across checks or matrix jobs.
+The CI coordinator owns polling, reruns, stabilization, and snapshot deduplication. Stable means all relevant checks are terminal and the check rollup remains unchanged after debounce. Repeated observations of the same current-head stable final check set do not start another hosted session. It does not deduplicate log content across checks or matrix jobs.
 
 For every failing check, the current coordinator runs `gh run view <run-id> [--job <job-id>] --log-failed --allow-escape-sequences`. It embeds the complete returned standard output for that check and its SHA-256 digest in the worker prompt. There is no cross-matrix log deduplication, truncation, excerpting, or aggregate prompt budget.
 
