@@ -142,6 +142,9 @@ TERMINAL_LOCAL_RECOVERY_MANIFEST_SCHEMA = {
 TERMINAL_LOCAL_RECOVERY_POLICY = (
     "marketplace-terminal-local-review-validator@1"
 )
+LEGACY_TERMINAL_RECOVERY_HELPER_SHA256 = (
+    "e953a22c62cb41bc935f5d4ccbf1b27d0c470d437a578d96b07bc88fa0e98ad4"
+)
 LEGACY_LOCAL_DECISION_RESULT_SCHEMA = {
     "id": "github.copilot.copilot-review-loop-local-result",
     "version": 1,
@@ -5519,7 +5522,10 @@ def validate_retained_local_decision(
             or terminal_recovery.get("policy")
             != TERMINAL_LOCAL_RECOVERY_POLICY
             or terminal_recovery.get("helper_sha256")
-            != sha256_file(Path(__file__).resolve())
+            not in {
+                sha256_file(Path(__file__).resolve()),
+                LEGACY_TERMINAL_RECOVERY_HELPER_SHA256,
+            }
             or terminal_recovery.get("live_base_sha")
             != preflight["pr"]["base_sha"]
             or terminal_recovery.get("forward_base_rule")
@@ -5927,6 +5933,7 @@ def agent_task_recovery_command(
     prepare_only: bool = False,
     preserve_artifacts: bool = False,
     apply_prepared: bool = False,
+    publish_prepared_only: bool = False,
 ) -> str:
     values = [
         sys.executable,
@@ -5941,6 +5948,8 @@ def agent_task_recovery_command(
         model,
     ]
     values.append("--apply-prepared" if apply_prepared else "--resume")
+    if publish_prepared_only:
+        values.append("--publish-prepared-only")
     if prepare_only:
         values.append("--prepare-only")
     if preserve_artifacts:
@@ -6952,6 +6961,102 @@ def recover_terminal_local_preparation(
     )
 
 
+def rescope_prepared_publication(
+    args: argparse.Namespace,
+    *,
+    target: dict[str, Any],
+    repo_root: Path,
+    state_path: Path,
+    state: dict[str, Any],
+    requested_model: str,
+) -> None:
+    task_state = state.get("agent_task")
+    if (
+        not isinstance(task_state, dict)
+        or task_state.get("status") != "validated_pending_import"
+        or not isinstance(task_state.get("prepared_at"), str)
+        or not isinstance(task_state.get("preparation"), dict)
+        or task_state.get("producer") != "local"
+        or task_state.get("model") != requested_model
+        or task_state.get("reasoning_effort")
+        != LOCAL_DECISION_REASONING_EFFORT
+    ):
+        raise WorkflowError(
+            "state has no validated local preparation to scope for publication"
+        )
+    preflight = task_state.get("preflight")
+    if (
+        not isinstance(preflight, dict)
+        or not isinstance(preflight.get("pr"), dict)
+        or preflight["pr"].get("pr_url") != target["pr_url"]
+    ):
+        raise WorkflowError("prepared local publication identity drifted")
+    validate_preserved_agent_task_artifacts(task_state, repo_root)
+    prompt_path = Path(task_state.get("prompt_file", ""))
+    decision_path = Path(task_state.get("decision_file", ""))
+    result_path = Path(task_state.get("result_file", ""))
+    canonical_path = Path(task_state.get("canonical_report_file", ""))
+    bundle = validate_retained_local_decision(
+        repo_root=repo_root,
+        target=target,
+        preflight=preflight,
+        prompt_path=prompt_path,
+        decision_path=decision_path,
+        result_path=result_path,
+        canonical_path=canonical_path,
+        requested_model=requested_model,
+    )
+    remote = bundle["remote"]
+    report = bundle["report"]
+    paths_checkpoint = [
+        {"commit": commit, "paths": bundle["paths_by_commit"][commit]}
+        for commit in remote["commits"]
+    ]
+    expected_preparation = {
+        "source_head_sha": preflight["pr"]["head_sha"],
+        "final_head_sha": remote["final_local_head"],
+        "generated_head_sha": remote["generated_head"],
+        "ordered_commits": remote["commits"],
+        "paths_by_commit": paths_checkpoint,
+        "report_path": remote["report_path"],
+        "report_sha256": remote["report_sha256"],
+        "comment_ids": [item["id"] for item in report["comments"]],
+        "thread_ids": [item["thread_id"] for item in report["comments"]],
+        "review_ids": sorted({item["review_id"] for item in report["comments"]}),
+    }
+    if (
+        task_state.get("preparation") != expected_preparation
+        or task_state.get("result_sha256") != sha256_file(result_path)
+        or task_state.get("report_sha256") != sha256_file(canonical_path)
+    ):
+        raise WorkflowError("prepared local publication checkpoint drifted")
+    command = agent_task_recovery_command(
+        target=preflight["pr"]["pr_url"],
+        repo_root=repo_root,
+        state_path=state_path,
+        model=args.model,
+        preserve_artifacts=True,
+        apply_prepared=True,
+        publish_prepared_only=True,
+    )
+    task_state["apply_scope"] = "source_publication_only"
+    task_state["apply_command"] = command
+    task_state["recovery_command"] = command
+    task_state["apply_scope_updated_at"] = utc_now()
+    save_state(state_path, state)
+    emit(
+        {
+            "result": "prepared_source_publication_only",
+            "state": str(state_path),
+            "pr": preflight["pr"]["pr_url"],
+            "head_sha": remote["final_local_head"],
+            "ordered_commits": remote["commits"],
+            "apply_scope": task_state["apply_scope"],
+            "apply_command": command,
+        }
+    )
+
+
 def command_agent_task(args: argparse.Namespace) -> None:
     prepare_only = bool(getattr(args, "prepare_only", False))
     apply_prepared = bool(getattr(args, "apply_prepared", False))
@@ -6960,6 +7065,35 @@ def command_agent_task(args: argparse.Namespace) -> None:
     recover_terminal_local = bool(
         getattr(args, "recover_terminal_local", None)
     )
+    publish_prepared_only = bool(
+        getattr(args, "publish_prepared_only", False)
+    )
+    rescope_publish_only = bool(
+        getattr(args, "rescope_prepared_publish_only", False)
+    )
+    if rescope_publish_only and (
+        prepare_only
+        or apply_prepared
+        or request_review_only
+        or args.resume
+        or recover_terminal_local
+        or not preserve_artifacts
+    ):
+        raise WorkflowError(
+            "--rescope-prepared-publish-only requires --preserve-artifacts "
+            "and cannot prepare, apply, resume, recover, or request review"
+        )
+    if publish_prepared_only and (
+        not apply_prepared
+        or request_review_only
+        or args.pipeline_run is not None
+        or args.pipeline_iteration is not None
+        or args.pipeline_max_iterations is not None
+    ):
+        raise WorkflowError(
+            "--publish-prepared-only requires --apply-prepared and cannot "
+            "request review or continue a pipeline"
+        )
     if recover_terminal_local and (
         not prepare_only
         or not preserve_artifacts
@@ -6991,6 +7125,18 @@ def command_agent_task(args: argparse.Namespace) -> None:
     require_outside_repository(state_path, repo_root)
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
+    if rescope_publish_only:
+        if not isinstance(existing, dict):
+            raise WorkflowError("prepared local publication state does not exist")
+        rescope_prepared_publication(
+            args,
+            target=target,
+            repo_root=repo_root,
+            state_path=state_path,
+            state=existing,
+            requested_model=requested_model,
+        )
+        return
     if recover_terminal_local:
         if not isinstance(existing, dict):
             raise WorkflowError("terminal local recovery state does not exist")
@@ -7017,6 +7163,33 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "state has no validated preparation awaiting authorized apply"
             )
         validate_preserved_agent_task_artifacts(prepared_task, repo_root)
+        expected_publish_only_command = agent_task_recovery_command(
+            target=target["pr_url"],
+            repo_root=repo_root,
+            state_path=state_path,
+            model=args.model,
+            preserve_artifacts=True,
+            apply_prepared=True,
+            publish_prepared_only=True,
+        )
+        if publish_prepared_only and (
+            prepared_task.get("apply_scope") != "source_publication_only"
+            or prepared_task.get("apply_command")
+            != expected_publish_only_command
+            or prepared_task.get("recovery_command")
+            != expected_publish_only_command
+        ):
+            raise WorkflowError(
+                "prepared source-only publication command identity drifted"
+            )
+        if (
+            prepared_task.get("apply_scope") == "source_publication_only"
+            and not publish_prepared_only
+        ):
+            raise WorkflowError(
+                "prepared source-only publication requires "
+                "--publish-prepared-only"
+            )
         args.resume = True
     elif (
         args.resume
@@ -8035,6 +8208,15 @@ def command_agent_task(args: argparse.Namespace) -> None:
             pr,
             expected_head=published_head,
         )
+        published_identity = local_identity(repo_root)
+        if (
+            published_identity["branch"] != preflight["identity"]["branch"]
+            or published_identity["head"] != remote["final_local_head"]
+            or published_identity["status"]
+        ):
+            raise WorkflowError(
+                "local repository identity drifted after source publication"
+            )
         state["pr"] = final_live
         cleanup_paths = {prompt_path, result_path}
         if decision_path is not None:
@@ -8049,6 +8231,53 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 cleanup_paths,
             )
             save_state(state_path, state)
+        if publish_prepared_only:
+            completed_at = utc_now()
+            task_state["status"] = "completed"
+            task_state["completed_at"] = completed_at
+            task_state["publication_scope"] = "source_only"
+            task_state["artifacts_removed"] = False
+            task_state.pop("apply_command", None)
+            task_state.pop("recovery_command", None)
+            clear_agent_task_failure(task_state)
+            publication = {
+                "task_id": remote["task_id"],
+                "source_head_sha": preflight["pr"]["head_sha"],
+                "published_head_sha": published_head,
+                "commits": remote["commits"],
+                "completed_at": completed_at,
+                "scope": "source_only",
+            }
+            publication_history = state.setdefault(
+                "source_publication_history", []
+            )
+            if not any(
+                isinstance(item, dict)
+                and item.get("task_id") == remote["task_id"]
+                and item.get("published_head_sha") == published_head
+                for item in publication_history
+            ):
+                publication_history.append(publication)
+            state["last_result"] = "published_source_only"
+            save_state(state_path, state)
+            finalize_agent_task_artifacts(
+                task_state,
+                cleanup_paths,
+                preserve=True,
+            )
+            save_state(state_path, state)
+            emit(
+                {
+                    "result": "published_source_only",
+                    "state": str(state_path),
+                    "pr": pr["pr_url"],
+                    "head_sha": published_head,
+                    "commits": remote["commits"],
+                    "review_mutations": False,
+                    "preserved_artifacts": task_state["preserved_artifacts"],
+                }
+            )
+            return
         live_comments = require_live_comments(
             preflight,
             allow_resolved=(
@@ -8418,6 +8647,22 @@ def build_parser() -> argparse.ArgumentParser:
     agent_task.add_argument(
         "--recovery-manifest-sha256",
         help="required SHA-256 for --recover-terminal-local",
+    )
+    agent_task.add_argument(
+        "--rescope-prepared-publish-only",
+        action="store_true",
+        help=(
+            "revalidate a prepared local result and replace its apply command "
+            "with source-only publication"
+        ),
+    )
+    agent_task.add_argument(
+        "--publish-prepared-only",
+        action="store_true",
+        help=(
+            "apply and publish a prepared result without replies, resolutions, "
+            "review requests, or worker execution"
+        ),
     )
     agent_task.set_defaults(function=command_agent_task)
 

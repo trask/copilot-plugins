@@ -2030,7 +2030,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.44")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.45")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -3696,6 +3696,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             preserve_artifacts=False,
             recover_terminal_local=None,
             recovery_manifest_sha256=None,
+            rescope_prepared_publish_only=False,
+            publish_prepared_only=False,
         )
 
     def terminal_local_recovery_case(self, state_path):
@@ -3766,6 +3768,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "reasoning_effort": MODULE.LOCAL_DECISION_REASONING_EFFORT,
                 "run_id": "terminal-owner",
                 "local_session_id": session_id,
+                "remaining_iterations": 5,
                 "preflight": self.preflight,
                 "prompt_file": str(prompt_path),
                 "prompt_sha256": MODULE.sha256_file(prompt_path),
@@ -3941,6 +3944,401 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             )
 
         self.assertEqual([self.fix], retained["remote"]["commits"])
+
+    def test_rescoped_prepared_publication_stops_before_review_mutation(self):
+        state_path = self.directory / "source-only-state.json"
+        arguments, manifest, attestation = self.terminal_local_recovery_case(
+            state_path
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=self.repo_root
+            ),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "local_source_fingerprint",
+                return_value=manifest["source_after"],
+            ),
+            mock.patch.object(
+                MODULE,
+                "validate_local_source_transition",
+                return_value=([self.fix], {self.fix: ["src/app.py"]}),
+            ),
+            mock.patch.object(
+                MODULE,
+                "terminal_recovery_github_fingerprint",
+                return_value=(
+                    self.github_fingerprint,
+                    self.preflight,
+                    "exact",
+                ),
+            ),
+            mock.patch.object(
+                MODULE,
+                "local_session_model_attestation",
+                return_value=attestation,
+            ),
+            mock.patch.object(MODULE, "run_local_decision_worker") as worker,
+            mock.patch.object(MODULE, "emit"),
+        ):
+            MODULE.command_agent_task(arguments)
+        worker.assert_not_called()
+
+        rescope_args = self.arguments(state_path)
+        rescope_args.rescope_prepared_publish_only = True
+        rescope_args.preserve_artifacts = True
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=self.repo_root
+            ),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "local_source_fingerprint",
+                return_value=manifest["source_after"],
+            ),
+            mock.patch.object(
+                MODULE,
+                "github_decision_fingerprint",
+                return_value=self.github_fingerprint,
+            ),
+            mock.patch.object(
+                MODULE,
+                "validate_local_source_transition",
+                return_value=([self.fix], {self.fix: ["src/app.py"]}),
+            ),
+            mock.patch.object(
+                MODULE,
+                "local_session_model_attestation",
+                return_value=attestation,
+            ),
+            mock.patch.object(MODULE, "run_local_decision_worker") as worker,
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(rescope_args)
+        worker.assert_not_called()
+        prepared = MODULE.load_state(state_path)["agent_task"]
+        self.assertEqual("source_publication_only", prepared["apply_scope"])
+        self.assertIn("--publish-prepared-only", prepared["apply_command"])
+        self.assertEqual(
+            "prepared_source_publication_only", emit.call_args.args[0]["result"]
+        )
+
+        remote_head = self.head
+        pushes = 0
+        live_snapshot_reads = 0
+
+        def apply_run(command, **_kwargs):
+            nonlocal pushes, remote_head
+            if "push" in command:
+                pushes += 1
+                remote_head = self.fix
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        def live_snapshot(_target, pr, expected_head):
+            nonlocal live_snapshot_reads
+            live_snapshot_reads += 1
+            if live_snapshot_reads == 1:
+                raise MODULE.WorkflowError("pull request metadata lagged")
+            return {**pr, "head_sha": expected_head}
+
+        apply_args = self.arguments(state_path)
+        apply_args.apply_prepared = True
+        apply_args.publish_prepared_only = True
+        apply_args.preserve_artifacts = True
+        replies = mock.Mock()
+        resolve = mock.Mock()
+        request = mock.Mock()
+        verify = mock.Mock()
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(MODULE, "require_tools"))
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE, "resolve_repo_root", return_value=self.repo_root
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE,
+                    "resolve_target",
+                    return_value=MODULE.parse_target("owner/repo#7"),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE,
+                    "local_source_fingerprint",
+                    return_value=manifest["source_after"],
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE,
+                    "github_decision_fingerprint",
+                    return_value=self.github_fingerprint,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE,
+                    "validate_local_source_transition",
+                    return_value=([self.fix], {self.fix: ["src/app.py"]}),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE,
+                    "local_session_model_attestation",
+                    return_value=attestation,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE,
+                    "local_identity",
+                    return_value={
+                        "branch": "feature",
+                        "head": self.fix,
+                        "status": "",
+                    },
+                )
+            )
+            apply_import = stack.enter_context(
+                mock.patch.object(
+                    MODULE,
+                    "apply_verified_import",
+                    return_value=False,
+                )
+            )
+            stack.enter_context(mock.patch.object(MODULE, "run", side_effect=apply_run))
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE,
+                    "metadata_for",
+                    return_value=self.preflight["pr"],
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE,
+                    "wait_for_live_pr_snapshot",
+                    side_effect=live_snapshot,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE,
+                    "remote_head",
+                    side_effect=lambda *_args: remote_head,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE,
+                    "wait_for_remote_head",
+                    side_effect=lambda *_args: remote_head,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(MODULE, "find_push_remote", return_value="origin")
+            )
+            live_comments = stack.enter_context(
+                mock.patch.object(
+                    MODULE,
+                    "require_live_comments",
+                    return_value=[self.comment],
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(MODULE, "post_missing_replies", new=replies)
+            )
+            stack.enter_context(
+                mock.patch.object(MODULE, "resolve_threads", new=resolve)
+            )
+            stack.enter_context(
+                mock.patch.object(MODULE, "request_copilot", new=request)
+            )
+            stack.enter_context(
+                mock.patch.object(MODULE, "verify_publish", new=verify)
+            )
+            continuation = stack.enter_context(
+                mock.patch.object(MODULE, "continue_after_review_request")
+            )
+            worker = stack.enter_context(
+                mock.patch.object(MODULE, "run_local_decision_worker")
+            )
+            discover = stack.enter_context(
+                mock.patch.object(MODULE, "discover_cloud_task")
+            )
+            emit = stack.enter_context(mock.patch.object(MODULE, "emit"))
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "pull request metadata lagged"
+            ):
+                MODULE.command_agent_task(apply_args)
+            self.assertEqual(1, pushes)
+            self.assertEqual(
+                "failed_after_publication",
+                MODULE.load_state(state_path)["agent_task"]["status"],
+            )
+            apply_args.resume = False
+            MODULE.command_agent_task(apply_args)
+
+        self.assertEqual(2, apply_import.call_count)
+        self.assertEqual(1, pushes)
+        self.assertEqual(2, live_comments.call_count)
+        replies.assert_not_called()
+        resolve.assert_not_called()
+        request.assert_not_called()
+        verify.assert_not_called()
+        continuation.assert_not_called()
+        worker.assert_not_called()
+        discover.assert_not_called()
+        completed = MODULE.load_state(state_path)
+        self.assertEqual("published_source_only", completed["last_result"])
+        self.assertEqual("completed", completed["agent_task"]["status"])
+        self.assertEqual(
+            "source_only", completed["agent_task"]["publication_scope"]
+        )
+        self.assertTrue(completed["agent_task"]["artifacts_preserved"])
+        self.assertNotIn("apply_command", completed["agent_task"])
+        self.assertEqual("published_source_only", emit.call_args.args[0]["result"])
+
+    def test_publish_prepared_only_requires_mechanical_rescope(self):
+        state_path = self.directory / "source-only-invalid.json"
+        arguments = self.arguments(state_path)
+        arguments.publish_prepared_only = True
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "--publish-prepared-only requires --apply-prepared",
+        ):
+            MODULE.command_agent_task(arguments)
+
+    def test_retained_terminal_recovery_accepts_only_pinned_legacy_helper(self):
+        state_path = self.directory / "legacy-helper-state.json"
+        arguments, manifest, attestation = self.terminal_local_recovery_case(
+            state_path
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=self.repo_root
+            ),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "local_source_fingerprint",
+                return_value=manifest["source_after"],
+            ),
+            mock.patch.object(
+                MODULE,
+                "validate_local_source_transition",
+                return_value=([self.fix], {self.fix: ["src/app.py"]}),
+            ),
+            mock.patch.object(
+                MODULE,
+                "terminal_recovery_github_fingerprint",
+                return_value=(
+                    self.github_fingerprint,
+                    self.preflight,
+                    "exact",
+                ),
+            ),
+            mock.patch.object(
+                MODULE,
+                "local_session_model_attestation",
+                return_value=attestation,
+            ),
+            mock.patch.object(MODULE, "emit"),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        recovered = MODULE.load_state(state_path)["agent_task"]
+        result_path = Path(recovered["result_file"])
+        manifest_path = Path(arguments.recover_terminal_local)
+        recovery_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        recovery_manifest["helper_sha256"] = (
+            MODULE.LEGACY_TERMINAL_RECOVERY_HELPER_SHA256
+        )
+        manifest_path.write_text(
+            json.dumps(recovery_manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result["terminal_recovery"]["helper_sha256"] = (
+            MODULE.LEGACY_TERMINAL_RECOVERY_HELPER_SHA256
+        )
+        result["terminal_recovery"]["manifest"]["sha256"] = MODULE.sha256_file(
+            manifest_path
+        )
+        result_path.write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        def validate():
+            return MODULE.validate_retained_local_decision(
+                repo_root=self.repo_root,
+                target=MODULE.parse_target("owner/repo#7"),
+                preflight=recovered["preflight"],
+                prompt_path=Path(recovered["prompt_file"]),
+                decision_path=Path(recovered["decision_file"]),
+                result_path=result_path,
+                canonical_path=Path(recovered["canonical_report_file"]),
+                requested_model=MODULE.LOCAL_DECISION_MODEL,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "local_source_fingerprint",
+                return_value=manifest["source_after"],
+            ),
+            mock.patch.object(
+                MODULE,
+                "github_decision_fingerprint",
+                return_value=self.github_fingerprint,
+            ),
+            mock.patch.object(
+                MODULE,
+                "validate_local_source_transition",
+                return_value=([self.fix], {self.fix: ["src/app.py"]}),
+            ),
+            mock.patch.object(
+                MODULE,
+                "local_session_model_attestation",
+                return_value=attestation,
+            ),
+        ):
+            self.assertEqual([self.fix], validate()["remote"]["commits"])
+
+            result["terminal_recovery"]["helper_sha256"] = "0" * 64
+            result_path.write_text(
+                json.dumps(result, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "terminal local recovery identity drifted",
+            ):
+                validate()
 
     def test_terminal_local_recovery_rejects_decision_hash_drift(self):
         state_path = self.directory / "terminal-drift-state.json"
