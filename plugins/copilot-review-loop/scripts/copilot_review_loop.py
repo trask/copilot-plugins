@@ -124,6 +124,7 @@ LOCAL_DECISION_RESULT_SCHEMA = {
     "id": "github.copilot.copilot-review-loop-local-result",
     "version": 1,
 }
+IGNORED_RUNTIME_REF_PREFIX = "refs/copilot/checkpoints/"
 LEGACY_AGENT_TASK_POLICY_V4 = {
     "id": "marketplace-agent-worker",
     "version": 4,
@@ -4779,6 +4780,8 @@ def git_ref_snapshot(repo_root: Path) -> dict[str, str]:
             or SHA_PATTERN.fullmatch(fields[1].lower()) is None
         ):
             raise WorkflowError("local Git refs have malformed identity")
+        if fields[0].startswith(IGNORED_RUNTIME_REF_PREFIX):
+            continue
         refs[fields[0]] = fields[1].lower()
     return refs
 
