@@ -1859,6 +1859,373 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                     target=MODULE.parse_target("owner/repo#7"),
                 )
 
+    def forward_provenance_fixture(self):
+        retained_head = "1" * 40
+        forward_head = "4" * 40
+        orphan_head = "5" * 40
+        pinned = {
+            "number": 7,
+            "repo_name": "owner/repo",
+            "pr_url": "https://github.com/owner/repo/pull/7",
+            "title": "Title",
+            "body": "Body",
+            "head_owner": "owner",
+            "head_repo": "repo",
+            "head_branch": "feature",
+            "head_repository": "owner/repo",
+            "head_sha": retained_head,
+            "base_branch": "main",
+            "base_sha": "2" * 40,
+            "state": "OPEN",
+            "upstream_owner": "owner",
+            "upstream_repo": "repo",
+            "is_fork": False,
+            "cross_repository": False,
+            "is_draft": True,
+            "commits": [{"sha": retained_head, "message": "Pinned"}],
+        }
+        live = copy.deepcopy(pinned)
+        live["head_sha"] = forward_head
+        live["commits"].append({"sha": forward_head, "message": "Forward"})
+        expectations = {
+            "forward_actor": "owner",
+            "forward_head_sha": forward_head,
+            "forward_run_id": 42,
+            "forward_tree_sha": "6" * 40,
+            "orphan_branch": "copilot/feature",
+            "orphan_head_sha": orphan_head,
+            "orphan_session_id": "session-1",
+            "orphan_task_id": "task-1",
+        }
+
+        def commit(sha, parent, tree, path, *, actor):
+            return {
+                "sha": sha,
+                "tree": tree,
+                "parent": parent,
+                "author": {
+                    "name": actor,
+                    "email": f"{actor}@example.test",
+                    "date": "2026-09-17T19:10:19Z",
+                    "login": actor,
+                },
+                "committer": {
+                    "name": actor,
+                    "email": f"{actor}@example.test",
+                    "date": "2026-09-17T19:10:19Z",
+                    "login": actor,
+                },
+                "message_sha256": "7" * 64,
+                "message_utf8_bytes": 7,
+                "signature": {
+                    "verified": actor == "Copilot",
+                    "reason": "valid" if actor == "Copilot" else "unsigned",
+                    "present": actor == "Copilot",
+                    "verified_at": None,
+                },
+                "files": [
+                    {
+                        "filename": path,
+                        "status": "modified",
+                        "sha": "8" * 40,
+                        "additions": 1,
+                        "deletions": 1,
+                        "changes": 2,
+                    }
+                ],
+            }
+
+        forward = {
+            "base": retained_head,
+            "head": forward_head,
+            "commit_count": 1,
+            "commits": [
+                commit(
+                    forward_head,
+                    retained_head,
+                    expectations["forward_tree_sha"],
+                    "src/forward.java",
+                    actor="owner",
+                )
+            ],
+        }
+        orphan = {
+            "base": retained_head,
+            "head": orphan_head,
+            "commit_count": 1,
+            "commits": [
+                commit(
+                    orphan_head,
+                    retained_head,
+                    "9" * 40,
+                    "src/orphan-test.java",
+                    actor="Copilot",
+                )
+            ],
+        }
+        task = {
+            "id": expectations["orphan_task_id"],
+            "state": "completed",
+            "created_at": "2026-09-17T17:19:21Z",
+            "updated_at": "2026-09-17T17:52:01Z",
+            "sessions": [
+                {
+                    "id": expectations["orphan_session_id"],
+                    "task_id": expectations["orphan_task_id"],
+                    "state": "completed",
+                    "model": "sweagent-capi:gpt-5.6-sol",
+                    "base_ref": retained_head,
+                    "head_ref": expectations["orphan_branch"],
+                    "created_at": "2026-09-17T17:19:24Z",
+                    "updated_at": "2026-09-17T17:52:01Z",
+                    "completed_at": "2026-09-17T17:52:01Z",
+                }
+            ],
+            "artifacts": [
+                {
+                    "type": "branch",
+                    "provider": "github",
+                    "data": {
+                        "base_ref": retained_head,
+                        "head_ref": expectations["orphan_branch"],
+                    },
+                }
+            ],
+        }
+        branch = {
+            "ref": f"refs/heads/{expectations['orphan_branch']}",
+            "object": {
+                "type": "commit",
+                "sha": expectations["orphan_head_sha"],
+            },
+        }
+        workflow_run = {
+            "id": expectations["forward_run_id"],
+            "event": "pull_request",
+            "head_sha": forward_head,
+            "head_branch": live["head_branch"],
+            "head_repository": {"full_name": live["head_repository"]},
+            "actor": {"login": expectations["forward_actor"]},
+            "triggering_actor": {"login": expectations["forward_actor"]},
+            "created_at": "2026-09-17T19:10:40Z",
+            "run_started_at": "2026-09-17T19:10:40Z",
+        }
+        return (
+            pinned,
+            live,
+            expectations,
+            forward,
+            orphan,
+            task,
+            branch,
+            workflow_run,
+        )
+
+    def test_forward_head_provenance_requires_disjoint_completed_task_history(self):
+        (
+            pinned,
+            live,
+            expectations,
+            forward,
+            orphan,
+            task,
+            branch,
+            workflow_run,
+        ) = self.forward_provenance_fixture()
+        with (
+            mock.patch.object(
+                MODULE,
+                "github_linear_history",
+                side_effect=[forward, orphan],
+            ),
+            mock.patch.object(
+                MODULE,
+                "agent_task_api_json",
+                return_value=task,
+            ),
+            mock.patch.object(
+                MODULE,
+                "gh_json",
+                side_effect=[branch, workflow_run],
+            ),
+        ):
+            provenance = MODULE.legacy_forward_head_provenance(
+                target=MODULE.parse_target("owner/repo#7"),
+                pinned_pr=pinned,
+                live_pr=live,
+                expectations=expectations,
+            )
+
+        self.assertEqual("independent_forward_head", provenance["mode"])
+        self.assertEqual(pinned["head_sha"], provenance["separation"]["merge_base"])
+        self.assertEqual([], provenance["separation"]["shared_generated_commits"])
+        self.assertEqual([], provenance["separation"]["overlapping_changed_paths"])
+        self.assertFalse(provenance["separation"]["old_result_imported"])
+        self.assertEqual("task-1", provenance["orphan"]["task_id"])
+
+        orphan["commits"][0]["files"][0]["filename"] = "src/forward.java"
+        with (
+            mock.patch.object(
+                MODULE,
+                "github_linear_history",
+                side_effect=[forward, orphan],
+            ),
+            mock.patch.object(
+                MODULE,
+                "agent_task_api_json",
+                return_value=task,
+            ),
+            mock.patch.object(MODULE, "gh_json", return_value=branch),
+            self.assertRaisesRegex(MODULE.WorkflowError, "overlaps orphan"),
+        ):
+            MODULE.legacy_forward_head_provenance(
+                target=MODULE.parse_target("owner/repo#7"),
+                pinned_pr=pinned,
+                live_pr=live,
+                expectations=expectations,
+            )
+
+    def test_forward_head_provenance_rejects_active_task_and_actor_drift(self):
+        (
+            pinned,
+            live,
+            expectations,
+            forward,
+            orphan,
+            task,
+            branch,
+            workflow_run,
+        ) = self.forward_provenance_fixture()
+        task["state"] = "in_progress"
+        with (
+            mock.patch.object(
+                MODULE,
+                "github_linear_history",
+                side_effect=[forward, orphan],
+            ),
+            mock.patch.object(
+                MODULE,
+                "agent_task_api_json",
+                return_value=task,
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "completed"),
+        ):
+            MODULE.legacy_forward_head_provenance(
+                target=MODULE.parse_target("owner/repo#7"),
+                pinned_pr=pinned,
+                live_pr=live,
+                expectations=expectations,
+            )
+
+        task["state"] = "completed"
+        workflow_run["actor"]["login"] = "other"
+        with (
+            mock.patch.object(
+                MODULE,
+                "github_linear_history",
+                side_effect=[forward, orphan],
+            ),
+            mock.patch.object(
+                MODULE,
+                "agent_task_api_json",
+                return_value=task,
+            ),
+            mock.patch.object(
+                MODULE,
+                "gh_json",
+                side_effect=[branch, workflow_run],
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "actor evidence"),
+        ):
+            MODULE.legacy_forward_head_provenance(
+                target=MODULE.parse_target("owner/repo#7"),
+                pinned_pr=pinned,
+                live_pr=live,
+                expectations=expectations,
+            )
+
+    def test_forward_head_reconciliation_requires_complete_exact_argv(self):
+        arguments = SimpleNamespace(
+            expected_forward_head_sha="1" * 40,
+            expected_forward_tree_sha=None,
+            expected_forward_actor=None,
+            expected_forward_run_id=None,
+            expected_orphan_task_id=None,
+            expected_orphan_session_id=None,
+            expected_orphan_branch=None,
+            expected_orphan_head_sha=None,
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "every exact provenance"):
+            MODULE.legacy_forward_expectations_from_args(arguments)
+
+    def test_forward_history_rejects_non_linear_or_diverged_commits(self):
+        base = "1" * 40
+        head = "2" * 40
+        compare = {
+            "status": "ahead",
+            "ahead_by": 1,
+            "behind_by": 0,
+            "total_commits": 1,
+            "merge_base_commit": {"sha": base},
+            "commits": [{"sha": head}],
+        }
+        commit = {
+            "sha": head,
+            "commit": {
+                "tree": {"sha": "3" * 40},
+                "author": {
+                    "name": "Owner",
+                    "email": "owner@example.test",
+                    "date": "2026-09-17T19:10:19Z",
+                },
+                "committer": {
+                    "name": "Owner",
+                    "email": "owner@example.test",
+                    "date": "2026-09-17T19:10:19Z",
+                },
+                "message": "Forward",
+                "verification": {
+                    "verified": False,
+                    "reason": "unsigned",
+                    "signature": None,
+                    "verified_at": None,
+                },
+            },
+            "parents": [{"sha": base}, {"sha": "4" * 40}],
+            "author": {"login": "owner"},
+            "committer": {"login": "owner"},
+            "files": [
+                {
+                    "filename": "src/file.java",
+                    "status": "modified",
+                    "sha": "5" * 40,
+                    "additions": 1,
+                    "deletions": 1,
+                    "changes": 2,
+                }
+            ],
+        }
+        with (
+            mock.patch.object(MODULE, "gh_json", side_effect=[compare, commit]),
+            self.assertRaisesRegex(MODULE.WorkflowError, "identity is invalid"),
+        ):
+            MODULE.github_linear_history(
+                "owner/repo",
+                base_sha=base,
+                head_sha=head,
+            )
+
+        compare["status"] = "diverged"
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value=compare),
+            self.assertRaisesRegex(MODULE.WorkflowError, "forward-only"),
+        ):
+            MODULE.github_linear_history(
+                "owner/repo",
+                base_sha=base,
+                head_sha=head,
+            )
+
     def test_package_manifest_verifies_exact_installed_helper_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1882,7 +2249,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             ]
             package = {
                 "name": "ci-fix-loop",
-                "version": "1.6.32",
+                "version": "1.6.33",
                 "file_count": 1,
                 "byte_count": helper.stat().st_size,
                 "package_sha256": MODULE.canonical_package_digest(files),
@@ -1950,7 +2317,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "installed_root": str(root / "installed"),
                 "package": {
                     "name": "ci-fix-loop",
-                    "version": "1.6.32",
+                    "version": "1.6.33",
                     "file_count": 8,
                     "package_sha256": "c" * 64,
                 },
@@ -2110,7 +2477,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "installed_root": str(root / "installed"),
                 "package": {
                     "name": "ci-fix-loop",
-                    "version": "1.6.32",
+                    "version": "1.6.33",
                     "file_count": 8,
                     "package_sha256": "c" * 64,
                 },
@@ -2193,7 +2560,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "installed_root": str(root / "installed"),
                 "package": {
                     "name": "ci-fix-loop",
-                    "version": "1.6.32",
+                    "version": "1.6.33",
                     "file_count": 8,
                     "package_sha256": "c" * 64,
                 },
@@ -2549,7 +2916,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("tools: [execute, agent, rename_session]", instructions)
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [execute, agent, todo", instructions)
-        self.assertEqual("1.6.32", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.33", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_canonicalizes_stack_start_target(self):
         instructions = AGENT.read_text(encoding="utf-8")

@@ -51,13 +51,13 @@ HOSTED_DISPATCH_IDENTITY_SCHEMA = (
     "github.copilot.ci-fix-loop-hosted-dispatch-identity.v1"
 )
 LEGACY_OWNER_RECONCILIATION_SNAPSHOT_SCHEMA = (
-    "github.copilot.ci-fix-loop-legacy-owner-reconciliation-snapshot.v1"
+    "github.copilot.ci-fix-loop-legacy-owner-reconciliation-snapshot.v2"
 )
 LEGACY_OWNER_ELIGIBILITY_SCHEMA = (
-    "github.copilot.ci-fix-loop-legacy-owner-eligibility.v1"
+    "github.copilot.ci-fix-loop-legacy-owner-eligibility.v2"
 )
 LEGACY_OWNER_AUTHORIZATION_SCHEMA = (
-    "github.copilot.ci-fix-loop-legacy-owner-authorization.v1"
+    "github.copilot.ci-fix-loop-legacy-owner-authorization.v2"
 )
 PLUGIN_PACKAGE_MANIFEST_SCHEMA = {
     "id": "github.copilot.plugin-package-manifest",
@@ -7392,11 +7392,504 @@ def legacy_recovery_command_matches(
     )
 
 
+LEGACY_FORWARD_EXPECTATION_FIELDS = {
+    "forward_actor",
+    "forward_head_sha",
+    "forward_run_id",
+    "forward_tree_sha",
+    "orphan_branch",
+    "orphan_head_sha",
+    "orphan_session_id",
+    "orphan_task_id",
+}
+
+
+def require_git_sha(value: Any, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40}", value) is None:
+        raise WorkflowError(f"{label} is not a lowercase Git SHA")
+    return value
+
+
+def require_nonempty_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise WorkflowError(f"{label} is missing")
+    return value
+
+
+def legacy_forward_expectations_from_args(
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    values = {
+        "forward_actor": getattr(args, "expected_forward_actor", None),
+        "forward_head_sha": getattr(args, "expected_forward_head_sha", None),
+        "forward_run_id": getattr(args, "expected_forward_run_id", None),
+        "forward_tree_sha": getattr(args, "expected_forward_tree_sha", None),
+        "orphan_branch": getattr(args, "expected_orphan_branch", None),
+        "orphan_head_sha": getattr(args, "expected_orphan_head_sha", None),
+        "orphan_session_id": getattr(args, "expected_orphan_session_id", None),
+        "orphan_task_id": getattr(args, "expected_orphan_task_id", None),
+    }
+    supplied = {name for name, value in values.items() if value is not None}
+    if not supplied:
+        return None
+    if supplied != LEGACY_FORWARD_EXPECTATION_FIELDS:
+        missing = ", ".join(sorted(LEGACY_FORWARD_EXPECTATION_FIELDS - supplied))
+        raise WorkflowError(
+            "forward-head reconciliation requires every exact provenance "
+            f"identity; missing: {missing}"
+        )
+    require_git_sha(values["forward_head_sha"], "expected forward head")
+    require_git_sha(values["forward_tree_sha"], "expected forward tree")
+    require_git_sha(values["orphan_head_sha"], "expected orphan head")
+    for name in (
+        "forward_actor",
+        "orphan_branch",
+        "orphan_session_id",
+        "orphan_task_id",
+    ):
+        require_nonempty_string(values[name], f"expected {name.replace('_', ' ')}")
+    if (
+        not isinstance(values["forward_run_id"], int)
+        or isinstance(values["forward_run_id"], bool)
+        or values["forward_run_id"] <= 0
+    ):
+        raise WorkflowError("expected forward run ID is invalid")
+    return values
+
+
+def require_forward_pr_identity(
+    expected: dict[str, Any],
+    actual: dict[str, Any],
+) -> None:
+    fields = (
+        "number",
+        "repo_name",
+        "pr_url",
+        "title",
+        "body",
+        "head_owner",
+        "head_repo",
+        "head_branch",
+        "head_repository",
+        "base_branch",
+        "base_sha",
+        "state",
+        "upstream_owner",
+        "upstream_repo",
+        "is_fork",
+        "cross_repository",
+        "is_draft",
+    )
+    if any(actual.get(field) != expected.get(field) for field in fields):
+        raise WorkflowError(
+            "live pull request identity changed outside the forward head"
+        )
+    expected_commits = expected.get("commits")
+    actual_commits = actual.get("commits")
+    if (
+        not isinstance(expected_commits, list)
+        or not expected_commits
+        or not isinstance(actual_commits, list)
+        or actual_commits[: len(expected_commits)] != expected_commits
+    ):
+        raise WorkflowError(
+            "live pull request history does not retain the pinned commit prefix"
+        )
+
+
+def github_commit_identity(
+    repository: str,
+    sha: str,
+    *,
+    expected_parent: str,
+) -> dict[str, Any]:
+    payload = gh_json(["api", f"repos/{repository}/commits/{sha}"])
+    if not isinstance(payload, dict):
+        raise WorkflowError(f"GitHub commit identity is invalid for {sha}")
+    commit = payload.get("commit") if isinstance(payload, dict) else None
+    tree = commit.get("tree") if isinstance(commit, dict) else None
+    author = commit.get("author") if isinstance(commit, dict) else None
+    committer = commit.get("committer") if isinstance(commit, dict) else None
+    verification = (
+        commit.get("verification") if isinstance(commit, dict) else None
+    )
+    parents = payload.get("parents") if isinstance(payload, dict) else None
+    files = payload.get("files") if isinstance(payload, dict) else None
+    outer_author = payload.get("author") if isinstance(payload, dict) else None
+    outer_committer = (
+        payload.get("committer") if isinstance(payload, dict) else None
+    )
+    if (
+        payload.get("sha") != sha
+        or not isinstance(tree, dict)
+        or require_git_sha(tree.get("sha"), "commit tree") == ""
+        or not isinstance(parents, list)
+        or [parent.get("sha") for parent in parents if isinstance(parent, dict)]
+        != [expected_parent]
+        or not isinstance(author, dict)
+        or not isinstance(committer, dict)
+        or not isinstance(verification, dict)
+        or not isinstance(files, list)
+        or not files
+    ):
+        raise WorkflowError(f"GitHub commit identity is invalid for {sha}")
+    people = {}
+    for label, person, account in (
+        ("author", author, outer_author),
+        ("committer", committer, outer_committer),
+    ):
+        if any(
+            not isinstance(person.get(field), str) or not person[field]
+            for field in ("name", "email", "date")
+        ):
+            raise WorkflowError(f"GitHub commit {sha} has invalid {label} metadata")
+        login = account.get("login") if isinstance(account, dict) else None
+        if login is not None and (not isinstance(login, str) or not login):
+            raise WorkflowError(f"GitHub commit {sha} has an invalid {label} login")
+        people[label] = {
+            "name": person["name"],
+            "email": person["email"],
+            "date": person["date"],
+            "login": login,
+        }
+    file_identities = []
+    for file in files:
+        if (
+            not isinstance(file, dict)
+            or not isinstance(file.get("filename"), str)
+            or not file["filename"]
+            or not isinstance(file.get("status"), str)
+            or not file["status"]
+            or require_git_sha(file.get("sha"), "commit file blob") == ""
+            or any(
+                not isinstance(file.get(field), int)
+                or isinstance(file.get(field), bool)
+                or file[field] < 0
+                for field in ("additions", "deletions", "changes")
+            )
+        ):
+            raise WorkflowError(f"GitHub commit file identity is invalid for {sha}")
+        file_identities.append(
+            {
+                field: file[field]
+                for field in (
+                    "filename",
+                    "status",
+                    "sha",
+                    "additions",
+                    "deletions",
+                    "changes",
+                )
+            }
+        )
+    message = commit.get("message")
+    if not isinstance(message, str) or not message:
+        raise WorkflowError(f"GitHub commit {sha} has no message")
+    verified = verification.get("verified")
+    reason = verification.get("reason")
+    if (
+        not isinstance(verified, bool)
+        or not isinstance(reason, str)
+        or not reason
+    ):
+        raise WorkflowError(f"GitHub commit {sha} has invalid signature metadata")
+    return {
+        "sha": sha,
+        "tree": tree["sha"],
+        "parent": expected_parent,
+        **people,
+        "message_sha256": sha256_text(message),
+        "message_utf8_bytes": len(message.encode("utf-8")),
+        "signature": {
+            "verified": verified,
+            "reason": reason,
+            "present": bool(verification.get("signature")),
+            "verified_at": verification.get("verified_at"),
+        },
+        "files": sorted(file_identities, key=lambda item: item["filename"]),
+    }
+
+
+def github_linear_history(
+    repository: str,
+    *,
+    base_sha: str,
+    head_sha: str,
+) -> dict[str, Any]:
+    require_git_sha(base_sha, "history base")
+    require_git_sha(head_sha, "history head")
+    compare = gh_json(
+        ["api", f"repos/{repository}/compare/{base_sha}...{head_sha}"]
+    )
+    commits = compare.get("commits") if isinstance(compare, dict) else None
+    merge_base = (
+        compare.get("merge_base_commit") if isinstance(compare, dict) else None
+    )
+    if (
+        compare.get("status") != "ahead"
+        or not isinstance(commits, list)
+        or not commits
+        or compare.get("ahead_by") != len(commits)
+        or compare.get("behind_by") != 0
+        or compare.get("total_commits") != len(commits)
+        or not isinstance(merge_base, dict)
+        or merge_base.get("sha") != base_sha
+    ):
+        raise WorkflowError(
+            f"{head_sha} is not a strict forward-only history from {base_sha}"
+        )
+    history = []
+    parent = base_sha
+    for candidate in commits:
+        sha = candidate.get("sha") if isinstance(candidate, dict) else None
+        require_git_sha(sha, "forward commit")
+        identity = github_commit_identity(
+            repository,
+            sha,
+            expected_parent=parent,
+        )
+        history.append(identity)
+        parent = sha
+    if parent != head_sha:
+        raise WorkflowError("forward history did not end at the expected head")
+    return {
+        "base": base_sha,
+        "head": head_sha,
+        "commit_count": len(history),
+        "commits": history,
+    }
+
+
+def legacy_forward_head_provenance(
+    *,
+    target: dict[str, Any],
+    pinned_pr: dict[str, Any],
+    live_pr: dict[str, Any],
+    expectations: dict[str, Any],
+) -> dict[str, Any]:
+    if set(expectations) != LEGACY_FORWARD_EXPECTATION_FIELDS:
+        raise WorkflowError("forward-head provenance expectations are malformed")
+    retained_head = require_git_sha(
+        pinned_pr.get("head_sha"), "retained pull request head"
+    )
+    forward_head = require_git_sha(
+        expectations["forward_head_sha"], "expected forward head"
+    )
+    if live_pr.get("head_sha") != forward_head or forward_head == retained_head:
+        raise WorkflowError("live pull request is not at the expected forward head")
+    require_forward_pr_identity(pinned_pr, live_pr)
+    forward_history = github_linear_history(
+        target["repo_name"],
+        base_sha=retained_head,
+        head_sha=forward_head,
+    )
+    if forward_history["commits"][-1]["tree"] != expectations["forward_tree_sha"]:
+        raise WorkflowError("forward head tree does not match the expected tree")
+    pinned_commits = pinned_pr["commits"]
+    if [
+        commit.get("sha") for commit in live_pr["commits"][len(pinned_commits) :]
+    ] != [commit["sha"] for commit in forward_history["commits"]]:
+        raise WorkflowError("live pull request commit list does not match history")
+    if any(
+        commit["author"]["login"] != expectations["forward_actor"]
+        or commit["committer"]["login"] != expectations["forward_actor"]
+        for commit in forward_history["commits"]
+    ):
+        raise WorkflowError("forward commits do not belong to the expected actor")
+
+    task_id = expectations["orphan_task_id"]
+    task = agent_task_api_json(
+        f"agents/repos/{target['repo_name']}/tasks/"
+        f"{urllib.parse.quote(task_id, safe='')}"
+    )
+    sessions = task.get("sessions") if isinstance(task, dict) else None
+    artifacts = task.get("artifacts") if isinstance(task, dict) else None
+    if (
+        task.get("id") != task_id
+        or task.get("state") != "completed"
+        or not isinstance(task.get("created_at"), str)
+        or not isinstance(task.get("updated_at"), str)
+        or not isinstance(sessions, list)
+        or len(sessions) != 1
+        or not isinstance(artifacts, list)
+        or len(artifacts) != 1
+    ):
+        raise WorkflowError("orphan Agent Task identity is not exact and completed")
+    session = sessions[0]
+    artifact = artifacts[0]
+    artifact_data = artifact.get("data") if isinstance(artifact, dict) else None
+    if (
+        not isinstance(session, dict)
+        or session.get("id") != expectations["orphan_session_id"]
+        or session.get("task_id") != task_id
+        or session.get("state") != "completed"
+        or session.get("model") != "sweagent-capi:gpt-5.6-sol"
+        or session.get("base_ref") != retained_head
+        or session.get("head_ref") != expectations["orphan_branch"]
+        or not isinstance(session.get("created_at"), str)
+        or not isinstance(session.get("updated_at"), str)
+        or not isinstance(session.get("completed_at"), str)
+        or not isinstance(artifact, dict)
+        or artifact.get("type") != "branch"
+        or artifact.get("provider") != "github"
+        or not isinstance(artifact_data, dict)
+        or artifact_data
+        != {
+            "base_ref": retained_head,
+            "head_ref": expectations["orphan_branch"],
+        }
+    ):
+        raise WorkflowError("orphan Agent Task session or branch identity drifted")
+    encoded_branch = urllib.parse.quote(expectations["orphan_branch"], safe="")
+    branch = gh_json(
+        [
+            "api",
+            f"repos/{target['repo_name']}/git/ref/heads/{encoded_branch}",
+        ]
+    )
+    if not isinstance(branch, dict):
+        raise WorkflowError("orphan Agent Task branch head drifted")
+    branch_object = branch.get("object") if isinstance(branch, dict) else None
+    if (
+        branch.get("ref") != f"refs/heads/{expectations['orphan_branch']}"
+        or not isinstance(branch_object, dict)
+        or branch_object.get("type") != "commit"
+        or branch_object.get("sha") != expectations["orphan_head_sha"]
+    ):
+        raise WorkflowError("orphan Agent Task branch head drifted")
+    orphan_history = github_linear_history(
+        target["repo_name"],
+        base_sha=retained_head,
+        head_sha=expectations["orphan_head_sha"],
+    )
+    forward_shas = {commit["sha"] for commit in forward_history["commits"]}
+    orphan_shas = {commit["sha"] for commit in orphan_history["commits"]}
+    forward_paths = {
+        file["filename"]
+        for commit in forward_history["commits"]
+        for file in commit["files"]
+    }
+    orphan_paths = {
+        file["filename"]
+        for commit in orphan_history["commits"]
+        for file in commit["files"]
+    }
+    if (
+        forward_shas & orphan_shas
+        or forward_paths & orphan_paths
+        or any(
+            path.startswith(
+                (
+                    ".github/agent-task-reports/",
+                    ".github/agent-task-validations/",
+                )
+            )
+            for path in forward_paths
+        )
+    ):
+        raise WorkflowError(
+            "forward head overlaps orphan Agent Task history or artifact paths"
+        )
+
+    run_id = expectations["forward_run_id"]
+    workflow_run = gh_json(
+        [
+            "api",
+            f"repos/{target['repo_name']}/actions/runs/{run_id}",
+        ]
+    )
+    if not isinstance(workflow_run, dict):
+        raise WorkflowError("forward-head workflow actor evidence drifted")
+    actor = workflow_run.get("actor") if isinstance(workflow_run, dict) else None
+    triggering_actor = (
+        workflow_run.get("triggering_actor")
+        if isinstance(workflow_run, dict)
+        else None
+    )
+    head_repository = (
+        workflow_run.get("head_repository")
+        if isinstance(workflow_run, dict)
+        else None
+    )
+    expected_actor = expectations["forward_actor"]
+    if (
+        workflow_run.get("id") != run_id
+        or workflow_run.get("event") != "pull_request"
+        or workflow_run.get("head_sha") != forward_head
+        or workflow_run.get("head_branch") != live_pr["head_branch"]
+        or not isinstance(actor, dict)
+        or actor.get("login") != expected_actor
+        or not isinstance(triggering_actor, dict)
+        or triggering_actor.get("login") != expected_actor
+        or not isinstance(head_repository, dict)
+        or head_repository.get("full_name") != live_pr["head_repository"]
+        or not isinstance(workflow_run.get("created_at"), str)
+        or not isinstance(workflow_run.get("run_started_at"), str)
+    ):
+        raise WorkflowError("forward-head workflow actor evidence drifted")
+
+    return {
+        "mode": "independent_forward_head",
+        "expected": expectations,
+        "retained_head": retained_head,
+        "live_head": forward_head,
+        "forward_history": forward_history,
+        "orphan": {
+            "task_id": task_id,
+            "state": task["state"],
+            "created_at": task["created_at"],
+            "updated_at": task["updated_at"],
+            "session_id": session["id"],
+            "session_state": session["state"],
+            "session_model": session["model"],
+            "session_created_at": session["created_at"],
+            "session_completed_at": session["completed_at"],
+            "branch": expectations["orphan_branch"],
+            "head": expectations["orphan_head_sha"],
+            "history": orphan_history,
+        },
+        "separation": {
+            "merge_base": retained_head,
+            "shared_generated_commits": [],
+            "overlapping_changed_paths": [],
+            "old_result_imported": False,
+        },
+        "workflow_actor_evidence": {
+            "run_id": run_id,
+            "event": workflow_run["event"],
+            "head_sha": workflow_run["head_sha"],
+            "head_branch": workflow_run["head_branch"],
+            "head_repository": head_repository["full_name"],
+            "actor": actor["login"],
+            "triggering_actor": triggering_actor["login"],
+            "created_at": workflow_run["created_at"],
+            "run_started_at": workflow_run["run_started_at"],
+        },
+    }
+
+
+def legacy_forward_expectations_from_snapshot(
+    snapshot: dict[str, Any],
+) -> dict[str, Any] | None:
+    provenance = snapshot.get("forward_head_provenance")
+    if provenance is None:
+        return None
+    if (
+        not isinstance(provenance, dict)
+        or provenance.get("mode") != "independent_forward_head"
+        or not isinstance(provenance.get("expected"), dict)
+        or set(provenance["expected"]) != LEGACY_FORWARD_EXPECTATION_FIELDS
+    ):
+        raise WorkflowError("sealed forward-head provenance is malformed")
+    return dict(provenance["expected"])
+
+
 def legacy_hosted_owner_reconciliation_snapshot(
     *,
     state_path: Path,
     repo_root: Path,
     target: dict[str, Any],
+    forward_expectations: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     state = load_state(state_path)
     task = state.get("agent_task")
@@ -7474,8 +7967,17 @@ def legacy_hosted_owner_reconciliation_snapshot(
             "legacy hosted owner source identity changed before reconciliation"
         )
     live_pr = metadata_for(target)
-    require_live_pr_snapshot(pr, live_pr, expected_head=pr["head_sha"])
-    require_live_check_snapshot(preflight)
+    forward_provenance = None
+    if forward_expectations is None:
+        require_live_pr_snapshot(pr, live_pr, expected_head=pr["head_sha"])
+        require_live_check_snapshot(preflight)
+    else:
+        forward_provenance = legacy_forward_head_provenance(
+            target=target,
+            pinned_pr=pr,
+            live_pr=live_pr,
+            expectations=forward_expectations,
+        )
     matching_process_ids = command_fragment_process_ids(
         str(result_path.resolve())
     )
@@ -7510,6 +8012,7 @@ def legacy_hosted_owner_reconciliation_snapshot(
         "source_identity": current_identity,
         "preflight_sha256": canonical_json_sha256(preflight),
         "live_pr_sha256": canonical_json_sha256(live_pr),
+        "forward_head_provenance": forward_provenance,
         "blocked_coordinator_observed_at": coordinator.get("observed_at"),
     }
 
@@ -7823,6 +8326,7 @@ def command_prepare_legacy_owner_reconciliation(
         state_path=state_path,
         repo_root=repo_root,
         target=target,
+        forward_expectations=legacy_forward_expectations_from_args(args),
     )
     artifact = legacy_owner_eligibility_artifact(
         target=target,
@@ -7880,6 +8384,9 @@ def command_verify_legacy_owner_reconciliation(
             state_path=state_path,
             repo_root=repo_root,
             target=target,
+            forward_expectations=legacy_forward_expectations_from_snapshot(
+                artifact["snapshot"]
+            ),
         )
         for _ in range(2)
     ]
@@ -7944,6 +8451,9 @@ def command_apply_legacy_owner_reconciliation(
             state_path=state_path,
             repo_root=repo_root,
             target=target,
+            forward_expectations=legacy_forward_expectations_from_snapshot(
+                artifact["snapshot"]
+            ),
         )
         for _ in range(2)
     ]
@@ -7967,6 +8477,9 @@ def command_apply_legacy_owner_reconciliation(
         state_path=state_path,
         repo_root=repo_root,
         target=target,
+        forward_expectations=legacy_forward_expectations_from_snapshot(
+            artifact["snapshot"]
+        ),
     )
     if final_snapshot != artifact["snapshot"]:
         raise WorkflowError("legacy owner changed at reconciliation boundary")
@@ -7996,14 +8509,29 @@ def command_apply_legacy_owner_reconciliation(
             "package_manifest_sha256": package_manifest["sha256"],
             "authorization_token": expected_token,
             "snapshot_sha256": snapshot_sha256,
+            "forward_head_provenance_sha256": (
+                canonical_json_sha256(
+                    artifact["snapshot"]["forward_head_provenance"]
+                )
+                if artifact["snapshot"].get("forward_head_provenance")
+                is not None
+                else None
+            ),
+            "old_task_result_imported": False,
         },
     }
     task["status"] = "failed"
     task["task_id_status"] = "unknown"
     task["task_id"] = None
     task["error"] = (
-        "legacy hosted Agent Task helper owner is no longer running; "
-        "task identity unknown"
+        "legacy hosted Agent Task helper owner was superseded by an "
+        "independently advanced forward pull request head; old task result "
+        "was not imported"
+        if artifact["snapshot"].get("forward_head_provenance") is not None
+        else (
+            "legacy hosted Agent Task helper owner is no longer running; "
+            "task identity unknown"
+        )
     )
     task["failed_at"] = finished_at
     task.pop("retry_command", None)
@@ -11446,6 +11974,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-package-manifest-sha256",
         required=True,
     )
+    prepare_legacy.add_argument("--expected-forward-head-sha")
+    prepare_legacy.add_argument("--expected-forward-tree-sha")
+    prepare_legacy.add_argument("--expected-forward-actor")
+    prepare_legacy.add_argument("--expected-forward-run-id", type=int)
+    prepare_legacy.add_argument("--expected-orphan-task-id")
+    prepare_legacy.add_argument("--expected-orphan-session-id")
+    prepare_legacy.add_argument("--expected-orphan-branch")
+    prepare_legacy.add_argument("--expected-orphan-head-sha")
     prepare_legacy.set_defaults(
         function=command_prepare_legacy_owner_reconciliation
     )
