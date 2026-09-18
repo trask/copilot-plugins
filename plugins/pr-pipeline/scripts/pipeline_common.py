@@ -73,6 +73,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "marker": ("clean_at_head_sha",),
         "skip_marker": ("policy_skip", "head_sha"),
         "model": DEFAULT_STAGE_MODEL,
+        "github_mutation_policy": True,
     },
     {
         "stage": STAGE_SELF_REVIEW,
@@ -83,6 +84,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "model": SELF_REVIEW_MODEL,
         "required_model": SELF_REVIEW_MODEL,
         "required_effort": SELF_REVIEW_EFFORT,
+        "github_mutation_policy": True,
     },
     {
         "stage": STAGE_CI,
@@ -100,6 +102,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "module": "pr_description",
         "marker": ("validated_head_sha",),
         "model": DEFAULT_STAGE_MODEL,
+        "github_mutation_policy": True,
     },
 )
 STAGE_NAMES = tuple(entry["stage"] for entry in STAGES)
@@ -1449,7 +1452,6 @@ STAGE_STATUS_FIELDS = (
     "agent_task",
     "attempt",
     "budget_scope",
-    "counts",
     "coordinator",
     "escalation",
     "github_mutation_policy",
@@ -1457,7 +1459,6 @@ STAGE_STATUS_FIELDS = (
     "iterations",
     "last_result",
     "last_helper_activity",
-    "local_validation",
     "managed_task_history",
     "mergeable_at_head_sha",
     "monitoring",
@@ -1473,9 +1474,7 @@ STAGE_STATUS_FIELDS = (
     "skip_note",
     "terminal_exit",
     "thread_mutations",
-    "validation",
     "validated_head_sha",
-    "verdicts",
 )
 
 ACTIVE_TASK_STATES = frozenset(
@@ -1882,7 +1881,7 @@ def stage_command(
             "sol",
             *stage_arguments,
         ]
-    if entry["stage"] in {STAGE_COPILOT_REVIEW, STAGE_SELF_REVIEW}:
+    if entry.get("github_mutation_policy") is True:
         stage_arguments.extend(
             ["--github-mutation-policy", ACTIVE_GITHUB_MUTATION_POLICY]
         )

@@ -22,16 +22,27 @@ ORDINARY_AGENT_TASK_PLUGINS = {
     "copilot-review-loop": "copilot_review_loop.py",
 }
 ORDINARY_HELPER_SHA256 = (
-    "e3a569b774bbcce9e85ce4d4f9ab8b4af5c7400b6b00fc67ab02b404c7085a8c"
+    "1601dfcb7f9228ad4d59fb3653ba0548b219c2de2b28d33921a4f1e7fd687297"
 )
 CI_FIX_RELEASE_BOUNDARY_HELPER_SHA256 = (
-    "e3a569b774bbcce9e85ce4d4f9ab8b4af5c7400b6b00fc67ab02b404c7085a8c"
+    "1601dfcb7f9228ad4d59fb3653ba0548b219c2de2b28d33921a4f1e7fd687297"
 )
 RUNTIME_PLUGIN = "agent-tasks-runtime"
 RUNTIME_SKILL = ROOT / "plugins" / RUNTIME_PLUGIN / "skills" / RUNTIME_PLUGIN
 CONFLICT_HELPER_SHA256 = (
     "ecddfa60e8896dfef31f2e441537f04a3814f98c1439f4d25ac65e35b5518412"
 )
+EXPECTED_PACKAGE_VERSIONS = {
+    "agent-tasks-runtime": "1.0.17",
+    "ci-fix-loop": "1.6.44",
+    "copilot-review-loop": "1.1.59",
+    "historical-pr-audit": "1.1.21",
+    "pr-conflict-resolver": "1.1.29",
+    "pr-description": "1.0.61",
+    "pr-pipeline": "1.5.26",
+    "pr-reviewer": "1.8.10",
+    "self-review-loop": "1.3.40",
+}
 
 
 class MarketplaceTest(unittest.TestCase):
@@ -80,6 +91,17 @@ class MarketplaceTest(unittest.TestCase):
                 self.assertTrue(
                     list((plugin_root / manifest["agents"]).glob("*.agent.md"))
                 )
+
+    def test_integrated_contract_package_versions_are_pinned(self):
+        marketplace = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            EXPECTED_PACKAGE_VERSIONS,
+            {
+                entry["name"]: entry["version"]
+                for entry in marketplace["plugins"]
+            },
+        )
 
     def test_all_agents_require_explicit_invocation(self):
         marketplace = json.loads(MARKETPLACE.read_text(encoding="utf-8"))

@@ -97,12 +97,13 @@ class GithubMutationPolicyTest(unittest.TestCase):
         index = command.index("--github-mutation-policy")
         self.assertEqual("source-only", command[index + 1])
 
-    def test_review_stages_receive_source_only_helper_argument(self):
+    def test_metadata_sensitive_stages_receive_source_only_helper_argument(self):
         MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
         target = {"repo_name": "owner/repo", "number": 7}
         for stage in (
             MODULE.common.STAGE_COPILOT_REVIEW,
             MODULE.common.STAGE_SELF_REVIEW,
+            MODULE.common.STAGE_DESCRIPTION,
         ):
             with self.subTest(stage=stage):
                 entry = next(
@@ -878,6 +879,142 @@ class MarkerTest(unittest.TestCase):
             with self.subTest(stage=stage):
                 self.assertTrue(self.status(stage, payload)["clear"])
 
+    def test_minimized_stage_results_clear_without_hosted_report_fields(self):
+        payloads = {
+            MODULE.STAGE_CONFLICT: {
+                "mergeable_at_head_sha": HEAD,
+                "attempt": {
+                    "base_sha": BASE,
+                    "result_schema": {
+                        "id": "github.copilot.conflict-result",
+                        "version": 4,
+                    },
+                    "receipt_version": 3,
+                    "status": "mergeable",
+                },
+            },
+            MODULE.STAGE_SELF_REVIEW: {
+                "review": {
+                    "outcome": "clean",
+                    "clean_at_head_sha": HEAD,
+                    "report_version": 3,
+                    "candidate_commits": 0,
+                },
+                "agent_task": {"status": "completed"},
+            },
+            MODULE.STAGE_CI: {
+                "clean_at_head_sha": HEAD,
+                "run": {
+                    "head_sha": HEAD,
+                    "status": "completed",
+                    "report_version": 7,
+                    "receipt_version": 3,
+                },
+            },
+            MODULE.STAGE_DESCRIPTION: {
+                "validated_head_sha": HEAD,
+                "proposal": {"version": 3, "decision": "keep"},
+                "agent_task": {"status": "completed"},
+            },
+        }
+        forbidden = {
+            "report": "arbitrary advisory prose with no machine meaning",
+            "findings": [{"body": "model prose"}],
+            "validation": [{"command": "./gradlew test", "passed": True}],
+            "model_commit_mappings": {"model": "commit"},
+            "report_identity": {"author": "model"},
+            "changed_file_evidence": ["src/App.java"],
+        }
+        for stage, payload in payloads.items():
+            with self.subTest(stage=stage):
+                missing = self.status(stage, payload)
+                arbitrary = self.status(stage, {**payload, **forbidden})
+                self.assertTrue(missing["clear"])
+                self.assertTrue(arbitrary["clear"])
+                self.assertEqual(missing["clear_at_head_sha"], arbitrary["clear_at_head_sha"])
+                self.assertTrue(
+                    set(arbitrary["status"]).isdisjoint(forbidden)
+                )
+
+    def test_ci_candidate_publication_waits_for_exact_sha_github_green(self):
+        published = self.status(
+            MODULE.STAGE_CI,
+            {
+                "stage_outcome": None,
+                "clean_at_head_sha": None,
+                "run": {
+                    "status": "published",
+                    "published_head_sha": HEAD,
+                },
+            },
+        )
+        waiting = self.status(
+            MODULE.STAGE_CI,
+            {
+                "stage_outcome": None,
+                "clean_at_head_sha": None,
+                "run": {
+                    "status": "waiting",
+                    "head_sha": HEAD,
+                    "decision": {"reason": "pending_checks"},
+                },
+            },
+        )
+        green = self.status(
+            MODULE.STAGE_CI,
+            {
+                "stage_outcome": "cleared",
+                "clean_at_head_sha": HEAD,
+                "run": {"status": "completed", "head_sha": HEAD},
+            },
+        )
+        stale_green = self.status(
+            MODULE.STAGE_CI,
+            {
+                "stage_outcome": "cleared",
+                "clean_at_head_sha": NEXT_HEAD,
+                "run": {"status": "completed", "head_sha": NEXT_HEAD},
+            },
+        )
+
+        self.assertFalse(published["clear"])
+        self.assertFalse(waiting["clear"])
+        self.assertTrue(green["clear"])
+        self.assertFalse(stale_green["clear"])
+        self.assertEqual(
+            "clearance_is_for_an_older_head", stale_green["reason"]
+        )
+
+    def test_source_only_description_proposal_never_counts_as_applied(self):
+        previous_policy = MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY
+        MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
+        try:
+            result = self.status(
+                MODULE.STAGE_DESCRIPTION,
+                {
+                    "stage_outcome": None,
+                    "validated_head_sha": None,
+                    "proposal": {
+                        "version": 3,
+                        "title": "Replacement title",
+                        "body": "Replacement body",
+                    },
+                    "agent_task": {
+                        "status": "completed",
+                        "github_mutation_policy": "source-only",
+                    },
+                },
+            )
+        finally:
+            MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
+
+        self.assertFalse(result["clear"])
+        self.assertIsNone(result["clear_at_head_sha"])
+        self.assertEqual(
+            "source-only",
+            result["status"]["agent_task"]["github_mutation_policy"],
+        )
+
     def test_verified_source_only_review_skip_is_clear_without_review_marker(self):
         previous_policy = MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY
         MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
@@ -1054,11 +1191,27 @@ class MarkerTest(unittest.TestCase):
             {
                 "stage_outcome": "escalated",
                 "escalation": escalation,
-                "counts": {"failed": 1},
             },
         )
         self.assertEqual(escalation, result["status"]["escalation"])
-        self.assertEqual({"failed": 1}, result["status"]["counts"])
+        self.assertNotIn("validation", result["status"])
+        self.assertNotIn("verdicts", result["status"])
+
+    def test_ci_stage_command_never_runs_a_local_build(self):
+        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CI]
+        command = MODULE.common.stage_command(
+            entry,
+            target(),
+            model="gpt-5.6-sol",
+            effort="high",
+            arguments=["--pipeline-run", PIPELINE_RUN],
+        )
+
+        self.assertEqual("pipeline", command[2])
+        lowered = " ".join(command).lower()
+        for forbidden in ("gradle", "mvn", "maven", "pytest", " test"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, lowered)
 
     def test_preserves_agent_task_recovery_details(self):
         agent_task = {

@@ -56,6 +56,8 @@ class PipelineCancelled(RuntimeError):
 
 KICKOFF_VERSION = 1
 STATE_VERSION = 1
+MONITOR_SCHEMA = "github.copilot.pr-stack-pipeline-monitor"
+MONITOR_VERSION = 1
 MAX_PASSES = 2
 DEFAULT_EFFORT = common.DEFAULT_EFFORT
 READINESS_TIMEOUT = 300.0
@@ -275,16 +277,16 @@ def run_root() -> Path:
     return common.copilot_home() / "run" / RUN_KIND
 
 
-def state_path_for(kickoff: dict[str, Any]) -> Path:
-    return run_root() / f"{run_slug(kickoff)}.json"
-
-
 def lock_path_for(kickoff: dict[str, Any]) -> Path:
     return run_root() / f"{run_slug(kickoff)}.lock"
 
 
 def run_directory_for(kickoff: dict[str, Any], run_id: str) -> Path:
     return run_root() / run_slug(kickoff) / run_id
+
+
+def state_path_for(kickoff: dict[str, Any], run_id: str) -> Path:
+    return run_directory_for(kickoff, run_id) / "state.json"
 
 
 def validate_worktree_root(root: Path, *, platform_name: str | None = None) -> Path:
@@ -340,6 +342,105 @@ def cancellation_request_path(kickoff: dict[str, Any], run_id: str) -> Path:
 
 def run_result_path(kickoff: dict[str, Any], run_id: str) -> Path:
     return run_directory_for(kickoff, run_id) / "result.json"
+
+
+def monitor_locator_path(run_id: str) -> Path:
+    return run_root() / "monitors" / f"{run_id}.json"
+
+
+def paths_match(left: Any, right: Path) -> bool:
+    if not isinstance(left, str) or not left:
+        return False
+    try:
+        return Path(left).resolve() == right.resolve()
+    except OSError:
+        return False
+
+
+def monitor_locator(kickoff: dict[str, Any], run_id: str) -> dict[str, Any]:
+    return {
+        "schema": MONITOR_SCHEMA,
+        "version": MONITOR_VERSION,
+        "run_id": run_id,
+        "kickoff": kickoff,
+        "launch_path": str(launch_state_path(kickoff, run_id)),
+        "event_log": str(progress_log_path(kickoff, run_id)),
+    }
+
+
+def load_monitor_kickoff(run_id: str) -> dict[str, Any]:
+    path = monitor_locator_path(run_id)
+    if not path.is_file() or path.is_symlink():
+        raise WorkflowError(f"monitor handle does not exist for run {run_id}")
+    locator = common.read_json(path)
+    if (
+        not isinstance(locator, dict)
+        or set(locator)
+        != {
+            "schema",
+            "version",
+            "run_id",
+            "kickoff",
+            "launch_path",
+            "event_log",
+        }
+        or locator.get("schema") != MONITOR_SCHEMA
+        or locator.get("version") != MONITOR_VERSION
+        or locator.get("run_id") != run_id
+    ):
+        raise WorkflowError(f"monitor handle is malformed for run {run_id}")
+    kickoff = parse_kickoff(locator.get("kickoff"))
+    expected_launch = launch_state_path(kickoff, run_id)
+    expected_log = progress_log_path(kickoff, run_id)
+    if not paths_match(locator.get("launch_path"), expected_launch) or not paths_match(
+        locator.get("event_log"), expected_log
+    ):
+        raise WorkflowError(f"monitor handle paths are invalid for run {run_id}")
+    return kickoff
+
+
+def validate_launch_record(kickoff: dict[str, Any], run_id: str) -> dict[str, Any]:
+    launch = common.read_json(launch_state_path(kickoff, run_id))
+    if (
+        not isinstance(launch, dict)
+        or launch.get("kind") != RUN_KIND
+        or launch.get("run_id") != run_id
+        or launch.get("kickoff") != kickoff
+        or not paths_match(
+            launch.get("event_log"), progress_log_path(kickoff, run_id)
+        )
+    ):
+        raise WorkflowError(f"launch record identity is invalid for run {run_id}")
+    return launch
+
+
+def watch_arguments(run_id: str, cursor: int) -> list[str]:
+    return [
+        "watch",
+        "--run-id",
+        run_id,
+        "--cursor",
+        str(cursor),
+        "--wait-seconds",
+        str(int(PROGRESS_HEARTBEAT_INTERVAL)),
+    ]
+
+
+def bind_next_watch(
+    payload: dict[str, Any], *, kickoff: dict[str, Any], run_id: str
+) -> dict[str, Any]:
+    bound = {
+        **payload,
+        "run_id": run_id,
+        "repository": kickoff["repository"],
+        "stack_number": kickoff["stackNumber"],
+        "start_pull_request": kickoff["startPullRequest"],
+    }
+    if not payload.get("finished"):
+        bound["next_watch"] = {
+            "arguments": watch_arguments(run_id, int(payload.get("cursor", 0)))
+        }
+    return bound
 
 
 def format_pull_requests(numbers: list[int]) -> str:
@@ -850,43 +951,6 @@ def lock_holder_is_live(
     return isinstance(pid, int) and alive(pid)
 
 
-def live_recorded_workers(
-    state: dict[str, Any],
-    *,
-    alive: Callable[[int], bool] = common.process_is_alive,
-) -> list[dict[str, Any]]:
-    workers = state.get("active_workers")
-    if not isinstance(workers, list):
-        return []
-    return [
-        worker
-        for worker in workers
-        if isinstance(worker, dict)
-        and isinstance(worker.get("pid"), int)
-        and alive(worker["pid"])
-    ]
-
-
-def live_worker_files(
-    run_directory: Path,
-    *,
-    alive: Callable[[int], bool] = common.process_is_alive,
-) -> list[dict[str, Any]]:
-    records = run_directory / "workers"
-    if not records.is_dir():
-        return []
-    live: list[dict[str, Any]] = []
-    for path in records.glob("*.json"):
-        worker = common.read_json(path)
-        if (
-            isinstance(worker, dict)
-            and isinstance(worker.get("pid"), int)
-            and alive(worker["pid"])
-        ):
-            live.append({**worker, "record_path": str(path)})
-    return live
-
-
 @contextmanager
 def lock_guard(path: Path):
     guard_path = path.with_name(f"{path.name}.guard")
@@ -983,31 +1047,6 @@ def load_state(path: Path) -> dict[str, Any] | None:
     if payload.get("state_version") != STATE_VERSION or payload.get("kind") != RUN_KIND:
         return None
     return payload
-
-
-def resume_state(
-    path: Path, kickoff: dict[str, Any], run_id: str, fingerprint: str
-) -> dict[str, Any]:
-    """Recover from durable evidence, never from how long ago something ran."""
-    existing = load_state(path)
-    if existing is None or existing.get("result") is not None:
-        return new_state(kickoff, run_id, fingerprint)
-    previous_run_id = existing.get("run_id")
-    if existing.get("topology_fingerprint") != fingerprint:
-        recovered = new_state(kickoff, run_id, fingerprint)
-        recovered["recovered_from"] = {
-            "run_id": previous_run_id,
-            "reason": "topology_changed",
-        }
-        return recovered
-    existing["run_id"] = run_id
-    existing["recovered_from"] = {
-        "run_id": previous_run_id,
-        "reason": "resumed",
-        "pass": existing.get("pass"),
-        "phase": existing.get("phase"),
-    }
-    return existing
 
 
 def worktree_ownership_path(run_directory: Path, number: int) -> Path:
@@ -1597,6 +1636,7 @@ class StackPipeline:
         models: dict[str, str],
         effort: str,
         conflict_strategy: str = "auto",
+        github_mutation_policy: str = "allow",
         run_id: str | None = None,
         report: Callable[[dict[str, Any]], None] | None = None,
         launcher: Any | None = None,
@@ -1623,9 +1663,15 @@ class StackPipeline:
         self.models = models
         self.effort = effort
         self.conflict_strategy = conflict_strategy
+        if github_mutation_policy not in {"allow", "source-only"}:
+            raise WorkflowError(
+                "github_mutation_policy must be 'allow' or 'source-only'"
+            )
+        self.github_mutation_policy = github_mutation_policy
+        common.ACTIVE_GITHUB_MUTATION_POLICY = github_mutation_policy
         self.run_id = run_id or uuid.uuid4().hex
         self.report = report
-        self.state_path = state_path or state_path_for(kickoff)
+        self.state_path = state_path or state_path_for(kickoff, self.run_id)
         self.lock_path = lock_path or lock_path_for(kickoff)
         self.run_directory = run_directory or run_directory_for(kickoff, self.run_id)
         self.cancellation_path = cancellation_path or (
@@ -3033,6 +3079,27 @@ class StackPipeline:
                 detail=opening.get("detail"),
             )
         fingerprint = opening["fingerprint"]
+        if self.state_path.exists():
+            self.state = new_state(self.kickoff, self.run_id, fingerprint)
+            result = {
+                "result": "stopped",
+                "reason": "run_state_already_exists",
+                "detail": (
+                    "the exact run state path already exists and is sealed "
+                    "against replay"
+                ),
+                "run_id": self.run_id,
+                "repository": self.repository,
+                "stack_number": self.kickoff["stackNumber"],
+                "state_path": str(self.state_path),
+                **(
+                    {"session_title": self.session_title}
+                    if self.session_title is not None
+                    else {}
+                ),
+            }
+            self.persist_result(result)
+            return result
         lock = acquire_lock(self.lock_path, self.run_id)
         if lock["result"] != "acquired":
             self.state = new_state(self.kickoff, self.run_id, fingerprint)
@@ -3052,41 +3119,11 @@ class StackPipeline:
             }
             self.persist_result(result)
             return result
-        self.state = resume_state(
-            self.state_path, self.kickoff, self.run_id, fingerprint
-        )
+        self.state = new_state(self.kickoff, self.run_id, fingerprint)
         self.check_cancellation()
-        prior_run_directory = self.state.get("run_directory")
-        active_workers = live_recorded_workers(self.state)
-        if isinstance(prior_run_directory, str):
-            known_nonces = {worker.get("nonce") for worker in active_workers}
-            active_workers.extend(
-                worker
-                for worker in live_worker_files(Path(prior_run_directory))
-                if worker.get("nonce") not in known_nonces
-            )
-        if active_workers:
-            result = {
-                "result": "incomplete",
-                "reason": "previous_workers_still_active",
-                "run_id": self.run_id,
-                "repository": self.repository,
-                "stack_number": self.kickoff["stackNumber"],
-                "workers": active_workers,
-                "state_path": str(self.state_path),
-                **(
-                    {"session_title": self.session_title}
-                    if self.session_title is not None
-                    else {}
-                ),
-            }
-            try:
-                self.persist_result(result)
-            finally:
-                release_lock(self.lock_path, self.run_id)
-            return result
         self.state["active_workers"] = []
         self.state["run_directory"] = str(self.run_directory)
+        self.state["github_mutation_policy"] = self.github_mutation_policy
         self.state["expected_heads"] = {
             str(member["number"]): member["head_sha"]
             for member in opening["selected"]
@@ -3502,6 +3539,8 @@ def scheduler_command(
         args.effort,
         "--conflict-strategy",
         args.conflict_strategy,
+        "--github-mutation-policy",
+        args.github_mutation_policy,
     ]
     for override in args.stage_model or []:
         command.extend(["--stage-model", override])
@@ -3523,19 +3562,25 @@ def command_start(args: argparse.Namespace) -> None:
     run_id = uuid.uuid4().hex
     event_log = progress_log_path(kickoff, run_id)
     launch_path = launch_state_path(kickoff, run_id)
+    locator_path = monitor_locator_path(run_id)
+    if launch_path.exists() or locator_path.exists():
+        raise WorkflowError(f"run identity already exists: {run_id}")
     started_at_epoch = time.time()
+    started_at = utc_now()
+    launch = {
+        "kind": RUN_KIND,
+        "run_id": run_id,
+        "kickoff": kickoff,
+        "pid": None,
+        "event_log": str(event_log),
+        "started_at": started_at,
+        "started_at_epoch": started_at_epoch,
+        "conflict_strategy": args.conflict_strategy,
+        "github_mutation_policy": args.github_mutation_policy,
+    }
     common.write_json_atomically(
         launch_path,
-        {
-            "kind": RUN_KIND,
-            "run_id": run_id,
-            "kickoff": kickoff,
-            "pid": None,
-            "event_log": str(event_log),
-            "started_at": utc_now(),
-            "started_at_epoch": started_at_epoch,
-            "conflict_strategy": args.conflict_strategy,
-        },
+        launch,
     )
     command = scheduler_command(args, kickoff, repo_root, run_id, event_log)
     process = start_scheduler(
@@ -3546,16 +3591,10 @@ def command_start(args: argparse.Namespace) -> None:
     try:
         common.write_json_atomically(
             launch_path,
-            {
-                "kind": RUN_KIND,
-                "run_id": run_id,
-                "kickoff": kickoff,
-                "pid": process.pid,
-                "event_log": str(event_log),
-                "started_at": utc_now(),
-                "started_at_epoch": started_at_epoch,
-                "conflict_strategy": args.conflict_strategy,
-            },
+            {**launch, "pid": process.pid},
+        )
+        common.write_json_atomically(
+            locator_path, monitor_locator(kickoff, run_id)
         )
     except OSError:
         process.terminate()
@@ -3567,20 +3606,27 @@ def command_start(args: argparse.Namespace) -> None:
             "pid": process.pid,
             "cursor": 0,
             "conflict_strategy": args.conflict_strategy,
+            "github_mutation_policy": args.github_mutation_policy,
+            "next_watch": {"arguments": watch_arguments(run_id, 0)},
         }
     )
 
 
 def command_watch(args: argparse.Namespace) -> None:
-    kickoff = load_kickoff(args)
     run_id = validate_run_id(args.run_id)
+    kickoff = load_monitor_kickoff(run_id)
+    validate_launch_record(kickoff, run_id)
     common.emit(
-        watch_progress(
-            event_log=progress_log_path(kickoff, run_id),
-            launch_path=launch_state_path(kickoff, run_id),
-            observer_path=observer_state_path(kickoff, run_id),
-            cursor=args.cursor,
-            wait_seconds=args.wait_seconds,
+        bind_next_watch(
+            watch_progress(
+                event_log=progress_log_path(kickoff, run_id),
+                launch_path=launch_state_path(kickoff, run_id),
+                observer_path=observer_state_path(kickoff, run_id),
+                cursor=args.cursor,
+                wait_seconds=args.wait_seconds,
+            ),
+            kickoff=kickoff,
+            run_id=run_id,
         )
     )
 
@@ -3713,6 +3759,7 @@ def command_cancel(args: argparse.Namespace) -> None:
 
 
 def command_run(args: argparse.Namespace) -> None:
+    common.ACTIVE_GITHUB_MUTATION_POLICY = args.github_mutation_policy
     common.require_tools()
     kickoff = load_kickoff(args)
     repo_root = Path(args.repo_root).resolve() if args.repo_root else common.resolve_repo_root()
@@ -3724,6 +3771,7 @@ def command_run(args: argparse.Namespace) -> None:
         models=common.stage_models(args.stage_model, args.effort),
         effort=args.effort,
         conflict_strategy=args.conflict_strategy,
+        github_mutation_policy=args.github_mutation_policy,
         run_id=validate_run_id(args.run_id) if args.run_id else None,
         report=reporter,
     )
@@ -3765,6 +3813,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=common.CONFLICT_STRATEGIES,
         default="auto",
     )
+    run.add_argument(
+        "--github-mutation-policy",
+        choices=("allow", "source-only"),
+        default="allow",
+    )
     run.add_argument("--run-id", help=argparse.SUPPRESS)
     run.add_argument("--event-log", help=argparse.SUPPRESS)
     run.set_defaults(function=command_run)
@@ -3793,17 +3846,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=common.CONFLICT_STRATEGIES,
         default="auto",
     )
+    start.add_argument(
+        "--github-mutation-policy",
+        choices=("allow", "source-only"),
+        default="allow",
+    )
     start.set_defaults(function=command_start)
 
     watch = subparsers.add_parser(
         "watch", help="wait for progress or one five-minute heartbeat"
-    )
-    watch.add_argument(
-        "--kickoff",
-        help="the structured kickoff JSON; omit to read it from standard input",
-    )
-    watch.add_argument(
-        "--kickoff-file", help="read the structured kickoff JSON from this file"
     )
     watch.add_argument("--run-id", required=True)
     watch.add_argument("--cursor", type=int, default=0)
@@ -3841,8 +3892,10 @@ def main() -> int:
                 {
                     "event": PROGRESS_UPDATE_EVENT,
                     "updates": [],
-                    "finished": False,
+                    "finished": True,
                     "monitor_failure": str(error),
+                    "run_id": getattr(args, "run_id", None),
+                    "cursor": getattr(args, "cursor", 0),
                 }
             )
             return 1
@@ -3879,8 +3932,10 @@ def main() -> int:
                 {
                     "event": PROGRESS_UPDATE_EVENT,
                     "updates": [],
-                    "finished": False,
+                    "finished": True,
                     "monitor_failure": "interrupted",
+                    "run_id": getattr(args, "run_id", None),
+                    "cursor": getattr(args, "cursor", 0),
                 }
             )
             return 130

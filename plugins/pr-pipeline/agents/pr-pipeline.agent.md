@@ -25,19 +25,19 @@ The helper runs at most two foreground sweeps in this order:
 
 Each stage owns its internal workflow. A stage that reaches a recorded limit does not block the stages after it. Missing or unreadable stage state, and an Agent Task that still owns recoverable or active state after its stage process returns, block the pipeline instead of starting a duplicate worker. The helper runs a second sweep only when the pull request head or base changed during the first and some stage is not clear at the final revisions. A completed PR Conflict Resolver run is not launched again during that pipeline run.
 
+Hosted workers write under `.github/agent-task-output/`. Treat optional `report.md` as free-form advice, never as stage evidence. PR Description alone requires `title.txt` and `body.md`. Do not inspect or trust model-authored findings, explanations, identities, SHAs, paths, commit mappings, validation claims, or canonical reports. The stage coordinators derive the source and GitHub evidence that appears in their status envelopes.
+
 Choose the launch command for the active shell:
 
 - Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; python "$copilot_home/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_pipeline.py" start`
 - PowerShell on Windows: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; python "$copilotHome/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_pipeline.py" start`
 - POSIX shells: `python3 "${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_pipeline.py" start`
 
-Choose one GitHub mutation policy before `start` and never change it for that run. If the caller forbids any comment, reply, thread resolution, review request, draft change, title/body update, or other GitHub metadata mutation, pass `--github-mutation-policy source-only`. Otherwise pass `--github-mutation-policy allow`. A `source-only` run may publish verified source commits, but every stage must preserve comments, threads, reviews, draft state, title, body, and other pull request metadata exactly. Copilot Review may report a verified policy skip only when two identical preflights prove that the frozen head has neither a Copilot review nor actionable Copilot feedback; any existing review work or identity drift remains blocking.
+Choose one GitHub mutation policy before `start` and never change it for that run. If the caller forbids any comment, reply, thread resolution, review request, draft change, title/body update, or other GitHub metadata mutation, pass `--github-mutation-policy source-only`. Otherwise pass `--github-mutation-policy allow`. A `source-only` run may publish verified source commits, but every stage must preserve comments, threads, reviews, draft state, title, body, and other pull request metadata exactly. The helper forwards this policy to Copilot Review, Self Review, and PR Description. Copilot Review may record only its run-bound policy skip, with `clean_at_head_sha` set to `null`. PR Description may preserve a replacement proposal but must not apply it.
 
 Append the user's target exactly as given. Omit it only when the user omitted it.
 
 When the user explicitly chooses conflict strategy `merge` or `rebase`, append `--conflict-strategy merge` or `--conflict-strategy rebase` to `start`. Preserve that choice exactly. Otherwise omit the option and let the helper use `auto`.
-
-A fresh conflict-stage launch may replace a retained Resolver `failed` or `normalization_required` preflight only when its task ID is explicitly null and its task ID status is `not_created`. The Resolver preserves the prior owner in history, applies its own retry budget, and revalidates current source and GitHub identity before creating any task. The pipeline still blocks after the replacement launch and for every recovery state that may own a task.
 
 Run `start` synchronously exactly once. It returns `pipeline_launched` with a `run_id`, cursor, and `next_watch.arguments`. The helper has already bound the canonical target to this run ID in a versioned monitor handle. The scheduler is a detached process; never launch it again, even if progress monitoring fails.
 
@@ -54,6 +54,8 @@ Never end your turn or leave the session idle while `finished` is false. Stop on
 After monitoring finishes, rename the session to `PR Pipeline: <PR number> - <PR title>` using the final event's `pr` fields when the current name does not already begin with `PR Pipeline: <PR number> - `.
 
 Never mark the pull request ready for review, approve it, create a pull request, or post a comment.
+
+Conflict Resolver clears only on its current-head and current-base mechanical result or when GitHub already reports the pull request mergeable. Self Review treats zero candidate commits as clean and accepts imported fixes only after the stage coordinator advances the exact source. CI candidate publication is pending, never green by itself. Only trusted current GitHub checks and statuses bound to the exact published source SHA can clear CI. Do not run Gradle, Maven, tests, or builds locally. PR Description clears a keep result, or an allowed title/body application, at the current head.
 
 Write a concise final response from the complete `pipeline_finished` event. Lead with the linked pull request, plain-language result, short final head, and sweep count. A clean run that pushed no commits should usually fit in one sentence: all five stages are clear and no changes were needed.
 

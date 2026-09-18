@@ -331,6 +331,61 @@ class ModelTest(unittest.TestCase):
             command,
         )
 
+    def test_stack_workers_forward_source_only_to_pr_description(self):
+        previous = COMMON.ACTIVE_GITHUB_MUTATION_POLICY
+        COMMON.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
+        self.addCleanup(
+            setattr, COMMON, "ACTIVE_GITHUB_MUTATION_POLICY", previous
+        )
+        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_DESCRIPTION]
+        command = COMMON.stage_command(
+            entry,
+            COMMON.target_for("owner/repo", 11),
+            model="gpt-5.6-sol",
+            effort="high",
+            arguments=["--pipeline-run", "a" * 32],
+            prompt="frozen worker prompt",
+            resolve_program=lambda name: name,
+        )
+
+        prompt = command[command.index("-p") + 1]
+        self.assertIn("--github-mutation-policy source-only", prompt)
+        self.assertIn("immutable argument", prompt)
+
+    def test_stack_pipeline_freezes_source_only_in_run_state(self):
+        previous = COMMON.ACTIVE_GITHUB_MUTATION_POLICY
+        self.addCleanup(
+            setattr, COMMON, "ACTIVE_GITHUB_MUTATION_POLICY", previous
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pipeline = MODULE.StackPipeline(
+                kickoff(),
+                root,
+                models=COMMON.stage_models(None),
+                effort="high",
+                github_mutation_policy="source-only",
+                run_id="a" * 32,
+                state_path=root / "state.json",
+                lock_path=root / "state.lock",
+                run_directory=root / "run",
+            )
+            pipeline.state = MODULE.new_state(
+                kickoff(), pipeline.run_id, "fingerprint"
+            )
+            pipeline.state["github_mutation_policy"] = (
+                pipeline.github_mutation_policy
+            )
+            pipeline.save()
+
+            saved = COMMON.read_json(pipeline.state_path)
+            self.assertEqual(
+                "source-only", saved["github_mutation_policy"]
+            )
+            self.assertEqual(
+                "source-only", COMMON.ACTIVE_GITHUB_MUTATION_POLICY
+            )
+
 
 class TopologyTest(unittest.TestCase):
     def test_a_suffix_selection_is_accepted_with_drafts_included(self):
@@ -621,7 +676,7 @@ class StackRunTest(StackFixture):
         for number in (11, 12, 13):
             self.assertNotIn(number, active_at_finish[number])
 
-    def test_active_agent_task_blocks_launch_and_restart_without_duplicates(self):
+    def test_active_agent_task_blocks_each_fresh_run_without_duplicates(self):
         self.stack = stack(members=(11,))
         active = {
             "reason": "not_cleared",
@@ -636,7 +691,12 @@ class StackRunTest(StackFixture):
 
         first = self.pipeline(kickoff([11]))
         first_result = first.execute()
-        second = self.pipeline(kickoff([11]))
+        second = self.pipeline(
+            kickoff([11]),
+            run_id="run-2",
+            state_path=self.root / "state-2.json",
+            run_directory=self.root / "run-2",
+        )
         second_result = second.execute()
 
         self.assertEqual("stage_still_active", first_result["reason"])
@@ -1679,7 +1739,7 @@ class StackRunTest(StackFixture):
             COMMON.read_json(first.result_path)["pipeline_result"]["result"],
         )
 
-    def test_recovery_does_not_duplicate_a_still_active_worker(self):
+    def test_exact_run_path_refuses_a_sealed_state_from_an_older_owner(self):
         pipeline = self.pipeline()
         state = MODULE.new_state(
             pipeline.kickoff, "old-run", MODULE.topology_fingerprint(self.stack)
@@ -1696,18 +1756,14 @@ class StackRunTest(StackFixture):
         ]
         MODULE.save_state(pipeline.state_path, state)
 
-        with mock.patch.object(
-            MODULE, "live_recorded_workers", return_value=state["active_workers"]
-        ):
-            result = pipeline.execute()
+        result = pipeline.execute()
 
-        self.assertEqual("incomplete", result["result"])
-        self.assertEqual("previous_workers_still_active", result["reason"])
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual("run_state_already_exists", result["reason"])
         self.assertEqual([], self.launcher.calls)
-        self.assertEqual(
-            "incomplete",
-            COMMON.read_json(pipeline.result_path)["pipeline_result"]["result"],
-        )
+        sealed = COMMON.read_json(pipeline.state_path)
+        self.assertEqual("old-run", sealed["run_id"])
+        self.assertEqual("old-nonce", sealed["active_workers"][0]["nonce"])
 
     def test_progress_events_name_every_phase(self):
         self.clear_everything()
@@ -1823,38 +1879,29 @@ class StateTest(unittest.TestCase):
         self.assertEqual(kickoff(), loaded["kickoff"])
         self.assertEqual([], list(self.root.glob("*.tmp")))
 
-    def test_an_unfinished_run_is_resumed_from_its_durable_state(self):
-        path = self.root / "state.json"
-        state = MODULE.new_state(kickoff(), "run-1", "fingerprint")
-        state["pass"] = 1
-        state["phase"] = MODULE.STAGE_CI
-        MODULE.save_state(path, state)
+    def test_each_run_has_a_distinct_state_path(self):
+        first = MODULE.state_path_for(kickoff(), "a" * 32)
+        second = MODULE.state_path_for(kickoff(), "b" * 32)
 
-        resumed = MODULE.resume_state(path, kickoff(), "run-2", "fingerprint")
+        self.assertNotEqual(first, second)
+        self.assertEqual("state.json", first.name)
+        self.assertEqual("a" * 32, first.parent.name)
+        self.assertEqual("b" * 32, second.parent.name)
 
-        self.assertEqual("run-2", resumed["run_id"])
-        self.assertEqual(1, resumed["pass"])
-        self.assertEqual("run-1", resumed["recovered_from"]["run_id"])
+    def test_new_state_never_imports_old_owner_or_result_fields(self):
+        old = MODULE.new_state(kickoff(), "old-run", "old-fingerprint")
+        old.update(
+            result="complete",
+            active_workers=[{"nonce": "old-owner"}],
+            recovered_from={"run_id": "older-run"},
+        )
 
-    def test_a_changed_topology_starts_a_fresh_state(self):
-        path = self.root / "state.json"
-        MODULE.save_state(path, MODULE.new_state(kickoff(), "run-1", "old"))
+        fresh = MODULE.new_state(kickoff(), "new-run", "new-fingerprint")
 
-        resumed = MODULE.resume_state(path, kickoff(), "run-2", "new")
-
-        self.assertEqual(0, resumed["pass"])
-        self.assertEqual("topology_changed", resumed["recovered_from"]["reason"])
-
-    def test_a_finished_run_is_not_resumed(self):
-        path = self.root / "state.json"
-        state = MODULE.new_state(kickoff(), "run-1", "fingerprint")
-        state["result"] = "complete"
-        MODULE.save_state(path, state)
-
-        resumed = MODULE.resume_state(path, kickoff(), "run-2", "fingerprint")
-
-        self.assertIsNone(resumed["result"])
-        self.assertNotIn("recovered_from", resumed)
+        self.assertEqual("new-run", fresh["run_id"])
+        self.assertIsNone(fresh["result"])
+        self.assertNotIn("active_workers", fresh)
+        self.assertNotIn("recovered_from", fresh)
 
     def test_a_lock_held_by_a_live_process_is_not_taken(self):
         path = self.root / "state.lock"
@@ -1927,7 +1974,7 @@ class WorktreePathTest(unittest.TestCase):
         self.assertEqual("00000000000000000000000000000001", first.name)
         self.assertEqual("00000000000000000000000000000002", second.name)
 
-    def test_windows_resume_reuses_the_same_physical_root(self):
+    def test_windows_same_run_id_uses_the_same_physical_root(self):
         arguments = {
             "run_directory": self.root / ("long-run-directory-" * 10),
             "run_id": "0b5659a09b3a4f3bb5ba1a7f467bbe38",
@@ -1936,9 +1983,9 @@ class WorktreePathTest(unittest.TestCase):
         }
 
         original = MODULE.worktree_root_for(**arguments)
-        resumed = MODULE.worktree_root_for(**arguments)
+        repeated = MODULE.worktree_root_for(**arguments)
 
-        self.assertEqual(original, resumed)
+        self.assertEqual(original, repeated)
 
     def test_windows_rejects_a_root_that_exhausts_the_path_budget(self):
         local_app_data = self.root / ("long-local-app-data-" * 10)
@@ -2209,6 +2256,9 @@ class ProgressProtocolTest(StackFixture):
         self.assertIn("ci-fix-loop=claude-sonnet-5", command)
         self.assertEqual(
             "merge", command[command.index("--conflict-strategy") + 1]
+        )
+        self.assertEqual(
+            "allow", command[command.index("--github-mutation-policy") + 1]
         )
 
     def test_watch_emits_one_heartbeat_only_after_five_unchanged_minutes(self):
@@ -2646,11 +2696,13 @@ class AgentInstructionTest(unittest.TestCase):
 
     def test_the_agent_only_runs_and_reports_the_helper(self):
         self.assertIn('pr_stack_pipeline.py" start --kickoff', self.text)
-        self.assertIn('pr_stack_pipeline.py" watch --kickoff', self.text)
+        self.assertIn('pr_stack_pipeline.py" watch --run-id', self.text)
         self.assertIn('pr_stack_pipeline.py" cancel --kickoff', self.text)
         self.assertIn("Interrupting `watch` does not cancel", self.text)
         self.assertIn("The helper owns all control flow", self.text)
         self.assertIn("Run `start` synchronously exactly once", self.text)
+        self.assertIn("exactly as returned", self.text)
+        self.assertIn("Never reconstruct", self.text)
         self.assertIn("--wait-seconds 300", self.text)
         self.assertIn("no more than one per five minutes", self.text)
         self.assertIn("Never end your turn", self.text)
@@ -2668,7 +2720,10 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertIn("Waiting: <wait_reason>.", self.text)
         self.assertIn("Next: <next_action>.", self.text)
         self.assertIn("Do not send these updates to the PR Flight canvas", self.text)
-        self.assertIn("If `updates` is empty, call `watch` again", self.text)
+        self.assertIn(
+            "If `updates` is empty, invoke the returned `next_watch.arguments`",
+            self.text,
+        )
 
     def test_the_agent_states_the_session_title(self):
         self.assertIn(
@@ -2701,6 +2756,162 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertIn("not app sessions", self.text)
         self.assertNotIn("mergeable_at_head_sha", self.text)
         self.assertNotIn("clean_at_head_sha", self.text)
+
+
+class MonitorHandleTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.payload = kickoff()
+        self.run_id = "a" * 32
+        self.run_root = mock.patch.object(MODULE, "run_root", return_value=self.root)
+        self.run_root.start()
+        self.addCleanup(self.run_root.stop)
+
+    def write_monitor_run(self, *, launch_run_id=None):
+        launch = {
+            "kind": MODULE.RUN_KIND,
+            "run_id": launch_run_id or self.run_id,
+            "kickoff": self.payload,
+            "pid": 4321,
+            "event_log": str(
+                MODULE.progress_log_path(self.payload, self.run_id)
+            ),
+            "github_mutation_policy": "source-only",
+        }
+        COMMON.write_json_atomically(
+            MODULE.launch_state_path(self.payload, self.run_id), launch
+        )
+        COMMON.write_json_atomically(
+            MODULE.monitor_locator_path(self.run_id),
+            MODULE.monitor_locator(self.payload, self.run_id),
+        )
+
+    def test_start_returns_a_versioned_run_only_watch_handle(self):
+        args = MODULE.build_parser().parse_args(
+            [
+                "start",
+                "--kickoff",
+                json.dumps(self.payload),
+                "--github-mutation-policy",
+                "source-only",
+            ]
+        )
+        output = StringIO()
+        process = SimpleNamespace(pid=4321, terminate=mock.Mock())
+        with (
+            mock.patch.object(COMMON, "resolve_repo_root", return_value=self.root),
+            mock.patch.object(MODULE, "start_scheduler", return_value=process),
+            mock.patch.object(
+                MODULE.uuid, "uuid4", return_value=SimpleNamespace(hex=self.run_id)
+            ),
+            redirect_stdout(output),
+        ):
+            MODULE.command_start(args)
+
+        launch = COMMON.read_json(
+            MODULE.launch_state_path(self.payload, self.run_id)
+        )
+        locator = COMMON.read_json(MODULE.monitor_locator_path(self.run_id))
+        event = json.loads(output.getvalue())
+        self.assertEqual("source-only", launch["github_mutation_policy"])
+        self.assertEqual(MODULE.MONITOR_SCHEMA, locator["schema"])
+        self.assertEqual(MODULE.MONITOR_VERSION, locator["version"])
+        self.assertEqual(self.payload, locator["kickoff"])
+        self.assertEqual(
+            [
+                "watch",
+                "--run-id",
+                self.run_id,
+                "--cursor",
+                "0",
+                "--wait-seconds",
+                "300",
+            ],
+            event["next_watch"]["arguments"],
+        )
+        self.assertNotIn("--kickoff", event["next_watch"]["arguments"])
+
+    def test_watch_uses_only_the_exact_monitor_handle(self):
+        self.write_monitor_run()
+        args = MODULE.build_parser().parse_args(
+            ["watch", "--run-id", self.run_id, "--cursor", "4"]
+        )
+        output = StringIO()
+        with (
+            mock.patch.object(
+                MODULE,
+                "watch_progress",
+                return_value={
+                    "event": MODULE.PROGRESS_UPDATE_EVENT,
+                    "cursor": 5,
+                    "updates": [],
+                    "finished": False,
+                },
+            ) as watch,
+            redirect_stdout(output),
+        ):
+            MODULE.command_watch(args)
+
+        watch.assert_called_once_with(
+            event_log=MODULE.progress_log_path(self.payload, self.run_id),
+            launch_path=MODULE.launch_state_path(self.payload, self.run_id),
+            observer_path=MODULE.observer_state_path(self.payload, self.run_id),
+            cursor=4,
+            wait_seconds=MODULE.PROGRESS_HEARTBEAT_INTERVAL,
+        )
+        event = json.loads(output.getvalue())
+        self.assertEqual(self.run_id, event["run_id"])
+        self.assertEqual(
+            MODULE.watch_arguments(self.run_id, 5),
+            event["next_watch"]["arguments"],
+        )
+
+    def test_watch_never_scans_or_falls_back_to_another_run(self):
+        requested = "a" * 32
+        decoy = "b" * 32
+        COMMON.write_json_atomically(
+            MODULE.monitor_locator_path(decoy),
+            MODULE.monitor_locator(self.payload, decoy),
+        )
+        COMMON.write_json_atomically(
+            self.root / "latest.json",
+            {"run_id": decoy, "kickoff": self.payload},
+        )
+        args = MODULE.build_parser().parse_args(
+            ["watch", "--run-id", requested]
+        )
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            f"monitor handle does not exist for run {requested}",
+        ):
+            MODULE.command_watch(args)
+
+    def test_watch_rejects_a_launch_record_from_another_run(self):
+        self.write_monitor_run(launch_run_id="b" * 32)
+        args = MODULE.build_parser().parse_args(
+            ["watch", "--run-id", self.run_id]
+        )
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            f"launch record identity is invalid for run {self.run_id}",
+        ):
+            MODULE.command_watch(args)
+
+    def test_terminal_watch_has_no_next_command(self):
+        payload = MODULE.bind_next_watch(
+            {
+                "event": MODULE.PROGRESS_UPDATE_EVENT,
+                "cursor": 5,
+                "updates": [],
+                "finished": True,
+            },
+            kickoff=self.payload,
+            run_id=self.run_id,
+        )
+
+        self.assertNotIn("next_watch", payload)
 
 
 class CancelCommandTest(unittest.TestCase):
@@ -2816,8 +3027,6 @@ class ParserTest(unittest.TestCase):
         args = MODULE.build_parser().parse_args(
             [
                 "watch",
-                "--kickoff",
-                json.dumps(kickoff()),
                 "--run-id",
                 "a" * 32,
                 "--cursor",
@@ -2826,6 +3035,7 @@ class ParserTest(unittest.TestCase):
                 "300",
             ]
         )
+        self.assertFalse(hasattr(args, "kickoff"))
         self.assertEqual(4, args.cursor)
         self.assertEqual(300, args.wait_seconds)
 

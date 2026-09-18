@@ -17,13 +17,13 @@
     {
       "name": "pr-reviewer",
       "description": "Review a GitHub pull request and create a verified pending review with high-confidence inline comments.",
-      "version": "1.8.9",
+      "version": "1.8.10",
       "source": "./plugins/pr-reviewer"
     },
     {
       "name": "copilot-review-loop",
       "description": "Address Copilot pull request review comments, publish fixes, and repeat until the review is clean.",
-      "version": "1.1.58",
+      "version": "1.1.59",
       "source": "./plugins/copilot-review-loop"
     },
     {
@@ -41,7 +41,7 @@
     {
       "name": "pr-pipeline",
       "description": "Drive one pull request or a selected native-stack suffix through conflict resolution, review, CI fixing, and description validation.",
-      "version": "1.5.25",
+      "version": "1.5.26",
       "source": "./plugins/pr-pipeline"
     },
     {
@@ -59,7 +59,7 @@
     {
       "name": "historical-pr-audit",
       "description": "Audit an already-merged GitHub pull request against its own historical snapshot, verify each finding independently, and commit the fixes on a separate audit branch.",
-      "version": "1.1.20",
+      "version": "1.1.21",
       "source": "./plugins/historical-pr-audit"
     }
   ]
