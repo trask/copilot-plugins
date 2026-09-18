@@ -117,6 +117,16 @@ COMMAND_RESULT_SCHEMAS = {
     "stack-start": "github.copilot.ci-fix-loop-stack-start-result.v1",
     "loop": "github.copilot.ci-fix-loop-loop-result.v1",
 }
+TERMINAL_CI_FIX_STAGE_OUTCOMES = {
+    "green": "cleared",
+    "no_checks": "skipped",
+    "nothing_to_publish": "no_progress",
+    "pre_existing": "escalated",
+    "escalate": "escalated",
+    "escalated": "escalated",
+    "no_rerun_support": "escalated",
+    "max_iterations_reached": "carried",
+}
 COMMAND_RESULT_KEYS = {
     "command",
     "command_id",
@@ -2124,6 +2134,10 @@ def execute_managed_command(args: argparse.Namespace) -> dict[str, Any]:
                 f"{args.command} returned {len(captured)} terminal results"
             )
         outcome = captured[0]
+        if args.command == "loop" and outcome.get("result") in (
+            TERMINAL_CI_FIX_STAGE_OUTCOMES
+        ):
+            validate_terminal_ci_fix_state(args, outcome)
         payload = finish_command_result(
             args=args,
             result_path=result_path,
@@ -2145,6 +2159,101 @@ def execute_managed_command(args: argparse.Namespace) -> dict[str, Any]:
         )
     validate_terminal_command_result(args, result_path, payload)
     return payload
+
+
+def validate_terminal_ci_fix_state(
+    args: argparse.Namespace,
+    outcome: dict[str, Any],
+) -> dict[str, Any]:
+    result = outcome.get("result")
+    expected_stage_outcome = TERMINAL_CI_FIX_STAGE_OUTCOMES.get(result)
+    if expected_stage_outcome is None:
+        raise WorkflowError(f"CI Fix returned nonterminal result {result!r}")
+    if not isinstance(args.state, str) or not args.state:
+        raise WorkflowError("CI Fix terminal result has no caller-provided state path")
+    state_path = cli_path(args.state)
+    reported_path = outcome.get("state")
+    try:
+        state_matches = (
+            isinstance(reported_path, str)
+            and bool(reported_path)
+            and os.path.normcase(str(cli_path(reported_path).resolve()))
+            == os.path.normcase(str(state_path.resolve()))
+        )
+    except OSError:
+        state_matches = False
+    if not state_matches:
+        raise WorkflowError(
+            "CI Fix terminal result did not name the caller-provided state path"
+        )
+
+    target = parse_target(args.target)
+    state = load_state(state_path)
+    payload = status_payload(state, state_path)
+    pr = payload.get("pr")
+    pipeline_budget = payload.get("pipeline_budget")
+    invocation_budget = payload.get("invocation_budget")
+    if getattr(args, "pipeline_run", None):
+        budget_matches = (
+            payload.get("budget_scope") == "pipeline"
+            and isinstance(pipeline_budget, dict)
+            and pipeline_budget.get("run") == args.pipeline_run
+            and pipeline_budget.get("iteration") == args.pipeline_iteration
+        )
+    elif getattr(args, "invocation_run", None):
+        budget_matches = (
+            payload.get("budget_scope") == "invocation"
+            and isinstance(invocation_budget, dict)
+            and invocation_budget.get("run") == args.invocation_run
+        )
+    elif bool(getattr(args, "new_invocation", False)):
+        budget_matches = (
+            payload.get("budget_scope") == "invocation"
+            and isinstance(invocation_budget, dict)
+            and isinstance(invocation_budget.get("run"), str)
+            and bool(invocation_budget["run"])
+        )
+    else:
+        budget_matches = payload.get("budget_scope") == "lifetime"
+    if (
+        not isinstance(pr, dict)
+        or pr.get("number") != target["number"]
+        or str(pr.get("repo_name") or "").casefold()
+        != target["repo_name"].casefold()
+        or not budget_matches
+    ):
+        raise WorkflowError(
+            "CI Fix terminal state does not match the caller's invocation identity"
+        )
+    if result == "nothing_to_publish" and stage_outcome(state) is None:
+        state["outcome"] = "no_progress"
+        state["clean_at_head_sha"] = None
+        save_state(state_path, state)
+        state = load_state(state_path)
+        payload = status_payload(state, state_path)
+    if payload.get("stage_outcome") != expected_stage_outcome:
+        raise WorkflowError(
+            "CI Fix terminal state does not match the returned outcome"
+        )
+    return payload
+
+
+def command_pipeline(args: argparse.Namespace) -> None:
+    global ACTIVE_GITHUB_MUTATION_POLICY
+
+    previous_policy = ACTIVE_GITHUB_MUTATION_POLICY
+    try:
+        ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
+        captured = capture_command(command_loop, args)
+        if len(captured) != 1:
+            raise WorkflowError(
+                f"CI Fix pipeline returned {len(captured)} terminal results"
+            )
+        outcome = captured[0]
+        validate_terminal_ci_fix_state(args, outcome)
+        emit(outcome)
+    finally:
+        ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
 
 
 def require_stack_start_result(
@@ -14435,7 +14544,8 @@ def stage_outcome(state: dict[str, Any]) -> str | None:
 
     A pipeline reads greenness from GitHub rather than from here, so this states
     only how the loop itself ended: `cleared` when it recorded green, `skipped`
-    when the head ran no applicable checks, `carried` when it spent its own
+    when the head ran no applicable checks, `no_progress` when a completed
+    worker produced no publishable commit, `carried` when it spent its own
     iteration cap, and `escalated` when it handed the pull request back to a
     person for any other reason. A cap bounds one pass of the orchestrator, which
     gives the stage the rest of its budget on the next pass rather than ending
@@ -14445,10 +14555,7 @@ def stage_outcome(state: dict[str, Any]) -> str | None:
     field is then left out so a reader sees an absent answer rather than a
     manufactured one. State exists from the moment `preflight` writes it, so a
     run killed before it decided anything leaves exactly the same absence as a
-    run still in flight. Neither is `no_progress`, which asserts that a run ran
-    to completion and achieved nothing. Only the agent can support that claim,
-    because only a live agent can report on a run it saw end, and it says so in
-    its own report instead.
+    run still in flight.
 
     A reader is entitled to take any value it finds at face value, so a value
     this function cannot support must not appear at all.
@@ -14463,6 +14570,8 @@ def stage_outcome(state: dict[str, Any]) -> str | None:
         return "skipped"
     if outcome == "green":
         return "cleared"
+    if outcome == "no_progress":
+        return "no_progress"
     return None
 
 
@@ -14987,6 +15096,73 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_COORDINATOR_JITTER,
     )
     loop.set_defaults(resume=False, function=command_loop)
+
+    pipeline = subparsers.add_parser(
+        "pipeline",
+        help="run one pipeline-owned invocation and verify its terminal state",
+    )
+    pipeline.add_argument("target")
+    pipeline.add_argument("--repo-root")
+    pipeline.add_argument("--state", required=True)
+    pipeline.add_argument("--model", choices=["sol"], default="sol")
+    pipeline.add_argument("--pipeline-run", required=True)
+    pipeline.add_argument("--pipeline-iteration", type=int, required=True)
+    pipeline.add_argument("--pipeline-max-iterations", type=int, required=True)
+    pipeline.add_argument(
+        "--max-iterations",
+        type=int,
+        default=DEFAULT_MAX_ITERATIONS,
+    )
+    pipeline.add_argument(
+        "--hosted-timeout",
+        type=float,
+        default=DEFAULT_HOSTED_HELPER_TIMEOUT,
+    )
+    pipeline.add_argument(
+        "--hosted-discovery-interval",
+        type=float,
+        default=DEFAULT_HOSTED_DISCOVERY_INTERVAL,
+    )
+    pipeline.add_argument(
+        "--poll-interval",
+        type=float,
+        default=DEFAULT_COORDINATOR_POLL_INTERVAL,
+    )
+    pipeline.add_argument(
+        "--poll-max-interval",
+        type=float,
+        default=DEFAULT_COORDINATOR_MAX_POLL_INTERVAL,
+    )
+    pipeline.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=DEFAULT_COORDINATOR_WAIT_TIMEOUT,
+    )
+    pipeline.add_argument(
+        "--stability-polls",
+        type=int,
+        default=DEFAULT_COORDINATOR_STABILITY_POLLS,
+    )
+    pipeline.add_argument(
+        "--debounce-seconds",
+        type=float,
+        default=DEFAULT_COORDINATOR_DEBOUNCE_SECONDS,
+    )
+    pipeline.add_argument(
+        "--poll-jitter",
+        type=float,
+        default=DEFAULT_COORDINATOR_JITTER,
+    )
+    pipeline.set_defaults(
+        function=command_pipeline,
+        invocation_run=None,
+        new_invocation=False,
+        preflight_result_file=None,
+        preserve_artifacts=False,
+        result_file=None,
+        resume=False,
+        stack_state=None,
+    )
 
     stack_start = subparsers.add_parser(
         "stack-start",

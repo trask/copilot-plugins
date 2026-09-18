@@ -690,6 +690,44 @@ class StageContractTest(unittest.TestCase):
         self.assertIn(f"--state {expected}", command[2])
         self.assertIn("--strategy merge", command[2])
 
+    def test_ci_stage_runs_the_coordinator_directly_with_exact_state(self):
+        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CI]
+        expected = MODULE.stage_state_path(entry, target(), "run-1")
+        with mock.patch.object(
+            MODULE.common,
+            "stage_script_path",
+            return_value=Path("installed-ci-fix-loop.py"),
+        ):
+            command = MODULE.stage_command(
+                entry,
+                target(),
+                model=MODULE.stage_models(None)[MODULE.STAGE_CI],
+                effort="high",
+                run_id="run-1",
+                sweep=1,
+            )
+
+        self.assertEqual(
+            [
+                MODULE.sys.executable,
+                "installed-ci-fix-loop.py",
+                "pipeline",
+                "owner/repo#7",
+                "--model",
+                "sol",
+                "--pipeline-run",
+                "run-1",
+                "--pipeline-iteration",
+                "1",
+                "--pipeline-max-iterations",
+                "2",
+                "--state",
+                str(expected),
+            ],
+            command,
+        )
+        self.assertNotIn("copilot", command)
+
     def test_ci_live_progress_reads_the_action_and_pending_checks(self):
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / "ci.json"

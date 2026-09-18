@@ -285,31 +285,48 @@ class ModelTest(unittest.TestCase):
         for stage in MODULE.PHASE_NAMES:
             self.assertEqual("gpt-5.6-sol", models[stage])
 
-    def test_worker_commands_use_the_pipeline_flags(self):
+    def test_ci_workers_run_the_coordinator_directly(self):
         entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CI]
         target = COMMON.target_for("owner/repo", 11)
-        command = COMMON.stage_command(
-            entry,
-            target,
-            model="gpt-5.6-sol",
-            effort="high",
-            arguments=[],
-            prompt="owner/repo#11",
-            resolve_program=lambda name: name,
-        )
+        with mock.patch.object(
+            COMMON,
+            "stage_script_path",
+            return_value=Path("installed-ci-fix-loop.py"),
+        ):
+            command = COMMON.stage_command(
+                entry,
+                target,
+                model="gpt-5.6-sol",
+                effort="high",
+                arguments=[
+                    "--pipeline-run",
+                    "run-1",
+                    "--pipeline-iteration",
+                    "1",
+                    "--pipeline-max-iterations",
+                    "2",
+                    "--state",
+                    "state.json",
+                ],
+                prompt="ignored for direct CI execution",
+                resolve_program=lambda name: name,
+            )
         self.assertEqual(
             [
-                "copilot",
-                "-p",
+                MODULE.sys.executable,
+                "installed-ci-fix-loop.py",
+                "pipeline",
                 "owner/repo#11",
-                "--agent",
-                "ci-fix-loop:ci-fix-loop",
                 "--model",
-                "gpt-5.6-sol",
-                "--effort",
-                "high",
-                *COMMON.STAGE_AUTOPILOT_FLAGS,
-                *COMMON.STAGE_PERMISSION_FLAGS,
+                "sol",
+                "--pipeline-run",
+                "run-1",
+                "--pipeline-iteration",
+                "1",
+                "--pipeline-max-iterations",
+                "2",
+                "--state",
+                "state.json",
             ],
             command,
         )

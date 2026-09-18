@@ -920,6 +920,16 @@ class SealedCiFixCommandTest(unittest.TestCase):
             ),
         )
 
+    def write_terminal_state(self, state_path, *, outcome="green"):
+        temporary = write_state(
+            state_path.parent,
+            outcome=outcome,
+            clean_at_head_sha="head1" if outcome == "green" else None,
+            budget_scope="invocation",
+            invocation_budget={"run": "sealed-invocation", "iteration": 1},
+        )
+        temporary.replace(state_path)
+
     def test_prepare_writes_one_nonexecuted_direct_invocation(self):
         with tempfile.TemporaryDirectory(prefix="sealed prepare ") as directory:
             root = Path(directory)
@@ -1104,6 +1114,7 @@ class SealedCiFixCommandTest(unittest.TestCase):
                     "source-only",
                     MODULE.ACTIVE_GITHUB_MUTATION_POLICY,
                 )
+                self.write_terminal_state(state_path)
                 MODULE.emit(
                     {
                         "result": "green",
@@ -1196,16 +1207,7 @@ class SealedCiFixCommandTest(unittest.TestCase):
                 )
 
             def loop(_arguments):
-                MODULE.save_state(
-                    state_path,
-                    {
-                        "version": MODULE.STATE_VERSION,
-                        "iterations": 0,
-                        "history": [],
-                        "reruns": {},
-                        "outcome": "green",
-                    },
-                )
+                self.write_terminal_state(state_path)
                 MODULE.emit(
                     {
                         "result": "green",
@@ -10245,6 +10247,10 @@ class StageOutcomeTest(unittest.TestCase):
             {"stage_outcome": "cleared"},
             MODULE.stage_outcome_fields({"outcome": "green"}),
         )
+        self.assertEqual(
+            {"stage_outcome": "no_progress"},
+            MODULE.stage_outcome_fields({"outcome": "no_progress"}),
+        )
 
     def test_an_escalation_outranks_a_recorded_clearance(self):
         state = {"outcome": "green", "escalation": {"reason": "head_changed"}}
@@ -11658,6 +11664,164 @@ class MainTest(unittest.TestCase):
             target="https://github.com/owner/repo/pull/7",
         )
 
+    def pipeline_args(self, state):
+        return argparse.Namespace(
+            command="pipeline",
+            function=MODULE.command_pipeline,
+            invocation_run=None,
+            model="sol",
+            new_invocation=False,
+            pipeline_iteration=1,
+            pipeline_max_iterations=2,
+            pipeline_run="pipeline-run",
+            preflight_result_file=None,
+            preserve_artifacts=False,
+            repo_root=str(Path.cwd()),
+            result_file=None,
+            resume=False,
+            stack_state=None,
+            state=str(state),
+            target="owner/repo#7",
+        )
+
+    def pipeline_state(self, root, *, outcome=None, escalation=None):
+        return write_state(
+            root,
+            outcome=outcome,
+            escalation=escalation,
+            budget_scope="pipeline",
+            pipeline_budget={
+                "run": "pipeline-run",
+                "iteration": 1,
+                "baseline": 0,
+                "run_baseline": 0,
+            },
+        )
+
+    def test_pipeline_exit_zero_without_expected_state_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "missing.json"
+            args = self.pipeline_args(state)
+            with mock.patch.object(
+                MODULE,
+                "command_loop",
+                side_effect=lambda _args: MODULE.emit(
+                    {
+                        "result": "green",
+                        "state": str(state),
+                        "head_sha": "head1",
+                    }
+                ),
+            ):
+                code, output = self.run_main(args)
+
+            self.assertEqual(1, code)
+            self.assertFalse(state.exists())
+            self.assertIn("state file does not exist", output)
+
+    def test_pipeline_propagates_the_exact_state_and_invocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "invocation-state.json"
+            args = self.pipeline_args(state)
+            observed = []
+
+            def command(loop_args):
+                observed.append(loop_args)
+                self.assertEqual(
+                    "source-only",
+                    MODULE.ACTIVE_GITHUB_MUTATION_POLICY,
+                )
+                written = self.pipeline_state(root, outcome="green")
+                written.replace(state)
+                MODULE.emit(
+                    {
+                        "result": "green",
+                        "state": str(state),
+                        "head_sha": "head1",
+                    }
+                )
+
+            with mock.patch.object(MODULE, "command_loop", side_effect=command):
+                code, _ = self.run_main(args)
+
+            self.assertEqual(0, code)
+            self.assertEqual(1, len(observed))
+            self.assertEqual(str(state), observed[0].state)
+            self.assertEqual("pipeline-run", observed[0].pipeline_run)
+            self.assertEqual(1, observed[0].pipeline_iteration)
+            self.assertEqual("allow", MODULE.ACTIVE_GITHUB_MUTATION_POLICY)
+
+    def test_pipeline_validates_every_terminal_outcome(self):
+        cases = (
+            ("green", "green", None, "cleared"),
+            ("no_checks", "no_checks", None, "skipped"),
+            ("nothing_to_publish", None, None, "no_progress"),
+            (
+                "pre_existing",
+                None,
+                {"reason": "pre_existing_failures"},
+                "escalated",
+            ),
+            ("escalate", None, {"reason": "unknown_checks"}, "escalated"),
+            ("escalated", None, {"reason": "unfixable_failure"}, "escalated"),
+            (
+                "no_rerun_support",
+                None,
+                {"reason": "no_rerun_support"},
+                "escalated",
+            ),
+            (
+                "max_iterations_reached",
+                None,
+                {"reason": "max_iterations_reached"},
+                "carried",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, (result, state_outcome, escalation, expected) in enumerate(
+                cases
+            ):
+                with self.subTest(result=result):
+                    case_root = root / str(index)
+                    case_root.mkdir()
+                    state = self.pipeline_state(
+                        case_root,
+                        outcome=state_outcome,
+                        escalation=escalation,
+                    )
+                    payload = MODULE.validate_terminal_ci_fix_state(
+                        self.pipeline_args(state),
+                        {"result": result, "state": str(state), "head_sha": "head1"},
+                    )
+                    self.assertEqual(expected, payload["stage_outcome"])
+
+    def test_no_progress_terminal_write_is_atomic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = self.pipeline_state(root)
+            original = state.read_bytes()
+            with (
+                mock.patch.object(
+                    MODULE.os,
+                    "replace",
+                    side_effect=OSError("replace failed"),
+                ),
+                self.assertRaisesRegex(OSError, "replace failed"),
+            ):
+                MODULE.validate_terminal_ci_fix_state(
+                    self.pipeline_args(state),
+                    {
+                        "result": "nothing_to_publish",
+                        "state": str(state),
+                        "head_sha": "head1",
+                    },
+                )
+
+            self.assertEqual(original, state.read_bytes())
+            self.assertEqual([], list(root.glob(f".{state.name}.*.tmp")))
+
     def test_stack_start_result_survives_blank_execution_output(self):
         with tempfile.TemporaryDirectory() as directory:
             preflight, _ = self.command_files(Path(directory))
@@ -11828,6 +11992,13 @@ class MainTest(unittest.TestCase):
     def test_valid_preflight_authorizes_one_file_backed_loop(self):
         with tempfile.TemporaryDirectory() as directory:
             preflight, result = self.command_files(Path(directory))
+            state = write_state(
+                Path(directory),
+                outcome="green",
+                clean_at_head_sha="head1",
+                budget_scope="invocation",
+                invocation_budget={"run": "invocation-run", "iteration": 1},
+            )
 
             def stack_start(_args):
                 MODULE.emit(
@@ -11844,14 +12015,14 @@ class MainTest(unittest.TestCase):
                 side_effect=lambda _args: MODULE.emit(
                     {
                         "result": "green",
-                        "state": str(Path(directory) / "state.json"),
+                        "state": str(state),
                     }
                 )
             )
 
-            loop_code, _ = self.run_main(
-                self.loop_args(result, preflight, loop)
-            )
+            loop_args = self.loop_args(result, preflight, loop)
+            loop_args.state = str(state)
+            loop_code, _ = self.run_main(loop_args)
 
             self.assertEqual(0, stack_code)
             self.assertEqual(0, loop_code)
@@ -11868,8 +12039,17 @@ class MainTest(unittest.TestCase):
     def test_pipeline_loop_uses_result_file_without_stack_start_result(self):
         with tempfile.TemporaryDirectory() as directory:
             _, result = self.command_files(Path(directory))
+            state = write_state(
+                Path(directory),
+                outcome="green",
+                clean_at_head_sha="head1",
+                budget_scope="pipeline",
+                pipeline_budget={"run": "pipeline-run", "iteration": 1},
+            )
             loop = mock.Mock(
-                side_effect=lambda _args: MODULE.emit({"result": "green"})
+                side_effect=lambda _args: MODULE.emit(
+                    {"result": "green", "state": str(state)}
+                )
             )
             args = self.loop_args(result, Path(directory) / "absent.json", loop)
             args.pipeline_run = "pipeline-run"
@@ -11877,6 +12057,7 @@ class MainTest(unittest.TestCase):
             args.pipeline_max_iterations = 2
             args.preflight_result_file = None
             args.new_invocation = False
+            args.state = str(state)
 
             code, _ = self.run_main(args)
 

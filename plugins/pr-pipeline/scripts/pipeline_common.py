@@ -84,6 +84,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "module": "ci_fix_loop",
         "marker": ("clean_at_head_sha",),
         "model": DEFAULT_STAGE_MODEL,
+        "required_model": DEFAULT_STAGE_MODEL,
     },
     {
         "stage": STAGE_DESCRIPTION,
@@ -1747,6 +1748,16 @@ def stage_command(
 ) -> list[str]:
     validate_stage_route(entry, model, effort)
     stage_arguments = list(arguments)
+    if entry["stage"] == STAGE_CI:
+        return [
+            sys.executable,
+            str(stage_script_path(entry)),
+            "pipeline",
+            f"{target['repo_name']}#{target['number']}",
+            "--model",
+            "sol",
+            *stage_arguments,
+        ]
     if entry["stage"] in {STAGE_COPILOT_REVIEW, STAGE_SELF_REVIEW}:
         stage_arguments.extend(
             ["--github-mutation-policy", ACTIVE_GITHUB_MUTATION_POLICY]

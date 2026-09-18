@@ -76,7 +76,7 @@ Every stage launch and status read uses the state path derived from the current 
 
 `start` writes a versioned monitor handle that binds its random run ID to the canonical pull request, launch record, and progress log before starting the detached scheduler. `watch` needs only that run ID and obtains the target from the handle. Every unfinished response supplies the complete arguments for the next watch call. An unknown or malformed handle fails without scanning for the latest run or reading PR-wide state. The old explicit `watch <owner/repo#number> --run-id <id>` form remains available only for exact runs created before monitor handles.
 
-Each stage has a local coordinator. For hosted stages, the local Agent Tasks Runtime dispatches the request and verifies the result. It is not a worker session. Copilot Review starts a local `gpt-5.6-sol` decision session with reasoning effort `high` and has no hosted fallback. CI Fix starts a separate read-only local session with the same model and effort to triage failed-log files before hosted fixing.
+Each stage has a local coordinator. For hosted stages, the local Agent Tasks Runtime dispatches the request and verifies the result. It is not a worker session. Copilot Review starts a local `gpt-5.6-sol` decision session with reasoning effort `high` and has no hosted fallback. Pipeline starts the installed CI Fix coordinator directly with its invocation-local state path and pipeline position. CI Fix then starts a separate read-only local session with the same model and effort to triage failed-log files before hosted fixing.
 
 | Stage | Worker cardinality and bundle |
 | --- | --- |
@@ -86,7 +86,7 @@ Each stage has a local coordinator. For hosted stages, the local Agent Tasks Run
 | CI Fix | One local triage session reads failed-log files for each stable current-head iteration, then one hosted Agent Task receives its bounded summary. A new pair starts only after the head or final check results change. It is not one pair per failed check. |
 | PR Description | One hosted report task for the whole pull request title and body decision. |
 
-The CI coordinator owns polling, reruns, stabilization, and snapshot deduplication. Stable means all relevant checks are terminal and the check rollup remains unchanged after debounce. Repeated observations of the same current-head stable final check set do not start another local triage session or hosted worker.
+The CI coordinator owns polling, reruns, stabilization, and snapshot deduplication. Stable means all relevant checks are terminal and the check rollup remains unchanged after debounce. Repeated observations of the same current-head stable final check set do not start another local triage session or hosted worker. Its pipeline entrypoint exits successfully only after the exact caller-provided state path contains a terminal outcome bound to the same pipeline run and iteration.
 
 For every failing Actions check, the coordinator runs `gh run view <run> [--job <job>] --log-failed` and writes the complete output to a local file outside the repository. The triage prompt contains file paths and digests, not log text. The local session starts in a per-attempt workspace that contains only the pinned logs and triage prompt, without repository path access or authenticated `gh` state. It decides which failures are root causes, related, or cascading and writes the context the fixer needs. It can use `rg`, grep, scripts, and bounded reads without loading whole logs into its context.
 
