@@ -683,15 +683,20 @@ class StageContractTest(unittest.TestCase):
     def test_conflict_stage_receives_the_invocation_state_path_explicitly(self):
         entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT]
         expected = MODULE.stage_state_path(entry, target(), "run-1")
-        command = MODULE.stage_command(
-            entry,
-            target(),
-            model=MODULE.stage_models(None)[MODULE.STAGE_CONFLICT],
-            effort="high",
-            run_id="run-1",
-            sweep=1,
-            conflict_strategy="merge",
-        )
+        with mock.patch.object(
+            MODULE.common,
+            "path_image",
+            return_value=str(Path("copilot.exe").resolve()),
+        ):
+            command = MODULE.stage_command(
+                entry,
+                target(),
+                model=MODULE.stage_models(None)[MODULE.STAGE_CONFLICT],
+                effort="high",
+                run_id="run-1",
+                sweep=1,
+                conflict_strategy="merge",
+            )
 
         self.assertIn(f"--state {expected}", command[2])
         self.assertIn("--strategy merge", command[2])

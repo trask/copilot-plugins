@@ -190,6 +190,7 @@ class AgentCommandAdmissionTest(unittest.TestCase):
             / "files"
         )
         files.mkdir(parents=True, exist_ok=True)
+        files = files.resolve()
         artifact_path = files / "ci-fix-loop-1.6.38-7-sealed-invocation.json"
         invocation_id = "f" * 32
         outputs = MODULE.sealed_ci_fix_output_paths(
@@ -289,6 +290,7 @@ class AgentCommandAdmissionTest(unittest.TestCase):
             root = Path(directory)
             cwd = root / "repo with spaces"
             cwd.mkdir()
+            cwd = cwd.resolve()
             artifact_path, artifact = self.write_sealed_ci_fix_artifact(
                 root,
                 cwd,
@@ -818,6 +820,7 @@ class SealedCiFixCommandTest(unittest.TestCase):
     def fixture(self, root, *, write_artifact=True):
         repo = root / "source workspace"
         repo.mkdir()
+        repo = repo.resolve()
         files = (
             root
             / ".copilot"
@@ -826,6 +829,7 @@ class SealedCiFixCommandTest(unittest.TestCase):
             / "files"
         )
         files.mkdir(parents=True)
+        files = files.resolve()
         artifact_path = files / "ci-fix-loop-1.6.38-7-sealed-invocation.json"
         invocation_id = "f" * 32
         outputs = MODULE.sealed_ci_fix_output_paths(
@@ -3446,7 +3450,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             root = Path(directory)
             repo = root / "source"
             repo.mkdir()
-            installed_root = root / "installed plugins"
+            installed_root = root.resolve() / "installed plugins"
             helper = (
                 installed_root
                 / "ci-fix-loop"
@@ -3495,7 +3499,10 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 encoding="utf-8",
                 newline="\n",
             )
-            with mock.patch.object(MODULE, "__file__", str(helper)):
+            with (
+                mock.patch.object(sys, "dont_write_bytecode", True),
+                mock.patch.object(MODULE, "__file__", str(helper)),
+            ):
                 verified = MODULE.verify_installed_package_manifest(
                     manifest_path,
                     MODULE.sha256_file(manifest_path),
@@ -12411,7 +12418,7 @@ class NativeStackParsingTest(unittest.TestCase):
 class NativeStackCoordinatorTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = MODULE.cli_path(self.temporary.name)
         self.stack_state = self.root / "stack.json"
         self.resolver = self.root / "pr_conflict_resolver.py"
         self.resolver.write_text("# test", encoding="utf-8")

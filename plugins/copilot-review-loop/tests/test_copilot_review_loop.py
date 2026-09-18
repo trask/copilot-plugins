@@ -8113,7 +8113,7 @@ class TerminalCoordinatorContractTest(unittest.TestCase):
         preflight = self.unreviewed_preflight()
         previous_policy = MODULE.ACTIVE_GITHUB_MUTATION_POLICY
         with tempfile.TemporaryDirectory() as directory:
-            state_path = Path(directory) / "state.json"
+            state_path = MODULE.cli_path(str(Path(directory) / "state.json"))
             args = self.arguments(state_path)
             args.pipeline_run = "allow-run"
             args.pipeline_iteration = 1
