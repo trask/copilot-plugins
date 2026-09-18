@@ -3410,18 +3410,30 @@ class RecommendationContractTest(unittest.TestCase):
 
         self.assertEqual(
             {
+                "contract": "recommendation_candidate",
+                "task_id": fixture["task"]["id"],
+                "task_url": fixture["task"]["url"],
+                "session_id": fixture["candidate"]["task"]["session_id"],
+                "generated_branch": fixture["generated"]["branch"],
+                "generated_head": fixture["generated"]["head_sha"],
+                "code_tip": pr["head_sha"],
+                "commits": [],
+                "candidate_manifest": fixture["candidate"],
+                "completion": fixture["completion"],
+                "output_commit": fixture["candidate"]["artifact_commit"],
+                "report_evidence": None,
+                "structural_attestation": True,
+            },
+            remote,
+        )
+        self.assertEqual(
+            {
                 "status": "not_applicable",
                 "final_local_head": self.identity["head"],
             },
             result["application"],
         )
-        self.assertEqual(
-            [
-                MODULE.AGENT_TASK_OUTPUT_BODY,
-                MODULE.AGENT_TASK_OUTPUT_TITLE,
-            ],
-            remote["output_paths"],
-        )
+        self.assertNotIn("output_paths", remote)
 
     def test_title_and_body_only_outputs_derive_keep_and_replace(self):
         remote = self.remote()
