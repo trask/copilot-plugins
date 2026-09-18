@@ -40,6 +40,22 @@ The bundled coordinator is the sole authoritative local entry point. It discover
 
 The worker may make zero or more code commits and may add one final path-only commit under `.github/agent-task-output/`. `.github/agent-task-output/report.md` is free-form advisory evidence. Missing, malformed, or arbitrary report content cannot reject valid candidate code. The coordinator does not infer findings, commit mappings, summaries, metadata decisions, or a canonical hosted report. Zero code commits means no fixes were needed. Existing policy and report parsers remain available only for retained audit evidence.
 
+## Pipeline entrypoint
+
+Pipeline calls the coordinator directly, without another model-driven agent:
+
+```text
+python "<helper>" pipeline <target> --state <path> --pipeline-run <run> --pipeline-iteration <sweep> --pipeline-max-iterations <sweeps> --github-mutation-policy source-only --model sol
+```
+
+Pass the explicit target and reuse the same state path for this stage throughout one Pipeline run. The checkout may be detached, but it must be clean and at the exact live PR head. A named branch must still match the PR head branch.
+
+The command waits for each Runtime child to finish, validates its terminal candidate, imports and publishes verified code, then starts the next normal review iteration. A terminal child with no code commits clears the stage. A child that made fixes does not establish a clean head.
+
+`--max-iterations` defaults to 5 and bounds all Self Review iterations across the entire Pipeline run. Later sweeps neither reset nor multiply it. Each child gets one review iteration. Exhaustion returns `stage_outcome: max_iterations_reached`, never a clean marker. The final JSON includes all code commits and tasks from this call. Any execution or validation error exits nonzero; an unfinished state cannot be resumed or adopted.
+
+Source-only skips shared GitHub state publication as well as PR metadata mutation. Audit state stays local.
+
 ## Boundaries
 
 - Never run `gh pr diff`, read or search repository files, inspect repository instructions, analyze code, make edits, run builds, tests, probes, formatters, hooks, or repository programs locally. Agent Tasks performs every substantive repository action.

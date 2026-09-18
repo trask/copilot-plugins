@@ -63,7 +63,6 @@ STAGES: tuple[dict[str, Any], ...] = (
         "marker": ("mergeable_at_head_sha",),
         "base_marker": ("attempt", "base_sha"),
         "model": DEFAULT_STAGE_MODEL,
-        "pipeline_position": False,
     },
     {
         "stage": STAGE_COPILOT_REVIEW,
@@ -73,6 +72,8 @@ STAGES: tuple[dict[str, Any], ...] = (
         "marker": ("clean_at_head_sha",),
         "skip_marker": ("policy_skip", "head_sha"),
         "model": DEFAULT_STAGE_MODEL,
+        "required_model": DEFAULT_STAGE_MODEL,
+        "required_effort": DEFAULT_EFFORT,
         "github_mutation_policy": True,
     },
     {
@@ -1824,13 +1825,7 @@ def pipeline_arguments(
     *,
     accepts: Callable[..., bool] = stage_accepts_pipeline_position,
 ) -> list[str]:
-    """Give a stage its position in the pipeline so its own budget can shrink.
-
-    A stage that is excluded from pipeline budgeting or does not understand
-    these flags is left alone.
-    """
-    if not accepts(entry):
-        return []
+    """Bind every stage to this run without changing its iteration allowance."""
     return [
         PIPELINE_RUN_FLAG,
         run_id,
@@ -1868,44 +1863,24 @@ def stage_command(
     arguments: list[str],
     prompt: str | None = None,
     resolve_program: Callable[[str], str] = resolve_launch_program,
+    repo_root: Path | None = None,
 ) -> list[str]:
     validate_stage_route(entry, model, effort)
     stage_arguments = list(arguments)
-    if entry["stage"] == STAGE_CI:
-        return [
-            sys.executable,
-            str(stage_script_path(entry)),
-            "pipeline",
-            f"{target['repo_name']}#{target['number']}",
-            "--model",
-            "sol",
-            *stage_arguments,
-        ]
     if entry.get("github_mutation_policy") is True:
         stage_arguments.extend(
             ["--github-mutation-policy", ACTIVE_GITHUB_MUTATION_POLICY]
         )
-    effective_prompt = (
-        prompt if prompt is not None else stage_prompt(target, stage_arguments)
-    )
-    if prompt is not None and stage_arguments != arguments:
-        effective_prompt += (
-            "\n\nPass this immutable argument to the helper command that owns "
-            "this stage run: --github-mutation-policy "
-            f"{ACTIVE_GITHUB_MUTATION_POLICY}"
-        )
+    if repo_root is not None:
+        stage_arguments.extend(["--repo-root", str(repo_root)])
     return [
-        resolve_program("copilot"),
-        "-p",
-        effective_prompt,
-        "--agent",
-        entry["agent"],
+        sys.executable,
+        str(stage_script_path(entry)),
+        "pipeline",
+        f"{target['repo_name']}#{target['number']}",
         "--model",
-        model,
-        "--effort",
-        effort,
-        *STAGE_AUTOPILOT_FLAGS,
-        *STAGE_PERMISSION_FLAGS,
+        "sol" if model == DEFAULT_STAGE_MODEL else model,
+        *stage_arguments,
     ]
 
 

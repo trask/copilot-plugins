@@ -105,10 +105,6 @@ LEGACY_RUNNING_LOCAL_OWNER_FIELDS = frozenset(
         "worker_command",
     }
 )
-# How many of its own iterations an outer loop is assumed to allow when it names no
-# cap of its own. Only the ceiling derived from it is affected, never the per-iteration
-# budget, so a caller cannot lift the bound by leaving the value out.
-DEFAULT_PIPELINE_MAX_ITERATIONS = 2
 PR_HEAD_LAG_RETRY_DELAYS = (1, 2, 4)
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
 # Preflight results that mean Copilot reviewed the current head and asked for nothing.
@@ -912,6 +908,8 @@ def empty_queue_clearance_head(
     preflight: dict[str, Any],
     confirmation: dict[str, Any],
     target: dict[str, Any],
+    *,
+    allow_detached: bool = False,
 ) -> str:
     if preflight != confirmation:
         raise WorkflowError("empty queue identity drifted during clearance revalidation")
@@ -924,7 +922,7 @@ def empty_queue_clearance_head(
         not isinstance(pr, dict)
         or not isinstance(identity, dict)
         or not isinstance(identity.get("branch"), str)
-        or not identity["branch"]
+        or (not identity["branch"] and not allow_detached)
         or not isinstance(identity.get("head"), str)
         or SHA_PATTERN.fullmatch(identity["head"]) is None
         or identity.get("status") != ""
@@ -938,7 +936,7 @@ def empty_queue_clearance_head(
         or not isinstance(pr.get("base_sha"), str)
         or SHA_PATTERN.fullmatch(pr["base_sha"]) is None
         or identity["head"] != pr["head_sha"]
-        or identity["branch"] != pr.get("head_branch")
+        or (identity["branch"] and identity["branch"] != pr.get("head_branch"))
     ):
         raise WorkflowError("empty queue clearance has invalid ownership identity")
     if (
@@ -1164,6 +1162,7 @@ def source_only_policy_skip_head(
     *,
     pipeline_run: str | None,
     state_sha256: str | None,
+    pipeline_iteration: int | None = None,
 ) -> str:
     if ACTIVE_GITHUB_MUTATION_POLICY != "source-only":
         raise WorkflowError("policy skip requires exact source-only policy")
@@ -1180,7 +1179,7 @@ def source_only_policy_skip_head(
         or not isinstance(viewer, dict)
         or not isinstance(permissions, dict)
         or not isinstance(identity.get("branch"), str)
-        or not identity["branch"]
+        or (not identity["branch"] and not pipeline_run)
         or not isinstance(identity.get("head"), str)
         or SHA_PATTERN.fullmatch(identity["head"]) is None
         or identity.get("status") != ""
@@ -1195,7 +1194,7 @@ def source_only_policy_skip_head(
         or not isinstance(pr.get("base_sha"), str)
         or SHA_PATTERN.fullmatch(pr["base_sha"]) is None
         or identity["head"] != pr["head_sha"]
-        or identity["branch"] != pr.get("head_branch")
+        or (identity["branch"] and identity["branch"] != pr.get("head_branch"))
         or pr.get("head_repository")
         != f"{pr.get('head_owner')}/{pr.get('head_repo')}"
         or pr.get("cross_repository")
@@ -1225,6 +1224,15 @@ def source_only_policy_skip_head(
             raise WorkflowError(detail)
         stored_pr = state["pr"]
         stored_skip = state["policy_skip"]
+        previous_iteration = (state.get("pipeline_budget") or {}).get("iteration")
+        advanced = (
+            isinstance(pipeline_run, str)
+            and stored_skip.get("pipeline_run") == pipeline_run
+            and type(pipeline_iteration) is int
+            and type(previous_iteration) is int
+            and pipeline_iteration > previous_iteration
+            and stored_pr.get("head_sha") != pr["head_sha"]
+        )
         if (
             state.get("repo_root") != preflight.get("repository_root")
             or any(
@@ -1234,12 +1242,26 @@ def source_only_policy_skip_head(
                     "number",
                     "head_repository",
                     "head_branch",
-                    "head_sha",
-                    "base_sha",
                 )
             )
             or stored_skip.get("viewer_login") != viewer["login"]
-            or stored_skip.get("preflight_sha256") != preflight_sha256
+            or (
+                not advanced
+                and (
+                    stored_skip.get("preflight_sha256") != preflight_sha256
+                    or any(
+                        stored_pr.get(field) != pr[field]
+                        for field in ("head_sha", "base_sha")
+                    )
+                )
+            )
+            or (
+                advanced
+                and any(
+                    stored_pr.get(field) != pr.get(field)
+                    for field in ("title", "body", "base_branch", "is_draft")
+                )
+            )
         ):
             raise WorkflowError("policy skip replayed against a different preflight")
         if stored_skip.get("pipeline_run") != pipeline_run:
@@ -2649,28 +2671,7 @@ def whole_number(value: Any, fallback: int) -> int:
 def pipeline_scope(
     state: dict[str, Any], args: argparse.Namespace
 ) -> dict[str, Any] | None:
-    """Scope the iteration budget to an outer pipeline's loop rather than a launch.
-
-    An invocation is not a sound unit of budget. An outer loop relaunches a
-    stage within one iteration as a matter of course, so a budget that resets on
-    launch is reset by the one event it must ignore, and nothing bounds the
-    total.
-
-    The budget resets on a run this stage has not seen, or on an iteration
-    strictly greater than the one it recorded. A repeat, a stale relaunch, and a
-    replayed iteration are all inert. Run inequality is load-bearing on its own:
-    this state is durable and per-pull-request while an outer iteration restarts
-    at 1, so comparing order alone would see the count go backwards on a later
-    run and never reset again.
-
-    Two baselines are kept because they bound different things. ``baseline``
-    moves on every advance and bounds one outer iteration. ``run_baseline`` moves
-    only on a new run and bounds the whole run, so an advance cannot refresh the
-    ceiling that stops a caller from spending without end.
-
-    Returns ``None`` when no outer loop is driving this stage, which leaves a
-    standalone invocation as it was. Absent arguments never read as a new run.
-    """
+    """Keep one stage allowance for the entire Pipeline run."""
 
     run = getattr(args, "pipeline_run", None)
     if not run:
@@ -2679,9 +2680,6 @@ def pipeline_scope(
     recorded = state.get("pipeline_budget") or {}
     same_run = recorded.get("run") == run
     seen = recorded.get("iteration")
-    advanced = (
-        same_run and iteration is not None and seen is not None and iteration > seen
-    )
     published = int(state.get("iterations", 0))
     if not same_run:
         return {
@@ -2691,13 +2689,6 @@ def pipeline_scope(
             "run_baseline": published,
         }
     run_baseline = whole_number(recorded.get("run_baseline"), published)
-    if advanced:
-        return {
-            "run": run,
-            "iteration": iteration,
-            "baseline": published,
-            "run_baseline": run_baseline,
-        }
     highest = max(
         (value for value in (seen, iteration) if value is not None), default=None
     )
@@ -2712,31 +2703,10 @@ def pipeline_scope(
 def absolute_iteration_cap(
     scope: dict[str, Any] | None, max_iterations: int, pipeline_max_iterations: Any
 ) -> int | None:
-    """Bound the total work one outer run may spend on a pull request.
-
-    The outer cap counts the caller's own loop-backs and the stage cap counts
-    stage iterations, so the two are different quantities. Replacing one with the
-    other would hand a stage as many iterations as its caller has loop-backs,
-    which is far fewer than one round of review comments usually needs.
-
-    Derived from the caller's own cap rather than hardcoded, so raising the outer
-    iteration limit raises this with it. It is enforced even though the caller
-    advancing its own loop at most that many times already implies it, because a
-    bound that depends on a peer behaving is not a bound.
-
-    Only the outer cap is optional. Omitting it falls back rather than removing
-    the ceiling, so a caller cannot lift the bound by leaving the value out.
-    """
+    """Pipeline sweeps do not multiply the stage's configured allowance."""
     if scope is None:
         return None
-    outer = (
-        pipeline_max_iterations
-        if isinstance(pipeline_max_iterations, int)
-        and not isinstance(pipeline_max_iterations, bool)
-        and pipeline_max_iterations > 0
-        else DEFAULT_PIPELINE_MAX_ITERATIONS
-    )
-    return max_iterations * outer
+    return max_iterations
 
 
 def budget_spent(
@@ -6506,11 +6476,6 @@ def require_live_comments(
 
 def local_identity(repo_root: Path) -> dict[str, str]:
     branch = git(repo_root, "branch", "--show-current")
-    if not branch:
-        raise WorkflowError(
-            "the pull request checkout is detached; check out its head branch before "
-            "starting Copilot Review Loop"
-        )
     return {
         "branch": branch,
         "head": git(repo_root, "rev-parse", "HEAD").lower(),
@@ -6528,14 +6493,13 @@ def local_source_owner_fingerprint(
     status = fingerprint.get("status")
     if (
         not isinstance(branch, str)
-        or not branch
         or not isinstance(head, str)
         or SHA_PATTERN.fullmatch(head.lower()) is None
         or not isinstance(status, str)
     ):
         raise WorkflowError("local source fingerprint has malformed identity")
     head = head.lower()
-    branch_ref = f"refs/heads/{branch}"
+    branch_ref = f"refs/heads/{branch}" if branch else "HEAD"
     refs = fingerprint.get("refs")
     if refs is not None and (
         not isinstance(refs, dict) or refs.get(branch_ref) != head
@@ -6558,7 +6522,7 @@ def local_source_owner_fingerprint(
         ),
     }
     worktree = fingerprint.get("worktree")
-    if worktree is not None:
+    if worktree is not None or not branch:
         if (
             not isinstance(worktree, str)
             or not worktree
@@ -6571,6 +6535,10 @@ def local_source_owner_fingerprint(
 
 def local_source_fingerprint(repo_root: Path) -> dict[str, Any]:
     identity = local_identity(repo_root)
+    if not identity["branch"]:
+        return local_source_owner_fingerprint(
+            {**identity, "worktree": str(repo_root.resolve())}
+        )
     branch_ref = f"refs/heads/{identity['branch']}"
     branch_head = git(repo_root, "rev-parse", "--verify", branch_ref).lower()
     if (
@@ -6874,10 +6842,15 @@ def restore_source_after_invalid_decision(
     after_owner = local_source_owner_fingerprint(after)
     if before_owner == after_owner:
         return before_owner
-    branch_ref = f"refs/heads/{before_owner['branch']}"
+    if local_source_fingerprint(repo_root) != after_owner:
+        raise WorkflowError("local source moved before invalid-decision rollback")
+    branch_ref = (
+        f"refs/heads/{before_owner['branch']}" if before_owner["branch"] else "HEAD"
+    )
     git(
         repo_root,
         "update-ref",
+        *(["--no-deref"] if not before_owner["branch"] else []),
         branch_ref,
         before_owner["head"],
         after_owner["head"],
@@ -7842,7 +7815,9 @@ def review_snapshot_sha256(preflight: dict[str, Any]) -> str:
     return sha256_text(json.dumps(identity, separators=(",", ":"), sort_keys=True))
 
 
-def agent_task_preflight(repo_root: Path, target: dict[str, Any]) -> dict[str, Any]:
+def agent_task_preflight(
+    repo_root: Path, target: dict[str, Any], *, allow_detached: bool = False
+) -> dict[str, Any]:
     pr = metadata_for(target)
     if pr["state"] != "OPEN":
         raise WorkflowError(
@@ -7861,7 +7836,11 @@ def agent_task_preflight(repo_root: Path, target: dict[str, Any]) -> dict[str, A
             f"HEAD mismatch: local {identity['head']}, PR head {pr['head_sha']}; "
             "check out the exact pull request head before starting"
         )
-    if identity["branch"] != pr["head_branch"]:
+    if not identity["branch"] and not allow_detached:
+        raise WorkflowError(
+            "a detached checkout requires a Pipeline run at the exact pull request head"
+        )
+    if identity["branch"] and identity["branch"] != pr["head_branch"]:
         raise WorkflowError(
             f"branch mismatch: local {identity['branch']!r}, "
             f"PR head {pr['head_branch']!r}"
@@ -8011,7 +7990,7 @@ def build_worker_prompt(
         f"Copilot Review Loop local worker prompt version {WORKER_PROMPT_VERSION}.\n\n"
         "You are the sole local repository analysis and execution worker for one "
         "iteration of a thin Copilot Review Loop coordinator. Work only on the exact "
-        "checked-out branch, open "
+        "checkout, open "
         "pull request, immutable head, and exact unresolved Copilot comments below. "
         "Investigate every comment against the repository. Make every warranted edit, "
         "including tests and related files. Run all formatters, probes, builds, tests, "
@@ -8019,7 +7998,7 @@ def build_worker_prompt(
         "Do not sleep, poll, watch, wait for CI, wait for another review, or start "
         "another iteration. Produce this iteration's artifacts and exit.\n\n"
         "Put all warranted fixes in exactly one single-parent commit on the current "
-        "branch. Create no "
+        "checkout, keeping a detached HEAD detached. Create no "
         "empty commit, branch, tag, worktree, merge commit, or report commit. Before "
         "writing the decision file, squash every correction-only follow-up into that "
         "single fix commit. Do not put commit SHAs, parents, changed paths, patch "
@@ -8312,7 +8291,9 @@ def wait_for_stable_review_preflight(
                 details={"state": str(state_path), "reason": "timeout"},
             )
         try:
-            preflight = agent_task_preflight(repo_root, target)
+            preflight = agent_task_preflight(
+                repo_root, target, allow_detached=bool(getattr(args, "pipeline_run", None))
+            )
         except WorkflowError as error:
             if not is_rate_limit_error(error):
                 raise
@@ -8356,7 +8337,10 @@ def wait_for_stable_review_preflight(
             debounce = float(getattr(args, "debounce_seconds", 0.0))
             if debounce > 0:
                 time.sleep(debounce)
-                confirmation = agent_task_preflight(repo_root, target)
+                confirmation = agent_task_preflight(
+                    repo_root, target,
+                    allow_detached=bool(getattr(args, "pipeline_run", None)),
+                )
                 if review_snapshot_sha256(confirmation) != identity:
                     stable_identity = None
                     stable_polls = 0
@@ -9771,15 +9755,20 @@ def command_agent_task(args: argparse.Namespace) -> None:
         clean_head = None
         policy_skip_head = None
         if not preflight["comments"] and preflight["head_review_clean"]:
-            confirmation = agent_task_preflight(repo_root, target)
+            confirmation = agent_task_preflight(
+                repo_root, target, allow_detached=bool(args.pipeline_run)
+            )
             clean_head = empty_queue_clearance_head(
-                existing, preflight, confirmation, target
+                existing, preflight, confirmation, target,
+                allow_detached=bool(args.pipeline_run),
             )
         elif (
             not preflight["comments"]
             and ACTIVE_GITHUB_MUTATION_POLICY == "source-only"
         ):
-            confirmation = agent_task_preflight(repo_root, target)
+            confirmation = agent_task_preflight(
+                repo_root, target, allow_detached=bool(args.pipeline_run)
+            )
             existing_sha256 = (
                 sha256_file(state_path) if existing is not None else None
             )
@@ -9790,6 +9779,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 target,
                 pipeline_run=getattr(args, "pipeline_run", None),
                 state_sha256=existing_sha256,
+                pipeline_iteration=getattr(args, "pipeline_iteration", None),
             )
         if policy_skip_head is not None:
             state = record_source_only_policy_skip(
@@ -11525,6 +11515,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent_task = subparsers.add_parser(
         "agent-task",
+        aliases=["pipeline"],
         help="run Copilot Review Loop through a validated local Sol decision session",
     )
     agent_task.add_argument(
@@ -11675,16 +11666,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--pipeline-iteration",
         type=int,
         help=(
-            "which iteration of that run this is; a higher one within the same "
-            "run refreshes the per-iteration budget"
+            "which sweep of that run this is; advancing it does not refresh "
+            "the stage allowance"
         ),
     )
     preflight.add_argument(
         "--pipeline-max-iterations",
         type=int,
         help=(
-            "how many iterations that run may take, used to derive the ceiling "
-            "on the whole run rather than to replace the per-iteration budget"
+            "the caller's sweep limit; it never multiplies or replaces "
+            "--max-iterations"
         ),
     )
     preflight.set_defaults(function=command_preflight)
@@ -11883,14 +11874,14 @@ def main() -> int:
                 "agent-task invocation"
             )
         args.function(args)
-        if args.command == "agent-task":
+        if args.command in {"agent-task", "pipeline"}:
             require_terminal_agent_task_clearance(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:
         details = error.details if isinstance(error, WorkflowError) else {}
         persistence_error = (
             persist_agent_task_coordinator_error(args, error)
-            if args.command == "agent-task"
+            if args.command in {"agent-task", "pipeline"}
             else None
         )
         if persistence_error is not None:

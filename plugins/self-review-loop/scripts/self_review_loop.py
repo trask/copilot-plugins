@@ -1295,11 +1295,6 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
 
 def local_identity(repo_root: Path) -> dict[str, str]:
     branch = git(repo_root, "branch", "--show-current")
-    if not branch:
-        raise WorkflowError(
-            "the pull request checkout is detached; check out its head branch before "
-            "starting Self Review Loop"
-        )
     return {
         "branch": branch,
         "head": git(repo_root, "rev-parse", "HEAD").lower(),
@@ -1308,7 +1303,7 @@ def local_identity(repo_root: Path) -> dict[str, str]:
 
 
 def agent_task_preflight(
-    repo_root: Path, target: dict[str, Any]
+    repo_root: Path, target: dict[str, Any], *, allow_detached: bool = False
 ) -> dict[str, Any]:
     pr = metadata_for(target)
     if pr["state"] != "OPEN":
@@ -1328,7 +1323,9 @@ def agent_task_preflight(
             f"HEAD mismatch: local {identity['head']}, PR head {pr['head_sha']}; "
             "check out the exact pull request head before starting"
         )
-    if identity["branch"] != pr["head_branch"]:
+    if identity["branch"] != pr["head_branch"] and not (
+        allow_detached and not identity["branch"]
+    ):
         raise WorkflowError(
             f"branch mismatch: local {identity['branch']!r}, "
             f"PR head {pr['head_branch']!r}"
@@ -6193,7 +6190,35 @@ def command_archive_stale_agent_task(args: argparse.Namespace) -> None:
     )
 
 
-def command_agent_task(args: argparse.Namespace) -> None:
+def command_pipeline(args: argparse.Namespace) -> None:
+    if (
+        not args.target
+        or not args.state
+        or not args.pipeline_run
+        or not args.pipeline_iteration
+        or not args.pipeline_max_iterations
+        or args.pipeline_iteration < 1
+        or args.pipeline_max_iterations < args.pipeline_iteration
+        or args.max_iterations < 1
+    ):
+        raise WorkflowError("pipeline requires a target, state, and valid run position")
+    args._pipeline = True
+    commits: list[str] = []
+    tasks: list[dict[str, Any]] = []
+    for _ in range(args.max_iterations):
+        result = command_agent_task(args)
+        commits.extend(result.get("commits", []))
+        if result.get("task"):
+            tasks.append(result["task"])
+        if result.get("outcome") != "continue":
+            if commits and result.get("result") == "nothing_to_publish":
+                result["result"] = "published"
+            emit({**result, "commits": commits, "tasks": tasks})
+            return
+    raise WorkflowError("Self Review Loop exceeded its configured iteration budget")
+
+
+def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
     global ACTIVE_GITHUB_MUTATION_POLICY
 
     ACTIVE_GITHUB_MUTATION_POLICY = github_mutation_policy(args)
@@ -6219,8 +6244,23 @@ def command_agent_task(args: argparse.Namespace) -> None:
     repo_root = resolve_repo_root(args.repo_root)
     target = resolve_target(args.target, repo_root)
     state_path = invocation_state_path(target, args, run_scope)
+    require_outside_repository(state_path, repo_root)
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
+    pipeline_mode = bool(getattr(args, "_pipeline", False))
+    if pipeline_mode and existing is not None:
+        if (existing.get("pr") or {}).get("pr_url") != target["pr_url"]:
+            raise WorkflowError("pipeline state belongs to a different pull request")
+        active_task = existing.get("agent_task") or {}
+        if active_task.get("status") != "completed":
+            raise WorkflowError(
+                "pipeline state is unfinished audit evidence; start a fresh run"
+            )
+        recorded_budget = existing.get("pipeline_budget") or {}
+        if recorded_budget.get("run") != args.pipeline_run:
+            raise WorkflowError("pipeline state belongs to a different run")
+        if recorded_budget.get("max_iterations") != args.max_iterations:
+            raise WorkflowError("pipeline review iteration budget changed")
     retained_task = (
         existing.get("agent_task") if isinstance(existing, dict) else None
     )
@@ -6425,7 +6465,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 )
                 active_task.pop("recovery_command", None)
                 save_state(state_path, existing)
-        preflight = agent_task_preflight(repo_root, target)
+        preflight = (
+            agent_task_preflight(repo_root, target, allow_detached=True)
+            if pipeline_mode
+            else agent_task_preflight(repo_root, target)
+        )
         pr = preflight["pr"]
         previous_clean_at_head_sha = None
         if existing is None:
@@ -6504,6 +6548,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
             scope = invocation
         else:
             budget_scope = "pipeline"
+            if pipeline_mode:
+                pipeline["max_iterations"] = max_iterations
             state["pipeline_budget"] = pipeline
             scope = pipeline
         state["budget_scope"] = budget_scope
@@ -6513,6 +6559,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
             max_iterations,
             args.pipeline_max_iterations,
         )
+        if pipeline_mode:
+            absolute_cap = max_iterations
         iteration_spent, run_spent = budget_spent(state, scope)
         remaining = max_iterations - iteration_spent
         if absolute_cap is not None:
@@ -6527,16 +6575,18 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "batches": [],
             }
             save_state(state_path, state)
-            emit(
-                {
-                    "result": "max_iterations_reached",
-                    "state": str(state_path),
-                    "pr": pr["pr_url"],
-                    "head_sha": pr["head_sha"],
-                    "iterations": state["iterations"],
-                }
-            )
-            return
+            payload = {
+                "result": "max_iterations_reached",
+                "state": str(state_path),
+                "pr": pr["pr_url"],
+                "head_sha": pr["head_sha"],
+                "iterations": state["iterations"],
+                "outcome": "max_iterations_reached",
+                "stage_outcome": "max_iterations_reached",
+            }
+            if not pipeline_mode:
+                emit(payload)
+            return payload
         allowed_iterations = remaining
         run_id = secrets.token_hex(16)
         prompt_path = state_path.with_name(
@@ -6576,7 +6626,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "started_at": utc_now(),
         }
         save_state(state_path, state)
-        if clear_shared_state_on_apply and not prepare_only:
+        if (
+            clear_shared_state_on_apply
+            and not prepare_only
+            and ACTIVE_GITHUB_MUTATION_POLICY != "source-only"
+        ):
             publish_shared_state(
                 pr,
                 section="self_review",
@@ -6590,7 +6644,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             helper = discover_cloud_task()
             prompt = build_worker_prompt(
                 preflight,
-                max_iterations=allowed_iterations,
+                max_iterations=1 if pipeline_mode else allowed_iterations,
                 prior_history=state.get("history") or [],
             )
             require_no_credentials(prompt, source="Agent Task prompt")
@@ -6770,6 +6824,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
             }
         )
         save_state(state_path, state)
+        if process.returncode != 0 and result.get("status") == "success":
+            raise WorkflowError(
+                f"managed helper exited {process.returncode} despite a success result"
+            )
         if result.get("status") != "success":
             result_task = result.get("task")
             result_task_id = (
@@ -6839,7 +6897,13 @@ def command_agent_task(args: argparse.Namespace) -> None:
             )
             report_content = None
             report = {
-                "outcome": "cleared",
+                "outcome": (
+                    "continue"
+                    if pipeline_mode and remote["commits"] and allowed_iterations > 1
+                    else "max_iterations_reached"
+                    if pipeline_mode and remote["commits"]
+                    else "cleared"
+                ),
                 "iterations_used": 1,
             }
             metadata_result = None
@@ -7104,6 +7168,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         if (
             task_state.get("clear_shared_state_on_apply")
             and not task_state.get("shared_state_cleared")
+            and ACTIVE_GITHUB_MUTATION_POLICY != "source-only"
         ):
             publish_shared_state(
                 pr,
@@ -7239,6 +7304,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
         review["status"] = (
             "resolved"
             if report["outcome"] == "cleared"
+            else "completed"
+            if report["outcome"] == "continue"
             else "max_iterations_reached"
         )
         review["published_head_sha"] = published_head
@@ -7278,7 +7345,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
         for field in ("error", "failed_at", "recovery_files"):
             current["agent_task"].pop(field, None)
         save_state(state_path, current)
-        if report["outcome"] == "cleared":
+        if (
+            report["outcome"] == "cleared"
+            and ACTIVE_GITHUB_MUTATION_POLICY != "source-only"
+        ):
             publish_shared_state(
                 current["pr"],
                 section="self_review",
@@ -7294,35 +7364,41 @@ def command_agent_task(args: argparse.Namespace) -> None:
         )
         save_state(state_path, current)
         result_name = "published" if remote["commits"] else "nothing_to_publish"
-        emit(
-            {
-                "result": result_name,
-                "state": str(state_path),
-                "pr": current["pr"]["pr_url"],
-                "head_sha": published_head,
-                "commits": remote["commits"],
-                "iterations": current["iterations"],
-                "outcome": report["outcome"],
-                **stage_outcome_fields(current),
-                "task": {
-                    "id": remote["task_id"],
-                    "url": remote["task_url"],
-                },
-                "attestation": (
-                    "dispatcher_candidate"
-                    if candidate_flow
-                    else "dispatcher_structural"
-                ),
-                **(
-                    {"coordinator_report": coordinator_report}
-                    if candidate_flow
-                    else {
-                        "metadata": metadata_result,
-                        "findings": report["findings"],
-                    }
-                ),
-            }
-        )
+        payload = {
+            "result": result_name,
+            "state": str(state_path),
+            "pr": current["pr"]["pr_url"],
+            "head_sha": published_head,
+            "commits": remote["commits"],
+            "iterations": current["iterations"],
+            "outcome": report["outcome"],
+            **stage_outcome_fields(current),
+            **(
+                {"stage_outcome": "max_iterations_reached"}
+                if pipeline_mode and report["outcome"] == "max_iterations_reached"
+                else {}
+            ),
+            "task": {
+                "id": remote["task_id"],
+                "url": remote["task_url"],
+            },
+            "attestation": (
+                "dispatcher_candidate"
+                if candidate_flow
+                else "dispatcher_structural"
+            ),
+            **(
+                {"coordinator_report": coordinator_report}
+                if candidate_flow
+                else {
+                    "metadata": metadata_result,
+                    "findings": report["findings"],
+                }
+            ),
+        }
+        if not pipeline_mode:
+            emit(payload)
+        return payload
     except BaseException as error:
         current = load_state(state_path)
         task_state = current.get("agent_task")
@@ -7561,6 +7637,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent_task = subparsers.add_parser(
         "agent-task",
+        aliases=["pipeline"],
         help="run the complete Self Review Loop through a managed GitHub Agent Task",
     )
     agent_task.add_argument(
@@ -7808,12 +7885,15 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
-        if args.command not in {"agent-task", "status", "cleanup"}:
+        if args.command not in {"agent-task", "pipeline", "status", "cleanup"}:
             raise WorkflowError(
                 f"legacy command {args.command!r} is disabled; start a fresh "
                 "agent-task invocation"
             )
-        args.function(args)
+        if args.command == "pipeline":
+            command_pipeline(args)
+        else:
+            args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:
         details = error.details if isinstance(error, WorkflowError) else {}

@@ -23,7 +23,7 @@ The helper runs at most two foreground sweeps in this order:
 4. `ci-fix-loop`
 5. `pr-description`
 
-Each stage owns its internal workflow. A stage that reaches a recorded limit does not block the stages after it. Missing or unreadable stage state, and an Agent Task that still owns recoverable or active state after its stage process returns, block the pipeline instead of starting a duplicate worker. The helper runs a second sweep only when the pull request head or base changed during the first and some stage is not clear at the final revisions. A completed PR Conflict Resolver run is not launched again during that pipeline run.
+The helper invokes each installed Python coordinator directly, not through a model session. Each stage waits for its children and owns one configured iteration allowance for the entire run. Sweeps never reset or multiply it. A nonzero stage exit, missing or unreadable state, or an active child after its coordinator returns blocks the Pipeline. An interruption abandons the run; start from the beginning rather than resuming. The helper runs a second sweep only when the pull request head or base changed during the first and some stage is not clear at the final revisions. A completed PR Conflict Resolver run is not launched again during that pipeline run.
 
 Hosted workers write under `.github/agent-task-output/`. Treat optional `report.md` as free-form advice, never as stage evidence. PR Description alone requires `title.txt` and `body.md`. Do not inspect or trust model-authored findings, explanations, identities, SHAs, paths, commit mappings, validation claims, or canonical reports. The stage coordinators derive the source and GitHub evidence that appears in their status envelopes.
 

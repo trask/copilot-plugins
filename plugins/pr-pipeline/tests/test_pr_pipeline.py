@@ -128,10 +128,10 @@ class GithubMutationPolicyTest(unittest.TestCase):
                         resolve_program=lambda _name: "copilot",
                     )
 
-                prompt = command[command.index("-p") + 1]
-                self.assertIn(
-                    "--github-mutation-policy source-only", prompt
+                self.assertEqual(
+                    "source-only", command[command.index("--github-mutation-policy") + 1]
                 )
+                self.assertNotIn("-p", command)
 
     def test_agent_freezes_caller_mutation_prohibition_at_start(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -670,15 +670,13 @@ class StageContractTest(unittest.TestCase):
         self.assertIn("replaces standalone invocation scope", prompt)
         self.assertIn("Do not pass --new-invocation or --invocation-run", prompt)
 
-    def test_the_conflict_stage_no_longer_takes_a_pipeline_position(self):
-        """PR Conflict Resolver runs once per launch and has no budget to shrink.
-
-        Passing the flags to a helper that rejects them would make every
-        conflict launch die on its own preflight.
-        """
+    def test_the_conflict_stage_receives_the_run_identity(self):
         entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT]
-        self.assertFalse(MODULE.stage_accepts_pipeline_position(entry))
-        self.assertEqual([], MODULE.pipeline_arguments(entry, "run-1", 2))
+        self.assertEqual(
+            ["--pipeline-run", "run-1", "--pipeline-iteration", "2",
+             "--pipeline-max-iterations", "2"],
+            MODULE.pipeline_arguments(entry, "run-1", 2),
+        )
 
     def test_conflict_stage_receives_the_invocation_state_path_explicitly(self):
         entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT]
@@ -698,8 +696,9 @@ class StageContractTest(unittest.TestCase):
                 conflict_strategy="merge",
             )
 
-        self.assertIn(f"--state {expected}", command[2])
-        self.assertIn("--strategy merge", command[2])
+        self.assertEqual(str(expected), command[command.index("--state") + 1])
+        self.assertEqual("merge", command[command.index("--strategy") + 1])
+        self.assertEqual("pipeline", command[2])
 
     def test_ci_stage_runs_the_coordinator_directly_with_exact_state(self):
         entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CI]
@@ -1524,6 +1523,43 @@ class InvocationStateIsolationTest(unittest.TestCase):
 
 
 class RunStageStateIsolationTest(unittest.TestCase):
+    def test_every_stage_invokes_the_installed_coordinator_without_a_model_wrapper(self):
+        for entry in MODULE.STAGES:
+            with self.subTest(stage=entry["stage"]), mock.patch.object(
+                MODULE.common, "stage_script_path", return_value=Path("installed.py")
+            ):
+                command = MODULE.common.stage_command(
+                    entry, target(), model=entry["model"], effort="high",
+                    arguments=["--state", "state with spaces.json"],
+                    repo_root=Path("repo with spaces"),
+                    resolve_program=lambda _name: self.fail("model wrapper launched"),
+                )
+                self.assertEqual(
+                    [MODULE.sys.executable, "installed.py", "pipeline",
+                     "owner/repo#7", "--model", "sol"],
+                    command[:6],
+                )
+                self.assertEqual(
+                    "state with spaces.json", command[command.index("--state") + 1]
+                )
+                self.assertEqual(
+                    "repo with spaces", command[command.index("--repo-root") + 1]
+                )
+
+    def test_coordinator_failure_is_not_translated_from_stdout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "coordinator.py"
+            script.write_text(
+                "print('{\"result\": \"success\"}')\nraise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            result = MODULE.common.run_foreground(
+                [MODULE.sys.executable, str(script)],
+                cwd=root, log_path=root / "stage.log",
+            )
+        self.assertEqual(1, result["returncode"])
+
     def test_ci_progress_reads_the_current_pipeline_state(self):
         entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CI]
         seen = []
@@ -2331,7 +2367,7 @@ class SweepTest(unittest.TestCase):
         self.assertEqual("two_sweeps_finished", result["reason"])
         self.assertEqual(10, len(self.launched))
 
-    def test_nonzero_stage_exit_does_not_block_later_stages(self):
+    def test_nonzero_stage_exit_blocks_later_stages(self):
         original = self.run_stage
 
         def fail_conflict(entry, *args, **kwargs):
@@ -2343,11 +2379,24 @@ class SweepTest(unittest.TestCase):
 
         MODULE.run_stage.side_effect = fail_conflict
         result = self.execute()
-        self.assertEqual("incomplete", result["result"])
+        self.assertEqual("blocked", result["result"])
+        self.assertEqual("stage_execution_failed", result["reason"])
         self.assertEqual(
-            [(stage, 1) for stage in MODULE.STAGE_NAMES],
+            [(MODULE.STAGE_CONFLICT, 1)],
             self.launched,
         )
+
+    def test_failed_coordinator_cannot_clear_a_stage_even_with_a_current_marker(self):
+        def fail_after_marker(entry, *args, **kwargs):
+            result = self.run_stage(entry, *args, **kwargs)
+            result["returncode"] = 1
+            return result
+
+        MODULE.run_stage.side_effect = fail_after_marker
+        result = self.execute()
+        self.assertEqual("blocked", result["result"])
+        self.assertEqual("stage_execution_failed", result["reason"])
+        self.assertEqual([(MODULE.STAGE_CONFLICT, 1)], self.launched)
 
     def test_unsafe_worktree_stops_the_sweep(self):
         MODULE.settle_after_stage.side_effect = None
@@ -2622,8 +2671,9 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertIn("pr_pipeline.py\" start", text)
         self.assertIn("pr_pipeline.py\" watch", text)
         self.assertIn("at most two foreground sweeps", text)
-        self.assertIn("reaches a recorded limit does not block", text)
-        self.assertIn("block the pipeline instead of starting a duplicate worker", text)
+        self.assertIn("A nonzero stage exit", text)
+        self.assertIn("Sweeps never reset or multiply it", text)
+        self.assertIn("an active child after its coordinator returns blocks", text)
         self.assertIn("Run `start` synchronously exactly once", text)
         self.assertIn("`next_watch.arguments`", text)
         self.assertIn("never add or reconstruct a positional target", text)

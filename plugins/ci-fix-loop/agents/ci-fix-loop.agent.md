@@ -64,6 +64,20 @@ The only GitHub changes allowed are verified source pushes and the existing sour
 
 Before importing generated commits, the coordinator locks publication for the exact head repository and branch. It rechecks the frozen remote head and clean local source identity while holding the lock. It imports at most once and pushes with an exact force-with-lease from the frozen head to the verified intended head. A concurrent or stale invocation stops before local import. A lost push response counts as success only when the live remote head exactly equals that invocation's intended head.
 
+## Pipeline integration
+
+Pipeline calls the coordinator's `pipeline` entrypoint directly, not this agent.
+That command waits for the active hosted worker, then observes checks at the
+published head before spending another repair attempt. `--max-iterations` caps
+CI repairs for the entire Pipeline run. Later Pipeline sweeps share the remaining
+budget; `--pipeline-max-iterations` never multiplies it.
+
+The entrypoint accepts a clean detached checkout at the exact pull request head.
+`--github-mutation-policy` accepts only `source-only`, also the default.
+The command keeps this policy throughout the loop, including the empty-commit
+flake fallback. It never requests workflow reruns or changes GitHub metadata.
+An interrupted command fails rather than continuing in a later invocation.
+
 ## Final response
 
 Report the terminal outcome returned by the command. Include the pull request, final head when present, and the coordinator's exact error when it failed. Do not post anything to GitHub.

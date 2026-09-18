@@ -2766,12 +2766,16 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             self.assertNotIn("recovery_command", task)
             self.assertNotIn("retry_command", task)
 
-    def test_completed_helper_returns_captured_output_and_identity(self):
+    def test_active_helper_is_waited_to_completion_before_returning_its_output(self):
         class FakeProcess:
             pid = 23
-            returncode = 0
+            returncode = None
+
+            def __init__(self):
+                self.polls = iter((None, None, 0))
 
             def poll(self):
+                self.returncode = next(self.polls)
                 return self.returncode
 
             def wait(self):
@@ -2812,6 +2816,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                     return_value=self.identity(),
                 ),
                 mock.patch.object(MODULE.time, "monotonic", return_value=0.0),
+                mock.patch.object(MODULE.time, "sleep") as sleep,
             ):
                 result = MODULE.run_hosted_helper(
                     ["helper"],
@@ -2828,6 +2833,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             self.assertEqual(0, result.returncode)
             self.assertEqual("stdout", result.stdout)
             self.assertEqual("stderr", result.stderr)
+            self.assertEqual([mock.call(5), mock.call(5)], sleep.call_args_list)
             task = MODULE.load_state(state_path)["agent_task"]
             self.assertEqual("task-1", task["task_id"])
             self.assertNotIn("semantic_output", task)
@@ -4601,7 +4607,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.50", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.51", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -4656,6 +4662,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("worker prompt version 7", prompt)
         self.assertIn("validate them in this hosted task", prompt)
         self.assertIn("never executes candidate validation commands", prompt)
+        self.assertIn("rerun checks, post comments, reviews or replies", prompt)
+        self.assertIn("resolve threads, change labels, or change any GitHub metadata", prompt)
         self.assertNotIn("AssertionError: expected 2", prompt)
         self.assertIn(MODULE.AGENT_TASK_OUTPUT_REPORT, prompt)
         self.assertNotIn("{{MARKETPLACE_SEMANTIC_PATH}}", prompt)
@@ -7958,6 +7966,12 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
 
     def test_managed_iterations_share_the_budget_and_stop_at_the_cap(self):
+        self.check_managed_iteration_budget(pipeline=False)
+
+    def test_managed_pipeline_sweeps_share_one_budget_without_multiplication(self):
+        self.check_managed_iteration_budget(pipeline=True)
+
+    def check_managed_iteration_budget(self, *, pipeline):
         repo = self.root / "repo"
         repo.mkdir()
         state_path = self.root / "state.json"
@@ -8006,6 +8020,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "--max-iterations",
             "2",
         ]
+        if pipeline:
+            raw_arguments += [
+                "--pipeline-run", "pipeline-run", "--pipeline-max-iterations", "10"
+            ]
         with (
             mock.patch.object(MODULE, "require_tools"),
             mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
@@ -8024,9 +8042,12 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(MODULE, "metadata_for", return_value=preflights[0]["pr"]),
             mock.patch.object(MODULE, "emit") as emit,
         ):
-            for _ in range(3):
+            for sweep in range(1, 4):
                 MODULE.command_agent_task(
-                    MODULE.build_parser().parse_args(raw_arguments)
+                    MODULE.build_parser().parse_args(
+                        raw_arguments
+                        + (["--pipeline-iteration", str(sweep)] if pipeline else [])
+                    )
                 )
 
         self.assertEqual(2, helper_calls)
@@ -8034,6 +8055,72 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         state = MODULE.load_state(state_path)
         self.assertEqual(2, state["iterations"])
         self.assertEqual("max_iterations_reached", state["escalation"]["reason"])
+        if pipeline:
+            self.assertEqual(3, state["pipeline_budget"]["iteration"])
+
+    def test_pipeline_preflight_accepts_only_clean_exact_head_detached_checkouts(self):
+        for branch, head, dirty, message in (
+            ("", self.head, "", None),
+            ("", "9" * 40, "", "HEAD mismatch"),
+            ("other", self.head, "", "branch mismatch"),
+            ("", self.head, " M changed.py", "worktree is not clean"),
+        ):
+            with self.subTest(branch=branch, head=head, dirty=dirty):
+                def git(_repo, *arguments):
+                    return {
+                        ("branch", "--show-current"): branch,
+                        ("rev-parse", "HEAD"): head,
+                        ("status", "--porcelain=v1"): dirty,
+                    }[arguments]
+
+                with (
+                    mock.patch.object(MODULE, "ALLOW_DETACHED_CHECKOUT", True),
+                    mock.patch.object(MODULE, "git", side_effect=git),
+                    mock.patch.object(
+                        MODULE, "metadata_for", return_value=self.preflight["pr"]
+                    ),
+                    mock.patch.object(MODULE, "checkout_pr"),
+                    mock.patch.object(MODULE, "require_fork_head"),
+                    mock.patch.object(MODULE, "find_push_remote"),
+                    mock.patch.object(
+                        MODULE,
+                        "gh_json",
+                        side_effect=[
+                            {"permissions": dict.fromkeys(
+                                ("admin", "maintain", "push", "triage", "pull"), True
+                            )},
+                            {"login": "viewer"},
+                        ],
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "fetch_rollup",
+                        return_value=(self.head, [{"key": "check:green"}]),
+                    ),
+                    mock.patch.object(
+                        MODULE, "decide", return_value={"decision": "green"}
+                    ),
+                    mock.patch.object(MODULE, "check_rollup_identity", return_value=[]),
+                ):
+                    if message:
+                        with self.assertRaisesRegex(MODULE.WorkflowError, message):
+                            MODULE.agent_task_preflight(
+                                self.root, MODULE.parse_target("owner/repo#7")
+                            )
+                    else:
+                        preflight = MODULE.agent_task_preflight(
+                            self.root, MODULE.parse_target("owner/repo#7")
+                        )
+                        self.assertEqual(
+                            {"branch": "", "head": self.head, "status": ""},
+                            preflight["identity"],
+                        )
+
+        with (
+            mock.patch.object(MODULE, "git", return_value=""),
+            self.assertRaisesRegex(MODULE.WorkflowError, "checkout is detached"),
+        ):
+            MODULE.local_identity(self.root)
 
     def test_snapshot_identity_ignores_observation_time(self):
         first = copy.deepcopy(self.preflight["check_snapshot"])
@@ -12474,9 +12561,9 @@ class CommitSuppressionTest(unittest.TestCase):
 
 
 class PipelineBudgetTest(unittest.TestCase):
-    """A stage budget belongs to an outer loop's iteration, not to a launch."""
+    """One CI repair budget covers every sweep of a Pipeline run."""
 
-    RECORDED = {"run": "run-a", "iteration": 2, "baseline": 3, "run_baseline": 1}
+    RECORDED = {"run": "run-a", "iteration": 2, "baseline": 1, "run_baseline": 1}
 
     def scope(self, state, **pipeline):
         return MODULE.pipeline_scope(state, SimpleNamespace(**pipeline))
@@ -12486,10 +12573,8 @@ class PipelineBudgetTest(unittest.TestCase):
 
         The two halves are not symmetric for a reader. An iteration with no run
         asks which run it belongs to and nothing can answer it. A run with no
-        iteration still answers what the token is for, whether this loop has seen
-        the run before, so it scopes on equality alone. Only the outer cap is
-        optional in the other sense: leaving it out falls back rather than lifting
-        the ceiling.
+        iteration still scopes on equality alone. The outer cap never changes
+        the CI repair allowance.
         """
         parts = {
             "run": {"pipeline_run": "run-a"},
@@ -12547,16 +12632,15 @@ class PipelineBudgetTest(unittest.TestCase):
         )
         self.assertEqual((0, 0), MODULE.budget_spent(state, scope))
 
-    def test_the_pipeline_advancing_clears_only_the_per_iteration_budget(self):
-        """The whole-run ceiling must survive an advance, or it bounds nothing."""
+    def test_the_pipeline_advancing_keeps_the_whole_run_budget(self):
         state = {"iterations": 9, "pipeline_budget": dict(self.RECORDED)}
 
         scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
 
         self.assertEqual(
-            {"run": "run-a", "iteration": 3, "baseline": 9, "run_baseline": 1}, scope
+            {"run": "run-a", "iteration": 3, "baseline": 1, "run_baseline": 1}, scope
         )
-        self.assertEqual((0, 8), MODULE.budget_spent(state, scope))
+        self.assertEqual((8, 8), MODULE.budget_spent(state, scope))
 
     def test_a_relaunch_inside_one_iteration_buys_nothing(self):
         state = {"iterations": 9, "pipeline_budget": dict(self.RECORDED)}
@@ -12564,7 +12648,7 @@ class PipelineBudgetTest(unittest.TestCase):
         scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=2)
 
         self.assertEqual(self.RECORDED, scope)
-        self.assertEqual((6, 8), MODULE.budget_spent(state, scope))
+        self.assertEqual((8, 8), MODULE.budget_spent(state, scope))
 
     def test_replaying_an_earlier_iteration_buys_nothing(self):
         """Strictly greater, so a repeat and a replay both buy nothing."""
@@ -12670,7 +12754,7 @@ class PipelineBudgetTest(unittest.TestCase):
                     MODULE.exhausted_budget({"iterations": 5}, scope, 5, 10)
                 )
 
-    def test_only_the_position_the_caller_passes_can_reset_the_budget(self):
+    def test_only_a_different_run_can_reset_the_budget(self):
         """Enumerate the inputs to a reset instead of claiming the property in prose.
 
         A repeat of one position stays inert no matter what this loop did in
@@ -12711,27 +12795,26 @@ class PipelineBudgetTest(unittest.TestCase):
         }
 
         same = self.scope(state, pipeline_run="2026-05-01/7", pipeline_iteration=3)
-        self.assertEqual(2, same["baseline"])
+        self.assertEqual(0, same["baseline"])
         for other in ("2026-05-01/8", "2026-04-01/7", "7", "run", " 2026-05-01/7"):
             with self.subTest(other=other):
                 scope = self.scope(state, pipeline_run=other, pipeline_iteration=3)
                 self.assertEqual(4, scope["baseline"])
                 self.assertEqual(4, scope["run_baseline"])
 
-    def test_an_omitted_outer_cap_falls_back_rather_than_disabling_the_ceiling(self):
-        """Only the outer cap is optional, and omitting it must not remove the bound."""
+    def test_an_omitted_outer_cap_does_not_change_the_ci_cap(self):
         scope = {"run": "run-a", "iteration": 1, "baseline": 0, "run_baseline": 0}
         for value in (None, 0, -1, True, "3"):
             with self.subTest(value=value):
                 self.assertEqual(
-                    5 * MODULE.DEFAULT_PIPELINE_MAX_ITERATIONS,
+                    5,
                     MODULE.absolute_iteration_cap(scope, 5, value),
                 )
 
-    def test_the_ceiling_is_derived_from_the_callers_own_cap(self):
+    def test_the_outer_cap_never_multiplies_the_ci_cap(self):
         scope = {"run": "run-a", "iteration": 1, "baseline": 0, "run_baseline": 0}
-        self.assertEqual(15, MODULE.absolute_iteration_cap(scope, 5, 3))
-        self.assertEqual(20, MODULE.absolute_iteration_cap(scope, 10, 2))
+        self.assertEqual(5, MODULE.absolute_iteration_cap(scope, 5, 3))
+        self.assertEqual(10, MODULE.absolute_iteration_cap(scope, 10, 2))
 
     def test_there_is_no_ceiling_without_a_pipeline(self):
         self.assertIsNone(MODULE.absolute_iteration_cap(None, 5, 3))
@@ -12772,19 +12855,41 @@ class PipelineBudgetTest(unittest.TestCase):
         )
 
     def test_the_running_total_survives_a_pipeline_iteration(self):
-        """The ceiling only bounds anything if the per-iteration reset spares it."""
         state = {"iterations": 0}
         head = 0
-        for iteration in (1, 2):
+        for iteration in (1, 2, 3):
             scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=iteration)
             state["pipeline_budget"] = scope
-            state.pop("charged_head_sha", None)
-            for _ in range(5):
+            scope = MODULE.scoped_budget(state, "pipeline", scope)
+            cap = MODULE.absolute_iteration_cap(scope, 5, 3)
+            for _ in range(3):
+                if MODULE.exhausted_budget(state, scope, 5, cap):
+                    break
                 head += 1
-                MODULE.charge_iteration(state, {"head_sha": f"head{head}"})
-        self.assertEqual(10, state["iterations"])
-        self.assertEqual((5, 10), MODULE.budget_spent(state, scope))
-        self.assertEqual("absolute", MODULE.exhausted_budget(state, scope, 5, 10))
+                MODULE.charge_iteration(
+                    state,
+                    {
+                        "head_sha": f"head{head}",
+                        "budget_charge_key": scope["_charge_key"],
+                        "budget_run_charge_key": scope["_run_charge_key"],
+                        "budget_head_key": scope["_charge_key"],
+                    },
+                )
+        self.assertEqual(5, state["iterations"])
+        self.assertEqual((5, 5), MODULE.budget_spent(state, scope))
+        self.assertEqual("absolute", MODULE.exhausted_budget(state, scope, 5, cap))
+
+    def test_legacy_iteration_baseline_cannot_hide_whole_run_spending(self):
+        state = {
+            "iterations": 9,
+            "pipeline_budget": {
+                "run": "run-a", "iteration": 2, "baseline": 7, "run_baseline": 1
+            },
+        }
+        MODULE.migrate_budget_counters(state)
+        scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
+        scope = MODULE.scoped_budget(state, "pipeline", scope)
+        self.assertEqual((8, 8), MODULE.budget_spent(state, scope))
 
     def test_preflight_takes_the_position_and_defaults_it_to_absent(self):
         parser = MODULE.build_parser()
@@ -12868,11 +12973,10 @@ class BudgetAdvancedTest(unittest.TestCase):
 
     RECORDED = {"run": "run-a", "iteration": 2, "baseline": 3, "run_baseline": 1}
 
-    def test_a_new_run_or_a_later_iteration_both_count_as_an_advance(self):
+    def test_only_a_new_run_counts_as_a_budget_advance(self):
         for scope in (
             {"run": "run-b", "iteration": 1},
-            {"run": "run-a", "iteration": 3},
-            {"run": "run-a", "iteration": 99},
+            {"run": "run-b", "iteration": 99},
         ):
             with self.subTest(scope=scope):
                 self.assertTrue(MODULE.budget_advanced(self.RECORDED, scope))
@@ -12881,6 +12985,8 @@ class BudgetAdvancedTest(unittest.TestCase):
         for recorded, scope in (
             (self.RECORDED, {"run": "run-a", "iteration": 2}),
             (self.RECORDED, {"run": "run-a", "iteration": 1}),
+            (self.RECORDED, {"run": "run-a", "iteration": 3}),
+            (self.RECORDED, {"run": "run-a", "iteration": 99}),
             (self.RECORDED, {"run": "run-a", "iteration": None}),
             (self.RECORDED, None),
             (None, None),
@@ -12888,9 +12994,9 @@ class BudgetAdvancedTest(unittest.TestCase):
             with self.subTest(recorded=recorded, scope=scope):
                 self.assertFalse(MODULE.budget_advanced(recorded, scope))
 
-    def test_a_run_scoped_budget_advances_the_first_time_it_learns_an_iteration(self):
+    def test_learning_an_iteration_does_not_refresh_a_run_scoped_budget(self):
         recorded = {"run": "run-a", "iteration": None, "baseline": 5, "run_baseline": 5}
-        self.assertTrue(MODULE.budget_advanced(recorded, {"run": "run-a", "iteration": 1}))
+        self.assertFalse(MODULE.budget_advanced(recorded, {"run": "run-a", "iteration": 1}))
 
     def test_nothing_recorded_yet_reads_as_an_advance(self):
         self.assertTrue(MODULE.budget_advanced(None, {"run": "run-a", "iteration": 1}))
@@ -13360,8 +13466,7 @@ class PreflightCommandTest(unittest.TestCase):
 
         self.assertEqual(2, moved["iteration"])
 
-    def test_a_pipeline_iteration_frees_the_head_it_already_charged(self):
-        """The per-head charge protects one budget and must not outlive it."""
+    def test_a_pipeline_iteration_keeps_the_head_it_already_charged(self):
         path = self.root / "state.json"
         with contextlib.ExitStack() as stack:
             self.preflight(
@@ -13386,11 +13491,12 @@ class PreflightCommandTest(unittest.TestCase):
             )
 
         self.assertEqual(1, len(MODULE.load_state(path)["budget_charged_heads"]))
-        self.assertEqual(2, advanced["iteration"])
+        self.assertEqual(1, advanced["iteration"])
+        self.assertEqual("reused", advanced["budget_origin"])
         complete = json.loads(
             Path(advanced["preflight_path"]).read_text(encoding="utf-8")
         )
-        self.assertEqual(0, complete["completed_iterations"])
+        self.assertEqual(1, complete["completed_iterations"])
 
     def test_standalone_and_pipeline_budgets_do_not_spend_each_other(self):
         path = self.root / "state.json"
@@ -13620,6 +13726,7 @@ class MainTest(unittest.TestCase):
                     "source-only",
                     MODULE.ACTIVE_GITHUB_MUTATION_POLICY,
                 )
+                self.assertTrue(MODULE.ALLOW_DETACHED_CHECKOUT)
                 written = self.pipeline_state(root, outcome="green")
                 written.replace(state)
                 MODULE.emit(
@@ -13639,6 +13746,87 @@ class MainTest(unittest.TestCase):
             self.assertEqual("pipeline-run", observed[0].pipeline_run)
             self.assertEqual(1, observed[0].pipeline_iteration)
             self.assertEqual("allow", MODULE.ACTIVE_GITHUB_MUTATION_POLICY)
+            self.assertFalse(MODULE.ALLOW_DETACHED_CHECKOUT)
+
+    def test_pipeline_refuses_workflow_reruns_without_a_github_call(self):
+        def rerun(_args):
+            MODULE.rerun_failed_jobs(
+                {"upstream_owner": "owner", "upstream_repo": "repo"}, 7
+            )
+
+        with (
+            mock.patch.object(MODULE, "command_loop", side_effect=rerun),
+            mock.patch.object(MODULE, "run") as run,
+            mock.patch.object(MODULE, "gh_json") as gh_json,
+            self.assertRaisesRegex(MODULE.RerunPermissionDenied, "empty-commit"),
+        ):
+            MODULE.command_pipeline(self.pipeline_args(Path("unused-state.json")))
+
+        run.assert_not_called()
+        gh_json.assert_not_called()
+        self.assertEqual("allow", MODULE.ACTIVE_GITHUB_MUTATION_POLICY)
+        self.assertFalse(MODULE.ALLOW_DETACHED_CHECKOUT)
+
+    def test_pipeline_policy_argument_accepts_only_source_only(self):
+        parser = MODULE.build_parser()
+        arguments = [
+            "pipeline", "owner/repo#7",
+            "--state", "state.json",
+            "--pipeline-run", "run",
+            "--pipeline-iteration", "1",
+            "--pipeline-max-iterations", "2",
+        ]
+        for policy_args in ([], ["--github-mutation-policy", "source-only"]):
+            with self.subTest(policy_args=policy_args):
+                args = parser.parse_args(arguments + policy_args)
+                self.assertEqual("source-only", args.github_mutation_policy)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(arguments + ["--github-mutation-policy", "allow"])
+
+    def test_pipeline_runs_remaining_iterations_before_returning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            state = self.pipeline_state(
+                root, escalation={"reason": "max_iterations_reached"}
+            )
+            args = self.pipeline_args(state)
+            observed = []
+
+            def iteration(iteration_args):
+                self.assertEqual("source-only", MODULE.ACTIVE_GITHUB_MUTATION_POLICY)
+                self.assertIs(args, iteration_args._preflight["caller"])
+                observed.append(iteration_args)
+                MODULE.emit({
+                    "result": (
+                        "published" if len(observed) < 3 else "max_iterations_reached"
+                    ),
+                    "state": str(state),
+                    "task": {"id": f"task-{len(observed)}"},
+                })
+
+            with (
+                mock.patch.object(MODULE, "require_tools"),
+                mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
+                mock.patch.object(
+                    MODULE, "resolve_target",
+                    return_value=MODULE.parse_target(args.target),
+                ),
+                mock.patch.object(
+                    MODULE, "wait_for_stable_ci_preflight",
+                    return_value={"caller": args},
+                ) as checks,
+                mock.patch.object(MODULE, "command_agent_task", side_effect=iteration),
+                mock.patch.object(MODULE, "record_processed_ci_snapshot"),
+            ):
+                code, _ = self.run_main(args)
+
+            self.assertEqual(0, code)
+            self.assertEqual(3, len(observed))
+            self.assertEqual(3, checks.call_count)
+            self.assertEqual("allow", MODULE.ACTIVE_GITHUB_MUTATION_POLICY)
+            self.assertFalse(MODULE.ALLOW_DETACHED_CHECKOUT)
 
     def test_pipeline_validates_every_terminal_outcome(self):
         cases = (

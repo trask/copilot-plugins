@@ -52,9 +52,9 @@ If the bounded wait expires, that invocation is abandoned. A later user action s
 
 Every top-level call gets invocation-local state. Failed or interrupted local owners, prepared results, hosted-task results from older releases, and PR-level legacy state remain immutable audit evidence only. They cannot be resumed, imported, reconciled, replaced, or used to seed a fresh call.
 
-The source-checkout worker remains a Pipeline integration constraint. Candidate-worktree isolation would require coordinated changes to prepared-result publication and Pipeline ownership, so this layer does not attempt it. Pipeline must treat the before and after worktree, source-transition, and GitHub fingerprints as mandatory evidence and must not weaken the source-only policy.
+Pipeline invokes the coordinator's `pipeline` command directly. A clean detached checkout is accepted only for a Pipeline run at the exact pull request head. Its fingerprint binds the worktree and detached HEAD rather than a named branch ref. The worker must keep it detached. Source-transition, GitHub, remote-ref, and publication guards still apply.
 
-The stage's `--max-iterations` value remains the per-iteration limit. An outer loop does not raise or lower that; it bounds what the whole run may spend instead. The coordinator records work equivalent to `progress --state <path> --phase addressing_comments` before the decision session and `progress --state <path> --phase validating` while it validates local artifacts.
+The stage's `--max-iterations` value bounds the entire run. Pipeline sweeps never reset or multiply that allowance. The coordinator waits for each decision session and review monitor, then spends remaining iterations on fresh feedback before returning. The coordinator records work equivalent to `progress --state <path> --phase addressing_comments` before the decision session and `progress --state <path> --phase validating` while it validates local artifacts.
 
 ## Boundaries
 

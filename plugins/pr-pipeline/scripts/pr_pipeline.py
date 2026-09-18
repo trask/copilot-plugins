@@ -607,6 +607,7 @@ def stage_command(
     run_id: str,
     sweep: int,
     conflict_strategy: str = "auto",
+    repo_root: Path | None = None,
 ) -> list[str]:
     arguments = pipeline_arguments(entry, run_id, sweep)
     arguments.extend(
@@ -628,6 +629,7 @@ def stage_command(
         model=model,
         effort=effort,
         arguments=arguments,
+        repo_root=repo_root,
     )
 
 
@@ -664,6 +666,7 @@ def run_stage(
         run_id=run_id,
         sweep=sweep,
         conflict_strategy=conflict_strategy,
+        repo_root=repo_root,
     )
     log_path = stage_log_path(target, run_id, sweep, entry)
     if entry["stage"] != STAGE_CI:
@@ -1023,6 +1026,20 @@ def run_pipeline(
             )
             runs.append(record)
             report_event(report, "stage_finished", run_id=run_id, **record)
+            if launched.get("returncode") != 0:
+                return blocked_result(
+                    pr=current_pr,
+                    run_id=run_id,
+                    sweeps=completed_sweeps,
+                    runs=runs,
+                    stage=entry["stage"],
+                    reason="stage_execution_failed",
+                    detail=(
+                        f"{entry['stage']} exited with code "
+                        f"{launched.get('returncode')}; see {launched.get('log_path')}"
+                    ),
+                    stage_result=after,
+                )
             blocker = stage_blocker(
                 after,
                 after_launch=True,

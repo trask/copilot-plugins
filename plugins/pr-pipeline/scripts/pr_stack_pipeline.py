@@ -755,7 +755,8 @@ STACK_QUERY = (
     "          nodes {"
     "            position"
     "            pullRequest {"
-    "              number title headRefName baseRefName headRefOid isDraft state"
+    "              number title headRefName baseRefName headRefOid mergeable isDraft state"
+    "              baseRef { target { oid } }"
     "            }"
     "          }"
     "        }"
@@ -789,6 +790,8 @@ def parse_stack(raw: Any) -> dict[str, Any] | None:
         head_branch = member.get("headRefName")
         base_branch = member.get("baseRefName")
         head_sha = member.get("headRefOid")
+        base_ref = member.get("baseRef")
+        base_target = base_ref.get("target") if isinstance(base_ref, dict) else None
         if (
             not isinstance(number, int)
             or not isinstance(title, str)
@@ -811,6 +814,8 @@ def parse_stack(raw: Any) -> dict[str, Any] | None:
                 "head_branch": head_branch,
                 "base_branch": base_branch,
                 "head_sha": head_sha,
+                "base_sha": base_target.get("oid") if isinstance(base_target, dict) else None,
+                "mergeable": member.get("mergeable"),
                 "is_draft": bool(member.get("isDraft")),
                 "state": member.get("state"),
             }
@@ -1243,7 +1248,7 @@ class WorkerLauncher:
             model=self.models[request["stage"]],
             effort=self.effort,
             arguments=request["arguments"],
-            prompt=request["prompt"],
+            repo_root=worktree,
         )
         log_path = self.log_path(request)
         record_path = self.record_path(request)
@@ -1287,13 +1292,7 @@ class WorkerLauncher:
         *,
         should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
-        """Require durable evidence that this worker is running before the next.
-
-        The record file and the worker's own log are written to disk, so the
-        evidence survives a crash and can be read again on recovery. A worker
-        that exits before producing either one is a failed launch, not a
-        started one.
-        """
+        """Confirm process startup without requiring coordinator log output."""
         handle = started["handle"]
         record_path = Path(started["record_path"])
         log_path = Path(started["log_path"])
@@ -1303,7 +1302,7 @@ class WorkerLauncher:
                 return {"result": "cancelled"}
             exited = handle.poll()
             log_size = log_path.stat().st_size if log_path.exists() else 0
-            if record_path.is_file() and (log_size > 0 or exited == 0):
+            if record_path.is_file() and exited in {None, 0}:
                 return {
                     "result": "active",
                     "evidence": {
@@ -1319,7 +1318,7 @@ class WorkerLauncher:
                 return {
                     "result": "failed",
                     "reason": "worker_exited_before_readiness",
-                    "detail": f"the worker exited with {exited} before it wrote output",
+                    "detail": f"the worker exited with {exited} during startup",
                 }
             if self.monotonic() >= deadline:
                 return {
@@ -1889,6 +1888,8 @@ class StackPipeline:
                     self.conflict_strategy,
                 ]
             )
+            if scope is not None:
+                arguments.append("--whole-stack")
         return {
             "number": member["number"],
             "stage": stage,
@@ -2063,6 +2064,11 @@ class StackPipeline:
             after_launch=True,
             conflict_strategy=self.conflict_strategy,
         )
+        if completion.get("returncode") != 0:
+            blocker = (
+                "stage_execution_failed",
+                f"{request['stage']} exited with code {completion.get('returncode')}",
+            )
         if blocker is None and stage_result.get("control_reason") == "topology_changed":
             blocker = ("topology_changed", stage_result["detail"])
         if (
@@ -2215,17 +2221,84 @@ class StackPipeline:
         target = common.target_for(self.repository, number)
         return self.inspect(STAGE_BY_NAME[stage], target, head_sha, base_sha)
 
+    def mergeability_clearance(
+        self, member: dict[str, Any], base_sha: str | None
+    ) -> dict[str, Any]:
+        clear = (
+            member.get("state") == "OPEN"
+            and member.get("mergeable") == "MERGEABLE"
+            and base_sha is not None
+            and member.get("base_sha") == base_sha
+        )
+        return {
+            "stage": STAGE_CONFLICT,
+            "clear": clear,
+            "clear_at_head_sha": member["head_sha"] if clear else None,
+            "clear_at_base_sha": base_sha if clear else None,
+            "clearance_kind": "github_mergeability" if clear else None,
+            "outcome": "cleared" if clear else None,
+            "reason": None if clear else "unsupported_partial_selection_conflict",
+            "installed": stage_script_path(STAGE_BY_NAME[STAGE_CONFLICT]).is_file(),
+            "status_state": None,
+            "status": {
+                "mergeable": member.get("mergeable"),
+                "head_sha": member["head_sha"],
+                "base_sha": member.get("base_sha"),
+            },
+        }
+
     # Phases --------------------------------------------------------------
 
     def run_conflict_phase(
         self, pass_number: int, selected: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        """Delegate the whole stack's conflicts once, for the clicked pull request.
-
-        The conflict agent cascades a native stack itself, and that cascade can
-        move members below the click, so dispatching it per member would repeat
-        the same work and fight over the same branches.
-        """
+        """Permit whole-stack publication only for a whole-stack selection."""
+        current = self.revalidate()
+        if (
+            current["result"] != "ready"
+            or current["fingerprint"] != self.state["topology_fingerprint"]
+        ):
+            raise WorkflowError("stack selection changed before conflict dispatch")
+        whole_stack = [
+            member["number"] for member in current["stack"]["members"]
+        ] == self.kickoff["pullRequests"]
+        if not whole_stack:
+            results = [
+                (
+                    member,
+                    self.mergeability_clearance(member, self.base_sha_for(member)),
+                )
+                for member in current["selected"]
+            ]
+            blocked = next(
+                (member for member, result in results if not result["clear"]), None
+            )
+            result = {
+                "phase": STAGE_CONFLICT,
+                "mode": PHASE_STACK_DISPATCH,
+                "dispatches": 0,
+                "completions": [],
+                "clear": blocked is None,
+                "completed": blocked is None,
+                "action": "mergeability_checked",
+                "stopped": None if blocked is None else {
+                    "step": "conflict_scope",
+                    "number": blocked["number"],
+                    "stage": STAGE_CONFLICT,
+                    "reason": "unsupported_partial_selection_conflict",
+                    "detail": (
+                        "the selected suffix is not freshly mergeable at its exact "
+                        "head and base; conflict publication would require "
+                        "authorization for the full native stack"
+                    ),
+                },
+            }
+            self.emit(
+                "phase_finished", pull_request_pass=pass_number,
+                numbers=[member["number"] for member in current["selected"]],
+                **summarize_phase(result),
+            )
+            return result
         clicked = next(
             member
             for member in selected
@@ -2237,17 +2310,19 @@ class StackPipeline:
             "cascade may move members below it. Run PR Conflict Resolver preflight "
             "with --whole-stack."
         )
-        request = self.request_for(clicked, STAGE_CONFLICT, pass_number, scope=scope)
+        requests = [self.request_for(clicked, STAGE_CONFLICT, pass_number, scope=scope)]
+        by_number = {request["number"]: request for request in requests}
         self.emit(
             "phase_started",
             phase=STAGE_CONFLICT,
             pull_request_pass=pass_number,
-            numbers=[clicked["number"]],
+            numbers=list(by_number),
             mode=PHASE_STACK_DISPATCH,
         )
-        launched = self.dispatch([request], STAGE_CONFLICT, pass_number)
+        launched = self.dispatch(requests, STAGE_CONFLICT, pass_number)
         completions = [
-            self.monitor_worker(worker, request) for worker in launched["workers"]
+            self.monitor_worker(worker, by_number[worker["number"]])
+            for worker in launched["workers"]
         ]
         for completion in completions:
             self.record_stage(
@@ -2290,7 +2365,7 @@ class StackPipeline:
                 any(completion.get("accepted") for completion in completions)
                 and all(
                     completion.get("accepted")
-                    and completion.get("returncode") in {None, 0}
+                    and completion.get("returncode") == 0
                     and completion.get("clear")
                     for completion in completions
                 )
@@ -2299,7 +2374,7 @@ class StackPipeline:
         self.emit(
             "phase_finished",
             pull_request_pass=pass_number,
-            numbers=[clicked["number"]],
+            numbers=list(by_number),
             **summarize_phase(result),
         )
         return result
@@ -2755,7 +2830,7 @@ class StackPipeline:
             green = (
                 bool(after["clear"])
                 and completion["accepted"]
-                and completion.get("returncode") in {None, 0}
+                and completion.get("returncode") == 0
             )
             self.record_stage(
                 member["number"],
@@ -2820,6 +2895,9 @@ class StackPipeline:
         if opening["result"] != "ready":
             return {**opening, "result": "incomplete", "revalidation": opening["result"]}
         pull_requests = []
+        whole_stack = [
+            member["number"] for member in opening["stack"]["members"]
+        ] == self.kickoff["pullRequests"]
         for member in opening["selected"]:
             base_sha = self.base_sha_for(member)
             target = common.target_for(self.repository, member["number"])
@@ -2860,7 +2938,9 @@ class StackPipeline:
                     "pull_requests": pull_requests,
                 }
             stages = [
-                self.inspect(entry, target, member["head_sha"], base_sha)
+                self.mergeability_clearance(member, base_sha)
+                if entry["stage"] == STAGE_CONFLICT and not whole_stack
+                else self.inspect(entry, target, member["head_sha"], base_sha)
                 for entry in STAGES
             ]
             for stage in stages:
@@ -3307,7 +3387,7 @@ def summarize_phase(phase: dict[str, Any]) -> dict[str, Any]:
             else bool(accepted)
             and len(accepted) == len(completions)
             and all(
-                completion.get("returncode") in {None, 0}
+                completion.get("returncode") == 0
                 and completion.get("clear")
                 for completion in completions
             )

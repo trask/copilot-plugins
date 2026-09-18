@@ -348,9 +348,10 @@ class ModelTest(unittest.TestCase):
             resolve_program=lambda name: name,
         )
 
-        prompt = command[command.index("-p") + 1]
-        self.assertIn("--github-mutation-policy source-only", prompt)
-        self.assertIn("immutable argument", prompt)
+        self.assertEqual(
+            "source-only", command[command.index("--github-mutation-policy") + 1]
+        )
+        self.assertNotIn("-p", command)
 
     def test_stack_pipeline_freezes_source_only_in_run_state(self):
         previous = COMMON.ACTIVE_GITHUB_MUTATION_POLICY
@@ -447,6 +448,9 @@ class TopologyTest(unittest.TestCase):
                                             "headRefName": "branch-11",
                                             "baseRefName": "main",
                                             "headRefOid": head_of(11),
+                                            "baseRefOid": "a" * 40,
+                                            "baseRef": {"target": {"oid": BASE}},
+                                            "mergeable": "MERGEABLE",
                                             "isDraft": True,
                                             "state": "OPEN",
                                         },
@@ -463,6 +467,9 @@ class TopologyTest(unittest.TestCase):
         )
         self.assertEqual(77, live["number"])
         self.assertEqual([11], [member["number"] for member in live["members"]])
+        self.assertEqual(BASE, live["members"][0]["base_sha"])
+        self.assertEqual("MERGEABLE", live["members"][0]["mergeable"])
+        self.assertIn("baseRef { target { oid } }", MODULE.STACK_QUERY)
 
 
 class StackFixture(unittest.TestCase):
@@ -578,7 +585,7 @@ class StackRunTest(StackFixture):
     # Conflict dispatch -------------------------------------------------
 
     def test_conflicts_are_delegated_once_for_the_clicked_pull_request(self):
-        self.stack = stack(members=(9, 10, 11, 12))
+        self.stack = stack(members=(11, 12))
         pipeline = self.pipeline(kickoff([11, 12]))
         selected = MODULE.validate_selection(pipeline.kickoff, self.stack)["selected"]
 
@@ -591,6 +598,54 @@ class StackRunTest(StackFixture):
         self.assertEqual("pr-conflict-resolver:pr-conflict-resolver", request["agent"])
         self.assertIn("stack 77", request["prompt"])
         self.assertIn("as a whole", request["prompt"])
+        self.assertIn("--whole-stack", request["arguments"])
+
+    def test_partial_selection_never_authorizes_publication_of_unselected_prefix(self):
+        self.stack = stack(members=(9, 10, 11, 12))
+        self.stack["members"][0]["is_draft"] = False
+        pipeline = self.pipeline(kickoff([11, 12]))
+        selected = MODULE.validate_selection(pipeline.kickoff, self.stack)["selected"]
+        for member in selected:
+            member.update(mergeable="MERGEABLE", base_sha=BASE)
+
+        result = pipeline.run_conflict_phase(1, selected)
+
+        self.assertEqual(0, result["dispatches"])
+        self.assertTrue(result["clear"])
+        self.assertEqual([], self.launcher.started)
+
+    def test_partial_selection_blocks_conflicting_unknown_and_stale_metadata(self):
+        for mergeable, base_sha in (
+            ("CONFLICTING", BASE), ("UNKNOWN", BASE), ("MERGEABLE", "a" * 40),
+        ):
+            with self.subTest(mergeable=mergeable, base_sha=base_sha):
+                self.stack = stack(members=(10, 11))
+                member = self.stack["members"][-1]
+                member.update(mergeable=mergeable, base_sha=base_sha)
+                pipeline = self.pipeline(kickoff([11]))
+
+                result = pipeline.run_conflict_phase(1, [member])
+
+                self.assertEqual(
+                    "unsupported_partial_selection_conflict",
+                    result["stopped"]["reason"],
+                )
+                self.assertEqual(0, result["dispatches"])
+                self.assertEqual([], self.launcher.started)
+
+    def test_partial_selection_final_snapshot_rechecks_mergeability(self):
+        self.stack = stack(members=(10, 11))
+        member = self.stack["members"][-1]
+        member.update(mergeable="MERGEABLE", base_sha=BASE)
+        self.clear_everything()
+        pipeline = self.pipeline(kickoff([11]))
+        self.assertEqual("complete", pipeline.final_snapshot()["result"])
+
+        member["mergeable"] = "CONFLICTING"
+
+        result = pipeline.final_snapshot()
+        self.assertEqual("incomplete", result["result"])
+        self.assertIn(MODULE.STAGE_CONFLICT, result["pull_requests"][0]["uncleared"])
 
     # Serialized startup ------------------------------------------------
 
@@ -725,6 +780,20 @@ class StackRunTest(StackFixture):
         )
 
         self.assertEqual("stage_still_active", result["stopped"]["reason"])
+        self.assertEqual("blocked", self.events_named("worker_finished")[0]["status"])
+
+    def test_nonzero_worker_exit_blocks_even_a_current_clearance_marker(self):
+        self.stack = stack(members=(11,))
+        self.inspect_sequences[(11, MODULE.STAGE_COPILOT_REVIEW)] = [
+            {},
+            {"clear": True, "outcome": "cleared"},
+        ]
+        pipeline = self.pipeline(kickoff([11]))
+        with mock.patch.object(self.launcher, "wait", return_value={"returncode": 1}):
+            result = pipeline.run_parallel_phase(
+                MODULE.STAGE_COPILOT_REVIEW, 1, self.stack["members"]
+            )
+        self.assertEqual("stage_execution_failed", result["stopped"]["reason"])
         self.assertEqual("blocked", self.events_named("worker_finished")[0]["status"])
 
     def test_description_without_outcome_has_a_specific_blocking_reason(self):
@@ -1113,16 +1182,17 @@ class StackRunTest(StackFixture):
         )
 
     def test_the_conflict_stage_carries_state_and_strategy(self):
-        """PR Conflict Resolver integrates once per launch and takes no budget.
-
-        Its helper rejects pipeline position flags, but an explicit canonical
-        state path keeps the worker and scheduler on the same durable record.
-        """
         pipeline = self.pipeline(conflict_strategy="merge")
         member = self.stack["members"][0]
         request = pipeline.request_for(member, MODULE.STAGE_CONFLICT, 2)
         self.assertEqual(
             [
+                "--pipeline-run",
+                "run-1",
+                "--pipeline-iteration",
+                "2",
+                "--pipeline-max-iterations",
+                "2",
                 "--state",
                 str(
                     MODULE.stage_state_path(
@@ -1136,6 +1206,14 @@ class StackRunTest(StackFixture):
             ],
             request["arguments"],
         )
+
+    def test_stack_conflict_scope_is_an_explicit_coordinator_argument(self):
+        pipeline = self.pipeline()
+        member = self.stack["members"][0]
+        request = pipeline.request_for(
+            member, MODULE.STAGE_CONFLICT, 1, scope="Resolve the complete native stack"
+        )
+        self.assertIn("--whole-stack", request["arguments"])
 
     def test_taskless_resolver_failures_abandon_the_invocation(self):
         failures = (
@@ -2647,6 +2725,43 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual("failed", ready["result"])
         self.assertEqual("worker_exited_before_readiness", ready["reason"])
 
+    def test_a_silent_live_coordinator_is_ready_while_waiting_for_its_child(self):
+        request = self.request()
+        record = self.launcher.record_path(request)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text("{}", encoding="utf-8")
+        ready = self.launcher.confirm_ready(
+            request,
+            {
+                "handle": FakeHandle(alive_polls=100),
+                "pid": 99,
+                "log_path": self.launcher.log_path(request),
+                "record_path": record,
+            },
+        )
+        self.assertEqual("active", ready["result"])
+        self.assertEqual(0, ready["evidence"]["log_bytes"])
+        self.assertIsNone(ready["evidence"]["exited"])
+
+    def test_nonzero_startup_exit_is_failure_even_with_log_output(self):
+        request = self.request()
+        record = self.launcher.record_path(request)
+        log = self.launcher.log_path(request)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text("{}", encoding="utf-8")
+        log.write_text("success\n", encoding="utf-8")
+        ready = self.launcher.confirm_ready(
+            request,
+            {
+                "handle": FakeHandle(returncode=1),
+                "pid": 99,
+                "log_path": log,
+                "record_path": record,
+            },
+        )
+        self.assertEqual("failed", ready["result"])
+
     def test_readiness_times_out_instead_of_waiting_forever(self):
         request = self.request()
         ready = self.launcher.confirm_ready(
@@ -2753,7 +2868,7 @@ class AgentInstructionTest(unittest.TestCase):
 
     def test_the_agent_owns_no_stage_policy(self):
         self.assertIn("Do not launch stages yourself", self.text)
-        self.assertIn("not app sessions", self.text)
+        self.assertIn("not model wrappers or app sessions", self.text)
         self.assertNotIn("mergeable_at_head_sha", self.text)
         self.assertNotIn("clean_at_head_sha", self.text)
 

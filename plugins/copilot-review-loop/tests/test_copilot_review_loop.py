@@ -2503,7 +2503,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.60")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.61")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -4224,7 +4224,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIsNone(MODULE.exhausted_budget(2, 2, 5, None))
         self.assertEqual(MODULE.exhausted_budget(5, 5, 5, None), "iteration")
         pipeline = {"run": "flight", "iteration": 1, "baseline": 0, "run_baseline": 0}
-        self.assertEqual(MODULE.absolute_iteration_cap(pipeline, 5, 3), 15)
+        self.assertEqual(MODULE.absolute_iteration_cap(pipeline, 5, 3), 5)
 
     def test_clean_no_op_wins_at_cap_but_comments_do_not_start_another_task(self):
         clean_path = self.directory / "clean-at-cap.json"
@@ -7510,6 +7510,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     def test_fresh_review_comments_start_the_next_managed_iteration(self):
         state_path = self.directory / "watch-state.json"
+        events = []
         MODULE.save_state(
             state_path,
             {
@@ -7525,24 +7526,35 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
 
         def complete_watch(_args):
+            events.append("watch")
             state = MODULE.load_state(state_path)
             state["monitoring"] = {
                 "status": "completed",
                 "result": {"result": MODULE.WATCHER_REVIEW_COMMENTS},
             }
             MODULE.save_state(state_path, state)
+            events.append("terminal_review")
 
         arguments = self.arguments(state_path, resume=True)
+        arguments.pipeline_run = "pipeline-run"
+        arguments.pipeline_iteration = 2
+        arguments.pipeline_max_iterations = 2
         with (
             mock.patch.object(MODULE, "command_watch", side_effect=complete_watch),
             mock.patch.object(MODULE, "wait_for_fresh_copilot_state") as fresh,
-            mock.patch.object(MODULE, "command_agent_task") as next_iteration,
+            mock.patch.object(
+                MODULE, "command_agent_task",
+                side_effect=lambda _args: events.append("next_iteration"),
+            ) as next_iteration,
         ):
             MODULE.continue_after_review_request(arguments, state_path)
         fresh.assert_called_once()
         next_arguments = next_iteration.call_args.args[0]
         self.assertFalse(next_arguments.resume)
         self.assertEqual(next_arguments.max_iterations, 5)
+        self.assertEqual("pipeline-run", next_arguments.pipeline_run)
+        self.assertEqual(2, next_arguments.pipeline_iteration)
+        self.assertEqual(["watch", "terminal_review", "next_iteration"], events)
 
     def test_post_apply_review_only_monitor_persists_findings_without_managed_task(
         self,
@@ -8284,6 +8296,23 @@ class TerminalCoordinatorContractTest(unittest.TestCase):
 
         self.assertEqual(0, result)
 
+    def test_pipeline_alias_rejects_success_output_without_terminal_state(self):
+        argv = [str(SCRIPT), "pipeline", "owner/repo#7",
+                "--state", "missing-state.json", "--pipeline-run", "1" * 32]
+        emitted = []
+        with (
+            mock.patch.object(MODULE.sys, "argv", argv),
+            mock.patch.object(
+                MODULE, "command_agent_task",
+                side_effect=lambda _args: MODULE.emit({"result": "success"}),
+            ),
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            self.assertEqual(1, MODULE.main())
+        self.assertEqual("success", emitted[0]["result"])
+        self.assertEqual("error", emitted[-1]["result"])
+        self.assertIn("terminal state identity", emitted[-1]["error"])
+
     def test_nonzero_exit_preserves_an_existing_terminal_reason(self):
         capped = copy.deepcopy(self.state)
         capped["last_result"] = "max_iterations_reached"
@@ -8470,6 +8499,179 @@ class TerminalCoordinatorContractTest(unittest.TestCase):
                 "does not contain a JSON object",
             ):
                 MODULE.load_state(state_path)
+
+
+class DetachedPipelineCheckoutTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        MODULE.git(self.repo, "init", "-b", "feature")
+        MODULE.git(self.repo, "config", "user.name", "Test")
+        MODULE.git(self.repo, "config", "user.email", "test@example.com")
+        (self.repo / "code.txt").write_text("initial\n", encoding="utf-8")
+        MODULE.git(self.repo, "add", "code.txt")
+        MODULE.git(self.repo, "commit", "-m", "Initial")
+        self.head = MODULE.git(self.repo, "rev-parse", "HEAD")
+        MODULE.git(self.repo, "checkout", "--detach", self.head)
+        self.target = MODULE.parse_target("owner/repo#7")
+        self.pr = {
+            **self.target,
+            "state": "OPEN", "is_draft": False, "title": "Title", "body": "",
+            "head_branch": "feature", "head_sha": self.head,
+            "base_branch": "main", "base_sha": "2" * 40,
+            "head_owner": "owner", "head_repo": "repo",
+            "head_repository": "owner/repo",
+            "upstream_owner": "owner", "upstream_repo": "repo",
+        }
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        for name, kwargs in (
+            ("require_tools", {}),
+            ("metadata_for", {"side_effect": lambda _target: dict(self.pr)}),
+            ("remote_head", {"side_effect": lambda *_args: self.pr["head_sha"]}),
+            ("find_push_remote", {"return_value": "origin"}),
+            ("fetch_copilot_threads", {"return_value": ([], [])}),
+            ("fetch_reviews", {"return_value": []}),
+            ("gh_json", {"return_value": {
+                "login": "viewer", "role_name": "write",
+                "permissions": {"admin": False, "maintain": False,
+                                "push": True, "triage": True, "pull": True},
+            }}),
+        ):
+            self.stack.enter_context(mock.patch.object(MODULE, name, **kwargs))
+        policy = MODULE.ACTIVE_GITHUB_MUTATION_POLICY
+        self.addCleanup(setattr, MODULE, "ACTIVE_GITHUB_MUTATION_POLICY", policy)
+
+    def test_exact_head_detached_pipeline_completes_source_only_skip(self):
+        state_path = self.root / "state.json"
+        argv = [
+            str(SCRIPT), "pipeline", "owner/repo#7", "--repo-root", str(self.repo),
+            "--state", str(state_path), "--pipeline-run", "1" * 32,
+            "--pipeline-iteration", "1", "--pipeline-max-iterations", "2",
+            "--github-mutation-policy", "source-only",
+        ]
+        with (
+            mock.patch.object(MODULE.sys, "argv", argv),
+            mock.patch.object(MODULE, "emit") as emitted,
+            mock.patch.object(MODULE, "request_copilot") as request,
+            mock.patch.object(MODULE, "run_local_decision_worker") as worker,
+        ):
+            self.assertEqual(0, MODULE.main())
+            previous = MODULE.load_state(state_path)
+            self.assertEqual(self.head, previous["policy_skip"]["head_sha"])
+            (self.repo / "code.txt").write_text("next stage fix\n", encoding="utf-8")
+            MODULE.git(self.repo, "commit", "-am", "Next stage fix")
+            self.head = MODULE.git(self.repo, "rev-parse", "HEAD")
+            self.pr["head_sha"] = self.head
+            preflight = MODULE.agent_task_preflight(
+                self.repo, self.target, allow_detached=True
+            )
+            for run, iteration in (("1" * 32, 1), ("2" * 32, 2)):
+                with self.subTest(run=run, iteration=iteration), self.assertRaises(
+                    MODULE.WorkflowError
+                ):
+                    MODULE.source_only_policy_skip_head(
+                        previous, preflight, preflight, self.target,
+                        pipeline_run=run, pipeline_iteration=iteration,
+                        state_sha256=None,
+                    )
+            argv[argv.index("--pipeline-iteration") + 1] = "2"
+            self.assertEqual(0, MODULE.main())
+        self.assertEqual("skipped", emitted.call_args.args[0]["stage_outcome"])
+        state = MODULE.load_state(state_path)
+        self.assertEqual(self.head, state["policy_skip"]["head_sha"])
+        self.assertEqual(2, state["pipeline_budget"]["iteration"])
+        self.assertEqual(0, state["iterations"])
+        self.assertIsNone(state["clean_at_head_sha"])
+        self.assertEqual("", MODULE.git(self.repo, "branch", "--show-current"))
+        request.assert_not_called()
+        worker.assert_not_called()
+
+    def test_detached_clearance_keeps_exact_head_and_pipeline_guards(self):
+        preflight = MODULE.agent_task_preflight(
+            self.repo, self.target, allow_detached=True
+        )
+        preflight.update(head_review_clean=True, head_review_id=123)
+        self.assertEqual(
+            self.head,
+            MODULE.empty_queue_clearance_head(
+                None, preflight, preflight, self.target, allow_detached=True
+            ),
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "ownership identity"):
+            MODULE.empty_queue_clearance_head(None, preflight, preflight, self.target)
+        preflight["identity"]["head"] = "3" * 40
+        with self.assertRaisesRegex(MODULE.WorkflowError, "ownership identity"):
+            MODULE.empty_queue_clearance_head(
+                None, preflight, preflight, self.target, allow_detached=True
+            )
+
+    def test_detached_standalone_wrong_head_and_dirty_checkouts_fail(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "requires a Pipeline"):
+            MODULE.agent_task_preflight(self.repo, self.target)
+        self.pr["head_sha"] = "3" * 40
+        with self.assertRaisesRegex(MODULE.WorkflowError, "HEAD mismatch"):
+            MODULE.agent_task_preflight(self.repo, self.target, allow_detached=True)
+        self.pr["head_sha"] = self.head
+        (self.repo / "code.txt").write_text("dirty\n", encoding="utf-8")
+        with self.assertRaisesRegex(MODULE.WorkflowError, "not clean"):
+            MODULE.agent_task_preflight(self.repo, self.target, allow_detached=True)
+
+    def test_detached_fingerprint_binds_worktree_and_preserves_branch_ref(self):
+        before = MODULE.local_source_fingerprint(self.repo)
+        self.assertEqual("", before["branch"])
+        self.assertEqual(str(self.repo), before["worktree"])
+        (self.repo / "code.txt").write_text("fixed\n", encoding="utf-8")
+        MODULE.git(self.repo, "commit", "-am", "Fix")
+        after = MODULE.local_source_fingerprint(self.repo)
+        commits, paths = MODULE.validate_local_source_transition(
+            self.repo, before=before, after=after
+        )
+        self.assertEqual([after["head"]], commits)
+        self.assertEqual({after["head"]: ["code.txt"]}, paths)
+        self.assertEqual(
+            before,
+            MODULE.restore_source_after_invalid_decision(
+                self.repo, before=before, after=after
+            ),
+        )
+        self.assertEqual(self.head, MODULE.git(self.repo, "rev-parse", "feature"))
+        self.assertEqual("", MODULE.git(self.repo, "branch", "--show-current"))
+
+    def test_detached_transition_rejects_branch_and_worktree_drift(self):
+        before = MODULE.local_source_fingerprint(self.repo)
+        for changed in (
+            {**before, "branch": "feature"},
+            {**before, "worktree": str(self.root)},
+            {**before, "status": " M code.txt"},
+        ):
+            with self.subTest(changed=changed), self.assertRaisesRegex(
+                MODULE.WorkflowError, "changed the branch or working tree"
+            ):
+                MODULE.local_source_transition_evidence(
+                    self.repo, before=before, after=changed
+                )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "malformed worktree"):
+            MODULE.local_source_owner_fingerprint(
+                {key: value for key, value in before.items() if key != "worktree"}
+            )
+
+    def test_detached_rollback_refuses_concurrent_head_change(self):
+        before = MODULE.local_source_fingerprint(self.repo)
+        (self.repo / "code.txt").write_text("fixed\n", encoding="utf-8")
+        MODULE.git(self.repo, "commit", "-am", "Fix")
+        after = MODULE.local_source_fingerprint(self.repo)
+        (self.repo / "code.txt").write_text("concurrent\n", encoding="utf-8")
+        MODULE.git(self.repo, "commit", "-am", "Concurrent")
+        concurrent = MODULE.git(self.repo, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(MODULE.WorkflowError, "moved before"):
+            MODULE.restore_source_after_invalid_decision(
+                self.repo, before=before, after=after
+            )
+        self.assertEqual(concurrent, MODULE.git(self.repo, "rev-parse", "HEAD"))
 
 
 class ParseTargetTest(unittest.TestCase):
@@ -12495,10 +12697,34 @@ class PreflightTargetTest(unittest.TestCase):
 
 
 class PipelineBudgetTest(unittest.TestCase):
-    """A stage budget belongs to an outer loop's iteration, not to a launch."""
+    """The stage allowance belongs to the entire Pipeline run."""
 
     def scope(self, state, **pipeline):
         return MODULE.pipeline_scope(state, SimpleNamespace(**pipeline))
+
+    def test_later_sweeps_can_spend_only_the_remaining_five_iteration_allowance(self):
+        state = {"iterations": 0, "budget_scope": "pipeline"}
+        for iteration in range(5):
+            scope = self.scope(
+                state, pipeline_run="run-a",
+                pipeline_iteration=1 if iteration < 3 else 2,
+            )
+            state["pipeline_budget"] = scope
+            scoped = MODULE.scoped_pipeline_budget(state, scope)
+            spent = MODULE.budget_spent(state, scoped, 0)
+            self.assertIsNone(MODULE.exhausted_budget(*spent, 5, 5))
+            MODULE.charge_iteration(state)
+        scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
+        scoped = MODULE.scoped_pipeline_budget(state, scope)
+        self.assertEqual(0, scope["baseline"])
+        self.assertEqual(5, MODULE.budget_spent(state, scoped, 0)[1])
+        self.assertEqual(
+            "absolute",
+            MODULE.exhausted_budget(
+                *MODULE.budget_spent(state, scoped, 0), 5,
+                MODULE.absolute_iteration_cap(scope, 5, 100),
+            ),
+        )
 
     def test_a_standalone_invocation_is_left_exactly_as_it_was(self):
         """Absent arguments must never read as a new run."""
@@ -12544,7 +12770,7 @@ class PipelineBudgetTest(unittest.TestCase):
                 self.assertEqual(scope["baseline"], 7)
                 self.assertEqual(scope["iteration"], 4)
 
-    def test_a_genuine_advance_within_one_run_resets_the_budget(self):
+    def test_a_genuine_advance_within_one_run_preserves_the_budget(self):
         state = {
             "iterations": 9,
             "pipeline_budget": {"run": "run-a", "iteration": 2, "baseline": 7},
@@ -12552,7 +12778,7 @@ class PipelineBudgetTest(unittest.TestCase):
 
         scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
 
-        self.assertEqual(scope["baseline"], 9)
+        self.assertEqual(scope["baseline"], 7)
         self.assertEqual(scope["iteration"], 3)
 
     def test_a_new_run_resets_even_when_its_iteration_went_backwards(self):
@@ -12715,17 +12941,16 @@ class DerivedCeilingTest(unittest.TestCase):
 
         return emit.call_args.args[0]
 
-    def test_the_ceiling_is_derived_from_the_callers_own_cap(self):
-        self.assertEqual(15, MODULE.absolute_iteration_cap(self.SCOPE, 5, 3))
-        self.assertEqual(20, MODULE.absolute_iteration_cap(self.SCOPE, 10, 2))
+    def test_the_ceiling_is_the_stages_own_cap(self):
+        self.assertEqual(5, MODULE.absolute_iteration_cap(self.SCOPE, 5, 3))
+        self.assertEqual(10, MODULE.absolute_iteration_cap(self.SCOPE, 10, 2))
         self.assertIsNone(MODULE.absolute_iteration_cap(None, 5, 3))
 
-    def test_an_omitted_outer_cap_falls_back_rather_than_disabling_the_ceiling(self):
-        """Only the outer cap is optional, and omitting it must not remove the bound."""
+    def test_an_omitted_outer_cap_does_not_change_the_stage_allowance(self):
         for value in (None, 0, -1, True, "3"):
             with self.subTest(value=value):
                 self.assertEqual(
-                    5 * MODULE.DEFAULT_PIPELINE_MAX_ITERATIONS,
+                    5,
                     MODULE.absolute_iteration_cap(self.SCOPE, 5, value),
                 )
 
@@ -12774,13 +12999,12 @@ class DerivedCeilingTest(unittest.TestCase):
         )
 
         self.assertEqual(0, payload["completed_run_iterations"])
-        self.assertEqual(10, payload["absolute_cap"])
+        self.assertEqual(5, payload["absolute_cap"])
         self.assertEqual("absolute", payload["budget_exhausted"])
         self.assertEqual("max_iterations_reached", payload["result"])
 
-    def test_a_genuine_advance_refreshes_only_the_per_iteration_budget(self):
-        """The whole-run ceiling must survive an advance, or it bounds nothing."""
-        state = {"iterations": 9, "pipeline_budget": dict(self.SCOPE)}
+    def test_a_genuine_advance_preserves_both_baselines(self):
+        state = {"iterations": 11, "pipeline_budget": dict(self.SCOPE)}
 
         scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
 
@@ -12857,8 +13081,7 @@ class DerivedCeilingTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn(
-            "An outer loop does not raise or lower that; it bounds what the whole "
-            "run may spend instead.",
+            "Pipeline sweeps never reset or multiply that allowance.",
             instructions,
         )
 
@@ -12869,8 +13092,8 @@ class DerivedCeilingTest(unittest.TestCase):
         self.assertIsNone(bare.pipeline_max_iterations)
 
         source = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("used to derive the ceiling ", source)
-        self.assertIn("rather than to replace the per-iteration budget", source)
+        self.assertIn("advancing it does not refresh", source)
+        self.assertIn("it never multiplies or replaces ", source)
 
 
 class LocalValidationRecordTest(unittest.TestCase):

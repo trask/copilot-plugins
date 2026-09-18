@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
+import copy
 import importlib.util
 import inspect
 import io
@@ -1204,7 +1205,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.62")
+        self.assertEqual(plugin["version"], "1.0.63")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -3311,11 +3312,255 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         update.assert_not_called()
         self.assertEqual("source_only_no_mutation", emitted[-1]["result"])
         self.assertIsNone(emitted[-1]["validated_head_sha"])
+        self.assertEqual("excluded", emitted[-1]["stage_outcome"])
         state = MODULE.load_run_state(index.with_name("owner--repo--7--run-1.json"))
         self.assertEqual(
             "source-only", state["agent_task"]["github_mutation_policy"]
         )
         self.assertNotIn("validated_head_sha", state)
+        self.assertEqual("excluded", MODULE.stage_outcome(state))
+
+    def test_pipeline_waits_for_terminal_proposal_before_returning_excluded(self):
+        report = self.proposal_report(
+            decision="replace", title="Better title", body="Better body"
+        )
+        patches, emitted, _ = self.command_patches(
+            self.result(report), report, self.receipt()
+        )
+        args = MODULE.build_parser().parse_args(
+            [
+                "pipeline", "owner/repo#7",
+                "--state", str(self.directory / "pipeline.json"),
+                "--pipeline-run", "pipeline-1",
+                "--pipeline-iteration", "1",
+                "--pipeline-max-iterations", "2",
+                "--github-mutation-policy", "source-only",
+                "--model", "sol",
+            ]
+        )
+        events = []
+        patches = tuple(p for p in patches if p.attribute != "run")
+
+        def run(command, **kwargs):
+            events.append("child_started")
+            self.assertFalse(emitted)
+            self.assertFalse(MODULE.load_run_state(Path(args.state)).get("validated_head_sha"))
+            result_path = Path(command[command.index("--result-file") + 1])
+            result_path.write_text(json.dumps(self.result(report)), encoding="utf-8")
+            events.append("child_completed")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            stack.enter_context(mock.patch.object(MODULE, "run", side_effect=run))
+            update = stack.enter_context(mock.patch.object(MODULE, "update_pr"))
+            MODULE.command_pipeline(args)
+            events.append("returned")
+        update.assert_not_called()
+        self.assertEqual(["child_started", "child_completed", "returned"], events)
+        self.assertEqual("excluded", emitted[-1]["stage_outcome"])
+        self.assertIsNone(emitted[-1]["validated_head_sha"])
+
+    def test_pipeline_errors_exit_nonzero_without_applying_or_clearing(self):
+        for kind in ("running", "nonzero"):
+            with self.subTest(kind=kind):
+                report = self.proposal_report()
+                result = self.result(report)
+                if kind == "running":
+                    result["task"]["state"] = "running"
+                    result["completion"]["task"]["state"] = "running"
+                patches, emitted, _ = self.command_patches(result, report, self.receipt())
+                patches = tuple(p for p in patches if p.attribute != "run")
+                state_path = self.directory / f"pipeline-{kind}.json"
+                argv = [
+                    str(SCRIPT), "pipeline", "owner/repo#7",
+                    "--state", str(state_path),
+                    "--pipeline-run", "pipeline-1",
+                    "--pipeline-iteration", "1",
+                    "--pipeline-max-iterations", "2",
+                    "--model", "sol",
+                ]
+
+                def run(command, **kwargs):
+                    result_path = Path(command[command.index("--result-file") + 1])
+                    result_path.write_text(json.dumps(result), encoding="utf-8")
+                    return subprocess.CompletedProcess(
+                        command, 9 if kind == "nonzero" else 0, "", ""
+                    )
+
+                with contextlib.ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    stack.enter_context(mock.patch.object(MODULE, "run", side_effect=run))
+                    stack.enter_context(mock.patch.object(MODULE.sys, "argv", argv))
+                    apply = stack.enter_context(mock.patch.object(MODULE, "apply_proposal"))
+                    self.assertEqual(1, MODULE.main())
+                apply.assert_not_called()
+                self.assertEqual("error", emitted[-1]["result"])
+                self.assertIsNone(MODULE.stage_outcome(MODULE.load_run_state(state_path)))
+
+    def test_source_only_index_updates_do_not_publish_shared_github_state(self):
+        state = {"agent_task": {"github_mutation_policy": "source-only"}}
+        with (
+            mock.patch.object(MODULE, "index_lock", return_value=contextlib.nullcontext()),
+            mock.patch.object(MODULE, "update_run_index_unlocked", return_value=({}, True)),
+            mock.patch.object(MODULE, "publish_shared_state") as publish,
+        ):
+            MODULE.reserve_agent_task_run(Path("index"), Path("run"), state)
+            MODULE.update_run_index(Path("index"), Path("run"), state)
+        publish.assert_not_called()
+
+    def pipeline_arguments(self):
+        return MODULE.build_parser().parse_args(
+            [
+                "pipeline", "owner/repo#7",
+                "--state", str(self.directory / "pipeline.json"),
+                "--pipeline-run", "pipeline-1",
+                "--pipeline-iteration", "1",
+                "--pipeline-max-iterations", "2",
+                "--github-mutation-policy", "source-only",
+                "--model", "sol",
+                "--preserve-artifacts",
+            ]
+        )
+
+    def test_pipeline_reuses_run_state_for_a_completed_changed_head_sweep(self):
+        report = self.proposal_report()
+        patches, emitted, _ = self.command_patches(
+            self.result(report), report, self.receipt()
+        )
+        args = self.pipeline_arguments()
+        recommended_title = self.preflight["pr"]["title"]
+        self.identity["head"] = self.preflight["pr"]["head_sha"]
+
+        def run(command, **kwargs):
+            self.helper_commands.append(command)
+            result = self.result(report)
+            result["application"]["final_local_head"] = self.identity["head"]
+            result_path = Path(command[command.index("--result-file") + 1])
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        def output(repository, path, sha, **kwargs):
+            value = (
+                recommended_title
+                if path == MODULE.AGENT_TASK_OUTPUT_TITLE
+                else self.preflight["pr"]["body"]
+            )
+            return (value + "\n").encode()
+
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            stack.enter_context(mock.patch.object(MODULE, "run", side_effect=run))
+            stack.enter_context(mock.patch.object(MODULE, "fetch_committed_bytes", side_effect=output))
+            stack.enter_context(
+                mock.patch.object(
+                    MODULE, "metadata_for",
+                    side_effect=lambda _: pr_metadata(head_sha=self.preflight["pr"]["head_sha"]),
+                )
+            )
+            update = stack.enter_context(mock.patch.object(MODULE, "update_pr"))
+            MODULE.command_pipeline(args)
+            first = MODULE.load_run_state(Path(args.state))
+            first_artifacts = {
+                artifact["path"]: Path(artifact["path"]).read_bytes()
+                for artifact in first["agent_task"]["preserved_artifacts"]
+            }
+            self.assertEqual("cleared", emitted[-1]["stage_outcome"])
+            args.pipeline_iteration = 2
+            before = Path(args.state).read_bytes()
+            with self.assertRaisesRegex(MODULE.WorkflowError, "already evaluated"):
+                MODULE.command_pipeline(args)
+            self.assertEqual(before, Path(args.state).read_bytes())
+            self.assertEqual(1, len(self.helper_commands))
+            self.preflight["pr"]["head_sha"] = "9" * 40
+            self.preflight["pr"]["head"]["sha"] = "9" * 40
+            self.identity["head"] = "9" * 40
+            recommended_title = "Title for the changed head"
+            stack.enter_context(mock.patch.object(MODULE.secrets, "token_hex", return_value="run-2"))
+            MODULE.command_pipeline(args)
+        update.assert_not_called()
+        second = MODULE.load_run_state(Path(args.state))
+        self.assertEqual(2, len(self.helper_commands))
+        self.assertEqual(str(args.state), emitted[0]["state"])
+        self.assertEqual(str(args.state), emitted[1]["state"])
+        self.assertEqual("pipeline-1", second["pipeline_run"])
+        self.assertEqual(2, second["pipeline_iteration"])
+        self.assertEqual("9" * 40, second["pr"]["head_sha"])
+        self.assertEqual("excluded", emitted[-1]["stage_outcome"])
+        self.assertIsNone(emitted[-1]["validated_head_sha"])
+        self.assertNotIn("validated_head_sha", second)
+        self.assertEqual(
+            [{**first["agent_task"], "run_id": first["run_id"], "pipeline_iteration": 1}],
+            second["agent_task_history"],
+        )
+        for path, content in first_artifacts.items():
+            self.assertEqual(content, Path(path).read_bytes())
+
+    def test_later_sweep_keeps_same_head_source_only_proposal_excluded(self):
+        report = self.proposal_report(
+            decision="replace", title="Better title", body="Better body"
+        )
+        patches, emitted, _ = self.command_patches(
+            self.result(report), report, self.receipt()
+        )
+        args = self.pipeline_arguments()
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            update = stack.enter_context(mock.patch.object(MODULE, "update_pr"))
+            MODULE.command_pipeline(args)
+            before = Path(args.state).read_bytes()
+            args.pipeline_iteration = 2
+            MODULE.command_pipeline(args)
+        self.assertEqual(before, Path(args.state).read_bytes())
+        self.assertEqual(1, len(self.helper_commands))
+        self.assertEqual(["excluded", "excluded"], [
+            item["stage_outcome"] for item in emitted
+        ])
+        self.assertIsNone(emitted[-1]["validated_head_sha"])
+        update.assert_not_called()
+
+    def test_pipeline_rejects_foreign_or_unfinished_sweep_state_before_dispatch(self):
+        mutations = {
+            "wrong run": lambda state: state.update(pipeline_run="other-run"),
+            "standalone": lambda state: state.pop("pipeline_run"),
+            "same sweep": lambda state: state.update(pipeline_iteration=2),
+            "active": lambda state: state["agent_task"].update(status="running"),
+            "interrupted": lambda state: state["agent_task"].update(status="reserved"),
+            "failed": lambda state: state["agent_task"].update(status="failed"),
+            "nonterminal child": lambda state: state["agent_task"]["task"].update(state="running"),
+            "wrong policy": lambda state: state["agent_task"].update(github_mutation_policy="allow"),
+            "wrong model": lambda state: state["agent_task"].update(model="gpt-5.6-terra"),
+            "wrong sweep cap": lambda state: state.update(pipeline_max_iterations=3),
+            "wrong PR": lambda state: state["pr"].update(
+                number=8, url="https://github.com/owner/repo/pull/8"
+            ),
+        }
+        report = self.proposal_report()
+        patches, _, _ = self.command_patches(self.result(report), report, self.receipt())
+        args = self.pipeline_arguments()
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            MODULE.command_pipeline(args)
+            completed = MODULE.load_run_state(Path(args.state))
+            args.pipeline_iteration = 2
+            dispatch = stack.enter_context(mock.patch.object(MODULE, "run"))
+            preflight = stack.enter_context(mock.patch.object(MODULE, "agent_task_preflight"))
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    state = copy.deepcopy(completed)
+                    mutate(state)
+                    MODULE.save_state(Path(args.state), state)
+                    before = Path(args.state).read_bytes()
+                    with self.assertRaises(MODULE.WorkflowError):
+                        MODULE.command_pipeline(args)
+                    self.assertEqual(before, Path(args.state).read_bytes())
+            dispatch.assert_not_called()
+            preflight.assert_not_called()
 
 
 class RecommendationContractTest(unittest.TestCase):

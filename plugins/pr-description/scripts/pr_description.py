@@ -1043,7 +1043,9 @@ def update_run_index(index_path: Path, run_path: Path, state: dict[str, Any]) ->
         index, validation_changed = update_run_index_unlocked(
             index_path, run_path, state
         )
-    if validation_changed:
+    if validation_changed and (
+        (state.get("agent_task") or {}).get("github_mutation_policy") != "source-only"
+    ):
         publish_shared_state(
             index["pr"],
             section="description",
@@ -4684,7 +4686,9 @@ def reserve_agent_task_run(
         index, validation_changed = update_run_index_unlocked(
             index_path, run_path, state
         )
-    if validation_changed:
+    if validation_changed and (
+        (state.get("agent_task") or {}).get("github_mutation_policy") != "source-only"
+    ):
         publish_shared_state(
             index["pr"],
             section="description",
@@ -4694,8 +4698,25 @@ def reserve_agent_task_run(
         )
 
 
+def command_pipeline(args: argparse.Namespace) -> None:
+    if (
+        not args.target
+        or not args.state
+        or not args.pipeline_run
+        or not args.pipeline_iteration
+        or not args.pipeline_max_iterations
+        or args.pipeline_iteration < 1
+        or args.pipeline_max_iterations < args.pipeline_iteration
+    ):
+        raise WorkflowError("pipeline requires a target, state, and valid run position")
+    args._pipeline = True
+    command_agent_task(args)
+
+
 def command_agent_task(args: argparse.Namespace) -> None:
-    github_mutation_policy = getattr(args, "github_mutation_policy", None) or "allow"
+    github_mutation_policy = getattr(args, "github_mutation_policy", None) or (
+        "source-only" if getattr(args, "pipeline_run", None) else "allow"
+    )
     prepare_only = bool(getattr(args, "prepare_only", False))
     apply_prepared = bool(getattr(args, "apply_prepared", False))
     has_recovery_gate = any(
@@ -4749,11 +4770,52 @@ def command_agent_task(args: argparse.Namespace) -> None:
     require_outside_repository(path, repo_root)
     if path.resolve() == index_path.resolve():
         raise WorkflowError("invocation state must not replace the PR audit index")
+    pipeline_mode = bool(getattr(args, "_pipeline", False))
+    previous = None
     if path.exists():
-        raise WorkflowError(
-            f"invocation state already exists and is audit-only: {path}"
-        )
+        if not pipeline_mode:
+            raise WorkflowError(
+                f"invocation state already exists and is audit-only: {path}"
+            )
+        previous = load_run_state(path)
+        if target_from_state(previous) != target:
+            raise WorkflowError("pipeline state belongs to a different pull request")
+        if previous.get("pipeline_run") != args.pipeline_run:
+            raise WorkflowError("pipeline state belongs to a different run")
+        prior_iteration = previous.get("pipeline_iteration")
+        if (
+            type(prior_iteration) is not int
+            or not 1 <= prior_iteration < args.pipeline_iteration
+            or previous.get("pipeline_max_iterations") != args.pipeline_max_iterations
+        ):
+            raise WorkflowError("pipeline state requires a later sweep in the same run")
+        prior_task = previous.get("agent_task") or {}
+        if (
+            prior_task.get("status") != "completed"
+            or (prior_task.get("task") or {}).get("state") != "completed"
+        ):
+            raise WorkflowError(
+                "pipeline state is unfinished audit evidence; start a fresh run"
+            )
+        if prior_task.get("github_mutation_policy") != github_mutation_policy:
+            raise WorkflowError("pipeline GitHub mutation policy changed")
+        if prior_task.get("model") != MODEL_ALIASES[args.model]:
+            raise WorkflowError("pipeline worker model changed")
     preflight = agent_task_preflight(repo_root, target)
+    if previous is not None and previous["pr"]["head_sha"] == preflight["pr"]["head_sha"]:
+        if stage_outcome(previous) == "excluded":
+            emit(
+                {
+                    "result": "source_only_no_mutation",
+                    "state": str(path),
+                    "pr": target["pr_url"],
+                    "head_sha": preflight["pr"]["head_sha"],
+                    "validated_head_sha": None,
+                    "stage_outcome": "excluded",
+                }
+            )
+            return
+        raise WorkflowError("pipeline description was already evaluated at this head")
     preflight["changed_files"] = pull_request_file_paths(preflight)
     pr = preflight["pr"]
     requested_model = MODEL_ALIASES[args.model]
@@ -4774,15 +4836,42 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "github_mutation_policy": github_mutation_policy,
         },
     }
-    create_state(path, state)
+    if pipeline_mode:
+        state.update(
+            {
+                "pipeline_run": args.pipeline_run,
+                "pipeline_iteration": args.pipeline_iteration,
+                "pipeline_max_iterations": args.pipeline_max_iterations,
+            }
+        )
+    if previous is None:
+        create_state(path, state)
+    else:
+        state["agent_task_history"] = [
+            *(previous.get("agent_task_history") or []),
+            {
+                **previous["agent_task"],
+                "run_id": previous["run_id"],
+                "pipeline_iteration": previous["pipeline_iteration"],
+            },
+        ]
+        with index_lock(path):
+            if load_run_state(path) != previous:
+                raise WorkflowError("pipeline state changed before the next sweep")
+            save_state(path, state)
     try:
         reserve_agent_task_run(index_path, path, state)
-    except BaseException:
-        path.unlink(missing_ok=True)
+    except BaseException as error:
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            state["agent_task"].update({"status": "failed", "error": str(error)})
+            save_state(path, state)
         raise
+    artifact_stem = f"{path.stem}--{run_id}" if pipeline_mode else path.stem
     artifacts = {
-        "prompt": path.with_name(f"{path.stem}--agent-task-prompt.txt"),
-        "result": path.with_name(f"{path.stem}--agent-task-result.json"),
+        "prompt": path.with_name(f"{artifact_stem}--agent-task-prompt.txt"),
+        "result": path.with_name(f"{artifact_stem}--agent-task-result.json"),
     }
 
     def record_failure(error: BaseException) -> None:
@@ -4861,6 +4950,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
             requested_model=requested_model,
             identity=identity,
         )
+        if process.returncode != 0 and result.get("status") == "success":
+            raise WorkflowError(
+                f"managed cloud helper exited {process.returncode} despite a success result"
+            )
         if process.returncode != 0 or result.get("status") != "success":
             raise task_failure_from_result(result)
         remote = validate_success_result(
@@ -4979,6 +5072,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "title": action["title"],
                 "body": action["body"],
                 "validated_head_sha": action["validated_head_sha"],
+                "stage_outcome": (
+                    "excluded"
+                    if action["result"] == "source_only_no_mutation"
+                    else "cleared"
+                ),
             }
         )
     except BaseException as error:
@@ -5011,30 +5109,17 @@ def recorded_validated_head_sha(state: dict[str, Any]) -> str | None:
 
 
 def stage_outcome(state: dict[str, Any]) -> str | None:
-    """Name this run's ending in the vocabulary an orchestrator records.
-
-    `apply` and `validate` are the only commands that record an ending, so
-    `cleared` is the only word this state can support, and it is read straight
-    off the same validated-at-head record a reader consults for whether the
-    description is settled. Both endings count, because a description this run
-    replaced and one it confirmed unchanged are equally settled. This says how
-    the run ended. It never says whether the description is settled.
-
-    Returning `None` means this state supports no claim about an ending, and the
-    field is then left out so a reader sees an absent answer rather than a
-    manufactured one. State exists from the moment `preflight` writes it, so a
-    run killed at any point leaves exactly the same state as a run still in
-    flight. Nothing in that state distinguishes them, so neither is
-    `no_progress`, which asserts that a run ran to completion and settled
-    nothing. Only the agent that watched the run can support that claim, and it
-    reports it through the orchestrator's own `finish`.
-
-    A reader is entitled to take any value it finds at face value, so a value
-    this function cannot support must not appear at all.
-    """
+    """Report a verified description or an excluded source-only replacement."""
 
     if recorded_validated_head_sha(state) is not None:
         return "cleared"
+    task = state.get("agent_task") or {}
+    if (
+        task.get("status") == "completed"
+        and task.get("github_mutation_policy") == "source-only"
+        and task.get("decision") == "replace"
+    ):
+        return "excluded"
     return None
 
 
@@ -5181,6 +5266,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent_task = subparsers.add_parser(
         "agent-task",
+        aliases=["pipeline"],
         help="analyze and update a pull request through the managed Agent Tasks worker",
     )
     agent_task.add_argument(
@@ -5194,10 +5280,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_task.add_argument("--repo-root")
     agent_task.add_argument(
         "--state",
-        help=(
-            "exact retained run state path; valid with --resume or "
-            "--apply-prepared"
-        ),
+        help="external state path; fresh for standalone, run-bound for Pipeline",
     )
     agent_task.add_argument(
         "--resume",
@@ -5233,7 +5316,6 @@ def build_parser() -> argparse.ArgumentParser:
     agent_task.add_argument(
         "--github-mutation-policy",
         choices=("allow", "source-only"),
-        default="allow",
     )
     agent_task.add_argument("--recovery-state-sha256")
     agent_task.add_argument("--recovery-prompt-sha256")
@@ -5242,9 +5324,9 @@ def build_parser() -> argparse.ArgumentParser:
     agent_task.add_argument("--recovery-request-id")
     agent_task.add_argument("--recovery-generated-head")
     agent_task.add_argument("--recovery-report-sha256")
-    agent_task.add_argument("--pipeline-run", help=argparse.SUPPRESS)
-    agent_task.add_argument("--pipeline-iteration", help=argparse.SUPPRESS)
-    agent_task.add_argument("--pipeline-max-iterations", help=argparse.SUPPRESS)
+    agent_task.add_argument("--pipeline-run", help="opaque Pipeline run identity")
+    agent_task.add_argument("--pipeline-iteration", type=int, help="current Pipeline sweep")
+    agent_task.add_argument("--pipeline-max-iterations", type=int, help="Pipeline sweep limit")
     agent_task.set_defaults(function=command_agent_task)
 
     archive_taskless = subparsers.add_parser(
@@ -5333,12 +5415,15 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
-        if args.command not in {"agent-task", "status", "cleanup"}:
+        if args.command not in {"agent-task", "pipeline", "status", "cleanup"}:
             raise WorkflowError(
                 f"legacy command {args.command!r} is disabled; start a fresh "
                 "agent-task invocation"
             )
-        args.function(args)
+        if args.command == "pipeline":
+            command_pipeline(args)
+        else:
+            args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:
         payload = {"result": "error", "error": str(error)}

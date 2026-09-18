@@ -27,11 +27,15 @@ flowchart LR
 
 The scheduler runs these stages in order. A second sweep starts only when the head or base changed during the first sweep and at least one stage is not clear at the final revisions. Once Conflict Resolver records a mechanically valid result for the current head and base, or GitHub already reports the pull request mergeable, that stage is clear. A completed resolver is not launched again in the same Pipeline run.
 
+Every stage is an installed Python coordinator subprocess. No model translates its command or exit status. Each coordinator waits for child completion and consumes its own configured iteration allowance. That allowance belongs to the entire run and is neither reset nor multiplied by sweeps. A nonzero exit or unfinished child blocks the Pipeline even if a clearance marker exists. An interrupted run is abandoned; a later invocation starts from the beginning.
+
 Every stage launch and status read uses a state path derived from the Pipeline run ID. The helpers never fall back to pull-request-wide state. A status envelope must name the exact state file and pull request before its current-head marker can clear a stage. Conflict Resolver also binds the current base. Old owners, reports, results, and clearances cannot enter a fresh run.
 
 `start` creates a random run ID and a versioned monitor handle. The handle binds the canonical target, launch record, and progress log. Each unfinished `watch` response returns the complete arguments for the next call. Callers pass those arguments unchanged. The helpers do not scan for a latest run or reconstruct a target from shared state.
 
 Stack Pipeline uses the same rules. Each run has its own scheduler state, monitor handle, stage state files, worker records, and worktrees. A stack-wide lock permits one active owner for the selected suffix, but no new run resumes or imports a sealed run. Each worker request binds one run ID, nonce, head, base, and role. Native-stack Conflict Resolver requests keep each role on its request-bound ref.
+
+Only a full native-stack selection authorizes `--whole-stack` conflict publication. A partial suffix never launches the conflict coordinator. Fresh GitHub mergeability clears each selected member only at its exact head and base. Conflicting, unknown, or stale metadata blocks rather than changing an unselected prefix.
 
 ## Hosted outputs
 

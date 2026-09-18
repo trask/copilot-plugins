@@ -2218,7 +2218,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.40")
+        self.assertEqual(plugin["version"], "1.3.41")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -4121,6 +4121,258 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             [call.kwargs["value"] for call in publish_shared_state.call_args_list],
             [None, self.head],
         )
+
+    @contextlib.contextmanager
+    def pipeline_run(
+        self, *, fixes=1, exit_code=0, task_state="completed", max_iterations=3
+    ):
+        args = MODULE.build_parser().parse_args(
+            [
+                "pipeline", "owner/repo#7",
+                "--state", str(self.directory / "pipeline.json"),
+                "--pipeline-run", "pipeline-1",
+                "--pipeline-iteration", "1",
+                "--pipeline-max-iterations", "2",
+                "--max-iterations", str(max_iterations),
+                "--github-mutation-policy", "source-only",
+                "--model", "sol",
+            ]
+        )
+        live = copy.deepcopy(self.preflight["pr"])
+        identity = {**self.preflight["identity"], "branch": ""}
+        commands, emitted = [], []
+
+        def preflight(*args, **kwargs):
+            self.assertTrue(kwargs["allow_detached"])
+            self.head = live["head_sha"]
+            self.preflight = {
+                **self.preflight,
+                "pr": copy.deepcopy(live),
+                "identity": dict(identity),
+            }
+            return copy.deepcopy(self.preflight)
+
+        def run(command, **kwargs):
+            if "--result-file" in command:
+                self.assertEqual(live["head_sha"], identity["head"])
+                self.assertFalse(emitted)
+                commands.append(command)
+                state = MODULE.load_state(Path(args.state))
+                self.assertEqual(len(commands) - 1, state["iterations"])
+                self.assertEqual(
+                    max_iterations - len(commands) + 1,
+                    state["agent_task"]["allowed_iterations"],
+                )
+                self.assertEqual("sol", command[command.index("--model") + 1])
+                prompt = Path(command[command.index("--prompt-file") + 1])
+                self.assertIn(
+                    '"maximum_review_iterations": 1',
+                    prompt.read_text(encoding="utf-8"),
+                )
+                commits = (
+                    [f"{len(commands) + 5:040x}"] if len(commands) <= fixes else []
+                )
+                result = self.candidate_result(commits=commits)
+                result["task"]["state"] = task_state
+                result["completion"]["task"]["state"] = task_state
+                result_path = Path(command[command.index("--result-file") + 1])
+                result_path.write_text(json.dumps(result), encoding="utf-8")
+                return MODULE.subprocess.CompletedProcess(command, exit_code, "", "")
+            if "merge" in command:
+                identity["head"] = command[-1]
+            elif "push" in command:
+                live["head_sha"] = identity["head"]
+            else:
+                self.fail(f"unexpected command: {command}")
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(MODULE, "agent_task_preflight", side_effect=preflight),
+            mock.patch.object(
+                MODULE, "discover_cloud_task", return_value=self.directory / "runtime.py"
+            ),
+            mock.patch.object(MODULE, "run", side_effect=run),
+            mock.patch.object(MODULE, "local_identity", side_effect=lambda _: dict(identity)),
+            mock.patch.object(
+                MODULE, "validate_candidate_history",
+                side_effect=lambda *a, **kw: {
+                    sha: ["src/app.py"] for sha in kw["remote"]["commits"]
+                },
+            ),
+            mock.patch.object(MODULE, "metadata_for", side_effect=lambda _: dict(live)),
+            mock.patch.object(MODULE, "remote_head", side_effect=lambda *a: live["head_sha"]),
+            mock.patch.object(
+                MODULE, "wait_for_remote_head", side_effect=lambda *a: live["head_sha"]
+            ),
+            mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
+            mock.patch.object(MODULE, "publish_shared_state") as shared,
+            mock.patch.object(MODULE, "emit", emitted.append),
+            mock.patch.object(MODULE, "update_pr_metadata") as metadata,
+        ):
+            yield args, commands, emitted
+            shared.assert_not_called()
+            metadata.assert_not_called()
+
+    def test_pipeline_waits_for_fixes_then_a_terminal_clean_pass(self):
+        with self.pipeline_run() as (args, commands, emitted):
+            MODULE.command_pipeline(args)
+            self.assertEqual(2, len(commands))
+            self.assertEqual(1, len(emitted))
+            self.assertEqual("published", emitted[0]["result"])
+            self.assertEqual("cleared", emitted[0]["stage_outcome"])
+            self.assertEqual(2, emitted[0]["iterations"])
+            self.assertEqual(1, len(emitted[0]["commits"]))
+            self.assertEqual(2, len(emitted[0]["tasks"]))
+            state = MODULE.load_state(Path(args.state))
+            self.assertEqual("", state["agent_task"]["preflight"]["identity"]["branch"])
+            self.assertEqual(state["pr"]["head_sha"], MODULE.recorded_clean_at_head_sha(state))
+
+    def test_pipeline_spends_its_budget_once_across_all_sweeps(self):
+        with self.pipeline_run(fixes=5) as (args, commands, emitted):
+            MODULE.command_pipeline(args)
+            self.assertEqual(3, len(commands))
+            self.assertEqual("max_iterations_reached", emitted[-1]["stage_outcome"])
+            self.assertIsNone(MODULE.recorded_clean_at_head_sha(MODULE.load_state(Path(args.state))))
+            args.pipeline_iteration = 2
+            MODULE.command_pipeline(args)
+            self.assertEqual(3, len(commands))
+            self.assertEqual(3, emitted[-1]["iterations"])
+            self.assertEqual("max_iterations_reached", emitted[-1]["stage_outcome"])
+
+    def test_pipeline_charges_one_iteration_per_candidate_until_fifth_clean_pass(self):
+        with self.pipeline_run(fixes=4, max_iterations=5) as (args, commands, emitted):
+            MODULE.command_pipeline(args)
+            self.assertEqual(5, len(commands))
+            self.assertEqual(1, len(emitted))
+            self.assertEqual(5, emitted[0]["iterations"])
+            self.assertEqual(4, len(emitted[0]["commits"]))
+            self.assertEqual(5, len(emitted[0]["tasks"]))
+            self.assertEqual("cleared", emitted[0]["stage_outcome"])
+
+    def test_pipeline_rejects_nonzero_exit_even_with_success_result(self):
+        with self.pipeline_run(exit_code=9) as (args, commands, emitted):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "exited 9"):
+                MODULE.command_pipeline(args)
+            self.assertEqual(1, len(commands))
+            self.assertFalse(emitted)
+            state = MODULE.load_state(Path(args.state))
+            self.assertEqual("failed", state["agent_task"]["status"])
+            self.assertEqual(0, state["iterations"])
+            self.assertIsNone(MODULE.recorded_clean_at_head_sha(state))
+
+    def test_pipeline_cli_returns_nonzero_for_execution_errors(self):
+        argv = [
+            str(SCRIPT), "pipeline", "owner/repo#7",
+            "--state", str(self.directory / "pipeline.json"),
+            "--pipeline-run", "pipeline-1",
+            "--pipeline-iteration", "1",
+            "--pipeline-max-iterations", "2",
+            "--model", "sol",
+        ]
+        with (
+            mock.patch.object(MODULE.sys, "argv", argv),
+            mock.patch.object(
+                MODULE, "command_agent_task",
+                side_effect=MODULE.WorkflowError("managed helper exited 9"),
+            ) as child,
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            self.assertEqual(1, MODULE.main())
+        self.assertTrue(child.call_args.args[0]._pipeline)
+        self.assertEqual("error", emit.call_args.args[0]["result"])
+
+    def test_pipeline_rejects_running_result_without_import_or_next_pass(self):
+        with self.pipeline_run(task_state="running") as (args, commands, emitted):
+            with self.assertRaises(MODULE.WorkflowError):
+                MODULE.command_pipeline(args)
+            self.assertEqual(1, len(commands))
+            self.assertFalse(emitted)
+            state = MODULE.load_state(Path(args.state))
+            self.assertEqual("failed", state["agent_task"]["status"])
+            self.assertEqual(0, state["iterations"])
+
+    def test_pipeline_cannot_adopt_a_failed_invocation(self):
+        with self.pipeline_run(exit_code=9) as (args, commands, emitted):
+            with self.assertRaises(MODULE.WorkflowError):
+                MODULE.command_pipeline(args)
+            before = Path(args.state).read_bytes()
+            with self.assertRaisesRegex(MODULE.WorkflowError, "unfinished audit"):
+                MODULE.command_pipeline(args)
+            self.assertEqual(before, Path(args.state).read_bytes())
+            self.assertEqual(1, len(commands))
+
+    def test_detached_preflight_keeps_exact_head_and_branch_guards(self):
+        for branch, head, status, allowed in (
+            ("", self.head, "", True),
+            ("", "9" * 40, "", False),
+            ("wrong-branch", self.head, "", False),
+            ("", self.head, " M file.py", False),
+        ):
+            with (
+                self.subTest(branch=branch, head=head, status=status),
+                mock.patch.object(MODULE, "metadata_for", return_value=self.preflight["pr"]),
+                mock.patch.object(
+                    MODULE, "local_identity",
+                    return_value={"branch": branch, "head": head, "status": status},
+                ),
+                mock.patch.object(
+                    MODULE, "gh_json",
+                    side_effect=[
+                        {"permissions": self.preflight["viewer"]["permissions"]},
+                        {"login": "viewer"},
+                    ],
+                ),
+                mock.patch.object(MODULE, "require_fork_head"),
+                mock.patch.object(MODULE, "find_push_remote"),
+            ):
+                if allowed:
+                    context = MODULE.agent_task_preflight(
+                        self.repo_root, {}, allow_detached=True
+                    )
+                    self.assertEqual("", context["identity"]["branch"])
+                    with self.assertRaisesRegex(MODULE.WorkflowError, "branch mismatch"):
+                        MODULE.agent_task_preflight(self.repo_root, {})
+                else:
+                    with self.assertRaises(MODULE.WorkflowError):
+                        MODULE.agent_task_preflight(self.repo_root, {}, allow_detached=True)
+
+    def test_candidate_import_fast_forwards_a_real_detached_checkout(self):
+        def git(*arguments):
+            return MODULE.git(self.repo_root, *arguments)
+
+        git("init", "-q")
+        git("config", "user.name", "Test")
+        git("config", "user.email", "test@example.com")
+        source = self.repo_root / "source.txt"
+        source.write_text("source\n", encoding="utf-8")
+        git("add", "source.txt")
+        git("-c", "commit.gpgsign=false", "commit", "-qm", "source")
+        source_head = git("rev-parse", "HEAD")
+        source.write_text("fixed\n", encoding="utf-8")
+        git("add", "source.txt")
+        git("-c", "commit.gpgsign=false", "commit", "-qm", "fix")
+        code_tip = git("rev-parse", "HEAD")
+        git("checkout", "--detach", source_head)
+        result_path = self.directory / "candidate.json"
+        result_path.write_text("{}\n", encoding="utf-8")
+        identity = MODULE.local_identity(self.repo_root)
+        self.assertEqual("", identity["branch"])
+        self.assertTrue(
+            MODULE.apply_verified_candidate_import(
+                self.repo_root,
+                result_path=result_path,
+                result_sha256=MODULE.sha256_file(result_path),
+                preflight={"identity": identity, "pr": {"head_sha": source_head}},
+                remote={"final_local_head": code_tip, "commits": [code_tip]},
+            )
+        )
+        self.assertEqual(
+            {"branch": "", "head": code_tip, "status": ""},
+            MODULE.local_identity(self.repo_root),
+        )
+        self.assertEqual("fixed\n", source.read_text(encoding="utf-8"))
 
     @unittest.skip("prepared-result recovery is intentionally unavailable")
     def test_prepare_only_records_fix_and_metadata_before_authorized_apply(self):
