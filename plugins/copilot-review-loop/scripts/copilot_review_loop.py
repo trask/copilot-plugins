@@ -161,6 +161,9 @@ STAGE_OUTCOME_BY_RESULT = {
     "stopped": "no_progress",
     "timeout": "escalated",
 }
+TERMINAL_AGENT_TASK_STATES = frozenset({"completed", "consumed"})
+ACTIVE_MONITORING_STATES = frozenset({"requesting", "requested", "running"})
+TERMINAL_MONITORING_STATES = frozenset({"completed"})
 IS_WINDOWS = os.name == "nt"
 # A pasted review or comment fragment is accepted and ignored: the queue is always
 # every unresolved Copilot comment on the pull request.
@@ -791,6 +794,8 @@ def load_state(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise WorkflowError(f"state file does not exist: {path}")
     state = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(state, dict):
+        raise WorkflowError(f"state file does not contain a JSON object: {path}")
     if state.get("version") != STATE_VERSION:
         raise WorkflowError(f"unsupported state version in {path}")
     return state
@@ -826,6 +831,242 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def empty_queue_clearance_head(
+    state: dict[str, Any] | None,
+    preflight: dict[str, Any],
+    confirmation: dict[str, Any],
+    target: dict[str, Any],
+) -> str:
+    if preflight != confirmation:
+        raise WorkflowError("empty queue identity drifted during clearance revalidation")
+    pr = preflight.get("pr")
+    identity = preflight.get("identity")
+    comments = preflight.get("comments")
+    comment_identities = preflight.get("comment_identities")
+    review_id = preflight.get("head_review_id")
+    if (
+        not isinstance(pr, dict)
+        or not isinstance(identity, dict)
+        or not isinstance(identity.get("branch"), str)
+        or not identity["branch"]
+        or not isinstance(identity.get("head"), str)
+        or SHA_PATTERN.fullmatch(identity["head"]) is None
+        or identity.get("status") != ""
+        or not isinstance(pr.get("number"), int)
+        or isinstance(pr["number"], bool)
+        or pr["number"] <= 0
+        or pr["number"] != target["number"]
+        or pr.get("repo_name") != f"{target['owner']}/{target['repo']}"
+        or not isinstance(pr.get("head_sha"), str)
+        or SHA_PATTERN.fullmatch(pr["head_sha"]) is None
+        or not isinstance(pr.get("base_sha"), str)
+        or SHA_PATTERN.fullmatch(pr["base_sha"]) is None
+        or identity["head"] != pr["head_sha"]
+        or identity["branch"] != pr.get("head_branch")
+    ):
+        raise WorkflowError("empty queue clearance has invalid ownership identity")
+    if (
+        comments != []
+        or comment_identities != []
+        or preflight.get("head_review_clean") is not True
+        or not isinstance(review_id, int)
+        or isinstance(review_id, bool)
+        or review_id <= 0
+    ):
+        raise WorkflowError(
+            "empty queue clearance lacks a current-head clean Copilot review"
+        )
+    if state is None:
+        return pr["head_sha"]
+    task = state.get("agent_task")
+    monitoring = state.get("monitoring")
+    stored_pr = state.get("pr")
+    queue = state.get("queue")
+    if stored_pr is None and queue is None:
+        if (
+            task is None
+            and monitoring is None
+            and state.get("coordinator") is None
+        ):
+            return pr["head_sha"]
+        raise WorkflowError("empty queue clearance state has unbound ownership")
+    if not isinstance(stored_pr, dict) or any(
+        stored_pr.get(field) != pr[field]
+        for field in (
+            "repo_name",
+            "number",
+            "head_branch",
+            "head_sha",
+            "base_sha",
+        )
+    ):
+        raise WorkflowError("empty queue clearance state identity drifted")
+    if (
+        not isinstance(queue, dict)
+        or queue.get("id") != f"pr-{pr['number']}"
+        or queue.get("status") != "active"
+        or queue.get("comments") != []
+        or queue.get("batches") != []
+    ):
+        raise WorkflowError("empty queue clearance state is malformed or has work")
+    if isinstance(task, dict) and task.get("status") not in TERMINAL_AGENT_TASK_STATES:
+        raise WorkflowError("empty queue clearance has an active Agent Task owner")
+    if task is not None and not isinstance(task, dict):
+        raise WorkflowError("empty queue clearance has malformed Agent Task state")
+    if isinstance(monitoring, dict):
+        if monitoring.get("status") in ACTIVE_MONITORING_STATES:
+            raise WorkflowError("empty queue clearance has active review monitoring")
+        if monitoring.get("status") not in TERMINAL_MONITORING_STATES:
+            raise WorkflowError("empty queue clearance has malformed monitoring state")
+    if monitoring is not None and not isinstance(monitoring, dict):
+        raise WorkflowError("empty queue clearance has malformed monitoring state")
+    return pr["head_sha"]
+
+
+def terminal_agent_task_clearance_error(
+    state: dict[str, Any], target: dict[str, Any]
+) -> str | None:
+    pr = state.get("pr")
+    if (
+        not isinstance(pr, dict)
+        or pr.get("number") != target["number"]
+        or pr.get("repo_name")
+        != f"{target['owner']}/{target['repo']}"
+        or not isinstance(pr.get("head_sha"), str)
+        or SHA_PATTERN.fullmatch(pr["head_sha"]) is None
+    ):
+        return "terminal state has invalid or mismatched pull request identity"
+    head = pr["head_sha"]
+    if state.get("clean_at_head_sha") != head or stage_outcome(state) != "cleared":
+        return "coordinator returned without validated current-head clearance"
+    if state.get("last_result") not in {
+        *CLEAN_PREFLIGHT_RESULTS,
+        WATCHER_REVIEW_CLEAN,
+    }:
+        return "terminal clearance has no validated clean result"
+    coordinator = state.get("coordinator")
+    escalation = state.get("escalation")
+    if (
+        isinstance(coordinator, dict)
+        and coordinator.get("status") == "blocked"
+    ) or (
+        isinstance(escalation, dict)
+        and escalation.get("reason") == "coordinator_error"
+    ):
+        return "terminal clearance conflicts with a coordinator error"
+    task = state.get("agent_task")
+    if isinstance(task, dict) and task.get("status") not in TERMINAL_AGENT_TASK_STATES:
+        return "terminal clearance still has an active Agent Task owner"
+    if task is not None and not isinstance(task, dict):
+        return "terminal clearance has malformed Agent Task state"
+    monitoring = state.get("monitoring")
+    if isinstance(monitoring, dict):
+        if monitoring.get("status") in ACTIVE_MONITORING_STATES:
+            return "terminal clearance still has active review monitoring"
+        if monitoring.get("status") not in TERMINAL_MONITORING_STATES:
+            return "terminal clearance has malformed monitoring state"
+    if monitoring is not None and not isinstance(monitoring, dict):
+        return "terminal clearance has malformed monitoring state"
+    queue = state.get("queue")
+    if (
+        not isinstance(queue, dict)
+        or queue.get("id") != f"pr-{pr['number']}"
+        or not isinstance(queue.get("comments"), list)
+        or not isinstance(queue.get("batches"), list)
+        or queue["batches"]
+    ):
+        return "terminal clearance has malformed or unfinished queue state"
+    status = queue.get("status")
+    if status == "clean":
+        if queue["comments"]:
+            return "terminal clean queue still contains work"
+    elif status == "active":
+        if queue["comments"]:
+            return "terminal active queue still contains work"
+    elif status == "published":
+        if any(
+            not isinstance(comment, dict) or comment.get("status") != "handled"
+            for comment in queue["comments"]
+        ):
+            return "terminal published queue still contains unhandled work"
+    else:
+        return "terminal clearance has invalid queue status"
+    if status in {"active", "published"}:
+        result = monitoring.get("result") if isinstance(monitoring, dict) else None
+        if (
+            not isinstance(monitoring, dict)
+            or monitoring.get("status") != "completed"
+            or monitoring.get("head_sha") != head
+            or not isinstance(result, dict)
+            or result.get("result") != WATCHER_REVIEW_CLEAN
+            or result.get("clean_at_head_sha") != head
+        ):
+            return "terminal queue lacks a matching completed clean review monitor"
+    return None
+
+
+def require_terminal_agent_task_clearance(args: argparse.Namespace) -> None:
+    state_path = getattr(args, "_coordinator_state_path", None)
+    target = getattr(args, "_coordinator_target", None)
+    if not isinstance(state_path, Path) or not isinstance(target, dict):
+        raise WorkflowError("coordinator did not retain its terminal state identity")
+    state = load_state(state_path)
+    detail = terminal_agent_task_clearance_error(state, target)
+    if detail is not None:
+        raise WorkflowError(
+            detail,
+            details={
+                "state": str(state_path),
+                "reason": "terminal_state_not_clear",
+            },
+        )
+
+
+def persist_agent_task_coordinator_error(
+    args: argparse.Namespace, error: BaseException
+) -> str | None:
+    state_path = getattr(args, "_coordinator_state_path", None)
+    if not isinstance(state_path, Path) or not state_path.is_file():
+        return None
+    try:
+        state = load_state(state_path)
+        detail = str(error)
+        observed_at = utc_now()
+        state["terminal_exit"] = {
+            "status": "nonzero",
+            "reason": detail,
+            "observed_at": observed_at,
+        }
+        recorded_outcome = stage_outcome(state)
+        if recorded_outcome not in {None, "cleared"}:
+            save_state(state_path, state)
+            return None
+        state["clean_at_head_sha"] = None
+        state["last_result"] = "coordinator_error"
+        coordinator = state.setdefault("coordinator", {})
+        if not isinstance(coordinator, dict):
+            raise WorkflowError("coordinator state is malformed")
+        coordinator.update(
+            {
+                "status": "blocked",
+                "detail": detail,
+                "observed_at": observed_at,
+            }
+        )
+        pr = state.get("pr")
+        if isinstance(pr, dict) and isinstance(pr.get("head_sha"), str):
+            coordinator["head_sha"] = pr["head_sha"]
+        state["escalation"] = {
+            "reason": "coordinator_error",
+            "detail": detail,
+            "observed_at": observed_at,
+        }
+        save_state(state_path, state)
+    except (WorkflowError, json.JSONDecodeError, OSError) as persistence_error:
+        return str(persistence_error)
+    return None
 
 
 def set_stage_progress(
@@ -8287,6 +8528,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
     repo_root = resolve_repo_root(args.repo_root)
     target = resolve_target(args.target, repo_root)
     state_path, invocation_id = invocation_state_path(target, args)
+    args._coordinator_state_path = state_path
+    args._coordinator_target = target
     require_outside_repository(state_path, repo_root)
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
@@ -8751,6 +8994,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
             source="Agent Task preflight",
         )
         pr = preflight["pr"]
+        clean_head = None
+        if not preflight["comments"] and preflight["head_review_clean"]:
+            confirmation = agent_task_preflight(repo_root, target)
+            clean_head = empty_queue_clearance_head(
+                existing, preflight, confirmation, target
+            )
         if existing is None:
             state = {
                 "version": STATE_VERSION,
@@ -8809,16 +9058,19 @@ def command_agent_task(args: argparse.Namespace) -> None:
         remaining = args.max_iterations - iteration_spent
         if absolute_cap is not None:
             remaining = min(remaining, absolute_cap - run_spent)
-        if not preflight["comments"] and preflight["head_review_clean"]:
-            state["clean_at_head_sha"] = pr["head_sha"]
+        if clean_head is not None:
+            state["clean_at_head_sha"] = clean_head
             state["last_result"] = "no_unresolved_comments"
             state["queue"]["status"] = "clean"
             save_state(state_path, state)
+            detail = terminal_agent_task_clearance_error(state, target)
+            if detail is not None:
+                raise WorkflowError(detail)
             emit(
                 {
                     "result": "no_unresolved_comments",
                     "state": str(state_path),
-                    "head_sha": pr["head_sha"],
+                    "head_sha": clean_head,
                     "iterations": state["iterations"],
                     "stage_outcome": "cleared",
                 }
@@ -9663,6 +9915,8 @@ def command_status(args: argparse.Namespace) -> None:
         "queue": state.get("queue"),
         "monitoring": state.get("monitoring"),
         "agent_task": state.get("agent_task"),
+        "coordinator": state.get("coordinator"),
+        "escalation": state.get("escalation"),
         "history": state.get("history") or [],
         "iterations": int(state.get("iterations", 0)),
         "clean_at_head_sha": state.get("clean_at_head_sha"),
@@ -10798,9 +11052,21 @@ def main() -> int:
                 "agent-task invocation"
             )
         args.function(args)
+        if args.command == "agent-task":
+            require_terminal_agent_task_clearance(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:
         details = error.details if isinstance(error, WorkflowError) else {}
+        persistence_error = (
+            persist_agent_task_coordinator_error(args, error)
+            if args.command == "agent-task"
+            else None
+        )
+        if persistence_error is not None:
+            details = {
+                **details,
+                "persistence_error": persistence_error,
+            }
         emit({"result": "error", "error": str(error), **details})
         return 1
 

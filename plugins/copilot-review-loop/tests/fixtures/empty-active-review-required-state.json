@@ -1,0 +1,31 @@
+{
+  "budget_charges": {
+    "[\"pipeline\",\"5e73aaf3c5064f0c838888632b7c4ae6\",1]": 0,
+    "[\"pipeline\",\"5e73aaf3c5064f0c838888632b7c4ae6\"]": 0
+  },
+  "budget_scope": "pipeline",
+  "clean_at_head_sha": null,
+  "history": [],
+  "iterations": 0,
+  "last_result": "review_required",
+  "pipeline_budget": {
+    "baseline": 0,
+    "iteration": 1,
+    "run": "5e73aaf3c5064f0c838888632b7c4ae6",
+    "run_baseline": 0
+  },
+  "pr": {
+    "base_sha": "2515ed4055bb1802c7d21d7a01882b92b6d5c675",
+    "head_branch": "grpc-server-address",
+    "head_sha": "02ad2ba216cdc6ef2f3f3768f7c5bc700ed62eac",
+    "number": 16161,
+    "repo_name": "open-telemetry/opentelemetry-java-instrumentation"
+  },
+  "queue": {
+    "batches": [],
+    "comments": [],
+    "id": "pr-16161",
+    "status": "active"
+  },
+  "version": 3
+}

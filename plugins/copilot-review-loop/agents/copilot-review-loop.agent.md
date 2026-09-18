@@ -29,6 +29,8 @@ When a pipeline position includes `github-mutation-policy: source-only`, pass `-
    - Use `python3` on POSIX when needed.
    - Pass a supplied PR URL or `owner/repo#number` exactly. Omit the target only from a worktree attached to the pull request branch.
    - Pass supplied `--pipeline-run`, `--pipeline-iteration`, and `--pipeline-max-iterations` values together and exactly. Never mint a pipeline position.
+   - Run the shell tool synchronously with `mode: sync`. Leave out `timeout` and `isBackground` so the coordinator can finish its bounded watch. Never use `mode: async`, `isBackground: true`, or a tool timeout.
+   - Consume the terminal JSON from that same shell call. A tool interruption, timeout, nonzero exit, missing terminal result, or result without `stage_outcome: cleared` is a coordinator failure. Do not finish the agent successfully or infer clearance from an empty queue.
 3. After the coordinator returns, ensure the session name is `Copilot Review Loop: <PR number> - <PR title>`. If the harness already supplied that name, do not call `rename_session`. Otherwise call it once when available. Accept a skipped or unavailable rename without retrying.
 4. Render the coordinator result, canonical PR URL, final head, outcome, fix commits, handled finding identities, replies, local decision session ID, iteration count, watcher state, recovery details, and any `stage_outcome`.
 

@@ -42,6 +42,11 @@ MISSING_FINDING_TRAILER_RESULT = (
     / "fixtures"
     / "missing-finding-trailer-agent-task-result.json"
 )
+EMPTY_ACTIVE_REVIEW_REQUIRED_STATE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "empty-active-review-required-state.json"
+)
 APPLIED_PATH_CORRELATED_V2_RESULT = (
     Path(__file__).parent
     / "fixtures"
@@ -2186,7 +2191,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.55")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.56")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -3879,6 +3884,16 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             MODULE.command_agent_task(self.arguments(capped_path, max_iterations=5))
         self.assertEqual(emitted[-1]["result"], "max_iterations_reached")
         discover.assert_not_called()
+
+    def test_agent_runs_the_coordinator_synchronously_without_a_tool_timeout(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+
+        self.assertIn("Run the shell tool synchronously with `mode: sync`", instructions)
+        self.assertIn("Leave out `timeout` and `isBackground`", instructions)
+        self.assertIn(
+            "Do not finish the agent successfully or infer clearance from an empty queue",
+            instructions,
+        )
 
     @unittest.skip("prepared-result recovery is intentionally unavailable")
     def test_prepare_only_stops_before_requesting_a_missing_review(self):
@@ -7302,6 +7317,369 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertLess(push, after_push)
         self.assertLess(after_push, reply)
         self.assertLess(reply, resolve)
+
+
+class TerminalCoordinatorContractTest(unittest.TestCase):
+    def setUp(self):
+        self.target = MODULE.parse_target(
+            "open-telemetry/opentelemetry-java-instrumentation#16161"
+        )
+        self.state = json.loads(
+            EMPTY_ACTIVE_REVIEW_REQUIRED_STATE.read_text(encoding="utf-8")
+        )
+        self.head = self.state["pr"]["head_sha"]
+        self.preflight = {
+            "repository_root": "repo",
+            "identity": {
+                "branch": "grpc-server-address",
+                "head": self.head,
+                "status": "",
+            },
+            "pr": {
+                **self.state["pr"],
+                "pr_url": (
+                    "https://github.com/open-telemetry/"
+                    "opentelemetry-java-instrumentation/pull/16161"
+                ),
+            },
+            "viewer": {
+                "login": "viewer",
+                "repository_role": "write",
+                "permissions": {
+                    "admin": False,
+                    "maintain": False,
+                    "push": True,
+                    "triage": True,
+                    "pull": True,
+                },
+            },
+            "comments": [],
+            "comment_identities": [],
+            "skipped_authors": [],
+            "head_review_clean": True,
+            "head_review_id": 1952601,
+            "copilot_bot_id": "BOT_1",
+        }
+
+    def arguments(self, state_path):
+        return SimpleNamespace(
+            target=(
+                "open-telemetry/"
+                "opentelemetry-java-instrumentation#16161"
+            ),
+            repo_root="repo",
+            state=str(state_path),
+            resume=False,
+            model="sol",
+            max_iterations=5,
+            pipeline_run=None,
+            pipeline_iteration=None,
+            pipeline_max_iterations=None,
+            watch_interval=0.01,
+            cancellation_grace=0.01,
+            prepare_only=False,
+            apply_prepared=False,
+            request_review_only=False,
+            preserve_artifacts=False,
+            recover_terminal_local=None,
+            recovery_manifest_sha256=None,
+            rescope_prepared_publish_only=False,
+            publish_prepared_only=False,
+        )
+
+    def run_clean_coordinator(self, state_path, *, historical_fixes=None):
+        emitted = []
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(
+                MODULE, "resolve_repo_root", return_value=Path("repo")
+            ),
+            mock.patch.object(
+                MODULE, "resolve_target", return_value=self.target
+            ),
+            mock.patch.object(
+                MODULE,
+                "wait_for_stable_review_preflight",
+                return_value=copy.deepcopy(self.preflight),
+            ),
+            mock.patch.object(
+                MODULE,
+                "agent_task_preflight",
+                return_value=copy.deepcopy(self.preflight),
+            ),
+            mock.patch.object(
+                MODULE,
+                "historical_source_fixes",
+                return_value=historical_fixes,
+            ),
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.command_agent_task(self.arguments(state_path))
+        return emitted
+
+    def test_exact_zero_iteration_active_empty_queue_is_not_success(self):
+        self.assertEqual(
+            "coordinator returned without validated current-head clearance",
+            MODULE.terminal_agent_task_clearance_error(self.state, self.target),
+        )
+
+    def test_main_persists_the_exact_artifact_as_a_coordinator_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            MODULE.save_state(state_path, copy.deepcopy(self.state))
+            args = SimpleNamespace(command="agent-task")
+
+            def incomplete(current):
+                current._coordinator_state_path = state_path
+                current._coordinator_target = self.target
+
+            args.function = incomplete
+            parser = mock.Mock()
+            parser.parse_args.return_value = args
+            emitted = []
+            with (
+                mock.patch.object(MODULE, "build_parser", return_value=parser),
+                mock.patch.object(MODULE, "emit", emitted.append),
+            ):
+                result = MODULE.main()
+
+            saved = MODULE.load_state(state_path)
+            exit_payload = emitted[-1]
+            emitted.clear()
+            with mock.patch.object(MODULE, "emit", emitted.append):
+                MODULE.command_status(
+                    SimpleNamespace(
+                        current=False,
+                        state=str(state_path),
+                        repo_root=None,
+                    )
+                )
+
+        self.assertEqual(1, result)
+        self.assertEqual("terminal_state_not_clear", exit_payload["reason"])
+        self.assertEqual("ready", emitted[-1]["result"])
+        self.assertEqual("coordinator_error", saved["last_result"])
+        self.assertIsNone(saved["clean_at_head_sha"])
+        self.assertEqual("blocked", saved["coordinator"]["status"])
+        self.assertEqual(
+            "coordinator_error", saved["escalation"]["reason"]
+        )
+        self.assertEqual("blocked", emitted[-1]["coordinator"]["status"])
+        self.assertEqual(
+            "coordinator_error", emitted[-1]["escalation"]["reason"]
+        )
+
+    def test_main_returns_zero_only_for_a_validated_terminal_clear_state(self):
+        cleared = copy.deepcopy(self.state)
+        cleared["clean_at_head_sha"] = self.head
+        cleared["last_result"] = "no_unresolved_comments"
+        cleared["queue"]["status"] = "clean"
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            MODULE.save_state(state_path, cleared)
+            args = SimpleNamespace(command="agent-task")
+
+            def complete(current):
+                current._coordinator_state_path = state_path
+                current._coordinator_target = self.target
+
+            args.function = complete
+            parser = mock.Mock()
+            parser.parse_args.return_value = args
+            with (
+                mock.patch.object(MODULE, "build_parser", return_value=parser),
+                mock.patch.object(MODULE, "emit"),
+            ):
+                result = MODULE.main()
+
+        self.assertEqual(0, result)
+
+    def test_nonzero_exit_preserves_an_existing_terminal_reason(self):
+        capped = copy.deepcopy(self.state)
+        capped["last_result"] = "max_iterations_reached"
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            MODULE.save_state(state_path, capped)
+            args = SimpleNamespace(
+                _coordinator_state_path=state_path,
+                _coordinator_target=self.target,
+            )
+
+            MODULE.persist_agent_task_coordinator_error(
+                args,
+                MODULE.WorkflowError("terminal state is not clear"),
+            )
+            saved = MODULE.load_state(state_path)
+
+        self.assertEqual("max_iterations_reached", saved["last_result"])
+        self.assertNotIn("coordinator", saved)
+        self.assertEqual("nonzero", saved["terminal_exit"]["status"])
+
+    def test_revalidated_empty_queue_clears_only_at_the_frozen_head(self):
+        self.assertEqual(
+            self.head,
+            MODULE.empty_queue_clearance_head(
+                self.state,
+                self.preflight,
+                copy.deepcopy(self.preflight),
+                self.target,
+            ),
+        )
+        cleared = copy.deepcopy(self.state)
+        cleared["clean_at_head_sha"] = self.head
+        cleared["last_result"] = "no_unresolved_comments"
+        cleared["queue"]["status"] = "clean"
+        self.assertIsNone(
+            MODULE.terminal_agent_task_clearance_error(cleared, self.target)
+        )
+
+    def test_clean_preflight_does_not_replace_persisted_queue_work(self):
+        retained = copy.deepcopy(self.state)
+        retained["queue"]["comments"] = [{"id": 1, "status": "pending"}]
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            MODULE.save_state(state_path, retained)
+
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "malformed or has work",
+            ):
+                self.run_clean_coordinator(state_path)
+            saved = MODULE.load_state(state_path)
+
+        self.assertEqual(retained["queue"], saved["queue"])
+        self.assertEqual("review_required", saved["last_result"])
+
+    def test_clean_preflight_preserves_terminal_monitoring_state(self):
+        retained = copy.deepcopy(self.state)
+        retained["monitoring"] = {
+            "status": "completed",
+            "head_sha": self.head,
+            "result": {"result": "review_comments"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            MODULE.save_state(state_path, retained)
+
+            self.run_clean_coordinator(
+                state_path,
+                historical_fixes=[{"commit": "f" * 40}],
+            )
+            saved = MODULE.load_state(state_path)
+
+        self.assertEqual(retained["monitoring"], saved["monitoring"])
+        self.assertEqual(self.head, saved["clean_at_head_sha"])
+        self.assertEqual("clean", saved["queue"]["status"])
+
+    def test_empty_queue_clearance_rejects_unsafe_state_and_identity(self):
+        cases = {}
+
+        nonempty = copy.deepcopy(self.state)
+        nonempty["queue"]["comments"] = [{"id": 1, "status": "pending"}]
+        cases["nonempty work"] = (nonempty, self.preflight, self.preflight)
+
+        owned = copy.deepcopy(self.state)
+        owned["agent_task"] = {"status": "running", "run_id": "owner"}
+        cases["active owner"] = (owned, self.preflight, self.preflight)
+
+        monitored = copy.deepcopy(self.state)
+        monitored["monitoring"] = {"status": "running", "pid": 123}
+        cases["active monitoring"] = (
+            monitored,
+            self.preflight,
+            self.preflight,
+        )
+
+        requesting = copy.deepcopy(self.state)
+        requesting["monitoring"] = {"status": "requesting"}
+        cases["requesting review"] = (
+            requesting,
+            self.preflight,
+            self.preflight,
+        )
+
+        invalid_monitoring = copy.deepcopy(self.state)
+        invalid_monitoring["monitoring"] = {"status": "unknown"}
+        cases["malformed monitoring"] = (
+            invalid_monitoring,
+            self.preflight,
+            self.preflight,
+        )
+
+        missing_identity = copy.deepcopy(self.preflight)
+        missing_identity["identity"] = {}
+        cases["missing identity"] = (
+            self.state,
+            missing_identity,
+            missing_identity,
+        )
+
+        malformed = copy.deepcopy(self.state)
+        malformed["queue"] = []
+        cases["malformed state"] = (
+            malformed,
+            self.preflight,
+            self.preflight,
+        )
+
+        unbound_owner = {
+            "version": MODULE.STATE_VERSION,
+            "coordinator": {"status": "stabilizing"},
+        }
+        cases["unbound coordinator owner"] = (
+            unbound_owner,
+            self.preflight,
+            self.preflight,
+        )
+
+        replayed = copy.deepcopy(self.state)
+        replayed["pr"]["base_sha"] = "e" * 40
+        cases["stored identity drift"] = (
+            replayed,
+            self.preflight,
+            self.preflight,
+        )
+
+        invalid_base = copy.deepcopy(self.preflight)
+        invalid_base["pr"]["base_sha"] = "invalid"
+        cases["invalid base identity"] = (
+            self.state,
+            invalid_base,
+            invalid_base,
+        )
+
+        wrong_target = copy.deepcopy(self.preflight)
+        wrong_target["pr"]["number"] = 20075
+        cases["mismatched target"] = (
+            self.state,
+            wrong_target,
+            wrong_target,
+        )
+
+        drifted = copy.deepcopy(self.preflight)
+        drifted["pr"]["head_sha"] = "f" * 40
+        drifted["identity"]["head"] = "f" * 40
+        cases["head drift"] = (self.state, self.preflight, drifted)
+
+        for name, (state, preflight, confirmation) in cases.items():
+            with self.subTest(name=name), self.assertRaises(MODULE.WorkflowError):
+                MODULE.empty_queue_clearance_head(
+                    state,
+                    preflight,
+                    confirmation,
+                    self.target,
+                )
+
+    def test_load_state_rejects_a_non_object_document(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text("[]\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "does not contain a JSON object",
+            ):
+                MODULE.load_state(state_path)
 
 
 class ParseTargetTest(unittest.TestCase):
