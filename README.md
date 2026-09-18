@@ -67,29 +67,29 @@ local `gh api`; repository analysis and execution stay in GitHub Agent Tasks.
 
 ### Self Review Loop
 
-Uses one managed GitHub Agent Task to review the pinned pull request, fix every
-validated finding in scope, and run the repository's formatting, tests, and
-builds. The local coordinator validates the task's commit history, report,
-receipt, and live branch identity before it imports and pushes the fix commits.
-A clean review leaves the branch unchanged.
+Uses managed GitHub Agent Tasks to review the pinned pull request and fix
+findings in scope. Formatting, tests, and builds stay hosted. The local
+coordinator validates committed code and the live branch identity before it
+imports and pushes fixes. A clean review leaves the branch unchanged.
 
 The plugin locates and verifies the shared `cloud_task.py`, then runs it with
-policy `marketplace-agent-worker@1`. The backend is GitHub Agent Tasks through
-local `gh api`; there is no Cloud Sandbox, custom agent, local repository
-analysis, or local execution fallback.
+policy `marketplace-agent-code-candidate-worker@1`. The backend is GitHub Agent
+Tasks through local `gh api`; there is no Cloud Sandbox, custom agent, local
+repository analysis, or local execution fallback.
 
 ### PR Description
 
 Uses a managed GitHub Agent Task to review the current pull request title and
 description against the complete diff. The local coordinator pins the pull
-request and permission context, validates the task's committed report and
-receipt, then keeps ideal text or applies the proposed replacement through
-GitHub's authenticated API.
+request and permission context, then reads the proposed title and body from
+committed files on the task's generated branch. It keeps matching text or
+applies the proposed replacement through GitHub's authenticated API when
+permission allows it.
 
 The plugin locates and verifies the shared `cloud_task.py`, then runs it with
-policy `marketplace-agent-worker@1`. The backend is GitHub Agent Tasks through
-local `gh api`; there is no Cloud Sandbox, custom agent, or local-analysis
-fallback.
+policy `marketplace-agent-report-recommendation-worker@1`. The backend is GitHub
+Agent Tasks through local `gh api`; there is no Cloud Sandbox, custom agent, or
+local-analysis fallback.
 
 ### PR Pipeline
 
@@ -97,6 +97,11 @@ Runs conflict handling, Copilot review, self review, CI repair, and description
 validation for one pull request. The same plugin includes PR Stack Pipeline,
 which applies those existing agents to a selected suffix of a native GitHub
 stack with at most two passes.
+
+Schedulers invoke stage coordinators directly, preserving their exit codes.
+Each stage waits for its children and owns its configured iteration budget.
+Another Pipeline pass does not replenish that budget. An interrupted run
+fails; a later invocation starts from the beginning.
 
 Both parent agents launch their scheduler once and use a durable monitor
 protocol to report every stage transition and one coalesced heartbeat per five
@@ -118,17 +123,24 @@ Stack state lives under `~/.copilot/run/pr-stack-pipeline/` and exposes the run
 ID, topology fingerprint, selected suffix, expected heads and bases, current
 pass and phase, per-PR stage state, dispatch nonces, result, and timestamps.
 
+Under `source-only`, guarded source publication is allowed, but comments,
+reviews, review requests, thread changes, workflow reruns, and PR or stack
+metadata changes are not. A proposed description replacement remains blocked
+under this policy; it does not count as a cleared description stage.
+
 ### PR Conflict Resolver
 
 Resolves the merge conflicts on a pull request in one pass. It reads the history
 behind each conflicted file first, then keeps what both sides meant to do rather
-than picking a side, and records why in the merge commit. It stops and reports
+than picking a side. It stops and reports
 when the two sides genuinely contradict each other. It refuses to rewrite an
-ordinary branch with dependents. For a native GitHub stack, it rebases every
-descendant in a throwaway clone and publishes the complete stack with one
-atomic, exact-lease push. A run that publishes and then still reads as
-conflicting is finished rather than failed, and a caller that wants another
-integration starts another run. It never posts anything to GitHub. Its
+ordinary branch with dependents. For a native GitHub stack, the coordinator
+processes members in order, with one hosted task per member and committed code
+on each task's authoritative generated branch. It verifies the complete result
+before publishing with one atomic, exact-lease push. A run that publishes and
+then still reads as conflicting is finished rather than failed, and a caller
+that wants another integration starts another run. It never posts anything to
+GitHub. Its
 machine-facing descendant propagation operation uses the same topology checks and
 atomic publisher after a lower stack member receives a CI fix.
 
@@ -148,11 +160,10 @@ native stack keeps the single-PR behavior.
 The plugin verifies the shared Agent Tasks runtime. Authentication stays in
 local `gh api`; CI diagnosis, edits, and validation stay in GitHub Agent Tasks.
 
-Each member gets five charged iterations. A PR Pipeline run keeps its existing
-five charged iterations per outer pass and absolute ten across two passes. Every
-accepted push records a durable machine-readable checkpoint. Install
-`pr-conflict-resolver@trask-plugins` to use native-stack mode; the loop checks
-for it before it edits or pushes any stack member.
+Each member gets five charged iterations. PR Pipeline does not reset this
+budget between passes. Every accepted push records a machine-readable
+checkpoint. Install `pr-conflict-resolver@trask-plugins` to use native-stack
+mode; the loop checks for it before it edits or pushes any stack member.
 
 ### Historical PR Audit
 
