@@ -26,6 +26,11 @@ FORWARD_COMPACT_KEEP_REPORT = (
 FORWARD_IDENTITY_KEEP_REPORT = (
     Path(__file__).parent / "fixtures" / "forward-identity-keep-report.md"
 )
+FORWARD_TOP_LEVEL_IDENTITY_KEEP_REPORT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "forward-top-level-identity-keep-report.md"
+)
 FORWARD_IDENTITY_RESULT = (
     Path(__file__).parent / "fixtures" / "forward-identity-347-result.json"
 )
@@ -1114,7 +1119,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.57")
+        self.assertEqual(plugin["version"], "1.0.58")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1403,6 +1408,113 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "changed_files": changed_files,
             "proposal_count": 0,
         }
+        for candidate in malformed:
+            with self.subTest(candidate=candidate), self.assertRaises(
+                MODULE.WorkflowError
+            ):
+                MODULE.validate_proposal_report(
+                    f"```json\n{json.dumps(candidate)}\n```",
+                    **common,
+                )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "stale identity"):
+            MODULE.validate_proposal_report(
+                content,
+                **{**common, "proposal_count": 1},
+            )
+
+    def test_exact_forward_top_level_identity_keep_report_recovers_no_proposal(self):
+        title = (
+            "Populate gRPC `server.address` and `server.port` from channel targets"
+        )
+        body = (
+            "gRPC client spans now populate `server.address` and `server.port` "
+            "from configured channel targets instead of relying only on channel "
+            "authority. Target parsing covers DNS, Unix domain socket, IPv4, IPv6, "
+            "and xDS addresses. Direct-address channels fall back to authority.\n\n"
+            "### Library API\n\nUse `addClientInterceptor` when configuring a "
+            "`ManagedChannelBuilder`:\n\n```java\nGrpcTelemetry telemetry = "
+            "GrpcTelemetry.create(openTelemetry);\ntelemetry.addClientInterceptor"
+            "(channelBuilder);\n```\n\nOn gRPC 1.64 and newer, this method captures "
+            "the builder target. Older versions fall back to channel authority. "
+            "`createClientInterceptor()` remains supported for integrations that "
+            "accept only a `ClientInterceptor`, but it cannot capture the builder "
+            "target.\n\n### Compatibility\n\n`GrpcRequest.getLogicalHost()` and "
+            "`getLogicalPort()` are deprecated. Use `getServerAddress()` and "
+            "`getServerPort()` instead."
+        )
+        head_sha = "02ad2ba216cdc6ef2f3f3768f7c5bc700ed62eac"
+        preflight = agent_task_preflight()
+        preflight["pr"].update(
+            {
+                "number": 16161,
+                "owner": "open-telemetry",
+                "repo": "opentelemetry-java-instrumentation",
+                "repo_name": "open-telemetry/opentelemetry-java-instrumentation",
+                "title": title,
+                "body": body,
+                "head_sha": head_sha,
+                "head": {
+                    "repository": "trask/opentelemetry-java-instrumentation",
+                    "ref": "grpc-server-address",
+                    "sha": head_sha,
+                },
+                "base": {
+                    "repository": (
+                        "open-telemetry/opentelemetry-java-instrumentation"
+                    ),
+                    "ref": "main",
+                    "sha": "2" * 40,
+                },
+            }
+        )
+        content = FORWARD_TOP_LEVEL_IDENTITY_KEEP_REPORT.read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            "6bd1626db370ddaba63c1d82f7b77f75c12d6da4161c4b551f45b37a9da1d286",
+            MODULE.sha256_text(content),
+        )
+        parsed = MODULE.parse_markdown_report(content, description="test report")
+        changed_files = parsed["evidence"]["changed_files"]
+        common = {
+            "request_id": "3e8966b3-fa28-457c-a872-425241cff874",
+            "preflight": preflight,
+            "changed_files": changed_files,
+            "proposal_count": 0,
+        }
+
+        report = MODULE.validate_proposal_report(content, **common)
+
+        self.assertEqual(MODULE.LEGACY_PR_DESCRIPTION_PROPOSAL_SCHEMA, report["schema"])
+        self.assertEqual(common["request_id"], report["request_id"])
+        self.assertEqual("keep", report["decision"])
+        self.assertEqual({"title": title, "body": body}, report["proposal"])
+        self.assertEqual(
+            changed_files,
+            [item["path"] for item in report["evidence"]["changed_files"]],
+        )
+
+        malformed = []
+        missing_identity = json.loads(json.dumps(parsed))
+        missing_identity.pop("body")
+        malformed.append(missing_identity)
+        extra_identity = json.loads(json.dumps(parsed))
+        extra_identity["schema"] = MODULE.PR_DESCRIPTION_PROPOSAL_SCHEMA
+        malformed.append(extra_identity)
+        ambiguous_repository = json.loads(json.dumps(parsed))
+        ambiguous_repository["repository"] = {
+            "name_with_owner": preflight["pr"]["repo_name"]
+        }
+        malformed.append(ambiguous_repository)
+        mismatched_title = json.loads(json.dumps(parsed))
+        mismatched_title["title"] = "Different title"
+        malformed.append(mismatched_title)
+        replacement = json.loads(json.dumps(parsed))
+        replacement["decision"] = "replace"
+        malformed.append(replacement)
+        incomplete_files = json.loads(json.dumps(parsed))
+        incomplete_files["evidence"]["changed_files"] = changed_files[:-1]
+        malformed.append(incomplete_files)
         for candidate in malformed:
             with self.subTest(candidate=candidate), self.assertRaises(
                 MODULE.WorkflowError

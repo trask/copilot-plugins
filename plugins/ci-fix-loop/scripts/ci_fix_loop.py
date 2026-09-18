@@ -50,6 +50,10 @@ DEFAULT_COORDINATOR_JITTER = 0.2
 DEFAULT_HOSTED_HELPER_TIMEOUT = 7200.0
 DEFAULT_HOSTED_DISCOVERY_INTERVAL = 5.0
 HOSTED_HELPER_TERMINATION_TIMEOUT = 10.0
+EXTERNAL_COMMAND_DIAGNOSTIC_TEXT_LIMIT = 4096
+EXTERNAL_COMMAND_DIAGNOSTIC_SCHEMA = (
+    "github.copilot.ci-fix-loop-external-command-diagnostic.v1"
+)
 AGENT_TASK_API_VERSION = "2026-03-10"
 HOSTED_DISPATCH_IDENTITY_SCHEMA = (
     "github.copilot.ci-fix-loop-hosted-dispatch-identity.v1"
@@ -1372,6 +1376,13 @@ CREDENTIAL_PATTERNS = (
     r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
 )
 REDACTED_CREDENTIAL = "[REDACTED]"
+ENVIRONMENT_ASSIGNMENT_PATTERN = re.compile(
+    r"(?m)(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)=([^\r\n]*)"
+)
+SENSITIVE_HEADER_PATTERN = re.compile(
+    r"(?im)^[ \t]*(authorization|proxy-authorization|cookie|set-cookie|"
+    r"x-api-key|x-github-token|private-token)[ \t]*:[^\r\n]*"
+)
 PRIVATE_KEY_BLOCK_PATTERN = re.compile(
     r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
     r".*?(?:-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\Z)",
@@ -1393,6 +1404,78 @@ def redact_credentials(value: str) -> str:
 def require_no_credentials(value: str, *, source: str) -> None:
     if contains_credentials(value):
         raise WorkflowError(f"{source} appears to contain credentials")
+
+
+def sanitize_external_command_text(value: str) -> str:
+    sanitized = redact_credentials(value)
+    sanitized = SENSITIVE_HEADER_PATTERN.sub(
+        lambda match: f"{match.group(1)}: {REDACTED_CREDENTIAL}",
+        sanitized,
+    )
+    sanitized = ENVIRONMENT_ASSIGNMENT_PATTERN.sub(
+        lambda match: f"{match.group(1)}={REDACTED_CREDENTIAL}",
+        sanitized,
+    )
+    require_no_credentials(sanitized, source="external command diagnostic")
+    return sanitized
+
+
+def external_command_stream_diagnostic(raw: bytes) -> dict[str, Any]:
+    decoded = raw.decode("utf-8", errors="replace")
+    sanitized = sanitize_external_command_text(decoded)
+    encoded = sanitized.encode("utf-8")
+    diagnostic: dict[str, Any] = {
+        "byte_count": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "decode_replacement_count": decoded.count("\ufffd"),
+        "sanitized_utf8_byte_count": len(encoded),
+        "retained_utf8_byte_limit": EXTERNAL_COMMAND_DIAGNOSTIC_TEXT_LIMIT,
+        "truncated": len(encoded) > EXTERNAL_COMMAND_DIAGNOSTIC_TEXT_LIMIT,
+    }
+    if sanitized.strip():
+        retained = encoded[:EXTERNAL_COMMAND_DIAGNOSTIC_TEXT_LIMIT].decode(
+            "utf-8", errors="ignore"
+        )
+        retained_byte_count = len(retained.encode("utf-8"))
+        diagnostic.update(
+            {
+                "text": retained,
+                "retained_utf8_byte_count": retained_byte_count,
+                "omitted_utf8_byte_count": len(encoded) - retained_byte_count,
+            }
+        )
+    return diagnostic
+
+
+def external_command_diagnostic(
+    *,
+    exit_status: int,
+    stdout: bytes,
+    stderr: bytes,
+) -> dict[str, Any]:
+    return {
+        "schema": EXTERNAL_COMMAND_DIAGNOSTIC_SCHEMA,
+        "exit_status": exit_status,
+        "stdout": external_command_stream_diagnostic(stdout),
+        "stderr": external_command_stream_diagnostic(stderr),
+    }
+
+
+def external_command_failure(
+    description: str,
+    completed: subprocess.CompletedProcess[bytes],
+) -> WorkflowError:
+    diagnostic = external_command_diagnostic(
+        exit_status=completed.returncode,
+        stdout=completed.stdout or b"",
+        stderr=completed.stderr or b"",
+    )
+    serialized = json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
+    return WorkflowError(
+        f"{description}: exit status {completed.returncode}; "
+        f"diagnostic={serialized}",
+        details={"external_command_diagnostic": diagnostic},
+    )
 
 
 def parse_strict_json(value: str, *, description: str) -> Any:
@@ -6073,22 +6156,17 @@ def fetch_failed_check_log(
     if "job_id" in reference:
         command.extend(["--job", str(reference["job_id"])])
     command.append("--log-failed")
-    process = run(
+    process = run_bytes(
         command,
         check=False,
     )
     if process.returncode != 0:
-        stdout_bytes = process.stdout.encode("utf-8")
-        stderr_bytes = process.stderr.encode("utf-8")
-        raise WorkflowError(
-            f"could not download the failing log for {check['key']}: "
-            f"exit status {process.returncode}; "
-            f"stdout bytes={len(stdout_bytes)} "
-            f"sha256={hashlib.sha256(stdout_bytes).hexdigest()}; "
-            f"stderr bytes={len(stderr_bytes)} "
-            f"sha256={hashlib.sha256(stderr_bytes).hexdigest()}"
+        raise external_command_failure(
+            f"could not download the failing log for {check['key']}",
+            process,
         )
-    content = redact_credentials(process.stdout)
+    decoded = (process.stdout or b"").decode("utf-8", errors="replace")
+    content = redact_credentials(decoded)
     require_no_credentials(content, source=f"redacted failing log for {check['key']}")
     if destination is not None:
         if repo_root is not None:
@@ -12912,6 +12990,18 @@ def record_coordinator_failure(state_path: Path, error: WorkflowError) -> None:
     coordinator["status"] = "blocked"
     coordinator["detail"] = str(error)
     coordinator["observed_at"] = utc_now()
+    diagnostic = error.details.get("external_command_diagnostic")
+    if (
+        isinstance(diagnostic, dict)
+        and diagnostic.get("schema") == EXTERNAL_COMMAND_DIAGNOSTIC_SCHEMA
+    ):
+        state["escalation"]["external_command_diagnostic"] = copy.deepcopy(
+            diagnostic
+        )
+        coordinator["external_command_diagnostic"] = copy.deepcopy(diagnostic)
+    else:
+        state["escalation"].pop("external_command_diagnostic", None)
+        coordinator.pop("external_command_diagnostic", None)
     save_state(state_path, state)
 
 

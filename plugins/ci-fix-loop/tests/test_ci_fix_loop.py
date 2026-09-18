@@ -4446,7 +4446,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.41", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.43", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -4516,11 +4516,11 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         destination = self.root.parent / f"{self.root.name}-download.log"
         self.addCleanup(destination.unlink, missing_ok=True)
         completed = MODULE.subprocess.CompletedProcess(
-            ["gh"], 0, "focused failure log\n", ""
+            ["gh"], 0, b"focused failure log\n", b""
         )
         with (
             mock.patch.object(MODULE, "resolve_run_id", return_value=1),
-            mock.patch.object(MODULE, "run", return_value=completed) as run,
+            mock.patch.object(MODULE, "run_bytes", return_value=completed) as run,
         ):
             content = MODULE.fetch_failed_check_log(
                 self.preflight["pr"],
@@ -4541,11 +4541,11 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.addCleanup(destination.unlink, missing_ok=True)
         secret = "github_pat_abcdefghijklmnopqrstuvwxyz"
         completed = MODULE.subprocess.CompletedProcess(
-            ["gh"], 0, f"before {secret} after\n", ""
+            ["gh"], 0, f"before {secret} after\n".encode(), b""
         )
         with (
             mock.patch.object(MODULE, "resolve_run_id", return_value=1),
-            mock.patch.object(MODULE, "run", return_value=completed),
+            mock.patch.object(MODULE, "run_bytes", return_value=completed),
         ):
             content = MODULE.fetch_failed_check_log(
                 self.preflight["pr"],
@@ -4573,12 +4573,12 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 "private-base64-material\n"
                 "-----END PRIVATE KEY-----\n"
                 "after\n"
-            ),
-            "",
+            ).encode(),
+            b"",
         )
         with (
             mock.patch.object(MODULE, "resolve_run_id", return_value=1),
-            mock.patch.object(MODULE, "run", return_value=completed),
+            mock.patch.object(MODULE, "run_bytes", return_value=completed),
         ):
             content = MODULE.fetch_failed_check_log(self.preflight["pr"], check)
 
@@ -4597,12 +4597,12 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             (
                 "checkout Authorization: Basic ******\n"
                 "test TOKEN=CONFIGURATION_SERVER failed\n"
-            ),
-            "",
+            ).encode(),
+            b"",
         )
         with (
             mock.patch.object(MODULE, "resolve_run_id", return_value=1),
-            mock.patch.object(MODULE, "run", return_value=completed),
+            mock.patch.object(MODULE, "run_bytes", return_value=completed),
         ):
             content = MODULE.fetch_failed_check_log(self.preflight["pr"], check)
 
@@ -4612,30 +4612,192 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn(" failed", content)
         MODULE.require_no_credentials(content, source="redacted test log")
 
-    def test_failed_log_download_error_never_includes_raw_output(self):
+    def test_failed_log_download_error_retains_sanitized_bounded_output(self):
         check = self.preflight["check_snapshot"]["failures"][0]
+        stderr = b"gh: failed to download job log: HTTP 404 Not Found".ljust(
+            76, b" "
+        ) + b"\n"
+        self.assertEqual(77, len(stderr))
         completed = MODULE.subprocess.CompletedProcess(
             ["gh"],
             1,
-            "RAW FAILURE LOG THAT MUST STAY OUT OF THE ERROR\n",
-            "authentication failed\n",
+            b"",
+            stderr,
         )
         with (
             mock.patch.object(MODULE, "resolve_run_id", return_value=1),
-            mock.patch.object(MODULE, "run", return_value=completed),
+            mock.patch.object(MODULE, "run_bytes", return_value=completed),
             self.assertRaises(MODULE.WorkflowError) as raised,
         ):
             MODULE.fetch_failed_check_log(self.preflight["pr"], check)
 
         message = str(raised.exception)
-        self.assertNotIn("RAW FAILURE LOG", message)
-        self.assertNotIn("authentication failed", message)
         self.assertIn("exit status 1", message)
-        self.assertIn(
-            f"stdout bytes={len(completed.stdout.encode('utf-8'))}",
-            message,
+        self.assertIn("gh: failed to download job log: HTTP 404 Not Found", message)
+        diagnostic = raised.exception.details["external_command_diagnostic"]
+        self.assertEqual(0, diagnostic["stdout"]["byte_count"])
+        self.assertNotIn("text", diagnostic["stdout"])
+        self.assertEqual(77, diagnostic["stderr"]["byte_count"])
+        self.assertEqual(
+            MODULE.hashlib.sha256(stderr).hexdigest(),
+            diagnostic["stderr"]["sha256"],
         )
-        self.assertIn(MODULE.sha256_text(completed.stdout), message)
+        self.assertEqual(stderr.decode(), diagnostic["stderr"]["text"])
+
+    def test_failed_log_diagnostic_redacts_secrets_headers_and_environment(self):
+        token = "ghp_" + ("A" * 40)
+        stderr = (
+            f"ordinary gh failure\n"
+            f"Authorization: Bearer {token}\n"
+            f"Cookie: session={token}\n"
+            f"GH_TOKEN={token}\n"
+            f"request token={token}\n"
+        ).encode()
+        completed = MODULE.subprocess.CompletedProcess(
+            ["gh"], 1, b"useful stdout\n", stderr
+        )
+
+        error = MODULE.external_command_failure("download failed", completed)
+
+        serialized = str(error)
+        self.assertIn("ordinary gh failure", serialized)
+        self.assertIn("useful stdout", serialized)
+        self.assertIn(MODULE.REDACTED_CREDENTIAL, serialized)
+        self.assertNotIn(token, serialized)
+        diagnostic = error.details["external_command_diagnostic"]
+        self.assertEqual(
+            MODULE.hashlib.sha256(stderr).hexdigest(),
+            diagnostic["stderr"]["sha256"],
+        )
+
+    def test_failed_log_diagnostic_truncates_text_but_hashes_all_bytes(self):
+        stderr = b"x" * (MODULE.EXTERNAL_COMMAND_DIAGNOSTIC_TEXT_LIMIT + 17)
+        completed = MODULE.subprocess.CompletedProcess(["gh"], 1, b"", stderr)
+
+        error = MODULE.external_command_failure("download failed", completed)
+
+        diagnostic = error.details["external_command_diagnostic"]["stderr"]
+        self.assertEqual(len(stderr), diagnostic["byte_count"])
+        self.assertEqual(
+            MODULE.hashlib.sha256(stderr).hexdigest(), diagnostic["sha256"]
+        )
+        self.assertTrue(diagnostic["truncated"])
+        self.assertEqual(
+            MODULE.EXTERNAL_COMMAND_DIAGNOSTIC_TEXT_LIMIT,
+            diagnostic["retained_utf8_byte_count"],
+        )
+        self.assertEqual(17, diagnostic["omitted_utf8_byte_count"])
+
+    def test_failed_log_diagnostic_replaces_malformed_utf8(self):
+        stderr = b"gh: invalid response \xff\xfe\n"
+        completed = MODULE.subprocess.CompletedProcess(["gh"], 1, b"", stderr)
+
+        error = MODULE.external_command_failure("download failed", completed)
+
+        diagnostic = error.details["external_command_diagnostic"]["stderr"]
+        self.assertEqual(2, diagnostic["decode_replacement_count"])
+        self.assertEqual("gh: invalid response \ufffd\ufffd\n", diagnostic["text"])
+        self.assertEqual(
+            MODULE.hashlib.sha256(stderr).hexdigest(), diagnostic["sha256"]
+        )
+
+    def test_pipeline_failure_persists_diagnostic_and_returns_nonzero(self):
+        repo_root = self.root / "repo"
+        repo_root.mkdir()
+        state_path = self.root / "coordinator.json"
+        stderr = b"gh: failed to download job log: HTTP 404 Not Found".ljust(
+            76, b" "
+        ) + b"\n"
+        error = MODULE.external_command_failure(
+            "could not download the failing log for check:CI/test",
+            MODULE.subprocess.CompletedProcess(["gh"], 1, b"", stderr),
+        )
+        output = io.StringIO()
+        arguments = [
+            str(SCRIPT),
+            "pipeline",
+            "owner/repo#7",
+            "--repo-root",
+            str(repo_root),
+            "--state",
+            str(state_path),
+            "--pipeline-run",
+            "bc204b55bc1240b18bc5193123ceb226",
+            "--pipeline-iteration",
+            "1",
+            "--pipeline-max-iterations",
+            "2",
+        ]
+
+        with (
+            mock.patch.object(sys, "argv", arguments),
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo_root),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value={"repo_name": "owner/repo", "number": 7},
+            ),
+            mock.patch.object(
+                MODULE, "wait_for_stable_ci_preflight", side_effect=error
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = MODULE.main()
+
+        self.assertEqual(1, exit_code)
+        result = json.loads(output.getvalue())
+        self.assertEqual("error", result["result"])
+        self.assertEqual("coordinator_error", result["reason"])
+        self.assertEqual(
+            77,
+            result["external_command_diagnostic"]["stderr"]["byte_count"],
+        )
+        state = MODULE.load_state(state_path)
+        self.assertEqual(0, state["iterations"])
+        self.assertNotIn("agent_task", state)
+        self.assertEqual("blocked", state["coordinator"]["status"])
+        self.assertEqual("coordinator_error", state["escalation"]["reason"])
+        self.assertIn(
+            "gh: failed to download job log: HTTP 404 Not Found",
+            state["escalation"]["detail"],
+        )
+        self.assertEqual(
+            result["external_command_diagnostic"],
+            state["escalation"]["external_command_diagnostic"],
+        )
+        self.assertEqual(
+            "escalated",
+            MODULE.status_payload(state, state_path)["stage_outcome"],
+        )
+
+    def test_coordinator_failure_state_replacement_is_atomic(self):
+        state_path = self.root / "coordinator.json"
+        MODULE.save_state(
+            state_path,
+            {
+                "version": MODULE.STATE_VERSION,
+                "created_at": MODULE.utc_now(),
+                "iterations": 0,
+                "history": [],
+            },
+        )
+        original = state_path.read_bytes()
+        error = MODULE.external_command_failure(
+            "download failed",
+            MODULE.subprocess.CompletedProcess(["gh"], 1, b"", b"failed\n"),
+        )
+
+        with (
+            mock.patch.object(
+                MODULE.os, "replace", side_effect=OSError("replace failed")
+            ),
+            self.assertRaisesRegex(OSError, "replace failed"),
+        ):
+            MODULE.record_coordinator_failure(state_path, error)
+
+        self.assertEqual(original, state_path.read_bytes())
+        self.assertEqual([], list(self.root.glob(f".{state_path.name}.*.tmp")))
 
     def test_external_status_context_never_resolves_an_actions_job(self):
         check = {
