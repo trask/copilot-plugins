@@ -5804,6 +5804,77 @@ def check_rollup_identity(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{field: check.get(field) for field in fields} for check in checks]
 
 
+def pull_request_api_identity(pull_request: dict[str, Any]) -> dict[str, Any]:
+    def selected(
+        value: Any,
+        fields: tuple[str, ...],
+    ) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise WorkflowError("pull request API identity contains a malformed object")
+        return {field: value.get(field) for field in fields}
+
+    def user(value: Any) -> dict[str, Any] | None:
+        return selected(value, ("id", "node_id", "login", "type"))
+
+    def repository(value: Any) -> dict[str, Any] | None:
+        return selected(value, ("id", "node_id", "full_name", "private", "fork"))
+
+    def pull_request_ref(
+        value: Any,
+        *,
+        include_sha: bool,
+    ) -> dict[str, Any] | None:
+        identity = selected(value, ("label", "ref"))
+        if identity is None:
+            return None
+        if include_sha:
+            identity["sha"] = value.get("sha")
+        identity["user"] = user(value.get("user"))
+        identity["repo"] = repository(value.get("repo"))
+        return identity
+
+    def auto_merge(value: Any) -> dict[str, Any] | None:
+        identity = selected(value, ("commit_title", "commit_message", "merge_method"))
+        if identity is not None:
+            identity["enabled_by"] = user(value.get("enabled_by"))
+        return identity
+
+    fields = (
+        "id",
+        "node_id",
+        "number",
+        "state",
+        "locked",
+        "active_lock_reason",
+        "title",
+        "body",
+        "draft",
+        "maintainer_can_modify",
+        "closed_at",
+        "merged_at",
+    )
+    identity = {field: pull_request.get(field) for field in fields}
+    identity.update(
+        {
+            "user": user(pull_request.get("user")),
+            "merged_by": user(pull_request.get("merged_by")),
+            "head": pull_request_ref(pull_request.get("head"), include_sha=True),
+            "base": pull_request_ref(pull_request.get("base"), include_sha=False),
+            "requested_reviewers": [
+                user(value) for value in pull_request.get("requested_reviewers", [])
+            ],
+            "requested_teams": [
+                selected(value, ("id", "node_id", "name", "slug"))
+                for value in pull_request.get("requested_teams", [])
+            ],
+            "auto_merge": auto_merge(pull_request.get("auto_merge")),
+        }
+    )
+    return identity
+
+
 def fetch_failed_check_log(
     pr: dict[str, Any],
     check: dict[str, Any],
@@ -6303,8 +6374,8 @@ def github_triage_fingerprint(
         "issue": gh_json(
             ["api", f"repos/{pr['repo_name']}/issues/{pr['number']}"]
         ),
-        "pull_request_api": gh_json(
-            ["api", f"repos/{pr['repo_name']}/pulls/{pr['number']}"]
+        "pull_request_api": pull_request_api_identity(
+            gh_json(["api", f"repos/{pr['repo_name']}/pulls/{pr['number']}"])
         ),
     }
     return {
@@ -6394,7 +6465,7 @@ def run_local_triage_worker(
     if before_source != after_source:
         raise WorkflowError("local CI triage session changed repository source state")
     if before_github != after_github:
-        raise WorkflowError("local CI triage session changed GitHub state")
+        raise WorkflowError("GitHub state changed during local CI triage")
     if sha256_file(prompt_path) != prompt_sha256:
         raise WorkflowError("local CI triage session changed its pinned prompt")
     for path, digest in log_digests.items():

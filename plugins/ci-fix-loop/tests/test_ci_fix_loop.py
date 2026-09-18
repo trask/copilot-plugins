@@ -4425,7 +4425,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.39", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.40", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -6669,6 +6669,119 @@ class LocalCiLogTriageTest(unittest.TestCase):
         self.assertEqual(self.summary, handed_off)
         self.assertNotIn(self.log_text, prompt)
         self.assertNotIn(str(self.log_path), prompt)
+
+    def test_github_fingerprint_ignores_unrelated_repository_activity(self):
+        pull_request = {
+            "id": 17,
+            "node_id": "PR_node",
+            "number": 7,
+            "state": "open",
+            "locked": False,
+            "active_lock_reason": None,
+            "title": "Fix widget",
+            "body": "",
+            "draft": True,
+            "maintainer_can_modify": True,
+            "closed_at": None,
+            "merged_at": None,
+            "user": {"id": 11, "node_id": "U_owner", "login": "owner", "type": "User"},
+            "merged_by": None,
+            "head": {
+                "label": "owner:feature",
+                "ref": "feature",
+                "sha": self.preflight["pr"]["head_sha"],
+                "user": {
+                    "id": 11,
+                    "node_id": "U_owner",
+                    "login": "owner",
+                    "type": "User",
+                },
+                "repo": {
+                    "id": 21,
+                    "node_id": "R_fork",
+                    "full_name": "owner/repo",
+                    "private": False,
+                    "fork": True,
+                    "pushed_at": "2026-09-17T19:10:31Z",
+                },
+            },
+            "base": {
+                "label": "owner:main",
+                "ref": "main",
+                "sha": "3" * 40,
+                "user": {
+                    "id": 11,
+                    "node_id": "U_owner",
+                    "login": "owner",
+                    "type": "User",
+                },
+                "repo": {
+                    "id": 22,
+                    "node_id": "R_upstream",
+                    "full_name": "owner/repo",
+                    "private": False,
+                    "fork": False,
+                    "pushed_at": "2026-09-18T01:12:00Z",
+                    "stargazers_count": 100,
+                },
+            },
+            "requested_reviewers": [],
+            "requested_teams": [],
+            "auto_merge": None,
+            "mergeable": True,
+            "rebaseable": False,
+            "mergeable_state": "blocked",
+            "merge_commit_sha": "4" * 40,
+        }
+
+        def fingerprint():
+            def api_response(arguments):
+                path = arguments[-1]
+                if path == "repos/owner/repo/pulls/7":
+                    return copy.deepcopy(pull_request)
+                if path == "repos/owner/repo/issues/7":
+                    return {"id": 7}
+                return []
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "metadata_for",
+                    return_value=self.preflight["pr"],
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "fetch_rollup",
+                    return_value=(self.preflight["pr"]["head_sha"], []),
+                ),
+                mock.patch.object(MODULE, "gh_json", side_effect=api_response),
+            ):
+                return MODULE.github_triage_fingerprint(
+                    {"repo_name": "owner/repo", "number": 7},
+                    self.preflight,
+                )
+
+        before = fingerprint()
+        pull_request["base"]["repo"]["pushed_at"] = "2026-09-18T01:14:39Z"
+        pull_request["base"]["repo"]["stargazers_count"] = 101
+        pull_request["mergeable_state"] = "unknown"
+        pull_request["merge_commit_sha"] = "5" * 40
+        after_external_activity = fingerprint()
+
+        self.assertEqual(before, after_external_activity)
+
+        pull_request["requested_reviewers"] = [
+            {
+                "id": 12,
+                "node_id": "U_reviewer",
+                "login": "reviewer",
+                "type": "User",
+            }
+        ]
+        self.assertNotEqual(
+            before,
+            fingerprint(),
+        )
 
     def test_local_worker_uses_default_agent_and_verified_artifacts(self):
         prompt_path = self.artifacts / "prompt.txt"
