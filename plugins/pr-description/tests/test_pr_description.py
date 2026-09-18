@@ -31,6 +31,11 @@ FORWARD_TOP_LEVEL_IDENTITY_KEEP_REPORT = (
     / "fixtures"
     / "forward-top-level-identity-keep-report.md"
 )
+FORWARD_STRUCTURED_TOP_LEVEL_IDENTITY_KEEP_REPORT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "forward-structured-top-level-identity-keep-report.md"
+)
 FORWARD_NESTED_REQUEST_KEEP_REPORT = (
     Path(__file__).parent
     / "fixtures"
@@ -1129,7 +1134,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.59")
+        self.assertEqual(plugin["version"], "1.0.60")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1533,6 +1538,179 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     f"```json\n{json.dumps(candidate)}\n```",
                     **common,
                 )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "stale identity"):
+            MODULE.validate_proposal_report(
+                content,
+                **{**common, "proposal_count": 1},
+            )
+
+    def test_exact_structured_top_level_identity_keep_report_recovers_no_proposal(
+        self,
+    ):
+        content = FORWARD_STRUCTURED_TOP_LEVEL_IDENTITY_KEEP_REPORT.read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            "b8844220977c0ae954c000678af3077b9097afe70ed32f511143454d52d3a6d8",
+            MODULE.sha256_text(content),
+        )
+        parsed = MODULE.parse_markdown_report(content, description="test report")
+        repository = parsed["repository"]
+        head = parsed["head"]
+        base = parsed["base"]
+        preflight = agent_task_preflight()
+        preflight["pr"].update(
+            {
+                "number": parsed["pull_request"]["number"],
+                "owner": repository["owner"],
+                "repo": repository["name"],
+                "repo_name": f"{repository['owner']}/{repository['name']}",
+                "title": parsed["title"]["current"],
+                "body": parsed["body"]["current"],
+                "url": parsed["pull_request"]["url"],
+                "head_sha": head["sha"],
+                "head": {
+                    "repository": head["repository"],
+                    "ref": head["branch"],
+                    "sha": head["sha"],
+                },
+                "base": {
+                    "repository": base["repository"],
+                    "ref": base["branch"],
+                    "sha": "2" * 40,
+                },
+            }
+        )
+        changed_files = parsed["evidence"]["changed_files"]
+        common = {
+            "request_id": parsed["request"]["id"],
+            "preflight": preflight,
+            "changed_files": changed_files,
+            "proposal_count": 0,
+        }
+
+        report = MODULE.validate_proposal_report(content, **common)
+
+        self.assertEqual(MODULE.LEGACY_PR_DESCRIPTION_PROPOSAL_SCHEMA, report["schema"])
+        self.assertEqual(common["request_id"], report["request_id"])
+        self.assertEqual("keep", report["decision"])
+        self.assertEqual(
+            {
+                "title": parsed["title"]["current"],
+                "body": parsed["body"]["current"],
+            },
+            report["proposal"],
+        )
+        self.assertEqual(
+            changed_files,
+            [item["path"] for item in report["evidence"]["changed_files"]],
+        )
+
+        identity_fields = [
+            (("request", "id"), "different-request"),
+            (("request", "type"), "pull_request_review"),
+            (("repository", "owner"), "different-owner"),
+            (("repository", "name"), "different-repository"),
+            (("pull_request", "number"), 16162),
+            (
+                ("pull_request", "url"),
+                "https://github.com/open-telemetry/"
+                "opentelemetry-java-instrumentation/pull/16162",
+            ),
+            (
+                ("head", "repository"),
+                "open-telemetry/opentelemetry-java-instrumentation",
+            ),
+            (("head", "branch"), "different-branch"),
+            (("head", "sha"), "0" * 40),
+            (("base", "repository"), "different-owner/different-repository"),
+            (("base", "branch"), "different-base"),
+            (("title", "current"), "Different title"),
+            (("body", "current"), "Different body"),
+        ]
+        for path, replacement in identity_fields:
+            mutated = json.loads(json.dumps(parsed))
+            target = mutated
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = replacement
+            with self.subTest(kind="mutated", path=path), self.assertRaises(
+                MODULE.WorkflowError
+            ):
+                MODULE.validate_proposal_report(
+                    f"```json\n{json.dumps(mutated)}\n```",
+                    **common,
+                )
+
+            missing = json.loads(json.dumps(parsed))
+            target = missing
+            for key in path[:-1]:
+                target = target[key]
+            target.pop(path[-1])
+            with self.subTest(kind="missing", path=path), self.assertRaises(
+                MODULE.WorkflowError
+            ):
+                MODULE.validate_proposal_report(
+                    f"```json\n{json.dumps(missing)}\n```",
+                    **common,
+                )
+
+        for path in (
+            ("request",),
+            ("repository",),
+            ("pull_request",),
+            ("head",),
+            ("base",),
+            ("title",),
+            ("body",),
+        ):
+            extra = json.loads(json.dumps(parsed))
+            target = extra
+            for key in path:
+                target = target[key]
+            target["unexpected"] = True
+            with self.subTest(kind="extra", path=path), self.assertRaises(
+                MODULE.WorkflowError
+            ):
+                MODULE.validate_proposal_report(
+                    f"```json\n{json.dumps(extra)}\n```",
+                    **common,
+                )
+
+        malformed = []
+        alternate_action = json.loads(json.dumps(parsed))
+        alternate_action["decision"] = "replace"
+        malformed.append(alternate_action)
+        mutation = json.loads(json.dumps(parsed))
+        mutation["proposal"]["title"] = "Different title"
+        malformed.append(mutation)
+        body_mutation = json.loads(json.dumps(parsed))
+        body_mutation["proposal"]["body"] = "Different body"
+        malformed.append(body_mutation)
+        ambiguous = json.loads(json.dumps(parsed))
+        ambiguous["repository"] = preflight["pr"]["repo_name"]
+        malformed.append(ambiguous)
+        finding_bearing = json.loads(json.dumps(parsed))
+        finding_bearing["findings"] = []
+        malformed.append(finding_bearing)
+        evidence_with_unknown_key = json.loads(json.dumps(parsed))
+        evidence_with_unknown_key["evidence"]["title_basis"] = "Unexpected"
+        malformed.append(evidence_with_unknown_key)
+        incomplete_files = json.loads(json.dumps(parsed))
+        incomplete_files["evidence"]["changed_files"] = changed_files[:-1]
+        malformed.append(incomplete_files)
+        duplicate_files = json.loads(json.dumps(parsed))
+        duplicate_files["evidence"]["changed_files"][-1] = changed_files[0]
+        malformed.append(duplicate_files)
+        for candidate in malformed:
+            with self.subTest(candidate=candidate), self.assertRaises(
+                MODULE.WorkflowError
+            ):
+                MODULE.validate_proposal_report(
+                    f"```json\n{json.dumps(candidate)}\n```",
+                    **common,
+                )
+
         with self.assertRaisesRegex(MODULE.WorkflowError, "stale identity"):
             MODULE.validate_proposal_report(
                 content,

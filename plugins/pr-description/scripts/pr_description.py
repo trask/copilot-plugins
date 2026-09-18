@@ -1956,6 +1956,23 @@ def validate_proposal_report(
         "evidence",
         "proposal",
     }
+    forward_structured_top_level_identity_keep = (
+        forward_top_level_identity_keep
+        and isinstance(report.get("request"), dict)
+        and set(report["request"]) == {"id", "type"}
+        and isinstance(report.get("repository"), dict)
+        and set(report["repository"]) == {"owner", "name"}
+        and isinstance(report.get("pull_request"), dict)
+        and set(report["pull_request"]) == {"number", "url"}
+        and isinstance(report.get("head"), dict)
+        and set(report["head"]) == {"repository", "branch", "sha"}
+        and isinstance(report.get("base"), dict)
+        and set(report["base"]) == {"repository", "branch"}
+        and isinstance(report.get("title"), dict)
+        and set(report["title"]) == {"current"}
+        and isinstance(report.get("body"), dict)
+        and set(report["body"]) == {"current"}
+    )
     retained_top_level_keep = (
         retained_recovery is not None
         and isinstance(report, dict)
@@ -2004,6 +2021,14 @@ def validate_proposal_report(
         )
     elif forward_nested_request_keep:
         report = normalize_forward_nested_request_keep_proposal_report(
+            report,
+            request_id=request_id,
+            preflight=preflight,
+            changed_files=changed_files,
+            proposal_count=proposal_count,
+        )
+    elif forward_structured_top_level_identity_keep:
+        report = normalize_forward_structured_top_level_identity_keep_report(
             report,
             request_id=request_id,
             preflight=preflight,
@@ -2604,6 +2629,67 @@ def normalize_forward_top_level_identity_keep_proposal_report(
             "body_basis": evidence["body_basis"],
         },
     }
+
+
+def normalize_forward_structured_top_level_identity_keep_report(
+    report: dict[str, Any],
+    *,
+    request_id: str,
+    preflight: dict[str, Any],
+    changed_files: list[str],
+    proposal_count: int | None,
+) -> dict[str, Any]:
+    pr = preflight["pr"]
+    if (
+        proposal_count != 0
+        or report.get("request")
+        != {
+            "id": request_id,
+            "type": "pull_request_description",
+        }
+        or report.get("repository")
+        != {
+            "owner": pr["owner"],
+            "name": pr["repo"],
+        }
+        or report.get("pull_request")
+        != {
+            "number": pr["number"],
+            "url": pr["url"],
+        }
+        or report.get("head")
+        != {
+            "repository": pr["head"]["repository"],
+            "branch": pr["head"]["ref"],
+            "sha": pr["head_sha"],
+        }
+        or report.get("base")
+        != {
+            "repository": pr["base"]["repository"],
+            "branch": pr["base"]["ref"],
+        }
+        or report.get("title") != {"current": pr["title"]}
+        or report.get("body") != {"current": pr["body"]}
+    ):
+        raise WorkflowError(
+            "Agent Task structured top-level identity keep report is malformed or "
+            "has stale identity"
+        )
+    scalar_report = {
+        **report,
+        "request": {"type": "pull_request_description"},
+        "repository": pr["repo_name"],
+        "pull_request": pr["number"],
+        "title": pr["title"],
+        "body": pr["body"],
+    }
+    return normalize_forward_top_level_identity_keep_proposal_report(
+        scalar_report,
+        request_id=request_id,
+        preflight=preflight,
+        changed_files=changed_files,
+        proposal_count=proposal_count,
+    )
 
 
 def command_preflight(args: argparse.Namespace) -> None:
