@@ -4599,7 +4599,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.44", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.45", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -4671,6 +4671,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         with (
             mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+            mock.patch.object(MODULE, "verify_failed_log_download_identity"),
             mock.patch.object(MODULE, "run_bytes", return_value=completed) as run,
         ):
             content = MODULE.fetch_failed_check_log(
@@ -4686,6 +4687,326 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("2", run.call_args.args[0])
         self.assertNotIn("--allow-escape-sequences", run.call_args.args[0])
 
+    def test_failed_log_retries_exact_http2_cancel_then_succeeds(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        error_text = "stream ID 1; CANCEL; received from peer"
+        cancelled = MODULE.subprocess.CompletedProcess(
+            ["gh"], 1, b"", error_text.encode("utf-8")
+        )
+        succeeded = MODULE.subprocess.CompletedProcess(
+            ["gh"], 0, b"focused failure log\n", b""
+        )
+        evidence = {}
+        with (
+            mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+            mock.patch.object(MODULE, "verify_failed_log_download_identity"),
+            mock.patch.object(
+                MODULE, "run_bytes", side_effect=[cancelled, succeeded]
+            ) as run,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            content = MODULE.fetch_failed_check_log(
+                self.preflight["pr"], check, evidence=evidence
+            )
+
+        self.assertEqual("focused failure log\n", content)
+        self.assertEqual(2, run.call_count)
+        self.assertEqual(run.call_args_list[0].args[0], run.call_args_list[1].args[0])
+        self.assertEqual(
+            MODULE.FAILED_LOG_DOWNLOAD_TIMEOUT_SECONDS,
+            run.call_args_list[0].kwargs["timeout"],
+        )
+        sleep.assert_called_once_with(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS[0])
+        self.assertEqual(
+            ["transient_failure", "success"],
+            [attempt["result"] for attempt in evidence["attempts"]],
+        )
+        self.assertEqual(2, evidence["attempt_count"])
+        self.assertIsNone(evidence["terminal_error"])
+        self.assertEqual(MODULE.sha256_text(content), evidence["content_sha256"])
+
+    def test_failed_log_retries_multiple_transient_failures_then_succeeds(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        results = [
+            MODULE.subprocess.CompletedProcess(["gh"], 1, b"", b"HTTP 429"),
+            MODULE.subprocess.CompletedProcess(["gh"], 1, b"", b"HTTP 503"),
+            MODULE.subprocess.CompletedProcess(
+                ["gh"], 1, b"", b"connection reset by peer"
+            ),
+            MODULE.subprocess.CompletedProcess(["gh"], 0, b"failure\n", b""),
+        ]
+        evidence = {}
+        with (
+            mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+            mock.patch.object(MODULE, "verify_failed_log_download_identity"),
+            mock.patch.object(MODULE, "run_bytes", side_effect=results) as run,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            content = MODULE.fetch_failed_check_log(
+                self.preflight["pr"], check, evidence=evidence
+            )
+
+        self.assertEqual("failure\n", content)
+        self.assertEqual(4, run.call_count)
+        self.assertEqual(
+            [mock.call(delay) for delay in MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS],
+            sleep.call_args_list,
+        )
+        self.assertEqual(4, evidence["attempt_count"])
+
+    def test_failed_log_retry_exhaustion_fails_closed(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        cancelled = MODULE.subprocess.CompletedProcess(
+            ["gh"], 1, b"", b"stream ID 1; CANCEL; received from peer"
+        )
+        evidence = {}
+        attempts_per_method = len(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS) + 1
+        with (
+            mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+            mock.patch.object(MODULE, "run_bytes", return_value=cancelled) as run,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "8 pinned attempts; transient retry budget exhausted",
+            ) as raised,
+        ):
+            MODULE.fetch_failed_check_log(
+                self.preflight["pr"], check, evidence=evidence
+            )
+
+        self.assertEqual(2 * attempts_per_method, run.call_count)
+        self.assertEqual(
+            2 * len(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS),
+            sleep.call_count,
+        )
+        self.assertEqual(
+            ["gh-run-view"] * attempts_per_method
+            + ["rest-job-log"] * attempts_per_method,
+            [attempt["method"] for attempt in evidence["attempts"]],
+        )
+        self.assertEqual(
+            "transient_retry_exhausted",
+            evidence["terminal_error"]["classification"],
+        )
+        self.assertEqual(evidence, raised.exception.details["log_download"])
+
+    def test_failed_log_transient_error_classification_is_narrow(self):
+        transient = (
+            "HTTP 429 Too Many Requests",
+            "HTTP 500 Internal Server Error",
+            "HTTP/2 502 Bad Gateway",
+            "HTTP 503 Service Unavailable",
+            "HTTP 504 Gateway Timeout",
+            "connection reset by peer",
+            "received RST_STREAM from peer",
+            "unexpected EOF",
+            "http2: server sent GOAWAY",
+            "HTTP/2 stream 3 was not closed cleanly: CANCEL (err 8)",
+        )
+        permanent = (
+            "HTTP 400 Bad Request",
+            "HTTP 401 Unauthorized",
+            "HTTP 403 Forbidden",
+            "HTTP 404 Not Found",
+            "HTTP 501 Not Implemented",
+            "invalid JSON response",
+        )
+        for message in transient:
+            with self.subTest(message=message):
+                process = MODULE.subprocess.CompletedProcess(
+                    ["gh"], 1, b"", message.encode("utf-8")
+                )
+                self.assertTrue(MODULE.failed_log_download_error_is_transient(process))
+        for message in permanent:
+            with self.subTest(message=message):
+                process = MODULE.subprocess.CompletedProcess(
+                    ["gh"], 1, b"", message.encode("utf-8")
+                )
+                self.assertFalse(
+                    MODULE.failed_log_download_error_is_transient(process)
+                )
+
+    def test_failed_log_permanent_errors_do_not_retry_or_fallback(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        for message in (
+            "HTTP 401 Unauthorized",
+            "HTTP 403 Forbidden",
+            "HTTP 404 Not Found",
+        ):
+            with self.subTest(message=message):
+                process = MODULE.subprocess.CompletedProcess(
+                    ["gh"], 1, b"", message.encode("utf-8")
+                )
+                with (
+                    mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+                    mock.patch.object(
+                        MODULE, "run_bytes", return_value=process
+                    ) as run,
+                    mock.patch.object(MODULE.time, "sleep") as sleep,
+                    self.assertRaises(MODULE.WorkflowError) as raised,
+                ):
+                    MODULE.fetch_failed_check_log(self.preflight["pr"], check)
+                self.assertEqual(1, run.call_count)
+                sleep.assert_not_called()
+                self.assertEqual(
+                    "permanent_failure",
+                    raised.exception.details["log_download"]["terminal_error"][
+                        "classification"
+                    ],
+                )
+
+    def test_failed_log_malformed_success_does_not_retry(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        for output in (b"", b"\xff"):
+            with self.subTest(output=output):
+                process = MODULE.subprocess.CompletedProcess(["gh"], 0, output, b"")
+                with (
+                    mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+                    mock.patch.object(
+                        MODULE, "run_bytes", return_value=process
+                    ) as run,
+                    mock.patch.object(MODULE.time, "sleep") as sleep,
+                    self.assertRaisesRegex(
+                        MODULE.WorkflowError, "empty response|malformed UTF-8"
+                    ) as raised,
+                ):
+                    MODULE.fetch_failed_check_log(self.preflight["pr"], check)
+                self.assertEqual(1, run.call_count)
+                sleep.assert_not_called()
+                self.assertEqual(
+                    "malformed_response",
+                    raised.exception.details["log_download"]["terminal_error"][
+                        "classification"
+                    ],
+                )
+
+    def test_failed_log_verifies_exact_run_job_and_head_identity(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        pr = self.preflight["pr"]
+        run_payload = {
+            "id": 1,
+            "head_sha": pr["head_sha"],
+            "repository": {"full_name": pr["repo_name"]},
+        }
+        job_payload = {
+            "id": 2,
+            "run_id": 1,
+            "head_sha": pr["head_sha"],
+            "name": check["name"],
+            "status": "completed",
+            "conclusion": "failure",
+        }
+        with mock.patch.object(
+            MODULE, "gh_json", side_effect=[run_payload, job_payload]
+        ) as gh_json:
+            MODULE.verify_failed_log_download_identity(
+                pr, check, {"run_id": 1, "job_id": 2}, run_id=1
+            )
+
+        self.assertEqual(
+            [
+                mock.call(["api", "repos/owner/repo/actions/runs/1"]),
+                mock.call(["api", "repos/owner/repo/actions/jobs/2"]),
+            ],
+            gh_json.call_args_list,
+        )
+        wrong_head = {**job_payload, "head_sha": "f" * 40}
+        with (
+            mock.patch.object(
+                MODULE, "gh_json", side_effect=[run_payload, wrong_head]
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "job 2 identity"),
+        ):
+            MODULE.verify_failed_log_download_identity(
+                pr, check, {"run_id": 1, "job_id": 2}, run_id=1
+            )
+        succeeded = MODULE.subprocess.CompletedProcess(
+            ["gh"], 0, b"untrusted failure log\n", b""
+        )
+        with (
+            mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+            mock.patch.object(MODULE, "run_bytes", return_value=succeeded) as run,
+            mock.patch.object(
+                MODULE,
+                "verify_failed_log_download_identity",
+                side_effect=MODULE.WorkflowError("job 2 identity mismatch"),
+            ),
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+            self.assertRaisesRegex(MODULE.WorkflowError, "identity mismatch"),
+        ):
+            MODULE.fetch_failed_check_log(pr, check)
+        self.assertEqual(1, run.call_count)
+        sleep.assert_not_called()
+
+    def test_failed_log_falls_back_to_exact_read_only_job_endpoint(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        cancelled = MODULE.subprocess.CompletedProcess(
+            ["gh"], 1, b"", b"stream ID 1; CANCEL; received from peer"
+        )
+        succeeded = MODULE.subprocess.CompletedProcess(
+            ["gh"], 0, b"fallback failure log\n", b""
+        )
+        primary_attempts = len(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS) + 1
+        evidence = {}
+        with (
+            mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+            mock.patch.object(MODULE, "verify_failed_log_download_identity"),
+            mock.patch.object(
+                MODULE,
+                "run_bytes",
+                side_effect=[cancelled] * primary_attempts + [succeeded],
+            ) as run,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            content = MODULE.fetch_failed_check_log(
+                self.preflight["pr"], check, evidence=evidence
+            )
+
+        self.assertEqual("fallback failure log\n", content)
+        fallback = run.call_args_list[-1].args[0]
+        self.assertEqual("gh", fallback[0])
+        self.assertEqual("api", fallback[1])
+        self.assertEqual("GET", fallback[fallback.index("--method") + 1])
+        self.assertIn("repos/owner/repo/actions/jobs/2/logs", fallback)
+        serialized = json.dumps([call.args[0] for call in run.call_args_list])
+        self.assertNotIn("rerun", serialized.casefold())
+        self.assertNotIn("POST", serialized)
+        self.assertEqual("rest-job-log", evidence["attempts"][-1]["method"])
+
+    def test_failed_log_evidence_hashes_are_deterministic_and_invocation_local(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        cancelled = MODULE.subprocess.CompletedProcess(
+            ["gh"], 1, b"", b"stream ID 1; CANCEL; received from peer"
+        )
+        succeeded = MODULE.subprocess.CompletedProcess(
+            ["gh"], 0, b"same failure log\n", b""
+        )
+        evidence_records = []
+        for _ in range(2):
+            evidence = {}
+            with (
+                mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+                mock.patch.object(MODULE, "verify_failed_log_download_identity"),
+                mock.patch.object(
+                    MODULE, "run_bytes", side_effect=[cancelled, succeeded]
+                ),
+                mock.patch.object(MODULE.time, "sleep"),
+            ):
+                MODULE.fetch_failed_check_log(
+                    self.preflight["pr"], check, evidence=evidence
+                )
+            evidence_records.append(evidence)
+
+        self.assertEqual(evidence_records[0], evidence_records[1])
+        self.assertEqual(2, evidence_records[0]["attempt_count"])
+        self.assertEqual(
+            MODULE.sha256_text("same failure log\n"),
+            evidence_records[0]["content_sha256"],
+        )
+        self.assertEqual([1, 2], [
+            attempt["attempt"] for attempt in evidence_records[0]["attempts"]
+        ])
+
     def test_failed_log_redacts_real_credentials_before_persistence(self):
         check = self.preflight["check_snapshot"]["failures"][0]
         destination = self.root.parent / f"{self.root.name}-redacted.log"
@@ -4696,6 +5017,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         with (
             mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+            mock.patch.object(MODULE, "verify_failed_log_download_identity"),
             mock.patch.object(MODULE, "run_bytes", return_value=completed),
         ):
             content = MODULE.fetch_failed_check_log(
@@ -4729,6 +5051,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         with (
             mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+            mock.patch.object(MODULE, "verify_failed_log_download_identity"),
             mock.patch.object(MODULE, "run_bytes", return_value=completed),
         ):
             content = MODULE.fetch_failed_check_log(self.preflight["pr"], check)
@@ -4753,6 +5076,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         with (
             mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+            mock.patch.object(MODULE, "verify_failed_log_download_identity"),
             mock.patch.object(MODULE, "run_bytes", return_value=completed),
         ):
             content = MODULE.fetch_failed_check_log(self.preflight["pr"], check)
@@ -4921,6 +5245,44 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "escalated",
             MODULE.status_payload(state, state_path)["stage_outcome"],
         )
+
+    def test_coordinator_failure_persists_log_download_evidence_without_log_text(self):
+        state_path = self.root / "coordinator.json"
+        evidence = {
+            "schema": MODULE.FAILED_LOG_DOWNLOAD_EVIDENCE_SCHEMA,
+            "repository": "owner/repo",
+            "run_id": 1,
+            "job_id": 2,
+            "head_sha": self.head,
+            "check_key": "check:CI/test",
+            "attempt_count": 4,
+            "attempts": [
+                {
+                    "attempt": 4,
+                    "method": "gh-run-view",
+                    "result": "transient_failure",
+                    "error_sha256": "a" * 64,
+                }
+            ],
+            "terminal_error": {
+                "classification": "transient_retry_exhausted",
+                "method": "gh-run-view",
+                "attempt": 4,
+                "sha256": "a" * 64,
+            },
+            "content_sha256": None,
+        }
+        error = MODULE.WorkflowError(
+            "log download retry budget exhausted",
+            details={"log_download": evidence},
+        )
+
+        MODULE.record_coordinator_failure(state_path, error)
+
+        state = MODULE.load_state(state_path)
+        self.assertEqual(evidence, state["coordinator"]["log_download"])
+        self.assertEqual(evidence, state["escalation"]["log_download"])
+        self.assertNotIn('"text"', json.dumps(evidence))
 
     def test_coordinator_failure_state_replacement_is_atomic(self):
         state_path = self.root / "coordinator.json"
