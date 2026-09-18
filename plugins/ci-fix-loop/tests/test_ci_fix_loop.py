@@ -4601,7 +4601,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.48", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.49", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -5415,6 +5415,296 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     self.assertNotIn(source_marker, serialized)
                     self.assertNotIn(secret, serialized)
                     self.assertNotIn("downloaded failure log", serialized)
+
+    def test_malformed_metadata_never_persists_parser_or_source_text(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        pr = self.preflight["pr"]
+        run_payload = {
+            "id": 1,
+            "head_sha": pr["head_sha"],
+            "repository": {"full_name": pr["repo_name"]},
+            "name": check["workflow"],
+            "workflow_id": 17,
+            "html_url": "https://github.com/owner/repo/actions/runs/1",
+            "status": "completed",
+            "conclusion": "failure",
+        }
+        job_payload = {
+            "id": 2,
+            "run_id": 1,
+            "head_sha": pr["head_sha"],
+            "name": check["name"],
+            "html_url": "https://github.com/owner/repo/actions/runs/1/job/2",
+            "status": "completed",
+            "conclusion": "failure",
+        }
+        run_success = MODULE.subprocess.CompletedProcess(
+            ["gh"], 0, json.dumps(run_payload).encode(), b""
+        )
+        job_success = MODULE.subprocess.CompletedProcess(
+            ["gh"], 0, json.dumps(job_payload).encode(), b""
+        )
+        log_success = MODULE.subprocess.CompletedProcess(
+            ["gh"], 0, b"downloaded failure log\n", b""
+        )
+        secret = "github_pat_abcdefghijklmnopqrstuvwxyz"
+        cases = (
+            {
+                "name": "duplicate-key",
+                "method": "pre-run-metadata",
+                "prefix": [],
+                "raw": (
+                    f'{{"duplicate-{secret}":"first",'
+                    f'"duplicate-{secret}":"second"}}'
+                ).encode(),
+                "source": f"duplicate-{secret}",
+                "malformed": True,
+            },
+            {
+                "name": "invalid-json",
+                "method": "pre-job-metadata",
+                "prefix": [run_success],
+                "raw": (
+                    f'{{"source":"WidgetTest invalid {secret}",INVALID}}'
+                ).encode(),
+                "source": "WidgetTest invalid",
+                "malformed": True,
+            },
+            {
+                "name": "invalid-utf8",
+                "method": "pre-run-metadata",
+                "prefix": [],
+                "raw": f"invalid UTF-8 source {secret}\n".encode() + b"\xff",
+                "source": "invalid UTF-8 source",
+                "malformed": True,
+            },
+            {
+                "name": "non-object",
+                "method": "post-run-metadata",
+                "prefix": [run_success, job_success, log_success],
+                "raw": json.dumps(
+                    f"non-object source fragment {secret}"
+                ).encode(),
+                "source": "non-object source fragment",
+                "malformed": True,
+            },
+            {
+                "name": "schema-invalid-object",
+                "method": "post-job-metadata",
+                "prefix": [
+                    run_success,
+                    job_success,
+                    log_success,
+                    run_success,
+                ],
+                "raw": json.dumps(
+                    {
+                        "id": "not-a-job-id",
+                        f"schema-field-{secret}": "WidgetTest schema source",
+                    }
+                ).encode(),
+                "source": "schema-field-",
+                "malformed": False,
+            },
+        )
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                stderr = b"metadata warning from gh"
+                malformed = MODULE.subprocess.CompletedProcess(
+                    ["gh"], 0, case["raw"], stderr
+                )
+                completed = [*case["prefix"], malformed]
+                evidence = {}
+                state_path = self.root / f"{case['name']}-coordinator.json"
+                repo_root = self.root / f"{case['name']}-repo"
+                repo_root.mkdir()
+                output = io.StringIO()
+                arguments = [
+                    str(SCRIPT),
+                    "pipeline",
+                    "owner/repo#7",
+                    "--repo-root",
+                    str(repo_root),
+                    "--state",
+                    str(state_path),
+                    "--pipeline-run",
+                    "bc204b55bc1240b18bc5193123ceb226",
+                    "--pipeline-iteration",
+                    "1",
+                    "--pipeline-max-iterations",
+                    "2",
+                ]
+
+                def fail_during_preflight(*_args, **_kwargs):
+                    return MODULE.fetch_failed_check_log(
+                        pr, check, evidence=evidence
+                    )
+
+                with (
+                    mock.patch.object(sys, "argv", arguments),
+                    mock.patch.object(MODULE, "require_tools"),
+                    mock.patch.object(
+                        MODULE,
+                        "resolve_repo_root",
+                        return_value=repo_root,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "resolve_target",
+                        return_value={"repo_name": "owner/repo", "number": 7},
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "wait_for_stable_ci_preflight",
+                        side_effect=fail_during_preflight,
+                    ),
+                    mock.patch.object(
+                        MODULE, "run_bytes", side_effect=completed
+                    ) as run,
+                    mock.patch.object(
+                        MODULE,
+                        "record_coordinator_failure",
+                        wraps=MODULE.record_coordinator_failure,
+                    ) as record_failure,
+                    contextlib.redirect_stdout(output),
+                ):
+                    exit_code = MODULE.main()
+
+                self.assertEqual(1, exit_code)
+                self.assertEqual(len(completed), run.call_count)
+                record_failure.assert_called_once()
+                error = record_failure.call_args.args[1]
+                result = json.loads(output.getvalue())
+                state = MODULE.load_state(state_path)
+                target_attempts = [
+                    attempt
+                    for attempt in evidence["attempts"]
+                    if attempt["method"] == case["method"]
+                ]
+                self.assertEqual(1, len(target_attempts))
+                if case["malformed"]:
+                    diagnostic = error.details[
+                        "external_command_diagnostic"
+                    ]
+                    expected_stdout = {
+                        "byte_count": len(case["raw"]),
+                        "sha256": MODULE.hashlib.sha256(
+                            case["raw"]
+                        ).hexdigest(),
+                    }
+                    self.assertEqual(
+                        MODULE.FAILED_LOG_COMMAND_DIAGNOSTIC_SCHEMA,
+                        diagnostic["schema"],
+                    )
+                    self.assertEqual(expected_stdout, diagnostic["stdout"])
+                    self.assertNotIn("text", diagnostic["stdout"])
+                    self.assertEqual(
+                        "metadata warning from gh",
+                        diagnostic["stderr"]["text"],
+                    )
+                    self.assertEqual(
+                        diagnostic, result["external_command_diagnostic"]
+                    )
+                    self.assertEqual(
+                        diagnostic,
+                        state["coordinator"][
+                            "external_command_diagnostic"
+                        ],
+                    )
+                    self.assertEqual(
+                        diagnostic,
+                        state["escalation"][
+                            "external_command_diagnostic"
+                        ],
+                    )
+                    expected_error_hash = MODULE.canonical_json_sha256(
+                        diagnostic
+                    )
+                    self.assertEqual(
+                        {
+                            "attempt": evidence["attempt_count"],
+                            "method": case["method"],
+                            "result": "malformed_response",
+                            "error_sha256": expected_error_hash,
+                        },
+                        target_attempts[0],
+                    )
+                    self.assertEqual(
+                        {
+                            "classification": "malformed_response",
+                            "method": case["method"],
+                            "attempt": evidence["attempt_count"],
+                            "sha256": expected_error_hash,
+                        },
+                        evidence["terminal_error"],
+                    )
+                    metadata_error = error.__cause__
+                    self.assertIsInstance(
+                        metadata_error, MODULE.FailedLogMetadataError
+                    )
+                    self.assertIsNone(metadata_error.__cause__)
+                    self.assertIsNone(metadata_error.__context__)
+                else:
+                    self.assertNotIn(
+                        "external_command_diagnostic", error.details
+                    )
+                    payload = json.loads(case["raw"])
+                    self.assertEqual(
+                        {
+                            "attempt": target_attempts[0]["attempt"],
+                            "method": case["method"],
+                            "result": "success",
+                            "content_sha256": MODULE.canonical_json_sha256(
+                                payload
+                            ),
+                        },
+                        target_attempts[0],
+                    )
+                    self.assertEqual(
+                        "identity_mismatch",
+                        evidence["terminal_error"]["classification"],
+                    )
+                    self.assertEqual(
+                        "post-identity",
+                        evidence["terminal_error"]["method"],
+                    )
+                exception_graph = []
+                pending = [error]
+                seen = set()
+                while pending:
+                    current = pending.pop()
+                    if id(current) in seen:
+                        continue
+                    seen.add(id(current))
+                    exception_graph.append(
+                        {
+                            "type": type(current).__name__,
+                            "message": str(current),
+                            "details": (
+                                current.details
+                                if isinstance(current, MODULE.WorkflowError)
+                                else {}
+                            ),
+                        }
+                    )
+                    for nested in (
+                        current.__cause__,
+                        current.__context__,
+                    ):
+                        if isinstance(nested, BaseException):
+                            pending.append(nested)
+                serialized = json.dumps(
+                    {
+                        "result": result,
+                        "state": state,
+                        "evidence": evidence,
+                        "exceptions": exception_graph,
+                    },
+                    sort_keys=True,
+                )
+                self.assertNotIn(case["source"], serialized)
+                self.assertNotIn(secret, serialized)
+                self.assertNotIn("downloaded failure log", serialized)
 
     def test_failed_log_permanent_errors_do_not_retry_or_fallback(self):
         check = self.preflight["check_snapshot"]["failures"][0]

@@ -6293,6 +6293,19 @@ def run_failed_log_command(
         )
 
 
+def parse_failed_log_metadata_response(
+    raw: bytes,
+    *,
+    description: str,
+) -> dict[str, Any] | None:
+    try:
+        decoded = raw.decode("utf-8")
+        payload = parse_strict_json(decoded, description=description)
+    except (UnicodeDecodeError, WorkflowError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def exact_actions_json_get(
     repository: str,
     endpoint: str,
@@ -6331,11 +6344,16 @@ def exact_actions_json_get(
             ) from error
         if process.returncode == 0:
             raw = process.stdout or b""
-            try:
-                decoded = raw.decode("utf-8")
-                payload = parse_strict_json(decoded, description=f"{method} response")
-            except (UnicodeDecodeError, WorkflowError) as error:
-                error_sha256 = hashlib.sha256(raw).hexdigest()
+            payload = parse_failed_log_metadata_response(
+                raw, description=f"{method} response"
+            )
+            if payload is None:
+                diagnostic = failed_log_command_diagnostic(
+                    exit_status=process.returncode,
+                    stdout=raw,
+                    stderr=process.stderr or b"",
+                )
+                error_sha256 = canonical_json_sha256(diagnostic)
                 record_failed_log_download_attempt(
                     evidence,
                     method=method,
@@ -6343,20 +6361,11 @@ def exact_actions_json_get(
                     error_sha256=error_sha256,
                 )
                 raise FailedLogMetadataError(
-                    f"{method} returned a malformed response: {error}",
-                    details={"classification": "malformed_response"},
-                ) from error
-            if not isinstance(payload, dict):
-                error_sha256 = hashlib.sha256(raw).hexdigest()
-                record_failed_log_download_attempt(
-                    evidence,
-                    method=method,
-                    result="malformed_response",
-                    error_sha256=error_sha256,
-                )
-                raise FailedLogMetadataError(
-                    f"{method} did not return an object",
-                    details={"classification": "malformed_response"},
+                    f"{method} returned a malformed metadata response",
+                    details={
+                        "classification": "malformed_response",
+                        "external_command_diagnostic": diagnostic,
+                    },
                 )
             record_failed_log_download_attempt(
                 evidence,
