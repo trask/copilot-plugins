@@ -59,6 +59,7 @@ FAILED_LOG_DOWNLOAD_EVIDENCE_SCHEMA = (
 )
 FAILED_LOG_DOWNLOAD_RETRY_DELAYS = (1, 2, 4)
 FAILED_LOG_DOWNLOAD_TIMEOUT_SECONDS = 300
+FAILED_LOG_DOWNLOAD_OPERATION_TIMEOUT_SECONDS = 1200
 AGENT_TASK_API_VERSION = "2026-03-10"
 HOSTED_DISPATCH_IDENTITY_SCHEMA = (
     "github.copilot.ci-fix-loop-hosted-dispatch-identity.v2"
@@ -625,6 +626,10 @@ class WorkflowError(RuntimeError):
 
 
 class RerunPermissionDenied(WorkflowError):
+    pass
+
+
+class FailedLogMetadataError(WorkflowError):
     pass
 
 
@@ -6147,12 +6152,22 @@ def pull_request_api_identity(pull_request: dict[str, Any]) -> dict[str, Any]:
 def failed_log_download_error_is_transient(
     process: subprocess.CompletedProcess[bytes],
 ) -> bool:
-    text = b"\n".join((process.stdout or b"", process.stderr or b"")).decode(
-        "utf-8", errors="replace"
-    )
+    text = (process.stderr or b"").decode("utf-8", errors="replace")
     folded = text.casefold()
+    permanent_patterns = (
+        r"\bhttp(?:/\S+)?\s+(?:400|401|403|404|405|409|410|422|501|505)\b",
+        r"\b(?:authentication|authorization) (?:failed|required)\b",
+        r"\bunauthorized\b",
+        r"\bforbidden\b",
+        r"\bpermission denied\b",
+        r"\bnot found\b",
+        r"\binvalid (?:json|response)\b",
+        r"\bmalformed (?:json|response)\b",
+    )
+    if any(re.search(pattern, folded) for pattern in permanent_patterns):
+        return False
     if re.search(r"\bhttp(?:/\S+)?\s+(?:429|5\d\d)\b", folded):
-        return not bool(re.search(r"\bhttp(?:/\S+)?\s+(?:501|505)\b", folded))
+        return True
     transient_fragments = (
         "connection reset",
         "connection aborted",
@@ -6170,6 +6185,7 @@ def failed_log_download_error_is_transient(
         "server sent goaway",
         "rst_stream",
         "stream reset",
+        "command timed out after",
         "failing log download timed out after",
     )
     if any(fragment in folded for fragment in transient_fragments):
@@ -6187,49 +6203,294 @@ def failed_log_download_error_is_transient(
     )
 
 
+def record_failed_log_download_attempt(
+    evidence: dict[str, Any],
+    *,
+    method: str,
+    result: str,
+    error_sha256: str | None = None,
+    content_sha256: str | None = None,
+) -> int:
+    attempt = int(evidence["attempt_count"]) + 1
+    evidence["attempt_count"] = attempt
+    record = {
+        "attempt": attempt,
+        "method": method,
+        "result": result,
+    }
+    if error_sha256 is not None:
+        record["error_sha256"] = error_sha256
+    if content_sha256 is not None:
+        record["content_sha256"] = content_sha256
+    evidence["attempts"].append(record)
+    return attempt
+
+
+def failed_log_command_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise FailedLogMetadataError(
+            "failing-log operation timeout exhausted",
+            details={"classification": "metadata_transport_exhausted"},
+        )
+    return min(float(FAILED_LOG_DOWNLOAD_TIMEOUT_SECONDS), remaining)
+
+
+def run_failed_log_command(
+    command: list[str],
+    *,
+    deadline: float,
+) -> subprocess.CompletedProcess[bytes]:
+    timeout = failed_log_command_timeout(deadline)
+    try:
+        return run_bytes(command, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        stdout = error.stdout if isinstance(error.stdout, bytes) else b""
+        stderr = error.stderr if isinstance(error.stderr, bytes) else b""
+        return subprocess.CompletedProcess(
+            command,
+            124,
+            stdout,
+            stderr
+            + f"command timed out after {timeout:g} seconds".encode("ascii"),
+        )
+
+
+def exact_actions_json_get(
+    repository: str,
+    endpoint: str,
+    *,
+    evidence: dict[str, Any],
+    method: str,
+    deadline: float,
+) -> dict[str, Any]:
+    if not endpoint.startswith(f"repos/{repository}/actions/"):
+        raise FailedLogMetadataError(
+            f"{method} endpoint is outside the pinned Actions repository",
+            details={"classification": "identity_mismatch"},
+        )
+    command = [
+        "gh",
+        "api",
+        "--method",
+        "GET",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        f"X-GitHub-Api-Version: {AGENT_TASK_API_VERSION}",
+        endpoint,
+    ]
+    last_diagnostic: dict[str, Any] | None = None
+    for method_attempt in range(len(FAILED_LOG_DOWNLOAD_RETRY_DELAYS) + 1):
+        try:
+            process = run_failed_log_command(command, deadline=deadline)
+        except FailedLogMetadataError as error:
+            raise FailedLogMetadataError(
+                f"{method} transport retry budget exhausted",
+                details={
+                    **error.details,
+                    "classification": "metadata_transport_exhausted",
+                },
+            ) from error
+        if process.returncode == 0:
+            raw = process.stdout or b""
+            try:
+                decoded = raw.decode("utf-8")
+                payload = parse_strict_json(decoded, description=f"{method} response")
+            except (UnicodeDecodeError, WorkflowError) as error:
+                error_sha256 = hashlib.sha256(raw).hexdigest()
+                record_failed_log_download_attempt(
+                    evidence,
+                    method=method,
+                    result="malformed_response",
+                    error_sha256=error_sha256,
+                )
+                raise FailedLogMetadataError(
+                    f"{method} returned a malformed response: {error}",
+                    details={"classification": "malformed_response"},
+                ) from error
+            if not isinstance(payload, dict):
+                error_sha256 = hashlib.sha256(raw).hexdigest()
+                record_failed_log_download_attempt(
+                    evidence,
+                    method=method,
+                    result="malformed_response",
+                    error_sha256=error_sha256,
+                )
+                raise FailedLogMetadataError(
+                    f"{method} did not return an object",
+                    details={"classification": "malformed_response"},
+                )
+            record_failed_log_download_attempt(
+                evidence,
+                method=method,
+                result="success",
+                content_sha256=hashlib.sha256(raw).hexdigest(),
+            )
+            return payload
+        diagnostic = external_command_diagnostic(
+            exit_status=process.returncode,
+            stdout=process.stdout or b"",
+            stderr=process.stderr or b"",
+        )
+        last_diagnostic = diagnostic
+        transient = failed_log_download_error_is_transient(process)
+        record_failed_log_download_attempt(
+            evidence,
+            method=method,
+            result="transient_failure" if transient else "permanent_failure",
+            error_sha256=canonical_json_sha256(diagnostic),
+        )
+        if not transient:
+            raise FailedLogMetadataError(
+                f"{method} failed permanently",
+                details={
+                    "classification": "metadata_permanent_failure",
+                    "external_command_diagnostic": diagnostic,
+                },
+            )
+        if method_attempt < len(FAILED_LOG_DOWNLOAD_RETRY_DELAYS):
+            delay = FAILED_LOG_DOWNLOAD_RETRY_DELAYS[method_attempt]
+            if time.monotonic() + delay >= deadline:
+                break
+            time.sleep(delay)
+    raise FailedLogMetadataError(
+        f"{method} transport retry budget exhausted",
+        details={
+            "classification": "metadata_transport_exhausted",
+            **(
+                {"external_command_diagnostic": last_diagnostic}
+                if last_diagnostic is not None
+                else {}
+            ),
+        },
+    )
+
+
+def exact_actions_check_reference(
+    pr: dict[str, Any],
+    check: dict[str, Any],
+) -> dict[str, int] | None:
+    if check.get("kind") != "check_run":
+        return None
+    url = check.get("url")
+    if not isinstance(url, str) or not url:
+        raise WorkflowError("failing check has no exact GitHub Actions reference")
+    parsed = urllib.parse.urlparse(url)
+    match = re.fullmatch(
+        r"/(?P<owner>[^/]+)/(?P<repo>[^/]+)/actions/runs/(?P<run>\d+)"
+        r"(?:/job/(?P<job>\d+))?/?",
+        parsed.path,
+    )
+    if (
+        parsed.scheme.casefold() != "https"
+        or parsed.netloc.casefold() != "github.com"
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or match is None
+        or f"{match.group('owner')}/{match.group('repo')}".casefold()
+        != pr["repo_name"].casefold()
+    ):
+        raise WorkflowError("failing check is not an exact GitHub Actions reference")
+    run_id = int(match.group("run"))
+    if check.get("workflow_run_id") != run_id:
+        raise WorkflowError("failing check workflow run identity is ambiguous")
+    workflow = check.get("workflow")
+    if not isinstance(workflow, str) or not workflow.strip():
+        raise WorkflowError("failing check has no trusted Actions workflow identity")
+    reference = {"run_id": run_id}
+    job = match.group("job")
+    if job is not None:
+        reference["job_id"] = int(job)
+    elif check.get("name") != workflow:
+        raise WorkflowError(
+            "run-only Actions reference is not an exact workflow aggregate"
+        )
+    return reference
+
+
 def verify_failed_log_download_identity(
     pr: dict[str, Any],
     check: dict[str, Any],
     reference: dict[str, int],
     *,
     run_id: int,
+    evidence: dict[str, Any],
+    phase: str,
+    deadline: float,
 ) -> None:
     repository = pr["repo_name"]
-    run = gh_json(["api", f"repos/{repository}/actions/runs/{run_id}"])
+    run = exact_actions_json_get(
+        repository,
+        f"repos/{repository}/actions/runs/{run_id}",
+        evidence=evidence,
+        method=f"{phase}-run-metadata",
+        deadline=deadline,
+    )
     run_repository = run.get("repository") if isinstance(run, dict) else None
     check_run_id = check.get("workflow_run_id")
+    run_status = str(run.get("status") or "").casefold()
+    check_status = str(check.get("status") or "").casefold()
+    run_url = run.get("html_url")
+    expected_run_url = (
+        f"https://github.com/{repository}/actions/runs/{run_id}"
+    )
     if (
         (isinstance(check_run_id, int) and check_run_id != run_id)
-        or not isinstance(run, dict)
         or run.get("id") != run_id
         or not isinstance(run.get("head_sha"), str)
         or run["head_sha"].lower() != pr["head_sha"].lower()
         or not isinstance(run_repository, dict)
         or not isinstance(run_repository.get("full_name"), str)
         or run_repository["full_name"].casefold() != repository.casefold()
+        or run.get("name") != check.get("workflow")
+        or not isinstance(run.get("workflow_id"), int)
+        or run["workflow_id"] <= 0
+        or run_url != expected_run_url
+        or run_status != check_status
     ):
         raise WorkflowError(
             f"workflow run {run_id} identity does not match pinned repository "
-            f"{repository} and head {pr['head_sha']}"
+            f"{repository}, head {pr['head_sha']}, workflow, or status",
+            details={"classification": "identity_mismatch"},
         )
     job_id = reference.get("job_id")
     if job_id is None:
+        if (
+            str(run.get("conclusion") or "").casefold()
+            != str(check.get("conclusion") or check.get("state") or "").casefold()
+        ):
+            raise WorkflowError(
+                f"workflow run {run_id} conclusion does not match pinned check",
+                details={"classification": "identity_mismatch"},
+            )
         return
-    job = gh_json(["api", f"repos/{repository}/actions/jobs/{job_id}"])
+    job = exact_actions_json_get(
+        repository,
+        f"repos/{repository}/actions/jobs/{job_id}",
+        evidence=evidence,
+        method=f"{phase}-job-metadata",
+        deadline=deadline,
+    )
+    expected_job_url = (
+        f"https://github.com/{repository}/actions/runs/{run_id}/job/{job_id}"
+    )
     if (
-        not isinstance(job, dict)
-        or job.get("id") != job_id
+        job.get("id") != job_id
         or job.get("run_id") != run_id
         or not isinstance(job.get("head_sha"), str)
         or job["head_sha"].lower() != pr["head_sha"].lower()
         or job.get("name") != check.get("name")
-        or str(job.get("status") or "").casefold() != "completed"
+        or job.get("html_url") != expected_job_url
+        or str(job.get("status") or "").casefold() != check_status
         or str(job.get("conclusion") or "").casefold()
         != str(check.get("conclusion") or check.get("state") or "").casefold()
     ):
         raise WorkflowError(
             f"job {job_id} identity does not match pinned run {run_id}, "
-            f"head {pr['head_sha']}, and check {check['key']}"
+            f"head {pr['head_sha']}, workflow, and check {check['key']}",
+            details={"classification": "identity_mismatch"},
         )
 
 
@@ -6241,14 +6502,17 @@ def fetch_failed_check_log(
     repo_root: Path | None = None,
     evidence: dict[str, Any] | None = None,
 ) -> str:
-    reference = check_run_reference(check)
+    reference = exact_actions_check_reference(pr, check)
     if reference is None:
         if destination is not None:
             if repo_root is not None:
                 require_outside_repository(destination, repo_root)
             atomic_write_text(destination, "")
         return ""
-    run_id = resolve_run_id(pr, reference)
+    run_id = reference["run_id"]
+    deadline = (
+        time.monotonic() + FAILED_LOG_DOWNLOAD_OPERATION_TIMEOUT_SECONDS
+    )
     primary_command = [
         "gh",
         "run",
@@ -6302,51 +6566,108 @@ def fetch_failed_check_log(
             evidence.clear()
             evidence.update(copy.deepcopy(download_evidence))
 
+    def validate_identity(phase: str) -> None:
+        try:
+            verify_failed_log_download_identity(
+                pr,
+                check,
+                reference,
+                run_id=run_id,
+                evidence=download_evidence,
+                phase=phase,
+                deadline=deadline,
+            )
+        except WorkflowError as error:
+            classification = error.details.get(
+                "classification", "identity_mismatch"
+            )
+            error_sha256 = sha256_text(
+                sanitize_external_command_text(str(error))
+            )
+            if classification == "identity_mismatch":
+                attempt = record_failed_log_download_attempt(
+                    download_evidence,
+                    method=f"{phase}-identity",
+                    result="identity_mismatch",
+                    error_sha256=error_sha256,
+                )
+                terminal_method = f"{phase}-identity"
+            else:
+                attempt = int(download_evidence["attempt_count"])
+                last_attempt = (
+                    download_evidence["attempts"][-1]
+                    if download_evidence["attempts"]
+                    else {}
+                )
+                error_sha256 = last_attempt.get("error_sha256", error_sha256)
+                terminal_method = last_attempt.get(
+                    "method", f"{phase}-identity"
+                )
+            download_evidence["terminal_error"] = {
+                "classification": classification,
+                "method": terminal_method,
+                "attempt": attempt,
+                "sha256": error_sha256,
+            }
+            publish_evidence()
+            details = {"log_download": copy.deepcopy(download_evidence)}
+            diagnostic = error.details.get("external_command_diagnostic")
+            if isinstance(diagnostic, dict):
+                details["external_command_diagnostic"] = diagnostic
+            raise WorkflowError(
+                f"could not download the failing log for {check['key']}: {error}",
+                details=details,
+            ) from error
+
+    publish_evidence()
+    validate_identity("pre")
     last_process: subprocess.CompletedProcess[bytes] | None = None
     decoded: str | None = None
     for method_index, (method, command) in enumerate(methods):
+        if method_index:
+            validate_identity("fallback")
         for method_attempt in range(len(FAILED_LOG_DOWNLOAD_RETRY_DELAYS) + 1):
-            attempt = download_evidence["attempt_count"] + 1
             try:
-                process = run_bytes(
-                    command,
-                    check=False,
-                    timeout=FAILED_LOG_DOWNLOAD_TIMEOUT_SECONDS,
+                process = run_failed_log_command(command, deadline=deadline)
+            except FailedLogMetadataError as error:
+                error_sha256 = sha256_text(str(error))
+                attempt = record_failed_log_download_attempt(
+                    download_evidence,
+                    method=method,
+                    result="transient_failure",
+                    error_sha256=error_sha256,
                 )
-            except subprocess.TimeoutExpired as error:
-                stdout = error.stdout if isinstance(error.stdout, bytes) else b""
-                stderr = error.stderr if isinstance(error.stderr, bytes) else b""
-                process = subprocess.CompletedProcess(
-                    command,
-                    124,
-                    stdout,
-                    stderr
-                    + (
-                        f"failing log download timed out after "
-                        f"{FAILED_LOG_DOWNLOAD_TIMEOUT_SECONDS} seconds"
-                    ).encode("ascii"),
-                )
+                download_evidence["terminal_error"] = {
+                    "classification": "transport_exhausted",
+                    "method": method,
+                    "attempt": attempt,
+                    "sha256": error_sha256,
+                }
+                publish_evidence()
+                raise WorkflowError(
+                    f"could not download the failing log for {check['key']}: "
+                    "operation timeout exhausted",
+                    details={"log_download": copy.deepcopy(download_evidence)},
+                ) from error
             last_process = process
-            download_evidence["attempt_count"] = attempt
             if process.returncode == 0:
                 try:
                     decoded = (process.stdout or b"").decode("utf-8")
                 except UnicodeDecodeError as error:
-                    download_evidence["attempts"].append(
-                        {
-                            "attempt": attempt,
-                            "method": method,
-                            "result": "malformed_response",
-                            "error_sha256": hashlib.sha256(
-                                process.stdout or b""
-                            ).hexdigest(),
-                        }
+                    error_sha256 = hashlib.sha256(
+                        process.stdout or b""
+                    ).hexdigest()
+                    attempt = record_failed_log_download_attempt(
+                        download_evidence,
+                        method=method,
+                        result="malformed_response",
+                        error_sha256=error_sha256,
                     )
                     download_evidence["terminal_error"] = {
                         "classification": "malformed_response",
                         "method": method,
                         "attempt": attempt,
-                        "sha256": hashlib.sha256(process.stdout or b"").hexdigest(),
+                        "sha256": error_sha256,
                     }
                     publish_evidence()
                     raise WorkflowError(
@@ -6355,21 +6676,20 @@ def fetch_failed_check_log(
                         details={"log_download": copy.deepcopy(download_evidence)},
                     ) from error
                 if not decoded.strip():
-                    download_evidence["attempts"].append(
-                        {
-                            "attempt": attempt,
-                            "method": method,
-                            "result": "malformed_response",
-                            "error_sha256": hashlib.sha256(
-                                process.stdout or b""
-                            ).hexdigest(),
-                        }
+                    error_sha256 = hashlib.sha256(
+                        process.stdout or b""
+                    ).hexdigest()
+                    attempt = record_failed_log_download_attempt(
+                        download_evidence,
+                        method=method,
+                        result="malformed_response",
+                        error_sha256=error_sha256,
                     )
                     download_evidence["terminal_error"] = {
                         "classification": "malformed_response",
                         "method": method,
                         "attempt": attempt,
-                        "sha256": hashlib.sha256(process.stdout or b"").hexdigest(),
+                        "sha256": error_sha256,
                     }
                     publish_evidence()
                     raise WorkflowError(
@@ -6377,42 +6697,15 @@ def fetch_failed_check_log(
                         f"{method} returned an empty response",
                         details={"log_download": copy.deepcopy(download_evidence)},
                     )
-                try:
-                    verify_failed_log_download_identity(
-                        pr,
-                        check,
-                        reference,
-                        run_id=run_id,
-                    )
-                except WorkflowError as error:
-                    identity_error = sanitize_external_command_text(str(error))
-                    download_evidence["attempts"].append(
-                        {
-                            "attempt": attempt,
-                            "method": method,
-                            "result": "identity_mismatch",
-                            "error_sha256": sha256_text(identity_error),
-                        }
-                    )
-                    download_evidence["terminal_error"] = {
-                        "classification": "identity_mismatch",
-                        "method": method,
-                        "attempt": attempt,
-                        "sha256": sha256_text(identity_error),
-                    }
-                    publish_evidence()
-                    raise WorkflowError(
-                        f"could not download the failing log for {check['key']}: "
-                        f"{identity_error}",
-                        details={"log_download": copy.deepcopy(download_evidence)},
-                    ) from error
-                download_evidence["attempts"].append(
-                    {
-                        "attempt": attempt,
-                        "method": method,
-                        "result": "success",
-                    }
+                record_failed_log_download_attempt(
+                    download_evidence,
+                    method=method,
+                    result="success",
+                    content_sha256=hashlib.sha256(
+                        process.stdout or b""
+                    ).hexdigest(),
                 )
+                validate_identity("post")
                 break
 
             diagnostic = external_command_diagnostic(
@@ -6421,22 +6714,21 @@ def fetch_failed_check_log(
                 stderr=process.stderr or b"",
             )
             transient = failed_log_download_error_is_transient(process)
-            download_evidence["attempts"].append(
-                {
-                    "attempt": attempt,
-                    "method": method,
-                    "result": (
-                        "transient_failure" if transient else "permanent_failure"
-                    ),
-                    "error_sha256": canonical_json_sha256(diagnostic),
-                }
+            error_sha256 = canonical_json_sha256(diagnostic)
+            attempt = record_failed_log_download_attempt(
+                download_evidence,
+                method=method,
+                result=(
+                    "transient_failure" if transient else "permanent_failure"
+                ),
+                error_sha256=error_sha256,
             )
             if not transient:
                 download_evidence["terminal_error"] = {
                     "classification": "permanent_failure",
                     "method": method,
                     "attempt": attempt,
-                    "sha256": canonical_json_sha256(diagnostic),
+                    "sha256": error_sha256,
                 }
                 publish_evidence()
                 failure = external_command_failure(
@@ -6446,7 +6738,23 @@ def fetch_failed_check_log(
                 failure.details["log_download"] = copy.deepcopy(download_evidence)
                 raise failure
             if method_attempt < len(FAILED_LOG_DOWNLOAD_RETRY_DELAYS):
-                time.sleep(FAILED_LOG_DOWNLOAD_RETRY_DELAYS[method_attempt])
+                delay = FAILED_LOG_DOWNLOAD_RETRY_DELAYS[method_attempt]
+                if time.monotonic() + delay >= deadline:
+                    download_evidence["terminal_error"] = {
+                        "classification": "transport_exhausted",
+                        "method": method,
+                        "attempt": attempt,
+                        "sha256": error_sha256,
+                    }
+                    publish_evidence()
+                    raise WorkflowError(
+                        f"could not download the failing log for {check['key']}: "
+                        "operation timeout exhausted",
+                        details={
+                            "log_download": copy.deepcopy(download_evidence)
+                        },
+                    )
+                time.sleep(delay)
                 continue
             if method_index + 1 < len(methods):
                 break
@@ -6454,12 +6762,13 @@ def fetch_failed_check_log(
                 "classification": "transient_retry_exhausted",
                 "method": method,
                 "attempt": attempt,
-                "sha256": canonical_json_sha256(diagnostic),
+                "sha256": error_sha256,
             }
             publish_evidence()
             failure = external_command_failure(
-                f"could not download the failing log for {check['key']} after "
-                f"{attempt} pinned attempts; transient retry budget exhausted",
+                f"could not download the failing log for {check['key']}; "
+                f"{method} exhausted {len(FAILED_LOG_DOWNLOAD_RETRY_DELAYS) + 1} "
+                "pinned attempts",
                 process,
             )
             failure.details["log_download"] = copy.deepcopy(download_evidence)

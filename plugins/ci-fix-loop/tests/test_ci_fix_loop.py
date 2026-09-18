@@ -4093,6 +4093,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "name": "test",
             "workflow": "CI",
             "url": "https://github.com/owner/repo/actions/runs/1/job/2",
+            "workflow_run_id": 1,
+            "status": "COMPLETED",
             "conclusion": "FAILURE",
             "baseline_conclusion": "SUCCESS",
             "baseline_verdict": "pr_caused",
@@ -4599,7 +4601,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.45", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.46", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -4687,6 +4689,31 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn("2", run.call_args.args[0])
         self.assertNotIn("--allow-escape-sequences", run.call_args.args[0])
 
+    def test_failed_log_validates_identity_before_and_after_download(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        events = []
+
+        def verify(*_args, **kwargs):
+            events.append(f"verify-{kwargs['phase']}")
+
+        def download(*_args, **_kwargs):
+            events.append("download")
+            return MODULE.subprocess.CompletedProcess(
+                ["gh"], 0, b"focused failure log\n", b""
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "verify_failed_log_download_identity",
+                side_effect=verify,
+            ),
+            mock.patch.object(MODULE, "run_bytes", side_effect=download),
+        ):
+            MODULE.fetch_failed_check_log(self.preflight["pr"], check)
+
+        self.assertEqual(["verify-pre", "download", "verify-post"], events)
+
     def test_failed_log_retries_exact_http2_cancel_then_succeeds(self):
         check = self.preflight["check_snapshot"]["failures"][0]
         error_text = "stream ID 1; CANCEL; received from peer"
@@ -4762,12 +4789,12 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         evidence = {}
         attempts_per_method = len(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS) + 1
         with (
-            mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+            mock.patch.object(MODULE, "verify_failed_log_download_identity"),
             mock.patch.object(MODULE, "run_bytes", return_value=cancelled) as run,
             mock.patch.object(MODULE.time, "sleep") as sleep,
             self.assertRaisesRegex(
                 MODULE.WorkflowError,
-                "8 pinned attempts; transient retry budget exhausted",
+                "rest-job-log exhausted 4 pinned attempts",
             ) as raised,
         ):
             MODULE.fetch_failed_check_log(
@@ -4808,6 +4835,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "HTTP 401 Unauthorized",
             "HTTP 403 Forbidden",
             "HTTP 404 Not Found",
+            "HTTP 422 Unprocessable Entity",
             "HTTP 501 Not Implemented",
             "invalid JSON response",
         )
@@ -4826,6 +4854,253 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     MODULE.failed_log_download_error_is_transient(process)
                 )
 
+    def test_failed_log_permanent_diagnostic_overrides_partial_log_text(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        for message in ("HTTP 401 Unauthorized", "HTTP 404 Not Found"):
+            with self.subTest(message=message):
+                process = MODULE.subprocess.CompletedProcess(
+                    ["gh"],
+                    1,
+                    b"partial log says HTTP 503 and connection reset\n",
+                    message.encode("utf-8"),
+                )
+                self.assertFalse(
+                    MODULE.failed_log_download_error_is_transient(process)
+                )
+                with (
+                    mock.patch.object(
+                        MODULE, "verify_failed_log_download_identity"
+                    ),
+                    mock.patch.object(
+                        MODULE, "run_bytes", return_value=process
+                    ) as run,
+                    mock.patch.object(MODULE.time, "sleep") as sleep,
+                    self.assertRaises(MODULE.WorkflowError) as raised,
+                ):
+                    MODULE.fetch_failed_check_log(self.preflight["pr"], check)
+                self.assertEqual(1, run.call_count)
+                sleep.assert_not_called()
+                self.assertEqual(
+                    "permanent_failure",
+                    raised.exception.details["log_download"]["terminal_error"][
+                        "classification"
+                    ],
+                )
+
+    def test_exact_actions_reference_rejects_ambiguous_run_only_and_external_checks(self):
+        pr = self.preflight["pr"]
+        check = copy.deepcopy(self.preflight["check_snapshot"]["failures"][0])
+        check["url"] = "https://github.com/owner/repo/actions/runs/1"
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "not an exact workflow aggregate"
+        ):
+            MODULE.exact_actions_check_reference(pr, check)
+
+        check["name"] = check["workflow"]
+        self.assertEqual(
+            {"run_id": 1},
+            MODULE.exact_actions_check_reference(pr, check),
+        )
+
+        check["url"] = "https://example.com/owner/repo/actions/runs/1"
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "not an exact GitHub Actions reference"
+        ):
+            MODULE.exact_actions_check_reference(pr, check)
+
+    def test_run_only_workflow_aggregate_binds_workflow_status_and_conclusion(self):
+        pr = self.preflight["pr"]
+        check = copy.deepcopy(self.preflight["check_snapshot"]["failures"][0])
+        check.update(
+            {
+                "name": "CI",
+                "workflow": "CI",
+                "url": "https://github.com/owner/repo/actions/runs/1",
+            }
+        )
+        run_payload = {
+            "id": 1,
+            "head_sha": pr["head_sha"],
+            "repository": {"full_name": pr["repo_name"]},
+            "name": "CI",
+            "workflow_id": 17,
+            "html_url": check["url"],
+            "status": "completed",
+            "conclusion": "failure",
+        }
+        for phase in ("pre", "post"):
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "exact_actions_json_get",
+                    return_value=run_payload,
+                ),
+            ):
+                MODULE.verify_failed_log_download_identity(
+                    pr,
+                    check,
+                    {"run_id": 1},
+                    run_id=1,
+                    evidence={"attempt_count": 0, "attempts": []},
+                    phase=phase,
+                    deadline=100,
+                )
+            for field, value in (
+                ("name", "Other workflow"),
+                ("status", "queued"),
+                ("conclusion", "success"),
+            ):
+                with (
+                    self.subTest(phase=phase, field=field),
+                    mock.patch.object(
+                        MODULE,
+                        "exact_actions_json_get",
+                        return_value={**run_payload, field: value},
+                    ),
+                    self.assertRaises(MODULE.WorkflowError) as raised,
+                ):
+                    MODULE.verify_failed_log_download_identity(
+                        pr,
+                        check,
+                        {"run_id": 1},
+                        run_id=1,
+                        evidence={"attempt_count": 0, "attempts": []},
+                        phase=phase,
+                        deadline=100,
+                    )
+                self.assertEqual(
+                    "identity_mismatch",
+                    raised.exception.details["classification"],
+                )
+
+    def test_metadata_get_retries_timeout_and_transient_failures_pre_and_post(self):
+        payload = {"id": 1}
+        encoded = json.dumps(payload).encode("utf-8")
+        success = MODULE.subprocess.CompletedProcess(["gh"], 0, encoded, b"")
+        failures = (
+            MODULE.subprocess.CompletedProcess(["gh"], 1, b"", b"HTTP 503"),
+            MODULE.subprocess.TimeoutExpired(
+                ["gh"], MODULE.FAILED_LOG_DOWNLOAD_TIMEOUT_SECONDS
+            ),
+        )
+        for phase in ("pre", "post"):
+            for failure in failures:
+                with self.subTest(phase=phase, failure=type(failure).__name__):
+                    evidence = {"attempt_count": 0, "attempts": []}
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "run_bytes",
+                            side_effect=[failure, success],
+                        ) as run,
+                        mock.patch.object(MODULE.time, "sleep") as sleep,
+                    ):
+                        result = MODULE.exact_actions_json_get(
+                            "owner/repo",
+                            "repos/owner/repo/actions/runs/1",
+                            evidence=evidence,
+                            method=f"{phase}-run-metadata",
+                            deadline=MODULE.time.monotonic() + 1000,
+                        )
+
+                    self.assertEqual(payload, result)
+                    self.assertEqual(2, run.call_count)
+                    self.assertEqual(
+                        run.call_args_list[0].args[0],
+                        run.call_args_list[1].args[0],
+                    )
+                    command = run.call_args_list[0].args[0]
+                    self.assertEqual("GET", command[command.index("--method") + 1])
+                    self.assertNotIn("POST", command)
+                    self.assertGreater(
+                        run.call_args_list[0].kwargs["timeout"], 0
+                    )
+                    self.assertLessEqual(
+                        run.call_args_list[0].kwargs["timeout"],
+                        MODULE.FAILED_LOG_DOWNLOAD_TIMEOUT_SECONDS,
+                    )
+                    sleep.assert_called_once_with(
+                        MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS[0]
+                    )
+                    self.assertEqual(
+                        ["transient_failure", "success"],
+                        [attempt["result"] for attempt in evidence["attempts"]],
+                    )
+                    self.assertTrue(
+                        all(
+                            attempt["method"] == f"{phase}-run-metadata"
+                            for attempt in evidence["attempts"]
+                        )
+                    )
+
+    def test_metadata_get_exhaustion_is_distinct_from_identity_mismatch_pre_and_post(self):
+        transient = MODULE.subprocess.CompletedProcess(
+            ["gh"], 1, b"", b"connection reset by peer"
+        )
+        attempts = len(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS) + 1
+        for phase in ("pre", "post"):
+            with self.subTest(phase=phase):
+                evidence = {"attempt_count": 0, "attempts": []}
+                with (
+                    mock.patch.object(
+                        MODULE, "run_bytes", return_value=transient
+                    ) as run,
+                    mock.patch.object(MODULE.time, "sleep"),
+                    self.assertRaisesRegex(
+                        MODULE.FailedLogMetadataError,
+                        "transport retry budget exhausted",
+                    ) as raised,
+                ):
+                    MODULE.exact_actions_json_get(
+                        "owner/repo",
+                        "repos/owner/repo/actions/runs/1",
+                        evidence=evidence,
+                        method=f"{phase}-run-metadata",
+                        deadline=MODULE.time.monotonic() + 1000,
+                    )
+
+                self.assertEqual(attempts, run.call_count)
+                self.assertEqual(attempts, evidence["attempt_count"])
+                self.assertEqual(
+                    "metadata_transport_exhausted",
+                    raised.exception.details["classification"],
+                )
+                self.assertTrue(
+                    all(
+                        attempt["result"] == "transient_failure"
+                        for attempt in evidence["attempts"]
+                    )
+                )
+
+    def test_metadata_get_permanent_failure_does_not_retry(self):
+        process = MODULE.subprocess.CompletedProcess(
+            ["gh"],
+            1,
+            b'{"message":"connection reset HTTP 503"}',
+            b"HTTP 404 Not Found",
+        )
+        evidence = {"attempt_count": 0, "attempts": []}
+        with (
+            mock.patch.object(MODULE, "run_bytes", return_value=process) as run,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+            self.assertRaises(MODULE.FailedLogMetadataError) as raised,
+        ):
+            MODULE.exact_actions_json_get(
+                "owner/repo",
+                "repos/owner/repo/actions/runs/1",
+                evidence=evidence,
+                method="pre-run-metadata",
+                deadline=MODULE.time.monotonic() + 1000,
+            )
+
+        self.assertEqual(1, run.call_count)
+        sleep.assert_not_called()
+        self.assertEqual(
+            "metadata_permanent_failure",
+            raised.exception.details["classification"],
+        )
+        self.assertEqual("permanent_failure", evidence["attempts"][0]["result"])
+
     def test_failed_log_permanent_errors_do_not_retry_or_fallback(self):
         check = self.preflight["check_snapshot"]["failures"][0]
         for message in (
@@ -4838,7 +5113,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     ["gh"], 1, b"", message.encode("utf-8")
                 )
                 with (
-                    mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+                    mock.patch.object(
+                        MODULE, "verify_failed_log_download_identity"
+                    ),
                     mock.patch.object(
                         MODULE, "run_bytes", return_value=process
                     ) as run,
@@ -4861,7 +5138,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             with self.subTest(output=output):
                 process = MODULE.subprocess.CompletedProcess(["gh"], 0, output, b"")
                 with (
-                    mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+                    mock.patch.object(
+                        MODULE, "verify_failed_log_download_identity"
+                    ),
                     mock.patch.object(
                         MODULE, "run_bytes", return_value=process
                     ) as run,
@@ -4887,44 +5166,66 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "id": 1,
             "head_sha": pr["head_sha"],
             "repository": {"full_name": pr["repo_name"]},
+            "name": check["workflow"],
+            "workflow_id": 17,
+            "html_url": "https://github.com/owner/repo/actions/runs/1",
+            "status": "completed",
+            "conclusion": "failure",
         }
         job_payload = {
             "id": 2,
             "run_id": 1,
             "head_sha": pr["head_sha"],
             "name": check["name"],
+            "html_url": "https://github.com/owner/repo/actions/runs/1/job/2",
             "status": "completed",
             "conclusion": "failure",
         }
+        evidence = {"attempt_count": 0, "attempts": []}
         with mock.patch.object(
-            MODULE, "gh_json", side_effect=[run_payload, job_payload]
-        ) as gh_json:
+            MODULE,
+            "exact_actions_json_get",
+            side_effect=[run_payload, job_payload],
+        ) as get:
             MODULE.verify_failed_log_download_identity(
-                pr, check, {"run_id": 1, "job_id": 2}, run_id=1
+                pr,
+                check,
+                {"run_id": 1, "job_id": 2},
+                run_id=1,
+                evidence=evidence,
+                phase="pre",
+                deadline=100,
             )
 
         self.assertEqual(
             [
-                mock.call(["api", "repos/owner/repo/actions/runs/1"]),
-                mock.call(["api", "repos/owner/repo/actions/jobs/2"]),
+                "repos/owner/repo/actions/runs/1",
+                "repos/owner/repo/actions/jobs/2",
             ],
-            gh_json.call_args_list,
+            [call.args[1] for call in get.call_args_list],
         )
         wrong_head = {**job_payload, "head_sha": "f" * 40}
         with (
             mock.patch.object(
-                MODULE, "gh_json", side_effect=[run_payload, wrong_head]
+                MODULE,
+                "exact_actions_json_get",
+                side_effect=[run_payload, wrong_head],
             ),
             self.assertRaisesRegex(MODULE.WorkflowError, "job 2 identity"),
         ):
             MODULE.verify_failed_log_download_identity(
-                pr, check, {"run_id": 1, "job_id": 2}, run_id=1
+                pr,
+                check,
+                {"run_id": 1, "job_id": 2},
+                run_id=1,
+                evidence={"attempt_count": 0, "attempts": []},
+                phase="pre",
+                deadline=100,
             )
         succeeded = MODULE.subprocess.CompletedProcess(
             ["gh"], 0, b"untrusted failure log\n", b""
         )
         with (
-            mock.patch.object(MODULE, "resolve_run_id", return_value=1),
             mock.patch.object(MODULE, "run_bytes", return_value=succeeded) as run,
             mock.patch.object(
                 MODULE,
@@ -4935,8 +5236,104 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             self.assertRaisesRegex(MODULE.WorkflowError, "identity mismatch"),
         ):
             MODULE.fetch_failed_check_log(pr, check)
+        run.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_failed_log_identity_fields_fail_closed_before_download(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        pr = self.preflight["pr"]
+        run_payload = {
+            "id": 1,
+            "head_sha": pr["head_sha"],
+            "repository": {"full_name": pr["repo_name"]},
+            "name": check["workflow"],
+            "workflow_id": 17,
+            "html_url": "https://github.com/owner/repo/actions/runs/1",
+            "status": "completed",
+            "conclusion": "failure",
+        }
+        job_payload = {
+            "id": 2,
+            "run_id": 1,
+            "head_sha": pr["head_sha"],
+            "name": check["name"],
+            "html_url": "https://github.com/owner/repo/actions/runs/1/job/2",
+            "status": "completed",
+            "conclusion": "failure",
+        }
+        cases = (
+            ({**run_payload, "name": "Other workflow"}, job_payload),
+            (run_payload, {**job_payload, "name": "other check"}),
+            (run_payload, {**job_payload, "status": "queued"}),
+            (run_payload, {**job_payload, "conclusion": "success"}),
+        )
+        for phase in ("pre", "post"):
+            for run_result, job_result in cases:
+                with self.subTest(
+                    phase=phase,
+                    run_name=run_result["name"],
+                    job_name=job_result["name"],
+                    job_status=job_result["status"],
+                    job_conclusion=job_result["conclusion"],
+                ):
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "exact_actions_json_get",
+                            side_effect=[run_result, job_result],
+                        ),
+                        self.assertRaises(MODULE.WorkflowError) as raised,
+                    ):
+                        MODULE.verify_failed_log_download_identity(
+                            pr,
+                            check,
+                            {"run_id": 1, "job_id": 2},
+                            run_id=1,
+                            evidence={"attempt_count": 0, "attempts": []},
+                            phase=phase,
+                            deadline=100,
+                        )
+                    self.assertEqual(
+                        "identity_mismatch",
+                        raised.exception.details["classification"],
+                    )
+
+    def test_failed_log_post_validation_failure_does_not_retry_download(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        succeeded = MODULE.subprocess.CompletedProcess(
+            ["gh"], 0, b"untrusted failure log\n", b""
+        )
+        evidence = {}
+        with (
+            mock.patch.object(
+                MODULE,
+                "verify_failed_log_download_identity",
+                side_effect=[
+                    None,
+                    MODULE.WorkflowError(
+                        "post identity mismatch",
+                        details={"classification": "identity_mismatch"},
+                    ),
+                ],
+            ) as verify,
+            mock.patch.object(MODULE, "run_bytes", return_value=succeeded) as run,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+            self.assertRaisesRegex(MODULE.WorkflowError, "post identity mismatch"),
+        ):
+            MODULE.fetch_failed_check_log(
+                self.preflight["pr"], check, evidence=evidence
+            )
+
+        self.assertEqual(["pre", "post"], [
+            call.kwargs["phase"] for call in verify.call_args_list
+        ])
         self.assertEqual(1, run.call_count)
         sleep.assert_not_called()
+        self.assertEqual(
+            "identity_mismatch",
+            evidence["terminal_error"]["classification"],
+        )
+        self.assertEqual("post-identity", evidence["terminal_error"]["method"])
 
     def test_failed_log_falls_back_to_exact_read_only_job_endpoint(self):
         check = self.preflight["check_snapshot"]["failures"][0]
@@ -4949,8 +5346,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         primary_attempts = len(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS) + 1
         evidence = {}
         with (
-            mock.patch.object(MODULE, "resolve_run_id", return_value=1),
-            mock.patch.object(MODULE, "verify_failed_log_download_identity"),
+            mock.patch.object(
+                MODULE, "verify_failed_log_download_identity"
+            ) as verify,
             mock.patch.object(
                 MODULE,
                 "run_bytes",
@@ -4972,6 +5370,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("rerun", serialized.casefold())
         self.assertNotIn("POST", serialized)
         self.assertEqual("rest-job-log", evidence["attempts"][-1]["method"])
+        self.assertEqual(
+            ["pre", "fallback", "post"],
+            [call.kwargs["phase"] for call in verify.call_args_list],
+        )
 
     def test_failed_log_evidence_hashes_are_deterministic_and_invocation_local(self):
         check = self.preflight["check_snapshot"]["failures"][0]
@@ -5100,7 +5502,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             stderr,
         )
         with (
-            mock.patch.object(MODULE, "resolve_run_id", return_value=1),
+            mock.patch.object(MODULE, "verify_failed_log_download_identity"),
             mock.patch.object(MODULE, "run_bytes", return_value=completed),
             self.assertRaises(MODULE.WorkflowError) as raised,
         ):
@@ -5329,13 +5731,17 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
     def test_external_check_run_page_never_resolves_an_actions_job(self):
         node = json.loads(EXTERNAL_ZIZMOR_CHECK.read_text(encoding="utf-8"))
         check = MODULE.normalize_rollup([node])[0]
-        with mock.patch.object(MODULE, "resolve_run_id") as resolve:
-            content = MODULE.fetch_failed_check_log(self.preflight["pr"], check)
+        with (
+            mock.patch.object(MODULE, "run_bytes") as run,
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "not an exact GitHub Actions reference"
+            ),
+        ):
+            MODULE.fetch_failed_check_log(self.preflight["pr"], check)
 
         self.assertEqual("check_run", check["kind"])
         self.assertIsNone(check["workflow"])
-        self.assertEqual("", content)
-        resolve.assert_not_called()
+        run.assert_not_called()
 
     def test_accepts_noop_and_complete_relevant_validation(self):
         report = self.validate_report(self.report())
