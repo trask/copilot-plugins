@@ -38,8 +38,16 @@ PATH_EVIDENCE_VALUE_MAX_BYTES = 256
 MODE = "conflict_with_report"
 REQUEST_SCHEMA = {"id": "github.copilot.agent-task-conflict-request", "version": 1}
 RESULT_SCHEMA = {"id": "github.copilot.agent-task-conflict-result", "version": 3}
+MINIMAL_RESULT_SCHEMA = {
+    "id": "github.copilot.agent-task-conflict-result",
+    "version": 4,
+}
 LEGACY_RESULT_SCHEMA = {"id": "github.copilot.agent-task-conflict-result", "version": 1}
 RECEIPT_SCHEMA = {"id": "github.copilot.agent-task-conflict-receipt", "version": 2}
+MINIMAL_RECEIPT_SCHEMA = {
+    "id": "github.copilot.agent-task-conflict-receipt",
+    "version": 3,
+}
 LEGACY_RECEIPT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-receipt",
     "version": 1,
@@ -89,6 +97,43 @@ POLICY_SHA256 = hashlib.sha256(
 POLICY_SELECTOR = f"{POLICY_ID}@{POLICY_VERSION}"
 LEGACY_POLICY_SELECTOR = f"{POLICY_ID}@{LEGACY_POLICY_VERSION}"
 POLICY = {"id": POLICY_ID, "version": POLICY_VERSION, "sha256": POLICY_SHA256}
+MINIMAL_POLICY_VERSION = 6
+MINIMAL_POLICY_SPEC = {
+    "id": POLICY_ID,
+    "version": MINIMAL_POLICY_VERSION,
+    "execution_backend": "github-agent-tasks-rest",
+    "authentication": "local-gh-api",
+    "custom_agent": False,
+    "local_fallback": False,
+    "single_role_code_tip": "authoritative-generated-ref",
+    "multi_role_code_refs": "dispatcher-assigned-request-scoped",
+    "user_branch_publication": False,
+    "quarantined_refs_only": True,
+    "worker_identity_fields": False,
+    "worker_validation_fields": False,
+    "worker_commit_annotations": False,
+    "optional_output": ".github/agent-task-output/report.md",
+    "output_is_advisory": True,
+    "dispatcher_generated_receipt": True,
+    "require_exact_request_identity": True,
+    "require_exact_target_identity": True,
+    "require_mechanical_history_proof": True,
+    "safe_direct_base_sync_merge_omission": True,
+    "terminal_completion_signal": "completed-without-platform-error",
+}
+MINIMAL_POLICY_SHA256 = hashlib.sha256(
+    json.dumps(
+        MINIMAL_POLICY_SPEC,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+).hexdigest()
+MINIMAL_POLICY_SELECTOR = f"{POLICY_ID}@{MINIMAL_POLICY_VERSION}"
+MINIMAL_POLICY = {
+    "id": POLICY_ID,
+    "version": MINIMAL_POLICY_VERSION,
+    "sha256": MINIMAL_POLICY_SHA256,
+}
 MODEL_IDS = {
     "luna": "gpt-5.6-luna",
     "terra": "gpt-5.6-terra",
@@ -120,6 +165,7 @@ REPO_RE = re.compile(r"\A[^/\s]+/[^/\s]+\Z")
 REPORT_DIRECTORY = ".github/agent-task-conflict-reports"
 RECEIPT_DIRECTORY = ".github/agent-task-conflict-receipts"
 SEMANTIC_DIRECTORY = ".github/agent-task-conflict-semantic"
+OUTPUT_REPORT_PATH = ".github/agent-task-output/report.md"
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
@@ -221,7 +267,7 @@ class Result:
     policy: Mapping[str, object] = field(default_factory=lambda: POLICY)
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        payload = {
             "schema": self.schema,
             "status": self.status,
             "error": self.error,
@@ -252,6 +298,9 @@ class Result:
                 "outcomes": self.validations,
             },
         }
+        if self.schema == MINIMAL_RESULT_SCHEMA:
+            payload.pop("validation")
+        return payload
 
 
 def canonical_json(value: object) -> bytes:
@@ -703,6 +752,11 @@ def validate_request(
         raise ConflictError("allowed_paths is not exact and ordered", "policy_rejected")
     for path in allowed_paths:
         require_path(path, "allowed path")
+    if request["policy"] == MINIMAL_POLICY and OUTPUT_REPORT_PATH in allowed_paths:
+        raise ConflictError(
+            "the advisory output path cannot be a publishable source path",
+            "policy_rejected",
+        )
     iteration = require_exact_keys(
         request["iteration"], {"id", "number", "budget"}, "iteration"
     )
@@ -859,7 +913,11 @@ def parse_args(args: Sequence[str]) -> Options:
             "invocation",
             "recovery_disabled",
         )
-    if values["--policy"] not in {POLICY_SELECTOR, LEGACY_POLICY_SELECTOR}:
+    if values["--policy"] not in {
+        MINIMAL_POLICY_SELECTOR,
+        POLICY_SELECTOR,
+        LEGACY_POLICY_SELECTOR,
+    }:
         raise ConflictError("unsupported conflict worker policy", "policy_rejected")
     strategy = str(values["--strategy"])
     if strategy not in STRATEGIES:
@@ -902,7 +960,9 @@ def parse_args(args: Sequence[str]) -> Options:
         expected_model=MODEL_IDS[alias],
         expected_pr_url=pr_url,
         expected_policy=(
-            POLICY
+            MINIMAL_POLICY
+            if values["--policy"] == MINIMAL_POLICY_SELECTOR
+            else POLICY
             if values["--policy"] == POLICY_SELECTOR
             else LEGACY_POLICY
         ),
@@ -2207,6 +2267,76 @@ def policy_prompt(
     *,
     include_per_commit_paths: bool = False,
 ) -> str:
+    if options.request["policy"] == MINIMAL_POLICY:
+        compact_request = compact_request_contract(
+            options.request,
+            include_per_commit_paths=include_per_commit_paths,
+        )
+        refs = (
+            [
+                {
+                    "role_index": index,
+                    "role": remote.role,
+                    "branch": remote.ref,
+                }
+                for index, remote in enumerate(
+                    assigned_code_refs(options.request),
+                    start=1,
+                )
+            ]
+            if options.request["strategy"] == "native-stack"
+            else []
+        )
+        code_locator_policy = (
+            "Publish each resolved member history to the exact request-scoped "
+            "branch assigned below, in role order. Do not publish any other "
+            "role branch. The final assigned member tip must also be the source "
+            "tip of the authoritative Agent Task branch.\n"
+            f"{json.dumps(refs, ensure_ascii=False, sort_keys=True)}\n"
+            if refs
+            else (
+                "Keep the complete resolved single-role history on the "
+                "authoritative Agent Task branch. Do not publish a duplicate "
+                "code branch.\n"
+            )
+        )
+        return (
+            f"{options.prompt.rstrip()}\n\n"
+            "----- marketplace conflict worker policy -----\n"
+            f"Policy: {MINIMAL_POLICY_SELECTOR}\n"
+            f"Policy SHA-256: {MINIMAL_POLICY_SHA256}\n"
+            f"Mode: {MODE}\n"
+            f"Strategy: {options.strategy}\n"
+            "The dispatcher owns and binds every request, repository, pull "
+            "request, frozen head and base, model, policy, task, session, "
+            "generated ref, commit, receipt, and completion identity. Do not "
+            "author or echo those fields in a hosted result file.\n"
+            "Compact immutable task contract (input evidence only): "
+            f"{canonical_json(compact_request).decode('utf-8')}\n"
+            f"{code_locator_policy}"
+            "Create only the requested conflict-resolution history. Preserve "
+            "the exact merge parent order or the exact one-to-one rewritten "
+            "commit order required by the contract. The dispatcher derives "
+            "parents, mappings, paths, patch digests, and publication leases "
+            "from Git. Do not create a result, receipt, validation schema, "
+            "commit annotation, conflict-path list, companion-path list, or "
+            "rationale payload.\n"
+            "You may add one final single-parent commit on the authoritative "
+            "Agent Task branch whose only changed path is "
+            f"`{OUTPUT_REPORT_PATH}`. Its free-form contents may summarize the "
+            "resolution, attempted validation, unresolved concerns, and a "
+            "retrospective. The report is optional and advisory. Do not mix "
+            "that path with code, add more than one output commit, or add code "
+            "after it. Do not run local validation through the dispatcher. "
+            "Normal GitHub checks validate behavior after exact-CAS "
+            "publication.\n"
+            "Do not read, request, print, persist, or transmit credentials, "
+            "local environment values, cookies, tokens, keys, or authorization "
+            "headers. Do not invoke a custom_agent or local fallback. Do not "
+            "update any user branch or pull request, reply to reviews, resolve "
+            "threads, or choose another strategy.\n"
+            "----- marketplace conflict worker policy -----"
+        )
     if options.request["policy"] == POLICY:
         path = semantic_path(options.request["request_id"])
         compact_request = compact_request_contract(
@@ -2691,6 +2821,97 @@ def discover_semantic_artifact_ref(
         request["repository"],
         artifact_head_ref,
     )
+
+
+def discover_minimal_artifact_ref(
+    task: Mapping[str, object], request: Mapping[str, object]
+) -> RemoteRef:
+    for field in ("error", "errors", "failure_reason"):
+        if task.get(field):
+            raise ConflictError(
+                "completed task reports a platform error",
+                "task_failed",
+            )
+    normalized_task = task
+    sessions = task.get("sessions")
+    if (
+        isinstance(sessions, list)
+        and len(sessions) == 1
+        and isinstance(sessions[0], dict)
+        and sessions[0].get("model") == request["model"]
+    ):
+        normalized = deepcopy(dict(task))
+        normalized_sessions = normalized.get("sessions")
+        if not isinstance(normalized_sessions, list) or not isinstance(
+            normalized_sessions[0], dict
+        ):
+            raise AssertionError("validated session copy changed shape")
+        normalized_sessions[0]["model"] = f"sweagent-capi:{request['model']}"
+        normalized_task = normalized
+    remote = discover_semantic_artifact_ref(normalized_task, request)
+    task_repository = task.get("repository")
+    task_owner = task.get("owner")
+    session = sessions[0]
+    reported_repository = (
+        next(
+            (
+                task_repository[field]
+                for field in ("full_name", "name_with_owner", "nameWithOwner")
+                if field in task_repository
+            ),
+            None,
+        )
+        if isinstance(task_repository, dict)
+        else None
+    )
+    if (
+        task_repository is not None
+        and (
+            not isinstance(task_repository, dict)
+            or (
+                reported_repository is not None
+                and (
+                    not isinstance(reported_repository, str)
+                    or reported_repository.casefold()
+                    != str(request["repository"]).casefold()
+                )
+            )
+        )
+    ):
+        raise ConflictError(
+            "completed task repository identity changed",
+            "task_failed",
+        )
+    if (
+        task_owner is not None
+        and (
+            not isinstance(task_owner, dict)
+            or (
+                task_owner.get("login") is not None
+                and (
+                    not isinstance(task_owner["login"], str)
+                    or task_owner["login"].casefold()
+                    != str(request["repository"]).partition("/")[0].casefold()
+                )
+            )
+        )
+    ):
+        raise ConflictError(
+            "completed task owner identity changed",
+            "task_failed",
+        )
+    if (
+        session.get("repository") is not None
+        and session.get("repository") != task_repository
+    ) or (
+        session.get("owner") is not None
+        and session.get("owner") != task_owner
+    ):
+        raise ConflictError(
+            "completed task and session ownership differ",
+            "task_failed",
+        )
+    return remote
 
 
 def code_refs_from_receipt(
@@ -3326,6 +3547,90 @@ def mapping_from_annotation(
     )
 
 
+def mechanical_mapping(
+    runner: Runner,
+    root: Path,
+    old: Mapping[str, object],
+    new_sha: str,
+    parent: str,
+    allowed_paths: set[str],
+) -> Mapping[str, object]:
+    old_parents = parents(runner, root, str(old["sha"]))
+    if len(old_parents) != 1:
+        raise ConflictError("old rewritten commit is not linear", "unexpected_history")
+    subject = commit_subject(runner, root, new_sha)
+    trailers = commit_trailers(runner, root, new_sha)
+    if subject != old["subject"] or trailers != old["trailers"]:
+        raise ConflictError(
+            "rewritten commit subject or trailers changed",
+            "unexpected_history",
+        )
+    old_paths = list(old["paths"])
+    new_paths = changed_paths(runner, root, new_sha)
+    compared_paths = sorted(set(old_paths) | set(new_paths))
+    differences = [
+        path
+        for path in compared_paths
+        if path_patch_sha256(
+            runner,
+            root,
+            old_parents[0],
+            str(old["sha"]),
+            path,
+        )
+        != path_patch_sha256(runner, root, parent, new_sha, path)
+    ]
+    if OUTPUT_REPORT_PATH in compared_paths or not set(differences) <= allowed_paths:
+        raise ConflictError(
+            "rewritten commit changed an undeclared or reserved path",
+            "unexpected_history",
+        )
+    return {
+        "old_sha": old["sha"],
+        "new_sha": new_sha,
+        "subject": subject,
+        "trailers": trailers,
+        "old_patch_sha256": old["patch_sha256"],
+        "new_patch_sha256": patch_sha256(runner, root, parent, new_sha),
+        "old_paths": old_paths,
+        "new_paths": new_paths,
+        "changed_paths": differences,
+    }
+
+
+def prove_rebase_range_mechanically(
+    runner: Runner,
+    root: Path,
+    base_sha: str,
+    tip: str,
+    old_commits: Sequence[Mapping[str, object]],
+    allowed_paths: set[str],
+) -> tuple[list[str], list[Mapping[str, object]]]:
+    commits = ordered_commits(runner, root, base_sha, tip)
+    if len(commits) != len(old_commits):
+        raise ConflictError(
+            "rewritten range dropped, squashed, reordered, or added commits",
+            "unexpected_history",
+        )
+    mappings: list[Mapping[str, object]] = []
+    parent = base_sha
+    for old, new_sha in zip(old_commits, commits):
+        if parents(runner, root, new_sha) != [parent]:
+            raise ConflictError("rewritten range is not linear", "unexpected_history")
+        mappings.append(
+            mechanical_mapping(
+                runner,
+                root,
+                old,
+                new_sha,
+                parent,
+                allowed_paths,
+            )
+        )
+        parent = new_sha
+    return commits, mappings
+
+
 def prove_rebase_range(
     runner: Runner,
     root: Path,
@@ -3894,6 +4199,239 @@ def prove_generated_semantic(
     return code_refs, artifact, validations
 
 
+def separate_optional_report(
+    runner: Runner,
+    root: Path,
+    generated_head: str,
+) -> tuple[str, Mapping[str, object] | None]:
+    paths = changed_paths(runner, root, generated_head)
+    if OUTPUT_REPORT_PATH not in paths:
+        return generated_head, None
+    if paths != [OUTPUT_REPORT_PATH]:
+        raise ConflictError(
+            "generated commit mixes source and output paths",
+            "unexpected_history",
+        )
+    report_parents = parents(runner, root, generated_head)
+    if len(report_parents) != 1:
+        raise ConflictError(
+            "output report commit must have one parent",
+            "unexpected_history",
+        )
+    blob_sha = git(
+        runner,
+        root,
+        "rev-parse",
+        "--verify",
+        f"{generated_head}:{OUTPUT_REPORT_PATH}",
+    ).strip().lower()
+    require_sha(blob_sha, "output report blob")
+    return (
+        report_parents[0],
+        {
+            "path": OUTPUT_REPORT_PATH,
+            "commit": generated_head,
+            "blob_sha": blob_sha,
+        },
+    )
+
+
+def canonical_minimal_receipt(
+    request: Mapping[str, object],
+    code_refs: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    return {
+        "schema": MINIMAL_RECEIPT_SCHEMA,
+        "request": {
+            "id": request["request_id"],
+            "sha256": request["request_sha256"],
+        },
+        "policy": request["policy"],
+        "model": request["model"],
+        "mode": MODE,
+        "strategy": request["strategy"],
+        "repository": request["repository"],
+        "pull_request": request["pull_request"],
+        "generated_refs": [
+            {"ref": ref, "sha256": object_digest(ref)}
+            for ref in code_refs
+        ],
+    }
+
+
+def prove_generated_minimal(
+    runner: Runner,
+    snapshot: LocalSnapshot,
+    request: Mapping[str, object],
+    task: Mapping[str, object],
+    recovery_result: Result | None = None,
+) -> tuple[list[Mapping[str, object]], Mapping[str, object], list[Mapping[str, str]]]:
+    artifact_remote = discover_minimal_artifact_ref(task, request)
+    request_id = str(request["request_id"])
+    assigned = assigned_code_refs(request)
+    if request["strategy"] == "native-stack" and (
+        artifact_remote.ref in {remote.ref for remote in assigned}
+        or len({remote.ref for remote in assigned}) != len(assigned)
+    ):
+        raise ConflictError(
+            "generated branch ownership is ambiguous",
+            "unexpected_history",
+        )
+    quarantine: list[str] = []
+    artifact_ref, artifact_head = fetch_quarantined(
+        runner,
+        snapshot,
+        artifact_remote,
+        request_id,
+    )
+    quarantine.append(artifact_ref)
+    final_code_head, report = separate_optional_report(
+        runner,
+        snapshot.root,
+        artifact_head,
+    )
+    fetched_code: list[tuple[RemoteRef, str, str]] = []
+    if request["strategy"] == "native-stack":
+        for remote in assigned:
+            target, tip = fetch_quarantined(
+                runner,
+                snapshot,
+                remote,
+                request_id,
+            )
+            quarantine.append(target)
+            fetched_code.append((remote, target, tip))
+        if not fetched_code or fetched_code[-1][2] != final_code_head:
+            raise ConflictError(
+                "authoritative task branch does not identify the final assigned role",
+                "unexpected_history",
+            )
+    else:
+        target = quarantine_ref(request_id, "code")
+        git(
+            runner,
+            snapshot.root,
+            "update-ref",
+            target,
+            final_code_head,
+        )
+        quarantine.append(target)
+        fetched_code.append(
+            (
+                RemoteRef(
+                    "code",
+                    request["pull_request"]["number"],
+                    request["repository"],
+                    artifact_remote.ref,
+                ),
+                target,
+                final_code_head,
+            )
+        )
+    require_local_unchanged(runner, snapshot, quarantine)
+    allowed_paths = set(request["allowed_paths"])
+    code_refs: list[Mapping[str, object]] = []
+    if request["strategy"] == "merge":
+        remote, _, tip = fetched_code[0]
+        commits = first_parent_chain(
+            runner,
+            snapshot.root,
+            request["pull_request"]["head_sha"],
+            tip,
+        )
+        if not commits or parents(runner, snapshot.root, commits[0]) != [
+            request["pull_request"]["head_sha"],
+            request["pull_request"]["base_sha"],
+        ]:
+            raise ConflictError(
+                "merge integration parents are not [head, base]",
+                "unexpected_history",
+            )
+        parent = request["pull_request"]["head_sha"]
+        for index, commit in enumerate(commits):
+            expected_parents = (
+                [
+                    request["pull_request"]["head_sha"],
+                    request["pull_request"]["base_sha"],
+                ]
+                if index == 0
+                else [parent]
+            )
+            if parents(runner, snapshot.root, commit) != expected_parents:
+                raise ConflictError(
+                    "merge result has reversed or unexpected parents",
+                    "unexpected_history",
+                )
+            paths = changed_paths(runner, snapshot.root, commit)
+            if OUTPUT_REPORT_PATH in paths or not set(paths) <= allowed_paths:
+                raise ConflictError(
+                    "merge result changed an undeclared or reserved path",
+                    "unexpected_history",
+                )
+            parent = commit
+        code_ref = build_code_ref(request, remote, tip, commits, [])
+        code_ref["base_ref"] = request["pull_request"]["base_ref"]
+        code_ref["base_sha"] = request["pull_request"]["base_sha"]
+        code_refs.append(code_ref)
+    elif request["strategy"] == "rebase":
+        remote, _, tip = fetched_code[0]
+        commits, mappings = prove_rebase_range_mechanically(
+            runner,
+            snapshot.root,
+            request["pull_request"]["base_sha"],
+            tip,
+            request["head_commits"],
+            allowed_paths,
+        )
+        code_refs.append(build_code_ref(request, remote, tip, commits, mappings))
+    else:
+        previous_tip = request["native_stack"]["trunk"]["sha"]
+        for index, (remote, _, tip) in enumerate(fetched_code):
+            member = request["native_stack"]["members"][index]
+            prove_native_stack_member_input(runner, snapshot.root, member)
+            commits, mappings = prove_rebase_range_mechanically(
+                runner,
+                snapshot.root,
+                previous_tip,
+                tip,
+                member["old_commits"],
+                allowed_paths,
+            )
+            code_ref = build_code_ref(
+                request,
+                remote,
+                tip,
+                commits,
+                mappings,
+                generated_base_sha=previous_tip,
+            )
+            if (
+                code_ref["old_sha"] != member["head_sha"]
+                or code_ref["lease_sha"] != member["lease_sha"]
+            ):
+                raise ConflictError(
+                    "native stack lease identity mismatch",
+                    "stale_target",
+                )
+            code_refs.append(code_ref)
+            previous_tip = tip
+    receipt = canonical_minimal_receipt(request, code_refs)
+    artifact = {
+        "branch": artifact_remote.ref,
+        "head_sha": artifact_head,
+        "source_tip_sha": final_code_head,
+        "report": report,
+        "receipt": {
+            "sha256": object_digest(receipt),
+            "value": receipt,
+        },
+    }
+    if recovery_result is not None:
+        recovery_result.code_refs = list(code_refs)
+        recovery_result.artifact = artifact
+    return code_refs, artifact, []
+
+
 def prove_generated(
     runner: Runner,
     snapshot: LocalSnapshot,
@@ -3901,6 +4439,14 @@ def prove_generated(
     task: Mapping[str, object],
     recovery_result: Result | None = None,
 ) -> tuple[list[Mapping[str, object]], Mapping[str, object], list[Mapping[str, str]]]:
+    if request["policy"] == MINIMAL_POLICY:
+        return prove_generated_minimal(
+            runner,
+            snapshot,
+            request,
+            task,
+            recovery_result,
+        )
     if request["policy"] == POLICY:
         return prove_generated_semantic(
             runner,
@@ -4260,10 +4806,12 @@ def execute(
     require_target_fresh(runner, snapshot, request)
     require_local_unchanged(runner, snapshot)
     if result is not None:
-        request_policy = request.get("policy", POLICY)
+        request_policy = request.get("policy", MINIMAL_POLICY)
         result.schema = (
             LEGACY_RESULT_SCHEMA
             if request_policy == LEGACY_POLICY
+            else MINIMAL_RESULT_SCHEMA
+            if request_policy == MINIMAL_POLICY
             else RESULT_SCHEMA
         )
         result.policy = request_policy
@@ -4290,8 +4838,10 @@ def execute(
                         ),
                     }
                 ]
-                if request.get("policy", POLICY) == LEGACY_POLICY
+                if request.get("policy", MINIMAL_POLICY) == LEGACY_POLICY
                 else [{"command": "local-history-proof", "result": "passed"}]
+                if request.get("policy", MINIMAL_POLICY) == POLICY
+                else []
             )
         return 0
     fetch_pinned_inputs(runner, snapshot, request)
@@ -4393,7 +4943,14 @@ def main(
 ) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     result_path = result_path_from_args(args)
-    result = Result()
+    active_policy_requested = any(
+        args[index : index + 2] == ["--policy", MINIMAL_POLICY_SELECTOR]
+        for index in range(len(args) - 1)
+    )
+    result = Result(
+        schema=MINIMAL_RESULT_SCHEMA if active_policy_requested else RESULT_SCHEMA,
+        policy=MINIMAL_POLICY if active_policy_requested else POLICY,
+    )
     progress = Progress()
     try:
         options = parse_args(args)

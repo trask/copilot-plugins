@@ -826,6 +826,39 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         return value
 
     def success_result(self, request):
+        code_ref = {
+            "role": "code",
+            "pr_number": 7,
+            "repository": "owner/repo",
+            "ref": "artifact",
+            "old_sha": "b" * 40,
+            "new_sha": "c" * 40,
+            "base_ref": "main",
+            "base_sha": "a" * 40,
+            "lease_sha": "b" * 40,
+            "commits": ["c" * 40],
+        }
+        receipt = {
+            "schema": MODULE.CONFLICT_RECEIPT_SCHEMA,
+            "request": {
+                "id": request["request_id"],
+                "sha256": request["request_sha256"],
+            },
+            "policy": MODULE.CONFLICT_POLICY_IDENTITY,
+            "model": request["model"],
+            "mode": "conflict_with_report",
+            "strategy": request["strategy"],
+            "repository": request["repository"],
+            "pull_request": request["pull_request"],
+            "generated_refs": [
+                {
+                    "ref": code_ref,
+                    "sha256": hashlib.sha256(
+                        MODULE.canonical_json(code_ref).encode("utf-8")
+                    ).hexdigest(),
+                }
+            ],
+        }
         return {
             "schema": MODULE.CONFLICT_RESULT_SCHEMA,
             "status": "success",
@@ -850,58 +883,36 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             "generated": {
                 "artifact": {
                     "branch": "artifact",
-                    "head_sha": "d" * 40,
-                    "report": {
-                        "path": (
-                            ".github/agent-task-conflict-reports/request-1.md"
-                        ),
-                        "commit": "d" * 40,
-                        "sha256": "2" * 64,
-                    },
+                    "head_sha": "c" * 40,
+                    "source_tip_sha": "c" * 40,
+                    "report": None,
                     "receipt": {
-                        "path": (
-                            ".github/agent-task-conflict-receipts/request-1.json"
-                        ),
-                        "commit": "d" * 40,
+                        "sha256": hashlib.sha256(
+                            MODULE.canonical_json(receipt).encode("utf-8")
+                        ).hexdigest(),
+                        "value": receipt,
                     },
                 },
-                "code_refs": [
-                    {
-                        "role": "code",
-                        "pr_number": 7,
-                        "repository": "owner/repo",
-                        "ref": "artifact",
-                        "old_sha": "b" * 40,
-                        "new_sha": "c" * 40,
-                        "base_ref": "main",
-                        "base_sha": "a" * 40,
-                        "lease_sha": "b" * 40,
-                        "commits": ["c" * 40],
-                    }
-                ],
+                "code_refs": [code_ref],
             },
             "application": {"status": "quarantined_refs"},
-            "validation": {
-                "complete": True,
-                "outcomes": [
-                    {
-                        "command": "python -m unittest",
-                        "result": "passed",
-                    }
-                ],
-            },
         }
 
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "a947419cc9266ad411f6897fc13c7d20f15ec711b67b7add849196572c93d563",
+            "ecddfa60e8896dfef31f2e441537f04a3814f98c1439f4d25ac65e35b5518412",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
+            "157e03e39720f4d7ef6cab6410f6f866974a1e01fef64cc782474fc04a204b63",
+        )
+        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@6")
+        self.assertEqual(MODULE.V5_CONFLICT_POLICY, "marketplace-conflict-worker@5")
+        self.assertEqual(
+            MODULE.V5_CONFLICT_POLICY_SHA256,
             "21b4142edcb7cb35b805e3f225d16f53a2139eda4e974f56826a3cc9d3c1f933",
         )
-        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@5")
         self.assertEqual(
             MODULE.CONFLICT_REQUEST_SCHEMA["id"],
             "github.copilot.agent-task-conflict-request",
@@ -2312,7 +2323,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertIn("prior results", self.instructions)
         self.assertIn("never seed execution", self.instructions)
 
-    def test_rejects_malformed_or_failed_validation(self):
+    def test_v5_parser_rejects_malformed_or_failed_validation(self):
         bad_values = [
             [],
             [{"command": "test", "result": "failed"}],
@@ -2329,15 +2340,14 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(MODULE.WorkflowError):
                 MODULE.validate_passed_validations(value)
 
-    def test_success_result_requires_exact_request_task_and_validation_identity(self):
+    def test_success_result_requires_exact_request_and_task_identity(self):
         request = self.request()
         result = self.success_result(request)
-        refs, artifact, validations = MODULE.validate_conflict_result_identity(
+        refs, artifact = MODULE.validate_conflict_result_identity(
             result, request
         )
         self.assertEqual(refs, result["generated"]["code_refs"])
         self.assertEqual(artifact, result["generated"]["artifact"])
-        self.assertEqual(validations, result["validation"]["outcomes"])
         for field, value in (
             ("model", "gpt-5.6-terra"),
             ("strategy", "rebase"),
@@ -2356,6 +2366,35 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.WorkflowError, "interrupted"):
             MODULE.validate_conflict_result_identity(result, request)
 
+    def test_active_result_has_no_hosted_validation_schema(self):
+        directory = temporary_directory(self)
+        request = self.request()
+        result = self.success_result(request)
+        result["validation"] = {"complete": True, "outcomes": []}
+        path = directory / "result.json"
+        path.write_text(json.dumps(result), encoding="utf-8")
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "unsupported fields"):
+            MODULE.load_conflict_result(path)
+
+    def test_v5_result_parser_remains_available_for_audit(self):
+        directory = temporary_directory(self)
+        request = self.request()
+        result = self.success_result(request)
+        result["schema"] = MODULE.V5_CONFLICT_RESULT_SCHEMA
+        result["policy"] = MODULE.V5_CONFLICT_POLICY_IDENTITY
+        result["validation"] = {
+            "complete": True,
+            "outcomes": [{"command": "git diff --check", "result": "passed"}],
+        }
+        path = directory / "v5-result.json"
+        path.write_text(json.dumps(result), encoding="utf-8")
+
+        self.assertEqual(
+            MODULE.V5_CONFLICT_RESULT_SCHEMA,
+            MODULE.load_v5_conflict_result(path)["schema"],
+        )
+
     def test_consumer_rejects_a_single_role_code_locator_not_bound_to_artifact(self):
         request = self.request()
         result = self.success_result(request)
@@ -2373,7 +2412,6 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
                 request,
                 code_refs,
                 result["generated"]["artifact"],
-                result["validation"]["outcomes"],
             )
 
     def test_merge_publication_uses_the_explicit_head_refspec(self):
@@ -2422,6 +2460,34 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             f"--force-with-lease=refs/heads/feature:{'b' * 40}",
             command,
         )
+
+    def test_managed_publication_rejects_any_non_cas_remote_head(self):
+        directory = temporary_directory(self)
+        request = self.request()
+        code_refs = self.success_result(request)["generated"]["code_refs"]
+        state = {
+            "agent_task": {
+                "preflight": {
+                    "request": request,
+                    "repository_root": str(directory),
+                },
+                "code_refs": code_refs,
+            }
+        }
+        with (
+            mock.patch.object(MODULE, "require_clean_worktree"),
+            mock.patch.object(MODULE, "require_no_integration_in_progress"),
+            mock.patch.object(MODULE, "require_live_conflict_guards"),
+            mock.patch.object(
+                MODULE,
+                "remote_publication_heads",
+                return_value=["unexpected"],
+            ),
+            mock.patch.object(MODULE, "run") as runner,
+            self.assertRaisesRegex(MODULE.WorkflowError, "mixed or unexpected"),
+        ):
+            MODULE.publish_conflict_result(directory / "state.json", state)
+        runner.assert_not_called()
 
     def test_native_stack_publication_is_atomic_with_one_lease_per_branch(self):
         request = self.request("native-stack")
@@ -3904,13 +3970,22 @@ class ManagedRequestStrategyTest(unittest.TestCase):
 
 class ManagedTaskPromptTest(unittest.TestCase):
     def request(self):
-        return ManagedRequestStrategyTest().request(
+        request = ManagedRequestStrategyTest().request(
             {
                 "merge_commit": True,
                 "rebase_merge": True,
                 "squash_merge": True,
             }
         )
+        request["policy"] = CLOUD_MODULE.POLICY
+        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
+        return request
+
+    def minimal_request(self):
+        request = self.request()
+        request["policy"] = CLOUD_MODULE.MINIMAL_POLICY
+        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
+        return request
 
     def options(self, request):
         return SimpleNamespace(
@@ -4885,6 +4960,427 @@ class ManagedTaskPromptTest(unittest.TestCase):
             CLOUD_MODULE.start_task(runner, mock.sentinel.snapshot, options)
 
         runner.assert_not_called()
+
+
+class MinimalConflictContractTest(ManagedTaskPromptTest):
+    def task(self, request, branch="copilot/generated-task"):
+        task_id = "task-1"
+        return {
+            "id": task_id,
+            "state": "completed",
+            "head_ref": branch,
+            "artifacts": [
+                {
+                    "provider": "github",
+                    "type": "branch",
+                    "data": {
+                        "base_ref": request["pull_request"]["head_sha"],
+                        "head_ref": branch,
+                    },
+                }
+            ],
+            "sessions": [
+                {
+                    "task_id": task_id,
+                    "state": "completed",
+                    "model": "sweagent-capi:gpt-5.6-sol",
+                    "base_ref": request["pull_request"]["head_sha"],
+                    "head_ref": branch,
+                }
+            ],
+        }
+
+    def prove_merge(self, *, report=False, repeated_report=False):
+        request = self.minimal_request()
+        task = self.task(request)
+        snapshot = CLOUD_MODULE.LocalSnapshot(
+            Path("C:/repo"),
+            Path("C:/state"),
+            request["repository"],
+            "origin",
+            request["pull_request"]["head_ref"],
+            request["pull_request"]["head_sha"],
+            "",
+            None,
+        )
+        code_tip = "c" * 40
+        report_head = "d" * 40
+        earlier_report = "e" * 40
+        artifact_head = report_head if report else code_tip
+
+        def commit_parents(_runner, _root, commit):
+            if commit == report_head:
+                return [earlier_report if repeated_report else code_tip]
+            if commit in {code_tip, earlier_report}:
+                return [
+                    request["pull_request"]["head_sha"],
+                    request["pull_request"]["base_sha"],
+                ]
+            raise AssertionError(commit)
+
+        def paths(_runner, _root, commit):
+            return (
+                [CLOUD_MODULE.OUTPUT_REPORT_PATH]
+                if commit in {report_head, earlier_report}
+                else ["app.py"]
+            )
+
+        def git_result(_runner, _root, *arguments):
+            if arguments[:2] == ("rev-parse", "--verify") and ":" in arguments[-1]:
+                return "f" * 40
+            return ""
+
+        with (
+            mock.patch.object(
+                CLOUD_MODULE,
+                "fetch_quarantined",
+                return_value=("refs/cloud-conflict-tasks/request-1/artifact", artifact_head),
+            ),
+            mock.patch.object(CLOUD_MODULE, "parents", side_effect=commit_parents),
+            mock.patch.object(CLOUD_MODULE, "changed_paths", side_effect=paths),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "first_parent_chain",
+                return_value=[earlier_report if repeated_report else code_tip],
+            ),
+            mock.patch.object(CLOUD_MODULE, "git", side_effect=git_result),
+            mock.patch.object(CLOUD_MODULE, "require_local_unchanged"),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "git_show_file",
+                side_effect=AssertionError("advisory report prose must not be parsed"),
+            ),
+        ):
+            return CLOUD_MODULE.prove_generated_minimal(
+                mock.sentinel.runner,
+                snapshot,
+                request,
+                task,
+            )
+
+    def test_policy_6_omits_hosted_result_validation_and_annotations(self):
+        request = self.minimal_request()
+        prompt = CLOUD_MODULE.policy_prompt(self.options(request))
+        result = CLOUD_MODULE.Result(
+            schema=CLOUD_MODULE.MINIMAL_RESULT_SCHEMA,
+            policy=CLOUD_MODULE.MINIMAL_POLICY,
+        ).as_dict()
+
+        self.assertIn("Policy: marketplace-conflict-worker@6", prompt)
+        self.assertIn(CLOUD_MODULE.OUTPUT_REPORT_PATH, prompt)
+        self.assertIn("Do not run local validation through the dispatcher", prompt)
+        self.assertNotIn("validation", result)
+        for field in (
+            "commit_annotations",
+            "conflict_paths",
+            "companion_paths",
+            "rationale",
+        ):
+            self.assertNotIn(f'"{field}"', prompt)
+
+    def test_single_role_code_only_result_uses_authoritative_task_tip(self):
+        code_refs, artifact, validations = self.prove_merge()
+
+        self.assertEqual("c" * 40, code_refs[0]["new_sha"])
+        self.assertEqual("copilot/generated-task", code_refs[0]["ref"])
+        self.assertEqual("c" * 40, artifact["head_sha"])
+        self.assertEqual("c" * 40, artifact["source_tip_sha"])
+        self.assertIsNone(artifact["report"])
+        self.assertEqual([], validations)
+        self.assertNotIn("validation", artifact["receipt"]["value"])
+
+    def test_optional_report_is_retained_but_excluded_from_source(self):
+        code_refs, artifact, _ = self.prove_merge(report=True)
+
+        self.assertEqual("c" * 40, code_refs[0]["new_sha"])
+        self.assertEqual("d" * 40, artifact["head_sha"])
+        self.assertEqual("c" * 40, artifact["source_tip_sha"])
+        self.assertEqual(
+            {
+                "path": CLOUD_MODULE.OUTPUT_REPORT_PATH,
+                "commit": "d" * 40,
+                "blob_sha": "f" * 40,
+            },
+            artifact["report"],
+        )
+
+    def test_missing_or_arbitrary_report_prose_cannot_reject_valid_code(self):
+        for report in (False, True):
+            with self.subTest(report=report):
+                code_refs, _, _ = self.prove_merge(report=report)
+                self.assertEqual("c" * 40, code_refs[0]["new_sha"])
+
+    def test_mixed_output_and_code_commit_fails_closed(self):
+        with (
+            mock.patch.object(
+                CLOUD_MODULE,
+                "changed_paths",
+                return_value=[CLOUD_MODULE.OUTPUT_REPORT_PATH, "app.py"],
+            ),
+            self.assertRaisesRegex(
+                CLOUD_MODULE.ConflictError,
+                "mixes source and output",
+            ),
+        ):
+            CLOUD_MODULE.separate_optional_report(
+                mock.sentinel.runner,
+                Path("repo"),
+                "d" * 40,
+            )
+
+    def test_repeated_output_commit_fails_closed(self):
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError,
+            "reserved path",
+        ):
+            self.prove_merge(report=True, repeated_report=True)
+
+    def test_output_report_with_extra_parent_fails_closed(self):
+        with (
+            mock.patch.object(
+                CLOUD_MODULE,
+                "changed_paths",
+                return_value=[CLOUD_MODULE.OUTPUT_REPORT_PATH],
+            ),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "parents",
+                return_value=["a" * 40, "b" * 40],
+            ),
+            self.assertRaisesRegex(CLOUD_MODULE.ConflictError, "one parent"),
+        ):
+            CLOUD_MODULE.separate_optional_report(
+                mock.sentinel.runner,
+                Path("repo"),
+                "d" * 40,
+            )
+
+    def test_commit_mapping_is_derived_without_model_annotations(self):
+        old = {
+            "sha": "1" * 40,
+            "subject": "Retained subject",
+            "trailers": ["Reviewed-by: A"],
+            "patch_sha256": "2" * 64,
+            "paths": ["app.py", "safe.py"],
+        }
+
+        def path_digest(_runner, _root, _parent, commit, path):
+            if path == "safe.py":
+                return "same"
+            return "old" if commit == old["sha"] else "new"
+
+        with (
+            mock.patch.object(CLOUD_MODULE, "parents", return_value=["0" * 40]),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "commit_subject",
+                return_value=old["subject"],
+            ),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "commit_trailers",
+                return_value=old["trailers"],
+            ),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "changed_paths",
+                return_value=["app.py", "safe.py"],
+            ),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "path_patch_sha256",
+                side_effect=path_digest,
+            ),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "patch_sha256",
+                return_value="3" * 64,
+            ),
+        ):
+            mapping = CLOUD_MODULE.mechanical_mapping(
+                mock.sentinel.runner,
+                Path("repo"),
+                old,
+                "4" * 40,
+                "5" * 40,
+                {"app.py"},
+            )
+
+        self.assertEqual(["app.py"], mapping["changed_paths"])
+        self.assertEqual("2" * 64, mapping["old_patch_sha256"])
+        self.assertEqual("3" * 64, mapping["new_patch_sha256"])
+        self.assertTrue(
+            {
+                "commit_annotations",
+                "conflict_paths",
+                "companion_paths",
+                "rationale",
+            }.isdisjoint(mapping)
+        )
+
+    def test_mechanical_mapping_rejects_an_unapproved_patch_difference(self):
+        old = {
+            "sha": "1" * 40,
+            "subject": "Retained subject",
+            "trailers": [],
+            "patch_sha256": "2" * 64,
+            "paths": ["unsafe.py"],
+        }
+        with (
+            mock.patch.object(CLOUD_MODULE, "parents", return_value=["0" * 40]),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "commit_subject",
+                return_value=old["subject"],
+            ),
+            mock.patch.object(CLOUD_MODULE, "commit_trailers", return_value=[]),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "changed_paths",
+                return_value=["unsafe.py"],
+            ),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "path_patch_sha256",
+                side_effect=["old", "new"],
+            ),
+            self.assertRaisesRegex(CLOUD_MODULE.ConflictError, "undeclared"),
+        ):
+            CLOUD_MODULE.mechanical_mapping(
+                mock.sentinel.runner,
+                Path("repo"),
+                old,
+                "4" * 40,
+                "5" * 40,
+                {"app.py"},
+            )
+
+    def test_non_linear_rebase_range_fails_closed(self):
+        old = {
+            "sha": "1" * 40,
+            "subject": "Retained subject",
+            "trailers": [],
+            "patch_sha256": "2" * 64,
+            "paths": ["app.py"],
+        }
+        with (
+            mock.patch.object(
+                CLOUD_MODULE,
+                "ordered_commits",
+                return_value=["4" * 40],
+            ),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "parents",
+                return_value=["9" * 40],
+            ),
+            self.assertRaisesRegex(CLOUD_MODULE.ConflictError, "not linear"),
+        ):
+            CLOUD_MODULE.prove_rebase_range_mechanically(
+                mock.sentinel.runner,
+                Path("repo"),
+                "a" * 40,
+                "4" * 40,
+                [old],
+                {"app.py"},
+            )
+
+    def test_native_stack_prompt_assigns_each_role_an_independent_ref(self):
+        request = self.minimal_request()
+        request["strategy"] = "native-stack"
+        request["head_commits"] = []
+        request["native_stack"] = {
+            "trunk": {"ref": "main", "sha": "a" * 40},
+            "members": [
+                {"pr_number": 6, "repository": "owner/repo"},
+                {"pr_number": 7, "repository": "owner/repo"},
+            ],
+            "outside_dependents": [],
+        }
+        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
+        refs = CLOUD_MODULE.assigned_code_refs(request)
+        prompt = CLOUD_MODULE.policy_prompt(self.options(request))
+
+        self.assertEqual(["member:6", "member:7"], [ref.role for ref in refs])
+        self.assertEqual(2, len({ref.ref for ref in refs}))
+        for ref in refs:
+            self.assertIn(ref.ref, prompt)
+        self.assertIn("must also be the source tip", prompt)
+
+    def test_missing_assigned_native_stack_ref_fails_closed(self):
+        request = self.minimal_request()
+        request["strategy"] = "native-stack"
+        request["head_commits"] = []
+        request["native_stack"] = {
+            "trunk": {"ref": "main", "sha": "a" * 40},
+            "members": [
+                {"pr_number": 6, "repository": "owner/repo"},
+                {"pr_number": 7, "repository": "owner/repo"},
+            ],
+            "outside_dependents": [],
+        }
+        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
+        task = self.task(request)
+        snapshot = CLOUD_MODULE.LocalSnapshot(
+            Path("C:/repo"),
+            Path("C:/state"),
+            request["repository"],
+            "origin",
+            request["pull_request"]["head_ref"],
+            request["pull_request"]["head_sha"],
+            "",
+            None,
+        )
+        with (
+            mock.patch.object(
+                CLOUD_MODULE,
+                "fetch_quarantined",
+                side_effect=[
+                    ("refs/cloud-conflict-tasks/request-1/artifact", "d" * 40),
+                    ("refs/cloud-conflict-tasks/request-1/member-6", "c" * 40),
+                    CLOUD_MODULE.ConflictError(
+                        "missing assigned ref",
+                        "unexpected_history",
+                    ),
+                ],
+            ),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "changed_paths",
+                return_value=["app.py"],
+            ),
+            self.assertRaisesRegex(CLOUD_MODULE.ConflictError, "missing assigned ref"),
+        ):
+            CLOUD_MODULE.prove_generated_minimal(
+                mock.sentinel.runner,
+                snapshot,
+                request,
+                task,
+            )
+
+    def test_stale_or_platform_error_task_identity_fails_closed(self):
+        request = self.minimal_request()
+        for mutation in (
+            lambda task: task.update(error={"message": "platform failed"}),
+            lambda task: task.update(
+                repository={"full_name": "other/repo"},
+            ),
+        ):
+            task = self.task(request)
+            mutation(task)
+            with self.subTest(task=task), self.assertRaises(
+                CLOUD_MODULE.ConflictError
+            ):
+                CLOUD_MODULE.discover_minimal_artifact_ref(task, request)
+
+    def test_task_identity_accepts_runtime_model_spelling(self):
+        request = self.minimal_request()
+        task = self.task(request)
+        task["sessions"][0]["model"] = request["model"]
+
+        remote = CLOUD_MODULE.discover_minimal_artifact_ref(task, request)
+
+        self.assertEqual("copilot/generated-task", remote.ref)
 
 
 class MalformedCompletedReplacementTest(unittest.TestCase):
