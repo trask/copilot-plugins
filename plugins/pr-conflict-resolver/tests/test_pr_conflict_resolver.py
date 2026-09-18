@@ -5292,8 +5292,32 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
         request["native_stack"] = {
             "trunk": {"ref": "main", "sha": "a" * 40},
             "members": [
-                {"pr_number": 6, "repository": "owner/repo"},
-                {"pr_number": 7, "repository": "owner/repo"},
+                {
+                    "pr_number": number,
+                    "repository": "owner/repo",
+                    "head_ref": f"feature-{number}",
+                    "head_sha": f"{number:040x}",
+                    "direct_base_ref": "main" if number == 6 else "feature-6",
+                    "direct_base_sha": "a" * 40 if number == 6 else f"{6:040x}",
+                    "retained_base_sha": "a" * 40 if number == 6 else f"{6:040x}",
+                    "direct_merge_base": "a" * 40 if number == 6 else f"{6:040x}",
+                    "expected_new_parent": {
+                        "role": "trunk" if number == 6 else "member:6",
+                        "old_sha": "a" * 40 if number == 6 else f"{6:040x}",
+                    },
+                    "old_commits": [
+                        {
+                            "sha": f"{number:040x}",
+                            "subject": f"Feature {number}",
+                            "trailers": [],
+                            "patch_sha256": f"{number:064x}",
+                            "paths": ["app.py"],
+                        }
+                    ],
+                    "sync_merges": [],
+                    "lease_sha": f"{number:040x}",
+                }
+                for number in (6, 7)
             ],
             "outside_dependents": [],
         }
@@ -5302,7 +5326,13 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
         prompt = CLOUD_MODULE.policy_prompt(self.options(request))
 
         self.assertEqual(["member:6", "member:7"], [ref.role for ref in refs])
-        self.assertEqual(2, len({ref.ref for ref in refs}))
+        self.assertEqual(
+            [
+                CLOUD_MODULE.assigned_code_ref(request["request_id"], ref.role)
+                for ref in refs
+            ],
+            [ref.ref for ref in refs],
+        )
         for ref in refs:
             self.assertIn(ref.ref, prompt)
         self.assertIn("must also be the source tip", prompt)
@@ -5974,10 +6004,21 @@ class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertEqual("success", result.status)
         self.assertEqual("no_changes", result.application_status)
+        payload = result.as_dict()
+        self.assertEqual(CLOUD_MODULE.MINIMAL_RESULT_SCHEMA, payload["schema"])
         self.assertEqual(
-            [{"command": "local-history-proof", "result": "passed"}],
-            result.validations,
+            CLOUD_MODULE.pull_request_result(request),
+            payload["pull_request"],
         )
+        self.assertEqual(
+            {
+                "id": request["request_id"],
+                "sha256": request["request_sha256"],
+            },
+            payload["request"],
+        )
+        self.assertNotIn("validation", payload)
+        self.assertEqual([], result.validations)
         self.assertEqual("owner/repo", result.repository)
 
     def test_task_creation_failure_keeps_all_task_identity_null(self):

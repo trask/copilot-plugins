@@ -6571,7 +6571,6 @@ def local_source_owner_fingerprint(
 
 def local_source_fingerprint(repo_root: Path) -> dict[str, Any]:
     identity = local_identity(repo_root)
-    identity["worktree"] = str(repo_root.resolve())
     branch_ref = f"refs/heads/{identity['branch']}"
     branch_head = git(repo_root, "rev-parse", "--verify", branch_ref).lower()
     if (

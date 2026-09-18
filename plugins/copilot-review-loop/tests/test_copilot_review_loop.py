@@ -2168,7 +2168,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         }
 
         self.assertEqual(projected_probe, stored)
-        self.assertEqual(str(self.repo_root.resolve()), stored["worktree"])
 
     def test_source_transition_derives_parent_paths_and_exact_patch_digest(self):
         before = {
@@ -2504,7 +2503,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.59")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.60")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -3494,7 +3493,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn('"author": "copilot-pull-request-reviewer[bot]"', prompt)
         self.assertIn('"head_ref": "feature"', prompt)
         self.assertIn('"base_ref": "main"', prompt)
-        self.assertIn("squash a correction-only follow-up", prompt)
+        self.assertIn("exactly one single-parent commit", prompt)
+        self.assertIn("squash every correction-only follow-up", prompt)
 
     def test_canonical_report_v3_validates_refs_and_separate_author(self):
         preflight = copy.deepcopy(self.preflight)
@@ -5573,6 +5573,15 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "session_id": "session-1",
             "run_id": "request-1",
             "paths_by_commit": {self.fix: ["src/app.py"]},
+            "source_transition": [
+                {
+                    "sha": self.fix,
+                    "parent_sha": self.head,
+                    "tree_sha": "a" * 40,
+                    "patch_sha256": "b" * 64,
+                    "paths": ["src/app.py"],
+                }
+            ],
             "model_attestation": attestation,
             "remote": {
                 "commits": [self.fix],
@@ -5648,8 +5657,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         with (
             mock.patch.object(
                 MODULE,
-                "validate_local_source_transition",
-                return_value=([self.fix], {self.fix: ["src/app.py"]}),
+                "local_source_transition_evidence",
+                return_value=result["source_transition"],
             ),
             mock.patch.object(
                 MODULE,

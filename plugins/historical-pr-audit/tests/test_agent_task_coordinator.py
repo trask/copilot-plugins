@@ -458,17 +458,21 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     def test_execute_uses_subprocess_and_no_window_wrapper(self):
         completed = MODULE.subprocess.CompletedProcess(["python"], 0, "", "")
+        root = Path(tempfile.gettempdir()).resolve()
         with mock.patch.object(MODULE, "run", return_value=completed) as run:
             actual = MODULE.execute_managed_agent_task(
-                Path("C:/copilot/cloud_task.py"),
-                repo_root=Path("C:/repo"),
+                root / "copilot" / "cloud_task.py",
+                repo_root=root / "repo",
                 metadata=METADATA,
                 model_alias="sol",
-                prompt_path=Path("C:/state/prompt.txt"),
-                result_path=Path("C:/state/result.json"),
+                prompt_path=root / "state" / "prompt.txt",
+                result_path=root / "state" / "result.json",
             )
         self.assertIs(actual, completed)
-        self.assertEqual(run.call_args.kwargs, {"cwd": Path("C:/repo"), "check": False})
+        self.assertEqual(
+            run.call_args.kwargs,
+            {"cwd": root / "repo", "check": False},
+        )
         self.assertNotIn("ApiClient", MODULE.execute_managed_agent_task.__code__.co_names)
         self.assertNotIn("start_task", MODULE.execute_managed_agent_task.__code__.co_names)
 

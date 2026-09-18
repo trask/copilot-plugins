@@ -4287,6 +4287,134 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "error": None,
         }
 
+    def candidate_metadata(self, sha, parent, paths):
+        return {
+            "sha": sha,
+            "parent_sha": parent,
+            "tree_sha": "a" * 40,
+            "patch_sha256": "b" * 64,
+            "changed_paths": paths,
+        }
+
+    def candidate_result(self, commits=None, *, changed_paths=None):
+        commits = [] if commits is None else commits
+        paths = changed_paths or ["src/App.java"]
+        parent = self.head
+        commit_metadata = []
+        for commit in commits:
+            commit_metadata.append(
+                self.candidate_metadata(commit, parent, paths)
+            )
+            parent = commit
+        completion = {
+            "request": {
+                "requested_model": "gpt-5.6-sol",
+                "prompt_sha256": "c" * 64,
+            },
+            "task": {
+                "id": "task-1",
+                "state": "completed",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:01:00Z",
+                "completed_at": "2026-01-01T00:01:00Z",
+                "raw_response_sha256": "d" * 64,
+            },
+            "session": {
+                "id": "session-1",
+                "state": "completed",
+                "actual_model": "gpt-5.6-sol",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:01:00Z",
+                "completed_at": "2026-01-01T00:01:00Z",
+                "prompt_sha256": "c" * 64,
+            },
+            "repository": {
+                "name_with_owner": "owner/repo",
+                "id": 1,
+                "owner": {"login": "owner", "id": 2},
+            },
+            "refs": {
+                "base": "feature",
+                "generated": "copilot/candidate",
+            },
+        }
+        return {
+            "schema": MODULE.CANDIDATE_AGENT_TASK_RESULT_SCHEMA,
+            "status": "success",
+            "mode": "code_candidate",
+            "repository": {"name_with_owner": "owner/repo"},
+            "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
+            "requested_model": "gpt-5.6-sol",
+            "policy": {
+                "id": "marketplace-agent-code-candidate-worker",
+                "version": 1,
+                "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
+            },
+            "task": {
+                "id": "task-1",
+                "url": "https://github.com/owner/repo/agent-tasks/task-1",
+                "state": "completed",
+                "base_ref": "feature",
+                "base_sha": self.head,
+            },
+            "generated": {
+                "branch": "copilot/candidate",
+                "head_sha": parent,
+                "commits": commits,
+            },
+            "application": {
+                "status": "not_applied",
+                "final_local_head": self.head,
+            },
+            "report": None,
+            "candidate": {
+                "schema": MODULE.AGENT_TASK_CANDIDATE_MANIFEST_SCHEMA,
+                "repository": {"name_with_owner": "owner/repo"},
+                "task": {"id": "task-1", "session_id": "session-1"},
+                "base": {"ref": "feature", "sha": self.head},
+                "generated": {
+                    "ref": "copilot/candidate",
+                    "head_sha": parent,
+                    "code_tip_sha": parent,
+                },
+                "code_commits": commit_metadata,
+                "artifact_commit": None,
+            },
+            "completion": completion,
+            "attestation": {
+                "kind": "dispatcher_candidate",
+                "structural_complete": True,
+            },
+            "error": None,
+        }
+
+    def candidate_taskless_failure(self):
+        failure = self.candidate_result()
+        failure.update(
+            {
+                "status": "error",
+                "task": {
+                    "id": None,
+                    "url": None,
+                    "state": None,
+                    "base_ref": None,
+                    "base_sha": None,
+                },
+                "generated": {"branch": None, "head_sha": None, "commits": []},
+                "candidate": None,
+                "completion": None,
+                "attestation": {
+                    "kind": "dispatcher_candidate",
+                    "structural_complete": False,
+                },
+                "error": {
+                    "code": "api_failure",
+                    "message": "start Agent Task failed",
+                },
+            }
+        )
+        return failure
+
     def taskless_failure(self):
         failure = self.result()
         failure.update(
@@ -4318,7 +4446,27 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         return failure
 
-    def test_taskless_api_failure_keeps_its_trusted_error(self):
+    def test_candidate_taskless_failure_keeps_its_trusted_error(self):
+        failure = self.candidate_taskless_failure()
+        candidate_error = MODULE.validate_candidate_task_creation_failure_result(
+            failure,
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+        )
+        self.assertEqual("api_failure", candidate_error["code"])
+        malformed = copy.deepcopy(failure)
+        malformed["candidate"] = {}
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "malformed or mismatched identity",
+        ):
+            MODULE.validate_candidate_task_creation_failure_result(
+                malformed,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+            )
+
+    def test_legacy_taskless_failure_remains_parseable_for_audit(self):
         error = MODULE.validate_task_creation_failure_result(
             self.taskless_failure(),
             preflight=self.preflight,
@@ -4436,7 +4584,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("run-sealed-ci-fix", instructions)
         self.assertIn("runs one installed coordinator command", instructions)
-        self.assertIn("It emits no retry or recovery command", instructions)
+        self.assertIn("A crash or lost invocation is abandoned", instructions)
+        self.assertIn("No later invocation may resume", instructions)
         self.assertIn(
             "tools: [execute, read, rename_session]",
             instructions,
@@ -5650,7 +5799,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         log_directory = self.root / "state--ci-fix-logs--retry"
         log_path = log_directory / "failed.log"
         preflight["check_snapshot"]["failures"][0]["log_path"] = str(log_path)
-        failed = self.taskless_failure()
+        failed = self.candidate_taskless_failure()
         helper_commands = []
 
         def preflight_for_retry(*_args, **_kwargs):
@@ -5700,7 +5849,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             ),
             mock.patch.object(MODULE, "require_live_check_snapshot"),
         ):
-            with self.assertRaisesRegex(MODULE.WorkflowError, "CCA enabled"):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                r"Agent Task failed \[api_failure\]: start Agent Task failed",
+            ):
                 MODULE.command_agent_task(
                     MODULE.build_parser().parse_args(arguments)
                 )
@@ -5852,11 +6004,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         preflight = copy.deepcopy(self.preflight)
         preflight["repository_root"] = str(repo)
         commit = "5" * 40
-        semantic = self.semantic_artifact(
+        result = self.candidate_result(
             [commit],
             changed_paths=["src/widget.py"],
         )
-        result = self.result([commit], changed_paths=["src/widget.py"])
         commands = []
 
         def run_command(command, **kwargs):
@@ -5895,14 +6046,12 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     preflight["identity"],
                     preflight["identity"],
                     preflight["identity"],
+                    preflight["identity"],
                     imported_identity,
                     imported_identity,
                 ],
             ),
-            mock.patch.object(
-                MODULE, "fetch_committed_text", return_value=semantic
-            ),
-            mock.patch.object(MODULE, "validate_generated_history"),
+            mock.patch.object(MODULE, "validate_candidate_history"),
             mock.patch.object(MODULE, "refuse_test_suppression"),
             mock.patch.object(MODULE, "require_live_check_snapshot"),
             mock.patch.object(
@@ -5936,46 +6085,41 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         hosted = next(command for command in commands if "--apply-with-report" in command)
         self.assertEqual(
-            MODULE.CI_FIX_SEMANTIC_KIND,
-            hosted[hosted.index("--semantic-kind") + 1],
+            MODULE.AGENT_TASK_POLICY,
+            hosted[hosted.index("--policy") + 1],
         )
         self.assertEqual("published", emit.call_args.args[0]["result"])
         state = MODULE.load_state(state_path)
         self.assertEqual(commit, state["agent_task"]["published_head_sha"])
         self.assertEqual([commit], state["agent_task"]["ordered_commits"])
         self.assertEqual(
-            MODULE.CI_FIX_CONSUMER_RECEIPT_SCHEMA,
+            MODULE.CI_FIX_CANDIDATE_RECEIPT_SCHEMA,
             state["agent_task"]["consumer_receipt"]["schema"],
         )
         self.assertEqual(
-            self.trusted_evidence(commit),
-            state["agent_task"]["consumer_receipt"]["validation"],
+            MODULE.canonical_json_sha256(result["candidate"]),
+            state["agent_task"]["consumer_receipt"][
+                "candidate_manifest_sha256"
+            ],
         )
-        self.assertEqual(
-            MODULE.canonical_json_sha256(self.trusted_evidence(commit)),
-            state["agent_task"]["consumer_receipt"]["validation_sha256"],
-        )
-        self.assertEqual(
-            result["semantic_output"]["sha256"],
-            state["agent_task"]["semantic_output_sha256"],
-        )
+        self.assertNotIn("validation", state["agent_task"]["consumer_receipt"])
+        self.assertNotIn("semantic_output_sha256", state["agent_task"])
         self.assertRegex(
             state["agent_task"]["consumer_receipt_sha256"],
             r"^[0-9a-f]{64}$",
         )
 
-    def test_trusted_validation_failure_stops_before_import_and_push(self):
+    def test_failed_exact_sha_check_clearance_stops_before_import_and_push(self):
         repo = self.root / "repo"
         repo.mkdir()
         state_path = self.root / "validation-failed.json"
         preflight = copy.deepcopy(self.preflight)
         preflight["repository_root"] = str(repo)
         commit = "5" * 40
-        semantic = self.semantic_artifact(
+        result = self.candidate_result(
             [commit],
             changed_paths=["src/widget.py"],
         )
-        result = self.result([commit], changed_paths=["src/widget.py"])
         commands = []
 
         def run_command(command, **kwargs):
@@ -6018,23 +6162,26 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 return_value=self.root / "cloud_task.py",
             ),
             mock.patch.object(MODULE, "run", side_effect=run_command),
-            mock.patch.object(
-                MODULE, "fetch_committed_text", return_value=semantic
-            ),
-            mock.patch.object(MODULE, "validate_generated_history"),
+            mock.patch.object(MODULE, "validate_candidate_history"),
             mock.patch.object(MODULE, "refuse_test_suppression"),
-            mock.patch.object(MODULE, "require_live_check_snapshot"),
             mock.patch.object(
                 MODULE,
-                "run_trusted_ci_validation",
+                "metadata_for",
+                return_value=preflight["pr"],
+            ),
+            mock.patch.object(
+                MODULE,
+                "require_live_check_snapshot",
                 side_effect=MODULE.WorkflowError(
-                    "trusted validation failed with exit code 1"
+                    "GitHub checks for the exact frozen SHA are no longer current"
                 ),
             ),
-            mock.patch.object(MODULE, "apply_verified_import") as apply_import,
+            mock.patch.object(
+                MODULE, "apply_verified_candidate_import"
+            ) as apply_import,
             self.assertRaisesRegex(
                 MODULE.WorkflowError,
-                "trusted validation failed",
+                "exact frozen SHA",
             ),
         ):
             MODULE.command_agent_task(arguments)
@@ -6054,11 +6201,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         preflight = copy.deepcopy(self.preflight)
         preflight["repository_root"] = str(repo)
         commit = "5" * 40
-        semantic = self.semantic_artifact(
+        result = self.candidate_result(
             [commit],
             changed_paths=["src/widget.py"],
         )
-        result = self.result([commit], changed_paths=["src/widget.py"])
         commands = []
 
         def run_command(command, **kwargs):
@@ -6099,10 +6245,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(
                 MODULE, "local_identity", return_value=preflight["identity"]
             ),
-            mock.patch.object(
-                MODULE, "fetch_committed_text", return_value=semantic
-            ),
-            mock.patch.object(MODULE, "validate_generated_history"),
+            mock.patch.object(MODULE, "validate_candidate_history"),
             mock.patch.object(MODULE, "refuse_test_suppression"),
             mock.patch.object(MODULE, "require_live_check_snapshot"),
             mock.patch.object(
@@ -6110,7 +6253,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             ),
             mock.patch.object(MODULE, "remote_head", return_value=commit),
             mock.patch.object(
-                MODULE, "apply_verified_import"
+                MODULE, "apply_verified_candidate_import"
             ) as apply_import,
             self.assertRaisesRegex(
                 MODULE.WorkflowError,
@@ -6134,11 +6277,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         preflight = copy.deepcopy(self.preflight)
         preflight["repository_root"] = str(repo)
         commit = "5" * 40
-        semantic = self.semantic_artifact(
+        result = self.candidate_result(
             [commit],
             changed_paths=["src/widget.py"],
         )
-        result = self.result([commit], changed_paths=["src/widget.py"])
         commands = []
 
         def run_command(command, **kwargs):
@@ -6180,12 +6322,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     imported_identity,
                 ],
             ),
-            mock.patch.object(
-                MODULE,
-                "fetch_committed_text",
-                side_effect=[semantic, semantic],
-            ),
-            mock.patch.object(MODULE, "validate_generated_history"),
+            mock.patch.object(MODULE, "validate_candidate_history"),
             mock.patch.object(MODULE, "refuse_test_suppression"),
             mock.patch.object(MODULE, "require_live_check_snapshot") as check_snapshot,
             mock.patch.object(MODULE, "metadata_for", return_value=preflight["pr"]),
@@ -6198,7 +6335,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 return_value=live_after_push,
             ),
             mock.patch.object(
-                MODULE, "apply_verified_import", return_value=True
+                MODULE, "apply_verified_candidate_import", return_value=True
             ) as apply_import,
             mock.patch.object(MODULE, "emit") as emit,
         ):
@@ -6224,7 +6361,6 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         repo.mkdir()
         state_path = self.root / "state.json"
         preflights = []
-        semantic_artifacts = []
         results = []
         for iteration in range(3):
             preflight = copy.deepcopy(self.preflight)
@@ -6245,9 +6381,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             preflight["check_snapshot"]["sha256"] = MODULE.check_snapshot_sha256(
                 preflight["check_snapshot"]
             )
-            result = self.result()
+            result = self.candidate_result()
             preflights.append(preflight)
-            semantic_artifacts.append(self.semantic_artifact())
             results.append(result)
         helper_calls = 0
 
@@ -6282,12 +6417,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(
                 MODULE, "local_identity", return_value=preflights[0]["identity"]
             ),
-            mock.patch.object(
-                MODULE,
-                "fetch_committed_text",
-                side_effect=semantic_artifacts,
-            ),
-            mock.patch.object(MODULE, "validate_generated_history"),
+            mock.patch.object(MODULE, "validate_candidate_history"),
             mock.patch.object(MODULE, "refuse_test_suppression"),
             mock.patch.object(MODULE, "require_live_check_snapshot"),
             mock.patch.object(MODULE, "metadata_for", return_value=preflights[0]["pr"]),

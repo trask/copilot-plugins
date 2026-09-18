@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -53,6 +54,22 @@ SPEC = importlib.util.spec_from_file_location("pr_description", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+RUNTIME_SCRIPT = (
+    ROOT.parent
+    / "agent-tasks-runtime"
+    / "skills"
+    / "agent-tasks-runtime"
+    / "scripts"
+    / "cloud_task.py"
+)
+RUNTIME_SPEC = importlib.util.spec_from_file_location(
+    "pr_description_test_cloud_task",
+    RUNTIME_SCRIPT,
+)
+assert RUNTIME_SPEC is not None and RUNTIME_SPEC.loader is not None
+RUNTIME = importlib.util.module_from_spec(RUNTIME_SPEC)
+sys.modules[RUNTIME_SPEC.name] = RUNTIME
+RUNTIME_SPEC.loader.exec_module(RUNTIME)
 
 
 class WindowsSubprocessTest(unittest.TestCase):
@@ -185,7 +202,7 @@ def agent_task_result(preflight=None, **overrides):
             "commits": [],
         },
         "application": {
-            "status": "not_applied",
+            "status": "not_applicable",
             "final_local_head": "4" * 40,
         },
         "report": None,
@@ -1187,7 +1204,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.61")
+        self.assertEqual(plugin["version"], "1.0.62")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -3346,6 +3363,66 @@ class RecommendationContractTest(unittest.TestCase):
         )
         self.assertEqual(3, MODULE.PR_DESCRIPTION_PROPOSAL_SCHEMA["version"])
 
+    def test_runtime_report_recommendation_envelope_is_accepted(self):
+        fixture = self.result()
+        pr = self.preflight["pr"]
+        envelope = RUNTIME.ResultEnvelope(
+            schema_version=fixture["schema"]["version"],
+            mode=fixture["mode"],
+            requested_model=fixture["requested_model"],
+            repository=fixture["repository"]["name_with_owner"],
+            pull_request=RUNTIME.PullRequestSnapshot(
+                number=pr["number"],
+                url=pr["url"],
+                state=pr["state"],
+                base_repository=pr["base"]["repository"],
+                base_ref=pr["base"]["ref"],
+                base_sha=pr["base"]["sha"],
+                head_repository=pr["head"]["repository"],
+                head_ref=pr["head"]["ref"],
+                head_sha=pr["head_sha"],
+                cross_repository=pr["cross_repository"],
+            ),
+            policy=fixture["policy"],
+            task_id=fixture["task"]["id"],
+            task_url=fixture["task"]["url"],
+            task_state=fixture["task"]["state"],
+            task_base_ref=fixture["task"]["base_ref"],
+            task_base_sha=fixture["task"]["base_sha"],
+            generated_branch=fixture["generated"]["branch"],
+            generated_head=fixture["generated"]["head_sha"],
+            cloud_commits=fixture["generated"]["commits"],
+            application_status="not_applicable",
+            final_local_head=self.identity["head"],
+            structural_complete=True,
+            candidate_manifest=fixture["candidate"],
+            completion_evidence=fixture["completion"],
+            status="success",
+        )
+
+        result = envelope.as_dict()
+        remote = MODULE.validate_success_result(
+            result,
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+            identity=self.identity,
+        )
+
+        self.assertEqual(
+            {
+                "status": "not_applicable",
+                "final_local_head": self.identity["head"],
+            },
+            result["application"],
+        )
+        self.assertEqual(
+            [
+                MODULE.AGENT_TASK_OUTPUT_BODY,
+                MODULE.AGENT_TASK_OUTPUT_TITLE,
+            ],
+            remote["output_paths"],
+        )
+
     def test_title_and_body_only_outputs_derive_keep_and_replace(self):
         remote = self.remote()
         keep = MODULE.recommendation_from_outputs(
@@ -3438,6 +3515,9 @@ class RecommendationContractTest(unittest.TestCase):
             ].update(parent_sha="d" * 40),
             "completion ref": lambda value: value["completion"]["refs"].update(
                 generated="other/ref"
+            ),
+            "application status": lambda value: value["application"].update(
+                status="not_applied"
             ),
         }
         for label, mutate in mutations.items():

@@ -1385,6 +1385,133 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         return result
 
+    def candidate_metadata(self, sha, parent, paths):
+        return {
+            "sha": sha,
+            "parent_sha": parent,
+            "tree_sha": "a" * 40,
+            "patch_sha256": "b" * 64,
+            "changed_paths": paths,
+        }
+
+    def candidate_result(self, *, commits=None, changed_paths=None):
+        commits = [] if commits is None else commits
+        paths = changed_paths or ["src/app.py"]
+        parent = self.head
+        commit_metadata = []
+        for commit in commits:
+            commit_metadata.append(
+                self.candidate_metadata(commit, parent, paths)
+            )
+            parent = commit
+        return {
+            "schema": MODULE.CANDIDATE_AGENT_TASK_RESULT_SCHEMA,
+            "status": "success",
+            "mode": "code_candidate",
+            "repository": {"name_with_owner": "owner/repo"},
+            "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
+            "requested_model": "gpt-5.6-sol",
+            "policy": {
+                "id": "marketplace-agent-code-candidate-worker",
+                "version": 1,
+                "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
+            },
+            "task": {
+                "id": "task-1",
+                "url": "https://github.com/owner/repo/agent-tasks/task-1",
+                "state": "completed",
+                "base_ref": "feature",
+                "base_sha": self.head,
+            },
+            "generated": {
+                "branch": "copilot/candidate",
+                "head_sha": parent,
+                "commits": commits,
+            },
+            "application": {
+                "status": "not_applied",
+                "final_local_head": self.head,
+            },
+            "report": None,
+            "candidate": {
+                "schema": MODULE.AGENT_TASK_CANDIDATE_MANIFEST_SCHEMA,
+                "repository": {"name_with_owner": "owner/repo"},
+                "task": {"id": "task-1", "session_id": "session-1"},
+                "base": {"ref": "feature", "sha": self.head},
+                "generated": {
+                    "ref": "copilot/candidate",
+                    "head_sha": parent,
+                    "code_tip_sha": parent,
+                },
+                "code_commits": commit_metadata,
+                "artifact_commit": None,
+            },
+            "completion": {
+                "request": {
+                    "requested_model": "gpt-5.6-sol",
+                    "prompt_sha256": "c" * 64,
+                },
+                "task": {
+                    "id": "task-1",
+                    "state": "completed",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:01:00Z",
+                    "completed_at": "2026-01-01T00:01:00Z",
+                    "raw_response_sha256": "d" * 64,
+                },
+                "session": {
+                    "id": "session-1",
+                    "state": "completed",
+                    "actual_model": "gpt-5.6-sol",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:01:00Z",
+                    "completed_at": "2026-01-01T00:01:00Z",
+                    "prompt_sha256": "c" * 64,
+                },
+                "repository": {
+                    "name_with_owner": "owner/repo",
+                    "id": 1,
+                    "owner": {"login": "owner", "id": 2},
+                },
+                "refs": {
+                    "base": "feature",
+                    "generated": "copilot/candidate",
+                },
+            },
+            "attestation": {
+                "kind": "dispatcher_candidate",
+                "structural_complete": True,
+            },
+            "error": None,
+        }
+
+    def candidate_creation_failure(self):
+        failure = self.candidate_result()
+        failure.update(
+            {
+                "status": "error",
+                "task": {
+                    "id": None,
+                    "url": None,
+                    "state": None,
+                    "base_ref": None,
+                    "base_sha": None,
+                },
+                "generated": {"branch": None, "head_sha": None, "commits": []},
+                "candidate": None,
+                "completion": None,
+                "attestation": {
+                    "kind": "dispatcher_candidate",
+                    "structural_complete": False,
+                },
+                "error": {
+                    "code": "api_failure",
+                    "message": "start Agent Task failed",
+                },
+            }
+        )
+        return failure
+
     def legacy_malformed_owner_state(self, state_path):
         request_id = "legacy-request-1"
         generated_head = "3" * 40
@@ -1484,7 +1611,27 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         MODULE.save_state(state_path, state)
         return state, result, prompt_path, result_path
 
-    def test_taskless_api_failure_keeps_its_trusted_error(self):
+    def test_candidate_taskless_failure_keeps_its_trusted_error(self):
+        candidate = self.candidate_creation_failure()
+        candidate_error = MODULE.validate_candidate_task_creation_failure_result(
+            candidate,
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+        )
+        self.assertEqual("api_failure", candidate_error["code"])
+        malformed_candidate = copy.deepcopy(candidate)
+        malformed_candidate["completion"] = {}
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "malformed or mismatched identity",
+        ):
+            MODULE.validate_candidate_task_creation_failure_result(
+                malformed_candidate,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+            )
+
+    def test_legacy_taskless_failure_remains_parseable_for_audit(self):
         failure = self.result()
         failure.update(
             {
@@ -1542,38 +1689,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         state_path = self.directory / "cca-disabled-state.json"
         helper = self.directory / "cloud_task.py"
         helper.write_text("# helper\n", encoding="utf-8")
-        failure = self.semantic_result(payload={})
-        failure.update(
-            {
-                "status": "error",
-                "task": {
-                    "id": None,
-                    "url": None,
-                    "state": None,
-                    "base_ref": None,
-                    "base_sha": None,
-                },
-                "generated": {"branch": None, "head_sha": None, "commits": []},
-                "application": {
-                    "status": "not_applied",
-                    "final_local_head": self.head,
-                },
-                "report": None,
-                "semantic_output": None,
-                "attestation": {
-                    "kind": "dispatcher_semantic",
-                    "structural_complete": False,
-                },
-                "error": {
-                    "code": "api_failure",
-                    "message": (
-                        "start Agent Task failed with HTTP 409: "
-                        "user or repo does not have CCA enabled; "
-                        "the request cannot be completed"
-                    ),
-                },
-            }
-        )
+        failure = self.candidate_creation_failure()
         commands = []
 
         def helper_run(command, **_kwargs):
@@ -1618,8 +1734,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             for _ in range(2):
                 with self.assertRaisesRegex(
                     MODULE.WorkflowError,
-                    "start Agent Task failed with HTTP 409: "
-                    "user or repo does not have CCA enabled",
+                    r"Agent Task failed \[api_failure\]: start Agent Task failed",
                 ):
                     MODULE.command_agent_task(args)
 
@@ -1643,6 +1758,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         self.assertIsNone(task["report"])
         self.assertIsNone(task["semantic_output"])
+        self.assertIsNone(task["candidate"])
+        self.assertIsNone(task["completion"])
         self.assertEqual("not_created", task["task_id_status"])
         self.assertNotIn("recovery_command", task)
         self.assertNotIn("retry_command", task)
@@ -1651,6 +1768,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual("run-2", task["run_id"])
         self.assertTrue(
             all("--apply-with-report" in command for command in commands)
+        )
+        self.assertTrue(
+            all(
+                command[command.index("--policy") + 1]
+                == MODULE.AGENT_TASK_POLICY
+                for command in commands
+            )
         )
         self.assertTrue(all("--resume" not in command for command in commands))
 
@@ -2118,7 +2242,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn(MODULE.AGENT_TASK_OUTPUT_REPORT, prompt)
         self.assertIn("report is advisory and may be absent", prompt)
         self.assertNotIn("commit_index", prompt)
-        self.assertNotIn("changed-path claims", prompt)
+        pinned_data = prompt.split("Pinned preflight data follows.", 1)[1]
+        self.assertNotIn("changed_paths", pinned_data)
         self.assertNotIn("{{MARKETPLACE_SEMANTIC_PATH}}", prompt)
         self.assertNotIn('"request_id":', prompt)
         self.assertIn("maximum_review_iterations", prompt)
@@ -3916,9 +4041,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         state_path = self.directory / "state.json"
         helper = self.directory / "cloud_task.py"
         helper.write_text("# helper\n", encoding="utf-8")
-        report = self.report()
-        result = self.result()
-        result["report"]["sha256"] = MODULE.sha256_text(report)
+        result = self.candidate_result()
         commands = []
         emitted = []
 
@@ -3959,13 +4082,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ),
             mock.patch.object(
                 MODULE,
-                "validate_generated_history",
+                "validate_candidate_history",
                 return_value={},
-            ),
-            mock.patch.object(
-                MODULE,
-                "fetch_committed_text",
-                side_effect=[report, self.receipt()],
             ),
             mock.patch.object(
                 MODULE,
@@ -3983,7 +4101,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             MODULE.command_agent_task(arguments)
 
         self.assertIn("--apply-with-report", commands[0])
-        self.assertNotIn("--report", commands[0])
+        self.assertEqual(
+            MODULE.AGENT_TASK_POLICY,
+            commands[0][commands[0].index("--policy") + 1],
+        )
         self.assertEqual(emitted[0]["result"], "nothing_to_publish")
         self.assertEqual(emitted[0]["stage_outcome"], "cleared")
         state = MODULE.load_state(state_path)
@@ -5270,25 +5391,15 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     "owner/repo", "1" * 40, "2" * 40
                 )
 
-    def test_recovery_accepts_a_push_that_already_reached_the_verified_head(self):
+    def test_current_candidate_accepts_push_already_at_verified_head(self):
         state_path = self.directory / "push-recovery-state.json"
         helper = self.directory / "cloud_task.py"
         helper.write_text("# helper\n", encoding="utf-8")
         fix = "5" * 40
-        finding = {
-            "id": "finding-1",
-            "title": "Fix the bug",
-            "path": "src/app.py",
-            "line": 7,
-            "side": "RIGHT",
-            "body": "The changed branch returns the wrong value.",
-            "disposition": "fixed",
-            "reason": "The focused test demonstrates the failure.",
-            "commit": fix,
-        }
-        report = self.report(commits=[fix], findings=[finding])
-        result = self.result(commits=[fix])
-        result["report"]["sha256"] = MODULE.sha256_text(report)
+        result = self.candidate_result(
+            commits=[fix],
+            changed_paths=["src/app.py"],
+        )
         live = {**self.preflight["pr"], "head_sha": fix}
         commands = []
 
@@ -5332,13 +5443,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ),
             mock.patch.object(
                 MODULE,
-                "validate_generated_history",
+                "validate_candidate_history",
                 return_value={fix: ["src/app.py"]},
             ),
             mock.patch.object(
                 MODULE,
-                "fetch_committed_text",
-                side_effect=[report, self.receipt()],
+                "apply_verified_candidate_import",
+                return_value=False,
             ),
             mock.patch.object(MODULE, "metadata_for", return_value=live),
             mock.patch.object(MODULE, "remote_head", return_value=fix),

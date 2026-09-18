@@ -699,10 +699,17 @@ class StageContractTest(unittest.TestCase):
     def test_ci_stage_runs_the_coordinator_directly_with_exact_state(self):
         entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CI]
         expected = MODULE.stage_state_path(entry, target(), "run-1")
-        with mock.patch.object(
-            MODULE.common,
-            "stage_script_path",
-            return_value=Path("installed-ci-fix-loop.py"),
+        with (
+            mock.patch.object(
+                MODULE.common,
+                "stage_script_path",
+                return_value=Path("installed-ci-fix-loop.py"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "stage_accepts_pipeline_position",
+                return_value=True,
+            ),
         ):
             command = MODULE.stage_command(
                 entry,

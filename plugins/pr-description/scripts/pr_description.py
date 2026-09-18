@@ -1933,7 +1933,7 @@ def validate_result_identity(
         or result.get("report") is not None
         or not isinstance(application, dict)
         or application
-        != {"status": "not_applied", "final_local_head": identity["head"]}
+        != {"status": "not_applicable", "final_local_head": identity["head"]}
     ):
         raise WorkflowError(
             "Agent Task recommendation policy, repository, pull request, model, "
