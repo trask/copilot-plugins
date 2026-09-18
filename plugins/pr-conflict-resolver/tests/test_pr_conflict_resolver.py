@@ -886,8 +886,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
                 "outcomes": [
                     {
                         "command": "python -m unittest",
-                        "status": "passed",
-                        "detail": "all tests passed",
+                        "result": "passed",
                     }
                 ],
             },
@@ -896,13 +895,13 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "d42bea53150d299bab98f0f350f2a05ed24a239a1955fc64e93da752f1f36f45",
+            "3350924ecdf54c61ad67fe9f38d529f2b6dcfd8ffc1ea19dcfb6acfab5bf6756",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
-            "45cf90107f6297a8110a0527ad1f2e80cd02b4b12f71dbfe1fd0a5b48d54a7bb",
+            "ee463e9fc5054c62547ea453346fa870a9674ed9f36a60b56497a47fb76770dd",
         )
-        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@3")
+        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@4")
         self.assertEqual(
             MODULE.CONFLICT_REQUEST_SCHEMA["id"],
             "github.copilot.agent-task-conflict-request",
@@ -2316,12 +2315,12 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_rejects_malformed_or_failed_validation(self):
         bad_values = [
             [],
-            [{"command": "test", "status": "failed", "detail": "bad"}],
-            [{"command": "", "status": "passed", "detail": "ok"}],
+            [{"command": "test", "result": "failed"}],
+            [{"command": "", "result": "passed"}],
             [
                 {
                     "command": "test",
-                    "status": "passed",
+                    "result": "passed",
                     "detail": "token=super-secret-value",
                 }
             ],
@@ -3972,19 +3971,14 @@ class ManagedTaskPromptTest(unittest.TestCase):
         code_tip = "c4547b279abbd7957325f8d3192dc2c458cd71a1"
         content = json.dumps(
             {
-                "schema": CLOUD_MODULE.SEMANTIC_SCHEMA,
-                "kind": "conflict-resolution",
-                "payload": {
-                    "summary": "Resolved the frozen merge conflict.",
-                    "commit_annotations": [[]],
-                    "validation": [
-                        {
-                            "command": "git diff --check",
-                            "status": "passed",
-                            "detail": "clean",
-                        }
-                    ],
-                },
+                "summary": "Resolved the frozen merge conflict.",
+                "commit_annotations": [[]],
+                "validation": [
+                    {
+                        "command": "git diff --check",
+                        "result": "passed",
+                    }
+                ],
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -4044,7 +4038,7 @@ class ManagedTaskPromptTest(unittest.TestCase):
         request = self.request()
         prompt = CLOUD_MODULE.policy_prompt(self.options(request))
 
-        self.assertIn("Policy: marketplace-conflict-worker@3", prompt)
+        self.assertIn("Policy: marketplace-conflict-worker@4", prompt)
         self.assertNotIn(
             CLOUD_MODULE.assigned_code_ref(request["request_id"], "code"),
             prompt,
@@ -4052,7 +4046,8 @@ class ManagedTaskPromptTest(unittest.TestCase):
         self.assertIn("Do not publish a duplicate code branch", prompt)
         self.assertIn("verified sole parent", prompt)
         self.assertIn("derives every SHA", prompt)
-        self.assertIn('"kind": "conflict-resolution"', prompt)
+        self.assertIn("dispatcher adds the semantic schema and kind", prompt)
+        self.assertIn('"result": "passed"', prompt)
         self.assertIn("Do not include SHAs, refs, roles, request identity", prompt)
         self.assertNotIn("Compact required receipt contract", prompt)
 
@@ -4128,7 +4123,9 @@ class ManagedTaskPromptTest(unittest.TestCase):
             code_refs,
         )
         self.assertEqual(semantic_head, artifact["head_sha"])
-        self.assertEqual("passed", validations[0]["status"])
+        self.assertEqual(CLOUD_MODULE.SEMANTIC_SCHEMA, artifact["semantic"]["schema"])
+        self.assertEqual("conflict-resolution", artifact["semantic"]["kind"])
+        self.assertEqual("passed", validations[0]["result"])
         git.assert_called_once_with(
             mock.sentinel.runner,
             snapshot.root,
@@ -4263,6 +4260,223 @@ class ManagedTaskPromptTest(unittest.TestCase):
                 task,
             )
 
+    def test_16161_policy_3_wrapper_is_not_promoted_into_policy_4(self):
+        request, task, _, semantic_head, code_tip, _, snapshot = (
+            self.single_role_evidence()
+        )
+        content = json.dumps(
+            {
+                "kind": "conflict-resolution",
+                "payload": {
+                    "commit_annotations": [
+                        [
+                            {
+                                "companion_paths": [],
+                                "conflict_paths": ["CHANGELOG.md"],
+                                "rationale": (
+                                    "Retained the gRPC API migration guidance from "
+                                    "the head alongside the Elasticsearch, selector "
+                                    "configuration, and query-capture deprecations "
+                                    "from the base so neither history's release "
+                                    "guidance was lost."
+                                ),
+                            }
+                        ]
+                    ],
+                    "summary": (
+                        "Merged the histories and preserved both sets of "
+                        "changelog deprecation guidance."
+                    ),
+                    "validation": [
+                        {
+                            "command": (
+                                "GitHub Actions Gradle wrapper validation"
+                            ),
+                            "result": "passed",
+                        },
+                        {
+                            "command": (
+                                "CodeQL analysis for Actions and Python"
+                            ),
+                            "result": "passed",
+                        },
+                    ],
+                },
+            },
+            separators=(",", ":"),
+        )
+        with (
+            mock.patch.object(
+                CLOUD_MODULE,
+                "fetch_quarantined",
+                return_value=("refs/quarantine/artifact", semantic_head),
+            ),
+            mock.patch.object(CLOUD_MODULE, "parents", return_value=[code_tip]),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "changed_paths",
+                return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
+            ),
+            mock.patch.object(CLOUD_MODULE, "git_show_file", return_value=content),
+            self.assertRaisesRegex(
+                CLOUD_MODULE.ConflictError,
+                "semantic output has an unsupported shape",
+            ),
+        ):
+            CLOUD_MODULE.prove_generated_semantic(
+                mock.sentinel.runner,
+                snapshot,
+                request,
+                task,
+            )
+
+    def test_16161_policy_4_accepts_the_exact_minimal_payload(self):
+        request, _, _, semantic_head, code_tip, _, snapshot = (
+            self.single_role_evidence()
+        )
+        content = json.dumps(
+            {
+                "summary": (
+                    "Merged the histories and preserved both sets of "
+                    "changelog deprecation guidance."
+                ),
+                "commit_annotations": [
+                    [
+                        {
+                            "companion_paths": [],
+                            "conflict_paths": ["CHANGELOG.md"],
+                            "rationale": (
+                                "Retained the gRPC API migration guidance from "
+                                "the head alongside the Elasticsearch, selector "
+                                "configuration, and query-capture deprecations "
+                                "from the base so neither history's release "
+                                "guidance was lost."
+                            ),
+                        }
+                    ]
+                ],
+                "validation": [
+                    {
+                        "command": "GitHub Actions Gradle wrapper validation",
+                        "result": "passed",
+                    },
+                    {
+                        "command": "CodeQL analysis for Actions and Python",
+                        "result": "passed",
+                    },
+                ],
+            },
+            separators=(",", ":"),
+        )
+        with (
+            mock.patch.object(CLOUD_MODULE, "parents", return_value=[code_tip]),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "changed_paths",
+                return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
+            ),
+            mock.patch.object(CLOUD_MODULE, "git_show_file", return_value=content),
+        ):
+            summary, annotations, validations, digest = (
+                CLOUD_MODULE.validate_semantic_artifact(
+                    mock.sentinel.runner,
+                    snapshot,
+                    request,
+                    CLOUD_MODULE.RemoteRef(
+                        "artifact",
+                        None,
+                        request["repository"],
+                        "copilot/conflict-fix-loop-worker-v2-another-one",
+                    ),
+                    semantic_head,
+                    code_tip,
+                )
+            )
+
+        self.assertIn("preserved both sets", summary)
+        self.assertEqual(["CHANGELOG.md"], annotations[0][0]["conflict_paths"])
+        self.assertEqual(
+            [
+                {
+                    "command": "GitHub Actions Gradle wrapper validation",
+                    "result": "passed",
+                },
+                {
+                    "command": "CodeQL analysis for Actions and Python",
+                    "result": "passed",
+                },
+            ],
+            validations,
+        )
+        self.assertEqual(
+            hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            digest,
+        )
+
+    def test_policy_4_never_invents_missing_validation_evidence(self):
+        invalid = [
+            [{"command": "git diff --check"}],
+            [{"result": "passed"}],
+            [{"command": "git diff --check", "result": "failed"}],
+            [
+                {
+                    "command": "git diff --check",
+                    "result": "passed",
+                    "status": "passed",
+                }
+            ],
+            [
+                {
+                    "command": "git diff --check",
+                    "result": "passed",
+                    "detail": "clean",
+                }
+            ],
+        ]
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaisesRegex(
+                CLOUD_MODULE.ConflictError,
+                "validation",
+            ):
+                CLOUD_MODULE.validate_semantic_validations(value)
+
+    def test_policy_4_rejects_identity_fields_in_the_minimal_payload(self):
+        request, _, _, semantic_head, code_tip, content, snapshot = (
+            self.single_role_evidence()
+        )
+        value = json.loads(content)
+        value["request_id"] = request["request_id"]
+        with (
+            mock.patch.object(CLOUD_MODULE, "parents", return_value=[code_tip]),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "changed_paths",
+                return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
+            ),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "git_show_file",
+                return_value=json.dumps(value),
+            ),
+            self.assertRaisesRegex(
+                CLOUD_MODULE.ConflictError,
+                "semantic output has an unsupported shape",
+            ),
+        ):
+            CLOUD_MODULE.validate_semantic_artifact(
+                mock.sentinel.runner,
+                snapshot,
+                request,
+                CLOUD_MODULE.RemoteRef(
+                    "artifact",
+                    None,
+                    request["repository"],
+                    "copilot/conflict-fix-loop-worker-v2-another-one",
+                ),
+                semantic_head,
+                code_tip,
+            )
+
     def test_single_role_rejects_unrelated_task_session_branch(self):
         request, task, _, _, _, _, _ = self.single_role_evidence()
         task["sessions"][0]["head_ref"] = "copilot/unrelated-task"
@@ -4336,8 +4550,7 @@ class ManagedTaskPromptTest(unittest.TestCase):
         validations = [
             {
                 "command": "git diff --check",
-                "status": "passed",
-                "detail": "clean",
+                "result": "passed",
             }
         ]
 
@@ -4351,6 +4564,7 @@ class ManagedTaskPromptTest(unittest.TestCase):
         self.assertIn(request["request_id"], report)
         self.assertIn(request["request_sha256"], report)
         self.assertEqual(receipt["request"]["id"], request["request_id"])
+        self.assertEqual(receipt["schema"], CLOUD_MODULE.RECEIPT_SCHEMA)
         self.assertEqual(receipt["policy"], CLOUD_MODULE.POLICY)
         self.assertEqual(receipt["generated_refs"][0]["ref"], code_ref)
         self.assertEqual(receipt["validation"], validations)
@@ -5236,6 +5450,10 @@ class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertEqual("success", result.status)
         self.assertEqual("no_changes", result.application_status)
+        self.assertEqual(
+            [{"command": "local-history-proof", "result": "passed"}],
+            result.validations,
+        )
         self.assertEqual("owner/repo", result.repository)
 
     def test_task_creation_failure_keeps_all_task_identity_null(self):

@@ -2240,6 +2240,8 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertIn("reaches a recorded limit does not block", text)
         self.assertIn("block the pipeline instead of starting a duplicate worker", text)
         self.assertIn("Run `start` synchronously exactly once", text)
+        self.assertIn("`next_watch.arguments`", text)
+        self.assertIn("never add or reconstruct a positional target", text)
         self.assertIn("--wait-seconds 300", text)
         self.assertIn("no more than one per five minutes", text)
         self.assertIn("Never end your turn", text)
@@ -2247,13 +2249,17 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertIn("Waiting: <wait_reason>.", text)
         self.assertIn("Next: <next_action>.", text)
         self.assertIn("Do not send these updates to the PR Flight canvas", text)
-        self.assertIn("If `updates` is empty, call `watch` again", text)
+        self.assertIn(
+            "If `updates` is empty, invoke the returned `next_watch.arguments` again",
+            text,
+        )
         self.assertIn("`final_event`", text)
         watch_lines = [
             line for line in text.splitlines() if "pr_pipeline.py" in line and " watch " in line
         ]
         self.assertTrue(any("copilot_home=" in line for line in watch_lines))
         self.assertTrue(any("$copilotHome =" in line for line in watch_lines))
+        self.assertTrue(all("<owner/repo#number>" not in line for line in watch_lines))
         self.assertIn("A clean run that pushed no commits", text)
         self.assertIn("Do not organize the response by sweep", text)
         self.assertNotIn("### Sweep 1", text)
@@ -2350,9 +2356,32 @@ class CommandOutputTest(unittest.TestCase):
         self.assertEqual(1, result)
         event = json.loads(output.getvalue())
         self.assertEqual(MODULE.PROGRESS_UPDATE_EVENT, event["event"])
-        self.assertFalse(event["finished"])
+        self.assertTrue(event["finished"])
         self.assertIn("run-id", event["monitor_failure"])
+        self.assertEqual("invalid", event["run_id"])
+        self.assertEqual(0, event["cursor"])
+        self.assertNotIn("next_watch", event)
         self.assertNotEqual("pipeline_finished", event["event"])
+
+    def test_watch_without_a_run_id_returns_one_terminal_json_event(self):
+        output = StringIO()
+        with (
+            mock.patch.object(
+                __import__("sys"),
+                "argv",
+                ["pr_pipeline.py", "watch"],
+            ),
+            redirect_stdout(output),
+        ):
+            result = MODULE.main()
+
+        self.assertEqual(1, result)
+        event = json.loads(output.getvalue())
+        self.assertEqual(MODULE.PROGRESS_UPDATE_EVENT, event["event"])
+        self.assertTrue(event["finished"])
+        self.assertEqual("watch requires --run-id", event["monitor_failure"])
+        self.assertIsNone(event["run_id"])
+        self.assertNotIn("next_watch", event)
 
 
 class ProgressProtocolTest(unittest.TestCase):
@@ -2500,6 +2529,13 @@ class ProgressProtocolTest(unittest.TestCase):
             / ("a" * 32)
             / "launch.json"
         )
+        locator = MODULE.common.read_json(
+            self.root
+            / "run"
+            / MODULE.RUN_KIND
+            / "monitors"
+            / f"{'a' * 32}.json"
+        )
         event = json.loads(output.getvalue())
         self.assertEqual(4321, launch["pid"])
         self.assertEqual("a" * 32, launch["run_id"])
@@ -2507,6 +2543,323 @@ class ProgressProtocolTest(unittest.TestCase):
         self.assertEqual("pipeline_launched", event["event"])
         self.assertEqual("owner/repo#7", event["target"])
         self.assertEqual("merge", event["conflict_strategy"])
+        self.assertEqual(MODULE.MONITOR_SCHEMA, locator["schema"])
+        self.assertEqual(MODULE.MONITOR_VERSION, locator["version"])
+        self.assertEqual(
+            {"owner": "owner", "repo": "repo", "number": 7},
+            locator["target"],
+        )
+        self.assertEqual(
+            [
+                "watch",
+                "--run-id",
+                "a" * 32,
+                "--cursor",
+                "0",
+                "--wait-seconds",
+                "300",
+            ],
+            event["next_watch"]["arguments"],
+        )
+        self.assertNotIn("owner/repo#7", event["next_watch"]["arguments"])
+
+    def write_monitor_run(
+        self,
+        run_id: str,
+        *,
+        selected: dict | None = None,
+        launch_run_id: str | None = None,
+    ) -> dict:
+        selected = selected or target()
+        launch = {
+            "kind": MODULE.RUN_KIND,
+            "run_id": launch_run_id or run_id,
+            "target": selected,
+            "pid": 4321,
+            "event_log": str(MODULE.progress_log_path(selected, run_id)),
+            "started_at": "2026-09-17T00:00:00Z",
+            "started_at_epoch": 1.0,
+            "conflict_strategy": "auto",
+            "github_mutation_policy": "source-only",
+        }
+        MODULE.common.write_json_atomically(
+            MODULE.launch_state_path(selected, run_id), launch
+        )
+        MODULE.common.write_json_atomically(
+            MODULE.monitor_locator_path(run_id),
+            MODULE.monitor_locator(selected, run_id),
+        )
+        return selected
+
+    def test_watch_uses_the_start_bound_target_without_a_positional_target(self):
+        run_id = "a" * 32
+        args = MODULE.build_parser().parse_args(
+            [
+                "watch",
+                "--run-id",
+                run_id,
+                "--cursor",
+                "4",
+                "--wait-seconds",
+                "1",
+            ]
+        )
+        output = StringIO()
+        with (
+            mock.patch.object(MODULE, "copilot_home", return_value=self.root),
+            mock.patch.object(
+                MODULE.common,
+                "watch_progress",
+                return_value={
+                    "event": MODULE.PROGRESS_UPDATE_EVENT,
+                    "cursor": 5,
+                    "updates": [],
+                    "finished": False,
+                },
+            ) as watch,
+            redirect_stdout(output),
+        ):
+            self.write_monitor_run(run_id)
+            MODULE.command_watch(args)
+
+        run_directory = (
+            self.root
+            / "run"
+            / MODULE.RUN_KIND
+            / MODULE.run_slug(target())
+            / run_id
+        )
+        watch.assert_called_once_with(
+            event_log=run_directory / "progress.jsonl",
+            launch_path=run_directory / "launch.json",
+            observer_path=run_directory / "observer.json",
+            cursor=4,
+            wait_seconds=1.0,
+        )
+        event = json.loads(output.getvalue())
+        self.assertEqual("owner/repo#7", event["target"])
+        self.assertEqual(run_id, event["run_id"])
+        self.assertEqual(
+            [
+                "watch",
+                "--run-id",
+                run_id,
+                "--cursor",
+                "5",
+                "--wait-seconds",
+                "300",
+            ],
+            event["next_watch"]["arguments"],
+        )
+
+    def test_watch_does_not_fall_back_to_another_or_latest_run(self):
+        requested = "a" * 32
+        decoy = "b" * 32
+        args = MODULE.build_parser().parse_args(
+            ["watch", "--run-id", requested]
+        )
+        with (
+            mock.patch.object(MODULE, "copilot_home", return_value=self.root),
+            mock.patch.object(MODULE.common, "watch_progress") as watch,
+        ):
+            self.write_monitor_run(decoy)
+            latest = self.root / "run" / MODULE.RUN_KIND / "latest.json"
+            MODULE.common.write_json_atomically(
+                latest,
+                {"run_id": decoy, "target": MODULE.target_identity(target())},
+            )
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                f"monitor handle does not exist for run {requested}",
+            ):
+                MODULE.command_watch(args)
+
+        watch.assert_not_called()
+
+    def test_watch_rejects_a_malformed_monitor_locator(self):
+        run_id = "a" * 32
+        args = MODULE.build_parser().parse_args(
+            ["watch", "--run-id", run_id]
+        )
+        with (
+            mock.patch.object(MODULE, "copilot_home", return_value=self.root),
+            mock.patch.object(MODULE.common, "watch_progress") as watch,
+        ):
+            self.write_monitor_run(run_id)
+            locator = MODULE.monitor_locator(target(), run_id)
+            locator["launch_path"] = str(
+                MODULE.launch_state_path(target(), "b" * 32)
+            )
+            MODULE.common.write_json_atomically(
+                MODULE.monitor_locator_path(run_id), locator
+            )
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                f"monitor handle paths are invalid for run {run_id}",
+            ):
+                MODULE.command_watch(args)
+
+        watch.assert_not_called()
+
+    def test_watch_rejects_a_monitor_target_that_escapes_the_run_root(self):
+        run_id = "a" * 32
+        args = MODULE.build_parser().parse_args(
+            ["watch", "--run-id", run_id]
+        )
+        with (
+            mock.patch.object(MODULE, "copilot_home", return_value=self.root),
+            mock.patch.object(MODULE.common, "watch_progress") as watch,
+        ):
+            locator = MODULE.monitor_locator(target(), run_id)
+            locator["target"]["owner"] = "..\\..\\outside"
+            MODULE.common.write_json_atomically(
+                MODULE.monitor_locator_path(run_id), locator
+            )
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "invalid owner path identity",
+            ):
+                MODULE.command_watch(args)
+
+        watch.assert_not_called()
+
+    def test_watch_rejects_a_target_that_disagrees_with_the_handle(self):
+        run_id = "a" * 32
+        args = MODULE.build_parser().parse_args(
+            ["watch", "owner/repo#8", "--run-id", run_id]
+        )
+        with (
+            mock.patch.object(MODULE, "copilot_home", return_value=self.root),
+            mock.patch.object(MODULE.common, "watch_progress") as watch,
+        ):
+            self.write_monitor_run(run_id)
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                f"watch target does not match monitor handle for run {run_id}",
+            ):
+                MODULE.command_watch(args)
+
+        watch.assert_not_called()
+
+    def test_watch_rejects_a_launch_record_from_another_run(self):
+        run_id = "a" * 32
+        args = MODULE.build_parser().parse_args(
+            ["watch", "--run-id", run_id]
+        )
+        with (
+            mock.patch.object(MODULE, "copilot_home", return_value=self.root),
+            mock.patch.object(MODULE.common, "watch_progress") as watch,
+        ):
+            self.write_monitor_run(run_id, launch_run_id="b" * 32)
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                f"launch record identity is invalid for run {run_id}",
+            ):
+                MODULE.command_watch(args)
+
+        watch.assert_not_called()
+
+    def test_legacy_watch_requires_an_explicit_exact_target(self):
+        run_id = "a" * 32
+        args = MODULE.build_parser().parse_args(
+            ["watch", "owner/repo#7", "--run-id", run_id]
+        )
+        output = StringIO()
+        with (
+            mock.patch.object(MODULE, "copilot_home", return_value=self.root),
+            mock.patch.object(
+                MODULE.common,
+                "watch_progress",
+                return_value={
+                    "event": MODULE.PROGRESS_UPDATE_EVENT,
+                    "cursor": 1,
+                    "updates": [],
+                    "finished": False,
+                },
+            ) as watch,
+            redirect_stdout(output),
+        ):
+            selected = target()
+            MODULE.common.write_json_atomically(
+                MODULE.launch_state_path(selected, run_id),
+                {
+                    "kind": MODULE.RUN_KIND,
+                    "run_id": run_id,
+                    "target": selected,
+                    "pid": 4321,
+                    "event_log": str(MODULE.progress_log_path(selected, run_id)),
+                },
+            )
+            MODULE.command_watch(args)
+
+        watch.assert_called_once()
+        event = json.loads(output.getvalue())
+        self.assertEqual(
+            [
+                "watch",
+                "owner/repo#7",
+                "--run-id",
+                run_id,
+                "--cursor",
+                "1",
+                "--wait-seconds",
+                "300",
+            ],
+            event["next_watch"]["arguments"],
+        )
+        replay = MODULE.build_parser().parse_args(
+            event["next_watch"]["arguments"]
+        )
+        self.assertEqual("owner/repo#7", replay.target)
+        self.assertEqual(run_id, replay.run_id)
+
+    def test_terminal_watch_response_has_no_next_command(self):
+        payload = MODULE.bind_next_watch(
+            {
+                "event": MODULE.PROGRESS_UPDATE_EVENT,
+                "cursor": 3,
+                "updates": [],
+                "finished": True,
+            },
+            target=target(),
+            run_id="a" * 32,
+            legacy_target=False,
+        )
+
+        self.assertNotIn("next_watch", payload)
+
+    def test_failed_start_does_not_publish_a_monitor_handle(self):
+        args = MODULE.build_parser().parse_args(
+            ["start", "owner/repo#7"]
+        )
+        process_error = OSError("could not start scheduler")
+        with (
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.root),
+            mock.patch.object(MODULE, "resolve_target", return_value=target()),
+            mock.patch.object(MODULE, "copilot_home", return_value=self.root),
+            mock.patch.object(
+                MODULE.common,
+                "start_detached",
+                side_effect=process_error,
+            ),
+            mock.patch.object(
+                MODULE.uuid,
+                "uuid4",
+                return_value=mock.Mock(hex="a" * 32),
+            ),
+        ):
+            with self.assertRaisesRegex(OSError, "could not start scheduler"):
+                MODULE.command_start(args)
+
+        self.assertFalse(
+            (
+                self.root
+                / "run"
+                / MODULE.RUN_KIND
+                / "monitors"
+                / f"{'a' * 32}.json"
+            ).exists()
+        )
 
 
 class ParserTest(unittest.TestCase):
@@ -2538,11 +2891,10 @@ class ParserTest(unittest.TestCase):
 
         self.assertEqual("merge", args.conflict_strategy)
 
-    def test_watch_accepts_the_canonical_target_cursor_and_bounded_wait(self):
+    def test_watch_accepts_the_monitor_handle_without_a_target(self):
         args = MODULE.build_parser().parse_args(
             [
                 "watch",
-                "owner/repo#7",
                 "--run-id",
                 "a" * 32,
                 "--cursor",
@@ -2551,7 +2903,8 @@ class ParserTest(unittest.TestCase):
                 "300",
             ]
         )
-        self.assertEqual("owner/repo#7", args.target)
+        self.assertIsNone(args.target)
+        self.assertEqual("a" * 32, args.run_id)
         self.assertEqual(4, args.cursor)
         self.assertEqual(300, args.wait_seconds)
 

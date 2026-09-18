@@ -72,16 +72,16 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "d42bea53150d299bab98f0f350f2a05ed24a239a1955fc64e93da752f1f36f45"
+    "3350924ecdf54c61ad67fe9f38d529f2b6dcfd8ffc1ea19dcfb6acfab5bf6756"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
-CONFLICT_POLICY = "marketplace-conflict-worker@3"
+CONFLICT_POLICY = "marketplace-conflict-worker@4"
 CONFLICT_POLICY_SHA256 = (
-    "45cf90107f6297a8110a0527ad1f2e80cd02b4b12f71dbfe1fd0a5b48d54a7bb"
+    "ee463e9fc5054c62547ea453346fa870a9674ed9f36a60b56497a47fb76770dd"
 )
 CONFLICT_POLICY_IDENTITY = {
     "id": "marketplace-conflict-worker",
-    "version": 3,
+    "version": 4,
     "sha256": CONFLICT_POLICY_SHA256,
 }
 CONFLICT_REQUEST_SCHEMA = {
@@ -90,11 +90,15 @@ CONFLICT_REQUEST_SCHEMA = {
 }
 CONFLICT_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-result",
-    "version": 2,
+    "version": 3,
 }
 CONFLICT_RECEIPT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-receipt",
-    "version": 1,
+    "version": 2,
+}
+CONFLICT_SEMANTIC_SCHEMA = {
+    "id": "github.copilot.agent-task-conflict-semantic-output",
+    "version": 2,
 }
 MODEL_ALIASES = {
     "sol": "gpt-5.6-sol",
@@ -7803,12 +7807,10 @@ def validate_passed_validations(value: Any) -> list[dict[str, str]]:
     for outcome in value:
         if (
             not isinstance(outcome, dict)
-            or set(outcome) != {"command", "status", "detail"}
+            or set(outcome) != {"command", "result"}
             or not isinstance(outcome.get("command"), str)
             or not outcome["command"].strip()
-            or outcome.get("status") != "passed"
-            or not isinstance(outcome.get("detail"), str)
-            or not outcome["detail"].strip()
+            or outcome.get("result") != "passed"
         ):
             raise WorkflowError("managed conflict validation is malformed or failed")
         require_no_credentials(canonical_json(outcome), source="validation outcome")
@@ -8138,6 +8140,8 @@ def verify_quarantined_result(
             or semantic_bytes is None
             or semantic
             != {
+                "schema": CONFLICT_SEMANTIC_SCHEMA,
+                "kind": "conflict-resolution",
                 "path": semantic_path,
                 "commit": artifact_head,
                 "sha256": hashlib.sha256(semantic_bytes).hexdigest(),

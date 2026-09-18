@@ -37,12 +37,16 @@ PATH_EVIDENCE_BOUNDARY_COUNT = 8
 PATH_EVIDENCE_VALUE_MAX_BYTES = 256
 MODE = "conflict_with_report"
 REQUEST_SCHEMA = {"id": "github.copilot.agent-task-conflict-request", "version": 1}
-RESULT_SCHEMA = {"id": "github.copilot.agent-task-conflict-result", "version": 2}
+RESULT_SCHEMA = {"id": "github.copilot.agent-task-conflict-result", "version": 3}
 LEGACY_RESULT_SCHEMA = {"id": "github.copilot.agent-task-conflict-result", "version": 1}
-RECEIPT_SCHEMA = {"id": "github.copilot.agent-task-conflict-receipt", "version": 1}
+RECEIPT_SCHEMA = {"id": "github.copilot.agent-task-conflict-receipt", "version": 2}
+LEGACY_RECEIPT_SCHEMA = {
+    "id": "github.copilot.agent-task-conflict-receipt",
+    "version": 1,
+}
 SEMANTIC_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-semantic-output",
-    "version": 1,
+    "version": 2,
 }
 POLICY_ID = "marketplace-conflict-worker"
 LEGACY_POLICY_VERSION = 1
@@ -54,7 +58,7 @@ LEGACY_POLICY = {
     "version": LEGACY_POLICY_VERSION,
     "sha256": LEGACY_POLICY_SHA256,
 }
-POLICY_VERSION = 3
+POLICY_VERSION = 4
 POLICY_SPEC = {
     "id": POLICY_ID,
     "version": POLICY_VERSION,
@@ -67,7 +71,9 @@ POLICY_SPEC = {
     "user_branch_publication": False,
     "quarantined_refs_only": True,
     "worker_identity_fields": False,
-    "semantic_artifact": "versioned-json",
+    "semantic_artifact": "minimal-payload-json",
+    "semantic_wrapper_owner": "dispatcher",
+    "semantic_validation_evidence": "command-result",
     "dispatcher_generated_report_receipt": True,
     "require_exact_request_identity": True,
     "require_exact_target_identity": True,
@@ -1132,7 +1138,10 @@ def _validate_prior_result(
         ):
             raise ConflictError("prior success is malformed", "malformed_result")
         try:
-            validate_validations(validation["outcomes"])
+            if result["schema"] == RESULT_SCHEMA and result["policy"] == POLICY:
+                validate_semantic_validations(validation["outcomes"])
+            else:
+                validate_validations(validation["outcomes"])
         except ConflictError:
             raise ConflictError(
                 "prior validation is malformed", "malformed_result"
@@ -2080,12 +2089,12 @@ def compact_receipt_contract(
             "validation_complete",
             "validation",
         ],
-        "schema": RECEIPT_SCHEMA,
+        "schema": LEGACY_RECEIPT_SCHEMA,
         "request": {
             "id": request["request_id"],
             "sha256": request["request_sha256"],
         },
-        "policy": POLICY,
+        "policy": LEGACY_POLICY,
         "model": request["model"],
         "mode": MODE,
         "strategy": request["strategy"],
@@ -2169,12 +2178,12 @@ def receipt_contract_template(
             }
         )
     return {
-        "schema": RECEIPT_SCHEMA,
+        "schema": LEGACY_RECEIPT_SCHEMA,
         "request": {
             "id": request["request_id"],
             "sha256": request["request_sha256"],
         },
-        "policy": POLICY,
+        "policy": LEGACY_POLICY,
         "model": request["model"],
         "mode": MODE,
         "strategy": request["strategy"],
@@ -2237,27 +2246,22 @@ def policy_prompt(
             )
         )
         shape = {
-            "schema": SEMANTIC_SCHEMA,
-            "kind": "conflict-resolution",
-            "payload": {
-                "summary": "<nonempty explanation of the resolution>",
-                "commit_annotations": [
-                    [
-                        {
-                            "conflict_paths": [],
-                            "companion_paths": [],
-                            "rationale": "",
-                        }
-                    ]
-                ],
-                "validation": [
+            "summary": "<nonempty explanation of the resolution>",
+            "commit_annotations": [
+                [
                     {
-                        "command": "<exact command or deterministic proof>",
-                        "status": "passed",
-                        "detail": "<concise result>",
+                        "conflict_paths": [],
+                        "companion_paths": [],
+                        "rationale": "",
                     }
-                ],
-            },
+                ]
+            ],
+            "validation": [
+                {
+                    "command": "<exact command or deterministic proof>",
+                    "result": "passed",
+                }
+            ],
         }
         return (
             f"{options.prompt.rstrip()}\n\n"
@@ -2275,8 +2279,9 @@ def policy_prompt(
             f"{code_locator_policy}"
             "Create one final single-parent task artifact commit on the Agent Task "
             f"branch. Its only changed path must be `{path}` and its parent must be "
-            "the final mechanically verified code tip. Write exactly the versioned JSON wrapper "
-            "below. `commit_annotations` is positional: one array per assigned role, "
+            "the final mechanically verified code tip. Write exactly the minimal "
+            "JSON payload below. The dispatcher adds the semantic schema and kind; "
+            "do not author them. `commit_annotations` is positional: one array per assigned role, "
             "and for rebase/native-stack one entry per frozen old commit. Merge uses "
             "one empty annotations array. An unchanged rewritten commit uses empty "
             "path arrays and an empty rationale; a conflict-touched commit must name "
@@ -2284,7 +2289,8 @@ def policy_prompt(
             "not include SHAs, refs, roles, request identity, validation completion, "
             "or any report/receipt/envelope fields. Missing or malformed semantic "
             "output fails closed. Validation entries are untrusted evidence and must "
-            "all describe passed work; the dispatcher never invents validation.\n"
+            "contain only the exact command and explicit `result: passed`; the "
+            "dispatcher never invents validation status or detail.\n"
             f"{json.dumps(shape, ensure_ascii=False, sort_keys=True)}\n"
             "----- marketplace conflict worker policy -----"
         )
@@ -3459,6 +3465,25 @@ def validate_validations(value: object) -> list[Mapping[str, str]]:
     return outcomes
 
 
+def validate_semantic_validations(value: object) -> list[Mapping[str, str]]:
+    if not isinstance(value, list) or not value:
+        raise ConflictError("validation is incomplete", "validation_failed")
+    outcomes: list[Mapping[str, str]] = []
+    for item in value:
+        outcome = require_exact_keys(
+            item, {"command", "result"}, "semantic validation outcome"
+        )
+        if (
+            not isinstance(outcome["command"], str)
+            or not outcome["command"].strip()
+            or outcome["result"] != "passed"
+            or contains_credentials(canonical_json(outcome).decode("utf-8"))
+        ):
+            raise ConflictError("validation did not pass", "validation_failed")
+        outcomes.append(outcome)
+    return outcomes
+
+
 def git_show_file(
     runner: Runner, root: Path, commit: str, path: str
 ) -> str:
@@ -3528,10 +3553,10 @@ def validate_artifact(
         for ref in code_refs
     ]
     if (
-        value["schema"] != RECEIPT_SCHEMA
+        value["schema"] != LEGACY_RECEIPT_SCHEMA
         or value["request"]
         != {"id": request["request_id"], "sha256": request["request_sha256"]}
-        or value["policy"] != POLICY
+        or value["policy"] != LEGACY_POLICY
         or value["model"] != request["model"]
         or value["mode"] != MODE
         or value["strategy"] != request["strategy"]
@@ -3598,22 +3623,17 @@ def validate_semantic_artifact(
         ) from None
     if (
         not isinstance(value, dict)
-        or set(value) != {"schema", "kind", "payload"}
-        or value.get("schema") != SEMANTIC_SCHEMA
-        or value.get("kind") != "conflict-resolution"
-        or not isinstance(value.get("payload"), dict)
-        or set(value["payload"])
-        != {"summary", "commit_annotations", "validation"}
-        or not isinstance(value["payload"].get("summary"), str)
-        or not value["payload"]["summary"].strip()
-        or contains_credentials(value["payload"]["summary"])
-        or not isinstance(value["payload"].get("commit_annotations"), list)
+        or set(value) != {"summary", "commit_annotations", "validation"}
+        or not isinstance(value.get("summary"), str)
+        or not value["summary"].strip()
+        or contains_credentials(value["summary"])
+        or not isinstance(value.get("commit_annotations"), list)
     ):
         raise ConflictError(
             "conflict semantic output has an unsupported shape",
             "validation_failed",
         )
-    annotations = value["payload"]["commit_annotations"]
+    annotations = value["commit_annotations"]
     expected_role_count = len(expected_roles(request))
     if (
         len(annotations) != expected_role_count
@@ -3623,9 +3643,9 @@ def validate_semantic_artifact(
             "conflict semantic annotations do not match assigned roles",
             "validation_failed",
         )
-    validations = validate_validations(value["payload"]["validation"])
+    validations = validate_semantic_validations(value["validation"])
     return (
-        value["payload"]["summary"],
+        value["summary"],
         annotations,
         validations,
         hashlib.sha256(content.encode("utf-8")).hexdigest(),
@@ -3840,6 +3860,8 @@ def prove_generated_semantic(
         "branch": artifact_remote.ref,
         "head_sha": artifact_head,
         "semantic": {
+            "schema": SEMANTIC_SCHEMA,
+            "kind": "conflict-resolution",
             "path": semantic_path(request_id),
             "commit": artifact_head,
             "sha256": semantic_sha256,
@@ -4244,15 +4266,20 @@ def execute(
         if result is not None:
             result.status = "success"
             result.application_status = "no_changes"
-            result.validations = [
-                {
-                    "command": "local-history-proof",
-                    "status": "passed",
-                    "detail": (
-                        "all requested heads already have their exact expected parent"
-                    ),
-                }
-            ]
+            result.validations = (
+                [
+                    {
+                        "command": "local-history-proof",
+                        "status": "passed",
+                        "detail": (
+                            "all requested heads already have their exact expected "
+                            "parent"
+                        ),
+                    }
+                ]
+                if request.get("policy", POLICY) == LEGACY_POLICY
+                else [{"command": "local-history-proof", "result": "passed"}]
+            )
         return 0
     fetch_pinned_inputs(runner, snapshot, request)
     verify_frozen_ranges(runner, snapshot, request)

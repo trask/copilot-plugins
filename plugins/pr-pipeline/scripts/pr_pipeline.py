@@ -7,6 +7,7 @@ import argparse
 import importlib.util
 import json
 from pathlib import Path
+import re
 import sys
 import time
 import uuid
@@ -96,6 +97,8 @@ stage_models = common.stage_models
 stage_prompt = common.stage_prompt
 
 RUN_KIND = "pr-pipeline"
+MONITOR_SCHEMA = "github.copilot.pr-pipeline-monitor"
+MONITOR_VERSION = 1
 PROGRESS_EVENT = common.PROGRESS_EVENT
 PROGRESS_UPDATE_EVENT = common.PROGRESS_UPDATE_EVENT
 PROGRESS_HEARTBEAT_INTERVAL = common.PROGRESS_HEARTBEAT_INTERVAL
@@ -112,7 +115,15 @@ UNAVAILABLE_STATUS_REASONS = common.UNAVAILABLE_STATUS_REASONS
 
 
 def run_slug(target: dict[str, Any]) -> str:
-    return f"{target['owner']}--{target['repo']}--pr-{target['number']}"
+    owner = str(target["owner"])
+    repo = str(target["repo"])
+    for name, value in (("owner", owner), ("repository", repo)):
+        if (
+            re.fullmatch(r"[A-Za-z0-9_.-]+", value) is None
+            or value in {".", ".."}
+        ):
+            raise WorkflowError(f"invalid {name} path identity")
+    return f"{owner}--{repo}--pr-{target['number']}"
 
 
 def run_root() -> Path:
@@ -137,6 +148,160 @@ def observer_state_path(target: dict[str, Any], run_id: str) -> Path:
 
 def scheduler_log_path(target: dict[str, Any], run_id: str) -> Path:
     return run_directory_for(target, run_id) / "scheduler.log"
+
+
+def monitor_locator_path(run_id: str) -> Path:
+    return run_root() / "monitors" / f"{run_id}.json"
+
+
+def target_identity(target: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "owner": target["owner"],
+        "repo": target["repo"],
+        "number": target["number"],
+    }
+
+
+def targets_match(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return (
+        str(left.get("owner") or "").casefold()
+        == str(right.get("owner") or "").casefold()
+        and str(left.get("repo") or "").casefold()
+        == str(right.get("repo") or "").casefold()
+        and left.get("number") == right.get("number")
+    )
+
+
+def paths_match(left: Any, right: Path) -> bool:
+    if not isinstance(left, str) or not left:
+        return False
+    try:
+        return Path(left).resolve() == right.resolve()
+    except OSError:
+        return False
+
+
+def monitor_locator(target: dict[str, Any], run_id: str) -> dict[str, Any]:
+    return {
+        "schema": MONITOR_SCHEMA,
+        "version": MONITOR_VERSION,
+        "run_id": run_id,
+        "target": target_identity(target),
+        "launch_path": str(launch_state_path(target, run_id)),
+        "event_log": str(progress_log_path(target, run_id)),
+    }
+
+
+def load_monitor_target(run_id: str) -> dict[str, Any]:
+    path = monitor_locator_path(run_id)
+    if not path.is_file() or path.is_symlink():
+        raise WorkflowError(f"monitor handle does not exist for run {run_id}")
+    locator = common.read_json(path)
+    if (
+        not isinstance(locator, dict)
+        or set(locator)
+        != {
+            "schema",
+            "version",
+            "run_id",
+            "target",
+            "launch_path",
+            "event_log",
+        }
+        or locator.get("schema") != MONITOR_SCHEMA
+        or locator.get("version") != MONITOR_VERSION
+        or locator.get("run_id") != run_id
+    ):
+        raise WorkflowError(f"monitor handle is malformed for run {run_id}")
+    identity = locator.get("target")
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != {"owner", "repo", "number"}
+        or not isinstance(identity.get("owner"), str)
+        or not identity["owner"]
+        or not isinstance(identity.get("repo"), str)
+        or not identity["repo"]
+        or isinstance(identity.get("number"), bool)
+        or not isinstance(identity.get("number"), int)
+        or identity["number"] < 1
+    ):
+        raise WorkflowError(f"monitor handle has invalid target identity for run {run_id}")
+    target = build_target(identity["owner"], identity["repo"], identity["number"])
+    try:
+        run_directory_for(target, run_id).resolve().relative_to(run_root().resolve())
+    except ValueError as error:
+        raise WorkflowError(
+            f"monitor handle target escapes the run directory for run {run_id}"
+        ) from error
+    if (
+        not paths_match(locator.get("launch_path"), launch_state_path(target, run_id))
+        or not paths_match(locator.get("event_log"), progress_log_path(target, run_id))
+    ):
+        raise WorkflowError(f"monitor handle paths are invalid for run {run_id}")
+    return target
+
+
+def validate_launch_record(target: dict[str, Any], run_id: str) -> None:
+    path = launch_state_path(target, run_id)
+    if not path.is_file() or path.is_symlink():
+        raise WorkflowError(f"launch record does not exist for run {run_id}")
+    launch = common.read_json(path)
+    if (
+        not isinstance(launch, dict)
+        or launch.get("kind") != RUN_KIND
+        or launch.get("run_id") != run_id
+        or not isinstance(launch.get("target"), dict)
+        or not targets_match(launch["target"], target)
+        or not paths_match(launch.get("event_log"), progress_log_path(target, run_id))
+    ):
+        raise WorkflowError(f"launch record identity is invalid for run {run_id}")
+
+
+def watch_arguments(
+    run_id: str,
+    cursor: int,
+    *,
+    target: dict[str, Any] | None = None,
+) -> list[str]:
+    arguments = ["watch"]
+    if target is not None:
+        arguments.append(
+            f"{target['owner']}/{target['repo']}#{target['number']}"
+        )
+    arguments.extend(
+        [
+            "--run-id",
+            run_id,
+            "--cursor",
+            str(cursor),
+            "--wait-seconds",
+            str(int(PROGRESS_HEARTBEAT_INTERVAL)),
+        ]
+    )
+    return arguments
+
+
+def bind_next_watch(
+    payload: dict[str, Any],
+    *,
+    target: dict[str, Any],
+    run_id: str,
+    legacy_target: bool,
+) -> dict[str, Any]:
+    bound = {
+        **payload,
+        "run_id": run_id,
+        "target": f"{target['owner']}/{target['repo']}#{target['number']}",
+    }
+    if not payload.get("finished"):
+        bound["next_watch"] = {
+            "arguments": watch_arguments(
+                run_id,
+                int(payload.get("cursor", 0)),
+                target=target if legacy_target else None,
+            )
+        }
+    return bound
 
 
 def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -987,41 +1152,31 @@ def command_start(args: argparse.Namespace) -> None:
     run_id = uuid.uuid4().hex
     event_log = progress_log_path(target, run_id)
     launch_path = launch_state_path(target, run_id)
+    locator_path = monitor_locator_path(run_id)
+    if launch_path.exists() or locator_path.exists():
+        raise WorkflowError(f"run identity already exists: {run_id}")
     started_at_epoch = time.time()
-    common.write_json_atomically(
-        launch_path,
-        {
-            "kind": RUN_KIND,
-            "run_id": run_id,
-            "target": target,
-            "pid": None,
-            "event_log": str(event_log),
-            "started_at": utc_now(),
-            "started_at_epoch": started_at_epoch,
-            "conflict_strategy": args.conflict_strategy,
-            "github_mutation_policy": args.github_mutation_policy,
-        },
-    )
+    started_at = utc_now()
+    launch = {
+        "kind": RUN_KIND,
+        "run_id": run_id,
+        "target": target,
+        "pid": None,
+        "event_log": str(event_log),
+        "started_at": started_at,
+        "started_at_epoch": started_at_epoch,
+        "conflict_strategy": args.conflict_strategy,
+        "github_mutation_policy": args.github_mutation_policy,
+    }
+    common.write_json_atomically(launch_path, launch)
     process = common.start_detached(
         scheduler_command(args, target, run_id, event_log),
         cwd=repo_root,
         log_path=scheduler_log_path(target, run_id),
     )
     try:
-        common.write_json_atomically(
-            launch_path,
-            {
-                "kind": RUN_KIND,
-                "run_id": run_id,
-                "target": target,
-                "pid": process.pid,
-                "event_log": str(event_log),
-                "started_at": utc_now(),
-                "started_at_epoch": started_at_epoch,
-                "conflict_strategy": args.conflict_strategy,
-                "github_mutation_policy": args.github_mutation_policy,
-            },
-        )
+        common.write_json_atomically(launch_path, {**launch, "pid": process.pid})
+        common.write_json_atomically(locator_path, monitor_locator(target, run_id))
     except OSError:
         process.terminate()
         raise
@@ -1032,6 +1187,12 @@ def command_start(args: argparse.Namespace) -> None:
             "target": f"{target['owner']}/{target['repo']}#{target['number']}",
             "pid": process.pid,
             "cursor": 0,
+            "next_watch": {
+                "arguments": watch_arguments(
+                    run_id,
+                    0,
+                )
+            },
             "conflict_strategy": args.conflict_strategy,
             "github_mutation_policy": args.github_mutation_policy,
         }
@@ -1039,15 +1200,36 @@ def command_start(args: argparse.Namespace) -> None:
 
 
 def command_watch(args: argparse.Namespace) -> None:
-    target = parse_target(args.target)
+    if args.run_id is None:
+        raise WorkflowError("watch requires --run-id")
     run_id = common.validate_run_id(args.run_id)
+    locator_path = monitor_locator_path(run_id)
+    legacy_target = not locator_path.exists()
+    if locator_path.exists():
+        target = load_monitor_target(run_id)
+        if args.target is not None and not targets_match(
+            parse_target(args.target), target
+        ):
+            raise WorkflowError(
+                f"watch target does not match monitor handle for run {run_id}"
+            )
+    elif args.target is not None:
+        target = parse_target(args.target)
+    else:
+        raise WorkflowError(f"monitor handle does not exist for run {run_id}")
+    validate_launch_record(target, run_id)
     emit(
-        common.watch_progress(
-            event_log=progress_log_path(target, run_id),
-            launch_path=launch_state_path(target, run_id),
-            observer_path=observer_state_path(target, run_id),
-            cursor=args.cursor,
-            wait_seconds=args.wait_seconds,
+        bind_next_watch(
+            common.watch_progress(
+                event_log=progress_log_path(target, run_id),
+                launch_path=launch_state_path(target, run_id),
+                observer_path=observer_state_path(target, run_id),
+                cursor=args.cursor,
+                wait_seconds=args.wait_seconds,
+            ),
+            target=target,
+            run_id=run_id,
+            legacy_target=legacy_target,
         )
     )
 
@@ -1137,8 +1319,12 @@ def build_parser() -> argparse.ArgumentParser:
     watch = subparsers.add_parser(
         "watch", help="wait for progress or one five-minute heartbeat"
     )
-    watch.add_argument("target", help="the canonical owner/repo#number from start")
-    watch.add_argument("--run-id", required=True)
+    watch.add_argument(
+        "target",
+        nargs="?",
+        help="legacy exact owner/repo#number for runs created before monitor handles",
+    )
+    watch.add_argument("--run-id")
     watch.add_argument("--cursor", type=int, default=0)
     watch.add_argument(
         "--wait-seconds",
@@ -1160,8 +1346,10 @@ def main() -> int:
                 {
                     "event": PROGRESS_UPDATE_EVENT,
                     "updates": [],
-                    "finished": False,
+                    "finished": True,
                     "monitor_failure": str(error),
+                    "run_id": getattr(args, "run_id", None),
+                    "cursor": getattr(args, "cursor", 0),
                 }
             )
             return 1
@@ -1180,8 +1368,10 @@ def main() -> int:
                 {
                     "event": PROGRESS_UPDATE_EVENT,
                     "updates": [],
-                    "finished": False,
+                    "finished": True,
                     "monitor_failure": "interrupted",
+                    "run_id": getattr(args, "run_id", None),
+                    "cursor": getattr(args, "cursor", 0),
                 }
             )
             return 130
