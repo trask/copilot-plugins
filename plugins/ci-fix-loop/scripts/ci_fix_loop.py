@@ -54,6 +54,9 @@ EXTERNAL_COMMAND_DIAGNOSTIC_TEXT_LIMIT = 4096
 EXTERNAL_COMMAND_DIAGNOSTIC_SCHEMA = (
     "github.copilot.ci-fix-loop-external-command-diagnostic.v1"
 )
+FAILED_LOG_COMMAND_DIAGNOSTIC_SCHEMA = (
+    "github.copilot.ci-fix-loop-failed-log-command-diagnostic.v1"
+)
 FAILED_LOG_DOWNLOAD_EVIDENCE_SCHEMA = (
     "github.copilot.ci-fix-loop-failed-log-download.v1"
 )
@@ -1485,6 +1488,40 @@ def external_command_failure(
     completed: subprocess.CompletedProcess[bytes],
 ) -> WorkflowError:
     diagnostic = external_command_diagnostic(
+        exit_status=completed.returncode,
+        stdout=completed.stdout or b"",
+        stderr=completed.stderr or b"",
+    )
+    serialized = json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
+    return WorkflowError(
+        f"{description}: exit status {completed.returncode}; "
+        f"diagnostic={serialized}",
+        details={"external_command_diagnostic": diagnostic},
+    )
+
+
+def failed_log_command_diagnostic(
+    *,
+    exit_status: int,
+    stdout: bytes,
+    stderr: bytes,
+) -> dict[str, Any]:
+    return {
+        "schema": FAILED_LOG_COMMAND_DIAGNOSTIC_SCHEMA,
+        "exit_status": exit_status,
+        "stdout": {
+            "byte_count": len(stdout),
+            "sha256": hashlib.sha256(stdout).hexdigest(),
+        },
+        "stderr": external_command_stream_diagnostic(stderr),
+    }
+
+
+def failed_log_command_failure(
+    description: str,
+    completed: subprocess.CompletedProcess[bytes],
+) -> WorkflowError:
+    diagnostic = failed_log_command_diagnostic(
         exit_status=completed.returncode,
         stdout=completed.stdout or b"",
         stderr=completed.stderr or b"",
@@ -6325,7 +6362,7 @@ def exact_actions_json_get(
                 evidence,
                 method=method,
                 result="success",
-                content_sha256=hashlib.sha256(raw).hexdigest(),
+                content_sha256=canonical_json_sha256(payload),
             )
             return payload
         diagnostic = external_command_diagnostic(
@@ -6708,7 +6745,7 @@ def fetch_failed_check_log(
                 validate_identity("post")
                 break
 
-            diagnostic = external_command_diagnostic(
+            diagnostic = failed_log_command_diagnostic(
                 exit_status=process.returncode,
                 stdout=process.stdout or b"",
                 stderr=process.stderr or b"",
@@ -6731,7 +6768,7 @@ def fetch_failed_check_log(
                     "sha256": error_sha256,
                 }
                 publish_evidence()
-                failure = external_command_failure(
+                failure = failed_log_command_failure(
                     f"could not download the failing log for {check['key']}",
                     process,
                 )
@@ -6765,7 +6802,7 @@ def fetch_failed_check_log(
                 "sha256": error_sha256,
             }
             publish_evidence()
-            failure = external_command_failure(
+            failure = failed_log_command_failure(
                 f"could not download the failing log for {check['key']}; "
                 f"{method} exhausted {len(FAILED_LOG_DOWNLOAD_RETRY_DELAYS) + 1} "
                 "pinned attempts",
@@ -14265,7 +14302,11 @@ def record_coordinator_failure(state_path: Path, error: WorkflowError) -> None:
     diagnostic = error.details.get("external_command_diagnostic")
     if (
         isinstance(diagnostic, dict)
-        and diagnostic.get("schema") == EXTERNAL_COMMAND_DIAGNOSTIC_SCHEMA
+        and diagnostic.get("schema")
+        in {
+            EXTERNAL_COMMAND_DIAGNOSTIC_SCHEMA,
+            FAILED_LOG_COMMAND_DIAGNOSTIC_SCHEMA,
+        }
     ):
         state["escalation"]["external_command_diagnostic"] = copy.deepcopy(
             diagnostic

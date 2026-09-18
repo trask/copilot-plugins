@@ -4601,7 +4601,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.46", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.47", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -5032,6 +5032,111 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                             for attempt in evidence["attempts"]
                         )
                     )
+
+    def test_metadata_success_hash_uses_canonical_parsed_json(self):
+        payload = {
+            "id": 1,
+            "name": "CI",
+            "repository": {"full_name": "owner/repo", "id": 17},
+        }
+        encodings = (
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(),
+            json.dumps(
+                {
+                    "repository": {"id": 17, "full_name": "owner/repo"},
+                    "name": "CI",
+                    "id": 1,
+                },
+                indent=2,
+            ).encode(),
+        )
+        hashes = []
+        for raw in encodings:
+            evidence = {"attempt_count": 0, "attempts": []}
+            completed = MODULE.subprocess.CompletedProcess(["gh"], 0, raw, b"")
+            with mock.patch.object(MODULE, "run_bytes", return_value=completed):
+                result = MODULE.exact_actions_json_get(
+                    "owner/repo",
+                    "repos/owner/repo/actions/runs/1",
+                    evidence=evidence,
+                    method="pre-run-metadata",
+                    deadline=MODULE.time.monotonic() + 1000,
+                )
+            self.assertEqual(payload, result)
+            hashes.append(evidence["attempts"][0]["content_sha256"])
+
+        self.assertEqual([MODULE.canonical_json_sha256(payload)] * 2, hashes)
+
+    def test_failed_log_orchestration_uses_real_pre_and_post_trust_boundary(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        pr = self.preflight["pr"]
+        run_payload = {
+            "id": 1,
+            "head_sha": pr["head_sha"],
+            "repository": {"full_name": pr["repo_name"]},
+            "name": check["workflow"],
+            "workflow_id": 17,
+            "html_url": "https://github.com/owner/repo/actions/runs/1",
+            "status": "completed",
+            "conclusion": "failure",
+        }
+        job_payload = {
+            "id": 2,
+            "run_id": 1,
+            "head_sha": pr["head_sha"],
+            "name": check["name"],
+            "html_url": "https://github.com/owner/repo/actions/runs/1/job/2",
+            "status": "completed",
+            "conclusion": "failure",
+        }
+        pre_run = json.dumps(run_payload, sort_keys=True).encode()
+        pre_job = json.dumps(job_payload, sort_keys=True).encode()
+        post_run = json.dumps(
+            dict(reversed(list(run_payload.items()))), indent=2
+        ).encode()
+        post_job = json.dumps(
+            dict(reversed(list(job_payload.items()))), indent=2
+        ).encode()
+        completed = [
+            MODULE.subprocess.CompletedProcess(["gh"], 0, pre_run, b""),
+            MODULE.subprocess.CompletedProcess(["gh"], 0, pre_job, b""),
+            MODULE.subprocess.CompletedProcess(
+                ["gh"], 0, b"focused failure log\n", b""
+            ),
+            MODULE.subprocess.CompletedProcess(["gh"], 0, post_run, b""),
+            MODULE.subprocess.CompletedProcess(["gh"], 0, post_job, b""),
+        ]
+        evidence = {}
+        with mock.patch.object(
+            MODULE, "run_bytes", side_effect=completed
+        ) as run:
+            content = MODULE.fetch_failed_check_log(pr, check, evidence=evidence)
+
+        self.assertEqual("focused failure log\n", content)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn("repos/owner/repo/actions/runs/1", commands[0])
+        self.assertIn("repos/owner/repo/actions/jobs/2", commands[1])
+        self.assertEqual(["gh", "run", "view"], commands[2][:3])
+        self.assertIn("repos/owner/repo/actions/runs/1", commands[3])
+        self.assertIn("repos/owner/repo/actions/jobs/2", commands[4])
+        self.assertEqual(
+            [
+                "pre-run-metadata",
+                "pre-job-metadata",
+                "gh-run-view",
+                "post-run-metadata",
+                "post-job-metadata",
+            ],
+            [attempt["method"] for attempt in evidence["attempts"]],
+        )
+        self.assertEqual(
+            evidence["attempts"][0]["content_sha256"],
+            evidence["attempts"][3]["content_sha256"],
+        )
+        self.assertEqual(
+            evidence["attempts"][1]["content_sha256"],
+            evidence["attempts"][4]["content_sha256"],
+        )
 
     def test_metadata_get_exhaustion_is_distinct_from_identity_mismatch_pre_and_post(self):
         transient = MODULE.subprocess.CompletedProcess(
@@ -5489,8 +5594,12 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn(" failed", content)
         MODULE.require_no_credentials(content, source="redacted test log")
 
-    def test_failed_log_download_error_retains_sanitized_bounded_output(self):
+    def test_failed_log_download_error_hashes_stdout_without_retaining_text(self):
         check = self.preflight["check_snapshot"]["failures"][0]
+        stdout = (
+            b"assertion failed at WidgetTest:42\n"
+            b"github_pat_abcdefghijklmnopqrstuvwxyz\n"
+        )
         stderr = b"gh: failed to download job log: HTTP 404 Not Found".ljust(
             76, b" "
         ) + b"\n"
@@ -5498,7 +5607,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         completed = MODULE.subprocess.CompletedProcess(
             ["gh"],
             1,
-            b"",
+            stdout,
             stderr,
         )
         with (
@@ -5511,15 +5620,83 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("exit status 1", message)
         self.assertIn("gh: failed to download job log: HTTP 404 Not Found", message)
+        self.assertNotIn("WidgetTest", message)
+        self.assertNotIn("github_pat_", message)
         diagnostic = raised.exception.details["external_command_diagnostic"]
-        self.assertEqual(0, diagnostic["stdout"]["byte_count"])
-        self.assertNotIn("text", diagnostic["stdout"])
+        self.assertEqual(MODULE.FAILED_LOG_COMMAND_DIAGNOSTIC_SCHEMA, diagnostic["schema"])
+        self.assertEqual(
+            {
+                "byte_count": len(stdout),
+                "sha256": MODULE.hashlib.sha256(stdout).hexdigest(),
+            },
+            diagnostic["stdout"],
+        )
         self.assertEqual(77, diagnostic["stderr"]["byte_count"])
         self.assertEqual(
             MODULE.hashlib.sha256(stderr).hexdigest(),
             diagnostic["stderr"]["sha256"],
         )
         self.assertEqual(stderr.decode(), diagnostic["stderr"]["text"])
+        serialized = json.dumps(
+            {"message": message, "details": raised.exception.details}
+        )
+        self.assertNotIn("WidgetTest", serialized)
+        self.assertNotIn("github_pat_", serialized)
+        expected_error_hash = MODULE.canonical_json_sha256(diagnostic)
+        log_download = raised.exception.details["log_download"]
+        self.assertEqual(
+            expected_error_hash,
+            log_download["attempts"][-1]["error_sha256"],
+        )
+        self.assertEqual(
+            expected_error_hash,
+            log_download["terminal_error"]["sha256"],
+        )
+
+    def test_rest_fallback_failure_never_retains_partial_stdout(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        transient = MODULE.subprocess.CompletedProcess(
+            ["gh"],
+            1,
+            b"primary partial failure log\n",
+            b"stream ID 1; CANCEL; received from peer",
+        )
+        rest_stdout = (
+            b"fallback partial WidgetTest output\n"
+            b"github_pat_abcdefghijklmnopqrstuvwxyz\n"
+        )
+        permanent = MODULE.subprocess.CompletedProcess(
+            ["gh"], 1, rest_stdout, b"HTTP 404 Not Found"
+        )
+        primary_attempts = len(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS) + 1
+        with (
+            mock.patch.object(MODULE, "verify_failed_log_download_identity"),
+            mock.patch.object(
+                MODULE,
+                "run_bytes",
+                side_effect=[transient] * primary_attempts + [permanent],
+            ),
+            mock.patch.object(MODULE.time, "sleep"),
+            self.assertRaises(MODULE.WorkflowError) as raised,
+        ):
+            MODULE.fetch_failed_check_log(self.preflight["pr"], check)
+
+        serialized = json.dumps(
+            {"message": str(raised.exception), "details": raised.exception.details}
+        )
+        self.assertNotIn("primary partial", serialized)
+        self.assertNotIn("WidgetTest", serialized)
+        self.assertNotIn("github_pat_", serialized)
+        diagnostic = raised.exception.details["external_command_diagnostic"]
+        self.assertEqual(len(rest_stdout), diagnostic["stdout"]["byte_count"])
+        self.assertEqual(
+            MODULE.hashlib.sha256(rest_stdout).hexdigest(),
+            diagnostic["stdout"]["sha256"],
+        )
+        self.assertEqual(
+            "rest-job-log",
+            raised.exception.details["log_download"]["terminal_error"]["method"],
+        )
 
     def test_failed_log_diagnostic_redacts_secrets_headers_and_environment(self):
         token = "ghp_" + ("A" * 40)
@@ -5582,12 +5759,16 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         repo_root = self.root / "repo"
         repo_root.mkdir()
         state_path = self.root / "coordinator.json"
+        stdout = (
+            b"ordinary low entropy test failure\n"
+            b"ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
+        )
         stderr = b"gh: failed to download job log: HTTP 404 Not Found".ljust(
             76, b" "
         ) + b"\n"
-        error = MODULE.external_command_failure(
+        error = MODULE.failed_log_command_failure(
             "could not download the failing log for check:CI/test",
-            MODULE.subprocess.CompletedProcess(["gh"], 1, b"", stderr),
+            MODULE.subprocess.CompletedProcess(["gh"], 1, stdout, stderr),
         )
         output = io.StringIO()
         arguments = [
@@ -5630,6 +5811,13 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             77,
             result["external_command_diagnostic"]["stderr"]["byte_count"],
         )
+        self.assertEqual(
+            {
+                "byte_count": len(stdout),
+                "sha256": MODULE.hashlib.sha256(stdout).hexdigest(),
+            },
+            result["external_command_diagnostic"]["stdout"],
+        )
         state = MODULE.load_state(state_path)
         self.assertEqual(0, state["iterations"])
         self.assertNotIn("agent_task", state)
@@ -5643,6 +5831,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             result["external_command_diagnostic"],
             state["escalation"]["external_command_diagnostic"],
         )
+        serialized = json.dumps({"result": result, "state": state})
+        self.assertNotIn("low entropy", serialized)
+        self.assertNotIn("ghp_", serialized)
         self.assertEqual(
             "escalated",
             MODULE.status_payload(state, state_path)["stage_outcome"],
