@@ -870,7 +870,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
                         "role": "code",
                         "pr_number": 7,
                         "repository": "owner/repo",
-                        "ref": "generated",
+                        "ref": "artifact",
                         "old_sha": "b" * 40,
                         "new_sha": "c" * 40,
                         "base_ref": "main",
@@ -896,12 +896,13 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "a1edbe7463b322360f8b9978d6f4b9c825b08791a2c16b5153cc393566c9ef98",
+            "d42bea53150d299bab98f0f350f2a05ed24a239a1955fc64e93da752f1f36f45",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
-            "8ef8ce9fd429740875f1c06ae3c2dbb10f06759e49179a05dc9f493d4c72bd60",
+            "45cf90107f6297a8110a0527ad1f2e80cd02b4b12f71dbfe1fd0a5b48d54a7bb",
         )
+        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@3")
         self.assertEqual(
             MODULE.CONFLICT_REQUEST_SCHEMA["id"],
             "github.copilot.agent-task-conflict-request",
@@ -2355,6 +2356,26 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         result["error"] = {"code": "interrupted", "message": "stopped"}
         with self.assertRaisesRegex(MODULE.WorkflowError, "interrupted"):
             MODULE.validate_conflict_result_identity(result, request)
+
+    def test_consumer_rejects_a_single_role_code_locator_not_bound_to_artifact(self):
+        request = self.request()
+        result = self.success_result(request)
+        code_refs = result["generated"]["code_refs"]
+        code_refs[0]["ref"] = "copilot/unrelated-task"
+
+        with (
+            mock.patch.object(MODULE, "git", return_value="c" * 40),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "trusted source"
+            ),
+        ):
+            MODULE.verify_quarantined_result(
+                Path("repo"),
+                request,
+                code_refs,
+                result["generated"]["artifact"],
+                result["validation"]["outcomes"],
+            )
 
     def test_merge_publication_uses_the_explicit_head_refspec(self):
         request = self.request("merge")
@@ -3911,6 +3932,75 @@ class ManagedTaskPromptTest(unittest.TestCase):
             "paths": [path],
         }
 
+    def single_role_evidence(self):
+        request = self.request()
+        request["request_id"] = "pr-16161-d754a7530ef10e03"
+        request["pull_request"]["head_sha"] = (
+            "b490dcba7665ddc6078be7a4e5fafa389f9b62fe"
+        )
+        request["pull_request"]["base_sha"] = (
+            "2515ed4055bb1802c7d21d7a01882b92b6d5c675"
+        )
+        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
+        branch = "copilot/conflict-fix-loop-worker-prompt-v2-yet-again"
+        task_id = "deeb5e61-64a2-4fe0-b948-ce3dac511701"
+        task = {
+            "id": task_id,
+            "state": "completed",
+            "head_ref": branch,
+            "artifacts": [
+                {
+                    "provider": "github",
+                    "type": "branch",
+                    "data": {
+                        "base_ref": request["pull_request"]["head_sha"],
+                        "head_ref": branch,
+                    },
+                }
+            ],
+            "sessions": [
+                {
+                    "task_id": task_id,
+                    "state": "completed",
+                    "model": "sweagent-capi:gpt-5.6-sol",
+                    "base_ref": request["pull_request"]["head_sha"],
+                    "head_ref": branch,
+                }
+            ],
+        }
+        semantic_head = "a22ac93eab2fd8b970a1d050fea58eeb005aad9a"
+        code_tip = "c4547b279abbd7957325f8d3192dc2c458cd71a1"
+        content = json.dumps(
+            {
+                "schema": CLOUD_MODULE.SEMANTIC_SCHEMA,
+                "kind": "conflict-resolution",
+                "payload": {
+                    "summary": "Resolved the frozen merge conflict.",
+                    "commit_annotations": [[]],
+                    "validation": [
+                        {
+                            "command": "git diff --check",
+                            "status": "passed",
+                            "detail": "clean",
+                        }
+                    ],
+                },
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        snapshot = CLOUD_MODULE.LocalSnapshot(
+            Path("C:/repo"),
+            Path("C:/state"),
+            request["repository"],
+            "origin",
+            request["pull_request"]["head_ref"],
+            request["pull_request"]["head_sha"],
+            "",
+            None,
+        )
+        return request, task, branch, semantic_head, code_tip, content, snapshot
+
     def test_large_path_corpus_uses_complete_digest_and_boundary_evidence(self):
         request = self.request()
         request["allowed_paths"] = [
@@ -3950,19 +4040,237 @@ class ManagedTaskPromptTest(unittest.TestCase):
         self.assertIn(request["pull_request"]["head_sha"], prompt)
         self.assertIn("complete_values_in_retained_request", prompt)
 
-    def test_semantic_contract_assigns_refs_and_removes_worker_receipt_identity(self):
+    def test_single_role_semantic_contract_derives_code_tip_from_artifact_parent(self):
         request = self.request()
         prompt = CLOUD_MODULE.policy_prompt(self.options(request))
 
-        self.assertIn("Policy: marketplace-conflict-worker@2", prompt)
-        self.assertIn(
+        self.assertIn("Policy: marketplace-conflict-worker@3", prompt)
+        self.assertNotIn(
             CLOUD_MODULE.assigned_code_ref(request["request_id"], "code"),
             prompt,
         )
+        self.assertIn("Do not publish a duplicate code branch", prompt)
+        self.assertIn("verified sole parent", prompt)
         self.assertIn("derives every SHA", prompt)
         self.assertIn('"kind": "conflict-resolution"', prompt)
         self.assertIn("Do not include SHAs, refs, roles, request identity", prompt)
         self.assertNotIn("Compact required receipt contract", prompt)
+
+    def test_16161_derives_merge_tip_from_authoritative_task_artifact_parent(self):
+        (
+            request,
+            task,
+            branch,
+            semantic_head,
+            code_tip,
+            content,
+            snapshot,
+        ) = self.single_role_evidence()
+
+        def commit_parents(_runner, _root, commit):
+            if commit == semantic_head:
+                return [code_tip]
+            if commit == code_tip:
+                return [
+                    request["pull_request"]["head_sha"],
+                    request["pull_request"]["base_sha"],
+                ]
+            raise AssertionError(commit)
+
+        with (
+            mock.patch.object(
+                CLOUD_MODULE,
+                "fetch_quarantined",
+                return_value=(
+                    CLOUD_MODULE.quarantine_ref(request["request_id"], "artifact"),
+                    semantic_head,
+                ),
+            ) as fetch,
+            mock.patch.object(CLOUD_MODULE, "parents", side_effect=commit_parents),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "changed_paths",
+                return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
+            ),
+            mock.patch.object(CLOUD_MODULE, "git_show_file", return_value=content),
+            mock.patch.object(
+                CLOUD_MODULE, "first_parent_chain", return_value=[code_tip]
+            ),
+            mock.patch.object(CLOUD_MODULE, "git", return_value="") as git,
+            mock.patch.object(CLOUD_MODULE, "require_local_unchanged"),
+        ):
+            code_refs, artifact, validations = (
+                CLOUD_MODULE.prove_generated_semantic(
+                    mock.sentinel.runner,
+                    snapshot,
+                    request,
+                    task,
+                )
+            )
+
+        fetch.assert_called_once()
+        self.assertEqual(branch, fetch.call_args.args[2].ref)
+        self.assertEqual(
+            [
+                {
+                    "role": "code",
+                    "pr_number": request["pull_request"]["number"],
+                    "repository": request["repository"],
+                    "ref": branch,
+                    "old_sha": request["pull_request"]["head_sha"],
+                    "new_sha": code_tip,
+                    "base_ref": request["pull_request"]["base_ref"],
+                    "base_sha": request["pull_request"]["base_sha"],
+                    "lease_sha": request["pull_request"]["head_sha"],
+                    "commits": [code_tip],
+                }
+            ],
+            code_refs,
+        )
+        self.assertEqual(semantic_head, artifact["head_sha"])
+        self.assertEqual("passed", validations[0]["status"])
+        git.assert_called_once_with(
+            mock.sentinel.runner,
+            snapshot.root,
+            "update-ref",
+            CLOUD_MODULE.quarantine_ref(request["request_id"], "code"),
+            code_tip,
+        )
+
+    def test_single_role_rejects_semantic_commit_with_wrong_path(self):
+        request, task, _, semantic_head, code_tip, content, snapshot = (
+            self.single_role_evidence()
+        )
+        with (
+            mock.patch.object(
+                CLOUD_MODULE,
+                "fetch_quarantined",
+                return_value=("refs/quarantine/artifact", semantic_head),
+            ),
+            mock.patch.object(CLOUD_MODULE, "parents", return_value=[code_tip]),
+            mock.patch.object(
+                CLOUD_MODULE, "changed_paths", return_value=["src/Unrelated.java"]
+            ),
+            mock.patch.object(CLOUD_MODULE, "git_show_file", return_value=content),
+            self.assertRaisesRegex(
+                CLOUD_MODULE.ConflictError, "changed unexpected paths"
+            ),
+        ):
+            CLOUD_MODULE.prove_generated_semantic(
+                mock.sentinel.runner,
+                snapshot,
+                request,
+                task,
+            )
+
+    def test_single_role_rejects_semantic_merge_commit(self):
+        request, task, _, semantic_head, code_tip, _, snapshot = (
+            self.single_role_evidence()
+        )
+        with (
+            mock.patch.object(
+                CLOUD_MODULE,
+                "fetch_quarantined",
+                return_value=("refs/quarantine/artifact", semantic_head),
+            ),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "parents",
+                return_value=[code_tip, request["pull_request"]["head_sha"]],
+            ),
+            self.assertRaisesRegex(
+                CLOUD_MODULE.ConflictError, "exactly one parent"
+            ),
+        ):
+            CLOUD_MODULE.prove_generated_semantic(
+                mock.sentinel.runner,
+                snapshot,
+                request,
+                task,
+            )
+
+    def test_single_role_rejects_wrong_merge_parent_topology(self):
+        request, task, _, semantic_head, code_tip, content, snapshot = (
+            self.single_role_evidence()
+        )
+
+        def commit_parents(_runner, _root, commit):
+            if commit == semantic_head:
+                return [code_tip]
+            if commit == code_tip:
+                return [
+                    request["pull_request"]["base_sha"],
+                    request["pull_request"]["head_sha"],
+                ]
+            raise AssertionError(commit)
+
+        with (
+            mock.patch.object(
+                CLOUD_MODULE,
+                "fetch_quarantined",
+                return_value=("refs/quarantine/artifact", semantic_head),
+            ),
+            mock.patch.object(CLOUD_MODULE, "parents", side_effect=commit_parents),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "changed_paths",
+                return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
+            ),
+            mock.patch.object(CLOUD_MODULE, "git_show_file", return_value=content),
+            mock.patch.object(
+                CLOUD_MODULE, "first_parent_chain", return_value=[code_tip]
+            ),
+            mock.patch.object(CLOUD_MODULE, "git", return_value=""),
+            mock.patch.object(CLOUD_MODULE, "require_local_unchanged"),
+            self.assertRaisesRegex(
+                CLOUD_MODULE.ConflictError, "parents are not \\[head, base\\]"
+            ),
+        ):
+            CLOUD_MODULE.prove_generated_semantic(
+                mock.sentinel.runner,
+                snapshot,
+                request,
+                task,
+            )
+
+    def test_single_role_rejects_malformed_semantic_data(self):
+        request, task, _, semantic_head, code_tip, _, snapshot = (
+            self.single_role_evidence()
+        )
+        with (
+            mock.patch.object(
+                CLOUD_MODULE,
+                "fetch_quarantined",
+                return_value=("refs/quarantine/artifact", semantic_head),
+            ),
+            mock.patch.object(CLOUD_MODULE, "parents", return_value=[code_tip]),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "changed_paths",
+                return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
+            ),
+            mock.patch.object(
+                CLOUD_MODULE, "git_show_file", return_value="{malformed"
+            ),
+            self.assertRaisesRegex(
+                CLOUD_MODULE.ConflictError, "semantic output is malformed"
+            ),
+        ):
+            CLOUD_MODULE.prove_generated_semantic(
+                mock.sentinel.runner,
+                snapshot,
+                request,
+                task,
+            )
+
+    def test_single_role_rejects_unrelated_task_session_branch(self):
+        request, task, _, _, _, _, _ = self.single_role_evidence()
+        task["sessions"][0]["head_ref"] = "copilot/unrelated-task"
+
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError, "branches differ"
+        ):
+            CLOUD_MODULE.discover_semantic_artifact_ref(task, request)
 
     def test_missing_semantic_artifact_fails_closed(self):
         request = self.request()

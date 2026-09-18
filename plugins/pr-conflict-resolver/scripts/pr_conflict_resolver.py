@@ -72,16 +72,16 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "a1edbe7463b322360f8b9978d6f4b9c825b08791a2c16b5153cc393566c9ef98"
+    "d42bea53150d299bab98f0f350f2a05ed24a239a1955fc64e93da752f1f36f45"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
-CONFLICT_POLICY = "marketplace-conflict-worker@2"
+CONFLICT_POLICY = "marketplace-conflict-worker@3"
 CONFLICT_POLICY_SHA256 = (
-    "8ef8ce9fd429740875f1c06ae3c2dbb10f06759e49179a05dc9f493d4c72bd60"
+    "45cf90107f6297a8110a0527ad1f2e80cd02b4b12f71dbfe1fd0a5b48d54a7bb"
 )
 CONFLICT_POLICY_IDENTITY = {
     "id": "marketplace-conflict-worker",
-    "version": 2,
+    "version": 3,
     "sha256": CONFLICT_POLICY_SHA256,
 }
 CONFLICT_REQUEST_SCHEMA = {
@@ -7867,6 +7867,12 @@ def quarantine_ref(request_id: str, role: str) -> str:
     return f"refs/cloud-conflict-tasks/{request_id}/{safe_role}"
 
 
+def assigned_code_ref(request_id: str, role: str) -> str:
+    safe_request = re.sub(r"[^A-Za-z0-9._-]", "-", request_id)
+    safe_role = re.sub(r"[^A-Za-z0-9._-]", "-", role)
+    return f"copilot/conflict-{safe_request}-{safe_role}"
+
+
 def verify_commit_mapping(
     repo_root: Path,
     old: dict[str, Any],
@@ -8042,6 +8048,17 @@ def verify_quarantined_result(
         actual = git(repo_root, "rev-parse", "--verify", local_ref).lower()
         if actual != code_ref["new_sha"]:
             raise WorkflowError("quarantined code ref does not match its declared head")
+        expected_locator = (
+            assigned_code_ref(request["request_id"], role)
+            if request["strategy"] == "native-stack"
+            else artifact.get("branch")
+            if isinstance(artifact, dict)
+            else None
+        )
+        if code_ref["ref"] != expected_locator:
+            raise WorkflowError(
+                "generated code locator does not match its trusted source"
+            )
         if code_ref["repository"] != request["repository"]:
             raise WorkflowError("generated code ref belongs to another repository")
         if request["strategy"] != "native-stack" and (

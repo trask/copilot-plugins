@@ -54,7 +54,7 @@ LEGACY_POLICY = {
     "version": LEGACY_POLICY_VERSION,
     "sha256": LEGACY_POLICY_SHA256,
 }
-POLICY_VERSION = 2
+POLICY_VERSION = 3
 POLICY_SPEC = {
     "id": POLICY_ID,
     "version": POLICY_VERSION,
@@ -62,7 +62,8 @@ POLICY_SPEC = {
     "authentication": "local-gh-api",
     "custom_agent": False,
     "local_fallback": False,
-    "generated_ref_publication": "dispatcher-assigned-request-scoped",
+    "single_role_code_tip": "verified-task-artifact-parent",
+    "multi_role_code_refs": "dispatcher-assigned-request-scoped",
     "user_branch_publication": False,
     "quarantined_refs_only": True,
     "worker_identity_fields": False,
@@ -72,7 +73,7 @@ POLICY_SPEC = {
     "require_exact_target_identity": True,
     "require_mechanical_history_proof": True,
     "safe_direct_base_sync_merge_omission": True,
-    "require_separate_artifact_ref": True,
+    "require_separate_artifact_commit": True,
     "require_complete_successful_validation": True,
 }
 POLICY_SHA256 = hashlib.sha256(
@@ -2202,22 +2203,39 @@ def policy_prompt(
             options.request,
             include_per_commit_paths=include_per_commit_paths,
         )
-        refs = [
-            {
-                "role_index": index,
-                "role": remote.role,
-                "branch": remote.ref,
-                "annotation_count": (
-                    0
-                    if options.request["strategy"] == "merge"
-                    else len(code_ref_base(options.request, remote.role)[4])
-                ),
-            }
-            for index, remote in enumerate(
-                assigned_code_refs(options.request),
-                start=1,
+        refs = (
+            [
+                {
+                    "role_index": index,
+                    "role": remote.role,
+                    "branch": remote.ref,
+                    "annotation_count": len(
+                        code_ref_base(options.request, remote.role)[4]
+                    ),
+                }
+                for index, remote in enumerate(
+                    assigned_code_refs(options.request),
+                    start=1,
+                )
+            ]
+            if options.request["strategy"] == "native-stack"
+            else []
+        )
+        code_locator_policy = (
+            "Publish each resolved member tip to the exact request-scoped branch "
+            "assigned below, in role order. These branch names are locators only; "
+            "the dispatcher fetches them into quarantine and derives every SHA and "
+            "ordered mapping from Git history. Do not publish any other code branch.\n"
+            f"{json.dumps(refs, ensure_ascii=False, sort_keys=True)}\n"
+            if refs
+            else (
+                "Do not publish a duplicate code branch. Commit the resolved "
+                "single-role history directly before the final semantic artifact "
+                "commit on the Agent Task branch. The dispatcher derives the code "
+                "tip only from that final commit's verified sole parent and derives "
+                "every SHA and ordered mapping from Git history.\n"
             )
-        ]
+        )
         shape = {
             "schema": SEMANTIC_SCHEMA,
             "kind": "conflict-resolution",
@@ -2254,14 +2272,10 @@ def policy_prompt(
             "fields in the semantic artifact.\n"
             "Compact immutable task contract (input evidence only): "
             f"{canonical_json(compact_request).decode('utf-8')}\n"
-            "Publish each resolved code tip to the exact request-scoped branch assigned "
-            "below, in role order. These branch names are locators only; the dispatcher "
-            "fetches them into quarantine and derives every SHA and ordered mapping from "
-            "Git history. Do not publish any other code branch.\n"
-            f"{json.dumps(refs, ensure_ascii=False, sort_keys=True)}\n"
+            f"{code_locator_policy}"
             "Create one final single-parent task artifact commit on the Agent Task "
             f"branch. Its only changed path must be `{path}` and its parent must be "
-            "the final assigned code tip. Write exactly the versioned JSON wrapper "
+            "the final mechanically verified code tip. Write exactly the versioned JSON wrapper "
             "below. `commit_annotations` is positional: one array per assigned role, "
             "and for rebase/native-stack one entry per frozen old commit. Merge uses "
             "one empty annotations array. An unchanged rewritten commit uses empty "
@@ -2598,6 +2612,75 @@ def discover_artifact_ref(
         None,
         request["repository"],
         next(iter(heads)),
+    )
+
+
+def discover_semantic_artifact_ref(
+    task: Mapping[str, object], request: Mapping[str, object]
+) -> RemoteRef:
+    artifacts = task.get("artifacts")
+    sessions = task.get("sessions")
+    if (
+        task.get("state") != "completed"
+        or not isinstance(artifacts, list)
+        or len(artifacts) != 1
+        or not isinstance(artifacts[0], dict)
+        or not isinstance(sessions, list)
+        or len(sessions) != 1
+        or not isinstance(sessions[0], dict)
+    ):
+        raise ConflictError(
+            "completed task artifact identity is malformed",
+            "task_failed",
+        )
+    artifact = artifacts[0]
+    data = artifact.get("data")
+    session = sessions[0]
+    task_id = task.get("id")
+    if (
+        artifact.get("provider") != "github"
+        or artifact.get("type") != "branch"
+        or not isinstance(data, dict)
+        or data.get("base_ref") != request["pull_request"]["head_sha"]
+        or session.get("task_id") != task_id
+        or session.get("state") != "completed"
+        or session.get("model") != f"sweagent-capi:{request['model']}"
+        or session.get("base_ref") != request["pull_request"]["head_sha"]
+    ):
+        raise ConflictError(
+            "completed task session identity changed",
+            "task_failed",
+        )
+    artifact_head_ref = require_ref(
+        data.get("head_ref"),
+        "task artifact head ref",
+    ).removeprefix("refs/heads/")
+    session_head_ref = require_ref(
+        session.get("head_ref"),
+        "task session head ref",
+    ).removeprefix("refs/heads/")
+    task_head_ref = task.get("head_ref")
+    if task_head_ref is not None:
+        task_head_ref = require_ref(
+            task_head_ref,
+            "task head ref",
+        ).removeprefix("refs/heads/")
+    if (
+        artifact_head_ref != session_head_ref
+        or (
+            isinstance(task_head_ref, str)
+            and task_head_ref != artifact_head_ref
+        )
+    ):
+        raise ConflictError(
+            "task artifact and session branches differ",
+            "unexpected_history",
+        )
+    return RemoteRef(
+        "artifact",
+        None,
+        request["repository"],
+        artifact_head_ref,
     )
 
 
@@ -3606,7 +3689,7 @@ def prove_generated_semantic(
     task: Mapping[str, object],
     recovery_result: Result | None = None,
 ) -> tuple[list[Mapping[str, object]], Mapping[str, object], list[Mapping[str, str]]]:
-    artifact_remote = discover_artifact_ref(task, request)
+    artifact_remote = discover_semantic_artifact_ref(task, request)
     request_id = str(request["request_id"])
     quarantine: list[str] = []
     artifact_ref, artifact_head = fetch_quarantined(
@@ -3617,17 +3700,29 @@ def prove_generated_semantic(
     )
     quarantine.append(artifact_ref)
     fetched_code: list[tuple[RemoteRef, str, str]] = []
-    for remote in assigned_code_refs(request):
-        target, tip = fetch_quarantined(
+    if request["strategy"] == "native-stack":
+        for remote in assigned_code_refs(request):
+            target, tip = fetch_quarantined(
+                runner,
+                snapshot,
+                remote,
+                request_id,
+            )
+            quarantine.append(target)
+            fetched_code.append((remote, target, tip))
+        final_code_head = fetched_code[-1][2]
+    else:
+        artifact_parents = parents(
             runner,
-            snapshot,
-            remote,
-            request_id,
+            snapshot.root,
+            artifact_head,
         )
-        quarantine.append(target)
-        fetched_code.append((remote, target, tip))
-    require_local_unchanged(runner, snapshot, quarantine)
-    final_code_head = fetched_code[-1][2]
+        if len(artifact_parents) != 1:
+            raise ConflictError(
+                "semantic artifact commit must have exactly one parent",
+                "unexpected_history",
+            )
+        final_code_head = artifact_parents[0]
     summary, annotations, validations, semantic_sha256 = validate_semantic_artifact(
         runner,
         snapshot,
@@ -3636,6 +3731,29 @@ def prove_generated_semantic(
         artifact_head,
         final_code_head,
     )
+    if request["strategy"] != "native-stack":
+        target = quarantine_ref(request_id, "code")
+        git(
+            runner,
+            snapshot.root,
+            "update-ref",
+            target,
+            final_code_head,
+        )
+        quarantine.append(target)
+        fetched_code.append(
+            (
+                RemoteRef(
+                    "code",
+                    request["pull_request"]["number"],
+                    request["repository"],
+                    artifact_remote.ref,
+                ),
+                target,
+                final_code_head,
+            )
+        )
+    require_local_unchanged(runner, snapshot, quarantine)
     allowed_paths = set(request["allowed_paths"])
     code_refs: list[Mapping[str, object]] = []
     if request["strategy"] == "merge":
@@ -3665,6 +3783,7 @@ def prove_generated_semantic(
                 raise ConflictError("merge fixes are not linear", "unexpected_history")
             parent = commit
         code_ref = build_code_ref(request, remote, tip, commits, [])
+        code_ref["base_ref"] = request["pull_request"]["base_ref"]
         code_ref["base_sha"] = request["pull_request"]["base_sha"]
         code_refs.append(code_ref)
     elif request["strategy"] == "rebase":
