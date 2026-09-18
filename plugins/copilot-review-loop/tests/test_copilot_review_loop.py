@@ -1,6 +1,7 @@
 import argparse
 import copy
 from contextlib import ExitStack
+import hashlib
 import importlib.util
 import ast
 import json
@@ -1265,18 +1266,18 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         source = self.source_for_preflight(preflight)
         github = arguments["before_github"]
         decision = {
-            "schema": MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
-            "contract_id": MODULE.decision_report_contract(preflight),
             "decisions": [
                 {
-                    "finding_key": MODULE.decision_finding_key(identity),
+                    "finding_id": MODULE.decision_finding_id(run_id, position),
                     "disposition": "no_change",
                     "reason": "The current implementation already handles this case.",
-                    "commit": None,
-                    "reply": "No change is needed because the case is already handled.",
-                    "changed_paths": [],
+                    "proposed_reply": (
+                        "No change is needed because the case is already handled."
+                    ),
                 }
-                for identity in preflight["comment_identities"]
+                for position, _identity in enumerate(
+                    preflight["comment_identities"]
+                )
             ],
         }
         decision_content = json.dumps(decision, indent=2, sort_keys=True) + "\n"
@@ -1300,6 +1301,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             preflight=preflight,
             remote=remote,
             paths_by_commit={},
+            active_local_decisions=True,
         )
         canonical_content = MODULE.render_canonical_review_report(report)
         canonical_path.write_text(canonical_content, encoding="utf-8", newline="\n")
@@ -1358,6 +1360,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "decision": {
                 "path": str(decision_path),
                 "sha256": MODULE.sha256_file(decision_path),
+                "schema": MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
             },
             "canonical_report": {
                 "path": str(canonical_path),
@@ -1365,6 +1368,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             },
             "source_before": arguments["before_source"],
             "source_after": source,
+            "source_transition": [],
             "github_before": arguments["before_github"],
             "github_after": github,
             "command": MODULE.local_decision_command(
@@ -1580,20 +1584,16 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     def local_decision(self, *, contract_id=None):
         return {
-            "schema": MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
-            "contract_id": contract_id
-            if contract_id is not None
-            else MODULE.decision_report_contract(self.preflight),
             "decisions": [
                 {
-                    "finding_key": MODULE.decision_finding_key(
-                        self.preflight["comment_identities"][0]
-                    ),
+                    "finding_id": contract_id
+                    if contract_id is not None
+                    else MODULE.decision_finding_id("run-1", 0),
                     "disposition": "no_change",
                     "reason": "The current implementation already handles this case.",
-                    "commit": None,
-                    "reply": "No change is needed because the case is already handled.",
-                    "changed_paths": [],
+                    "proposed_reply": (
+                        "No change is needed because the case is already handled."
+                    ),
                 }
             ],
         }
@@ -1767,6 +1767,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual([], bundle["remote"]["commits"])
         self.assertTrue(paths["result"].is_file())
         self.assertTrue(paths["canonical"].is_file())
+        self.assertEqual(
+            MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
+            bundle["result"]["decision"]["schema"],
+        )
         command = runner.call_args.args[0]
         self.assertEqual(
             "gpt-5.6-sol", command[command.index("--model") + 1]
@@ -1826,6 +1830,43 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
         self.assertEqual(0, process.returncode, process.stderr)
         self.assertIn("--model <model>", process.stdout)
+
+    def test_local_worker_environment_removes_github_credentials_and_blocks_remotes(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GH_TOKEN": "gh-secret",
+                "GITHUB_TOKEN": "github-secret",
+                "GH_ENTERPRISE_TOKEN": "enterprise-secret",
+                "SSH_AUTH_SOCK": "agent-socket",
+            },
+        ):
+            environment = MODULE.local_worker_environment()
+
+        for name in (
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "SSH_AUTH_SOCK",
+        ):
+            self.assertNotIn(name, environment)
+        self.assertEqual("0", environment["GIT_TERMINAL_PROMPT"])
+        self.assertEqual("Never", environment["GCM_INTERACTIVE"])
+        self.assertIn("copilot-review-loop-empty-gh-", environment["GH_CONFIG_DIR"])
+        configured = {
+            (
+                environment[f"GIT_CONFIG_KEY_{index}"],
+                environment[f"GIT_CONFIG_VALUE_{index}"],
+            )
+            for index in range(int(environment["GIT_CONFIG_COUNT"]))
+        }
+        self.assertIn(
+            ("url.https://github.invalid/.insteadOf", "https://github.com/"),
+            configured,
+        )
+        self.assertIn(("credential.helper", ""), configured)
+        self.assertIn(("protocol.https.allow", "never"), configured)
+        self.assertIn(("protocol.ssh.allow", "never"), configured)
 
     def test_local_worker_rejects_agent_task_alias_fallback_events(self):
         copilot_home = self.directory / "alias-copilot-home"
@@ -1910,7 +1951,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.run_actual_local_worker(None)
 
         self.assertEqual(
-            self.source_fingerprint,
+            MODULE.local_source_owner_fingerprint(self.source_fingerprint),
             failure.exception.details["source_after"],
         )
 
@@ -1920,18 +1961,28 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
         with self.assertRaisesRegex(MODULE.WorkflowError, "valid JSON"):
             self.run_actual_local_worker(write_malformed)
+        self.assertFalse((self.directory / "result.json").exists())
+        self.assertFalse((self.directory / "canonical.json").exists())
+        self.assertEqual(
+            self.source_fingerprint,
+            MODULE.local_source_fingerprint.return_value,
+        )
+        self.assertEqual(
+            self.github_fingerprint,
+            MODULE.github_decision_fingerprint.return_value,
+        )
 
-    def test_local_worker_rejects_model_and_contract_identity_mismatch(self):
+    def test_local_worker_rejects_model_and_stale_finding_identity(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "requires gpt-5.6-sol"):
             self.run_actual_local_worker(
                 self.write_valid_local_decision,
                 requested_model="gpt-6-astra",
             )
 
-        def write_wrong_contract(*, decision_path, **_kwargs):
+        def write_stale_finding(*, decision_path, **_kwargs):
             decision_path.write_text(
                 json.dumps(
-                    self.local_decision(contract_id="0" * 64),
+                    self.local_decision(contract_id="finding-from-old-request"),
                     indent=2,
                     sort_keys=True,
                 )
@@ -1940,8 +1991,99 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 newline="\n",
             )
 
-        with self.assertRaisesRegex(MODULE.WorkflowError, "contract"):
-            self.run_actual_local_worker(write_wrong_contract)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "unknown"):
+            self.run_actual_local_worker(write_stale_finding)
+
+    def test_invalid_decision_restores_verified_candidate_commit(self):
+        after = {
+            **self.source_fingerprint,
+            "head": self.fix,
+            "refs": {"refs/heads/feature": self.fix},
+        }
+        MODULE.local_source_fingerprint.return_value = after
+
+        def write_stale_finding(*, decision_path, **_kwargs):
+            decision_path.write_text(
+                json.dumps(
+                    self.local_decision(contract_id="finding-from-old-request"),
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+
+        transition = [
+            {
+                "sha": self.fix,
+                "parent": self.head,
+                "paths": ["src/app.py"],
+                "patch_sha256": "a" * 64,
+            }
+        ]
+        with (
+            mock.patch.object(
+                MODULE,
+                "local_source_transition_evidence",
+                return_value=transition,
+            ),
+            mock.patch.object(
+                MODULE,
+                "restore_source_after_invalid_decision",
+                return_value=MODULE.local_source_owner_fingerprint(
+                    self.source_fingerprint
+                ),
+            ) as restore,
+            self.assertRaisesRegex(MODULE.WorkflowError, "unknown"),
+        ):
+            self.run_actual_local_worker(write_stale_finding)
+
+        restore.assert_called_once_with(
+            self.repo_root,
+            before=self.source_fingerprint,
+            after=after,
+        )
+        self.assertFalse((self.directory / "result.json").exists())
+        self.assertFalse((self.directory / "canonical.json").exists())
+
+    def test_missing_decision_restores_verified_candidate_commit(self):
+        after = {
+            **self.source_fingerprint,
+            "head": self.fix,
+            "refs": {"refs/heads/feature": self.fix},
+        }
+        MODULE.local_source_fingerprint.return_value = after
+        transition = [
+            {
+                "sha": self.fix,
+                "parent": self.head,
+                "paths": ["src/app.py"],
+                "patch_sha256": "a" * 64,
+            }
+        ]
+        with (
+            mock.patch.object(
+                MODULE,
+                "local_source_transition_evidence",
+                return_value=transition,
+            ),
+            mock.patch.object(
+                MODULE,
+                "restore_source_after_invalid_decision",
+                return_value=MODULE.local_source_owner_fingerprint(
+                    self.source_fingerprint
+                ),
+            ) as restore,
+            self.assertRaisesRegex(MODULE.WorkflowError, "no decision report"),
+        ):
+            self.run_actual_local_worker(None)
+
+        restore.assert_called_once_with(
+            self.repo_root,
+            before=self.source_fingerprint,
+            after=after,
+        )
 
     def test_local_worker_rejects_checked_out_branch_ref_mismatch(self):
         mutated = copy.deepcopy(self.source_fingerprint)
@@ -2026,6 +2168,83 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         }
 
         self.assertEqual(projected_probe, stored)
+        self.assertEqual(str(self.repo_root.resolve()), stored["worktree"])
+
+    def test_source_transition_derives_parent_paths_and_exact_patch_digest(self):
+        before = {
+            **self.source_fingerprint,
+            "worktree": str(self.repo_root.resolve()),
+        }
+        after = {
+            **before,
+            "head": self.fix,
+            "refs": {"refs/heads/feature": self.fix},
+        }
+        patch = b"diff --git a/src/app.py b/src/app.py\n+fixed\n"
+
+        def git(_root, *arguments):
+            if arguments == (
+                "rev-list",
+                "--reverse",
+                f"{self.head}..{self.fix}",
+            ):
+                return self.fix
+            if arguments == ("rev-list", "--parents", "-n", "1", self.fix):
+                return f"{self.fix} {self.head}"
+            if arguments == ("show", "-s", "--format=%B", self.fix):
+                return "Fix finding"
+            raise AssertionError(arguments)
+
+        with (
+            mock.patch.object(MODULE, "git", side_effect=git),
+            mock.patch.object(
+                MODULE, "git_z_paths", return_value=["src/app.py"]
+            ),
+            mock.patch.object(
+                MODULE,
+                "run_bytes",
+                return_value=MODULE.subprocess.CompletedProcess(
+                    ["git"], 0, patch, b""
+                ),
+            ),
+        ):
+            evidence = MODULE.local_source_transition_evidence(
+                self.repo_root,
+                before=before,
+                after=after,
+            )
+
+        self.assertEqual(
+            [
+                {
+                    "sha": self.fix,
+                    "parent": self.head,
+                    "paths": ["src/app.py"],
+                    "patch_sha256": hashlib.sha256(patch).hexdigest(),
+                }
+            ],
+            evidence,
+        )
+
+    def test_source_transition_rejects_worktree_drift(self):
+        before = {
+            **self.source_fingerprint,
+            "worktree": str(self.repo_root.resolve()),
+        }
+        after = {
+            **before,
+            "worktree": str((self.directory / "other-worktree").resolve()),
+        }
+
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "changed the branch or working tree",
+        ):
+            MODULE.local_source_transition_evidence(
+                self.repo_root,
+                before=before,
+                after=after,
+            )
 
     def test_terminal_recovery_refreezes_only_tree_identical_forward_base(self):
         live_base = "a" * 40
@@ -2175,6 +2394,31 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         result.pop("worker")
         result.pop("model_attestation")
+        result.pop("source_transition")
+        identity = self.preflight["comment_identities"][0]
+        legacy_decision = {
+            "schema": MODULE.LEGACY_DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
+            "contract_id": MODULE.decision_report_contract(self.preflight),
+            "decisions": [
+                {
+                    "finding_key": MODULE.decision_finding_key(identity),
+                    "disposition": "no_change",
+                    "reason": "The current implementation already handles this case.",
+                    "commit": None,
+                    "reply": (
+                        "No change is needed because the case is already handled."
+                    ),
+                    "changed_paths": [],
+                }
+            ],
+        }
+        paths["decision"].write_text(
+            json.dumps(legacy_decision, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        result["decision"]["sha256"] = MODULE.sha256_file(paths["decision"])
+        result["decision"].pop("schema")
         paths["result"].write_text(
             json.dumps(result, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -2196,6 +2440,59 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual("sol", result["command"][4])
         self.assertEqual(result["run_id"], retained["result"]["run_id"])
 
+    def test_retained_v2_local_decision_is_audit_only_compatibility(self):
+        _bundle, _runner, paths = self.run_actual_local_worker(
+            self.write_valid_local_decision
+        )
+        result = json.loads(paths["result"].read_text(encoding="utf-8"))
+        result["schema"] = MODULE.LEGACY_LOCAL_DECISION_RESULT_SCHEMA_V2
+        result["policy"] = MODULE.LEGACY_LOCAL_DECISION_POLICY_V2
+        result.pop("source_transition")
+        identity = self.preflight["comment_identities"][0]
+        legacy_decision = {
+            "schema": MODULE.LEGACY_DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
+            "contract_id": MODULE.decision_report_contract(self.preflight),
+            "decisions": [
+                {
+                    "finding_key": MODULE.decision_finding_key(identity),
+                    "disposition": "no_change",
+                    "reason": "The current implementation already handles this case.",
+                    "commit": None,
+                    "reply": (
+                        "No change is needed because the case is already handled."
+                    ),
+                    "changed_paths": [],
+                }
+            ],
+        }
+        paths["decision"].write_text(
+            json.dumps(legacy_decision, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        result["decision"]["sha256"] = MODULE.sha256_file(paths["decision"])
+        result["decision"].pop("schema")
+        paths["result"].write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        retained = MODULE.validate_retained_local_decision(
+            repo_root=self.repo_root,
+            target=MODULE.parse_target("owner/repo#7"),
+            preflight=self.preflight,
+            prompt_path=paths["prompt"],
+            decision_path=paths["decision"],
+            result_path=paths["result"],
+            canonical_path=paths["canonical"],
+            requested_model="gpt-5.6-sol",
+        )
+
+        self.assertEqual(MODULE.LEGACY_LOCAL_DECISION_POLICY_V2, result["policy"])
+        self.assertEqual("gpt-5.6-sol", result["command"][4])
+        self.assertEqual(result["run_id"], retained["result"]["run_id"])
+
     def test_agent_definition_is_thin_and_version_is_bumped(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
@@ -2207,7 +2504,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.57")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.58")
+        self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
+        self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
+        self.assertEqual(
+            "marketplace-local-review-decision-worker@3",
+            MODULE.LOCAL_DECISION_POLICY,
+        )
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -2240,26 +2543,26 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_prompt_is_self_contained_versioned_and_treats_inputs_as_untrusted(self):
         prompt = MODULE.build_worker_prompt(
             self.preflight,
+            request_id="request-1",
             iteration_allowance=1,
             prior_history=[],
         )
         self.assertIn("decision object atomically as UTF-8 JSON", prompt)
-        self.assertIn("local worker prompt version 7", prompt)
+        self.assertIn("local worker prompt version 8", prompt)
         self.assertIn("opaque coordinator-generated values", prompt)
-        self.assertIn("mechanically joins each decision", prompt)
+        self.assertIn("joins each decision", prompt)
         self.assertIn("negative ID is intentional", prompt)
         self.assertIn('"iteration_allowance": 1', prompt)
         self.assertIn("Do not sleep, poll, watch", prompt)
         self.assertIn('"thread_id": "PRRT_thread"', prompt)
         self.assertIn(
-            '"id": "github.copilot.copilot-review-loop-decision-report"',
+            MODULE.decision_finding_id("request-1", 0),
             prompt,
         )
-        self.assertIn(MODULE.decision_report_contract(self.preflight), prompt)
+        self.assertNotIn('"contract_id"', prompt)
+        self.assertNotIn('"finding_key"', prompt)
         self.assertIn(
-            MODULE.decision_finding_key(
-                self.preflight["comment_identities"][0]
-            ),
+            "Do not put commit SHAs, parents, changed paths, patch digests",
             prompt,
         )
         self.assertIn("untrusted data", prompt)
@@ -2431,7 +2734,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     MODULE.decision_finding_key(changed),
                 )
 
-    def test_decision_report_restores_suppressed_identities_by_opaque_key(self):
+    def test_decision_list_restores_suppressed_identities_by_opaque_id(self):
         preflight = copy.deepcopy(self.preflight)
         preflight["pr"].update(
             {
@@ -2475,20 +2778,21 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             )
         ]
         preflight["comment_identities"] = identities
-        keys = [MODULE.decision_finding_key(identity) for identity in identities]
+        finding_ids = [
+            MODULE.decision_finding_id("request-383", position)
+            for position in range(len(identities))
+        ]
         payload = {
-            "schema": MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
-            "contract_id": MODULE.decision_report_contract(preflight),
             "decisions": [
                 {
-                    "finding_key": key,
+                    "finding_id": finding_id,
                     "disposition": "no_change",
                     "reason": f"Verified finding {index} against the pinned source.",
-                    "commit": None,
-                    "reply": f"The pinned source handles finding {index}.",
-                    "changed_paths": [],
+                    "proposed_reply": f"The pinned source handles finding {index}.",
                 }
-                for index, key in reversed(list(enumerate(keys)))
+                for index, finding_id in reversed(
+                    list(enumerate(finding_ids))
+                )
             ],
         }
 
@@ -2498,6 +2802,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             preflight=preflight,
             remote={"commits": [], "requires_apply": False},
             paths_by_commit={},
+            active_local_decisions=True,
         )
 
         self.assertEqual(MODULE.COPILOT_REVIEW_REPORT_SCHEMA, report["schema"])
@@ -2513,36 +2818,27 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             [item["reply"] for item in report["comments"]],
         )
 
-    def test_decision_report_requires_exact_contract_key_set_and_count(self):
-        key = MODULE.decision_finding_key(
-            self.preflight["comment_identities"][0]
-        )
+    def test_decision_list_blocks_stale_unknown_duplicate_and_unreviewed_ids(self):
+        finding_id = MODULE.decision_finding_id("request-1", 0)
         decision = {
-            "finding_key": key,
+            "finding_id": finding_id,
             "disposition": "no_change",
             "reason": "Verified against the pinned source.",
-            "commit": None,
-            "reply": "The pinned source already handles this finding.",
-            "changed_paths": [],
+            "proposed_reply": "The pinned source already handles this finding.",
         }
-        payload = {
-            "schema": MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
-            "contract_id": MODULE.decision_report_contract(self.preflight),
-            "decisions": [decision],
-        }
+        payload = {"decisions": [decision]}
 
-        for field, value, message in (
-            ("contract_id", "wrong", "stale contract"),
-            ("decisions", [], "finding count"),
+        for value, message in (
+            ([], "stale or incomplete"),
             (
-                "decisions",
-                [{**decision, "finding_key": "0" * 64}],
-                "missing or unexpected findings",
+                [{**decision, "finding_id": MODULE.decision_finding_id("old-run", 0)}],
+                "unknown, duplicate, or unreviewed",
             ),
+            ([decision, decision], "stale or incomplete"),
         ):
             malformed = copy.deepcopy(payload)
-            malformed[field] = value
-            with self.subTest(field=field, value=value):
+            malformed["decisions"] = value
+            with self.subTest(value=value):
                 with self.assertRaisesRegex(MODULE.WorkflowError, message):
                     MODULE.validate_copilot_review_report(
                         json.dumps(malformed),
@@ -2550,23 +2846,85 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                         preflight=self.preflight,
                         remote={"commits": [], "requires_apply": False},
                         paths_by_commit={},
+                        active_local_decisions=True,
                     )
-
-    def test_decision_report_retains_exact_commit_and_path_validation(self):
-        key = MODULE.decision_finding_key(
-            self.preflight["comment_identities"][0]
+        two_findings = copy.deepcopy(self.preflight)
+        second_identity = copy.deepcopy(
+            two_findings["comment_identities"][0]
         )
-        payload = {
-            "schema": MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
+        second_identity["id"] = 18
+        second_identity["thread_id"] = "PRRT_second"
+        two_findings["comment_identities"].append(second_identity)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "malformed decision"):
+            MODULE.validate_copilot_review_report(
+                json.dumps({"decisions": [decision, decision]}),
+                request_id="request-1",
+                preflight=two_findings,
+                remote={"commits": [], "requires_apply": False},
+                paths_by_commit={},
+                active_local_decisions=True,
+            )
+
+    def test_active_decision_list_rejects_legacy_identity_and_evidence_fields(self):
+        identity = self.preflight["comment_identities"][0]
+        legacy = {
+            "schema": MODULE.LEGACY_DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
             "contract_id": MODULE.decision_report_contract(self.preflight),
             "decisions": [
                 {
-                    "finding_key": key,
+                    "finding_key": MODULE.decision_finding_key(identity),
+                    "disposition": "no_change",
+                    "reason": "No change is needed.",
+                    "commit": None,
+                    "reply": "No change is needed.",
+                    "changed_paths": [],
+                }
+            ],
+        }
+        with self.assertRaisesRegex(MODULE.WorkflowError, "legacy"):
+            MODULE.validate_copilot_review_report(
+                json.dumps(legacy),
+                request_id="request-1",
+                preflight=self.preflight,
+                remote={"commits": [], "requires_apply": False},
+                paths_by_commit={},
+                active_local_decisions=True,
+            )
+
+        fixed = {
+            "finding_id": MODULE.decision_finding_id("request-1", 0),
+            "disposition": "fixed",
+        }
+        for field, value in (
+            ("commit", self.fix),
+            ("changed_paths", ["src/app.py"]),
+            ("repository", "owner/repo"),
+            ("pull_request", 7),
+            ("head_sha", self.head),
+            ("finding_fingerprint", "a" * 64),
+            ("validation_complete", True),
+            ("session_id", "local-session"),
+            ("github_outcome", "replied"),
+        ):
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(MODULE.WorkflowError, "malformed decision"),
+            ):
+                MODULE.validate_copilot_review_report(
+                    json.dumps({"decisions": [{**fixed, field: value}]}),
+                    request_id="request-1",
+                    preflight=self.preflight,
+                    remote={"commits": [self.fix], "requires_apply": False},
+                    paths_by_commit={self.fix: ["src/app.py"]},
+                    active_local_decisions=True,
+                )
+
+    def test_decision_list_uses_coordinator_owned_commit_and_paths(self):
+        payload = {
+            "decisions": [
+                {
+                    "finding_id": MODULE.decision_finding_id("request-1", 0),
                     "disposition": "fixed",
-                    "reason": "The focused test confirms the corrected behavior.",
-                    "commit": self.fix,
-                    "reply": "Fixed and covered by the focused test.",
-                    "changed_paths": ["src/app.py"],
                 }
             ],
         }
@@ -2578,17 +2936,41 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             preflight=self.preflight,
             remote=remote,
             paths_by_commit={self.fix: ["src/app.py"]},
+            active_local_decisions=True,
         )
         self.assertEqual(self.fix, report["comments"][0]["commit"])
+        self.assertEqual(["src/app.py"], report["comments"][0]["changed_paths"])
 
-        payload["decisions"][0]["changed_paths"] = ["src/other.py"]
-        with self.assertRaisesRegex(MODULE.WorkflowError, "unexpected paths"):
+        payload["decisions"][0]["commit"] = self.fix
+        with self.assertRaisesRegex(MODULE.WorkflowError, "malformed decision"):
             MODULE.validate_copilot_review_report(
                 json.dumps(payload),
                 request_id="request-1",
                 preflight=self.preflight,
                 remote=remote,
                 paths_by_commit={self.fix: ["src/app.py"]},
+                active_local_decisions=True,
+            )
+
+        payload["decisions"][0] = {
+            "finding_id": MODULE.decision_finding_id("request-1", 0),
+            "disposition": "fixed",
+        }
+        second_fix = "6" * 40
+        with self.assertRaisesRegex(MODULE.WorkflowError, "at most one"):
+            MODULE.validate_copilot_review_report(
+                json.dumps(payload),
+                request_id="request-1",
+                preflight=self.preflight,
+                remote={
+                    "commits": [self.fix, second_fix],
+                    "requires_apply": False,
+                },
+                paths_by_commit={
+                    self.fix: ["src/app.py"],
+                    second_fix: ["src/other.py"],
+                },
+                active_local_decisions=True,
             )
 
     def test_both_exact_383_malformed_reports_fail_closed(self):
@@ -3097,6 +3479,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         prompt = MODULE.build_worker_prompt(
             preflight,
+            request_id="request-1",
             iteration_allowance=1,
             prior_history=[],
         )
@@ -3377,22 +3760,16 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             },
         }
         decision = {
-            "schema": MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA,
-            "contract_id": MODULE.decision_report_contract(preflight),
             "decisions": [
                 {
-                    "finding_key": finding_key,
+                    "finding_id": MODULE.decision_finding_id("request-1", 0),
                     "disposition": "fixed",
-                    "reason": "The published source commit contains the fix.",
-                    "commit": self.fix,
-                    "reply": "The existing source commit fixes this finding.",
-                    "changed_paths": ["src/app.py"],
                 }
             ],
         }
         with self.assertRaisesRegex(
             MODULE.WorkflowError,
-            "fixed comment does not name",
+            "no coordinator-owned source transition",
         ):
             MODULE.validate_copilot_review_report(
                 json.dumps(decision),
@@ -3400,6 +3777,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 preflight=preflight,
                 remote={"commits": [], "requires_apply": False},
                 paths_by_commit={},
+                active_local_decisions=True,
             )
 
         preflight["historical_fixes"] = historical
@@ -3409,6 +3787,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             preflight=preflight,
             remote={"commits": [], "requires_apply": False},
             paths_by_commit={},
+            active_local_decisions=True,
         )
 
         self.assertEqual("addressed", report["outcome"])
@@ -3425,6 +3804,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 preflight=changed,
                 remote={"commits": [], "requires_apply": False},
                 paths_by_commit={},
+                active_local_decisions=True,
             )
 
     def test_exact_v2_path_correlated_report_recovers_applied_local_commits(self):
