@@ -1,7 +1,7 @@
 {
   "name": "self-review-loop",
   "description": "Review and fix a GitHub pull request through a managed Agent Task without posting review comments.",
-  "version": "1.3.36",
+  "version": "1.3.37",
   "author": {
     "name": "Trask Stalnaker"
   },

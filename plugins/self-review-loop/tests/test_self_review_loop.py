@@ -2092,7 +2092,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.36")
+        self.assertEqual(plugin["version"], "1.3.37")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -2111,7 +2111,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             prior_history=[],
         )
         self.assertIn("workflow-specific semantic payload", prompt)
-        self.assertIn("worker prompt version 8", prompt)
+        self.assertIn("worker prompt version 9", prompt)
         self.assertIn("runtime adds the versioned wrapper", prompt)
         self.assertIn("compact clean payload", prompt.lower())
         self.assertIn('"status": "clean"', prompt)
@@ -2225,7 +2225,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "The pull request is clean.",
         )
 
-    def test_16161_compact_clean_semantic_payload_is_canonicalized(self):
+    def test_16161_compact_clean_with_findings_is_canonicalized(self):
         observed = {
             "body": self.preflight["pr"]["body"],
             "findings": [],
@@ -2267,6 +2267,52 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ),
         )
 
+    def test_16161_minimal_compact_clean_semantic_payload_is_canonicalized(self):
+        observed = {
+            "body": self.preflight["pr"]["body"],
+            "status": "clean",
+            "title": self.preflight["pr"]["title"],
+        }
+        result = self.semantic_result(payload=observed)
+        result["semantic_output"].update(
+            {
+                "path": (
+                    ".github/agent-task-semantic/"
+                    "ce2db286-6704-4f39-9b8e-c2bbc6d9c9a6.json"
+                ),
+                "commit": "63769c5b686eb5a061ba6045dd7a0661ad1c3b8b",
+                "sha256": (
+                    "757321cc311b5215f6db8aa27a13b76284e574d5474ceea91"
+                    "b71ec722bd7c315"
+                ),
+            }
+        )
+        result["generated"]["head_sha"] = (
+            "63769c5b686eb5a061ba6045dd7a0661ad1c3b8b"
+        )
+        remote = MODULE.validate_success_result(
+            result,
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+        )
+        content = MODULE.canonical_self_review_report(
+            preflight=self.preflight,
+            request_id=remote["request_id"],
+            semantic_payload=remote["semantic_payload"],
+        )
+        report = MODULE.validate_self_review_report(
+            content,
+            request_id=remote["request_id"],
+            preflight=self.preflight,
+            remote=remote,
+            max_iterations=5,
+            paths_by_commit={},
+        )
+        self.assertEqual(report["outcome"], "cleared")
+        self.assertEqual(report["iterations_used"], 1)
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(report["pull_request_metadata"]["decision"], "keep")
+
     def test_semantic_payload_rejects_missing_and_extra_fields(self):
         payload = {
             "body": self.preflight["pr"]["body"],
@@ -2278,6 +2324,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         }
         invalid_payloads = [
             {key: value for key, value in payload.items() if key != "summary"},
+            {key: value for key, value in payload.items() if key != "findings"},
             {**payload, "request_id": "worker-owned"},
             {
                 "body": self.preflight["pr"]["body"],
@@ -2290,6 +2337,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "body": self.preflight["pr"]["body"],
                 "findings": [],
                 "title": self.preflight["pr"]["title"],
+            },
+            {
+                "status": "clean",
+                "title": self.preflight["pr"]["title"],
+            },
+            {
+                "body": self.preflight["pr"]["body"],
+                "status": "clean",
             },
             {
                 "findings": [],
@@ -2322,6 +2377,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         invalid_payloads = [
             {**payload, "status": "max_iterations_reached"},
             {**payload, "findings": [{"body": "Unexpected finding."}]},
+            {
+                "body": payload["body"],
+                "status": "max_iterations_reached",
+                "title": payload["title"],
+            },
         ]
         for invalid in invalid_payloads:
             with (

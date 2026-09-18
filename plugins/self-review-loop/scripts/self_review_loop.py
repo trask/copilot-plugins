@@ -137,7 +137,7 @@ LEGACY_SELF_REVIEW_SEMANTIC_OUTPUT_SCHEMA = {
     "id": "github.copilot.agent-task-semantic-output",
     "version": 1,
 }
-WORKER_PROMPT_VERSION = 8
+WORKER_PROMPT_VERSION = 9
 MODEL_ALIASES = {
     "luna": "gpt-5.6-luna",
     "terra": "gpt-5.6-terra",
@@ -1416,7 +1416,6 @@ def build_worker_prompt(
         "title": "<complete final title>",
         "body": "<complete final body with LF line endings>",
         "status": "clean",
-        "findings": [],
     }
     return (
         f"Self Review Loop Agent Tasks worker prompt version {WORKER_PROMPT_VERSION}.\n\n"
@@ -3871,6 +3870,7 @@ def canonical_self_review_report(
         "summary",
         "title",
     }
+    minimal_compact_clean_keys = {"body", "status", "title"}
     compact_clean_keys = {"body", "findings", "status", "title"}
     payload_keys = set(semantic_payload)
     if payload_keys == detailed_keys:
@@ -3878,10 +3878,13 @@ def canonical_self_review_report(
         iterations_used = semantic_payload["iterations"]
         findings = semantic_payload["findings"]
         metadata_reason = semantic_payload["summary"]
-    elif payload_keys == compact_clean_keys:
+    elif payload_keys in (minimal_compact_clean_keys, compact_clean_keys):
         if (
             semantic_payload.get("status") != "clean"
-            or semantic_payload.get("findings") != []
+            or (
+                payload_keys == compact_clean_keys
+                and semantic_payload.get("findings") != []
+            )
         ):
             raise WorkflowError(
                 "Self Review Loop compact semantic payload is malformed"
