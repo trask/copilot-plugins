@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "ecddfa60e8896dfef31f2e441537f04a3814f98c1439f4d25ac65e35b5518412"
+    "67b75d394ea05079aa20f51ae1ddd480d269fead09328f76a39b88049378f2f9"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 V5_CONFLICT_POLICY = "marketplace-conflict-worker@5"
@@ -84,13 +84,13 @@ V5_CONFLICT_POLICY_IDENTITY = {
     "version": 5,
     "sha256": V5_CONFLICT_POLICY_SHA256,
 }
-CONFLICT_POLICY = "marketplace-conflict-worker@6"
+CONFLICT_POLICY = "marketplace-conflict-worker@7"
 CONFLICT_POLICY_SHA256 = (
-    "157e03e39720f4d7ef6cab6410f6f866974a1e01fef64cc782474fc04a204b63"
+    "60011fcbc545436fd6be68abc2776c8b9e4754580d038ae9b2b30a309b043900"
 )
 CONFLICT_POLICY_IDENTITY = {
     "id": "marketplace-conflict-worker",
-    "version": 6,
+    "version": 7,
     "sha256": CONFLICT_POLICY_SHA256,
 }
 CONFLICT_REQUEST_SCHEMA = {
@@ -7479,6 +7479,7 @@ def conflict_preflight(
     iteration_number: int,
     iteration_budget: int,
     model: str,
+    allow_native_stack: bool = True,
 ) -> dict[str, Any]:
     require_clean_worktree(repo_root)
     require_no_integration_in_progress(repo_root)
@@ -7516,6 +7517,11 @@ def conflict_preflight(
             "pr": metadata,
             "strategy": None,
         }
+    if stack is not None and not allow_native_stack:
+        raise WorkflowError(
+            "native-stack publication is outside the pipeline scope; "
+            "full-stack authorization requires --whole-stack"
+        )
     relations = stack_relations(metadata)
     methods = repository_merge_methods(metadata["repo_name"])
     strategy_choice = choose_strategy(
@@ -7777,9 +7783,10 @@ def build_conflict_prompt(preflight: dict[str, Any]) -> str:
         "The coordinator derives commit mappings, changed paths, and patch "
         "differences from Git.\n\n"
         "Run the repository's required formatting and focused validation remotely. "
-        "Publish only the dispatcher-assigned request-scoped native-stack refs plus "
-        "the authoritative Agent Task branch. For a single role, keep the code only "
-        "on the Agent Task branch. Do not push a user branch or edit pull request "
+        "Commit source deliverables only on the authoritative Agent Task branch. "
+        "The controller dispatches one task per native-stack member and supplies "
+        "its exact predecessor code tip. Do not create additional remote refs, "
+        "push a user branch, or edit pull request "
         "metadata. Do "
         "not read or transmit credentials. Do not use a custom agent, Cloud "
         "Sandboxes, or a local fallback.\n\n"
@@ -8365,6 +8372,11 @@ def validate_conflict_result_identity(
         "id": request["request_id"],
         "sha256": request["request_sha256"],
     }
+    expected_task_base = (
+        request["native_stack"]["members"][-1]["head_sha"]
+        if request["strategy"] == "native-stack"
+        else request["pull_request"]["head_sha"]
+    )
     if (
         result.get("error") is not None
         or result.get("model") != request["model"]
@@ -8379,8 +8391,8 @@ def validate_conflict_result_identity(
         or not isinstance(task.get("id"), str)
         or not task["id"]
         or task.get("state") != "completed"
-        or task.get("base_ref") != request["pull_request"]["head_sha"]
-        or task.get("base_sha") != request["pull_request"]["head_sha"]
+        or task.get("base_ref") != expected_task_base
+        or task.get("base_sha") != expected_task_base
         or not isinstance(generated, dict)
         or set(generated) != {"artifact", "code_refs"}
         or not isinstance(generated.get("code_refs"), list)
@@ -8388,6 +8400,15 @@ def validate_conflict_result_identity(
         or result.get("application") != {"status": "quarantined_refs"}
     ):
         raise WorkflowError("managed conflict result identity does not match the request")
+    if request["strategy"] == "native-stack":
+        members = generated["artifact"].get("members")
+        if (
+            not isinstance(members, list)
+            or not members
+            or not isinstance(members[-1], dict)
+            or members[-1].get("task") != task
+        ):
+            raise WorkflowError("managed stack final task identity does not match")
     return generated["code_refs"], generated["artifact"]
 
 
@@ -8446,9 +8467,17 @@ def verify_rebased_range_mechanically(
     old_commits: list[dict[str, Any]],
     mappings: list[Any],
     allowed_paths: set[str],
+    *,
+    fix_commits: list[str] | None = None,
 ) -> None:
     commits = ordered_commits(repo_root, base, tip)
-    if len(commits) != len(old_commits) or len(mappings) != len(old_commits):
+    fixes = [] if fix_commits is None else fix_commits
+    if (
+        not isinstance(fixes, list)
+        or len(commits) != len(old_commits) + len(fixes)
+        or commits[len(old_commits):] != fixes
+        or len(mappings) != len(old_commits)
+    ):
         raise WorkflowError("rewritten range dropped, added, squashed, or reordered commits")
     parent = base
     for old, new_sha, mapping in zip(old_commits, commits, mappings):
@@ -8466,6 +8495,122 @@ def verify_rebased_range_mechanically(
                 "generated commit mapping does not match mechanical history"
             )
         parent = new_sha
+    for new_sha in fixes:
+        if commit_parents(repo_root, new_sha) != [parent]:
+            raise WorkflowError("member fix suffix is not linear")
+        paths = conflict_changed_paths(repo_root, new_sha)
+        if AGENT_TASK_OUTPUT_REPORT in paths or not set(paths) <= allowed_paths:
+            raise WorkflowError("member fix changed an undeclared or reserved path")
+        parent = new_sha
+
+
+def verify_source_artifact(
+    repo_root: Path,
+    request_id: str,
+    artifact: dict[str, Any],
+    source_tip: str,
+    role: str,
+) -> None:
+    artifact_ref = quarantine_ref(request_id, role)
+    artifact_head = git(repo_root, "rev-parse", "--verify", artifact_ref).lower()
+    if (
+        artifact_head != artifact["head_sha"]
+        or artifact["source_tip_sha"] != source_tip
+    ):
+        raise WorkflowError("authoritative generated ref does not match source history")
+    report = artifact["report"]
+    if report is None:
+        if artifact_head != source_tip:
+            raise WorkflowError("generated ref has unaccounted commits after source")
+        return
+    expected_report = {
+        "path": AGENT_TASK_OUTPUT_REPORT,
+        "commit": artifact_head,
+        "blob_sha": git(
+            repo_root, "rev-parse", "--verify",
+            f"{artifact_head}:{AGENT_TASK_OUTPUT_REPORT}",
+        ).lower(),
+    }
+    if (
+        report != expected_report
+        or artifact_head == source_tip
+        or commit_parents(repo_root, artifact_head) != [source_tip]
+        or conflict_changed_paths(repo_root, artifact_head) != [AGENT_TASK_OUTPUT_REPORT]
+    ):
+        raise WorkflowError("optional output report commit is malformed")
+
+
+def verify_stack_task_artifacts(
+    repo_root: Path,
+    request: dict[str, Any],
+    code_refs: list[dict[str, Any]],
+    artifact: dict[str, Any],
+) -> None:
+    members = request["native_stack"]["members"]
+    artifacts = artifact.get("members")
+    if not isinstance(artifacts, list) or len(artifacts) != len(members):
+        raise WorkflowError("stack task artifacts are incomplete")
+    task_ids: set[str] = set()
+    branches: set[str] = set()
+    forbidden_branches = {member["head_ref"] for member in members}
+    forbidden_branches.add(request["native_stack"]["trunk"]["ref"])
+    for member, code_ref, item in zip(members, code_refs, artifacts):
+        if not isinstance(item, dict) or set(item) != {
+            "pr_number", "task", "request", "branch",
+            "head_sha", "source_tip_sha", "report",
+        }:
+            raise WorkflowError("stack task artifact is malformed")
+        task = item["task"]
+        branch = item["branch"]
+        if (
+            item["pr_number"] != member["pr_number"]
+            or not isinstance(task, dict)
+            or set(task) != {"id", "url", "state", "base_ref", "base_sha"}
+            or not isinstance(task["id"], str)
+            or not task["id"]
+            or task["id"] in task_ids
+            or task["state"] != "completed"
+            or task["base_ref"] != member["head_sha"]
+            or task["base_sha"] != member["head_sha"]
+            or not isinstance(branch, str)
+            or not branch
+            or branch in branches | forbidden_branches
+            or branch != code_ref["ref"]
+        ):
+            raise WorkflowError("stack task ownership or ordering is invalid")
+        task_ids.add(task["id"])
+        branches.add(branch)
+        projected = {
+            **request,
+            "request_id": f"{request['request_id']}-member-{member['pr_number']}",
+            "strategy": "rebase",
+            "head_commits": member["old_commits"],
+            "native_stack": None,
+            "merge_base": member["direct_merge_base"],
+            "pull_request": {
+                "number": member["pr_number"],
+                "url": f"https://github.com/{member['repository']}/pull/{member['pr_number']}",
+                "head_repository": member["repository"],
+                "head_ref": member["head_ref"],
+                "head_sha": member["head_sha"],
+                "base_repository": member["repository"],
+                "base_ref": member["direct_base_ref"],
+                "base_sha": code_ref["base_sha"],
+            },
+        }
+        if item["request"] != {
+            "id": projected["request_id"], "sha256": request_digest(projected),
+        }:
+            raise WorkflowError("stack task request does not match frozen member")
+        verify_source_artifact(
+            repo_root, request["request_id"], item, code_ref["new_sha"],
+            f"artifact-member-{member['pr_number']}",
+        )
+    if any(
+        artifact.get(key) != artifacts[-1][key]
+        for key in ("branch", "head_sha", "source_tip_sha", "report")
+    ):
+        raise WorkflowError("stack final artifact is not the last member")
 
 
 def verify_quarantined_result(
@@ -8474,6 +8619,12 @@ def verify_quarantined_result(
     code_refs: list[dict[str, Any]],
     artifact: dict[str, Any],
 ) -> None:
+    if (
+        not isinstance(code_refs, list)
+        or not all(isinstance(item, dict) for item in code_refs)
+        or not isinstance(artifact, dict)
+    ):
+        raise WorkflowError("generated candidate is malformed")
     expected_roles = (
         [f"member:{member['pr_number']}" for member in request["native_stack"]["members"]]
         if request["strategy"] == "native-stack"
@@ -8481,6 +8632,14 @@ def verify_quarantined_result(
     )
     if [item.get("role") for item in code_refs] != expected_roles:
         raise WorkflowError("generated code roles are missing, duplicated, or reordered")
+    if request["strategy"] == "native-stack":
+        artifacts = artifact.get("members")
+        if (
+            not isinstance(artifacts, list)
+            or len(artifacts) != len(code_refs)
+            or not all(isinstance(item, dict) for item in artifacts)
+        ):
+            raise WorkflowError("stack task artifacts are incomplete")
     allowed_paths = set(request["allowed_paths"])
     previous_tip = (
         request["native_stack"]["trunk"]["sha"]
@@ -8500,6 +8659,8 @@ def verify_quarantined_result(
             "lease_sha",
             "commits",
         }
+        if request["strategy"] == "native-stack":
+            expected_keys.add("fix_commits")
         if not isinstance(code_ref, dict) or set(code_ref) != expected_keys:
             raise WorkflowError("generated code ref is malformed")
         role = code_ref["role"]
@@ -8508,7 +8669,7 @@ def verify_quarantined_result(
         if actual != code_ref["new_sha"]:
             raise WorkflowError("quarantined code ref does not match its declared head")
         expected_locator = (
-            assigned_code_ref(request["request_id"], role)
+            artifact["members"][index].get("branch")
             if request["strategy"] == "native-stack"
             else artifact.get("branch")
             if isinstance(artifact, dict)
@@ -8580,6 +8741,8 @@ def verify_quarantined_result(
                 or code_ref["old_sha"] != member["head_sha"]
                 or code_ref["lease_sha"] != member["lease_sha"]
                 or code_ref["base_sha"] != previous_tip
+                or code_ref["base_ref"] != member["direct_base_ref"]
+                or not isinstance(code_ref["fix_commits"], list)
             ):
                 raise WorkflowError("native stack result violates member order or lease")
             verify_native_stack_member_input(repo_root, member)
@@ -8590,42 +8753,19 @@ def verify_quarantined_result(
                 member["old_commits"],
                 code_ref["commits"],
                 allowed_paths,
+                fix_commits=code_ref["fix_commits"],
             )
             previous_tip = code_ref["new_sha"]
     artifact_keys = {"branch", "head_sha", "source_tip_sha", "report", "receipt"}
+    if request["strategy"] == "native-stack":
+        artifact_keys.add("members")
     if not isinstance(artifact, dict) or set(artifact) != artifact_keys:
         raise WorkflowError("managed artifact identity is malformed")
-    artifact_ref = quarantine_ref(request["request_id"], "artifact")
-    artifact_head = git(repo_root, "rev-parse", "--verify", artifact_ref).lower()
-    source_tip = code_refs[-1]["new_sha"]
-    if (
-        artifact_head != artifact["head_sha"]
-        or artifact["source_tip_sha"] != source_tip
-    ):
-        raise WorkflowError("authoritative generated ref does not match source history")
-    report = artifact["report"]
-    if report is None:
-        if artifact_head != source_tip:
-            raise WorkflowError("generated ref has unaccounted commits after source")
-    else:
-        expected_report = {
-            "path": AGENT_TASK_OUTPUT_REPORT,
-            "commit": artifact_head,
-            "blob_sha": git(
-                repo_root,
-                "rev-parse",
-                "--verify",
-                f"{artifact_head}:{AGENT_TASK_OUTPUT_REPORT}",
-            ).lower(),
-        }
-        if (
-            report != expected_report
-            or artifact_head == source_tip
-            or commit_parents(repo_root, artifact_head) != [source_tip]
-            or conflict_changed_paths(repo_root, artifact_head)
-            != [AGENT_TASK_OUTPUT_REPORT]
-        ):
-            raise WorkflowError("optional output report commit is malformed")
+    verify_source_artifact(
+        repo_root, request["request_id"], artifact, code_refs[-1]["new_sha"], "artifact"
+    )
+    if request["strategy"] == "native-stack":
+        verify_stack_task_artifacts(repo_root, request, code_refs, artifact)
     receipt = artifact["receipt"]
     expected_receipt = {
         "schema": CONFLICT_RECEIPT_SCHEMA,
@@ -8866,6 +9006,11 @@ def publish_conflict_result(
     save_state(state_path, state)
     for role in [item["role"] for item in code_refs] + ["artifact"]:
         git_try(repo_root, "update-ref", "-d", quarantine_ref(request["request_id"], role))
+    for member in task.get("artifact", {}).get("members", []):
+        git_try(
+            repo_root, "update-ref", "-d",
+            quarantine_ref(request["request_id"], f"artifact-member-{member['pr_number']}"),
+        )
     for file_name in task.get("recovery_files") or []:
         try:
             Path(file_name).unlink(missing_ok=True)
@@ -8900,7 +9045,7 @@ def publish_conflict_result(
     }
 
 
-def command_agent_task(args: argparse.Namespace) -> None:
+def require_fresh_invocation(args: argparse.Namespace) -> None:
     replacement_values = (
         args.replace_unidentified_owner,
         args.replace_malformed_completed_task,
@@ -8914,6 +9059,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "resume and legacy-owner replacement are disabled; start a fresh "
             "invocation with --new-invocation"
         )
+
+
+def command_agent_task(args: argparse.Namespace) -> None:
+    require_fresh_invocation(args)
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
     target = resolve_target(args.target, repo_root)
@@ -9253,6 +9402,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 iteration_number=iteration_number,
                 iteration_budget=iteration_budget,
                 model=model,
+                **(
+                    {"allow_native_stack": args.whole_stack}
+                    if getattr(args, "command", None) == "pipeline"
+                    else {}
+                ),
             )
         except NativeStackNormalizationRequired as error:
             task = state["agent_task"]
@@ -9670,12 +9824,72 @@ def command_agent_task(args: argparse.Namespace) -> None:
     emit(publish_conflict_result(state_path, state))
 
 
+def command_pipeline(args: argparse.Namespace) -> int:
+    require_fresh_invocation(args)
+    if not args.state or not args.pipeline_run or not args.repo_root:
+        raise WorkflowError("pipeline requires --state, --pipeline-run, and --repo-root")
+    state_path = cli_path(args.state)
+    require_external_path(state_path, cli_path(args.repo_root).resolve())
+    if state_path.exists():
+        raise WorkflowError("pipeline state already exists; start a fresh invocation")
+    if args.pipeline_iteration is None and args.pipeline_max_iterations is None:
+        args.pipeline_iteration = 1
+        args.pipeline_max_iterations = args.max_iterations
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_name(state_path.name + ".lock")
+    try:
+        lock = lock_path.open("x", encoding="utf-8")
+    except FileExistsError:
+        raise WorkflowError("another invocation owns the pipeline state") from None
+    started = False
+    try:
+        with lock:
+            if state_path.exists():
+                raise WorkflowError(
+                    "pipeline state already exists; start a fresh invocation"
+                )
+            lock.write(str(os.getpid()))
+            lock.flush()
+            started = True
+            command_agent_task(args)
+        state = load_state(state_path) if state_path.is_file() else {}
+        task = state.get("agent_task", {})
+        return (
+            0
+            if task.get("status") == "completed"
+            and state.get("last_result") in {"published", "mergeable"}
+            else 1
+        )
+    except (WorkflowError, json.JSONDecodeError, OSError, KeyboardInterrupt) as error:
+        if started and state_path.is_file():
+            state = load_state(state_path)
+            task = state.get("agent_task")
+            if isinstance(task, dict):
+                task["status"] = (
+                    "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
+                )
+                task["error"] = {
+                    "code": "pipeline_invocation_failed",
+                    "message": (
+                        str(error) or "invocation interrupted; start a fresh invocation"
+                    ),
+                }
+                save_state(state_path, state)
+        if isinstance(error, KeyboardInterrupt):
+            emit({"result": "invocation_abandoned", "state": str(state_path)})
+            return 1
+        raise
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = CommandPassthroughArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     agent_task = subparsers.add_parser(
         "agent-task",
+        aliases=["pipeline"],
         help="resolve and publish conflicts through the pinned managed Agent Task",
     )
     agent_task.add_argument(
@@ -9923,11 +10137,13 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
-        if args.command not in {"agent-task", "status", "cleanup", "abort", "escalate"}:
+        if args.command not in {"agent-task", "pipeline", "status", "cleanup", "abort", "escalate"}:
             raise WorkflowError(
                 f"legacy command {args.command!r} is disabled; start a fresh "
                 "agent-task invocation"
             )
+        if args.command == "pipeline":
+            return command_pipeline(args)
         args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:
