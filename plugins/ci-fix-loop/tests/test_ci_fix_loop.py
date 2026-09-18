@@ -4601,7 +4601,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.47", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.48", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -5205,6 +5205,216 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             raised.exception.details["classification"],
         )
         self.assertEqual("permanent_failure", evidence["attempts"][0]["result"])
+
+    def test_metadata_failures_never_persist_stdout_text(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        pr = self.preflight["pr"]
+        run_payload = {
+            "id": 1,
+            "head_sha": pr["head_sha"],
+            "repository": {"full_name": pr["repo_name"]},
+            "name": check["workflow"],
+            "workflow_id": 17,
+            "html_url": "https://github.com/owner/repo/actions/runs/1",
+            "status": "completed",
+            "conclusion": "failure",
+        }
+        job_payload = {
+            "id": 2,
+            "run_id": 1,
+            "head_sha": pr["head_sha"],
+            "name": check["name"],
+            "html_url": "https://github.com/owner/repo/actions/runs/1/job/2",
+            "status": "completed",
+            "conclusion": "failure",
+        }
+        run_success = MODULE.subprocess.CompletedProcess(
+            ["gh"], 0, json.dumps(run_payload).encode(), b""
+        )
+        job_success = MODULE.subprocess.CompletedProcess(
+            ["gh"], 0, json.dumps(job_payload).encode(), b""
+        )
+        log_success = MODULE.subprocess.CompletedProcess(
+            ["gh"], 0, b"downloaded failure log\n", b""
+        )
+        stage_prefixes = {
+            "pre-run-metadata": [],
+            "pre-job-metadata": [run_success],
+            "post-run-metadata": [run_success, job_success, log_success],
+            "post-job-metadata": [
+                run_success,
+                job_success,
+                log_success,
+                run_success,
+            ],
+        }
+        for failure_mode in ("permanent", "retry-exhausted"):
+            for method, prefix in stage_prefixes.items():
+                with self.subTest(failure_mode=failure_mode, method=method):
+                    source_marker = f"{failure_mode}-{method}-source-body"
+                    secret = "github_pat_abcdefghijklmnopqrstuvwxyz"
+                    stdout = f"{source_marker}\n{secret}\n".encode()
+                    if failure_mode == "permanent":
+                        stderr = b"HTTP 404 Not Found"
+                        failure_count = 1
+                        expected_classification = "metadata_permanent_failure"
+                        expected_result = "permanent_failure"
+                    else:
+                        stderr = b"connection reset by peer"
+                        failure_count = (
+                            len(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS) + 1
+                        )
+                        expected_classification = "metadata_transport_exhausted"
+                        expected_result = "transient_failure"
+                    failed = MODULE.subprocess.CompletedProcess(
+                        ["gh"], 1, stdout, stderr
+                    )
+                    completed = [*prefix, *([failed] * failure_count)]
+                    evidence = {}
+                    state_path = self.root / (
+                        f"{failure_mode}-{method}-coordinator.json"
+                    )
+                    repo_root = self.root / f"{failure_mode}-{method}-repo"
+                    repo_root.mkdir()
+                    output = io.StringIO()
+                    arguments = [
+                        str(SCRIPT),
+                        "pipeline",
+                        "owner/repo#7",
+                        "--repo-root",
+                        str(repo_root),
+                        "--state",
+                        str(state_path),
+                        "--pipeline-run",
+                        "bc204b55bc1240b18bc5193123ceb226",
+                        "--pipeline-iteration",
+                        "1",
+                        "--pipeline-max-iterations",
+                        "2",
+                    ]
+
+                    def fail_during_preflight(*_args, **_kwargs):
+                        return MODULE.fetch_failed_check_log(
+                            pr, check, evidence=evidence
+                        )
+
+                    with (
+                        mock.patch.object(sys, "argv", arguments),
+                        mock.patch.object(MODULE, "require_tools"),
+                        mock.patch.object(
+                            MODULE,
+                            "resolve_repo_root",
+                            return_value=repo_root,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "resolve_target",
+                            return_value={
+                                "repo_name": "owner/repo",
+                                "number": 7,
+                            },
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "wait_for_stable_ci_preflight",
+                            side_effect=fail_during_preflight,
+                        ),
+                        mock.patch.object(
+                            MODULE, "run_bytes", side_effect=completed
+                        ) as run,
+                        mock.patch.object(MODULE.time, "sleep"),
+                        mock.patch.object(
+                            MODULE,
+                            "record_coordinator_failure",
+                            wraps=MODULE.record_coordinator_failure,
+                        ) as record_failure,
+                        contextlib.redirect_stdout(output),
+                    ):
+                        exit_code = MODULE.main()
+
+                    self.assertEqual(1, exit_code)
+                    self.assertEqual(len(completed), run.call_count)
+                    record_failure.assert_called_once()
+                    error = record_failure.call_args.args[1]
+                    result = json.loads(output.getvalue())
+                    state = MODULE.load_state(state_path)
+                    diagnostic = error.details["external_command_diagnostic"]
+                    expected_stdout = {
+                        "byte_count": len(stdout),
+                        "sha256": MODULE.hashlib.sha256(stdout).hexdigest(),
+                    }
+                    self.assertEqual(
+                        MODULE.FAILED_LOG_COMMAND_DIAGNOSTIC_SCHEMA,
+                        diagnostic["schema"],
+                    )
+                    self.assertEqual(expected_stdout, diagnostic["stdout"])
+                    self.assertNotIn("text", diagnostic["stdout"])
+                    self.assertIn(
+                        stderr.decode(), diagnostic["stderr"]["text"]
+                    )
+                    self.assertEqual(
+                        diagnostic, result["external_command_diagnostic"]
+                    )
+                    self.assertEqual(
+                        diagnostic,
+                        state["coordinator"]["external_command_diagnostic"],
+                    )
+                    self.assertEqual(
+                        diagnostic,
+                        state["escalation"]["external_command_diagnostic"],
+                    )
+                    target_attempts = [
+                        attempt
+                        for attempt in evidence["attempts"]
+                        if attempt["method"] == method
+                    ]
+                    self.assertEqual(failure_count, len(target_attempts))
+                    self.assertTrue(
+                        all(
+                            attempt["result"] == expected_result
+                            for attempt in target_attempts
+                        )
+                    )
+                    expected_error_hash = MODULE.canonical_json_sha256(
+                        diagnostic
+                    )
+                    self.assertTrue(
+                        all(
+                            attempt["error_sha256"] == expected_error_hash
+                            for attempt in target_attempts
+                        )
+                    )
+                    self.assertEqual(
+                        {
+                            "classification": expected_classification,
+                            "method": method,
+                            "attempt": evidence["attempt_count"],
+                            "sha256": expected_error_hash,
+                        },
+                        evidence["terminal_error"],
+                    )
+                    error_chain = []
+                    current = error
+                    while isinstance(current, MODULE.WorkflowError):
+                        error_chain.append(
+                            {
+                                "message": str(current),
+                                "details": current.details,
+                            }
+                        )
+                        current = current.__cause__
+                    serialized = json.dumps(
+                        {
+                            "result": result,
+                            "state": state,
+                            "evidence": evidence,
+                            "error_chain": error_chain,
+                        },
+                        sort_keys=True,
+                    )
+                    self.assertNotIn(source_marker, serialized)
+                    self.assertNotIn(secret, serialized)
+                    self.assertNotIn("downloaded failure log", serialized)
 
     def test_failed_log_permanent_errors_do_not_retry_or_fallback(self):
         check = self.preflight["check_snapshot"]["failures"][0]

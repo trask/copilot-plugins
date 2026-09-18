@@ -6365,7 +6365,7 @@ def exact_actions_json_get(
                 content_sha256=canonical_json_sha256(payload),
             )
             return payload
-        diagnostic = external_command_diagnostic(
+        diagnostic = failed_log_command_diagnostic(
             exit_status=process.returncode,
             stdout=process.stdout or b"",
             stderr=process.stderr or b"",
