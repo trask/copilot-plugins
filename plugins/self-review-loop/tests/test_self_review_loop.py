@@ -2092,7 +2092,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.38")
+        self.assertEqual(plugin["version"], "1.3.39")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -2227,7 +2227,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "The pull request is clean.",
         )
 
-    def test_compact_clean_semantic_payload_shapes_are_canonicalized(self):
+    def test_compact_semantic_payload_shapes_are_canonicalized(self):
         cases = [
             (
                 "status",
@@ -2256,6 +2256,21 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     "sha256": (
                         "6edba2d1d7509be98711ff591613cdc9b496a9c83e8a2316"
                         "d133ad32e64ffc1f"
+                    ),
+                },
+            ),
+            (
+                "16161-status-cleared-with-findings",
+                {"findings": [], "status": "cleared"},
+                {
+                    "path": (
+                        ".github/agent-task-semantic/"
+                        "da56169f-01e6-4279-9a2f-5aab32c6cdb1.json"
+                    ),
+                    "commit": "79ca4b8d7b498fd6b3e631890d92a26202d22d10",
+                    "sha256": (
+                        "a7185b3bce93983d43fd9a89a68a233c70d47b14b89557725"
+                        "ecc500bbbbe7756"
                     ),
                 },
             ),
@@ -2376,6 +2391,32 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 {**base, "request_id": "worker-owned", "status": "clean"},
             ),
             ("metadata-field", {**base, "status": "clean", "summary": "extra"}),
+            ("cleared-without-findings", {**base, "status": "cleared"}),
+            (
+                "cleared-null-findings",
+                {**base, "findings": None, "status": "cleared"},
+            ),
+            (
+                "cleared-non-empty-findings",
+                {
+                    **base,
+                    "findings": [{"body": "Unexpected finding."}],
+                    "status": "cleared",
+                },
+            ),
+            (
+                "cleared-outcome-discriminator",
+                {**base, "findings": [], "outcome": "cleared"},
+            ),
+            (
+                "cleared-extra-field",
+                {
+                    **base,
+                    "findings": [],
+                    "status": "cleared",
+                    "summary": "extra",
+                },
+            ),
         ]
         for discriminator in ("status", "outcome"):
             invalid_cases.append(
@@ -2416,16 +2457,57 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     semantic_payload=invalid,
                 )
 
-    def test_clean_semantic_payload_cannot_hide_a_fix_commit(self):
+    def test_cleared_compact_payload_rejects_malformed_metadata(self):
+        base = {
+            "body": self.preflight["pr"]["body"],
+            "findings": [],
+            "status": "cleared",
+            "title": self.preflight["pr"]["title"],
+        }
+        invalid_cases = [
+            ("non-string-title", {**base, "title": None}),
+            ("empty-title", {**base, "title": ""}),
+            ("whitespace-title", {**base, "title": "   "}),
+            ("multiline-title", {**base, "title": "First\nSecond"}),
+            ("carriage-return-title", {**base, "title": "First\rSecond"}),
+            ("non-string-body", {**base, "body": None}),
+            ("carriage-return-body", {**base, "body": "First\rSecond"}),
+        ]
+        for name, payload in invalid_cases:
+            remote = MODULE.validate_success_result(
+                self.semantic_result(payload=payload),
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+            )
+            content = MODULE.canonical_self_review_report(
+                preflight=self.preflight,
+                request_id=remote["request_id"],
+                semantic_payload=remote["semantic_payload"],
+            )
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "malformed PR metadata",
+                ),
+            ):
+                MODULE.validate_self_review_report(
+                    content,
+                    request_id=remote["request_id"],
+                    preflight=self.preflight,
+                    remote=remote,
+                    max_iterations=5,
+                    paths_by_commit={},
+                )
+
+    def test_clean_semantic_payloads_cannot_hide_a_fix_commit(self):
         commit = "4" * 40
         remote = {
             "requires_apply": True,
             "commits": [commit],
         }
-        content = MODULE.canonical_self_review_report(
-            preflight=self.preflight,
-            request_id="request-1",
-            semantic_payload={
+        payloads = [
+            {
                 "title": self.preflight["pr"]["title"],
                 "body": self.preflight["pr"]["body"],
                 "summary": "No metadata change is needed.",
@@ -2433,20 +2515,35 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "iterations": 1,
                 "findings": [],
             },
-        )
+            {
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+                "findings": [],
+                "status": "cleared",
+            },
+        ]
 
-        with self.assertRaisesRegex(
-            MODULE.WorkflowError,
-            "account for every fix commit",
-        ):
-            MODULE.validate_self_review_report(
-                content,
-                request_id="request-1",
+        for payload in payloads:
+            content = MODULE.canonical_self_review_report(
                 preflight=self.preflight,
-                remote=remote,
-                max_iterations=5,
-                paths_by_commit={commit: ["src/app.py"]},
+                request_id="request-1",
+                semantic_payload=payload,
             )
+            with (
+                self.subTest(fields=sorted(payload)),
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "account for every fix commit",
+                ),
+            ):
+                MODULE.validate_self_review_report(
+                    content,
+                    request_id="request-1",
+                    preflight=self.preflight,
+                    remote=remote,
+                    max_iterations=5,
+                    paths_by_commit={commit: ["src/app.py"]},
+                )
 
     def test_semantic_result_preserves_distinct_artifact_and_report_digests(self):
         result = self.result()

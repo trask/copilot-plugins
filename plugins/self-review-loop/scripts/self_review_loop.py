@@ -3881,7 +3881,7 @@ def canonical_self_review_report(
         "summary",
         "title",
     }
-    compact_clean_key_sets = (
+    compact_key_sets = (
         {"body", "status", "title"},
         {"body", "findings", "status", "title"},
         {"body", "outcome", "title"},
@@ -3893,11 +3893,18 @@ def canonical_self_review_report(
         iterations_used = semantic_payload["iterations"]
         findings = semantic_payload["findings"]
         metadata_reason = semantic_payload["summary"]
-    elif payload_keys in compact_clean_key_sets:
+    elif payload_keys in compact_key_sets:
         discriminator = "status" if "status" in payload_keys else "outcome"
         compact_findings = semantic_payload.get("findings", [])
+        exact_cleared_result = (
+            payload_keys == {"body", "findings", "status", "title"}
+            and semantic_payload.get("status") == "cleared"
+        )
         if (
-            semantic_payload.get(discriminator) != "clean"
+            (
+                semantic_payload.get(discriminator) != "clean"
+                and not exact_cleared_result
+            )
             or not isinstance(compact_findings, list)
             or compact_findings
         ):
