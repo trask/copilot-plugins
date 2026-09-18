@@ -40,28 +40,38 @@ validation claim. Result schema version 2 records
 path, and digest facts independently established by the dispatcher. Report
 content remains untrusted inert evidence for a consumer to evaluate.
 
-Policy `marketplace-agent-apply-report-worker@4` is the current apply contract.
-The worker writes one request-scoped
-`github.copilot.agent-task-semantic-output` version 1 JSON artifact and may
-produce ordered fix commits. The semantic payload contains only
-workflow-specific findings, decisions, and validation evidence. It cannot
-contain dispatcher-owned request, repository, pull request, frozen head or
-base, model, policy, task, session, generated-ref, commit, report, receipt, or
-validation-completion identity. Findings refer to generated commits only by
-one-based `commit_index`.
+Policy `marketplace-agent-apply-report-worker@5` is the current apply contract.
+The worker writes only one raw workflow-specific JSON object at the
+request-scoped semantic path and may produce ordered fix commits. The
+dispatcher adds `github.copilot.agent-task-semantic-output` version 2 identity
+and returns `github.copilot.agent-task-result` version 4. The worker cannot
+author wrapper spelling or dispatcher-owned request, repository, pull request,
+frozen head or base, model, policy, task, session, generated-ref, commit,
+report, receipt, or validation-completion identity. Findings refer to
+generated commits only by one-based `commit_index`.
 
 The dispatcher derives the complete fix history from Git, resolves every commit
 index, requires the payload to account for every generated fix commit, and
-returns result schema version 3 with
+returns result schema version 4 with
 `attestation.kind=dispatcher_semantic`. Consumers combine that payload with
 their frozen local request to generate the canonical workflow report and then
 run their workflow-specific consistency checks before guarded publication.
 Missing or malformed semantic output, unaccounted commits, stale frozen
 identity, and clean outcomes with nonempty fix history fail closed.
 
-Validation evidence remains semantic worker output because the dispatcher
-cannot truthfully claim commands it did not execute. It is never promoted to a
-dispatcher validation claim or inferred from prose or standard output.
+The generic dispatcher never turns worker prose or command claims into trusted
+validation. A consumer may accept an explicit semantic validation plan and
+execute it itself only after the candidate identity and history are verified.
+CI Fix Loop does this with bounded repository-wrapper argv arrays in a detached
+worktree at the exact candidate commit. Its coordinator owns command status,
+details, and output hashes and fails before import when execution is missing,
+unsafe, stale, dirty, timed out, or nonzero.
+
+Policy `marketplace-agent-apply-report-worker@4` remains parseable only as
+immutable legacy semantic evidence. Under that exact policy the worker authored
+the semantic-output version 1 wrapper and the dispatcher returned result
+version 3. Current consumers never repair, promote, resume, or import that
+legacy output as a policy 5 invocation.
 
 Policy `marketplace-agent-apply-report-worker@3` remains parseable only as
 immutable legacy evidence under that exact contract. It permits zero or more

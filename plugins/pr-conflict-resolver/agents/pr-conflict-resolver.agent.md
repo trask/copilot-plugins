@@ -45,10 +45,10 @@ The helper performs a trusted local preflight without executing repository code.
 
 A pipeline-owned isolated worktree may stay detached only at the exact frozen pull request head. An attached worktree must hold the pull request branch. Any other branch or commit fails preflight.
 
-The helper records `preparing` ownership at the explicit state path before conflict preflight. A preflight error records failed or interrupted ownership with a null task ID and `not_created` status, so a wrapper exit cannot erase the attempted run. The Agent Tasks runtime is bundled with this plugin. The helper writes the closed `github.copilot.agent-task-conflict-request` version 1 file and a trusted prompt outside the repository. It loads only the adjacent `cloud_conflict_task.py`, verifies SHA-256 `3350924ecdf54c61ad67fe9f38d529f2b6dcfd8ffc1ea19dcfb6acfab5bf6756`, and invokes it once with:
+The helper records `preparing` ownership at the explicit state path before conflict preflight. A preflight error records failed or interrupted ownership with a null task ID and `not_created` status, so a wrapper exit cannot erase the attempted run. The Agent Tasks runtime is bundled with this plugin. The helper writes the closed `github.copilot.agent-task-conflict-request` version 1 file and a trusted prompt outside the repository. It loads only the adjacent `cloud_conflict_task.py`, verifies SHA-256 `a947419cc9266ad411f6897fc13c7d20f15ec711b67b7add849196572c93d563`, and invokes it once with:
 
 ```text
---conflict-with-report --strategy <merge|rebase|native-stack> --request-file <absolute-path> --prompt-file <absolute-path> --result-file <absolute-path> --policy marketplace-conflict-worker@4 --pr <canonical-url> --model <alias>
+--conflict-with-report --strategy <merge|rebase|native-stack> --request-file <absolute-path> --prompt-file <absolute-path> --result-file <absolute-path> --policy marketplace-conflict-worker@5 --pr <canonical-url> --model <alias>
 ```
 
 Local Git checks stay pinned to the frozen worktree through `git -C <exact-root>`. Git launches from the verified Python executable directory, and GitHub CLI calls run from the outside-repository artifact directory. A stale inherited process directory cannot redirect either tool.
@@ -57,8 +57,8 @@ The current base comes from the advertised branch ref, not the pull request's la
 
 An upper native-stack member may contain a merge that only synchronized its direct base. The coordinator omits that topology marker from the linear replay only when it has exactly two parents, its second parent is in the current direct-base ancestry, and `git show --remerge-diff` is empty. The request retains the exact merge position, parents, tree, subject, trailers, and empty-diff digest. Any merge with manual resolution content, unrelated ancestry, more than two parents, or no later linear tip stops before task creation. Its retained manifest is audit evidence; a later authorized action starts a fresh invocation.
 
-Policy `marketplace-conflict-worker@4` has SHA-256 `ee463e9fc5054c62547ea453346fa870a9674ed9f36a60b56497a47fb76770dd`.
-The bundled worker helper has SHA-256 `3350924ecdf54c61ad67fe9f38d529f2b6dcfd8ffc1ea19dcfb6acfab5bf6756`.
+Policy `marketplace-conflict-worker@5` has SHA-256 `21b4142edcb7cb35b805e3f225d16f53a2139eda4e974f56826a3cc9d3c1f933`.
+The bundled worker helper has SHA-256 `a947419cc9266ad411f6897fc13c7d20f15ec711b67b7add849196572c93d563`.
 
 The full immutable request remains retained outside the repository. The hosted problem statement carries every execution identity and commit SHA, exact evidence for bounded path sets, and canonical SHA-256 summaries plus boundary samples for large path sets. Per-commit prompt evidence retains the exact commit SHA, patch digest, and a digest of the complete retained commit evidence. The managed helper reserves 1,000 characters and UTF-8 bytes below the 28,000-character and 28,000-byte Agent Task limits, and refuses a final policy-wrapped statement over 27,000 characters or UTF-8 bytes as `prompt_too_large` before contacting the Agent Tasks API; it never truncates or silently falls back.
 

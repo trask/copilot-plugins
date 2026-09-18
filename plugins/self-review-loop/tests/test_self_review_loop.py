@@ -1360,14 +1360,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "schema": MODULE.AGENT_TASK_RESULT_SCHEMA,
                 "policy": {
                     "id": "marketplace-agent-apply-report-worker",
-                    "version": 4,
+                    "version": 5,
                     "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
                 },
                 "report": None,
                 "semantic_output": {
                     "schema": {
                         "id": "github.copilot.agent-task-semantic-output",
-                        "version": 1,
+                        "version": 2,
                     },
                     "kind": "self-review-loop",
                     "path": ".github/agent-task-semantic/request-1.json",
@@ -2085,14 +2085,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-apply-report-worker@4", instructions)
+        self.assertIn("marketplace-agent-apply-report-worker@5", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("marketplace `custom_agent`", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.34")
+        self.assertEqual(plugin["version"], "1.3.35")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -2111,7 +2111,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             prior_history=[],
         )
         self.assertIn("workflow-specific semantic payload", prompt)
-        self.assertIn("worker prompt version 6", prompt)
+        self.assertIn("worker prompt version 7", prompt)
+        self.assertIn("runtime adds the versioned wrapper", prompt)
         self.assertIn("Do not copy request, repository, pull request", prompt)
         self.assertIn("one-based `commit_index`", prompt)
         self.assertIn("binds the frozen identity", prompt)
@@ -2174,6 +2175,26 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 },
             )
 
+    def test_20075_raw_payload_is_not_normalized_into_a_clean_review(self):
+        observed = {
+            "version": 1,
+            "payload": {
+                "findings": [],
+                "result": "clean",
+                "title": "Report configured Redis targets for Rediscala",
+                "body": "Reports configured Redis deployments.",
+            },
+        }
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "unexpected or missing fields",
+        ):
+            MODULE.canonical_self_review_report(
+                preflight=self.preflight,
+                request_id="d0b335f9-d2dd-4543-922c-f9e0d227e241",
+                semantic_payload=observed,
+            )
+
     def test_clean_semantic_payload_cannot_hide_a_fix_commit(self):
         commit = "4" * 40
         remote = {
@@ -2228,14 +2249,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "schema": MODULE.AGENT_TASK_RESULT_SCHEMA,
                 "policy": {
                     "id": "marketplace-agent-apply-report-worker",
-                    "version": 4,
+                    "version": 5,
                     "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
                 },
                 "report": None,
                 "semantic_output": {
                     "schema": {
                         "id": "github.copilot.agent-task-semantic-output",
-                        "version": 1,
+                        "version": 2,
                     },
                     "kind": "self-review-loop",
                     "path": ".github/agent-task-semantic/request-1.json",

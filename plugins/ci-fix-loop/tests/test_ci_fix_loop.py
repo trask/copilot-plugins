@@ -4162,14 +4162,37 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 command, cwd=repo_root, check=False
             ),
         )
+        self.trusted_validation = mock.patch.object(
+            MODULE,
+            "run_trusted_ci_validation",
+            side_effect=lambda _repo_root, *, commit_sha, **_kwargs: (
+                self.trusted_evidence(commit_sha)
+            ),
+        )
         self.triage_worker_mock = self.triage_worker.start()
         self.retained_triage_mock = self.retained_triage.start()
         self.github_fingerprint.start()
         self.hosted_helper_mock = self.hosted_helper.start()
+        self.trusted_validation_mock = self.trusted_validation.start()
         self.addCleanup(self.triage_worker.stop)
         self.addCleanup(self.retained_triage.stop)
         self.addCleanup(self.github_fingerprint.stop)
         self.addCleanup(self.hosted_helper.stop)
+        self.addCleanup(self.trusted_validation.stop)
+
+    def trusted_evidence(self, commit_sha=None):
+        return [
+            {
+                "argv": ["./gradlew", "--no-daemon", "test"],
+                "command": "./gradlew --no-daemon test",
+                "commit_sha": commit_sha or self.head,
+                "status": "passed",
+                "detail": "completed with exit code 0",
+                "exit_code": 0,
+                "stdout_sha256": MODULE.sha256_text(""),
+                "stderr_sha256": MODULE.sha256_text(""),
+            }
+        ]
 
     def semantic_payload(
         self,
@@ -4180,11 +4203,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         changed_paths=None,
     ):
         commits = [] if commits is None else commits
-        outcome = outcome or ("fixed" if commits else "no_change")
         disposition = disposition or ("fixed" if commits else "already_fixed")
         failure = self.preflight["check_snapshot"]["failures"][0]
         return {
-            "outcome": outcome,
             "failures": [
                 {
                     "key": failure["key"],
@@ -4202,18 +4223,16 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "changed_paths": (
                 ["src/App.java"] if commits and changed_paths is None else changed_paths or []
             ),
-            "evidence": [
-                {"command": "pytest focused", "outcome": "passed"}
-            ],
+            "validation_commands": (
+                [{"argv": ["./gradlew", "--no-daemon", "test"]}]
+                if disposition in {"fixed", "already_fixed"}
+                else []
+            ),
         }
 
     def semantic_artifact(self, commits=None, **kwargs):
         return json.dumps(
-            {
-                "schema": MODULE.CI_FIX_SEMANTIC_OUTPUT_SCHEMA,
-                "kind": MODULE.CI_FIX_SEMANTIC_KIND,
-                "payload": self.semantic_payload(commits, **kwargs),
-            },
+            self.semantic_payload(commits, **kwargs),
             separators=(",", ":"),
             sort_keys=True,
         )
@@ -4234,7 +4253,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "requested_model": "gpt-5.6-sol",
             "policy": {
                 "id": "marketplace-agent-apply-report-worker",
-                "version": 4,
+                "version": 5,
                 "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
             },
             "task": {
@@ -4352,9 +4371,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     }
                 ],
                 "changed_paths": [] if changed_paths is None else changed_paths,
-                "evidence": [
-                    {"command": "pytest focused", "outcome": "passed"}
-                ],
+                "evidence": self.trusted_evidence(
+                    commits[-1] if commits else self.head
+                ),
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -4425,7 +4444,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.40", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.41", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -4479,7 +4498,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn('"iteration_allowance": 1', prompt)
         self.assertIn("Never select a marketplace `custom_agent`", prompt)
         self.assertIn("use Cloud Sandboxes", prompt)
-        self.assertIn("worker prompt version 5", prompt)
+        self.assertIn("worker prompt version 6", prompt)
+        self.assertIn("Do not claim that a command ran", prompt)
+        self.assertIn("repository-owned Gradle or Maven wrappers", prompt)
         self.assertNotIn("AssertionError: expected 2", prompt)
         self.assertIn("Never replace a check key with a numeric database ID", prompt)
         self.assertIn("`{{MARKETPLACE_SEMANTIC_PATH}}`", prompt)
@@ -4856,6 +4877,57 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 iteration_allowance=1,
             )
 
+    def test_rejects_19204_model_authored_validation_and_outcome(self):
+        malformed = {
+            "outcome": "fixed",
+            "failures": [
+                {
+                    "key": "check:CI/test",
+                    "name": "test",
+                    "disposition": "fixed",
+                    "reason": "The worker claimed success.",
+                    "fixes": [{"commit_index": 1}],
+                }
+            ],
+            "changed_paths": ["src/App.java"],
+            "validation": {
+                "command": "./gradlew test",
+                "result": "passed",
+            },
+        }
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "unexpected or missing fields",
+        ):
+            MODULE.bind_ci_fix_semantic_payload(
+                malformed,
+                commits=["5" * 40],
+            )
+
+    def test_rejects_unverifiable_validation_commands(self):
+        cases = [
+            ["bash", "-lc", "./gradlew test"],
+            ["./gradlew", "--init-script", "outside.gradle", "test"],
+            ["./gradlew", "--include-build=../outside", "test"],
+            ["C:\\repo\\gradlew.bat", "test"],
+            ["./mvnw", "-s", "C:/Users/example/.m2/settings.xml", "test"],
+            ["./mvnw", "-s../outside.xml", "test"],
+            ["./gradlew", "-Dcache.dir=../outside", "--no-daemon", "test"],
+        ]
+        if MODULE.IS_WINDOWS:
+            cases.append(["./gradlew", "test&whoami"])
+        for argv in cases:
+            payload = self.semantic_payload(["5" * 40])
+            payload["validation_commands"] = [{"argv": argv}]
+            with self.subTest(argv=argv), self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "unverifiable validation command",
+            ):
+                MODULE.bind_ci_fix_semantic_payload(
+                    payload,
+                    commits=["5" * 40],
+                )
+
     def test_validates_runtime_bound_semantic_artifact_and_canonical_report(self):
         commit = "5" * 40
         content = self.semantic_artifact(
@@ -4869,6 +4941,12 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             content,
             remote=remote,
         )
+        payload = {
+            "outcome": MODULE.derive_ci_fix_outcome(payload, commits=[commit]),
+            "failures": payload["failures"],
+            "changed_paths": payload["changed_paths"],
+            "evidence": self.trusted_evidence(commit),
+        }
         report_content = MODULE.canonical_ci_fix_report(
             preflight=self.preflight,
             request_id=remote["request_id"],
@@ -4885,13 +4963,69 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
         self.assertEqual([commit], report["failures"][0]["fix_commits"])
         self.assertEqual(
-            [{"command": "pytest focused", "outcome": "passed"}],
+            self.trusted_evidence(commit),
             report["evidence"],
         )
         self.assertNotEqual(
             MODULE.sha256_text(content),
             MODULE.sha256_text(report_content),
         )
+
+    def test_rejects_missing_or_mismatched_trusted_validation_evidence(self):
+        commit = "5" * 40
+        remote = self.remote([commit], changed_paths=["src/widget.py"])
+        payload = MODULE.bind_ci_fix_semantic_payload(
+            self.semantic_payload(
+                [commit],
+                changed_paths=["src/widget.py"],
+            ),
+            commits=[commit],
+        )
+        report_payload = {
+            "outcome": "fixed",
+            "failures": payload["failures"],
+            "changed_paths": payload["changed_paths"],
+            "evidence": [],
+        }
+        report_content = MODULE.canonical_ci_fix_report(
+            preflight=self.preflight,
+            request_id=remote["request_id"],
+            iteration_allowance=1,
+            semantic_payload=report_payload,
+        )
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "missing trusted validation evidence",
+        ):
+            MODULE.validate_ci_fix_report(
+                report_content,
+                request_id=remote["request_id"],
+                preflight=self.preflight,
+                remote=remote,
+                iteration_allowance=1,
+            )
+
+        report_payload["evidence"] = self.trusted_evidence(commit)
+        report_content = MODULE.canonical_ci_fix_report(
+            preflight=self.preflight,
+            request_id=remote["request_id"],
+            iteration_allowance=1,
+            semantic_payload=report_payload,
+        )
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "does not match the prescribed commands",
+        ):
+            MODULE.validate_ci_fix_report(
+                report_content,
+                request_id=remote["request_id"],
+                preflight=self.preflight,
+                remote=remote,
+                iteration_allowance=1,
+                expected_validation_commands=[
+                    {"argv": ["./gradlew", "--no-daemon", "check"]}
+                ],
+            )
 
     def test_rejects_semantic_artifact_wrapper_identity_and_digest_drift(self):
         content = self.semantic_artifact()
@@ -4904,7 +5038,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             copy.deepcopy(remote),
         )
         forbidden_identity = json.loads(content)
-        forbidden_identity["payload"]["repository"] = "owner/repo"
+        forbidden_identity["repository"] = "owner/repo"
         cases["identity field"] = (
             json.dumps(forbidden_identity, separators=(",", ":"), sort_keys=True),
             copy.deepcopy(remote),
@@ -4925,7 +5059,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
     def test_rejects_invalid_semantic_commit_index_and_bound_payload_drift(self):
         commit = "5" * 40
         artifact = json.loads(self.semantic_artifact([commit]))
-        artifact["payload"]["failures"][0]["fixes"][0]["commit_index"] = 2
+        artifact["failures"][0]["fixes"][0]["commit_index"] = 2
         content = json.dumps(artifact, separators=(",", ":"), sort_keys=True)
         remote = self.remote([commit])
         remote["semantic_sha256"] = MODULE.sha256_text(content)
@@ -4947,11 +5081,17 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         payload["failures"][0]["fixes"] = [{"commit_index": 1}]
         bound = MODULE.bind_ci_fix_semantic_payload(payload, commits=commits)
         remote = self.remote(commits)
+        completed = {
+            "outcome": "fixed",
+            "failures": bound["failures"],
+            "changed_paths": bound["changed_paths"],
+            "evidence": self.trusted_evidence(commits[-1]),
+        }
         report_content = MODULE.canonical_ci_fix_report(
             preflight=self.preflight,
             request_id=remote["request_id"],
             iteration_allowance=1,
-            semantic_payload=bound,
+            semantic_payload=completed,
         )
         with self.assertRaisesRegex(MODULE.WorkflowError, "every fix commit"):
             MODULE.validate_ci_fix_report(
@@ -4962,30 +5102,16 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 iteration_allowance=1,
             )
 
-        clean_payload = self.semantic_payload(
-            [commits[0]],
-            outcome="no_change",
-            disposition="fixed",
-            changed_paths=[],
-        )
-        clean_bound = MODULE.bind_ci_fix_semantic_payload(
-            clean_payload,
+        missing_validation = self.semantic_payload([commits[0]])
+        missing_validation["validation_commands"] = []
+        missing_bound = MODULE.bind_ci_fix_semantic_payload(
+            missing_validation,
             commits=[commits[0]],
         )
-        clean_remote = self.remote([commits[0]])
-        clean_report = MODULE.canonical_ci_fix_report(
-            preflight=self.preflight,
-            request_id=clean_remote["request_id"],
-            iteration_allowance=1,
-            semantic_payload=clean_bound,
-        )
-        with self.assertRaisesRegex(MODULE.WorkflowError, "outcome"):
-            MODULE.validate_ci_fix_report(
-                clean_report,
-                request_id=clean_remote["request_id"],
-                preflight=self.preflight,
-                remote=clean_remote,
-                iteration_allowance=1,
+        with self.assertRaisesRegex(MODULE.WorkflowError, "missing trusted validation"):
+            MODULE.derive_ci_fix_outcome(
+                missing_bound,
+                commits=[commits[0]],
             )
 
     def test_rejects_pre_semantic_agent_task_result_schema(self):
@@ -5663,12 +5789,103 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             state["agent_task"]["consumer_receipt"]["schema"],
         )
         self.assertEqual(
+            self.trusted_evidence(commit),
+            state["agent_task"]["consumer_receipt"]["validation"],
+        )
+        self.assertEqual(
+            MODULE.canonical_json_sha256(self.trusted_evidence(commit)),
+            state["agent_task"]["consumer_receipt"]["validation_sha256"],
+        )
+        self.assertEqual(
             result["semantic_output"]["sha256"],
             state["agent_task"]["semantic_output_sha256"],
         )
         self.assertRegex(
             state["agent_task"]["consumer_receipt_sha256"],
             r"^[0-9a-f]{64}$",
+        )
+
+    def test_trusted_validation_failure_stops_before_import_and_push(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        state_path = self.root / "validation-failed.json"
+        preflight = copy.deepcopy(self.preflight)
+        preflight["repository_root"] = str(repo)
+        commit = "5" * 40
+        semantic = self.semantic_artifact(
+            [commit],
+            changed_paths=["src/widget.py"],
+        )
+        result = self.result([commit], changed_paths=["src/widget.py"])
+        commands = []
+
+        def run_command(command, **kwargs):
+            commands.append(command)
+            if "--result-file" in command:
+                Path(command[command.index("--result-file") + 1]).write_text(
+                    json.dumps(result), encoding="utf-8"
+                )
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        arguments = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                self.preflight["pr"]["pr_url"],
+                "--repo-root",
+                str(repo),
+                "--state",
+                str(state_path),
+            ]
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
+            mock.patch.object(
+                MODULE,
+                "resolve_target",
+                return_value={"repo_name": "owner/repo", "number": 7},
+            ),
+            mock.patch.object(
+                MODULE, "agent_task_preflight", return_value=preflight
+            ),
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                return_value=preflight["identity"],
+            ),
+            mock.patch.object(
+                MODULE,
+                "discover_cloud_task",
+                return_value=self.root / "cloud_task.py",
+            ),
+            mock.patch.object(MODULE, "run", side_effect=run_command),
+            mock.patch.object(
+                MODULE, "fetch_committed_text", return_value=semantic
+            ),
+            mock.patch.object(MODULE, "validate_generated_history"),
+            mock.patch.object(MODULE, "refuse_test_suppression"),
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
+            mock.patch.object(
+                MODULE,
+                "run_trusted_ci_validation",
+                side_effect=MODULE.WorkflowError(
+                    "trusted validation failed with exit code 1"
+                ),
+            ),
+            mock.patch.object(MODULE, "apply_verified_import") as apply_import,
+            self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "trusted validation failed",
+            ),
+        ):
+            MODULE.command_agent_task(arguments)
+
+        apply_import.assert_not_called()
+        self.assertFalse(
+            any(
+                command[:4] == ["git", "-C", str(repo), "push"]
+                for command in commands
+            )
         )
 
     def test_concurrent_cas_loser_stops_before_local_import(self):
@@ -6537,6 +6754,189 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
         self.assertFalse(state_path.exists())
         self.assertTrue(all(not artifact.exists() for artifact in (prompt, result, recovery)))
+
+
+class TrustedValidationRunnerTest(unittest.TestCase):
+    def setUp(self):
+        self.repo = Path("C:/repo")
+        self.commit = "5" * 40
+        self.command = [{"argv": ["./gradlew", "--no-daemon", "test"]}]
+        self.identity = {"branch": "feature", "head": "1" * 40, "status": ""}
+
+    def patches(self, *, returncode=0, source_after=None, worktree_head=None):
+        source_after = self.identity if source_after is None else source_after
+        worktree_head = self.commit if worktree_head is None else worktree_head
+        process = mock.Mock()
+        process.returncode = returncode
+        process.communicate.return_value = (b"stdout", b"stderr")
+        return (
+            mock.patch.object(
+                MODULE,
+                "local_identity",
+                side_effect=[self.identity, source_after],
+            ),
+            mock.patch.object(MODULE, "run"),
+            mock.patch.object(
+                MODULE,
+                "git",
+                side_effect=[worktree_head, worktree_head, ""],
+            ),
+            mock.patch.object(
+                MODULE,
+                "trusted_validation_executable",
+                return_value=Path("C:/validation/gradlew.bat"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "popen_owned_process",
+                return_value=(process, None),
+            ),
+        )
+
+    def test_executes_at_exact_commit_and_hashes_outputs(self):
+        with contextlib.ExitStack() as stack:
+            patches = [stack.enter_context(patch) for patch in self.patches()]
+            evidence = MODULE.run_trusted_ci_validation(
+                self.repo,
+                source_sha=self.identity["head"],
+                commit_sha=self.commit,
+                commands=self.command,
+            )
+
+        self.assertEqual("passed", evidence[0]["status"])
+        self.assertEqual(
+            MODULE.hashlib.sha256(b"stdout").hexdigest(),
+            evidence[0]["stdout_sha256"],
+        )
+        self.assertEqual(
+            MODULE.hashlib.sha256(b"stderr").hexdigest(),
+            evidence[0]["stderr_sha256"],
+        )
+        popen = patches[-1]
+        self.assertEqual(
+            MODULE.TRUSTED_VALIDATION_TIMEOUT_SECONDS,
+            popen.return_value[0].communicate.call_args.kwargs["timeout"],
+        )
+        self.assertFalse(popen.call_args.kwargs["text"])
+        self.assertEqual("worktree", popen.call_args.kwargs["cwd"].name)
+        self.assertEqual("true", popen.call_args.kwargs["env"]["CI"])
+
+    def test_rejects_nonzero_validation_before_success(self):
+        with contextlib.ExitStack() as stack:
+            for patch in self.patches(returncode=1):
+                stack.enter_context(patch)
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "trusted validation failed",
+            ):
+                MODULE.run_trusted_ci_validation(
+                    self.repo,
+                    source_sha=self.identity["head"],
+                    commit_sha=self.commit,
+                    commands=self.command,
+                )
+
+    def test_rejects_wrong_commit_and_source_identity_drift(self):
+        with contextlib.ExitStack() as stack:
+            for patch in self.patches(worktree_head="6" * 40):
+                stack.enter_context(patch)
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "not at the generated commit",
+            ):
+                MODULE.run_trusted_ci_validation(
+                    self.repo,
+                    source_sha=self.identity["head"],
+                    commit_sha=self.commit,
+                    commands=self.command,
+                )
+
+    def test_rejects_a_candidate_modified_validation_wrapper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            wrapper = worktree / ("gradlew.bat" if MODULE.IS_WINDOWS else "gradlew")
+            wrapper.write_text("candidate wrapper", encoding="utf-8")
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "git",
+                    side_effect=["source-blob", "candidate-blob"],
+                ),
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "changed in the candidate",
+                ),
+            ):
+                MODULE.trusted_validation_executable(
+                    self.repo,
+                    worktree,
+                    source_sha=self.identity["head"],
+                    commit_sha=self.commit,
+                    requested="./gradlew",
+                )
+
+    def test_rejects_candidate_modified_validation_bootstrap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            wrapper = worktree / ("gradlew.bat" if MODULE.IS_WINDOWS else "gradlew")
+            wrapper.write_text("source wrapper", encoding="utf-8")
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "git",
+                    side_effect=[
+                        "wrapper-blob",
+                        "wrapper-blob",
+                        "source-bootstrap",
+                        "candidate-bootstrap",
+                    ],
+                ),
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "bootstrap .* changed in the candidate",
+                ),
+            ):
+                MODULE.trusted_validation_executable(
+                    self.repo,
+                    worktree,
+                    source_sha=self.identity["head"],
+                    commit_sha=self.commit,
+                    requested="./gradlew",
+                )
+
+    def test_rejects_source_identity_drift(self):
+        drifted = {**self.identity, "head": "7" * 40}
+        with contextlib.ExitStack() as stack:
+            for patch in self.patches(source_after=drifted):
+                stack.enter_context(patch)
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "source worktree changed",
+            ):
+                MODULE.run_trusted_ci_validation(
+                    self.repo,
+                    source_sha=self.identity["head"],
+                    commit_sha=self.commit,
+                    commands=self.command,
+                )
+
+    def test_preserves_validation_failure_when_source_also_drifts(self):
+        drifted = {**self.identity, "head": "7" * 40}
+        with contextlib.ExitStack() as stack:
+            for patch in self.patches(returncode=1, source_after=drifted):
+                stack.enter_context(patch)
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "trusted validation failed",
+            ) as raised:
+                MODULE.run_trusted_ci_validation(
+                    self.repo,
+                    source_sha=self.identity["head"],
+                    commit_sha=self.commit,
+                    commands=self.command,
+                )
+
+        self.assertTrue(raised.exception.details["source_identity_drift"])
 
 
 class LocalCiLogTriageTest(unittest.TestCase):

@@ -2186,7 +2186,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.54")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.55")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {

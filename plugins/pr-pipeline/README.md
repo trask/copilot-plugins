@@ -31,9 +31,9 @@ flowchart LR
 
             subgraph hosted["HOSTED Agent Task workers"]
                 direction LR
-                conflictWorker["Conflict worker<br/>1x / managed attempt<br/>ALL frozen conflict paths and selected stack members<br/>marketplace-conflict-worker@4"]
-                selfReviewWorker["Self Review worker<br/>1x / review iteration<br/>ALL self-review findings<br/>marketplace-agent-apply-report-worker@4"]
-                ciWorker["CI Fix worker<br/>1 HOSTED agent receives the local triage summary<br/>A new agent starts only after the head or final check results change<br/>NOT one agent per failed check<br/>marketplace-agent-apply-report-worker@4"]
+                conflictWorker["Conflict worker<br/>1x / managed attempt<br/>ALL frozen conflict paths and selected stack members<br/>marketplace-conflict-worker@5"]
+                selfReviewWorker["Self Review worker<br/>1x / review iteration<br/>ALL self-review findings<br/>marketplace-agent-apply-report-worker@5"]
+                ciWorker["CI Fix worker<br/>1 HOSTED agent receives the local triage summary<br/>A new agent starts only after the head or final check results change<br/>NOT one agent per failed check<br/>marketplace-agent-apply-report-worker@5"]
                 descriptionWorker["PR Description worker<br/>1x report task / whole PR<br/>title and body decision<br/>marketplace-agent-report-worker@1"]
             end
 

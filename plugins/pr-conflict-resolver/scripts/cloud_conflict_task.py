@@ -58,7 +58,7 @@ LEGACY_POLICY = {
     "version": LEGACY_POLICY_VERSION,
     "sha256": LEGACY_POLICY_SHA256,
 }
-POLICY_VERSION = 4
+POLICY_VERSION = 5
 POLICY_SPEC = {
     "id": POLICY_ID,
     "version": POLICY_VERSION,
@@ -73,6 +73,7 @@ POLICY_SPEC = {
     "worker_identity_fields": False,
     "semantic_artifact": "minimal-payload-json",
     "semantic_wrapper_owner": "dispatcher",
+    "merge_commit_annotations": "dispatcher-derived",
     "semantic_validation_evidence": "command-result",
     "dispatcher_generated_report_receipt": True,
     "require_exact_request_identity": True,
@@ -2247,15 +2248,6 @@ def policy_prompt(
         )
         shape = {
             "summary": "<nonempty explanation of the resolution>",
-            "commit_annotations": [
-                [
-                    {
-                        "conflict_paths": [],
-                        "companion_paths": [],
-                        "rationale": "",
-                    }
-                ]
-            ],
             "validation": [
                 {
                     "command": "<exact command or deterministic proof>",
@@ -2263,6 +2255,16 @@ def policy_prompt(
                 }
             ],
         }
+        if options.strategy != "merge":
+            shape["commit_annotations"] = [
+                [
+                    {
+                        "conflict_paths": [],
+                        "companion_paths": [],
+                        "rationale": "",
+                    }
+                ]
+            ]
         return (
             f"{options.prompt.rstrip()}\n\n"
             "----- marketplace conflict worker policy -----\n"
@@ -2281,9 +2283,10 @@ def policy_prompt(
             f"branch. Its only changed path must be `{path}` and its parent must be "
             "the final mechanically verified code tip. Write exactly the minimal "
             "JSON payload below. The dispatcher adds the semantic schema and kind; "
-            "do not author them. `commit_annotations` is positional: one array per assigned role, "
-            "and for rebase/native-stack one entry per frozen old commit. Merge uses "
-            "one empty annotations array. An unchanged rewritten commit uses empty "
+            "do not author them. For merge, omit `commit_annotations`; the dispatcher "
+            "derives the empty positional annotation from verified history. For "
+            "rebase/native-stack, `commit_annotations` is positional: one array per "
+            "assigned role and one entry per frozen old commit. An unchanged rewritten commit uses empty "
             "path arrays and an empty rationale; a conflict-touched commit must name "
             "its conflict paths, any companion paths, and a concrete rationale. Do "
             "not include SHAs, refs, roles, request identity, validation completion, "
@@ -3621,19 +3624,29 @@ def validate_semantic_artifact(
             "conflict semantic output is malformed",
             "validation_failed",
         ) from None
+    expected_keys = (
+        {"summary", "validation"}
+        if request["strategy"] == "merge"
+        else {"summary", "commit_annotations", "validation"}
+    )
     if (
         not isinstance(value, dict)
-        or set(value) != {"summary", "commit_annotations", "validation"}
+        or set(value) != expected_keys
         or not isinstance(value.get("summary"), str)
         or not value["summary"].strip()
         or contains_credentials(value["summary"])
-        or not isinstance(value.get("commit_annotations"), list)
+        or (
+            request["strategy"] != "merge"
+            and not isinstance(value.get("commit_annotations"), list)
+        )
     ):
         raise ConflictError(
             "conflict semantic output has an unsupported shape",
             "validation_failed",
         )
-    annotations = value["commit_annotations"]
+    annotations = (
+        [[]] if request["strategy"] == "merge" else value["commit_annotations"]
+    )
     expected_role_count = len(expected_roles(request))
     if (
         len(annotations) != expected_role_count

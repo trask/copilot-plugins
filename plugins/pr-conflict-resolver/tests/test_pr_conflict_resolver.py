@@ -895,13 +895,13 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "3350924ecdf54c61ad67fe9f38d529f2b6dcfd8ffc1ea19dcfb6acfab5bf6756",
+            "a947419cc9266ad411f6897fc13c7d20f15ec711b67b7add849196572c93d563",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
-            "ee463e9fc5054c62547ea453346fa870a9674ed9f36a60b56497a47fb76770dd",
+            "21b4142edcb7cb35b805e3f225d16f53a2139eda4e974f56826a3cc9d3c1f933",
         )
-        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@4")
+        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@5")
         self.assertEqual(
             MODULE.CONFLICT_REQUEST_SCHEMA["id"],
             "github.copilot.agent-task-conflict-request",
@@ -3972,7 +3972,6 @@ class ManagedTaskPromptTest(unittest.TestCase):
         content = json.dumps(
             {
                 "summary": "Resolved the frozen merge conflict.",
-                "commit_annotations": [[]],
                 "validation": [
                     {
                         "command": "git diff --check",
@@ -4038,7 +4037,7 @@ class ManagedTaskPromptTest(unittest.TestCase):
         request = self.request()
         prompt = CLOUD_MODULE.policy_prompt(self.options(request))
 
-        self.assertIn("Policy: marketplace-conflict-worker@4", prompt)
+        self.assertIn("Policy: marketplace-conflict-worker@5", prompt)
         self.assertNotIn(
             CLOUD_MODULE.assigned_code_ref(request["request_id"], "code"),
             prompt,
@@ -4047,6 +4046,8 @@ class ManagedTaskPromptTest(unittest.TestCase):
         self.assertIn("verified sole parent", prompt)
         self.assertIn("derives every SHA", prompt)
         self.assertIn("dispatcher adds the semantic schema and kind", prompt)
+        self.assertIn("For merge, omit `commit_annotations`", prompt)
+        self.assertNotIn('"commit_annotations"', prompt)
         self.assertIn('"result": "passed"', prompt)
         self.assertIn("Do not include SHAs, refs, roles, request identity", prompt)
         self.assertNotIn("Compact required receipt contract", prompt)
@@ -4330,7 +4331,7 @@ class ManagedTaskPromptTest(unittest.TestCase):
                 task,
             )
 
-    def test_16161_policy_4_accepts_the_exact_minimal_payload(self):
+    def test_16161_policy_4_contradictory_payload_is_rejected_by_policy_5(self):
         request, _, _, semantic_head, code_tip, _, snapshot = (
             self.single_role_evidence()
         )
@@ -4376,6 +4377,37 @@ class ManagedTaskPromptTest(unittest.TestCase):
                 return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
             ),
             mock.patch.object(CLOUD_MODULE, "git_show_file", return_value=content),
+            self.assertRaisesRegex(
+                CLOUD_MODULE.ConflictError,
+                "unsupported shape",
+            ),
+        ):
+            CLOUD_MODULE.validate_semantic_artifact(
+                mock.sentinel.runner,
+                snapshot,
+                request,
+                CLOUD_MODULE.RemoteRef(
+                    "artifact",
+                    None,
+                    request["repository"],
+                    "copilot/conflict-fix-loop-worker-v2-another-one",
+                ),
+                semantic_head,
+                code_tip,
+            )
+
+    def test_16161_policy_5_derives_merge_annotations_from_history(self):
+        request, _, _, semantic_head, code_tip, content, snapshot = (
+            self.single_role_evidence()
+        )
+        with (
+            mock.patch.object(CLOUD_MODULE, "parents", return_value=[code_tip]),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "changed_paths",
+                return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
+            ),
+            mock.patch.object(CLOUD_MODULE, "git_show_file", return_value=content),
         ):
             summary, annotations, validations, digest = (
                 CLOUD_MODULE.validate_semantic_artifact(
@@ -4393,16 +4425,12 @@ class ManagedTaskPromptTest(unittest.TestCase):
                 )
             )
 
-        self.assertIn("preserved both sets", summary)
-        self.assertEqual(["CHANGELOG.md"], annotations[0][0]["conflict_paths"])
+        self.assertIn("Resolved the frozen merge conflict", summary)
+        self.assertEqual([[]], annotations)
         self.assertEqual(
             [
                 {
-                    "command": "GitHub Actions Gradle wrapper validation",
-                    "result": "passed",
-                },
-                {
-                    "command": "CodeQL analysis for Actions and Python",
+                    "command": "git diff --check",
                     "result": "passed",
                 },
             ],

@@ -108,6 +108,7 @@ class PolicyPromptTest(unittest.TestCase):
                     "marketplace-agent-apply-report-worker@2, "
                     "marketplace-agent-apply-report-worker@3, "
                     "marketplace-agent-apply-report-worker@4, "
+                    "marketplace-agent-apply-report-worker@5, "
                     "marketplace-agent-report-worker@1, "
                     "marketplace-agent-worker@5",
                 ) as raised:
@@ -312,9 +313,10 @@ class PolicyPromptTest(unittest.TestCase):
         )
         prompt = payload["prompt"]
 
-        self.assertIn("Policy: marketplace-agent-apply-report-worker@4", prompt)
+        self.assertIn("Policy: marketplace-agent-apply-report-worker@5", prompt)
         self.assertIn(f"only changed path is `{semantic_path}`", prompt)
-        self.assertIn('"kind": "self-review-loop"', prompt)
+        self.assertIn("Do not wrap it in schema, kind, version, or payload fields", prompt)
+        self.assertNotIn('"kind": "self-review-loop"', prompt)
         self.assertIn("one-based integer `commit_index`", prompt)
         self.assertIn("identities belong only to the dispatcher", prompt.lower())
         self.assertNotIn(MODULE.SEMANTIC_PATH_PLACEHOLDER, prompt)
@@ -368,14 +370,10 @@ class PolicyPromptTest(unittest.TestCase):
     def test_clean_semantic_output_cannot_hide_generated_fix_history(self):
         content = json.dumps(
             {
-                "schema": MODULE.SEMANTIC_OUTPUT_SCHEMA,
-                "kind": "self-review-loop",
-                "payload": {
-                    "outcome": "cleared",
-                    "iterations_used": 1,
-                    "findings": [],
-                    "pull_request_metadata": {"decision": "keep"},
-                },
+                "outcome": "cleared",
+                "iterations_used": 1,
+                "findings": [],
+                "pull_request_metadata": {"decision": "keep"},
             }
         )
         api = mock.Mock()
@@ -397,6 +395,48 @@ class PolicyPromptTest(unittest.TestCase):
                 kind="self-review-loop",
                 commits=["1" * 40],
             )
+
+    def test_current_policy_preserves_exact_20075_payload_without_normalizing_it(self):
+        value = {
+            "version": 1,
+            "payload": {
+                "findings": [],
+                "result": "clean",
+                "title": "Report configured Redis targets for Rediscala",
+                "body": "Reports configured Redis deployments.",
+            },
+        }
+        content = json.dumps(value)
+        api = mock.Mock()
+        api.request_json.return_value = {
+            "type": "file",
+            "encoding": "base64",
+            "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+        }
+
+        payload, digest = MODULE.fetch_semantic_output(
+            api,
+            "owner/repo",
+            ".github/agent-task-semantic/request-1.json",
+            "copilot/task-1",
+            kind="self-review-loop",
+            commits=[],
+        )
+
+        self.assertEqual(value, payload)
+        self.assertEqual(hashlib.sha256(content.encode("utf-8")).hexdigest(), digest)
+
+    def test_policy_v4_keeps_the_legacy_model_authored_wrapper(self):
+        prompt = MODULE.build_apply_report_policy_prompt(
+            "Review.",
+            report_path=".github/agent-task-semantic/request-1.json",
+            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V4_SELECTOR,
+            semantic_kind="self-review-loop",
+        )
+
+        self.assertIn("Policy: marketplace-agent-apply-report-worker@4", prompt)
+        self.assertIn('"kind": "self-review-loop"', prompt)
+        self.assertIn('"schema":', prompt)
 
     def test_structural_recovery_is_disabled(self):
         result_path = str((Path.cwd().parent / "result.json").resolve())
@@ -1334,7 +1374,7 @@ class DispatcherFinalizationTest(unittest.TestCase):
         code, result, _, _ = self.execute(repository, options=options)
 
         self.assertEqual(code, 0)
-        self.assertEqual(result.schema_version, 3)
+        self.assertEqual(result.schema_version, 4)
         self.assertTrue(result.structural_complete)
         self.assertIsNone(result.report_path)
         self.assertEqual(
@@ -1356,7 +1396,30 @@ class DispatcherFinalizationTest(unittest.TestCase):
         self.last_semantic_fetch.assert_called_once()
         envelope = result.as_dict()
         self.assertEqual(envelope["attestation"]["kind"], "dispatcher_semantic")
+        self.assertEqual(envelope["semantic_output"]["schema"], MODULE.SEMANTIC_OUTPUT_SCHEMA)
         self.assertIsNone(envelope["report"])
+
+    def test_legacy_semantic_apply_never_imports_worker_commits(self):
+        repository = self.repository()
+        options = MODULE.Options(
+            report=False,
+            model="gpt-5.6-sol",
+            prompt="Write {{MARKETPLACE_SEMANTIC_PATH}}.",
+            pull_request=MODULE.PrReference(7, "owner/repo", "owner/repo#7"),
+            apply_with_report=True,
+            result_file=Path("C:/state/result.json"),
+            policy=MODULE.MARKETPLACE_APPLY_REPORT_POLICY_V4_SELECTOR,
+            prompt_file=Path("C:/state/prompt.txt"),
+            semantic_kind="self-review-loop",
+        )
+
+        code, result, _, _ = self.execute(repository, options=options)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(result.schema_version, 3)
+        self.assertEqual(result.application_status, "not_applied")
+        self.assertEqual(result.final_local_head, self.base_sha)
+        repository.fast_forward.assert_not_called()
 
     def creation_failure(self, options):
         repository = self.repository()
