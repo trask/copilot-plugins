@@ -159,16 +159,16 @@ def agent_task_result(preflight=None, **overrides):
     preflight = preflight or agent_task_preflight()
     pr = preflight["pr"]
     generated_head = "3" * 40
-    request_id = "request-1"
+    base_ref = pr["head_sha"] if pr["cross_repository"] else pr["head"]["ref"]
     result = {
         "schema": MODULE.AGENT_TASK_RESULT_SCHEMA,
         "status": "success",
-        "mode": "report",
+        "mode": "report_recommendation",
         "repository": {"name_with_owner": pr["repo_name"]},
         "pull_request": MODULE.expected_cloud_pull_request(preflight),
         "requested_model": "gpt-5.6-sol",
         "policy": {
-            "id": "marketplace-agent-report-worker",
+            "id": "marketplace-agent-report-recommendation-worker",
             "version": 1,
             "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
         },
@@ -176,7 +176,7 @@ def agent_task_result(preflight=None, **overrides):
             "id": "task-1",
             "url": "https://github.com/owner/repo/agent-tasks/task-1",
             "state": "completed",
-            "base_ref": pr["head"]["ref"],
+            "base_ref": base_ref,
             "base_sha": pr["head_sha"],
         },
         "generated": {
@@ -185,16 +185,66 @@ def agent_task_result(preflight=None, **overrides):
             "commits": [],
         },
         "application": {
-            "status": "not_applicable",
+            "status": "not_applied",
             "final_local_head": "4" * 40,
         },
-        "report": {
-            "path": f".github/agent-task-reports/{request_id}.md",
-            "commit": generated_head,
-            "sha256": "5" * 64,
+        "report": None,
+        "candidate": {
+            "schema": MODULE.AGENT_TASK_CANDIDATE_MANIFEST_SCHEMA,
+            "repository": {"name_with_owner": pr["repo_name"]},
+            "task": {"id": "task-1", "session_id": "session-1"},
+            "base": {"ref": base_ref, "sha": pr["head_sha"]},
+            "generated": {
+                "ref": "copilot/agent-task",
+                "head_sha": generated_head,
+                "code_tip_sha": pr["head_sha"],
+            },
+            "code_commits": [],
+            "artifact_commit": {
+                "sha": generated_head,
+                "parent_sha": pr["head_sha"],
+                "tree_sha": "6" * 40,
+                "patch_sha256": "7" * 64,
+                "changed_paths": [
+                    MODULE.AGENT_TASK_OUTPUT_BODY,
+                    MODULE.AGENT_TASK_OUTPUT_TITLE,
+                ],
+            },
+        },
+        "completion": {
+            "request": {
+                "requested_model": "gpt-5.6-sol",
+                "prompt_sha256": "8" * 64,
+            },
+            "task": {
+                "id": "task-1",
+                "state": "completed",
+                "created_at": "2026-09-18T12:00:00Z",
+                "updated_at": "2026-09-18T12:01:00Z",
+                "completed_at": "2026-09-18T12:01:00Z",
+                "raw_response_sha256": "9" * 64,
+            },
+            "session": {
+                "id": "session-1",
+                "state": "completed",
+                "actual_model": "sweagent-capi:gpt-5.6-sol",
+                "created_at": "2026-09-18T12:00:01Z",
+                "updated_at": "2026-09-18T12:01:00Z",
+                "completed_at": "2026-09-18T12:01:00Z",
+                "prompt_sha256": "8" * 64,
+            },
+            "repository": {
+                "name_with_owner": pr["repo_name"],
+                "id": 11,
+                "owner": {"login": "owner", "id": 12},
+            },
+            "refs": {
+                "base": base_ref,
+                "generated": "copilot/agent-task",
+            },
         },
         "attestation": {
-            "kind": "dispatcher_structural",
+            "kind": "dispatcher_candidate",
             "structural_complete": True,
         },
         "error": None,
@@ -872,9 +922,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
 
     def result(self, report_content):
-        value = agent_task_result(self.preflight)
-        value["report"]["sha256"] = MODULE.sha256_text(report_content)
-        return value
+        return agent_task_result(self.preflight)
 
     def legacy_taskless_result(self, preflight, receipt_id):
         pr = preflight["pr"]
@@ -1077,8 +1125,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "run", side_effect=helper_run),
             mock.patch.object(
                 MODULE,
-                "fetch_committed_text",
-                side_effect=[report_content, receipt_content],
+                "fetch_committed_bytes",
+                side_effect=[
+                    (json.loads(report_content)["proposal"]["title"] + "\n").encode(),
+                    (json.loads(report_content)["proposal"]["body"] + "\n").encode(),
+                ],
             ),
             mock.patch.object(
                 MODULE,
@@ -1112,7 +1163,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("You are a thin local coordinator", instructions)
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-report-worker@1", instructions)
+        self.assertIn(
+            "marketplace-agent-report-recommendation-worker@1", instructions
+        )
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertIn("Never scrape", instructions)
@@ -1134,7 +1187,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.60")
+        self.assertEqual(plugin["version"], "1.0.61")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1246,22 +1299,25 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 self.repo_root, MODULE.parse_target("owner/repo#7")
             )
 
-    def test_validates_success_envelope_receipt_report_and_proposal(self):
+    def test_validates_candidate_envelope_and_derives_proposal(self):
         report_content = self.proposal_report()
         result = self.result(report_content)
+        self.preflight["changed_files"] = ["src/app.py"]
         remote = MODULE.validate_success_result(
             result,
             preflight=self.preflight,
             requested_model="gpt-5.6-sol",
             identity=self.identity,
         )
-        proposal = MODULE.validate_proposal_report(
-            report_content,
-            request_id=remote["request_id"],
+        expected = json.loads(report_content)["proposal"]
+        proposal = MODULE.recommendation_from_outputs(
             preflight=self.preflight,
-            changed_files=["src/app.py"],
+            remote=remote,
+            title_raw=(expected["title"] + "\n").encode(),
+            body_raw=(expected["body"] + "\n").encode(),
         )
         self.assertEqual(proposal["decision"], "keep")
+        self.assertEqual(proposal["evidence"]["changed_files"], ["src/app.py"])
 
     def test_exact_forward_compact_keep_report_recovers_no_proposal(self):
         body = (
@@ -1779,7 +1835,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "559a9f55-7133-4443-b11e-57da844457ed",
             result["task"]["id"],
         )
-        remote = MODULE.validate_success_result(
+        remote = MODULE.validate_legacy_success_result(
             result,
             preflight=preflight,
             requested_model="gpt-5.6-sol",
@@ -1986,12 +2042,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_prompt_uses_dispatcher_assigned_artifact_paths(self):
         prompt = MODULE.build_worker_prompt(agent_task_preflight())
 
-        self.assertIn("worker prompt version 3", prompt)
-        self.assertIn("with its request, repository, pull request, head, base", prompt)
-        self.assertIn("human-readable UTF-8 Markdown report", prompt)
-        self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
-        self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
-        self.assertIn("Do not choose alternate artifact names", prompt)
+        self.assertIn("worker prompt version 4", prompt)
+        self.assertIn(MODULE.AGENT_TASK_OUTPUT_TITLE, prompt)
+        self.assertIn(MODULE.AGENT_TASK_OUTPUT_BODY, prompt)
+        self.assertIn(MODULE.AGENT_TASK_OUTPUT_REPORT, prompt)
+        self.assertIn("report is optional, unstructured, and never parsed", prompt)
+        self.assertNotIn("MARKETPLACE_REPORT_PATH", prompt)
+        self.assertNotIn("fenced `json`", prompt)
+        self.assertNotIn("current_title_sha256", prompt)
 
     def test_success_uses_atomic_result_not_stdout_and_cleans_artifacts(self):
         report_content = self.proposal_report()
@@ -2007,7 +2065,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("--report", command)
         self.assertEqual(
             command[command.index("--policy") + 1],
-            "marketplace-agent-report-worker@1",
+            "marketplace-agent-report-recommendation-worker@1",
         )
         self.assertNotIn("--custom-agent", command)
         result_path = Path(command[command.index("--result-file") + 1])
@@ -2215,7 +2273,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         with self.assertRaisesRegex(
             MODULE.WorkflowError, "does not match the pinned request"
         ):
-            MODULE.validate_success_result(
+            MODULE.validate_legacy_success_result(
                 result,
                 preflight=self.preflight,
                 requested_model="gpt-5.6-sol",
@@ -3208,6 +3266,238 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         state = MODULE.load_run_state(index.with_name("owner--repo--7--run-1.json"))
         self.assertEqual(state["agent_task"]["status"], "failed_after_mutation")
         self.assertTrue(state["agent_task"]["recovery_files"])
+
+    def test_source_only_replacement_never_mutates_title_or_body(self):
+        report_content = self.proposal_report(
+            decision="replace",
+            title="Better title",
+            body="Better body",
+        )
+        patches, emitted, index = self.command_patches(
+            self.result(report_content), report_content, self.receipt()
+        )
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            apply = stack.enter_context(mock.patch.object(MODULE, "apply_proposal"))
+            update = stack.enter_context(mock.patch.object(MODULE, "update_pr"))
+            MODULE.command_agent_task(
+                SimpleNamespace(
+                    target="owner/repo#7",
+                    repo_root=None,
+                    model="sol",
+                    github_mutation_policy="source-only",
+                )
+            )
+
+        apply.assert_not_called()
+        update.assert_not_called()
+        self.assertEqual("source_only_no_mutation", emitted[-1]["result"])
+        self.assertIsNone(emitted[-1]["validated_head_sha"])
+        state = MODULE.load_run_state(index.with_name("owner--repo--7--run-1.json"))
+        self.assertEqual(
+            "source-only", state["agent_task"]["github_mutation_policy"]
+        )
+        self.assertNotIn("validated_head_sha", state)
+
+
+class RecommendationContractTest(unittest.TestCase):
+    def setUp(self):
+        self.preflight = agent_task_preflight()
+        self.preflight["changed_files"] = ["README.md", "src/app.py"]
+        self.identity = {"branch": "feature", "head": "4" * 40, "status": ""}
+
+    def result(self, *, report=False):
+        result = agent_task_result(self.preflight)
+        if report:
+            result["candidate"]["artifact_commit"]["changed_paths"].append(
+                MODULE.AGENT_TASK_OUTPUT_REPORT
+            )
+            result["candidate"]["artifact_commit"]["changed_paths"].sort()
+        return result
+
+    def remote(self, *, report=False):
+        return MODULE.validate_success_result(
+            self.result(report=report),
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+            identity=self.identity,
+        )
+
+    def test_runtime_policy_and_proposal_versions_are_pinned(self):
+        self.assertEqual(
+            "1601dfcb7f9228ad4d59fb3653ba0548b219c2de2b28d33921a4f1e7fd687297",
+            MODULE.REQUIRED_CLOUD_TASK_SHA256,
+        )
+        self.assertEqual(
+            "07aeb40461735368b72a570123a1afcb12d21f3a6b70cfa3dfd4e6dc2e6308ab",
+            MODULE.AGENT_TASK_POLICY_SHA256,
+        )
+        self.assertEqual(
+            {"id": "github.copilot.agent-task-result", "version": 5},
+            MODULE.AGENT_TASK_RESULT_SCHEMA,
+        )
+        self.assertEqual(
+            {
+                "id": "github.copilot.agent-task-candidate-manifest",
+                "version": 1,
+            },
+            MODULE.AGENT_TASK_CANDIDATE_MANIFEST_SCHEMA,
+        )
+        self.assertEqual(3, MODULE.PR_DESCRIPTION_PROPOSAL_SCHEMA["version"])
+
+    def test_title_and_body_only_outputs_derive_keep_and_replace(self):
+        remote = self.remote()
+        keep = MODULE.recommendation_from_outputs(
+            preflight=self.preflight,
+            remote=remote,
+            title_raw=b"Current title\n",
+            body_raw=b"Current body\n",
+        )
+        replace = MODULE.recommendation_from_outputs(
+            preflight=self.preflight,
+            remote=remote,
+            title_raw=b"Better title\n",
+            body_raw=b"Better body\n",
+        )
+
+        self.assertEqual("keep", keep["decision"])
+        self.assertEqual("replace", replace["decision"])
+        self.assertEqual(
+            self.preflight["changed_files"],
+            replace["evidence"]["changed_files"],
+        )
+        self.assertEqual(
+            MODULE.sha256_text("Current title"),
+            replace["identity"]["current_title_sha256"],
+        )
+        self.assertRegex(replace["proposal_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_optional_arbitrary_report_is_advisory(self):
+        remote = self.remote(report=True)
+
+        self.assertEqual(
+            MODULE.AGENT_TASK_OUTPUT_REPORT,
+            remote["report_evidence"]["path"],
+        )
+        self.assertEqual([], remote["commits"])
+        self.assertEqual(self.preflight["pr"]["head_sha"], remote["code_tip"])
+
+    def test_requires_title_and_body_and_rejects_other_output_paths(self):
+        for missing in (
+            MODULE.AGENT_TASK_OUTPUT_TITLE,
+            MODULE.AGENT_TASK_OUTPUT_BODY,
+        ):
+            with self.subTest(missing=missing):
+                result = self.result()
+                result["candidate"]["artifact_commit"]["changed_paths"].remove(
+                    missing
+                )
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError, "required title and body"
+                ):
+                    MODULE.validate_success_result(
+                        result,
+                        preflight=self.preflight,
+                        requested_model="gpt-5.6-sol",
+                        identity=self.identity,
+                    )
+
+        result = self.result()
+        result["candidate"]["artifact_commit"]["changed_paths"].append(
+            ".github/agent-task-output/details.json"
+        )
+        result["candidate"]["artifact_commit"]["changed_paths"].sort()
+        with self.assertRaisesRegex(MODULE.WorkflowError, "required title and body"):
+            MODULE.validate_success_result(
+                result,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+                identity=self.identity,
+            )
+
+    def test_rejects_code_commits_and_manifest_identity_drift(self):
+        mutations = {
+            "code commit": lambda value: value["candidate"]["code_commits"].append(
+                {
+                    "sha": "a" * 40,
+                    "parent_sha": self.preflight["pr"]["head_sha"],
+                    "tree_sha": "b" * 40,
+                    "patch_sha256": "c" * 64,
+                    "changed_paths": ["src/app.py"],
+                }
+            ),
+            "schema": lambda value: value["candidate"].update(
+                schema={"id": "wrong", "version": 1}
+            ),
+            "session": lambda value: value["candidate"]["task"].update(
+                session_id="other-session"
+            ),
+            "output parent": lambda value: value["candidate"][
+                "artifact_commit"
+            ].update(parent_sha="d" * 40),
+            "completion ref": lambda value: value["completion"]["refs"].update(
+                generated="other/ref"
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                result = self.result()
+                mutate(result)
+                with self.assertRaises(MODULE.WorkflowError):
+                    MODULE.validate_success_result(
+                        result,
+                        preflight=self.preflight,
+                        requested_model="gpt-5.6-sol",
+                        identity=self.identity,
+                    )
+
+    def test_legacy_result_is_loadable_for_audit_but_not_a_fresh_candidate(self):
+        result = MODULE.load_agent_task_result(FORWARD_NESTED_REQUEST_RESULT)
+
+        self.assertEqual(
+            MODULE.LEGACY_REPORT_AGENT_TASK_RESULT_SCHEMA,
+            result["schema"],
+        )
+        with self.assertRaises(MODULE.WorkflowError):
+            MODULE.validate_success_result(
+                result,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+                identity=self.identity,
+            )
+
+    def test_title_transport_rules_cover_encoding_size_and_newlines(self):
+        self.assertEqual("Title", MODULE.decode_recommendation_title(b"Title\n"))
+        self.assertEqual("Title", MODULE.decode_recommendation_title(b"Title\r\n"))
+        for raw in (
+            b"",
+            b"Title\n\n",
+            b"Title\x00",
+            b"\xef\xbb\xbfTitle",
+            b" Title",
+            b"Title ",
+            b"\xff",
+            b"x" * (MODULE.TITLE_MAX_BYTES + 1),
+        ):
+            with self.subTest(raw=raw[:20]), self.assertRaises(MODULE.WorkflowError):
+                MODULE.decode_recommendation_title(raw)
+
+    def test_body_transport_rules_cover_empty_encoding_size_and_newlines(self):
+        self.assertEqual("", MODULE.decode_recommendation_body(b""))
+        self.assertEqual("", MODULE.decode_recommendation_body(b"\n"))
+        self.assertEqual("Body", MODULE.decode_recommendation_body(b"Body\n"))
+        self.assertEqual("Body", MODULE.decode_recommendation_body(b"Body\r\n"))
+        self.assertEqual("Body\n", MODULE.decode_recommendation_body(b"Body\n\n"))
+        for raw in (
+            b"Body\x00",
+            b"\xef\xbb\xbfBody",
+            b"Body\rBody",
+            b"\xff",
+            b"x" * (MODULE.BODY_MAX_BYTES + 1),
+        ):
+            with self.subTest(raw=raw[:20]), self.assertRaises(MODULE.WorkflowError):
+                MODULE.decode_recommendation_body(raw)
 
 
 class TargetParsingTest(unittest.TestCase):
