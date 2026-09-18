@@ -637,6 +637,36 @@ class StageContractTest(unittest.TestCase):
                     resolve_program=lambda name: name,
                 )
 
+    def test_description_model_overrides_use_coordinator_aliases(self):
+        for model, alias in (
+            ("gpt-5.6-sol", "sol"),
+            ("gpt-5.6-luna", "luna"),
+            ("gpt-5.6-terra", "terra"),
+            ("gpt-6-astra", "astra"),
+        ):
+            with self.subTest(model=model):
+                models = MODULE.stage_models([f"pr-description={model}"])
+                command = MODULE.common.stage_command(
+                    MODULE.STAGE_BY_NAME[MODULE.STAGE_DESCRIPTION],
+                    target(),
+                    model=models[MODULE.STAGE_DESCRIPTION],
+                    effort="high",
+                    arguments=[],
+                )
+                self.assertEqual(alias, command[command.index("--model") + 1])
+
+    def test_unsupported_models_fail_before_stage_launch(self):
+        for assignment, error in (
+            ("pr-description=unknown-model", "does not support model"),
+            ("pr-conflict-resolver=gpt-6-astra", "requires exactly model"),
+            ("copilot-review-loop=gpt-6-astra", "requires exactly model"),
+        ):
+            with (
+                self.subTest(assignment=assignment),
+                self.assertRaisesRegex(MODULE.WorkflowError, error),
+            ):
+                MODULE.stage_models([assignment])
+
     def test_pipeline_position_is_one_run_and_two_sweeps(self):
         entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CI]
         with mock.patch.object(MODULE, "stage_accepts_pipeline_position", return_value=True):

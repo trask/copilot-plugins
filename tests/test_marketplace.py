@@ -30,18 +30,18 @@ CI_FIX_RELEASE_BOUNDARY_HELPER_SHA256 = (
 RUNTIME_PLUGIN = "agent-tasks-runtime"
 RUNTIME_SKILL = ROOT / "plugins" / RUNTIME_PLUGIN / "skills" / RUNTIME_PLUGIN
 CONFLICT_HELPER_SHA256 = (
-    "ecddfa60e8896dfef31f2e441537f04a3814f98c1439f4d25ac65e35b5518412"
+    "67b75d394ea05079aa20f51ae1ddd480d269fead09328f76a39b88049378f2f9"
 )
 EXPECTED_PACKAGE_VERSIONS = {
     "agent-tasks-runtime": "1.0.17",
-    "ci-fix-loop": "1.6.50",
-    "copilot-review-loop": "1.1.60",
+    "ci-fix-loop": "1.6.51",
+    "copilot-review-loop": "1.1.61",
     "historical-pr-audit": "1.1.21",
-    "pr-conflict-resolver": "1.1.29",
-    "pr-description": "1.0.62",
-    "pr-pipeline": "1.5.26",
+    "pr-conflict-resolver": "1.1.30",
+    "pr-description": "1.0.63",
+    "pr-pipeline": "1.5.27",
     "pr-reviewer": "1.8.10",
-    "self-review-loop": "1.3.40",
+    "self-review-loop": "1.3.41",
 }
 
 
@@ -348,6 +348,70 @@ class MarketplaceTest(unittest.TestCase):
                     module.discover_conflict_task()
             finally:
                 sys.modules.pop(module_name, None)
+
+    def test_pipeline_stages_expose_direct_coordinator_entrypoints(self):
+        common_path = (
+            ROOT / "plugins" / "pr-pipeline" / "scripts" / "pipeline_common.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "_marketplace_pipeline_common", common_path
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        self.addCleanup(sys.modules.pop, spec.name, None)
+        spec.loader.exec_module(module)
+        for stage in module.STAGES:
+            with (
+                self.subTest(stage=stage["stage"]),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                plugin_root = Path(directory) / stage["plugin"]
+                shutil.copytree(ROOT / "plugins" / stage["plugin"], plugin_root)
+                coordinator = plugin_root / "scripts" / f"{stage['module']}.py"
+                models = (
+                    tuple(module.COORDINATOR_MODEL_ARGUMENTS)
+                    if stage["stage"] == module.STAGE_DESCRIPTION
+                    else (stage["model"],)
+                )
+                for model in models:
+                    with (
+                        self.subTest(model=model),
+                        mock.patch.object(
+                            module, "stage_script_path", return_value=coordinator
+                        ),
+                    ):
+                        command = module.stage_command(
+                            stage,
+                            {"repo_name": "owner/repo", "number": 1},
+                            model=model,
+                            effort=module.DEFAULT_EFFORT,
+                            arguments=[
+                                "--state", str(Path(directory) / "state.json"),
+                                "--pipeline-run", "a" * 32,
+                                "--pipeline-iteration", "1",
+                                "--pipeline-max-iterations", "2",
+                                "--help",
+                            ],
+                        )
+                        process = subprocess.run(
+                            command,
+                            cwd=directory,
+                            env=dict(os.environ),
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            timeout=30,
+                            creationflags=(
+                                subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                            ),
+                        )
+                        self.assertEqual(process.returncode, 0, process.stderr)
+                        self.assertIn("--state ", process.stdout)
+                        self.assertIn("--pipeline-run ", process.stdout)
+                        if stage.get("github_mutation_policy"):
+                            self.assertIn("--github-mutation-policy ", process.stdout)
 
 
 if __name__ == "__main__":

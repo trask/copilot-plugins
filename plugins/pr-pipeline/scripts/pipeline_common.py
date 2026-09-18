@@ -27,6 +27,12 @@ from typing import Any, Callable
 
 DEFAULT_STAGE_MODEL = "gpt-5.6-sol"
 DEFAULT_EFFORT = "high"
+COORDINATOR_MODEL_ARGUMENTS = {
+    "gpt-5.6-sol": "sol",
+    "gpt-5.6-luna": "luna",
+    "gpt-5.6-terra": "terra",
+    "gpt-6-astra": "astra",
+}
 CONFLICT_STRATEGIES = ("auto", "merge", "rebase")
 SELF_REVIEW_MODEL = "gpt-5.6-sol"
 SELF_REVIEW_EFFORT = "high"
@@ -63,6 +69,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "marker": ("mergeable_at_head_sha",),
         "base_marker": ("attempt", "base_sha"),
         "model": DEFAULT_STAGE_MODEL,
+        "required_model": DEFAULT_STAGE_MODEL,
     },
     {
         "stage": STAGE_COPILOT_REVIEW,
@@ -1779,6 +1786,11 @@ def validate_stage_route(entry: dict[str, Any], model: str, effort: str) -> None
         raise WorkflowError(
             f"{entry['stage']} requires exactly model {required_model}, not {model}"
         )
+    if model not in COORDINATOR_MODEL_ARGUMENTS:
+        raise WorkflowError(
+            f"{entry['stage']} does not support model {model}; "
+            f"choose one of {', '.join(COORDINATOR_MODEL_ARGUMENTS)}"
+        )
     required_effort = entry.get("required_effort")
     if required_effort and effort != required_effort:
         raise WorkflowError(
@@ -1879,7 +1891,7 @@ def stage_command(
         "pipeline",
         f"{target['repo_name']}#{target['number']}",
         "--model",
-        "sol" if model == DEFAULT_STAGE_MODEL else model,
+        COORDINATOR_MODEL_ARGUMENTS[model],
         *stage_arguments,
     ]
 
