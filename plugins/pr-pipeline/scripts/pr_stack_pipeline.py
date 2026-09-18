@@ -2787,7 +2787,9 @@ class StackPipeline:
                         "reason": "base_status_unavailable",
                         "identity": "unverified",
                         "installed": stage_script_path(entry).is_file(),
-                        "status_state": str(stage_state_path(entry, target)),
+                        "status_state": str(
+                            stage_state_path(entry, target, self.run_id)
+                        ),
                         "status": {},
                         "inspected_head_sha": member["head_sha"],
                         "inspected_base_sha": None,

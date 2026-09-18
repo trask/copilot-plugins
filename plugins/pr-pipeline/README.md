@@ -31,9 +31,9 @@ flowchart LR
 
             subgraph hosted["HOSTED Agent Task workers"]
                 direction LR
-                conflictWorker["Conflict worker<br/>1x / managed attempt<br/>ALL frozen conflict paths and selected stack members<br/>marketplace-conflict-worker@1"]
-                selfReviewWorker["Self Review worker<br/>1x / review iteration<br/>ALL self-review findings<br/>marketplace-agent-apply-report-worker@3"]
-                ciWorker["CI Fix worker<br/>1 HOSTED agent receives the local triage summary<br/>A new agent starts only after the head or final check results change<br/>NOT one agent per failed check<br/>marketplace-agent-apply-report-worker@3"]
+                conflictWorker["Conflict worker<br/>1x / managed attempt<br/>ALL frozen conflict paths and selected stack members<br/>marketplace-conflict-worker@3"]
+                selfReviewWorker["Self Review worker<br/>1x / review iteration<br/>ALL self-review findings<br/>marketplace-agent-apply-report-worker@4"]
+                ciWorker["CI Fix worker<br/>1 HOSTED agent receives the local triage summary<br/>A new agent starts only after the head or final check results change<br/>NOT one agent per failed check<br/>marketplace-agent-apply-report-worker@4"]
                 descriptionWorker["PR Description worker<br/>1x report task / whole PR<br/>title and body decision<br/>marketplace-agent-report-worker@1"]
             end
 
@@ -71,6 +71,8 @@ flowchart LR
 ```
 
 The scheduler runs the five stages in the numbered order. It starts a second sweep only when the pull request head or base changes during the first sweep and a stage is not clear at the final revisions. A completed conflict resolver does not run again in that pipeline run.
+
+Every stage launch and status read uses the state path derived from the current pipeline run ID. The scheduler never falls back to a PR-wide state file. It also requires the stage's status envelope to name that exact file and pull request, then checks clearance against the current head and, for conflict resolution, the current base. Missing, unreadable, or mismatched invocation state fails closed without importing another run's task, owner, report, or clearance.
 
 Each stage has a local coordinator. For hosted stages, the local Agent Tasks Runtime dispatches the request and verifies the result. It is not a worker session. Copilot Review starts a local `gpt-5.6-sol` decision session with reasoning effort `high` and has no hosted fallback. CI Fix starts a separate read-only local session with the same model and effort to triage failed-log files before hosted fixing.
 

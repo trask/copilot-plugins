@@ -402,19 +402,24 @@ def inspect_stages(
     )
 
 
+def inspect_stage_for_run(
+    entry: dict[str, Any],
+    target: dict[str, Any],
+    head_sha: str,
+    base_sha: str,
+    run_id: str,
+) -> dict[str, Any]:
+    return inspect_stage(entry, target, head_sha, base_sha, run_id)
+
+
 def stage_accepts_pipeline_position(entry: dict[str, Any]) -> bool:
     return common.stage_accepts_pipeline_position(entry)
-
-
-DEFAULT_INSPECT_STAGES = inspect_stages
 
 
 def inspect_stages_for_run(
     target: dict[str, Any], head_sha: str, base_sha: str, run_id: str
 ) -> list[dict[str, Any]]:
-    if inspect_stages is DEFAULT_INSPECT_STAGES:
-        return inspect_stages(target, head_sha, base_sha, run_id)
-    return inspect_stages(target, head_sha, base_sha)
+    return inspect_stages(target, head_sha, base_sha, run_id)
 
 
 def pipeline_arguments(entry: dict[str, Any], run_id: str, sweep: int) -> list[str]:
@@ -502,7 +507,13 @@ def run_stage(
 
     def progress() -> None:
         nonlocal last_signature
-        current = common.stage_live_progress(entry, target)
+        current = common.stage_live_progress(
+            entry,
+            target,
+            state_for=lambda selected, current_target: stage_state_path(
+                selected, current_target, run_id
+            ),
+        )
         if current is None:
             return
         signature = json.dumps(current, sort_keys=True)
@@ -655,7 +666,9 @@ def run_pipeline(
             base_changed = base_changed or pr["base_sha"] != sweep_started_base
             known_safe_head = current_head
 
-            before = inspect_stage(entry, target, current_head, pr["base_sha"])
+            before = inspect_stage_for_run(
+                entry, target, current_head, pr["base_sha"], run_id
+            )
             before_attempt_id = (
                 ((before.get("status") or {}).get("attempt") or {}).get("id")
                 if entry["stage"] == STAGE_CONFLICT
@@ -823,11 +836,12 @@ def run_pipeline(
             known_safe_head = ended_head
             head_changed = head_changed or ended_head != current_head
             current_pr = read_pull_request(target)
-            after = inspect_stage(
+            after = inspect_stage_for_run(
                 entry,
                 target,
                 ended_head,
                 current_pr["base_sha"],
+                run_id,
             )
             record.update(
                 {

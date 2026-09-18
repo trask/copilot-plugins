@@ -1378,6 +1378,51 @@ def read_stage_status(
             "reason": "status_not_ready",
             "payload": payload,
         }
+    reported_state = payload.get("state")
+    try:
+        state_matches = (
+            isinstance(reported_state, str)
+            and bool(reported_state)
+            and os.path.normcase(str(Path(reported_state).resolve()))
+            == os.path.normcase(str(state.resolve()))
+        )
+    except OSError:
+        state_matches = False
+    if not state_matches:
+        return {
+            **common,
+            "ok": False,
+            "reason": "status_state_mismatch",
+            "detail": (
+                "stage status named a different state file: "
+                f"{payload.get('state')!r}"
+            ),
+            "payload": None,
+        }
+    pr = payload.get("pr")
+    coordinator = payload.get("coordinator")
+    escalation = payload.get("escalation")
+    pre_identity_coordinator_error = (
+        entry["stage"] == STAGE_CI
+        and pr is None
+        and isinstance(coordinator, dict)
+        and coordinator.get("status") == "blocked"
+        and isinstance(escalation, dict)
+        and escalation.get("reason") == "coordinator_error"
+    )
+    if not pre_identity_coordinator_error and (
+        not isinstance(pr, dict)
+        or pr.get("number") != target["number"]
+        or str(pr.get("repo_name") or "").casefold()
+        != str(target["repo_name"]).casefold()
+    ):
+        return {
+            **common,
+            "ok": False,
+            "reason": "status_identity_mismatch",
+            "detail": "stage status named a different pull request",
+            "payload": None,
+        }
     return {**common, "ok": True, "payload": payload}
 
 
@@ -1437,7 +1482,14 @@ RECOVERY_TASK_STATES = frozenset(
     }
 )
 UNAVAILABLE_STATUS_REASONS = frozenset(
-    {"status_timeout", "status_failed", "invalid_status_json", "status_not_ready"}
+    {
+        "status_timeout",
+        "status_failed",
+        "invalid_status_json",
+        "status_not_ready",
+        "status_state_mismatch",
+        "status_identity_mismatch",
+    }
 )
 
 

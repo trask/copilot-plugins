@@ -857,6 +857,336 @@ class MarkerTest(unittest.TestCase):
         self.assertEqual(agent_task, result["status"]["agent_task"])
 
 
+class InvocationStateIsolationTest(unittest.TestCase):
+    RUN_ID = "419b3efaa0754a18a27235f3bcc6b8ed"
+    HEAD = "028894b47c864dc5ea068751017788d3e6966740"
+    BASE = "737354d8" + ("0" * 32)
+    OLD_HEAD = "a48b898a" + ("0" * 32)
+
+    def test_20075_reads_only_fresh_stage_state(self):
+        stale_owner = "e9a8f3877a7e86e16973f9ebe01caaa2"
+        stale_task = "ccfbeb8b-3fef-4fff-9898-7be4d3dda172"
+        stale_report = "043c1f18" + ("0" * 56)
+        canonical_payloads = {
+            MODULE.STAGE_CONFLICT: {
+                "result": "ready",
+                "stage_outcome": "cleared",
+                "mergeable_at_head_sha": self.OLD_HEAD,
+                "attempt": {"base_sha": self.BASE},
+            },
+            MODULE.STAGE_COPILOT_REVIEW: {
+                "result": "ready",
+                "stage_outcome": "cleared",
+                "clean_at_head_sha": self.HEAD,
+            },
+            MODULE.STAGE_SELF_REVIEW: {
+                "result": "ready",
+                "agent_task": {
+                    "status": "failed",
+                    "run_id": stale_owner,
+                    "task_id": stale_task,
+                    "report_sha256": stale_report,
+                },
+            },
+        }
+        invocation_payloads = {
+            MODULE.STAGE_CONFLICT: {
+                "result": "ready",
+                "stage_outcome": "cleared",
+                "mergeable_at_head_sha": self.HEAD,
+                "attempt": {"base_sha": self.BASE},
+            },
+            MODULE.STAGE_COPILOT_REVIEW: {
+                "result": "ready",
+                "stage_outcome": "review_required",
+                "agent_task": {
+                    "status": "completed",
+                    "session_id": "e1313855-fresh",
+                },
+            },
+        }
+        read_paths = []
+
+        def read_status(entry, selected, *, script_for=None, state_for):
+            del script_for
+            path = state_for(entry, selected)
+            read_paths.append(path)
+            canonical = MODULE.stage_state_path(entry, selected)
+            invocation = MODULE.stage_state_path(entry, selected, self.RUN_ID)
+            if path == canonical:
+                payload = canonical_payloads[entry["stage"]]
+            elif path == invocation:
+                payload = invocation_payloads.get(entry["stage"])
+            else:
+                self.fail(f"unexpected stage state path: {path}")
+            if payload is None:
+                return {
+                    "ok": False,
+                    "installed": True,
+                    "state": str(path),
+                    "payload": None,
+                    "reason": "no_state",
+                }
+            return {
+                "ok": True,
+                "installed": True,
+                "state": str(path),
+                "payload": payload,
+            }
+
+        with mock.patch.object(
+            MODULE.common, "read_stage_status", side_effect=read_status
+        ):
+            results = {
+                entry["stage"]: MODULE.inspect_stage_for_run(
+                    entry,
+                    target(),
+                    self.HEAD,
+                    self.BASE,
+                    self.RUN_ID,
+                )
+                for entry in MODULE.STAGES[:3]
+            }
+
+        self.assertTrue(results[MODULE.STAGE_CONFLICT]["clear"])
+        self.assertEqual(
+            self.HEAD,
+            results[MODULE.STAGE_CONFLICT]["clear_at_head_sha"],
+        )
+        self.assertFalse(results[MODULE.STAGE_COPILOT_REVIEW]["clear"])
+        self.assertEqual(
+            "review_required",
+            results[MODULE.STAGE_COPILOT_REVIEW]["outcome"],
+        )
+        self.assertEqual(
+            "e1313855-fresh",
+            results[MODULE.STAGE_COPILOT_REVIEW]["status"]["agent_task"][
+                "session_id"
+            ],
+        )
+        self.assertEqual("no_state", results[MODULE.STAGE_SELF_REVIEW]["reason"])
+        self.assertEqual({}, results[MODULE.STAGE_SELF_REVIEW]["status"])
+        self.assertNotIn(stale_owner, json.dumps(results))
+        self.assertNotIn(stale_task, json.dumps(results))
+        self.assertNotIn(stale_report, json.dumps(results))
+        self.assertEqual(
+            [
+                MODULE.stage_state_path(entry, target(), self.RUN_ID)
+                for entry in MODULE.STAGES[:3]
+            ],
+            read_paths,
+        )
+        self.assertTrue(
+            all("--invocation-eaafa0037567822b.json" in str(path) for path in read_paths)
+        )
+
+    def read_status_envelope(self, payload: dict) -> dict:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            script = directory / "stage.py"
+            state = directory / "state.json"
+            script.write_text("", encoding="utf-8")
+            state.write_text("{}", encoding="utf-8")
+            completed = subprocess.CompletedProcess(
+                ["python", str(script)],
+                0,
+                json.dumps(payload),
+                "",
+            )
+            with mock.patch.object(MODULE.common, "run", return_value=completed):
+                return MODULE.common.read_stage_status(
+                    MODULE.STAGES[0],
+                    target(),
+                    script_for=lambda _entry: script,
+                    state_for=lambda _entry, _target: state,
+                )
+
+    def test_status_envelope_cannot_name_another_invocation_state(self):
+        result = self.read_status_envelope(
+            {
+                "result": "ready",
+                "state": "shared-state.json",
+                "pr": {
+                    "number": target()["number"],
+                    "repo_name": target()["repo_name"],
+                },
+            }
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("status_state_mismatch", result["reason"])
+        self.assertIsNone(result["payload"])
+        self.assertIn(
+            result["reason"],
+            MODULE.UNAVAILABLE_STATUS_REASONS,
+        )
+
+    def test_status_envelope_cannot_name_another_pull_request(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state.json"
+            state.write_text("{}", encoding="utf-8")
+            script = Path(temporary) / "stage.py"
+            script.write_text("", encoding="utf-8")
+            completed = subprocess.CompletedProcess(
+                ["python", str(script)],
+                0,
+                json.dumps(
+                    {
+                        "result": "ready",
+                        "state": str(state),
+                        "pr": {
+                            "number": 20075,
+                            "repo_name": "open-telemetry/"
+                            "opentelemetry-java-instrumentation",
+                        },
+                    }
+                ),
+                "",
+            )
+            with mock.patch.object(MODULE.common, "run", return_value=completed):
+                result = MODULE.common.read_stage_status(
+                    MODULE.STAGES[0],
+                    target(),
+                    script_for=lambda _entry: script,
+                    state_for=lambda _entry, _target: state,
+                )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("status_identity_mismatch", result["reason"])
+        self.assertIsNone(result["payload"])
+        self.assertIn(
+            result["reason"],
+            MODULE.UNAVAILABLE_STATUS_REASONS,
+        )
+
+    def test_status_accepts_the_resolved_form_of_the_same_state_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "nested").mkdir()
+            state = directory / "nested" / ".." / "state.json"
+            state.write_text("{}", encoding="utf-8")
+            script = directory / "stage.py"
+            script.write_text("", encoding="utf-8")
+            completed = subprocess.CompletedProcess(
+                ["python", str(script)],
+                0,
+                json.dumps(
+                    {
+                        "result": "ready",
+                        "state": str(state.resolve()),
+                        "pr": {
+                            "number": target()["number"],
+                            "repo_name": target()["repo_name"].upper(),
+                        },
+                    }
+                ),
+                "",
+            )
+            with mock.patch.object(MODULE.common, "run", return_value=completed):
+                result = MODULE.common.read_stage_status(
+                    MODULE.STAGES[0],
+                    target(),
+                    script_for=lambda _entry: script,
+                    state_for=lambda _entry, _target: state,
+                )
+
+        self.assertTrue(result["ok"])
+
+    def test_preidentity_ci_coordinator_failure_keeps_its_exact_reason(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            state = directory / "state.json"
+            state.write_text("{}", encoding="utf-8")
+            script = directory / "stage.py"
+            script.write_text("", encoding="utf-8")
+            detail = "GitHub check lookup failed before PR identity was recorded"
+            payload = {
+                "result": "ready",
+                "state": str(state),
+                "pr": None,
+                "coordinator": {"status": "blocked", "detail": detail},
+                "escalation": {
+                    "reason": "coordinator_error",
+                    "detail": detail,
+                },
+            }
+            completed = subprocess.CompletedProcess(
+                ["python", str(script)],
+                0,
+                json.dumps(payload),
+                "",
+            )
+            with mock.patch.object(MODULE.common, "run", return_value=completed):
+                status = MODULE.common.read_stage_status(
+                    MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
+                    target(),
+                    script_for=lambda _entry: script,
+                    state_for=lambda _entry, _target: state,
+                )
+            stage = MODULE.common.inspect_stage(
+                MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
+                target(),
+                self.HEAD,
+                self.BASE,
+                read_status=lambda _entry, _target: status,
+            )
+
+        self.assertTrue(status["ok"])
+        self.assertEqual(
+            ("stage_coordinator_error", detail),
+            MODULE.stage_blocker(stage, after_launch=False),
+        )
+
+
+class RunStageStateIsolationTest(unittest.TestCase):
+    def test_ci_progress_reads_the_current_pipeline_state(self):
+        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CI]
+        seen = []
+
+        def progress(_entry, selected, *, state_for):
+            seen.append(state_for(entry, selected))
+            return None
+
+        def monitored(_command, *, cwd, log_path, progress):
+            del cwd, log_path
+            progress()
+            return {
+                "returncode": 0,
+                "log_path": "ci.log",
+                "started_at": "start",
+                "ended_at": "end",
+            }
+
+        with (
+            mock.patch.object(MODULE, "stage_command", return_value=["copilot"]),
+            mock.patch.object(MODULE, "stage_log_path", return_value=Path("ci.log")),
+            mock.patch.object(
+                MODULE.common, "stage_live_progress", side_effect=progress
+            ),
+            mock.patch.object(MODULE.common, "run_monitored", side_effect=monitored),
+        ):
+            MODULE.run_stage(
+                entry,
+                target(),
+                Path("C:/repo"),
+                model="gpt-5.6-sol",
+                effort="high",
+                run_id=InvocationStateIsolationTest.RUN_ID,
+                sweep=1,
+            )
+
+        self.assertEqual(
+            [
+                MODULE.stage_state_path(
+                    entry,
+                    target(),
+                    InvocationStateIsolationTest.RUN_ID,
+                )
+            ],
+            seen,
+        )
+
+
 class SweepTest(unittest.TestCase):
     def setUp(self):
         self.repo = Path("C:/repo")
@@ -937,7 +1267,8 @@ class SweepTest(unittest.TestCase):
             "changed": self.sync_heads[-1] != started_head_sha,
         }
 
-    def inspect(self, entry, _target, head, base_sha):
+    def inspect(self, entry, _target, head, base_sha, run_id=None):
+        del run_id
         if entry["stage"] in self.completed:
             return {
                 **uncleared_stage(entry["stage"]),
@@ -954,7 +1285,8 @@ class SweepTest(unittest.TestCase):
             return clear_stage(entry["stage"], head)
         return uncleared_stage(entry["stage"])
 
-    def inspect_all(self, _target, head, base_sha):
+    def inspect_all(self, _target, head, base_sha, run_id=None):
+        del run_id
         return [
             self.inspect(entry, _target, head, base_sha) for entry in MODULE.STAGES
         ]
@@ -976,6 +1308,29 @@ class SweepTest(unittest.TestCase):
         self.assertEqual(
             [(stage, 1) for stage in MODULE.STAGE_NAMES],
             self.launched,
+        )
+
+    def test_every_scheduler_stage_read_uses_the_current_pipeline_run(self):
+        calls = []
+        original = MODULE.inspect_stage_for_run
+
+        def inspect(entry, selected, head, base, run_id):
+            calls.append((entry["stage"], run_id))
+            return original(entry, selected, head, base, run_id)
+
+        with mock.patch.object(
+            MODULE, "inspect_stage_for_run", side_effect=inspect
+        ):
+            result = self.execute()
+
+        self.assertTrue(calls)
+        self.assertEqual(
+            {result["run_id"]},
+            {run_id for _stage, run_id in calls},
+        )
+        self.assertEqual(
+            [(stage, result["run_id"]) for stage in MODULE.STAGE_NAMES for _ in range(2)],
+            calls,
         )
 
     @unittest.skip("failed invocations are abandoned rather than replaced")
