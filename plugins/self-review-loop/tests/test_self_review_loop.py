@@ -2092,7 +2092,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.35")
+        self.assertEqual(plugin["version"], "1.3.36")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -2111,8 +2111,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             prior_history=[],
         )
         self.assertIn("workflow-specific semantic payload", prompt)
-        self.assertIn("worker prompt version 7", prompt)
+        self.assertIn("worker prompt version 8", prompt)
         self.assertIn("runtime adds the versioned wrapper", prompt)
+        self.assertIn("compact clean payload", prompt.lower())
+        self.assertIn('"status": "clean"', prompt)
         self.assertIn("Do not copy request, repository, pull request", prompt)
         self.assertIn("one-based `commit_index`", prompt)
         self.assertIn("binds the frozen identity", prompt)
@@ -2132,15 +2134,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             preflight=self.preflight,
             request_id="request-1",
             semantic_payload={
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+                "summary": "No metadata change is needed.",
                 "outcome": "cleared",
-                "iterations_used": 1,
+                "iterations": 1,
                 "findings": [],
-                "pull_request_metadata": {
-                    "decision": "keep",
-                    "title": self.preflight["pr"]["title"],
-                    "body": self.preflight["pr"]["body"],
-                    "reason": "No metadata change is needed.",
-                },
             },
         )
         report = MODULE.parse_markdown_report(
@@ -2156,6 +2155,16 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(
             report["pull_request"]["head_sha"],
             self.preflight["pr"]["head_sha"],
+        )
+        self.assertEqual(report["iterations_used"], 1)
+        self.assertEqual(
+            report["pull_request_metadata"],
+            {
+                "decision": "keep",
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+                "reason": "No metadata change is needed.",
+            },
         )
 
     def test_legacy_shaped_semantic_payload_is_not_canonicalized(self):
@@ -2175,25 +2184,158 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 },
             )
 
-    def test_20075_raw_payload_is_not_normalized_into_a_clean_review(self):
+    def test_20075_semantic_payload_is_canonicalized(self):
         observed = {
-            "version": 1,
-            "payload": {
-                "findings": [],
-                "result": "clean",
-                "title": "Report configured Redis targets for Rediscala",
-                "body": "Reports configured Redis deployments.",
-            },
+            "body": self.preflight["pr"]["body"],
+            "findings": [],
+            "iterations": 1,
+            "outcome": "cleared",
+            "summary": "The pull request is clean.",
+            "title": self.preflight["pr"]["title"],
         }
-        with self.assertRaisesRegex(
-            MODULE.WorkflowError,
-            "unexpected or missing fields",
-        ):
-            MODULE.canonical_self_review_report(
-                preflight=self.preflight,
-                request_id="d0b335f9-d2dd-4543-922c-f9e0d227e241",
-                semantic_payload=observed,
-            )
+        result = self.semantic_result(payload=observed)
+        result["semantic_output"]["path"] = (
+            ".github/agent-task-semantic/"
+            "ee3b846f-abeb-4a8c-8495-74728053f514.json"
+        )
+        remote = MODULE.validate_success_result(
+            result,
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+        )
+        content = MODULE.canonical_self_review_report(
+            preflight=self.preflight,
+            request_id=remote["request_id"],
+            semantic_payload=remote["semantic_payload"],
+        )
+        report = MODULE.validate_self_review_report(
+            content,
+            request_id=remote["request_id"],
+            preflight=self.preflight,
+            remote=remote,
+            max_iterations=5,
+            paths_by_commit={},
+        )
+        self.assertEqual(report["outcome"], "cleared")
+        self.assertEqual(report["iterations_used"], 1)
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(report["pull_request_metadata"]["decision"], "keep")
+        self.assertEqual(
+            report["pull_request_metadata"]["reason"],
+            "The pull request is clean.",
+        )
+
+    def test_16161_compact_clean_semantic_payload_is_canonicalized(self):
+        observed = {
+            "body": self.preflight["pr"]["body"],
+            "findings": [],
+            "status": "clean",
+            "title": self.preflight["pr"]["title"],
+        }
+        result = self.semantic_result(payload=observed)
+        result["semantic_output"]["path"] = (
+            ".github/agent-task-semantic/"
+            "4cf5786a-69f4-4acb-8c5c-7fc487bf4ae5.json"
+        )
+        remote = MODULE.validate_success_result(
+            result,
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+        )
+        content = MODULE.canonical_self_review_report(
+            preflight=self.preflight,
+            request_id=remote["request_id"],
+            semantic_payload=remote["semantic_payload"],
+        )
+        report = MODULE.validate_self_review_report(
+            content,
+            request_id=remote["request_id"],
+            preflight=self.preflight,
+            remote=remote,
+            max_iterations=5,
+            paths_by_commit={},
+        )
+        self.assertEqual(report["outcome"], "cleared")
+        self.assertEqual(report["iterations_used"], 1)
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(report["pull_request_metadata"]["decision"], "keep")
+        self.assertEqual(
+            report["pull_request_metadata"]["reason"],
+            (
+                "The worker reported a clean review and supplied the final pull "
+                "request metadata."
+            ),
+        )
+
+    def test_semantic_payload_rejects_missing_and_extra_fields(self):
+        payload = {
+            "body": self.preflight["pr"]["body"],
+            "findings": [],
+            "iterations": 1,
+            "outcome": "cleared",
+            "summary": "The pull request is clean.",
+            "title": self.preflight["pr"]["title"],
+        }
+        invalid_payloads = [
+            {key: value for key, value in payload.items() if key != "summary"},
+            {**payload, "request_id": "worker-owned"},
+            {
+                "body": self.preflight["pr"]["body"],
+                "findings": [],
+                "status": "clean",
+                "summary": "extra",
+                "title": self.preflight["pr"]["title"],
+            },
+            {
+                "body": self.preflight["pr"]["body"],
+                "findings": [],
+                "title": self.preflight["pr"]["title"],
+            },
+            {
+                "findings": [],
+                "iterations_used": 1,
+                "outcome": "cleared",
+                "pull_request_metadata": {"decision": "keep"},
+            },
+        ]
+        for invalid in invalid_payloads:
+            with (
+                self.subTest(fields=sorted(invalid)),
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "unexpected or missing fields",
+                ),
+            ):
+                MODULE.canonical_self_review_report(
+                    preflight=self.preflight,
+                    request_id="request-1",
+                    semantic_payload=invalid,
+                )
+
+    def test_compact_semantic_payload_rejects_non_clean_results_and_findings(self):
+        payload = {
+            "body": self.preflight["pr"]["body"],
+            "findings": [],
+            "status": "clean",
+            "title": self.preflight["pr"]["title"],
+        }
+        invalid_payloads = [
+            {**payload, "status": "max_iterations_reached"},
+            {**payload, "findings": [{"body": "Unexpected finding."}]},
+        ]
+        for invalid in invalid_payloads:
+            with (
+                self.subTest(payload=invalid),
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "compact semantic payload is malformed",
+                ),
+            ):
+                MODULE.canonical_self_review_report(
+                    preflight=self.preflight,
+                    request_id="request-1",
+                    semantic_payload=invalid,
+                )
 
     def test_clean_semantic_payload_cannot_hide_a_fix_commit(self):
         commit = "4" * 40
@@ -2205,15 +2347,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             preflight=self.preflight,
             request_id="request-1",
             semantic_payload={
+                "title": self.preflight["pr"]["title"],
+                "body": self.preflight["pr"]["body"],
+                "summary": "No metadata change is needed.",
                 "outcome": "cleared",
-                "iterations_used": 1,
+                "iterations": 1,
                 "findings": [],
-                "pull_request_metadata": {
-                    "decision": "keep",
-                    "title": self.preflight["pr"]["title"],
-                    "body": self.preflight["pr"]["body"],
-                    "reason": "No metadata change is needed.",
-                },
             },
         )
 
@@ -2233,15 +2372,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_semantic_result_preserves_distinct_artifact_and_report_digests(self):
         result = self.result()
         payload = {
+            "title": self.preflight["pr"]["title"],
+            "body": self.preflight["pr"]["body"],
+            "summary": "No metadata change is needed.",
             "outcome": "cleared",
-            "iterations_used": 1,
+            "iterations": 1,
             "findings": [],
-            "pull_request_metadata": {
-                "decision": "keep",
-                "title": self.preflight["pr"]["title"],
-                "body": self.preflight["pr"]["body"],
-                "reason": "No metadata change is needed.",
-            },
         }
         semantic_sha256 = "5" * 64
         result.update(
@@ -3714,10 +3850,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "reason": "The final diff changes the public behavior.",
         }
         payload = {
+            "title": metadata["title"],
+            "body": metadata["body"],
+            "summary": metadata["reason"],
             "outcome": "cleared",
-            "iterations_used": 1,
+            "iterations": 1,
             "findings": [finding],
-            "pull_request_metadata": metadata,
         }
         report = MODULE.canonical_self_review_report(
             preflight=self.preflight,
