@@ -31,6 +31,16 @@ FORWARD_TOP_LEVEL_IDENTITY_KEEP_REPORT = (
     / "fixtures"
     / "forward-top-level-identity-keep-report.md"
 )
+FORWARD_NESTED_REQUEST_KEEP_REPORT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "forward-nested-request-keep-report.md"
+)
+FORWARD_NESTED_REQUEST_RESULT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "forward-nested-request-16161-result.json"
+)
 FORWARD_IDENTITY_RESULT = (
     Path(__file__).parent / "fixtures" / "forward-identity-347-result.json"
 )
@@ -1119,7 +1129,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.58")
+        self.assertEqual(plugin["version"], "1.0.59")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1515,6 +1525,188 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         incomplete_files = json.loads(json.dumps(parsed))
         incomplete_files["evidence"]["changed_files"] = changed_files[:-1]
         malformed.append(incomplete_files)
+        for candidate in malformed:
+            with self.subTest(candidate=candidate), self.assertRaises(
+                MODULE.WorkflowError
+            ):
+                MODULE.validate_proposal_report(
+                    f"```json\n{json.dumps(candidate)}\n```",
+                    **common,
+                )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "stale identity"):
+            MODULE.validate_proposal_report(
+                content,
+                **{**common, "proposal_count": 1},
+            )
+
+    def test_exact_forward_nested_request_keep_report_recovers_no_proposal(self):
+        content = FORWARD_NESTED_REQUEST_KEEP_REPORT.read_text(encoding="utf-8")
+        self.assertEqual(5789, len(content.encode("utf-8")))
+        self.assertEqual(
+            "4a14ace37fabd17ed6aff52461b5a6dfb09a7e2ac178ec38e8cc45401072cc79",
+            MODULE.sha256_text(content),
+        )
+        parsed = MODULE.parse_markdown_report(content, description="test report")
+        request = parsed["request"]
+        self.assertEqual(
+            {
+                "repository": "trask/opentelemetry-java-instrumentation",
+                "branch": "grpc-server-address",
+                "sha": "02ad2ba216cdc6ef2f3f3768f7c5bc700ed62eac",
+            },
+            request["head"],
+        )
+        self.assertEqual(
+            "a63ed47c6d154958c496bad936b0d55b2a818c2f7a927b0533cf391f860d422c",
+            MODULE.sha256_text(request["body"]),
+        )
+        preflight = agent_task_preflight()
+        preflight["pr"].update(
+            {
+                "number": 16161,
+                "owner": "open-telemetry",
+                "repo": "opentelemetry-java-instrumentation",
+                "repo_name": "open-telemetry/opentelemetry-java-instrumentation",
+                "pr_url": (
+                    "https://github.com/open-telemetry/"
+                    "opentelemetry-java-instrumentation/pull/16161"
+                ),
+                "url": (
+                    "https://github.com/open-telemetry/"
+                    "opentelemetry-java-instrumentation/pull/16161"
+                ),
+                "title": request["title"],
+                "body": request["body"],
+                "head_sha": request["head"]["sha"],
+                "cross_repository": True,
+                "head": {
+                    "repository": request["head"]["repository"],
+                    "ref": request["head"]["branch"],
+                    "sha": request["head"]["sha"],
+                },
+                "base": {
+                    "repository": request["base"]["repository"],
+                    "ref": request["base"]["branch"],
+                    "sha": "2515ed4055bb1802c7d21d7a01882b92b6d5c675",
+                },
+            }
+        )
+        result_content = FORWARD_NESTED_REQUEST_RESULT.read_text(encoding="utf-8")
+        self.assertEqual(
+            "765ff1ef1efd6e7a74ec22a84e8336f473cd4a4581e0ca4ca93b816bc433f2b2",
+            MODULE.sha256_text(result_content),
+        )
+        result = MODULE.load_agent_task_result(FORWARD_NESTED_REQUEST_RESULT)
+        self.assertEqual(
+            "559a9f55-7133-4443-b11e-57da844457ed",
+            result["task"]["id"],
+        )
+        remote = MODULE.validate_success_result(
+            result,
+            preflight=preflight,
+            requested_model="gpt-5.6-sol",
+            identity={
+                "branch": request["head"]["branch"],
+                "head": request["head"]["sha"],
+                "status": "",
+            },
+        )
+        self.assertEqual(
+            {
+                "request_id": "e0124007-56cb-4c26-957a-fa8d73b485f8",
+                "generated_head": "b5729aa2d5bfffab3ec7d78ba2f8a9c8a5c5c1c3",
+                "report_path": (
+                    ".github/agent-task-reports/"
+                    "e0124007-56cb-4c26-957a-fa8d73b485f8.md"
+                ),
+                "report_sha256": (
+                    "4a14ace37fabd17ed6aff52461b5a6dfb09a7e2ac178ec38e8cc45401072cc79"
+                ),
+                "structural_attestation": True,
+            },
+            remote,
+        )
+        self.assertEqual(remote["report_sha256"], MODULE.sha256_text(content))
+        changed_files = parsed["evidence"]["changed_files"]
+        common = {
+            "request_id": remote["request_id"],
+            "preflight": preflight,
+            "changed_files": changed_files,
+            "proposal_count": 0,
+        }
+
+        report = MODULE.validate_proposal_report(content, **common)
+
+        self.assertEqual(MODULE.LEGACY_PR_DESCRIPTION_PROPOSAL_SCHEMA, report["schema"])
+        self.assertEqual(common["request_id"], report["request_id"])
+        self.assertEqual("keep", report["decision"])
+        self.assertEqual(
+            {"title": request["title"], "body": request["body"]},
+            report["proposal"],
+        )
+        self.assertEqual(
+            changed_files,
+            [item["path"] for item in report["evidence"]["changed_files"]],
+        )
+
+        malformed = []
+        missing_top_level = json.loads(json.dumps(parsed))
+        missing_top_level.pop("request")
+        malformed.append(missing_top_level)
+        extra_top_level = json.loads(json.dumps(parsed))
+        extra_top_level["schema"] = MODULE.PR_DESCRIPTION_PROPOSAL_SCHEMA
+        malformed.append(extra_top_level)
+        mixed_identity = json.loads(json.dumps(parsed))
+        mixed_identity["identity"] = mixed_identity["request"]
+        malformed.append(mixed_identity)
+        missing_identity = json.loads(json.dumps(parsed))
+        missing_identity["request"].pop("base")
+        malformed.append(missing_identity)
+        extra_identity = json.loads(json.dumps(parsed))
+        extra_identity["request"]["type"] = "pull_request_description"
+        malformed.append(extra_identity)
+        wrong_repository = json.loads(json.dumps(parsed))
+        wrong_repository["request"]["repository"] = "other/repo"
+        malformed.append(wrong_repository)
+        wrong_pull_request = json.loads(json.dumps(parsed))
+        wrong_pull_request["request"]["pull_request"] = 7
+        malformed.append(wrong_pull_request)
+        wrong_head = json.loads(json.dumps(parsed))
+        wrong_head["request"]["head"]["sha"] = "0" * 40
+        malformed.append(wrong_head)
+        wrong_base = json.loads(json.dumps(parsed))
+        wrong_base["request"]["base"]["branch"] = "other"
+        malformed.append(wrong_base)
+        wrong_title = json.loads(json.dumps(parsed))
+        wrong_title["request"]["title"] = "Different title"
+        malformed.append(wrong_title)
+        wrong_body = json.loads(json.dumps(parsed))
+        wrong_body["request"]["body"] = "Different body"
+        malformed.append(wrong_body)
+        mismatched_proposal = json.loads(json.dumps(parsed))
+        mismatched_proposal["proposal"]["title"] = "Different title"
+        malformed.append(mismatched_proposal)
+        replacement = json.loads(json.dumps(parsed))
+        replacement["decision"] = "replace"
+        replacement["proposal"]["body"] = "Replacement body"
+        malformed.append(replacement)
+        extra_evidence = json.loads(json.dumps(parsed))
+        extra_evidence["evidence"]["title_basis"] = "Unexpected evidence"
+        malformed.append(extra_evidence)
+        oversized_evidence = json.loads(json.dumps(parsed))
+        oversized_evidence["evidence"]["body_basis"] = "x" * 4001
+        malformed.append(oversized_evidence)
+        whitespace_padded_evidence = json.loads(json.dumps(parsed))
+        whitespace_padded_evidence["evidence"]["body_basis"] = (
+            " " * 4000 + "diagnostic basis"
+        )
+        malformed.append(whitespace_padded_evidence)
+        incomplete_files = json.loads(json.dumps(parsed))
+        incomplete_files["evidence"]["changed_files"] = changed_files[:-1]
+        malformed.append(incomplete_files)
+        duplicate_files = json.loads(json.dumps(parsed))
+        duplicate_files["evidence"]["changed_files"][-1] = changed_files[0]
+        malformed.append(duplicate_files)
         for candidate in malformed:
             with self.subTest(candidate=candidate), self.assertRaises(
                 MODULE.WorkflowError
