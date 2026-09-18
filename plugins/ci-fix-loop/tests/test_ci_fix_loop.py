@@ -2549,16 +2549,9 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 "cross_repository": False,
             }
         }
-        self.report_path = ".github/agent-task-semantic/request-1.json"
-        self.consumer_prompt = (
-            "worker instructions\n"
-            f"write {MODULE.SEMANTIC_PATH_PLACEHOLDER}\n"
-        )
-        rendered = self.consumer_prompt.replace(
-            MODULE.SEMANTIC_PATH_PLACEHOLDER, self.report_path
-        )
+        self.consumer_prompt = "worker instructions\n"
         self.live_prompt = (
-            f"{rendered}\n"
+            f"{self.consumer_prompt}\n"
             f"Source PR: {self.preflight['pr']['pr_url']}\n"
             f"Exact source head SHA: {self.preflight['pr']['head_sha']}\n"
             f"Policy: {MODULE.AGENT_TASK_POLICY}\n"
@@ -2598,8 +2591,8 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
 
         self.assertEqual("task-1", identity["task_id"])
         self.assertEqual("session-1", identity["session_id"])
-        self.assertEqual(self.report_path, identity["report_path"])
-        self.assertEqual("request-1", identity["request_id"])
+        self.assertNotIn("report_path", identity)
+        self.assertNotIn("request_id", identity)
         self.assertEqual(
             MODULE.sha256_text(self.live_prompt),
             identity["live_prompt_sha256"],
@@ -2726,6 +2719,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             task = MODULE.load_state(state_path)["agent_task"]
             self.assertEqual("known", task["task_id_status"])
             self.assertEqual("task-1", task["task_id"])
+            self.assertNotIn("semantic_output", task)
             self.assertEqual("timed_out", task["dispatch_monitor"]["status"])
             self.assertEqual("hosted_helper_timeout", task["dispatch_monitor"]["failure"])
             owner.close.assert_called_once_with()
@@ -2832,6 +2826,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             self.assertEqual("stderr", result.stderr)
             task = MODULE.load_state(state_path)["agent_task"]
             self.assertEqual("task-1", task["task_id"])
+            self.assertNotIn("semantic_output", task)
             self.assertEqual("exited", task["dispatch_monitor"]["status"])
             owner.close.assert_called_once_with()
 
@@ -4256,7 +4251,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "policy": {
                 "id": "marketplace-agent-apply-report-worker",
                 "version": 5,
-                "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
+                "sha256": MODULE.LEGACY_SEMANTIC_AGENT_TASK_POLICY_V5[
+                    "sha256"
+                ],
             },
             "task": {
                 "id": "task-1",
@@ -4446,7 +4443,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.43", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.44", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -4493,20 +4490,18 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 "The test failure is the root failure.\n"
             ),
         )
-        self.assertIn("Write exactly one UTF-8 JSON object", prompt)
         self.assertIn("sole repository worker", prompt)
         self.assertIn(self.preflight["check_snapshot"]["sha256"], prompt)
-        self.assertIn(MODULE.AGENT_TASK_POLICY_SHA256, prompt)
         self.assertIn('"iteration_allowance": 1', prompt)
         self.assertIn("Never select a marketplace `custom_agent`", prompt)
         self.assertIn("use Cloud Sandboxes", prompt)
-        self.assertIn("worker prompt version 6", prompt)
-        self.assertIn("Do not claim that a command ran", prompt)
-        self.assertIn("repository-owned Gradle or Maven wrappers", prompt)
+        self.assertIn("worker prompt version 7", prompt)
+        self.assertIn("validate them in this hosted task", prompt)
+        self.assertIn("never executes candidate validation commands", prompt)
         self.assertNotIn("AssertionError: expected 2", prompt)
-        self.assertIn("Never replace a check key with a numeric database ID", prompt)
-        self.assertIn("`{{MARKETPLACE_SEMANTIC_PATH}}`", prompt)
-        self.assertIn('"commit_index"', prompt)
+        self.assertIn(MODULE.AGENT_TASK_OUTPUT_REPORT, prompt)
+        self.assertNotIn("{{MARKETPLACE_SEMANTIC_PATH}}", prompt)
+        self.assertNotIn('"commit_index"', prompt)
         self.assertNotIn("MARKETPLACE_REPORT_PATH", prompt)
         self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
@@ -13727,6 +13722,279 @@ class PreflightHelpTest(unittest.TestCase):
             if action.dest == "invocation_artifact"
         )
         self.assertTrue(artifact.required)
+
+
+class CandidateContractTest(unittest.TestCase):
+    def setUp(self):
+        self.head = "1" * 40
+        self.base = "2" * 40
+        self.code = "3" * 40
+        self.output = "4" * 40
+        self.preflight = {
+            "identity": {"branch": "feature", "head": self.head, "status": ""},
+            "pr": {
+                "repo_name": "owner/repo",
+                "number": 7,
+                "pr_url": "https://github.com/owner/repo/pull/7",
+                "base_branch": "main",
+                "base_sha": self.base,
+                "head_repository": "owner/repo",
+                "head_branch": "feature",
+                "head_sha": self.head,
+                "cross_repository": False,
+            },
+            "check_snapshot": {
+                "sha256": "d" * 64,
+                "rollup_sha256": "e" * 64,
+                "failures": [{"key": "check:CI/test", "name": "CI / test"}],
+            },
+        }
+
+    def metadata(self, sha, parent, paths):
+        return {
+            "sha": sha,
+            "parent_sha": parent,
+            "tree_sha": "a" * 40,
+            "patch_sha256": MODULE.sha256_text("patch\n"),
+            "changed_paths": paths,
+        }
+
+    def result(self, *, code=True, output_paths=None):
+        commits = (
+            [self.metadata(self.code, self.head, ["src/App.java"])] if code else []
+        )
+        code_tip = self.code if code else self.head
+        artifact = (
+            self.metadata(self.output, code_tip, output_paths)
+            if output_paths is not None
+            else None
+        )
+        generated_head = self.output if artifact else code_tip
+        return {
+            "schema": MODULE.CANDIDATE_AGENT_TASK_RESULT_SCHEMA,
+            "status": "success",
+            "mode": "code_candidate",
+            "repository": {"name_with_owner": "owner/repo"},
+            "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
+            "requested_model": "gpt-5.6-sol",
+            "policy": {
+                "id": "marketplace-agent-code-candidate-worker",
+                "version": 1,
+                "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
+            },
+            "task": {
+                "id": "task-1",
+                "url": "https://github.com/owner/repo/agent-tasks/task-1",
+                "state": "completed",
+                "base_ref": "feature",
+                "base_sha": self.head,
+            },
+            "generated": {
+                "branch": "copilot/candidate",
+                "head_sha": generated_head,
+                "commits": [item["sha"] for item in commits],
+            },
+            "application": {
+                "status": "not_applied",
+                "final_local_head": self.head,
+            },
+            "report": None,
+            "attestation": {
+                "kind": "dispatcher_candidate",
+                "structural_complete": True,
+            },
+            "candidate": {
+                "schema": MODULE.AGENT_TASK_CANDIDATE_MANIFEST_SCHEMA,
+                "repository": {"name_with_owner": "owner/repo"},
+                "task": {"id": "task-1", "session_id": "session-1"},
+                "base": {"ref": "feature", "sha": self.head},
+                "generated": {
+                    "ref": "copilot/candidate",
+                    "head_sha": generated_head,
+                    "code_tip_sha": code_tip,
+                },
+                "code_commits": commits,
+                "artifact_commit": artifact,
+            },
+            "completion": {
+                "request": {
+                    "requested_model": "gpt-5.6-sol",
+                    "prompt_sha256": "b" * 64,
+                },
+                "task": {
+                    "id": "task-1",
+                    "state": "completed",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:01:00Z",
+                    "completed_at": "2026-01-01T00:01:00Z",
+                    "raw_response_sha256": "c" * 64,
+                },
+                "session": {
+                    "id": "session-1",
+                    "state": "completed",
+                    "actual_model": "gpt-5.6-sol",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:01:00Z",
+                    "completed_at": "2026-01-01T00:01:00Z",
+                    "prompt_sha256": "b" * 64,
+                },
+                "repository": {
+                    "name_with_owner": "owner/repo",
+                    "id": 1,
+                    "owner": {"login": "owner", "id": 2},
+                },
+                "refs": {"base": "feature", "generated": "copilot/candidate"},
+            },
+            "error": None,
+        }
+
+    def validate(self, result):
+        return MODULE.validate_candidate_success_result(
+            result,
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+        )
+
+    def test_accepts_zero_code_and_any_optional_report_content(self):
+        cases = [
+            self.result(code=False),
+            self.result(output_paths=[MODULE.AGENT_TASK_OUTPUT_REPORT]),
+            self.result(
+                output_paths=[
+                    ".github/agent-task-output/arbitrary.bin",
+                    MODULE.AGENT_TASK_OUTPUT_REPORT,
+                ]
+            ),
+        ]
+        with (
+            mock.patch.object(
+                MODULE,
+                "fetch_committed_text",
+                side_effect=AssertionError("candidate prose was parsed"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "run_trusted_ci_validation",
+                side_effect=AssertionError("candidate validation ran locally"),
+            ),
+        ):
+            remotes = [self.validate(result) for result in cases]
+
+        self.assertEqual([], remotes[0]["commits"])
+        self.assertEqual(self.head, remotes[0]["final_local_head"])
+        self.assertEqual(self.code, remotes[1]["final_local_head"])
+        self.assertEqual(self.output, remotes[1]["generated_head"])
+
+    def test_rejects_stale_result_task_and_manifest_identity(self):
+        cases = []
+        stale = self.result()
+        stale["candidate"]["base"]["sha"] = "9" * 40
+        cases.append(stale)
+        wrong_task = self.result()
+        wrong_task["candidate"]["task"]["id"] = "other"
+        cases.append(wrong_task)
+        platform_error = self.result()
+        platform_error["error"] = {"code": "worker_failed", "message": "failed"}
+        cases.append(platform_error)
+        for value in cases:
+            with self.subTest(value=value), self.assertRaises(MODULE.WorkflowError):
+                self.validate(value)
+
+    def test_manifest_coverage_is_rederived_and_output_is_excluded(self):
+        remote = self.validate(
+            self.result(output_paths=[MODULE.AGENT_TASK_OUTPUT_REPORT])
+        )
+        parents = {
+            self.code: f"{self.code} {self.head}",
+            self.output: f"{self.output} {self.code}",
+        }
+        paths = {
+            self.code: ["src/App.java"],
+            self.output: [MODULE.AGENT_TASK_OUTPUT_REPORT],
+        }
+
+        def git_side_effect(_root, *arguments):
+            if arguments[0] == "rev-list" and arguments[1] == "--reverse":
+                return f"{self.code}\n{self.output}"
+            if arguments[0] == "rev-list":
+                return parents[arguments[-1]]
+            if arguments[0] == "show":
+                return "a" * 40
+            raise AssertionError(arguments)
+
+        with (
+            mock.patch.object(MODULE, "git", side_effect=git_side_effect),
+            mock.patch.object(
+                MODULE,
+                "git_z_paths",
+                side_effect=lambda _root, *args: paths[args[-1]],
+            ),
+            mock.patch.object(
+                MODULE,
+                "run",
+                return_value=SimpleNamespace(stdout="patch\n"),
+            ),
+        ):
+            coverage = MODULE.validate_candidate_history(
+                Path("repo"), base_sha=self.head, remote=remote
+            )
+
+        self.assertEqual({self.code: ["src/App.java"]}, coverage)
+
+    def test_guarded_import_uses_only_the_manifest_code_tip(self):
+        remote = self.validate(
+            self.result(output_paths=[MODULE.AGENT_TASK_OUTPUT_REPORT])
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result_path = Path(directory) / "result.json"
+            result_path.write_text("result", encoding="utf-8")
+            digest = MODULE.sha256_file(result_path)
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "local_identity",
+                    side_effect=[
+                        {"branch": "feature", "head": self.head, "status": ""},
+                        {"branch": "feature", "head": self.code, "status": ""},
+                    ],
+                ),
+                mock.patch.object(MODULE, "run") as run_command,
+            ):
+                MODULE.apply_verified_candidate_import(
+                    Path("repo"),
+                    result_path=result_path,
+                    result_sha256=digest,
+                    preflight=self.preflight,
+                    remote=remote,
+                )
+
+        self.assertEqual(self.code, run_command.call_args.args[0][-1])
+        self.assertNotIn(self.output, run_command.call_args.args[0])
+
+    def test_candidate_cannot_change_frozen_build_wrappers(self):
+        for path in ("gradlew", "gradle/wrapper/gradle-wrapper.jar", ".mvn/wrapper.xml"):
+            with self.subTest(path=path), self.assertRaisesRegex(
+                MODULE.WorkflowError, "frozen build wrapper"
+            ):
+                MODULE.refuse_candidate_wrapper_changes({self.code: [path]})
+
+    def test_green_snapshot_must_belong_to_the_exact_source_sha(self):
+        checks = [{"kind": "status_context", "name": "ci", "state": "SUCCESS"}]
+        rollup = MODULE.check_rollup_identity(checks)
+        self.preflight["check_snapshot"]["rollup_sha256"] = MODULE.sha256_text(
+            json.dumps(rollup, separators=(",", ":"), sort_keys=True)
+        )
+        with (
+            mock.patch.object(
+                MODULE, "fetch_rollup", return_value=("9" * 40, checks)
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "snapshot changed"),
+        ):
+            MODULE.require_live_check_snapshot(self.preflight)
+        with mock.patch.object(
+            MODULE, "fetch_rollup", return_value=(self.head, checks)
+        ):
+            MODULE.require_live_check_snapshot(self.preflight)
 
 
 if __name__ == "__main__":

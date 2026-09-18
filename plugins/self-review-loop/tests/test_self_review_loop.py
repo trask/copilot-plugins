@@ -1361,7 +1361,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "policy": {
                     "id": "marketplace-agent-apply-report-worker",
                     "version": 5,
-                    "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
+                    "sha256": MODULE.LEGACY_SEMANTIC_AGENT_TASK_POLICY_V5[
+                        "sha256"
+                    ],
                 },
                 "report": None,
                 "semantic_output": {
@@ -2085,14 +2087,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-apply-report-worker@5", instructions)
+        self.assertIn("marketplace-agent-code-candidate-worker@1", instructions)
         self.assertIn("Never use Cloud Sandboxes", instructions)
         self.assertIn("marketplace `custom_agent`", instructions)
         self.assertIn("Never run `gh pr diff`", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.39")
+        self.assertEqual(plugin["version"], "1.3.40")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -2110,24 +2112,19 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             max_iterations=5,
             prior_history=[],
         )
-        self.assertIn("workflow-specific semantic payload", prompt)
-        self.assertIn("worker prompt version 10", prompt)
-        self.assertIn("runtime adds the versioned wrapper", prompt)
-        self.assertIn("compact clean payload", prompt.lower())
-        self.assertIn('"status": "clean"', prompt)
-        self.assertIn('"outcome": "clean"', prompt)
-        self.assertIn("exactly one clean discriminator", prompt)
-        self.assertIn("Do not copy request, repository, pull request", prompt)
-        self.assertIn("one-based `commit_index`", prompt)
-        self.assertIn("binds the frozen identity", prompt)
-        self.assertIn("{{MARKETPLACE_SEMANTIC_PATH}}", prompt)
+        self.assertIn("worker prompt version 11", prompt)
+        self.assertIn("zero or more linear, single-parent code commits", prompt)
+        self.assertIn("The dispatcher derives the exact candidate history", prompt)
+        self.assertIn(MODULE.AGENT_TASK_OUTPUT_REPORT, prompt)
+        self.assertIn("report is advisory and may be absent", prompt)
+        self.assertNotIn("commit_index", prompt)
+        self.assertNotIn("changed-path claims", prompt)
+        self.assertNotIn("{{MARKETPLACE_SEMANTIC_PATH}}", prompt)
         self.assertNotIn('"request_id":', prompt)
         self.assertIn("maximum_review_iterations", prompt)
         self.assertIn("untrusted data", prompt)
-        self.assertIn("Map every fix commit to its findings", prompt)
         self.assertNotIn("`Finding: <identifier>`", prompt)
-        self.assertIn("explicit no-change result", prompt)
-        self.assertIn("`{{MARKETPLACE_SEMANTIC_PATH}}`", prompt)
+        self.assertIn("Zero code commits means no fixes were needed", prompt)
         self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
 
@@ -2562,7 +2559,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "policy": {
                     "id": "marketplace-agent-apply-report-worker",
                     "version": 5,
-                    "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
+                    "sha256": MODULE.LEGACY_SEMANTIC_AGENT_TASK_POLICY_V5[
+                        "sha256"
+                    ],
                 },
                 "report": None,
                 "semantic_output": {
@@ -3612,7 +3611,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     "status": "failed",
                     "run_id": "run-1",
                     "model": "gpt-5.6-sol",
-                    "policy": MODULE.AGENT_TASK_POLICY,
+                    "policy": "marketplace-agent-apply-report-worker@5",
                     "allowed_iterations": 5,
                     "preflight": self.preflight,
                     "prompt_file": str(prompt_path),
@@ -4534,7 +4533,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     "status": "failed",
                     "run_id": "9d697bac9a648c8e9bff516986aedcc2",
                     "model": "gpt-5.6-sol",
-                    "policy": MODULE.AGENT_TASK_POLICY,
+                    "policy": "marketplace-agent-apply-report-worker@5",
                     "allowed_iterations": 5,
                     "preflight": preflight,
                     "prompt_file": str(prompt_path),
@@ -4674,7 +4673,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     "status": "failed",
                     "run_id": owner,
                     "model": "gpt-5.6-sol",
-                    "policy": MODULE.AGENT_TASK_POLICY,
+                    "policy": "marketplace-agent-apply-report-worker@5",
                     "allowed_iterations": 5,
                     "preflight": preflight,
                     "prompt_file": str(prompt_path),
@@ -4801,7 +4800,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     "run_id": owner,
                     "resume_attempts": 1,
                     "model": "gpt-5.6-sol",
-                    "policy": MODULE.AGENT_TASK_POLICY,
+                    "policy": "marketplace-agent-apply-report-worker@5",
                     "allowed_iterations": 5,
                     "preflight": preflight,
                     "prompt_file": str(prompt_path),
@@ -8571,6 +8570,276 @@ class PreflightHelpTest(unittest.TestCase):
             target.help.endswith(f"; {clause}"),
             f"preflight target help {target.help!r} does not end with {clause!r}",
         )
+
+
+class CandidateContractTest(unittest.TestCase):
+    def setUp(self):
+        self.head = "1" * 40
+        self.base = "2" * 40
+        self.code = "3" * 40
+        self.output = "4" * 40
+        self.preflight = {
+            "identity": {"branch": "feature", "head": self.head, "status": ""},
+            "pr": {
+                "repo_name": "owner/repo",
+                "number": 7,
+                "pr_url": "https://github.com/owner/repo/pull/7",
+                "base_branch": "main",
+                "base_sha": self.base,
+                "head_repository": "owner/repo",
+                "head_branch": "feature",
+                "head_sha": self.head,
+                "cross_repository": False,
+            },
+        }
+
+    def metadata(self, sha, parent, paths):
+        return {
+            "sha": sha,
+            "parent_sha": parent,
+            "tree_sha": "a" * 40,
+            "patch_sha256": MODULE.sha256_text("patch\n"),
+            "changed_paths": paths,
+        }
+
+    def result(self, *, code=True, output_paths=None):
+        commits = (
+            [self.metadata(self.code, self.head, ["src/app.py"])] if code else []
+        )
+        code_tip = self.code if code else self.head
+        artifact = (
+            self.metadata(self.output, code_tip, output_paths)
+            if output_paths is not None
+            else None
+        )
+        generated_head = self.output if artifact else code_tip
+        completion = {
+            "request": {
+                "requested_model": "gpt-5.6-sol",
+                "prompt_sha256": "b" * 64,
+            },
+            "task": {
+                "id": "task-1",
+                "state": "completed",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:01:00Z",
+                "completed_at": "2026-01-01T00:01:00Z",
+                "raw_response_sha256": "c" * 64,
+            },
+            "session": {
+                "id": "session-1",
+                "state": "completed",
+                "actual_model": "gpt-5.6-sol",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:01:00Z",
+                "completed_at": "2026-01-01T00:01:00Z",
+                "prompt_sha256": "b" * 64,
+            },
+            "repository": {
+                "name_with_owner": "owner/repo",
+                "id": 1,
+                "owner": {"login": "owner", "id": 2},
+            },
+            "refs": {"base": "feature", "generated": "copilot/candidate"},
+        }
+        return {
+            "schema": MODULE.CANDIDATE_AGENT_TASK_RESULT_SCHEMA,
+            "status": "success",
+            "mode": "code_candidate",
+            "repository": {"name_with_owner": "owner/repo"},
+            "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
+            "requested_model": "gpt-5.6-sol",
+            "policy": {
+                "id": "marketplace-agent-code-candidate-worker",
+                "version": 1,
+                "sha256": MODULE.AGENT_TASK_POLICY_SHA256,
+            },
+            "task": {
+                "id": "task-1",
+                "url": "https://github.com/owner/repo/agent-tasks/task-1",
+                "state": "completed",
+                "base_ref": "feature",
+                "base_sha": self.head,
+            },
+            "generated": {
+                "branch": "copilot/candidate",
+                "head_sha": generated_head,
+                "commits": [item["sha"] for item in commits],
+            },
+            "application": {
+                "status": "not_applied",
+                "final_local_head": self.head,
+            },
+            "report": None,
+            "attestation": {
+                "kind": "dispatcher_candidate",
+                "structural_complete": True,
+            },
+            "candidate": {
+                "schema": MODULE.AGENT_TASK_CANDIDATE_MANIFEST_SCHEMA,
+                "repository": {"name_with_owner": "owner/repo"},
+                "task": {"id": "task-1", "session_id": "session-1"},
+                "base": {"ref": "feature", "sha": self.head},
+                "generated": {
+                    "ref": "copilot/candidate",
+                    "head_sha": generated_head,
+                    "code_tip_sha": code_tip,
+                },
+                "code_commits": commits,
+                "artifact_commit": artifact,
+            },
+            "completion": completion,
+            "error": None,
+        }
+
+    def validate(self, result):
+        return MODULE.validate_candidate_success_result(
+            result,
+            preflight=self.preflight,
+            requested_model="gpt-5.6-sol",
+        )
+
+    def test_accepts_missing_malformed_or_arbitrary_advisory_report(self):
+        cases = [
+            (self.result(code=False), None),
+            (
+                self.result(
+                    output_paths=[MODULE.AGENT_TASK_OUTPUT_REPORT],
+                ),
+                MODULE.AGENT_TASK_OUTPUT_REPORT,
+            ),
+            (
+                self.result(
+                    output_paths=[
+                        ".github/agent-task-output/arbitrary.bin",
+                        MODULE.AGENT_TASK_OUTPUT_REPORT,
+                    ],
+                ),
+                MODULE.AGENT_TASK_OUTPUT_REPORT,
+            ),
+        ]
+        with (
+            mock.patch.object(
+                MODULE,
+                "fetch_committed_text",
+                side_effect=AssertionError("candidate prose was parsed"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "parse_markdown_report",
+                side_effect=AssertionError("candidate prose was parsed"),
+            ),
+        ):
+            for result, report_path in cases:
+                with self.subTest(report_path=report_path):
+                    remote = self.validate(result)
+                    self.assertEqual(
+                        report_path,
+                        (
+                            remote["report_evidence"]["path"]
+                            if remote["report_evidence"]
+                            else None
+                        ),
+                    )
+
+    def test_zero_and_nonzero_candidates_use_the_manifest_code_tip(self):
+        zero = self.validate(self.result(code=False))
+        fixed = self.validate(
+            self.result(output_paths=[MODULE.AGENT_TASK_OUTPUT_REPORT])
+        )
+
+        self.assertEqual([], zero["commits"])
+        self.assertEqual(self.head, zero["final_local_head"])
+        self.assertEqual([self.code], fixed["commits"])
+        self.assertEqual(self.code, fixed["final_local_head"])
+        self.assertEqual(self.output, fixed["generated_head"])
+
+    def test_rejects_stale_or_mismatched_candidate_identity(self):
+        cases = []
+        stale = self.result()
+        stale["candidate"]["base"]["sha"] = "9" * 40
+        cases.append(stale)
+        wrong_task = self.result()
+        wrong_task["completion"]["task"]["id"] = "other"
+        cases.append(wrong_task)
+        platform_error = self.result()
+        platform_error["error"] = {"code": "worker_failed", "message": "failed"}
+        cases.append(platform_error)
+        for value in cases:
+            with self.subTest(value=value), self.assertRaises(MODULE.WorkflowError):
+                self.validate(value)
+
+    def test_rederives_manifest_coverage_and_excludes_output_commit(self):
+        result = self.result(output_paths=[MODULE.AGENT_TASK_OUTPUT_REPORT])
+        remote = self.validate(result)
+        parents = {
+            self.code: f"{self.code} {self.head}",
+            self.output: f"{self.output} {self.code}",
+        }
+        paths = {
+            self.code: ["src/app.py"],
+            self.output: [MODULE.AGENT_TASK_OUTPUT_REPORT],
+        }
+
+        def git_side_effect(_root, *arguments):
+            if arguments[0] == "rev-list" and arguments[1] == "--reverse":
+                return f"{self.code}\n{self.output}"
+            if arguments[0] == "rev-list":
+                return parents[arguments[-1]]
+            if arguments[0] == "show":
+                return "a" * 40
+            raise AssertionError(arguments)
+
+        with (
+            mock.patch.object(MODULE, "git", side_effect=git_side_effect),
+            mock.patch.object(
+                MODULE,
+                "git_z_paths",
+                side_effect=lambda _root, *args: paths[args[-1]],
+            ),
+            mock.patch.object(
+                MODULE,
+                "run",
+                return_value=SimpleNamespace(stdout="patch\n"),
+            ),
+        ):
+            coverage = MODULE.validate_candidate_history(
+                Path("repo"), base_sha=self.head, remote=remote
+            )
+
+        self.assertEqual({self.code: ["src/app.py"]}, coverage)
+
+    def test_guarded_import_targets_only_the_code_tip(self):
+        remote = self.validate(
+            self.result(output_paths=[MODULE.AGENT_TASK_OUTPUT_REPORT])
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result_path = Path(directory) / "result.json"
+            result_path.write_text("result", encoding="utf-8")
+            digest = MODULE.sha256_file(result_path)
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "local_identity",
+                    side_effect=[
+                        {"branch": "feature", "head": self.head, "status": ""},
+                        {"branch": "feature", "head": self.code, "status": ""},
+                    ],
+                ),
+                mock.patch.object(MODULE, "run") as run_command,
+            ):
+                self.assertTrue(
+                    MODULE.apply_verified_candidate_import(
+                        Path("repo"),
+                        result_path=result_path,
+                        result_sha256=digest,
+                        preflight=self.preflight,
+                        remote=remote,
+                    )
+                )
+
+        self.assertEqual(self.code, run_command.call_args.args[0][-1])
+        self.assertNotIn(self.output, run_command.call_args.args[0])
 
 
 if __name__ == "__main__":
