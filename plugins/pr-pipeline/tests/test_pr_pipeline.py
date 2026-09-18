@@ -22,6 +22,7 @@ HEAD = "a" * 40
 NEXT_HEAD = "b" * 40
 BASE = "c" * 40
 NEXT_BASE = "d" * 40
+PIPELINE_RUN = "1" * 32
 
 
 def target() -> dict:
@@ -597,6 +598,10 @@ class StageContractTest(unittest.TestCase):
             },
             {entry["stage"]: entry["marker"] for entry in MODULE.STAGES},
         )
+        self.assertEqual(
+            ("policy_skip", "head_sha"),
+            MODULE.STAGE_BY_NAME[MODULE.STAGE_COPILOT_REVIEW]["skip_marker"],
+        )
 
     def test_self_review_requires_the_exact_model_and_effort(self):
         models = MODULE.stage_models(None)
@@ -781,7 +786,13 @@ class StageContractTest(unittest.TestCase):
 
 
 class MarkerTest(unittest.TestCase):
-    def status(self, stage: str, payload: dict, base_sha: str = BASE) -> dict:
+    def status(
+        self,
+        stage: str,
+        payload: dict,
+        base_sha: str = BASE,
+        run_id: str | None = None,
+    ) -> dict:
         entry = MODULE.STAGE_BY_NAME[stage]
         with mock.patch.object(
             MODULE,
@@ -797,7 +808,58 @@ class MarkerTest(unittest.TestCase):
                 },
             },
         ):
-            return MODULE.inspect_stage(entry, target(), HEAD, base_sha)
+            return MODULE.inspect_stage(entry, target(), HEAD, base_sha, run_id)
+
+    def policy_skip_payload(self) -> dict:
+        observed_at = "2026-09-18T09:01:54Z"
+        return {
+            "stage_outcome": "skipped",
+            "pr": {
+                **target(),
+                "state": "OPEN",
+                "head_owner": "owner",
+                "head_repo": "repo",
+                "head_repository": "owner/repo",
+                "head_branch": "feature",
+                "head_sha": HEAD,
+                "base_sha": BASE,
+                "cross_repository": False,
+            },
+            "clean_at_head_sha": None,
+            "github_mutation_policy": "source-only",
+            "last_result": "source_only_review_not_applicable",
+            "budget_scope": "pipeline",
+            "pipeline_budget": {"run": PIPELINE_RUN},
+            "policy_skip": {
+                "policy": "source-only",
+                "reason": "review_request_forbidden",
+                "repo_name": "owner/repo",
+                "number": 7,
+                "head_repository": "owner/repo",
+                "head_branch": "feature",
+                "head_sha": HEAD,
+                "base_sha": BASE,
+                "viewer_login": "viewer",
+                "pipeline_run": PIPELINE_RUN,
+                "preflight_sha256": "e" * 64,
+                "observed_at": observed_at,
+            },
+            "coordinator": {
+                "status": "not_applicable",
+                "detail": MODULE.common.SOURCE_ONLY_POLICY_SKIP_DETAIL,
+                "head_sha": HEAD,
+                "observed_at": observed_at,
+            },
+            "queue": None,
+            "monitoring": None,
+            "agent_task": None,
+            "escalation": None,
+            "terminal_exit": None,
+            "thread_mutations": None,
+            "history": [],
+            "managed_task_history": [],
+            "local_validation": [],
+        }
 
     def test_reads_every_stage_marker(self):
         payloads = {
@@ -815,6 +877,126 @@ class MarkerTest(unittest.TestCase):
         for stage, payload in payloads.items():
             with self.subTest(stage=stage):
                 self.assertTrue(self.status(stage, payload)["clear"])
+
+    def test_verified_source_only_review_skip_is_clear_without_review_marker(self):
+        previous_policy = MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY
+        MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
+        try:
+            result = self.status(
+                MODULE.STAGE_COPILOT_REVIEW,
+                self.policy_skip_payload(),
+                run_id=PIPELINE_RUN,
+            )
+        finally:
+            MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
+
+        self.assertTrue(result["clear"])
+        self.assertEqual("skipped", result["outcome"])
+        self.assertEqual("policy_skip", result["clearance_kind"])
+        self.assertEqual(HEAD, result["clear_at_head_sha"])
+        self.assertIsNone(result["reason"])
+
+    def test_review_skip_is_not_clear_under_allow_policy(self):
+        result = self.status(
+            MODULE.STAGE_COPILOT_REVIEW,
+            self.policy_skip_payload(),
+            run_id=PIPELINE_RUN,
+        )
+
+        self.assertFalse(result["clear"])
+        self.assertEqual("policy_skip_not_verified", result["reason"])
+
+    def test_review_skip_with_owned_work_is_not_clear(self):
+        previous_policy = MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY
+        MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
+        try:
+            payload = self.policy_skip_payload()
+            payload["queue"] = {"status": "active", "comments": []}
+            result = self.status(
+                MODULE.STAGE_COPILOT_REVIEW,
+                payload,
+                run_id=PIPELINE_RUN,
+            )
+        finally:
+            MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
+
+        self.assertFalse(result["clear"])
+        self.assertEqual("policy_skip_not_verified", result["reason"])
+
+    def test_review_skip_rejects_cross_identity_and_forged_variants(self):
+        previous_policy = MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY
+        MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
+        cases = {}
+
+        run = self.policy_skip_payload()
+        run["policy_skip"]["pipeline_run"] = "2" * 32
+        cases["run"] = run
+
+        base = self.policy_skip_payload()
+        base["policy_skip"]["base_sha"] = NEXT_BASE
+        cases["base"] = base
+
+        repo = self.policy_skip_payload()
+        repo["policy_skip"]["repo_name"] = "other/repo"
+        cases["repo"] = repo
+
+        viewer = self.policy_skip_payload()
+        viewer["policy_skip"]["viewer_login"] = ""
+        cases["viewer"] = viewer
+
+        forged = self.policy_skip_payload()
+        forged["policy_skip"]["unexpected"] = True
+        cases["forged"] = forged
+
+        replayed = self.policy_skip_payload()
+        replayed["pipeline_budget"]["run"] = "2" * 32
+        cases["replayed"] = replayed
+
+        clean = self.policy_skip_payload()
+        clean["clean_at_head_sha"] = HEAD
+        cases["clean marker"] = clean
+
+        try:
+            for name, payload in cases.items():
+                with self.subTest(name=name):
+                    result = self.status(
+                        MODULE.STAGE_COPILOT_REVIEW,
+                        payload,
+                        run_id=PIPELINE_RUN,
+                    )
+                    self.assertFalse(result["clear"])
+                    self.assertEqual("policy_skip_not_verified", result["reason"])
+        finally:
+            MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
+
+    def test_review_skip_requires_a_ready_status_envelope(self):
+        previous_policy = MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY
+        MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
+        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_COPILOT_REVIEW]
+        try:
+            with mock.patch.object(
+                MODULE,
+                "read_stage_status",
+                return_value={
+                    "ok": False,
+                    "installed": True,
+                    "state": "state.json",
+                    "reason": "status_not_ready",
+                    "payload": self.policy_skip_payload(),
+                },
+            ):
+                result = MODULE.inspect_stage(
+                    entry,
+                    target(),
+                    HEAD,
+                    BASE,
+                    PIPELINE_RUN,
+                )
+        finally:
+            MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
+
+        self.assertFalse(result["clear"])
+        self.assertEqual("status_not_ready", result["reason"])
 
     def test_old_marker_is_not_clear(self):
         result = self.status(

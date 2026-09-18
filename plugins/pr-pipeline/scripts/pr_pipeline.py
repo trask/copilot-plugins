@@ -548,6 +548,7 @@ def inspect_stage(
         target,
         head_sha,
         base_sha,
+        pipeline_run=run_id,
         read_status=lambda current, selected: read_stage_status(
             current, selected, run_id
         ),

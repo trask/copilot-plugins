@@ -118,6 +118,22 @@ CLEAN_PREFLIGHT_RESULTS = frozenset({"no_copilot_comments", "no_unresolved_comme
 # lives in one place rather than being restated in a test.
 WATCHER_REVIEW_CLEAN = "review_no_comments"
 WATCHER_REVIEW_COMMENTS = "review_comments"
+SOURCE_ONLY_POLICY_SKIP_RESULT = "source_only_review_not_applicable"
+SOURCE_ONLY_POLICY_SKIP_REASON = "review_request_forbidden"
+SOURCE_ONLY_LEGACY_POLICY_BLOCK_SHA256 = (
+    "6e8068503eeb4d3ef35e4d15df8c03570e22d78391a824c98f27d9f26fd7181f"
+)
+SOURCE_ONLY_REVIEW_REQUEST_ERROR = (
+    "github mutation policy source-only forbids Copilot review requests"
+)
+SOURCE_ONLY_POLICY_SKIP_DETAIL = (
+    "Copilot Review is not applicable under source-only policy because no "
+    "Copilot review exists at the frozen head and requesting one is forbidden"
+)
+SOURCE_ONLY_ACTIONABLE_REVIEW_ERROR = (
+    "source-only policy cannot complete actionable Copilot review work because "
+    "review replies and thread resolution are forbidden"
+)
 # Watcher endings that are themselves a clearance: Copilot reviewed and asked for
 # nothing. The watcher writes `clean_at_head_sha` in the same `save_state` as this
 # result, so `stage_outcome` reads the marker first and never reaches this set in
@@ -925,9 +941,391 @@ def empty_queue_clearance_head(
     return pr["head_sha"]
 
 
+def policy_skip_clearance_error(
+    state: dict[str, Any], target: dict[str, Any] | None = None
+) -> str | None:
+    allowed_state_fields = {
+        "version",
+        "created_at",
+        "updated_at",
+        "iterations",
+        "history",
+        "repo_root",
+        "pr",
+        "budget_charges",
+        "budget_scope",
+        "pipeline_budget",
+        "github_mutation_policy",
+        "clean_at_head_sha",
+        "last_result",
+        "policy_skip",
+        "coordinator",
+    }
+    if set(state) - allowed_state_fields:
+        return "terminal policy skip state has unexpected fields"
+    pr = state.get("pr")
+    skip = state.get("policy_skip")
+    coordinator = state.get("coordinator")
+    if not isinstance(pr, dict) or not isinstance(skip, dict):
+        return "terminal policy skip lacks bound pull request identity"
+    head = pr.get("head_sha")
+    base = pr.get("base_sha")
+    repo_name = pr.get("repo_name")
+    number = pr.get("number")
+    head_repository = pr.get("head_repository")
+    head_branch = pr.get("head_branch")
+    if (
+        not isinstance(head, str)
+        or SHA_PATTERN.fullmatch(head) is None
+        or not isinstance(base, str)
+        or SHA_PATTERN.fullmatch(base) is None
+        or not isinstance(repo_name, str)
+        or not repo_name
+        or not isinstance(number, int)
+        or isinstance(number, bool)
+        or number <= 0
+        or not isinstance(head_repository, str)
+        or not head_repository
+        or not isinstance(head_branch, str)
+        or not head_branch
+        or pr.get("state") != "OPEN"
+        or head_repository
+        != f"{pr.get('head_owner')}/{pr.get('head_repo')}"
+        or pr.get("cross_repository")
+        != (head_repository.casefold() != repo_name.casefold())
+    ):
+        return "terminal policy skip has invalid pull request identity"
+    if target is not None and (
+        number != target["number"]
+        or repo_name.casefold()
+        != f"{target['owner']}/{target['repo']}".casefold()
+    ):
+        return "terminal policy skip names a different pull request"
+    expected_skip = {
+        "policy": "source-only",
+        "reason": SOURCE_ONLY_POLICY_SKIP_REASON,
+        "repo_name": repo_name,
+        "number": number,
+        "head_repository": head_repository,
+        "head_branch": head_branch,
+        "head_sha": head,
+        "base_sha": base,
+    }
+    if any(skip.get(key) != value for key, value in expected_skip.items()):
+        return "terminal policy skip identity does not match its pull request"
+    if (
+        set(skip)
+        != {
+            *expected_skip,
+            "viewer_login",
+            "pipeline_run",
+            "preflight_sha256",
+            "observed_at",
+        }
+        or not isinstance(skip.get("viewer_login"), str)
+        or not skip["viewer_login"]
+        or (
+            skip.get("pipeline_run") is not None
+            and (
+                not isinstance(skip["pipeline_run"], str)
+                or not skip["pipeline_run"]
+            )
+        )
+        or not isinstance(skip.get("preflight_sha256"), str)
+        or SHA256_PATTERN.fullmatch(skip["preflight_sha256"]) is None
+        or not isinstance(skip.get("observed_at"), str)
+        or not skip["observed_at"]
+    ):
+        return "terminal policy skip proof is malformed"
+    if (
+        state.get("github_mutation_policy") != "source-only"
+        or state.get("last_result") != SOURCE_ONLY_POLICY_SKIP_RESULT
+        or state.get("clean_at_head_sha") is not None
+    ):
+        return "terminal policy skip conflicts with recorded stage state"
+    pipeline_run = skip.get("pipeline_run")
+    pipeline_budget = state.get("pipeline_budget")
+    if (
+        pipeline_run is None
+        and state.get("budget_scope") != "standalone"
+    ) or (
+        pipeline_run is not None
+        and (
+            state.get("budget_scope") != "pipeline"
+            or not isinstance(pipeline_budget, dict)
+            or pipeline_budget.get("run") != pipeline_run
+        )
+    ):
+        return "terminal policy skip pipeline identity drifted"
+    if (
+        not isinstance(coordinator, dict)
+        or set(coordinator)
+        != {"status", "detail", "head_sha", "observed_at"}
+        or coordinator.get("status") != "not_applicable"
+        or coordinator.get("head_sha") != head
+        or coordinator.get("detail") != SOURCE_ONLY_POLICY_SKIP_DETAIL
+        or not isinstance(coordinator.get("observed_at"), str)
+        or not coordinator["observed_at"]
+    ):
+        return "terminal policy skip lacks matching coordinator state"
+    if any(
+        state.get(field) is not None
+        for field in (
+            "agent_task",
+            "monitoring",
+            "queue",
+            "escalation",
+            "terminal_exit",
+            "thread_mutations",
+        )
+    ):
+        return "terminal policy skip still owns or hides review work"
+    if any(
+        state.get(field) not in (None, [])
+        for field in ("history", "managed_task_history", "local_validation")
+    ):
+        return "terminal policy skip retains review work history"
+    return None
+
+
+def policy_skip_preflight_sha256(preflight: dict[str, Any]) -> str:
+    serialized = json.dumps(
+        preflight,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256_text(serialized)
+
+
+def source_only_policy_skip_head(
+    state: dict[str, Any] | None,
+    preflight: dict[str, Any],
+    confirmation: dict[str, Any],
+    target: dict[str, Any],
+    *,
+    pipeline_run: str | None,
+    state_sha256: str | None,
+) -> str:
+    if ACTIVE_GITHUB_MUTATION_POLICY != "source-only":
+        raise WorkflowError("policy skip requires exact source-only policy")
+    preflight_sha256 = policy_skip_preflight_sha256(preflight)
+    if preflight_sha256 != policy_skip_preflight_sha256(confirmation):
+        raise WorkflowError("policy skip identity drifted during revalidation")
+    pr = preflight.get("pr")
+    identity = preflight.get("identity")
+    viewer = preflight.get("viewer")
+    permissions = viewer.get("permissions") if isinstance(viewer, dict) else None
+    if (
+        not isinstance(pr, dict)
+        or not isinstance(identity, dict)
+        or not isinstance(viewer, dict)
+        or not isinstance(permissions, dict)
+        or not isinstance(identity.get("branch"), str)
+        or not identity["branch"]
+        or not isinstance(identity.get("head"), str)
+        or SHA_PATTERN.fullmatch(identity["head"]) is None
+        or identity.get("status") != ""
+        or not isinstance(pr.get("number"), int)
+        or isinstance(pr["number"], bool)
+        or pr["number"] <= 0
+        or pr["number"] != target["number"]
+        or pr.get("repo_name") != f"{target['owner']}/{target['repo']}"
+        or pr.get("state") != "OPEN"
+        or not isinstance(pr.get("head_sha"), str)
+        or SHA_PATTERN.fullmatch(pr["head_sha"]) is None
+        or not isinstance(pr.get("base_sha"), str)
+        or SHA_PATTERN.fullmatch(pr["base_sha"]) is None
+        or identity["head"] != pr["head_sha"]
+        or identity["branch"] != pr.get("head_branch")
+        or pr.get("head_repository")
+        != f"{pr.get('head_owner')}/{pr.get('head_repo')}"
+        or pr.get("cross_repository")
+        != (pr["head_repository"].casefold() != pr["repo_name"].casefold())
+        or not isinstance(viewer.get("login"), str)
+        or not viewer["login"]
+        or any(
+            not isinstance(permissions.get(name), bool)
+            for name in ("admin", "maintain", "push", "triage", "pull")
+        )
+    ):
+        raise WorkflowError("policy skip has invalid ownership identity")
+    if (
+        preflight.get("comments") != []
+        or preflight.get("comment_identities") != []
+        or preflight.get("head_review_clean") is not False
+        or preflight.get("head_review_id") is not None
+    ):
+        raise WorkflowError(
+            "policy skip would hide existing or actionable Copilot review work"
+        )
+    if state is None:
+        return pr["head_sha"]
+    if state.get("policy_skip") is not None:
+        detail = policy_skip_clearance_error(state, target)
+        if detail is not None:
+            raise WorkflowError(detail)
+        stored_pr = state["pr"]
+        stored_skip = state["policy_skip"]
+        if (
+            state.get("repo_root") != preflight.get("repository_root")
+            or any(
+                stored_pr.get(field) != pr[field]
+                for field in (
+                    "repo_name",
+                    "number",
+                    "head_repository",
+                    "head_branch",
+                    "head_sha",
+                    "base_sha",
+                )
+            )
+            or stored_skip.get("viewer_login") != viewer["login"]
+            or stored_skip.get("preflight_sha256") != preflight_sha256
+        ):
+            raise WorkflowError("policy skip replayed against a different preflight")
+        if stored_skip.get("pipeline_run") != pipeline_run:
+            raise WorkflowError("policy skip pipeline owner drifted")
+        return pr["head_sha"]
+    if state_sha256 != SOURCE_ONLY_LEGACY_POLICY_BLOCK_SHA256:
+        raise WorkflowError("policy skip state is not the hash-bound policy block")
+    stored_pr = state.get("pr")
+    queue = state.get("queue")
+    pipeline_budget = state.get("pipeline_budget")
+    if (
+        state.get("version") != STATE_VERSION
+        or state.get("repo_root") != preflight.get("repository_root")
+        or not isinstance(pipeline_run, str)
+        or not pipeline_run
+        or state.get("budget_scope") != "pipeline"
+        or not isinstance(pipeline_budget, dict)
+        or pipeline_budget.get("run") != pipeline_run
+    ):
+        raise WorkflowError("policy skip pipeline owner identity drifted")
+    if not isinstance(stored_pr, dict) or any(
+        stored_pr.get(field) != pr[field]
+        for field in (
+            "repo_name",
+            "number",
+            "head_repository",
+            "head_branch",
+            "head_sha",
+            "base_sha",
+        )
+    ):
+        raise WorkflowError("policy skip state identity drifted")
+    if (
+        not isinstance(queue, dict)
+        or queue.get("id") != f"pr-{pr['number']}"
+        or queue.get("status") != "active"
+        or queue.get("comments") != []
+        or queue.get("batches") != []
+    ):
+        raise WorkflowError("policy skip state is malformed or has work")
+    if any(state.get(field) is not None for field in ("agent_task", "monitoring")):
+        raise WorkflowError("policy skip state has an active or queued owner")
+    if state.get("clean_at_head_sha") is not None:
+        raise WorkflowError("policy skip conflicts with review clearance")
+    if state.get("history") not in (None, []):
+        raise WorkflowError("policy skip state has review history")
+    if state.get("managed_task_history") not in (None, []):
+        raise WorkflowError("policy skip state has managed task history")
+    if state.get("local_validation") not in (None, []):
+        raise WorkflowError("policy skip state has local validation work")
+    if state.get("thread_mutations") is not None:
+        raise WorkflowError("policy skip state has review thread mutations")
+    coordinator = state.get("coordinator")
+    escalation = state.get("escalation")
+    terminal_exit = state.get("terminal_exit")
+    if (
+        not isinstance(coordinator, dict)
+        or coordinator.get("status") != "blocked"
+        or coordinator.get("head_sha") != pr["head_sha"]
+        or coordinator.get("detail") != SOURCE_ONLY_REVIEW_REQUEST_ERROR
+        or not isinstance(escalation, dict)
+        or escalation.get("reason") != "coordinator_error"
+        or escalation.get("detail") != SOURCE_ONLY_REVIEW_REQUEST_ERROR
+        or not isinstance(terminal_exit, dict)
+        or terminal_exit.get("status") != "nonzero"
+        or terminal_exit.get("reason") != SOURCE_ONLY_REVIEW_REQUEST_ERROR
+        or state.get("last_result") != "coordinator_error"
+    ):
+        raise WorkflowError("policy skip state is not the recoverable policy block")
+    return pr["head_sha"]
+
+
+def record_source_only_policy_skip(
+    state: dict[str, Any] | None,
+    *,
+    preflight: dict[str, Any],
+    args: argparse.Namespace,
+    repo_root: Path,
+    state_path: Path,
+) -> dict[str, Any]:
+    pr = preflight["pr"]
+    result = (
+        state
+        if state is not None
+        else {
+            "version": STATE_VERSION,
+            "created_at": utc_now(),
+            "iterations": 0,
+            "history": [],
+        }
+    )
+    result["repo_root"] = str(repo_root)
+    result["pr"] = pr
+    result["iterations"] = int(result.get("iterations", 0))
+    migrate_budget_counters(result)
+    scope = pipeline_scope(result, args)
+    if scope is not None:
+        result["pipeline_budget"] = scope
+        result["budget_scope"] = "pipeline"
+    else:
+        result["budget_scope"] = "standalone"
+    observed_at = utc_now()
+    result["github_mutation_policy"] = "source-only"
+    result["clean_at_head_sha"] = None
+    result["last_result"] = SOURCE_ONLY_POLICY_SKIP_RESULT
+    result["policy_skip"] = {
+        "policy": "source-only",
+        "reason": SOURCE_ONLY_POLICY_SKIP_REASON,
+        "repo_name": pr["repo_name"],
+        "number": pr["number"],
+        "head_repository": pr["head_repository"],
+        "head_branch": pr["head_branch"],
+        "head_sha": pr["head_sha"],
+        "base_sha": pr["base_sha"],
+        "viewer_login": preflight["viewer"]["login"],
+        "pipeline_run": getattr(args, "pipeline_run", None),
+        "preflight_sha256": policy_skip_preflight_sha256(preflight),
+        "observed_at": observed_at,
+    }
+    result["coordinator"] = {
+        "status": "not_applicable",
+        "detail": SOURCE_ONLY_POLICY_SKIP_DETAIL,
+        "head_sha": pr["head_sha"],
+        "observed_at": observed_at,
+    }
+    for field in (
+        "agent_task",
+        "monitoring",
+        "queue",
+        "escalation",
+        "terminal_exit",
+        "stage_progress",
+        "thread_mutations",
+    ):
+        result.pop(field, None)
+    save_state(state_path, result)
+    return result
+
+
 def terminal_agent_task_clearance_error(
     state: dict[str, Any], target: dict[str, Any]
 ) -> str | None:
+    if state.get("policy_skip") is not None:
+        return policy_skip_clearance_error(state, target)
     pr = state.get("pr")
     if (
         not isinstance(pr, dict)
@@ -2139,6 +2537,8 @@ def stage_outcome(state: dict[str, Any]) -> str | None:
 
     ``cleared`` is read straight off ``clean_at_head_sha`` rather than decided
     again here, so this can never become a second, softer route to a clearance.
+    ``skipped`` requires the separate exact policy proof, which cannot be
+    mistaken for a completed review.
 
     Every word this returns is a claim about a run that ended. ``preflight``
     writes ``last_result`` before a run does any work, so a value it leaves is
@@ -2158,6 +2558,12 @@ def stage_outcome(state: dict[str, Any]) -> str | None:
     absence rather than absence of evidence.
     """
 
+    if state.get("policy_skip") is not None:
+        return (
+            "skipped"
+            if policy_skip_clearance_error(state) is None
+            else "escalated"
+        )
     if state.get("clean_at_head_sha"):
         return "cleared"
     last_result = state.get("last_result")
@@ -3006,7 +3412,7 @@ ACTIVE_GITHUB_MUTATION_POLICY = "allow"
 
 
 def github_mutation_policy(args: argparse.Namespace) -> str:
-    return (
+    policy = (
         getattr(args, "github_mutation_policy", None)
         or (
             "source-only"
@@ -3014,6 +3420,9 @@ def github_mutation_policy(args: argparse.Namespace) -> str:
             else "allow"
         )
     )
+    if policy not in {"allow", "source-only"}:
+        raise WorkflowError(f"invalid GitHub mutation policy: {policy!r}")
+    return policy
 
 
 def require_retained_github_mutation_policy(
@@ -8995,11 +9404,50 @@ def command_agent_task(args: argparse.Namespace) -> None:
         )
         pr = preflight["pr"]
         clean_head = None
+        policy_skip_head = None
         if not preflight["comments"] and preflight["head_review_clean"]:
             confirmation = agent_task_preflight(repo_root, target)
             clean_head = empty_queue_clearance_head(
                 existing, preflight, confirmation, target
             )
+        elif (
+            not preflight["comments"]
+            and ACTIVE_GITHUB_MUTATION_POLICY == "source-only"
+        ):
+            confirmation = agent_task_preflight(repo_root, target)
+            existing_sha256 = (
+                sha256_file(state_path) if existing is not None else None
+            )
+            policy_skip_head = source_only_policy_skip_head(
+                existing,
+                preflight,
+                confirmation,
+                target,
+                pipeline_run=getattr(args, "pipeline_run", None),
+                state_sha256=existing_sha256,
+            )
+        if policy_skip_head is not None:
+            state = record_source_only_policy_skip(
+                existing,
+                preflight=preflight,
+                args=args,
+                repo_root=repo_root,
+                state_path=state_path,
+            )
+            detail = terminal_agent_task_clearance_error(state, target)
+            if detail is not None:
+                raise WorkflowError(detail)
+            emit(
+                {
+                    "result": SOURCE_ONLY_POLICY_SKIP_RESULT,
+                    "state": str(state_path),
+                    "head_sha": policy_skip_head,
+                    "iterations": state["iterations"],
+                    "stage_outcome": "skipped",
+                    "policy_skip": state["policy_skip"],
+                }
+            )
+            return
         if existing is None:
             state = {
                 "version": STATE_VERSION,
@@ -9058,6 +9506,15 @@ def command_agent_task(args: argparse.Namespace) -> None:
         remaining = args.max_iterations - iteration_spent
         if absolute_cap is not None:
             remaining = min(remaining, absolute_cap - run_spent)
+        if (
+            ACTIVE_GITHUB_MUTATION_POLICY == "source-only"
+            and preflight["comments"]
+        ):
+            state["github_mutation_policy"] = "source-only"
+            state["clean_at_head_sha"] = None
+            state["last_result"] = "ready"
+            save_state(state_path, state)
+            raise WorkflowError(SOURCE_ONLY_ACTIONABLE_REVIEW_ERROR)
         if clean_head is not None:
             state["clean_at_head_sha"] = clean_head
             state["last_result"] = "no_unresolved_comments"
@@ -9918,8 +10375,16 @@ def command_status(args: argparse.Namespace) -> None:
         "coordinator": state.get("coordinator"),
         "escalation": state.get("escalation"),
         "history": state.get("history") or [],
+        "managed_task_history": state.get("managed_task_history") or [],
         "iterations": int(state.get("iterations", 0)),
         "clean_at_head_sha": state.get("clean_at_head_sha"),
+        "policy_skip": state.get("policy_skip"),
+        "github_mutation_policy": state.get("github_mutation_policy"),
+        "last_result": state.get("last_result"),
+        "budget_scope": state.get("budget_scope"),
+        "pipeline_budget": state.get("pipeline_budget"),
+        "terminal_exit": state.get("terminal_exit"),
+        "thread_mutations": state.get("thread_mutations"),
         "local_validation": state.get("local_validation") or [],
         "last_helper_activity": last_helper_activity(state),
         "stage_progress": state.get("stage_progress"),

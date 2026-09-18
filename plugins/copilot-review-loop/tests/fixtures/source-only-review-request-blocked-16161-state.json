@@ -1,0 +1,64 @@
+{
+  "budget_charges": {
+    "[\"pipeline\",\"356e7fe7ae7c4a14be7bfc1a1ec841fb\",1]": 0,
+    "[\"pipeline\",\"356e7fe7ae7c4a14be7bfc1a1ec841fb\"]": 0
+  },
+  "budget_scope": "pipeline",
+  "clean_at_head_sha": null,
+  "coordinator": {
+    "detail": "github mutation policy source-only forbids Copilot review requests",
+    "head_sha": "02ad2ba216cdc6ef2f3f3768f7c5bc700ed62eac",
+    "observed_at": "2026-09-18T09:01:54.411491Z",
+    "status": "blocked"
+  },
+  "created_at": "2026-09-18T09:01:53.963921Z",
+  "escalation": {
+    "detail": "github mutation policy source-only forbids Copilot review requests",
+    "observed_at": "2026-09-18T09:01:54.411491Z",
+    "reason": "coordinator_error"
+  },
+  "history": [],
+  "iterations": 0,
+  "last_result": "coordinator_error",
+  "pipeline_budget": {
+    "baseline": 0,
+    "iteration": 1,
+    "run": "356e7fe7ae7c4a14be7bfc1a1ec841fb",
+    "run_baseline": 0
+  },
+  "pr": {
+    "base_branch": "main",
+    "base_sha": "2515ed4055bb1802c7d21d7a01882b92b6d5c675",
+    "body": "gRPC client spans now populate `server.address` and `server.port` from configured channel targets instead of relying only on channel authority. Target parsing covers DNS, Unix domain socket, IPv4, IPv6, and xDS addresses. Direct-address channels fall back to authority.\n\n### Library API\n\nUse `addClientInterceptor` when configuring a `ManagedChannelBuilder`:\n\n```java\nGrpcTelemetry telemetry = GrpcTelemetry.create(openTelemetry);\ntelemetry.addClientInterceptor(channelBuilder);\n```\n\nOn gRPC 1.64 and newer, this method captures the builder target. Older versions fall back to channel authority. `createClientInterceptor()` remains supported for integrations that accept only a `ClientInterceptor`, but it cannot capture the builder target.\n\n### Compatibility\n\n`GrpcRequest.getLogicalHost()` and `getLogicalPort()` are deprecated. Use `getServerAddress()` and `getServerPort()` instead.",
+    "cross_repository": true,
+    "head_branch": "grpc-server-address",
+    "head_owner": "trask",
+    "head_repo": "opentelemetry-java-instrumentation",
+    "head_repository": "trask/opentelemetry-java-instrumentation",
+    "head_sha": "02ad2ba216cdc6ef2f3f3768f7c5bc700ed62eac",
+    "is_draft": true,
+    "number": 16161,
+    "pr_node_id": "PR_kwDODJKVX87DbRqa",
+    "pr_url": "https://github.com/open-telemetry/opentelemetry-java-instrumentation/pull/16161",
+    "repo_name": "open-telemetry/opentelemetry-java-instrumentation",
+    "state": "OPEN",
+    "title": "Populate gRPC `server.address` and `server.port` from channel targets",
+    "upstream_owner": "open-telemetry",
+    "upstream_repo": "opentelemetry-java-instrumentation",
+    "url": "https://github.com/open-telemetry/opentelemetry-java-instrumentation/pull/16161"
+  },
+  "queue": {
+    "batches": [],
+    "comments": [],
+    "id": "pr-16161",
+    "status": "active"
+  },
+  "repo_root": "C:\\Users\\trstalna\\.copilot\\repos\\copilot-worktrees\\opentelemetry-java-instrumentation\\grpc-server-address",
+  "terminal_exit": {
+    "observed_at": "2026-09-18T09:01:54.411491Z",
+    "reason": "github mutation policy source-only forbids Copilot review requests",
+    "status": "nonzero"
+  },
+  "updated_at": "2026-09-18T09:01:54.411802Z",
+  "version": 3
+}

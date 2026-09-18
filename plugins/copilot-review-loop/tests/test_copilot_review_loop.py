@@ -47,6 +47,11 @@ EMPTY_ACTIVE_REVIEW_REQUIRED_STATE = (
     / "fixtures"
     / "empty-active-review-required-state.json"
 )
+SOURCE_ONLY_REVIEW_REQUEST_BLOCKED_STATE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "source-only-review-request-blocked-16161-state.json"
+)
 APPLIED_PATH_CORRELATED_V2_RESULT = (
     Path(__file__).parent
     / "fixtures"
@@ -204,6 +209,17 @@ class GithubMutationPolicyTest(unittest.TestCase):
             MODULE.request_copilot({}, Path("state.json"), "1" * 40)
 
         graphql.assert_not_called()
+
+    def test_rejects_an_unknown_policy_before_any_work(self):
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "invalid GitHub mutation policy"
+        ):
+            MODULE.github_mutation_policy(
+                argparse.Namespace(
+                    pipeline_run="run-1",
+                    github_mutation_policy="mixed",
+                )
+            )
 
 
 class WindowsSubprocessTest(unittest.TestCase):
@@ -2191,7 +2207,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.56")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.57")
 
     def test_successful_retained_preparation_clears_prior_failure(self):
         task = {
@@ -3891,7 +3907,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("Run the shell tool synchronously with `mode: sync`", instructions)
         self.assertIn("Leave out `timeout` and `isBackground`", instructions)
         self.assertIn(
-            "Do not finish the agent successfully or infer clearance from an empty queue",
+            "accept `stage_outcome: skipped` only when a `source-only` run returns "
+            "its exact frozen-head `policy_skip` proof",
             instructions,
         )
 
@@ -7387,12 +7404,34 @@ class TerminalCoordinatorContractTest(unittest.TestCase):
             publish_prepared_only=False,
         )
 
+    def unreviewed_preflight(self):
+        incident = json.loads(
+            SOURCE_ONLY_REVIEW_REQUEST_BLOCKED_STATE.read_text(encoding="utf-8")
+        )
+        return {
+            **copy.deepcopy(self.preflight),
+            "repository_root": incident["repo_root"],
+            "identity": {
+                "branch": incident["pr"]["head_branch"],
+                "head": incident["pr"]["head_sha"],
+                "status": "",
+            },
+            "pr": copy.deepcopy(incident["pr"]),
+            "comments": [],
+            "comment_identities": [],
+            "head_review_clean": False,
+            "head_review_id": None,
+            "copilot_bot_id": None,
+        }
+
     def run_clean_coordinator(self, state_path, *, historical_fixes=None):
         emitted = []
         with (
             mock.patch.object(MODULE, "require_tools"),
             mock.patch.object(
-                MODULE, "resolve_repo_root", return_value=Path("repo")
+                MODULE,
+                "resolve_repo_root",
+                return_value=Path("repo"),
             ),
             mock.patch.object(
                 MODULE, "resolve_target", return_value=self.target
@@ -7422,6 +7461,368 @@ class TerminalCoordinatorContractTest(unittest.TestCase):
             "coordinator returned without validated current-head clearance",
             MODULE.terminal_agent_task_clearance_error(self.state, self.target),
         )
+
+    def test_exact_source_only_policy_block_becomes_a_verified_skip(self):
+        self.assertEqual(
+            MODULE.SOURCE_ONLY_LEGACY_POLICY_BLOCK_SHA256,
+            MODULE.sha256_file(SOURCE_ONLY_REVIEW_REQUEST_BLOCKED_STATE),
+        )
+        incident = json.loads(
+            SOURCE_ONLY_REVIEW_REQUEST_BLOCKED_STATE.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            "356e7fe7ae7c4a14be7bfc1a1ec841fb",
+            incident["pipeline_budget"]["run"],
+        )
+        self.assertEqual(
+            MODULE.SOURCE_ONLY_REVIEW_REQUEST_ERROR,
+            incident["coordinator"]["detail"],
+        )
+        preflight = self.unreviewed_preflight()
+        args = self.arguments(Path("unused"))
+        args.pipeline_run = incident["pipeline_budget"]["run"]
+        args.pipeline_iteration = 1
+        args.pipeline_max_iterations = 2
+        args.github_mutation_policy = "source-only"
+        emitted = []
+        previous_policy = MODULE.ACTIVE_GITHUB_MUTATION_POLICY
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            shutil.copyfile(SOURCE_ONLY_REVIEW_REQUEST_BLOCKED_STATE, state_path)
+            args.state = str(state_path)
+            try:
+                with (
+                    mock.patch.object(MODULE, "require_tools"),
+                    mock.patch.object(
+                        MODULE,
+                        "resolve_repo_root",
+                        return_value=Path(preflight["repository_root"]),
+                    ),
+                    mock.patch.object(
+                        MODULE, "resolve_target", return_value=self.target
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "wait_for_stable_review_preflight",
+                        return_value=copy.deepcopy(preflight),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "agent_task_preflight",
+                        return_value=copy.deepcopy(preflight),
+                    ),
+                    mock.patch.object(MODULE, "request_copilot") as request,
+                    mock.patch.object(MODULE, "discover_cloud_task") as discover,
+                    mock.patch.object(MODULE, "run_local_decision_worker") as worker,
+                    mock.patch.object(MODULE, "emit", emitted.append),
+                ):
+                    MODULE.command_agent_task(args)
+            finally:
+                MODULE.ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
+            saved = MODULE.load_state(state_path)
+            MODULE.require_terminal_agent_task_clearance(args)
+            status_payloads = []
+            with mock.patch.object(MODULE, "emit", status_payloads.append):
+                MODULE.command_status(
+                    SimpleNamespace(
+                        current=False,
+                        state=str(state_path),
+                        repo_root=None,
+                    )
+                )
+
+        request.assert_not_called()
+        discover.assert_not_called()
+        worker.assert_not_called()
+        self.assertEqual(
+            MODULE.SOURCE_ONLY_POLICY_SKIP_RESULT, emitted[-1]["result"]
+        )
+        self.assertEqual("skipped", emitted[-1]["stage_outcome"])
+        self.assertIsNone(saved["clean_at_head_sha"])
+        self.assertEqual("source-only", saved["github_mutation_policy"])
+        self.assertEqual(self.head, saved["policy_skip"]["head_sha"])
+        self.assertEqual("not_applicable", saved["coordinator"]["status"])
+        self.assertEqual("skipped", status_payloads[-1]["stage_outcome"])
+        self.assertEqual(saved["policy_skip"], status_payloads[-1]["policy_skip"])
+        for field in (
+            "queue",
+            "agent_task",
+            "monitoring",
+            "escalation",
+            "terminal_exit",
+        ):
+            self.assertNotIn(field, saved)
+        self.assertIsNone(
+            MODULE.terminal_agent_task_clearance_error(saved, self.target)
+        )
+        self.assertEqual("skipped", MODULE.stage_outcome(saved))
+        drifted = copy.deepcopy(saved)
+        drifted["policy_skip"]["pipeline_run"] = "another-run"
+        self.assertEqual("escalated", MODULE.stage_outcome(drifted))
+        self.assertEqual(
+            "terminal policy skip pipeline identity drifted",
+            MODULE.terminal_agent_task_clearance_error(drifted, self.target),
+        )
+        malformed = copy.deepcopy(saved)
+        malformed["request"] = {"status": "created"}
+        self.assertEqual("escalated", MODULE.stage_outcome(malformed))
+        self.assertEqual(
+            "terminal policy skip state has unexpected fields",
+            MODULE.terminal_agent_task_clearance_error(malformed, self.target),
+        )
+
+    def test_policy_skip_fails_closed_for_unsafe_variants(self):
+        incident = json.loads(
+            SOURCE_ONLY_REVIEW_REQUEST_BLOCKED_STATE.read_text(encoding="utf-8")
+        )
+        preflight = self.unreviewed_preflight()
+        cases = {}
+
+        active = copy.deepcopy(incident)
+        active["agent_task"] = {"status": "running", "run_id": "owner"}
+        cases["active task"] = (active, preflight, preflight)
+
+        queued = copy.deepcopy(incident)
+        queued["queue"]["comments"] = [{"id": 17, "status": "pending"}]
+        cases["queued comments"] = (queued, preflight, preflight)
+
+        monitored = copy.deepcopy(incident)
+        monitored["monitoring"] = {"status": "requested", "head_sha": self.head}
+        cases["active monitoring"] = (monitored, preflight, preflight)
+
+        actionable = copy.deepcopy(preflight)
+        actionable["comments"] = [copy.deepcopy(self.state["queue"])]
+        actionable["comment_identities"] = [{"id": 17}]
+        cases["fresh actionable work"] = (incident, actionable, actionable)
+
+        drifted = copy.deepcopy(preflight)
+        drifted["pr"]["head_sha"] = "f" * 40
+        drifted["identity"]["head"] = "f" * 40
+        cases["head drift"] = (incident, preflight, drifted)
+
+        wrong_error = copy.deepcopy(incident)
+        wrong_error["coordinator"]["detail"] = "another coordinator failure"
+        cases["different coordinator error"] = (
+            wrong_error,
+            preflight,
+            preflight,
+        )
+
+        previous_policy = MODULE.ACTIVE_GITHUB_MUTATION_POLICY
+        MODULE.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
+        try:
+            self.assertEqual(
+                self.head,
+                MODULE.source_only_policy_skip_head(
+                    incident,
+                    preflight,
+                    copy.deepcopy(preflight),
+                    self.target,
+                    pipeline_run=incident["pipeline_budget"]["run"],
+                    state_sha256=MODULE.SOURCE_ONLY_LEGACY_POLICY_BLOCK_SHA256,
+                ),
+            )
+            for name, (state, first, confirmation) in cases.items():
+                with self.subTest(name=name), self.assertRaises(MODULE.WorkflowError):
+                    MODULE.source_only_policy_skip_head(
+                        state,
+                        first,
+                        confirmation,
+                        self.target,
+                        pipeline_run=incident["pipeline_budget"]["run"],
+                        state_sha256=MODULE.SOURCE_ONLY_LEGACY_POLICY_BLOCK_SHA256,
+                    )
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "pipeline owner identity drifted"
+            ):
+                MODULE.source_only_policy_skip_head(
+                    incident,
+                    preflight,
+                    preflight,
+                    self.target,
+                    pipeline_run="another-run",
+                    state_sha256=MODULE.SOURCE_ONLY_LEGACY_POLICY_BLOCK_SHA256,
+                )
+            MODULE.ACTIVE_GITHUB_MUTATION_POLICY = "allow"
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "requires exact source-only"
+            ):
+                MODULE.source_only_policy_skip_head(
+                    incident,
+                    preflight,
+                    preflight,
+                    self.target,
+                    pipeline_run=incident["pipeline_budget"]["run"],
+                    state_sha256=MODULE.SOURCE_ONLY_LEGACY_POLICY_BLOCK_SHA256,
+                )
+        finally:
+            MODULE.ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
+
+    def test_policy_skip_rejects_unpinned_legacy_state_and_replayed_proof(self):
+        incident = json.loads(
+            SOURCE_ONLY_REVIEW_REQUEST_BLOCKED_STATE.read_text(encoding="utf-8")
+        )
+        preflight = self.unreviewed_preflight()
+        previous_policy = MODULE.ACTIVE_GITHUB_MUTATION_POLICY
+        MODULE.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
+        try:
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "hash-bound policy block"
+            ):
+                MODULE.source_only_policy_skip_head(
+                    incident,
+                    preflight,
+                    copy.deepcopy(preflight),
+                    self.target,
+                    pipeline_run=incident["pipeline_budget"]["run"],
+                    state_sha256="0" * 64,
+                )
+            with tempfile.TemporaryDirectory() as directory:
+                state_path = Path(directory) / "state.json"
+                args = self.arguments(state_path)
+                args.pipeline_run = incident["pipeline_budget"]["run"]
+                args.pipeline_iteration = 1
+                args.pipeline_max_iterations = 2
+                state = MODULE.record_source_only_policy_skip(
+                    None,
+                    preflight=preflight,
+                    args=args,
+                    repo_root=Path(preflight["repository_root"]),
+                    state_path=state_path,
+                )
+            drifted = copy.deepcopy(preflight)
+            drifted["pr"]["head_sha"] = "f" * 40
+            drifted["identity"]["head"] = "f" * 40
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "replayed against a different preflight"
+            ):
+                MODULE.source_only_policy_skip_head(
+                    state,
+                    drifted,
+                    copy.deepcopy(drifted),
+                    self.target,
+                    pipeline_run=incident["pipeline_budget"]["run"],
+                    state_sha256=None,
+                )
+            changed_viewer = copy.deepcopy(preflight)
+            changed_viewer["viewer"]["login"] = "another-viewer"
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "replayed against a different preflight"
+            ):
+                MODULE.source_only_policy_skip_head(
+                    state,
+                    changed_viewer,
+                    copy.deepcopy(changed_viewer),
+                    self.target,
+                    pipeline_run=incident["pipeline_budget"]["run"],
+                    state_sha256=None,
+                )
+        finally:
+            MODULE.ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
+
+    def test_allow_policy_still_requests_a_missing_review(self):
+        preflight = self.unreviewed_preflight()
+        previous_policy = MODULE.ACTIVE_GITHUB_MUTATION_POLICY
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            args = self.arguments(state_path)
+            args.pipeline_run = "allow-run"
+            args.pipeline_iteration = 1
+            args.pipeline_max_iterations = 2
+            args.github_mutation_policy = "allow"
+            try:
+                with (
+                    mock.patch.object(MODULE, "require_tools"),
+                    mock.patch.object(
+                        MODULE,
+                        "resolve_repo_root",
+                        return_value=Path(preflight["repository_root"]),
+                    ),
+                    mock.patch.object(
+                        MODULE, "resolve_target", return_value=self.target
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "wait_for_stable_review_preflight",
+                        return_value=copy.deepcopy(preflight),
+                    ),
+                    mock.patch.object(
+                        MODULE, "remote_head", return_value=self.head
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "request_copilot",
+                        return_value={
+                            "status": "requested",
+                            "head_sha": self.head,
+                        },
+                    ) as request,
+                    mock.patch.object(
+                        MODULE, "continue_after_review_request"
+                    ) as continuation,
+                    mock.patch.object(MODULE, "emit"),
+                ):
+                    MODULE.command_agent_task(args)
+            finally:
+                MODULE.ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
+            saved = MODULE.load_state(state_path)
+
+        request.assert_called_once()
+        continuation.assert_called_once_with(args, state_path)
+        self.assertEqual("review_required", saved["last_result"])
+        self.assertEqual("active", saved["queue"]["status"])
+        self.assertNotIn("policy_skip", saved)
+
+    def test_source_only_policy_stops_before_actionable_review_work(self):
+        preflight = self.unreviewed_preflight()
+        preflight["comments"] = [{"id": 17, "status": "pending"}]
+        preflight["comment_identities"] = [{"id": 17}]
+        previous_policy = MODULE.ACTIVE_GITHUB_MUTATION_POLICY
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            args = self.arguments(state_path)
+            args.pipeline_run = "source-only-run"
+            args.pipeline_iteration = 1
+            args.pipeline_max_iterations = 2
+            args.github_mutation_policy = "source-only"
+            try:
+                with (
+                    mock.patch.object(MODULE, "require_tools"),
+                    mock.patch.object(
+                        MODULE,
+                        "resolve_repo_root",
+                        return_value=Path(preflight["repository_root"]),
+                    ),
+                    mock.patch.object(
+                        MODULE, "resolve_target", return_value=self.target
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "wait_for_stable_review_preflight",
+                        return_value=copy.deepcopy(preflight),
+                    ),
+                    mock.patch.object(
+                        MODULE, "historical_source_fixes", return_value=None
+                    ),
+                    mock.patch.object(MODULE, "request_copilot") as request,
+                    mock.patch.object(MODULE, "discover_cloud_task") as discover,
+                    mock.patch.object(MODULE, "run_local_decision_worker") as worker,
+                    self.assertRaisesRegex(
+                        MODULE.WorkflowError,
+                        "cannot complete actionable Copilot review work",
+                    ),
+                ):
+                    MODULE.command_agent_task(args)
+            finally:
+                MODULE.ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
+            saved = MODULE.load_state(state_path)
+
+        request.assert_not_called()
+        discover.assert_not_called()
+        worker.assert_not_called()
+        self.assertEqual(preflight["comments"], saved["queue"]["comments"])
+        self.assertNotIn("agent_task", saved)
+        self.assertNotIn("policy_skip", saved)
 
     def test_main_persists_the_exact_artifact_as_a_coordinator_error(self):
         with tempfile.TemporaryDirectory() as directory:

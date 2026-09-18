@@ -30,6 +30,12 @@ DEFAULT_EFFORT = "high"
 CONFLICT_STRATEGIES = ("auto", "merge", "rebase")
 SELF_REVIEW_MODEL = "gpt-5.6-sol"
 SELF_REVIEW_EFFORT = "high"
+SOURCE_ONLY_POLICY_SKIP_RESULT = "source_only_review_not_applicable"
+SOURCE_ONLY_POLICY_SKIP_REASON = "review_request_forbidden"
+SOURCE_ONLY_POLICY_SKIP_DETAIL = (
+    "Copilot Review is not applicable under source-only policy because no "
+    "Copilot review exists at the frozen head and requesting one is forbidden"
+)
 IS_WINDOWS = os.name == "nt"
 
 PR_URL_PATTERN = re.compile(
@@ -65,6 +71,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "agent": f"{STAGE_COPILOT_REVIEW}:{STAGE_COPILOT_REVIEW}",
         "module": "copilot_review_loop",
         "marker": ("clean_at_head_sha",),
+        "skip_marker": ("policy_skip", "head_sha"),
         "model": DEFAULT_STAGE_MODEL,
     },
     {
@@ -1441,15 +1448,22 @@ def string_at(payload: dict[str, Any], path: tuple[str, ...]) -> str | None:
 STAGE_STATUS_FIELDS = (
     "agent_task",
     "attempt",
+    "budget_scope",
     "counts",
     "coordinator",
     "escalation",
+    "github_mutation_policy",
+    "history",
     "iterations",
+    "last_result",
     "last_helper_activity",
     "local_validation",
+    "managed_task_history",
     "mergeable_at_head_sha",
     "monitoring",
     "outcome",
+    "pipeline_budget",
+    "policy_skip",
     "proposal",
     "proposal_count",
     "progress",
@@ -1457,6 +1471,8 @@ STAGE_STATUS_FIELDS = (
     "review",
     "run",
     "skip_note",
+    "terminal_exit",
+    "thread_mutations",
     "validation",
     "validated_head_sha",
     "verdicts",
@@ -1584,6 +1600,7 @@ def inspect_stage(
     head_sha: str,
     base_sha: str | None = None,
     *,
+    pipeline_run: str | None = None,
     read_status: Callable[..., dict[str, Any]] = read_stage_status,
 ) -> dict[str, Any]:
     """Decide whether one stage is clear for exactly these revisions.
@@ -1596,8 +1613,14 @@ def inspect_stage(
     """
     status = read_status(entry, target)
     payload = status.get("payload")
-    marker = (
+    review_marker = (
         string_at(payload, entry["marker"]) if isinstance(payload, dict) else None
+    )
+    skip_marker_path = entry.get("skip_marker")
+    skip_marker = (
+        string_at(payload, skip_marker_path)
+        if isinstance(payload, dict) and isinstance(skip_marker_path, tuple)
+        else None
     )
     base_marker_path = entry.get("base_marker")
     base_marker = (
@@ -1606,11 +1629,105 @@ def inspect_stage(
         else None
     )
     outcome = payload.get("stage_outcome") if isinstance(payload, dict) else None
+    marker = skip_marker if outcome == "skipped" and skip_marker_path else review_marker
     head_is_clear = marker == head_sha
     base_is_clear = base_marker_path is None or (
         base_sha is not None and base_marker == base_sha
     )
-    clear = head_is_clear and base_is_clear and outcome in CLEARING_OUTCOMES
+    policy_skip_is_valid = True
+    if outcome == "skipped" and skip_marker_path is not None:
+        policy_skip = payload.get("policy_skip") if isinstance(payload, dict) else None
+        coordinator = payload.get("coordinator") if isinstance(payload, dict) else None
+        pr = payload.get("pr") if isinstance(payload, dict) else None
+        pipeline_budget = (
+            payload.get("pipeline_budget") if isinstance(payload, dict) else None
+        )
+        expected_policy_skip_keys = {
+            "policy",
+            "reason",
+            "repo_name",
+            "number",
+            "head_repository",
+            "head_branch",
+            "head_sha",
+            "base_sha",
+            "viewer_login",
+            "pipeline_run",
+            "preflight_sha256",
+            "observed_at",
+        }
+        policy_skip_is_valid = (
+            ACTIVE_GITHUB_MUTATION_POLICY == "source-only"
+            and isinstance(pipeline_run, str)
+            and bool(pipeline_run)
+            and isinstance(policy_skip, dict)
+            and set(policy_skip) == expected_policy_skip_keys
+            and policy_skip.get("policy") == "source-only"
+            and policy_skip.get("reason") == SOURCE_ONLY_POLICY_SKIP_REASON
+            and policy_skip.get("repo_name") == target["repo_name"]
+            and policy_skip.get("number") == target["number"]
+            and policy_skip.get("head_sha") == head_sha
+            and base_sha is not None
+            and policy_skip.get("base_sha") == base_sha
+            and isinstance(policy_skip.get("head_repository"), str)
+            and bool(policy_skip["head_repository"])
+            and isinstance(policy_skip.get("head_branch"), str)
+            and bool(policy_skip["head_branch"])
+            and isinstance(policy_skip.get("viewer_login"), str)
+            and bool(policy_skip["viewer_login"])
+            and policy_skip.get("pipeline_run") == pipeline_run
+            and isinstance(policy_skip.get("preflight_sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", policy_skip["preflight_sha256"])
+            is not None
+            and isinstance(policy_skip.get("observed_at"), str)
+            and bool(policy_skip["observed_at"])
+            and isinstance(pr, dict)
+            and pr.get("state") == "OPEN"
+            and pr.get("repo_name") == target["repo_name"]
+            and pr.get("number") == target["number"]
+            and pr.get("head_sha") == head_sha
+            and pr.get("base_sha") == base_sha
+            and pr.get("head_repository")
+            == policy_skip["head_repository"]
+            and pr.get("head_branch") == policy_skip["head_branch"]
+            and pr.get("head_repository")
+            == f"{pr.get('head_owner')}/{pr.get('head_repo')}"
+            and pr.get("cross_repository")
+            == (
+                str(pr.get("head_repository")).casefold()
+                != str(pr.get("repo_name")).casefold()
+            )
+            and payload.get("github_mutation_policy") == "source-only"
+            and payload.get("last_result") == SOURCE_ONLY_POLICY_SKIP_RESULT
+            and payload.get("budget_scope") == "pipeline"
+            and isinstance(pipeline_budget, dict)
+            and pipeline_budget.get("run") == pipeline_run
+            and payload.get("clean_at_head_sha") is None
+            and payload.get("queue") is None
+            and payload.get("monitoring") is None
+            and payload.get("agent_task") is None
+            and payload.get("escalation") is None
+            and payload.get("terminal_exit") is None
+            and payload.get("thread_mutations") is None
+            and payload.get("history") == []
+            and payload.get("managed_task_history") == []
+            and payload.get("local_validation") == []
+            and isinstance(coordinator, dict)
+            and set(coordinator)
+            == {"status", "detail", "head_sha", "observed_at"}
+            and coordinator.get("status") == "not_applicable"
+            and coordinator.get("detail") == SOURCE_ONLY_POLICY_SKIP_DETAIL
+            and coordinator.get("head_sha") == head_sha
+            and isinstance(coordinator.get("observed_at"), str)
+            and bool(coordinator["observed_at"])
+        )
+    clear = (
+        status.get("ok") is True
+        and head_is_clear
+        and base_is_clear
+        and outcome in CLEARING_OUTCOMES
+        and policy_skip_is_valid
+    )
     if clear:
         reason = None
     elif not status.get("ok"):
@@ -1623,6 +1740,8 @@ def inspect_stage(
         and base_marker != base_sha
     ):
         reason = "clearance_is_for_an_older_base"
+    elif outcome == "skipped" and not policy_skip_is_valid:
+        reason = "policy_skip_not_verified"
     else:
         reason = status.get("reason") or outcome or "not_cleared"
     return {
@@ -1630,6 +1749,11 @@ def inspect_stage(
         "clear": clear,
         "clear_at_head_sha": marker,
         "clear_at_base_sha": base_marker,
+        "clearance_kind": (
+            "policy_skip"
+            if clear and outcome == "skipped" and skip_marker_path is not None
+            else "stage_result" if clear else None
+        ),
         "outcome": outcome,
         "reason": reason,
         "installed": status["installed"],
