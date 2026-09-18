@@ -63,6 +63,8 @@ FAILED_LOG_DOWNLOAD_EVIDENCE_SCHEMA = (
 FAILED_LOG_DOWNLOAD_RETRY_DELAYS = (1, 2, 4)
 FAILED_LOG_DOWNLOAD_TIMEOUT_SECONDS = 300
 FAILED_LOG_DOWNLOAD_OPERATION_TIMEOUT_SECONDS = 1200
+FAILED_LOG_METADATA_RESPONSE_BYTE_LIMIT = 1024 * 1024
+FAILED_LOG_METADATA_NESTING_LIMIT = 64
 AGENT_TASK_API_VERSION = "2026-03-10"
 HOSTED_DISPATCH_IDENTITY_SCHEMA = (
     "github.copilot.ci-fix-loop-hosted-dispatch-identity.v2"
@@ -1543,8 +1545,15 @@ def parse_strict_json(value: str, *, description: str) -> Any:
             result[key] = item
         return result
 
+    def reject_non_finite_constant(_value: str) -> Any:
+        raise ValueError("non-finite JSON number")
+
     try:
-        return json.loads(value, object_pairs_hook=unique_object)
+        return json.loads(
+            value,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_non_finite_constant,
+        )
     except (json.JSONDecodeError, ValueError) as error:
         raise WorkflowError(f"{description} is invalid JSON: {error}") from error
 
@@ -6297,13 +6306,36 @@ def parse_failed_log_metadata_response(
     raw: bytes,
     *,
     description: str,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any], str] | None:
+    if len(raw) > FAILED_LOG_METADATA_RESPONSE_BYTE_LIMIT:
+        return None
     try:
         decoded = raw.decode("utf-8")
         payload = parse_strict_json(decoded, description=description)
-    except (UnicodeDecodeError, WorkflowError):
+        if not isinstance(payload, dict):
+            return None
+        pending: list[tuple[Any, int]] = [(payload, 1)]
+        while pending:
+            value, depth = pending.pop()
+            if isinstance(value, dict):
+                if depth > FAILED_LOG_METADATA_NESTING_LIMIT:
+                    return None
+                pending.extend((item, depth + 1) for item in value.values())
+            elif isinstance(value, list):
+                if depth > FAILED_LOG_METADATA_NESTING_LIMIT:
+                    return None
+                pending.extend((item, depth + 1) for item in value)
+        content_sha256 = canonical_json_sha256(payload)
+    except (
+        UnicodeDecodeError,
+        WorkflowError,
+        RecursionError,
+        TypeError,
+        ValueError,
+        OverflowError,
+    ):
         return None
-    return payload if isinstance(payload, dict) else None
+    return payload, content_sha256
 
 
 def exact_actions_json_get(
@@ -6344,10 +6376,10 @@ def exact_actions_json_get(
             ) from error
         if process.returncode == 0:
             raw = process.stdout or b""
-            payload = parse_failed_log_metadata_response(
+            parsed = parse_failed_log_metadata_response(
                 raw, description=f"{method} response"
             )
-            if payload is None:
+            if parsed is None:
                 diagnostic = failed_log_command_diagnostic(
                     exit_status=process.returncode,
                     stdout=raw,
@@ -6367,11 +6399,12 @@ def exact_actions_json_get(
                         "external_command_diagnostic": diagnostic,
                     },
                 )
+            payload, content_sha256 = parsed
             record_failed_log_download_attempt(
                 evidence,
                 method=method,
                 result="success",
-                content_sha256=canonical_json_sha256(payload),
+                content_sha256=content_sha256,
             )
             return payload
         diagnostic = failed_log_command_diagnostic(
@@ -9908,6 +9941,7 @@ def canonical_json_sha256(value: Any) -> str:
     return sha256_text(
         json.dumps(
             value,
+            allow_nan=False,
             ensure_ascii=True,
             separators=(",", ":"),
             sort_keys=True,

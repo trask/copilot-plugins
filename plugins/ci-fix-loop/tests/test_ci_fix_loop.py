@@ -4601,7 +4601,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.49", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.50", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -5067,6 +5067,25 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
         self.assertEqual([MODULE.canonical_json_sha256(payload)] * 2, hashes)
 
+    def test_strict_json_and_canonical_hash_reject_non_finite_numbers(self):
+        for constant, value in (
+            ("NaN", float("nan")),
+            ("Infinity", float("inf")),
+            ("-Infinity", float("-inf")),
+        ):
+            with self.subTest(constant=constant):
+                with self.assertRaises(MODULE.WorkflowError) as parsed:
+                    MODULE.parse_strict_json(
+                        f'{{"value":{constant}}}',
+                        description="metadata",
+                    )
+                self.assertNotIn(constant, str(parsed.exception))
+                self.assertNotIn(
+                    constant, str(parsed.exception.__cause__)
+                )
+                with self.assertRaises(ValueError):
+                    MODULE.canonical_json_sha256({"value": value})
+
     def test_failed_log_orchestration_uses_real_pre_and_post_trust_boundary(self):
         check = self.preflight["check_snapshot"]["failures"][0]
         pr = self.preflight["pr"]
@@ -5448,6 +5467,32 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             ["gh"], 0, b"downloaded failure log\n", b""
         )
         secret = "github_pat_abcdefghijklmnopqrstuvwxyz"
+        non_finite_key = f"non-finite-{secret}"
+
+        def non_finite_payload(
+            payload: dict[str, object],
+            constant: str,
+        ) -> bytes:
+            encoded = json.dumps(
+                {**payload, non_finite_key: 0},
+                separators=(",", ":"),
+            )
+            return encoded.replace(
+                f'"{non_finite_key}":0',
+                f'"{non_finite_key}":{constant}',
+            ).encode()
+
+        deep_object: object = 0
+        deep_object_key = f"deep-object-{secret}"
+        for _ in range(MODULE.FAILED_LOG_METADATA_NESTING_LIMIT + 1):
+            deep_object = {deep_object_key: deep_object}
+        deep_list: object = 0
+        deep_list_key = f"deep-list-{secret}"
+        for _ in range(MODULE.FAILED_LOG_METADATA_NESTING_LIMIT + 1):
+            deep_list = [deep_list]
+        deep_list_payload = {deep_list_key: deep_list}
+        canonical_key = f"canonical-{secret}"
+        canonical_payload = {**run_payload, canonical_key: "trigger"}
         cases = (
             {
                 "name": "duplicate-key",
@@ -5506,6 +5551,72 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 "source": "schema-field-",
                 "malformed": False,
             },
+            {
+                "name": "non-finite-nan",
+                "method": "pre-run-metadata",
+                "prefix": [],
+                "raw": non_finite_payload(run_payload, "NaN"),
+                "source": "NaN",
+                "malformed": True,
+            },
+            {
+                "name": "non-finite-positive-infinity",
+                "method": "pre-job-metadata",
+                "prefix": [run_success],
+                "raw": non_finite_payload(job_payload, "Infinity"),
+                "source": "Infinity",
+                "malformed": True,
+            },
+            {
+                "name": "non-finite-negative-infinity",
+                "method": "post-run-metadata",
+                "prefix": [run_success, job_success, log_success],
+                "raw": non_finite_payload(run_payload, "-Infinity"),
+                "source": "-Infinity",
+                "malformed": True,
+            },
+            {
+                "name": "deep-object",
+                "method": "post-job-metadata",
+                "prefix": [
+                    run_success,
+                    job_success,
+                    log_success,
+                    run_success,
+                ],
+                "raw": json.dumps(deep_object).encode(),
+                "source": deep_object_key,
+                "malformed": True,
+            },
+            {
+                "name": "deep-list",
+                "method": "pre-run-metadata",
+                "prefix": [],
+                "raw": json.dumps(deep_list_payload).encode(),
+                "source": deep_list_key,
+                "malformed": True,
+            },
+            {
+                "name": "canonicalization-failure",
+                "method": "pre-run-metadata",
+                "prefix": [],
+                "raw": json.dumps(canonical_payload).encode(),
+                "source": canonical_key,
+                "malformed": True,
+                "canonicalization_failure": True,
+            },
+            {
+                "name": "oversized-response",
+                "method": "pre-run-metadata",
+                "prefix": [],
+                "raw": (
+                    f"oversized-source-{secret}\n".encode()
+                    + b"x"
+                    * MODULE.FAILED_LOG_METADATA_RESPONSE_BYTE_LIMIT
+                ),
+                "source": "oversized-source-",
+                "malformed": True,
+            },
         )
         for case in cases:
             with self.subTest(case=case["name"]):
@@ -5540,6 +5651,19 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                         pr, check, evidence=evidence
                     )
 
+                canonical_json_sha256 = MODULE.canonical_json_sha256
+
+                def canonicalize(value):
+                    if (
+                        case.get("canonicalization_failure")
+                        and isinstance(value, dict)
+                        and canonical_key in value
+                    ):
+                        raise ValueError(
+                            f"canonical source fragment {secret}"
+                        )
+                    return canonical_json_sha256(value)
+
                 with (
                     mock.patch.object(sys, "argv", arguments),
                     mock.patch.object(MODULE, "require_tools"),
@@ -5563,6 +5687,11 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     ) as run,
                     mock.patch.object(
                         MODULE,
+                        "canonical_json_sha256",
+                        side_effect=canonicalize,
+                    ),
+                    mock.patch.object(
+                        MODULE,
                         "record_coordinator_failure",
                         wraps=MODULE.record_coordinator_failure,
                     ) as record_failure,
@@ -5583,6 +5712,12 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 ]
                 self.assertEqual(1, len(target_attempts))
                 if case["malformed"]:
+                    self.assertEqual(
+                        "could not download the failing log for "
+                        f"{check['key']}: {case['method']} returned a "
+                        "malformed metadata response",
+                        result["error"],
+                    )
                     diagnostic = error.details[
                         "external_command_diagnostic"
                     ]
