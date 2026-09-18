@@ -16,6 +16,7 @@ import time
 import urllib.parse
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Mapping, Sequence, TextIO
 
@@ -41,6 +42,8 @@ SHA_PATTERN = re.compile(r"\A[0-9a-fA-F]{40}\Z")
 REPORT_DIRECTORY = ".github/agent-task-reports"
 SEMANTIC_DIRECTORY = ".github/agent-task-semantic"
 VALIDATION_DIRECTORY = ".github/agent-task-validations"
+OUTPUT_DIRECTORY = ".github/agent-task-output"
+OUTPUT_REPORT_PATH = f"{OUTPUT_DIRECTORY}/report.md"
 REPORT_PATH_PLACEHOLDER = "{{MARKETPLACE_REPORT_PATH}}"
 SEMANTIC_PATH_PLACEHOLDER = "{{MARKETPLACE_SEMANTIC_PATH}}"
 VALIDATION_PATH_PLACEHOLDER = "{{MARKETPLACE_VALIDATION_PATH}}"
@@ -53,6 +56,11 @@ RESULT_SCHEMA_VERSION = 1
 REPORT_RESULT_SCHEMA_VERSION = 2
 LEGACY_SEMANTIC_RESULT_SCHEMA_VERSION = 3
 SEMANTIC_RESULT_SCHEMA_VERSION = 4
+CANDIDATE_RESULT_SCHEMA_VERSION = 5
+CANDIDATE_MANIFEST_SCHEMA = {
+    "id": "github.copilot.agent-task-candidate-manifest",
+    "version": 1,
+}
 LEGACY_SEMANTIC_OUTPUT_SCHEMA = {
     "id": "github.copilot.agent-task-semantic-output",
     "version": 1,
@@ -248,6 +256,112 @@ MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR = (
     f"{MARKETPLACE_APPLY_REPORT_POLICY_ID}@"
     f"{MARKETPLACE_APPLY_REPORT_POLICY_VERSION}"
 )
+MARKETPLACE_CODE_CANDIDATE_POLICY_ID = "marketplace-agent-code-candidate-worker"
+MARKETPLACE_CODE_CANDIDATE_POLICY_VERSION = 1
+MARKETPLACE_CODE_CANDIDATE_POLICY_SPEC = {
+    "id": MARKETPLACE_CODE_CANDIDATE_POLICY_ID,
+    "version": MARKETPLACE_CODE_CANDIDATE_POLICY_VERSION,
+    "execution_backend": "github-agent-tasks-rest",
+    "authentication": "local-gh-api",
+    "custom_agent": False,
+    "local_fallback": False,
+    "mode": "code_candidate",
+    "fresh_invocation_only": True,
+    "require_exact_task_session_identity": True,
+    "require_unchanged_pr_head": True,
+    "require_unchanged_local_identity": True,
+    "require_linear_generated_history": True,
+    "code_commits": "zero-or-more",
+    "artifact_commit": "optional-final-path-only",
+    "artifact_directory": OUTPUT_DIRECTORY,
+    "advisory_report_path": OUTPUT_REPORT_PATH,
+    "human_report": "optional-inert-advisory",
+    "require_safe_paths": True,
+    "dispatcher_candidate_manifest": True,
+    "candidate_manifest_schema": CANDIDATE_MANIFEST_SCHEMA,
+    "result_schema": {
+        "id": RESULT_SCHEMA_ID,
+        "version": CANDIDATE_RESULT_SCHEMA_VERSION,
+    },
+    "completion_evidence": [
+        "session-id",
+        "actual-model",
+        "prompt-sha256",
+        "task-session-timestamps",
+        "repository-owner",
+        "base-generated-refs",
+        "raw-task-response-sha256",
+    ],
+    "application": "forbidden",
+}
+MARKETPLACE_CODE_CANDIDATE_POLICY_HASH = hashlib.sha256(
+    json.dumps(
+        MARKETPLACE_CODE_CANDIDATE_POLICY_SPEC,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+).hexdigest()
+MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR = (
+    f"{MARKETPLACE_CODE_CANDIDATE_POLICY_ID}@"
+    f"{MARKETPLACE_CODE_CANDIDATE_POLICY_VERSION}"
+)
+MARKETPLACE_REPORT_RECOMMENDATION_POLICY_ID = (
+    "marketplace-agent-report-recommendation-worker"
+)
+MARKETPLACE_REPORT_RECOMMENDATION_POLICY_VERSION = 1
+MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SPEC = {
+    "id": MARKETPLACE_REPORT_RECOMMENDATION_POLICY_ID,
+    "version": MARKETPLACE_REPORT_RECOMMENDATION_POLICY_VERSION,
+    "execution_backend": "github-agent-tasks-rest",
+    "authentication": "local-gh-api",
+    "custom_agent": False,
+    "local_fallback": False,
+    "mode": "report_recommendation",
+    "fresh_invocation_only": True,
+    "require_exact_task_session_identity": True,
+    "require_unchanged_pr_head": True,
+    "require_unchanged_local_identity": True,
+    "require_linear_generated_history": True,
+    "code_commits": "forbidden",
+    "artifact_commit": "required-final-path-only",
+    "artifact_directory": OUTPUT_DIRECTORY,
+    "advisory_report_path": OUTPUT_REPORT_PATH,
+    "contents": "inert",
+    "require_safe_paths": True,
+    "dispatcher_candidate_manifest": True,
+    "candidate_manifest_schema": CANDIDATE_MANIFEST_SCHEMA,
+    "result_schema": {
+        "id": RESULT_SCHEMA_ID,
+        "version": CANDIDATE_RESULT_SCHEMA_VERSION,
+    },
+    "completion_evidence": [
+        "session-id",
+        "actual-model",
+        "prompt-sha256",
+        "task-session-timestamps",
+        "repository-owner",
+        "base-generated-refs",
+        "raw-task-response-sha256",
+    ],
+    "application": "forbidden",
+}
+MARKETPLACE_REPORT_RECOMMENDATION_POLICY_HASH = hashlib.sha256(
+    json.dumps(
+        MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SPEC,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+).hexdigest()
+MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR = (
+    f"{MARKETPLACE_REPORT_RECOMMENDATION_POLICY_ID}@"
+    f"{MARKETPLACE_REPORT_RECOMMENDATION_POLICY_VERSION}"
+)
+CANDIDATE_POLICY_SELECTORS = {
+    MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR,
+    MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR,
+}
 MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS = {
     MARKETPLACE_APPLY_REPORT_POLICY_V1_SELECTOR,
     MARKETPLACE_APPLY_REPORT_POLICY_V2_SELECTOR,
@@ -392,6 +506,13 @@ class WorkerHistory:
 
 
 @dataclass(frozen=True)
+class CandidateHistory:
+    code_head: str
+    code_commits: tuple[Mapping[str, object], ...]
+    artifact_commit: Mapping[str, object] | None
+
+
+@dataclass(frozen=True)
 class LocalIdentity:
     branch: str | None
     head: str
@@ -434,6 +555,8 @@ class ResultEnvelope:
     validation_complete: bool = False
     validation_outcomes: list[dict[str, str]] | None = None
     structural_complete: bool = False
+    candidate_manifest: Mapping[str, object] | None = None
+    completion_evidence: Mapping[str, object] | None = None
     status: str = "error"
     error_code: str | None = None
     error_message: str | None = None
@@ -496,10 +619,13 @@ class ResultEnvelope:
             REPORT_RESULT_SCHEMA_VERSION,
             LEGACY_SEMANTIC_RESULT_SCHEMA_VERSION,
             SEMANTIC_RESULT_SCHEMA_VERSION,
+            CANDIDATE_RESULT_SCHEMA_VERSION,
         }:
             common["attestation"] = {
                 "kind": (
-                    "dispatcher_semantic"
+                    "dispatcher_candidate"
+                    if self.schema_version == CANDIDATE_RESULT_SCHEMA_VERSION
+                    else "dispatcher_semantic"
                     if self.schema_version
                     in {
                         LEGACY_SEMANTIC_RESULT_SCHEMA_VERSION,
@@ -509,6 +635,9 @@ class ResultEnvelope:
                 ),
                 "structural_complete": self.structural_complete,
             }
+            if self.schema_version == CANDIDATE_RESULT_SCHEMA_VERSION:
+                common["candidate"] = self.candidate_manifest
+                common["completion"] = self.completion_evidence
             if self.schema_version in {
                 LEGACY_SEMANTIC_RESULT_SCHEMA_VERSION,
                 SEMANTIC_RESULT_SCHEMA_VERSION,
@@ -850,6 +979,7 @@ def parse_args(args: Sequence[str]) -> Options:
         )
     known_policies = {
         *MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
+        *CANDIDATE_POLICY_SELECTORS,
         MARKETPLACE_POLICY_SELECTOR,
         MARKETPLACE_REPORT_POLICY_SELECTOR,
     }
@@ -884,6 +1014,44 @@ def parse_args(args: Sequence[str]) -> Options:
             f"{MARKETPLACE_REPORT_POLICY_SELECTOR} requires --report, --pr, "
             "--prompt-file, and --result-file and does not support recovery or "
             "validation-receipt options",
+            "policy_rejected",
+        )
+    if policy == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR and (
+        not report
+        or pull_request is None
+        or prompt_file is None
+        or dispatch_only
+        or monitor_only
+        or apply_with_report
+        or resume_apply_with_report
+        or task_id is not None
+        or worker_receipt is not None
+        or input_result_file is not None
+        or allow_merged_pr
+    ):
+        raise CloudError(
+            f"{MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR} requires "
+            "--report, --pr, --prompt-file, and --result-file and does not "
+            "support recovery or validation-receipt options",
+            "policy_rejected",
+        )
+    if policy == MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR and (
+        not apply_with_report
+        or pull_request is None
+        or prompt_file is None
+        or report
+        or dispatch_only
+        or monitor_only
+        or resume_apply_with_report
+        or task_id is not None
+        or worker_receipt is not None
+        or input_result_file is not None
+        or allow_merged_pr
+    ):
+        raise CloudError(
+            f"{MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR} requires "
+            "--apply-with-report, --pr, --prompt-file, and --result-file and "
+            "does not support recovery or application options",
             "policy_rejected",
         )
     if policy in MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS and (
@@ -1774,6 +1942,10 @@ def read_legacy_apply_result(path: Path) -> dict[str, object]:
 
 
 def mode_name(options: Options) -> str:
+    if options.policy == MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR:
+        return "code_candidate"
+    if options.policy == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR:
+        return "report_recommendation"
     if options.dispatch_only:
         return "dispatch_only"
     if options.monitor_only:
@@ -1915,6 +2087,18 @@ def policy_metadata(options: Options) -> dict[str, object] | None:
             "version": MARKETPLACE_REPORT_POLICY_VERSION,
             "sha256": MARKETPLACE_REPORT_POLICY_HASH,
         }
+    if options.policy == MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR:
+        return {
+            "id": MARKETPLACE_CODE_CANDIDATE_POLICY_ID,
+            "version": MARKETPLACE_CODE_CANDIDATE_POLICY_VERSION,
+            "sha256": MARKETPLACE_CODE_CANDIDATE_POLICY_HASH,
+        }
+    if options.policy == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR:
+        return {
+            "id": MARKETPLACE_REPORT_RECOMMENDATION_POLICY_ID,
+            "version": MARKETPLACE_REPORT_RECOMMENDATION_POLICY_VERSION,
+            "sha256": MARKETPLACE_REPORT_RECOMMENDATION_POLICY_HASH,
+        }
     if options.policy in MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS:
         return structural_policy_metadata(options.policy)
     return {
@@ -1948,12 +2132,41 @@ def validate_policy_before_post(
 ) -> None:
     if options.policy not in {
         *MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
+        *CANDIDATE_POLICY_SELECTORS,
         MARKETPLACE_POLICY_SELECTOR,
         MARKETPLACE_REPORT_POLICY_SELECTOR,
     }:
         raise CloudError(
             "a supported marketplace policy is required",
             "policy_required",
+        )
+    if options.policy in CANDIDATE_POLICY_SELECTORS and (
+        options.pull_request is None
+        or options.prompt_file is None
+        or options.dispatch_only
+        or options.monitor_only
+        or options.resume_apply_with_report
+        or options.task_id is not None
+        or options.request_id is not None
+        or options.worker_receipt is not None
+        or options.semantic_kind is not None
+        or options.input_result_file is not None
+        or options.prior_result is not None
+        or options.allow_merged_pr
+        or (
+            options.policy == MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR
+            and (not options.apply_with_report or options.report)
+        )
+        or (
+            options.policy
+            == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR
+            and (not options.report or options.apply_with_report)
+        )
+    ):
+        raise CloudError(
+            "candidate policies require a fresh non-recovery invocation and "
+            "never accept application or prior-result identity",
+            "policy_rejected",
         )
     resolved_root = root.resolve()
     resolved_parent = result_path.parent.resolve()
@@ -2356,6 +2569,54 @@ def build_report_policy_prompt(prompt: str, *, report_path: str) -> str:
     )
 
 
+def build_candidate_policy_prompt(
+    prompt: str,
+    *,
+    policy: str,
+) -> str:
+    if policy == MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR:
+        policy_hash = MARKETPLACE_CODE_CANDIDATE_POLICY_HASH
+        history_instruction = (
+            "Put substantive code, test, documentation, or configuration changes "
+            "in zero or more linear single-parent commits. You may then create one "
+            "final single-parent artifact commit whose changed paths are all under "
+            f"`{OUTPUT_DIRECTORY}/`. The artifact commit is optional. "
+        )
+    elif policy == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR:
+        policy_hash = MARKETPLACE_REPORT_RECOMMENDATION_POLICY_HASH
+        history_instruction = (
+            "Do not create code, test, documentation, or configuration commits. "
+            "Create exactly one final single-parent artifact commit directly on "
+            "the task base. Every changed path must be under "
+            f"`{OUTPUT_DIRECTORY}/`. "
+        )
+    else:
+        raise CloudError(f"unsupported candidate policy {policy!r}")
+    return (
+        f"{prompt.rstrip()}\n\n"
+        f"{POLICY_MARKER}\n"
+        f"Policy: {policy}\n"
+        f"Policy SHA-256: {policy_hash}\n"
+        "Authentication and all request, repository, source, model, policy, task, "
+        "session, generated-history, candidate-manifest, and completion identities "
+        "belong only to the dispatcher. Do not echo or reconstruct them. Do not "
+        "request, read, print, persist, or transmit credentials, tokens, keys, "
+        "cookies, or authorization headers. Do not select or invoke a custom_agent. "
+        "Do not use a local-execution fallback.\n"
+        f"{history_instruction}"
+        "Do not mix output-directory paths with other paths in one commit, create "
+        "more than one output commit, or add commits after the output commit. "
+        f"`{OUTPUT_REPORT_PATH}` is optional free-form advisory Markdown. Its "
+        "presence, syntax, and contents are never mechanical validation evidence. "
+        "Do not write commit SHAs or claim dispatcher attestation. The dispatcher "
+        "binds the task and its single completed session to the fetched base and "
+        "generated refs, derives exact commit parents, trees, patch digests, and "
+        "changed paths, and writes the versioned candidate manifest. It never "
+        "imports or applies candidate commits.\n"
+        f"{POLICY_MARKER}"
+    )
+
+
 def build_apply_report_policy_prompt(
     prompt: str,
     *,
@@ -2525,6 +2786,11 @@ def run_process(
         kwargs["creationflags"] = _creation_flags()
     try:
         return runner(list(command), **kwargs)
+    except UnicodeError:
+        raise CloudError(
+            f"{command[0]} returned output that is not valid UTF-8",
+            "malformed_output",
+        ) from None
     except OSError as error:
         raise CloudError(f"could not run {command[0]}: {error}") from None
 
@@ -2991,6 +3257,137 @@ class GitRepository:
             expected_parent = commit
         return WorkerHistory(code_head, code_commits, receipt_commit)
 
+    def candidate_history(
+        self,
+        root: Path,
+        base_sha: str,
+        commits: Sequence[str],
+        *,
+        report_only: bool,
+    ) -> CandidateHistory:
+        expected_parent = base_sha
+        code_commits: list[Mapping[str, object]] = []
+        artifact_commit: Mapping[str, object] | None = None
+        for index, commit in enumerate(commits):
+            parent_output = self._run(
+                root,
+                "rev-list",
+                "--parents",
+                "-n",
+                "1",
+                commit,
+            ).stdout.strip().lower()
+            commit_and_parent = parent_output.split()
+            if (
+                len(commit_and_parent) != 2
+                or commit_and_parent[0] != commit
+                or commit_and_parent[1] != expected_parent
+            ):
+                raise CloudError(
+                    f"generated commit {commit} is not the next linear "
+                    "single-parent commit",
+                    "unexpected_commits",
+                )
+            changed_output = self._run(
+                root,
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "-z",
+                "--no-renames",
+                commit,
+            ).stdout
+            changed_paths = tuple(
+                sorted(path for path in changed_output.split("\0") if path)
+            )
+            if not changed_paths:
+                raise CloudError(
+                    f"generated commit {commit} has no changed paths",
+                    "unexpected_commits",
+                )
+            for path in changed_paths:
+                _validate_candidate_path(path)
+            output_paths = tuple(
+                _is_candidate_output_path(path) for path in changed_paths
+            )
+            if any(output_paths) and not all(output_paths):
+                raise CloudError(
+                    f"generated commit {commit} mixes candidate code and output "
+                    "artifact paths",
+                    "unexpected_paths",
+                )
+            tree = self._run(
+                root,
+                "show",
+                "-s",
+                "--format=%T",
+                commit,
+            ).stdout.strip().lower()
+            if not SHA_PATTERN.fullmatch(tree):
+                raise CloudError(
+                    f"git returned an invalid tree for generated commit {commit}",
+                    "malformed_history",
+                )
+            patch = self._run(
+                root,
+                "diff-tree",
+                "--binary",
+                "--full-index",
+                "--no-color",
+                "--no-renames",
+                "--patch",
+                "-r",
+                expected_parent,
+                commit,
+            ).stdout
+            metadata: Mapping[str, object] = {
+                "sha": commit,
+                "parent_sha": expected_parent,
+                "tree_sha": tree,
+                "patch_sha256": hashlib.sha256(
+                    patch.encode("utf-8")
+                ).hexdigest(),
+                "changed_paths": list(changed_paths),
+            }
+            if all(output_paths):
+                if artifact_commit is not None or index != len(commits) - 1:
+                    raise CloudError(
+                        "the generated history contains multiple or non-final "
+                        "output artifact commits",
+                        "unexpected_commits",
+                    )
+                artifact_commit = metadata
+            else:
+                if artifact_commit is not None:
+                    raise CloudError(
+                        "the generated history contains code after its output "
+                        "artifact commit",
+                        "unexpected_commits",
+                    )
+                code_commits.append(metadata)
+            expected_parent = commit
+        if report_only:
+            if code_commits:
+                raise CloudError(
+                    "report recommendation policy forbids candidate code commits",
+                    "unexpected_commits",
+                )
+            if artifact_commit is None:
+                raise CloudError(
+                    "report recommendation policy requires one final output "
+                    "artifact commit",
+                    "malformed_history",
+                )
+        code_head = (
+            str(code_commits[-1]["sha"]) if code_commits else base_sha
+        )
+        return CandidateHistory(
+            code_head,
+            tuple(code_commits),
+            artifact_commit,
+        )
+
     def report_history(
         self,
         root: Path,
@@ -3124,6 +3521,42 @@ class GitRepository:
 def _resolve_git_path(root: Path, value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else root / path
+
+
+def _validate_candidate_path(path: str) -> None:
+    parts = path.split("/")
+    reserved_names = {
+        "aux",
+        "con",
+        "nul",
+        "prn",
+        *(f"com{index}" for index in range(1, 10)),
+        *(f"lpt{index}" for index in range(1, 10)),
+    }
+    if (
+        not path
+        or path.startswith("/")
+        or "\\" in path
+        or ":" in path
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
+        or any(part in {"", ".", ".."} for part in parts)
+        or any(part.endswith((" ", ".")) for part in parts)
+        or any(part.casefold() == ".git" for part in parts)
+        or any(part.split(".", 1)[0].casefold() in reserved_names for part in parts)
+        or path.casefold() == OUTPUT_DIRECTORY.casefold()
+        or (
+            path.casefold().startswith(f"{OUTPUT_DIRECTORY.casefold()}/")
+            and not path.startswith(f"{OUTPUT_DIRECTORY}/")
+        )
+    ):
+        raise CloudError(
+            f"generated history contains unsafe path {path!r}",
+            "unsafe_path",
+        )
+
+
+def _is_candidate_output_path(path: str) -> bool:
+    return path.startswith(f"{OUTPUT_DIRECTORY}/")
 
 
 def _repository_from_url(url: str) -> str:
@@ -3400,6 +3833,7 @@ class ApiClient:
         self.sleep = sleep
         self.wall_clock = wall_clock
         self.max_transient_failures = max_transient_failures
+        self.last_response_sha256: str | None = None
 
     def request_json(
         self,
@@ -3484,12 +3918,16 @@ class ApiClient:
 
         if response.status == expected_status and result.returncode == 0:
             try:
-                return json.loads(response.body)
+                data = json.loads(response.body)
             except json.JSONDecodeError as error:
                 raise CloudError(
                     f"{operation} returned invalid JSON: {error.msg}",
                     "api_failure",
                 ) from None
+            self.last_response_sha256 = hashlib.sha256(
+                response.body.encode("utf-8")
+            ).hexdigest()
+            return data
         if response.status == 429 or _is_rate_limited_403(response):
             message = _api_message(response.body)
             raise RateLimitApiError(
@@ -3509,15 +3947,19 @@ class ApiClient:
 
 
 def parse_http_response(output: str) -> HttpResponse:
-    normalized = output.replace("\r\n", "\n")
-    remainder = normalized
+    remainder = output
     response: HttpResponse | None = None
     while remainder.startswith("HTTP/"):
-        separator = remainder.find("\n\n")
-        if separator < 0:
+        separators = [
+            (index, marker)
+            for marker in ("\r\n\r\n", "\n\n")
+            if (index := remainder.find(marker)) >= 0
+        ]
+        if not separators:
             raise CloudError("gh returned response headers without a body")
+        separator, marker = min(separators, key=lambda item: item[0])
         header_block = remainder[:separator]
-        body = remainder[separator + 2 :]
+        body = remainder[separator + len(marker) :]
         lines = header_block.splitlines()
         match = re.fullmatch(r"HTTP/\S+\s+(\d{3})(?:\s+.*)?", lines[0])
         if not match:
@@ -3845,7 +4287,16 @@ def task_payload(
     worker_receipt: str | None = None,
     repository: str | None = None,
 ) -> dict[str, object]:
-    if options.report and report_path is not None:
+    if options.policy in CANDIDATE_POLICY_SELECTORS:
+        if report_path != OUTPUT_REPORT_PATH:
+            raise AssertionError("candidate policy did not use its fixed report path")
+        prompt = render_artifact_paths(
+            options.prompt,
+            report_path=report_path,
+            worker_receipt=None,
+            semantic=False,
+        )
+    elif options.report and report_path is not None:
         prompt = build_report_prompt(
             render_artifact_paths(
                 options.prompt,
@@ -3904,6 +4355,11 @@ def task_payload(
             report_path=report_path,
             policy=options.policy,
             semantic_kind=options.semantic_kind,
+        )
+    elif options.policy in CANDIDATE_POLICY_SELECTORS:
+        prompt = build_candidate_policy_prompt(
+            prompt,
+            policy=options.policy,
         )
     payload: dict[str, object] = {
         "prompt": prompt,
@@ -4023,6 +4479,254 @@ def resolve_generated_refs(task: Mapping[str, object]) -> GeneratedRefs:
             f"{', '.join(sorted(bases))}"
         )
     return GeneratedRefs(next(iter(heads)), next(iter(bases)) if bases else None)
+
+
+def _validated_timestamp(
+    value: object,
+    *,
+    description: str,
+    required: bool,
+) -> tuple[str | None, datetime | None]:
+    if value is None and not required:
+        return None, None
+    if not isinstance(value, str) or not value:
+        raise CloudError(
+            f"completed Agent Task has no valid {description} timestamp",
+            "task_identity_mismatch",
+        )
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.utcoffset() is None:
+        raise CloudError(
+            f"completed Agent Task has an invalid {description} timestamp",
+            "task_identity_mismatch",
+        )
+    return value, parsed
+
+
+def _identity_object_id(value: object, description: str) -> int:
+    identifier = value.get("id") if isinstance(value, dict) else None
+    if not isinstance(identifier, int) or isinstance(identifier, bool):
+        raise CloudError(
+            f"completed Agent Task has invalid {description} identity",
+            "task_identity_mismatch",
+        )
+    return identifier
+
+
+def validate_fresh_completion(
+    task: Mapping[str, object],
+    *,
+    expected_task_id: str,
+    repository: str,
+    requested_model: str,
+    expected_prompt: str,
+    expected_base_ref: str,
+    generated_ref: str,
+    raw_task_response_sha256: object,
+) -> Mapping[str, object]:
+    task_id = task.get("id")
+    if (
+        task_id != expected_task_id
+        or not isinstance(task_id, str)
+        or not task_id
+        or task.get("state") != "completed"
+    ):
+        raise CloudError(
+            "candidate policy requires one freshly completed Agent Task",
+            "task_identity_mismatch",
+        )
+    if (
+        not isinstance(raw_task_response_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", raw_task_response_sha256)
+    ):
+        raise CloudError(
+            "completed Agent Task response has no raw response digest",
+            "task_identity_mismatch",
+        )
+    sessions = task.get("sessions")
+    if not isinstance(sessions, list) or len(sessions) != 1:
+        raise CloudError(
+            "candidate policy requires exactly one relevant Agent Task session",
+            "task_identity_mismatch",
+        )
+    session = sessions[0]
+    if not isinstance(session, dict):
+        raise CloudError(
+            "completed Agent Task session identity is malformed",
+            "task_identity_mismatch",
+        )
+    task_repository = task.get("repository")
+    task_owner = task.get("owner")
+    repository_id = _identity_object_id(task_repository, "repository")
+    owner_id = _identity_object_id(task_owner, "owner")
+    if session.get("repository") != task_repository or session.get("owner") != task_owner:
+        raise CloudError(
+            "completed session repository or owner does not match its task",
+            "task_identity_mismatch",
+        )
+    owner_login, separator, _ = repository.partition("/")
+    if not separator:
+        raise AssertionError("validated repository lost owner/name identity")
+    if isinstance(task_repository, dict):
+        reported_repository = next(
+            (
+                task_repository[field]
+                for field in ("full_name", "name_with_owner", "nameWithOwner")
+                if field in task_repository
+            ),
+            None,
+        )
+        if (
+            reported_repository is not None
+            and (
+                not isinstance(reported_repository, str)
+                or reported_repository.casefold() != repository.casefold()
+            )
+        ):
+            raise CloudError(
+                "completed Agent Task repository does not match the request",
+                "task_identity_mismatch",
+            )
+    if isinstance(task_owner, dict) and task_owner.get("login") is not None:
+        login = task_owner.get("login")
+        if not isinstance(login, str) or login.casefold() != owner_login.casefold():
+            raise CloudError(
+                "completed Agent Task owner does not match the request",
+                "task_identity_mismatch",
+            )
+    actual_model = session.get("model")
+    if actual_model not in {requested_model, f"sweagent-capi:{requested_model}"}:
+        raise CloudError(
+            "completed Agent Task session model does not match the request",
+            "task_identity_mismatch",
+        )
+    prompt = session.get("prompt")
+    if not isinstance(prompt, str) or prompt != expected_prompt:
+        raise CloudError(
+            "completed Agent Task session prompt does not match the submitted prompt",
+            "task_identity_mismatch",
+        )
+    session_id = session.get("id")
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or session.get("task_id") != task_id
+        or session.get("state") != "completed"
+    ):
+        raise CloudError(
+            "completed Agent Task session identity or state is invalid",
+            "task_identity_mismatch",
+        )
+    if (
+        _short_branch_ref(str(session.get("base_ref", "")))
+        != _short_branch_ref(expected_base_ref)
+        or _short_branch_ref(str(session.get("head_ref", ""))) != generated_ref
+    ):
+        raise CloudError(
+            "completed Agent Task session base or generated ref does not match",
+            "task_identity_mismatch",
+        )
+    for field, expected in (
+        ("base_ref", expected_base_ref),
+        ("head_ref", generated_ref),
+    ):
+        value = task.get(field)
+        if value is not None and _short_branch_ref(str(value)) != _short_branch_ref(
+            expected
+        ):
+            raise CloudError(
+                f"completed Agent Task {field} does not match",
+                "task_identity_mismatch",
+            )
+    task_created, task_created_at = _validated_timestamp(
+        task.get("created_at"),
+        description="task created_at",
+        required=True,
+    )
+    task_updated, task_updated_at = _validated_timestamp(
+        task.get("updated_at"),
+        description="task updated_at",
+        required=False,
+    )
+    task_completed, task_completed_at = _validated_timestamp(
+        task.get("completed_at"),
+        description="task completed_at",
+        required=False,
+    )
+    session_created, session_created_at = _validated_timestamp(
+        session.get("created_at"),
+        description="session created_at",
+        required=True,
+    )
+    session_updated, session_updated_at = _validated_timestamp(
+        session.get("updated_at"),
+        description="session updated_at",
+        required=False,
+    )
+    session_completed, session_completed_at = _validated_timestamp(
+        session.get("completed_at"),
+        description="session completed_at",
+        required=False,
+    )
+    chronological = (
+        (task_created_at, task_updated_at, "task updated_at"),
+        (task_created_at, task_completed_at, "task completed_at"),
+        (task_created_at, session_created_at, "session created_at"),
+        (session_created_at, session_updated_at, "session updated_at"),
+        (session_created_at, session_completed_at, "session completed_at"),
+    )
+    if any(
+        start is not None and end is not None and end < start
+        for start, end, _ in chronological
+    ):
+        field = next(
+            description
+            for start, end, description in chronological
+            if start is not None and end is not None and end < start
+        )
+        raise CloudError(
+            f"completed Agent Task has non-chronological {field}",
+            "task_identity_mismatch",
+        )
+    prompt_digest = hashlib.sha256(expected_prompt.encode("utf-8")).hexdigest()
+    return {
+        "request": {
+            "requested_model": requested_model,
+            "prompt_sha256": prompt_digest,
+        },
+        "task": {
+            "id": task_id,
+            "state": "completed",
+            "created_at": task_created,
+            "updated_at": task_updated,
+            "completed_at": task_completed,
+            "raw_response_sha256": raw_task_response_sha256,
+        },
+        "session": {
+            "id": session_id,
+            "state": "completed",
+            "actual_model": actual_model,
+            "created_at": session_created,
+            "updated_at": session_updated,
+            "completed_at": session_completed,
+            "prompt_sha256": prompt_digest,
+        },
+        "repository": {
+            "name_with_owner": repository,
+            "id": repository_id,
+            "owner": {
+                "login": owner_login,
+                "id": owner_id,
+            },
+        },
+        "refs": {
+            "base": expected_base_ref,
+            "generated": generated_ref,
+        },
+    }
 
 
 def report_metadata(task: Mapping[str, object], stream: TextIO) -> None:
@@ -4340,7 +5044,9 @@ def execute(
     api = ApiClient(runner, sleep, wall_clock)
     if result is not None:
         result.schema_version = (
-            SEMANTIC_RESULT_SCHEMA_VERSION
+            CANDIDATE_RESULT_SCHEMA_VERSION
+            if options.policy in CANDIDATE_POLICY_SELECTORS
+            else SEMANTIC_RESULT_SCHEMA_VERSION
             if options.policy == MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR
             else (
                 LEGACY_SEMANTIC_RESULT_SCHEMA_VERSION
@@ -4497,7 +5203,9 @@ def execute(
             )
     report_path = (
         (
-            f"{SEMANTIC_DIRECTORY}/{request_id}.json"
+            OUTPUT_REPORT_PATH
+            if options.policy in CANDIDATE_POLICY_SELECTORS
+            else f"{SEMANTIC_DIRECTORY}/{request_id}.json"
             if options.policy in SEMANTIC_APPLY_REPORT_POLICY_SELECTORS
             else f"{REPORT_DIRECTORY}/{request_id}.md"
         )
@@ -4524,6 +5232,7 @@ def execute(
                 report_path=report_path,
                 receipt=receipt,
             )
+    submitted_prompt: str | None = None
     if options.task_id is not None:
         initial = get_task(api, repository, options.task_id)
         if options.resume_apply_with_report:
@@ -4544,17 +5253,22 @@ def execute(
                 semantic_kind=options.semantic_kind,
             )
     else:
+        payload = task_payload(
+            options,
+            report_path,
+            pull_request,
+            request_id=request_id,
+            worker_receipt=receipt,
+            repository=repository,
+        )
+        submitted_prompt_value = payload.get("prompt")
+        if not isinstance(submitted_prompt_value, str):
+            raise AssertionError("Agent Task payload lost its prompt")
+        submitted_prompt = submitted_prompt_value
         initial = start_task(
             api,
             repository,
-            task_payload(
-                options,
-                report_path,
-                pull_request,
-                request_id=request_id,
-                worker_receipt=receipt,
-                repository=repository,
-            ),
+            payload,
         )
     if result is not None:
         if options.task_id is None:
@@ -4641,6 +5355,7 @@ def execute(
             in {
                 MARKETPLACE_REPORT_POLICY_SELECTOR,
                 *MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
+                *CANDIDATE_POLICY_SELECTORS,
             }
             and report_path is None
         ):
@@ -4676,6 +5391,84 @@ def execute(
         if result is not None:
             result.generated_head = generated_head
             result.cloud_commits = list(all_commits)
+        if options.policy in CANDIDATE_POLICY_SELECTORS:
+            if submitted_prompt is None:
+                raise AssertionError("fresh candidate policy lost its submitted prompt")
+            completion = validate_fresh_completion(
+                final,
+                expected_task_id=str(initial["id"]),
+                repository=repository,
+                requested_model=options.model,
+                expected_prompt=submitted_prompt,
+                expected_base_ref=expected_base,
+                generated_ref=refs.head,
+                raw_task_response_sha256=getattr(
+                    api,
+                    "last_response_sha256",
+                    None,
+                ),
+            )
+            history = git.candidate_history(
+                root,
+                recorded_base_sha,
+                all_commits,
+                report_only=(
+                    options.policy
+                    == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR
+                ),
+            )
+            expected_generated_head = (
+                all_commits[-1] if all_commits else recorded_base_sha
+            )
+            if generated_head != expected_generated_head:
+                raise CloudError(
+                    "fetched generated head does not match the derived candidate "
+                    "history",
+                    "malformed_history",
+                )
+            code_commit_shas = [
+                str(commit["sha"]) for commit in history.code_commits
+            ]
+            manifest = {
+                "schema": CANDIDATE_MANIFEST_SCHEMA,
+                "repository": {
+                    "name_with_owner": repository,
+                },
+                "task": {
+                    "id": completion["task"]["id"],
+                    "session_id": completion["session"]["id"],
+                },
+                "base": {
+                    "ref": expected_base,
+                    "sha": recorded_base_sha,
+                },
+                "generated": {
+                    "ref": refs.head,
+                    "head_sha": generated_head,
+                    "code_tip_sha": history.code_head,
+                },
+                "code_commits": list(history.code_commits),
+                "artifact_commit": history.artifact_commit,
+            }
+            if result is not None:
+                result.cloud_commits = code_commit_shas
+                result.candidate_manifest = manifest
+                result.completion_evidence = completion
+                result.structural_complete = True
+                result.application_status = (
+                    "not_applicable"
+                    if options.policy
+                    == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR
+                    else "not_applied"
+                )
+                result.final_local_head = git.head(root)
+                result.status = "success"
+            print(
+                f"Derived {len(code_commit_shas)} candidate code commit(s) from "
+                f"{refs.head} without importing or applying them.",
+                file=stderr,
+            )
+            return 0
         expected_paths = (
             [report_path]
             if options.policy
@@ -5097,7 +5890,21 @@ def main(
     args = list(sys.argv[1:] if argv is None else argv)
     result_path = _result_path_from_argv(args)
     result = ResultEnvelope()
-    if MARKETPLACE_POLICY_SELECTOR in args:
+    if MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR in args:
+        result.schema_version = CANDIDATE_RESULT_SCHEMA_VERSION
+        result.policy = {
+            "id": MARKETPLACE_CODE_CANDIDATE_POLICY_ID,
+            "version": MARKETPLACE_CODE_CANDIDATE_POLICY_VERSION,
+            "sha256": MARKETPLACE_CODE_CANDIDATE_POLICY_HASH,
+        }
+    elif MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR in args:
+        result.schema_version = CANDIDATE_RESULT_SCHEMA_VERSION
+        result.policy = {
+            "id": MARKETPLACE_REPORT_RECOMMENDATION_POLICY_ID,
+            "version": MARKETPLACE_REPORT_RECOMMENDATION_POLICY_VERSION,
+            "sha256": MARKETPLACE_REPORT_RECOMMENDATION_POLICY_HASH,
+        }
+    elif MARKETPLACE_POLICY_SELECTOR in args:
         result.policy = {
             "id": MARKETPLACE_POLICY_ID,
             "version": MARKETPLACE_POLICY_VERSION,

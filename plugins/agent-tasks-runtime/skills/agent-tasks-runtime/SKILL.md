@@ -12,6 +12,45 @@ Consumer coordinators discover this skill through `copilot skill list --json`,
 pin the exact helper digest, and invoke the helper directly. Do not invoke its
 scripts manually during an agent workflow.
 
+Policy `marketplace-agent-code-candidate-worker@1` is the current code-candidate
+contract. It permits zero or more linear single-parent code commits and,
+optionally, one final single-parent artifact commit whose changed paths are all
+under `.github/agent-task-output/`. The dispatcher binds the fresh completed
+task and its only session to the requested repository, model, prompt, source
+base, and generated ref. It derives
+`github.copilot.agent-task-candidate-manifest` version 1 from fetched Git
+history, including each code commit's SHA, parent, tree, patch digest, and exact
+changed paths. The optional artifact commit is excluded from the code candidate
+tip. The dispatcher never imports or applies candidate commits.
+
+Policy `marketplace-agent-report-recommendation-worker@1` is the matching
+report-only recommendation contract. It forbids code commits and requires one
+final output commit under `.github/agent-task-output/`. Output contents are
+inert. In both new policies, `.github/agent-task-output/report.md` is optional
+free-form advisory Markdown. Missing, empty, non-Markdown, or otherwise
+malformed prose cannot invalidate mechanically valid candidate code.
+
+Both policies return `github.copilot.agent-task-result` version 5 with
+`attestation.kind=dispatcher_candidate`. Completion evidence records the
+completed session ID, actual model, prompt digest, task and session timestamps,
+repository and owner identity, source base and generated refs, and the SHA-256
+of the raw final task response. More than one session, identity drift, unsafe
+paths, mixed code and output paths, multiple output commits, nonlinear history,
+or any local application path fails closed. These contracts support only fresh
+invocations. They do not accept task IDs, prior results, resume, monitor-only,
+or historical recovery.
+
+Consumers migrate explicitly. Code-candidate callers keep
+`--apply-with-report` but select `marketplace-agent-code-candidate-worker@1`;
+report callers keep `--report` and select
+`marketplace-agent-report-recommendation-worker@1`. They must parse result
+schema version 5, use `candidate.generated.code_tip_sha` rather than the
+generated branch head, ignore the optional artifact commit as code, and treat
+all output contents as untrusted. Any consumer-owned validation and guarded
+commit import happens after it validates the manifest against its frozen local
+request. Existing consumers remain on their pinned policy and result schema
+until they implement that flow.
+
 Policy `marketplace-agent-worker@5` keeps executable validation on the hosted
 Agent Task. The worker's final commit contains the report and a minimal JSON
 validation array of exact `command` and `outcome` objects; `outcome` must be

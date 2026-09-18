@@ -109,6 +109,8 @@ class PolicyPromptTest(unittest.TestCase):
                     "marketplace-agent-apply-report-worker@3, "
                     "marketplace-agent-apply-report-worker@4, "
                     "marketplace-agent-apply-report-worker@5, "
+                    "marketplace-agent-code-candidate-worker@1, "
+                    "marketplace-agent-report-recommendation-worker@1, "
                     "marketplace-agent-report-worker@1, "
                     "marketplace-agent-worker@5",
                 ) as raised:
@@ -1914,6 +1916,705 @@ class ReportOnlyDispatcherTest(unittest.TestCase):
                 )
 
         self.assertFalse(result.structural_complete)
+
+
+class CandidatePolicyTest(unittest.TestCase):
+    def test_policy_and_schema_audit_identities_are_immutable(self):
+        expected_hashes = {
+            "MARKETPLACE_POLICY_HASH": (
+                "a9a1592c15abb39c077c5af0e23b46b7b0e3fc3d747e02f41975813130b0c096"
+            ),
+            "MARKETPLACE_REPORT_POLICY_HASH": (
+                "b6ce6f5940c28fac03dda5be647c693e2a83e0c8f7eaf38f1b644b47bf49f2a2"
+            ),
+            "MARKETPLACE_APPLY_REPORT_POLICY_V1_HASH": (
+                "ea61b3edb7eb56b262d80eccb3b6a7e20a2167d5ca4381db66b7663bca33dd78"
+            ),
+            "MARKETPLACE_APPLY_REPORT_POLICY_V2_HASH": (
+                "411a9ba9a0931d40c685c6233639b15c31e0d6daa4b29706527424016367cad2"
+            ),
+            "MARKETPLACE_APPLY_REPORT_POLICY_V3_HASH": (
+                "7d48868140710139939cabc803a99f2122305e97dedbffa747e5f69903c16af1"
+            ),
+            "MARKETPLACE_APPLY_REPORT_POLICY_V4_HASH": (
+                "708e601f66db19d501f1f92ac5444980f025c84b0266ef9be1a178d37c36274b"
+            ),
+            "MARKETPLACE_APPLY_REPORT_POLICY_HASH": (
+                "8e843c0e41703fc067ae317da15916f839b57970f2fbb240629d9f610f55f82b"
+            ),
+            "MARKETPLACE_CODE_CANDIDATE_POLICY_HASH": (
+                "a110207256318e2df4b23b95c0b6843193cf64319bd1017731afdf0615705270"
+            ),
+            "MARKETPLACE_REPORT_RECOMMENDATION_POLICY_HASH": (
+                "07aeb40461735368b72a570123a1afcb12d21f3a6b70cfa3dfd4e6dc2e6308ab"
+            ),
+        }
+        for name, expected in expected_hashes.items():
+            with self.subTest(name=name):
+                self.assertEqual(getattr(MODULE, name), expected)
+        self.assertEqual(MODULE.RESULT_SCHEMA_VERSION, 1)
+        self.assertEqual(MODULE.REPORT_RESULT_SCHEMA_VERSION, 2)
+        self.assertEqual(MODULE.LEGACY_SEMANTIC_RESULT_SCHEMA_VERSION, 3)
+        self.assertEqual(MODULE.SEMANTIC_RESULT_SCHEMA_VERSION, 4)
+        self.assertEqual(MODULE.CANDIDATE_RESULT_SCHEMA_VERSION, 5)
+        self.assertEqual(
+            MODULE.LEGACY_SEMANTIC_OUTPUT_SCHEMA,
+            {
+                "id": "github.copilot.agent-task-semantic-output",
+                "version": 1,
+            },
+        )
+        self.assertEqual(
+            MODULE.SEMANTIC_OUTPUT_SCHEMA,
+            {
+                "id": "github.copilot.agent-task-semantic-output",
+                "version": 2,
+            },
+        )
+        self.assertEqual(
+            MODULE.CANDIDATE_MANIFEST_SCHEMA,
+            {
+                "id": "github.copilot.agent-task-candidate-manifest",
+                "version": 1,
+            },
+        )
+
+    def test_code_candidate_policy_uses_fixed_optional_output(self):
+        options = MODULE.Options(
+            report=False,
+            model="gpt-5.6-sol",
+            prompt=f"Write advisory prose to {MODULE.REPORT_PATH_PLACEHOLDER}.",
+            pull_request=MODULE.PrReference(1, "owner/repo", "owner/repo#1"),
+            apply_with_report=True,
+            result_file=Path("C:/state/result.json"),
+            policy=MODULE.MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR,
+            prompt_file=Path("C:/state/prompt.txt"),
+        )
+        pull_request = MODULE.PullRequestSnapshot(
+            1,
+            "https://github.com/owner/repo/pull/1",
+            "OPEN",
+            "owner/repo",
+            "main",
+            "2" * 40,
+            "owner/repo",
+            "feature",
+            "1" * 40,
+            False,
+        )
+
+        prompt = MODULE.task_payload(
+            options,
+            report_path=MODULE.OUTPUT_REPORT_PATH,
+            pull_request=pull_request,
+            request_id="ignored-request-id",
+            repository="owner/repo",
+        )["prompt"]
+
+        self.assertIn(
+            "Policy: marketplace-agent-code-candidate-worker@1",
+            prompt,
+        )
+        self.assertIn("zero or more linear single-parent commits", prompt)
+        self.assertIn("artifact commit is optional", prompt)
+        self.assertIn(MODULE.OUTPUT_REPORT_PATH, prompt)
+        self.assertIn("never imports or applies candidate commits", prompt)
+        self.assertNotIn(MODULE.REPORT_PATH_PLACEHOLDER, prompt)
+        self.assertNotIn(MODULE.APPLY_WITH_REPORT_MARKER, prompt)
+
+    def test_report_recommendation_policy_forbids_code(self):
+        prompt = MODULE.build_candidate_policy_prompt(
+            "Review only.",
+            policy=MODULE.MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR,
+        )
+
+        self.assertIn(
+            "Policy: marketplace-agent-report-recommendation-worker@1",
+            prompt,
+        )
+        self.assertIn("Do not create code", prompt)
+        self.assertIn("exactly one final single-parent artifact commit", prompt)
+        self.assertIn("contents are never mechanical validation evidence", prompt)
+
+    def test_candidate_policies_are_fresh_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt_path = root / "prompt.txt"
+            prompt_path.write_text("Review.", encoding="utf-8")
+            result_path = root / "result.json"
+            code = MODULE.parse_args(
+                [
+                    "--apply-with-report",
+                    "--pr",
+                    "owner/repo#1",
+                    "--prompt-file",
+                    str(prompt_path),
+                    "--result-file",
+                    str(result_path),
+                    "--policy",
+                    MODULE.MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR,
+                ]
+            )
+            report = MODULE.parse_args(
+                [
+                    "--report",
+                    "--pr",
+                    "owner/repo#1",
+                    "--prompt-file",
+                    str(prompt_path),
+                    "--result-file",
+                    str(result_path),
+                    "--policy",
+                    MODULE.MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR,
+                ]
+            )
+
+            self.assertEqual(
+                code.policy,
+                MODULE.MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR,
+            )
+            self.assertEqual(
+                report.policy,
+                MODULE.MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR,
+            )
+            with self.assertRaisesRegex(MODULE.CloudError, "disabled|does not support"):
+                MODULE.parse_args(
+                    [
+                        "--apply-with-report",
+                        "--allow-merged-pr",
+                        "--pr",
+                        "owner/repo#1",
+                        "--prompt-file",
+                        str(prompt_path),
+                        "--result-file",
+                        str(result_path),
+                        "--policy",
+                        MODULE.MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR,
+                    ]
+                )
+
+
+class CandidateHistoryTest(unittest.TestCase):
+    def repository(self, *, parents, paths, trees=None, patches=None):
+        trees = trees or {}
+        patches = patches or {}
+
+        def runner(command, **kwargs):
+            args = command[1:]
+            if args[:3] == ["rev-list", "--parents", "-n"]:
+                commit = args[-1]
+                output = parents[commit]
+            elif args[:3] == ["diff-tree", "--no-commit-id", "--name-only"]:
+                commit = args[-1]
+                output = "\0".join(paths[commit]) + "\0"
+            elif args[:3] == ["show", "-s", "--format=%T"]:
+                commit = args[-1]
+                output = trees.get(commit, "a" * 40) + "\n"
+            elif args and args[0] == "diff-tree" and "--patch" in args:
+                commit = args[-1]
+                output = patches.get(commit, f"patch for {commit}\n")
+            else:
+                raise AssertionError(f"unexpected git command: {command}")
+            return subprocess.CompletedProcess(command, 0, output, "")
+
+        return MODULE.GitRepository(runner, Path.exists)
+
+    def test_derives_ordered_code_and_trailing_artifact_manifest_entries(self):
+        base = "1" * 40
+        first = "2" * 40
+        second = "3" * 40
+        artifact = "4" * 40
+        repository = self.repository(
+            parents={
+                first: f"{first} {base}\n",
+                second: f"{second} {first}\n",
+                artifact: f"{artifact} {second}\n",
+            },
+            paths={
+                first: ["src/a.py"],
+                second: ["README.md", "src/b.py"],
+                artifact: [
+                    ".github/agent-task-output/details.json",
+                    MODULE.OUTPUT_REPORT_PATH,
+                ],
+            },
+            trees={
+                first: "a" * 40,
+                second: "b" * 40,
+                artifact: "c" * 40,
+            },
+        )
+
+        history = repository.candidate_history(
+            Path("C:/repo"),
+            base,
+            [first, second, artifact],
+            report_only=False,
+        )
+
+        self.assertEqual(history.code_head, second)
+        self.assertEqual(
+            [commit["sha"] for commit in history.code_commits],
+            [first, second],
+        )
+        self.assertEqual(
+            history.code_commits[1]["changed_paths"],
+            ["README.md", "src/b.py"],
+        )
+        self.assertEqual(history.code_commits[0]["parent_sha"], base)
+        self.assertEqual(history.code_commits[1]["parent_sha"], first)
+        self.assertEqual(history.code_commits[1]["tree_sha"], "b" * 40)
+        self.assertRegex(history.code_commits[1]["patch_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(history.artifact_commit["sha"], artifact)
+        self.assertEqual(history.artifact_commit["parent_sha"], second)
+
+    def test_code_candidate_accepts_zero_commits_and_no_artifact(self):
+        history = self.repository(parents={}, paths={}).candidate_history(
+            Path("C:/repo"),
+            "1" * 40,
+            [],
+            report_only=False,
+        )
+
+        self.assertEqual(history.code_head, "1" * 40)
+        self.assertEqual(history.code_commits, ())
+        self.assertIsNone(history.artifact_commit)
+
+    def test_report_recommendation_accepts_one_inert_output_commit(self):
+        base = "1" * 40
+        artifact = "2" * 40
+        history = self.repository(
+            parents={artifact: f"{artifact} {base}\n"},
+            paths={artifact: [".github/agent-task-output/arbitrary.bin"]},
+        ).candidate_history(
+            Path("C:/repo"),
+            base,
+            [artifact],
+            report_only=True,
+        )
+
+        self.assertEqual(history.code_commits, ())
+        self.assertEqual(history.artifact_commit["sha"], artifact)
+
+    def test_rejects_mixed_multiple_nonfinal_and_unsafe_output_history(self):
+        base = "1" * 40
+        first = "2" * 40
+        second = "3" * 40
+        cases = {
+            "mixes": (
+                [first],
+                {first: f"{first} {base}\n"},
+                {first: ["src/a.py", MODULE.OUTPUT_REPORT_PATH]},
+            ),
+            "multiple": (
+                [first, second],
+                {
+                    first: f"{first} {base}\n",
+                    second: f"{second} {first}\n",
+                },
+                {
+                    first: [MODULE.OUTPUT_REPORT_PATH],
+                    second: [".github/agent-task-output/details.json"],
+                },
+            ),
+            "unsafe": (
+                [first],
+                {first: f"{first} {base}\n"},
+                {first: ["src/../secret.txt"]},
+            ),
+        }
+        for name, (commits, parents, paths) in cases.items():
+            with self.subTest(name=name):
+                repository = self.repository(parents=parents, paths=paths)
+                with self.assertRaises(MODULE.CloudError):
+                    repository.candidate_history(
+                        Path("C:/repo"),
+                        base,
+                        commits,
+                        report_only=False,
+                    )
+
+    def test_rejects_non_linear_and_report_only_code_history(self):
+        base = "1" * 40
+        code = "2" * 40
+        merge = "3" * 40
+        nonlinear = self.repository(
+            parents={code: f"{code} {base} {merge}\n"},
+            paths={code: ["src/a.py"]},
+        )
+        with self.assertRaisesRegex(MODULE.CloudError, "linear single-parent"):
+            nonlinear.candidate_history(
+                Path("C:/repo"),
+                base,
+                [code],
+                report_only=False,
+            )
+
+        report_with_code = self.repository(
+            parents={code: f"{code} {base}\n"},
+            paths={code: ["src/a.py"]},
+        )
+        with self.assertRaisesRegex(MODULE.CloudError, "forbids candidate code"):
+            report_with_code.candidate_history(
+                Path("C:/repo"),
+                base,
+                [code],
+                report_only=True,
+            )
+
+        with self.assertRaisesRegex(MODULE.CloudError, "requires one final output"):
+            self.repository(parents={}, paths={}).candidate_history(
+                Path("C:/repo"),
+                base,
+                [],
+                report_only=True,
+            )
+
+    def test_rejects_generated_history_unrelated_to_the_fetched_base(self):
+        def runner(command, **kwargs):
+            if command[1:4] == ["merge-base", "--is-ancestor", "1" * 40]:
+                return subprocess.CompletedProcess(command, 1, "", "")
+            raise AssertionError(f"unexpected git command: {command}")
+
+        repository = MODULE.GitRepository(runner, Path.exists)
+        with self.assertRaisesRegex(MODULE.CloudError, "not an ancestor"):
+            repository.cloud_commits(
+                Path("C:/repo"),
+                "1" * 40,
+                "refs/cloud-agent-tasks/request-1/generated",
+            )
+
+
+class FreshCompletionEvidenceTest(unittest.TestCase):
+    def setUp(self):
+        self.prompt = "Managed prompt"
+        self.task = {
+            "id": "task-1",
+            "state": "completed",
+            "created_at": "2026-09-18T12:00:00Z",
+            "updated_at": "2026-09-18T12:03:00Z",
+            "completed_at": "2026-09-18T12:03:00Z",
+            "repository": {
+                "id": 11,
+                "full_name": "owner/repo",
+            },
+            "owner": {
+                "id": 12,
+                "login": "owner",
+            },
+            "base_ref": "feature",
+            "head_ref": "copilot/task-1",
+            "sessions": [
+                {
+                    "id": "session-1",
+                    "task_id": "task-1",
+                    "state": "completed",
+                    "created_at": "2026-09-18T12:00:01Z",
+                    "updated_at": "2026-09-18T12:03:00Z",
+                    "completed_at": "2026-09-18T12:03:00Z",
+                    "model": "sweagent-capi:gpt-5.6-sol",
+                    "base_ref": "feature",
+                    "head_ref": "copilot/task-1",
+                    "repository": {
+                        "id": 11,
+                        "full_name": "owner/repo",
+                    },
+                    "owner": {
+                        "id": 12,
+                        "login": "owner",
+                    },
+                    "prompt": self.prompt,
+                }
+            ],
+        }
+
+    def validate(self, task=None, **overrides):
+        arguments = {
+            "expected_task_id": "task-1",
+            "repository": "owner/repo",
+            "requested_model": "gpt-5.6-sol",
+            "expected_prompt": self.prompt,
+            "expected_base_ref": "feature",
+            "generated_ref": "copilot/task-1",
+            "raw_task_response_sha256": "a" * 64,
+        }
+        arguments.update(overrides)
+        return MODULE.validate_fresh_completion(
+            self.task if task is None else task,
+            **arguments,
+        )
+
+    def mutate(self, *, task_updates=None, session_updates=None):
+        task = json.loads(json.dumps(self.task))
+        task.update(task_updates or {})
+        task["sessions"][0].update(session_updates or {})
+        return task
+
+    def test_persists_fresh_task_session_model_prompt_and_ref_evidence(self):
+        evidence = self.validate()
+
+        self.assertEqual(evidence["task"]["id"], "task-1")
+        self.assertEqual(evidence["session"]["id"], "session-1")
+        self.assertEqual(
+            evidence["session"]["actual_model"],
+            "sweagent-capi:gpt-5.6-sol",
+        )
+        self.assertEqual(
+            evidence["request"]["prompt_sha256"],
+            hashlib.sha256(self.prompt.encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(evidence["task"]["raw_response_sha256"], "a" * 64)
+        self.assertEqual(evidence["repository"]["id"], 11)
+        self.assertEqual(evidence["repository"]["owner"]["id"], 12)
+        self.assertEqual(evidence["refs"]["base"], "feature")
+        self.assertEqual(evidence["refs"]["generated"], "copilot/task-1")
+
+    def test_rejects_ambiguous_stale_or_unbound_completion(self):
+        cases = [
+            (
+                self.mutate(
+                    task_updates={
+                        "sessions": self.task["sessions"] * 2,
+                    }
+                ),
+                {},
+            ),
+            (self.mutate(session_updates={"model": "gpt-6-astra"}), {}),
+            (self.mutate(session_updates={"prompt": "other"}), {}),
+            (self.mutate(session_updates={"base_ref": "other"}), {}),
+            (self.mutate(session_updates={"head_ref": "copilot/other"}), {}),
+            (
+                self.mutate(session_updates={"repository": {"id": 99}}),
+                {},
+            ),
+            (
+                self.mutate(session_updates={"owner": {"id": 99}}),
+                {},
+            ),
+            (self.task, {"repository": "other/repo"}),
+            (self.task, {"expected_task_id": "other-task"}),
+            (
+                self.mutate(
+                    task_updates={"completed_at": "2026-09-18T11:59:00Z"}
+                ),
+                {},
+            ),
+            (self.task, {"raw_task_response_sha256": None}),
+        ]
+        for task, overrides in cases:
+            with self.subTest(task=task, overrides=overrides):
+                with self.assertRaises(MODULE.CloudError):
+                    self.validate(task, **overrides)
+
+    def test_api_client_hashes_the_exact_success_response_body(self):
+        body = '{\r\n "id": "task-1", "state": "completed"\r\n}\r\n'
+
+        def runner(command, **kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                f"HTTP/2 200 OK\r\nContent-Type: application/json\r\n\r\n{body}",
+                "",
+            )
+
+        api = MODULE.ApiClient(runner)
+        value = api.request_json(
+            "GET",
+            "agents/repos/owner/repo/tasks/task-1",
+            expected_status=200,
+            operation="poll Agent Task task-1",
+        )
+
+        self.assertEqual(value["id"], "task-1")
+        self.assertEqual(
+            api.last_response_sha256,
+            hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        )
+
+
+class CandidateDispatcherTest(unittest.TestCase):
+    def test_derives_manifest_without_reading_or_applying_worker_output(self):
+        root = Path("C:/repo")
+        base_sha = "1" * 40
+        code_commit = "2" * 40
+        artifact_commit = "3" * 40
+        snapshot = MODULE.WorktreeSnapshot(
+            root,
+            "owner/repo",
+            "origin",
+            "feature",
+            base_sha,
+        )
+        pull_request = MODULE.PullRequestSnapshot(
+            7,
+            "https://github.com/owner/repo/pull/7",
+            "OPEN",
+            "owner/repo",
+            "main",
+            "4" * 40,
+            "owner/repo",
+            "feature",
+            base_sha,
+            False,
+        )
+        options = MODULE.Options(
+            report=False,
+            model="gpt-5.6-sol",
+            prompt="Review and prepare candidate fixes.",
+            pull_request=MODULE.PrReference(7, "owner/repo", "owner/repo#7"),
+            apply_with_report=True,
+            result_file=Path("C:/state/result.json"),
+            policy=MODULE.MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR,
+            prompt_file=Path("C:/state/prompt.txt"),
+        )
+        submitted_prompt = MODULE.task_payload(
+            options,
+            MODULE.OUTPUT_REPORT_PATH,
+            pull_request,
+            request_id="request-1",
+            repository="owner/repo",
+        )["prompt"]
+        task = {
+            "id": "task-1",
+            "state": "completed",
+            "created_at": "2026-09-18T12:00:00Z",
+            "completed_at": "2026-09-18T12:03:00Z",
+            "repository": {"id": 11, "full_name": "owner/repo"},
+            "owner": {"id": 12, "login": "owner"},
+            "artifacts": [
+                {
+                    "type": "branch",
+                    "provider": "github",
+                    "data": {
+                        "head_ref": "copilot/task-1",
+                        "base_ref": "feature",
+                    },
+                }
+            ],
+            "sessions": [
+                {
+                    "id": "session-1",
+                    "task_id": "task-1",
+                    "state": "completed",
+                    "created_at": "2026-09-18T12:00:01Z",
+                    "completed_at": "2026-09-18T12:03:00Z",
+                    "model": "sweagent-capi:gpt-5.6-sol",
+                    "base_ref": "feature",
+                    "head_ref": "copilot/task-1",
+                    "repository": {"id": 11, "full_name": "owner/repo"},
+                    "owner": {"id": 12, "login": "owner"},
+                    "prompt": submitted_prompt,
+                }
+            ],
+        }
+        code_metadata = {
+            "sha": code_commit,
+            "parent_sha": base_sha,
+            "tree_sha": "a" * 40,
+            "patch_sha256": "b" * 64,
+            "changed_paths": ["src/a.py"],
+        }
+        artifact_metadata = {
+            "sha": artifact_commit,
+            "parent_sha": code_commit,
+            "tree_sha": "c" * 40,
+            "patch_sha256": "d" * 64,
+            "changed_paths": [MODULE.OUTPUT_REPORT_PATH],
+        }
+        repository = mock.Mock()
+        repository.snapshot.return_value = snapshot
+        repository.root.return_value = root
+        repository.head.return_value = base_sha
+        repository.fetch_pr_inputs.return_value = {}
+        repository.align_to_pr.return_value = snapshot
+        repository.identity.return_value = MODULE.LocalIdentity(
+            "feature",
+            base_sha,
+            "",
+            None,
+        )
+        repository.fetch_generated.return_value = (
+            "refs/cloud-agent-tasks/request-1/generated"
+        )
+        repository.ref_sha.return_value = artifact_commit
+        repository.cloud_commits.return_value = [code_commit, artifact_commit]
+        repository.candidate_history.return_value = MODULE.CandidateHistory(
+            code_commit,
+            (code_metadata,),
+            artifact_metadata,
+        )
+        api = mock.Mock()
+        api.last_response_sha256 = "e" * 64
+        result = MODULE.ResultEnvelope()
+        with (
+            mock.patch.object(MODULE, "GitRepository", return_value=repository),
+            mock.patch.object(MODULE, "ApiClient", return_value=api),
+            mock.patch.object(
+                MODULE,
+                "repository_base",
+                return_value=SimpleNamespace(branch="main", sha="4" * 40),
+            ),
+            mock.patch.object(
+                MODULE,
+                "resolve_pull_request",
+                return_value=pull_request,
+            ),
+            mock.patch.object(MODULE, "validate_policy_before_post"),
+            mock.patch.object(MODULE, "validate_policy_before_mutation"),
+            mock.patch.object(MODULE, "start_task", return_value=task),
+            mock.patch.object(MODULE, "monitor_task", return_value=task),
+            mock.patch.object(
+                MODULE,
+                "fetch_report",
+                side_effect=AssertionError("candidate policy parsed worker prose"),
+            ),
+        ):
+            code = MODULE.execute(
+                options,
+                cwd=root,
+                uuid_factory=lambda: "request-1",
+                result=result,
+            )
+
+        envelope = result.as_dict()
+        self.assertEqual(code, 0)
+        self.assertEqual(envelope["schema"]["version"], 5)
+        self.assertEqual(
+            envelope["policy"],
+            {
+                "id": "marketplace-agent-code-candidate-worker",
+                "version": 1,
+                "sha256": MODULE.MARKETPLACE_CODE_CANDIDATE_POLICY_HASH,
+            },
+        )
+        self.assertEqual(
+            envelope["candidate"]["schema"],
+            MODULE.CANDIDATE_MANIFEST_SCHEMA,
+        )
+        self.assertEqual(
+            envelope["candidate"]["generated"]["code_tip_sha"],
+            code_commit,
+        )
+        self.assertEqual(
+            envelope["candidate"]["artifact_commit"]["sha"],
+            artifact_commit,
+        )
+        self.assertEqual(envelope["generated"]["commits"], [code_commit])
+        self.assertEqual(envelope["completion"]["session"]["id"], "session-1")
+        self.assertEqual(
+            envelope["completion"]["task"]["raw_response_sha256"],
+            "e" * 64,
+        )
+        self.assertEqual(envelope["application"]["status"], "not_applied")
+        self.assertEqual(
+            envelope["attestation"],
+            {
+                "kind": "dispatcher_candidate",
+                "structural_complete": True,
+            },
+        )
+        repository.fast_forward.assert_not_called()
+        repository.cherry_pick.assert_not_called()
 
 
 if __name__ == "__main__":
