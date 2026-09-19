@@ -618,7 +618,7 @@ class PipelineConflictEntryTest(unittest.TestCase):
 
     def test_state_created_before_lock_acquisition_is_not_overwritten(self):
         with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
+            directory = Path(temporary).resolve()
             root = directory / "repo"
             root.mkdir()
             state = directory / "state.json"
