@@ -54,6 +54,8 @@ The command waits for each Runtime child to finish, validates its terminal candi
 
 `--max-iterations` defaults to 5 and bounds all Self Review iterations across the entire Pipeline run. Later sweeps neither reset nor multiply it. Each child gets one review iteration. Exhaustion returns `stage_outcome: max_iterations_reached`, never a clean marker. The final JSON includes all code commits and tasks from this call. Any execution or validation error exits nonzero; an unfinished state cannot be resumed or adopted.
 
+A later sweep may inspect a head published by another stage using the original run's remaining allowance. It requires a completed prior task, a strictly later sweep, and unchanged run, checkout, PR source identity, model, mutation policy, and stage budget. Replaying the same or an older sweep is an error. The synchronous iterations inside one call are not new sweeps.
+
 Source-only skips shared GitHub state publication as well as PR metadata mutation. Audit state stays local.
 
 ## Boundaries

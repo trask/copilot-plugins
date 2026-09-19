@@ -56,6 +56,8 @@ Pipeline invokes the coordinator's `pipeline` command directly. A clean detached
 
 The stage's `--max-iterations` value bounds the entire run. Pipeline sweeps never reset or multiply that allowance. The coordinator waits for each decision session and review monitor, then spends remaining iterations on fresh feedback before returning. The coordinator records work equivalent to `progress --state <path> --phase addressing_comments` before the decision session and `progress --state <path> --phase validating` while it validates local artifacts.
 
+A strictly later sweep in the same run can revalidate a head published by another stage after the previous sweep reached terminal clearance or policy exclusion. It retains spent iterations and audit history, and checks the checkout, PR source identity, mutation policy, and completed ownership before reading fresh review evidence. Same or older sweeps, foreign runs, active owners, and failed coordinators are rejected. A current-head clean review returns `cleared`; an unreviewed source-only head returns only `skipped` with a fresh policy proof, never a reviewed-head marker or a review request.
+
 ## Boundaries
 
 - Never run `gh pr diff`, read or search repository files, inspect repository instructions, analyze code, edit files, or run repository programs in the coordinator session. The pinned local decision session performs repository work.

@@ -2503,7 +2503,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("validation_complete=true", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.62")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.63")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -8298,7 +8298,8 @@ class TerminalCoordinatorContractTest(unittest.TestCase):
 
     def test_pipeline_alias_rejects_success_output_without_terminal_state(self):
         argv = [str(SCRIPT), "pipeline", "owner/repo#7",
-                "--state", "missing-state.json", "--pipeline-run", "1" * 32]
+                "--state", "missing-state.json", "--pipeline-run", "1" * 32,
+                "--pipeline-iteration", "1", "--pipeline-max-iterations", "2"]
         emitted = []
         with (
             mock.patch.object(MODULE.sys, "argv", argv),
@@ -8590,6 +8591,83 @@ class DetachedPipelineCheckoutTest(unittest.TestCase):
         request.assert_not_called()
         worker.assert_not_called()
 
+    def test_later_sweep_rejects_unowned_or_unfinished_terminal_state(self):
+        state_path = self.root / "state.json"
+        argv = [
+            str(SCRIPT), "pipeline", "owner/repo#7", "--repo-root", str(self.repo),
+            "--state", str(state_path), "--pipeline-run", "1" * 32,
+            "--pipeline-iteration", "1", "--pipeline-max-iterations", "3",
+            "--github-mutation-policy", "source-only",
+        ]
+        with mock.patch.object(MODULE.sys, "argv", argv), mock.patch.object(MODULE, "emit"):
+            self.assertEqual(0, MODULE.main())
+        completed = MODULE.load_state(state_path)
+        argv[argv.index("--pipeline-iteration") + 1] = "2"
+        mutations = {
+            "foreign run": lambda state: state["pipeline_budget"].update(run="other"),
+            "same sweep": lambda state: state["pipeline_budget"].update(iteration=2),
+            "older sweep": lambda state: state["pipeline_budget"].update(iteration=3),
+            "standalone": lambda state: state.pop("pipeline_budget"),
+            "wrong checkout": lambda state: state.update(repo_root="other"),
+            "wrong PR": lambda state: state["pr"].update(number=8),
+            "policy changed": lambda state: state.update(github_mutation_policy="allow"),
+            "active child": lambda state: state.update(agent_task={"status": "running"}),
+            "interrupted": lambda state: state.update(terminal_exit={"status": "nonzero"}),
+            "active watcher": lambda state: state.update(monitoring={"status": "running"}),
+            "old task": lambda state: state.update(agent_task={"status": "completed"}),
+        }
+        with (
+            mock.patch.object(MODULE.sys, "argv", argv),
+            mock.patch.object(MODULE, "emit") as emitted,
+            mock.patch.object(MODULE, "agent_task_preflight") as preflight,
+            mock.patch.object(MODULE, "request_copilot") as request,
+            mock.patch.object(MODULE, "run_local_decision_worker") as worker,
+        ):
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    state = copy.deepcopy(completed)
+                    mutate(state)
+                    MODULE.save_state(state_path, state)
+                    self.assertEqual(1, MODULE.main())
+                    self.assertEqual("error", emitted.call_args.args[0]["result"])
+            preflight.assert_not_called()
+            request.assert_not_called()
+            worker.assert_not_called()
+
+    def test_later_sweep_rejects_live_source_drift(self):
+        state_path = self.root / "state.json"
+        argv = [
+            str(SCRIPT), "pipeline", "owner/repo#7", "--repo-root", str(self.repo),
+            "--state", str(state_path), "--pipeline-run", "1" * 32,
+            "--pipeline-iteration", "1", "--pipeline-max-iterations", "2",
+            "--github-mutation-policy", "source-only",
+        ]
+        with (
+            mock.patch.object(MODULE.sys, "argv", argv),
+            mock.patch.object(MODULE, "emit") as emitted,
+            mock.patch.object(MODULE, "request_copilot") as request,
+            mock.patch.object(MODULE, "run_local_decision_worker") as worker,
+        ):
+            self.assertEqual(0, MODULE.main())
+            completed = MODULE.load_state(state_path)
+            (self.repo / "code.txt").write_text("later stage\n", encoding="utf-8")
+            MODULE.git(self.repo, "commit", "-am", "Later stage fix")
+            self.head = MODULE.git(self.repo, "rev-parse", "HEAD")
+            self.pr["head_sha"] = self.head
+            live = dict(self.pr)
+            argv[argv.index("--pipeline-iteration") + 1] = "2"
+            for field, value in (
+                ("head_branch", "other"), ("base_branch", "other"),
+                ("title", "other"), ("body", "other"), ("is_draft", True),
+            ):
+                with self.subTest(field=field):
+                    MODULE.save_state(state_path, copy.deepcopy(completed))
+                    self.pr = {**live, field: value}
+                    self.assertEqual(1, MODULE.main())
+                    self.assertIn("source identity changed", emitted.call_args.args[0]["error"])
+            request.assert_not_called()
+            worker.assert_not_called()
+
     def test_detached_clearance_keeps_exact_head_and_pipeline_guards(self):
         preflight = MODULE.agent_task_preflight(
             self.repo, self.target, allow_detached=True
@@ -8608,6 +8686,112 @@ class DetachedPipelineCheckoutTest(unittest.TestCase):
             MODULE.empty_queue_clearance_head(
                 None, preflight, preflight, self.target, allow_detached=True
             )
+
+    def test_later_sweep_revalidates_terminal_clean_or_skipped_head(self):
+        for first_clean, second_clean in ((True, False), (True, True), (False, True)):
+            with self.subTest(first_clean=first_clean, second_clean=second_clean):
+                state_path = self.root / f"state-{first_clean}-{second_clean}.json"
+                argv = [
+                    str(SCRIPT), "pipeline", "owner/repo#7", "--repo-root", str(self.repo),
+                    "--state", str(state_path), "--pipeline-run", "1" * 32,
+                    "--pipeline-iteration", "1", "--pipeline-max-iterations", "2",
+                    "--github-mutation-policy", "source-only",
+                ]
+                reviews = []
+
+                def review_current_head():
+                    reviews[:] = [{
+                        "id": 123, "commit_id": self.head, "body": "",
+                        "submitted_at": "2026-01-01T00:00:00Z", "state": "COMMENTED",
+                        "user": {"login": "copilot-pull-request-reviewer[bot]"},
+                    }]
+
+                if first_clean:
+                    review_current_head()
+                with (
+                    mock.patch.object(MODULE.sys, "argv", argv),
+                    mock.patch.object(MODULE, "fetch_reviews", side_effect=lambda *_: list(reviews)),
+                    mock.patch.object(MODULE, "emit") as emitted,
+                    mock.patch.object(MODULE, "request_copilot") as request,
+                    mock.patch.object(MODULE, "run_local_decision_worker") as worker,
+                ):
+                    self.assertEqual(0, MODULE.main())
+                    self.assertEqual(
+                        "cleared" if first_clean else "skipped",
+                        emitted.call_args.args[0]["stage_outcome"],
+                    )
+                    (self.repo / "code.txt").write_text(
+                        f"later stage {first_clean}-{second_clean}\n", encoding="utf-8"
+                    )
+                    MODULE.git(self.repo, "commit", "-am", "Later stage fix")
+                    self.head = MODULE.git(self.repo, "rev-parse", "HEAD")
+                    self.pr["head_sha"] = self.head
+                    if second_clean:
+                        review_current_head()
+                    argv[argv.index("--pipeline-iteration") + 1] = "2"
+                    self.assertEqual(0, MODULE.main(), emitted.call_args.args[0])
+                state = MODULE.load_state(state_path)
+                self.assertEqual(
+                    "cleared" if second_clean else "skipped",
+                    emitted.call_args.args[0]["stage_outcome"],
+                )
+                self.assertEqual(self.head, state["pr"]["head_sha"])
+                self.assertEqual(0, state["iterations"])
+                self.assertEqual(self.head if second_clean else None, state["clean_at_head_sha"])
+                request.assert_not_called()
+                worker.assert_not_called()
+
+    def test_later_sweep_clearance_preserves_completed_work_and_spent_budget(self):
+        state_path = self.root / "state.json"
+        argv = [
+            str(SCRIPT), "pipeline", "owner/repo#7", "--repo-root", str(self.repo),
+            "--state", str(state_path), "--pipeline-run", "1" * 32,
+            "--pipeline-iteration", "1", "--pipeline-max-iterations", "2",
+            "--github-mutation-policy", "allow", "--model", "sol",
+        ]
+        with (
+            mock.patch.object(MODULE.sys, "argv", argv),
+            mock.patch.object(MODULE, "fetch_reviews", side_effect=lambda *_: [{
+                "id": 123, "commit_id": self.head, "body": "",
+                "submitted_at": "2026-01-01T00:00:00Z", "state": "COMMENTED",
+                "user": {"login": "copilot-pull-request-reviewer[bot]"},
+            }]),
+            mock.patch.object(MODULE, "emit") as emitted,
+            mock.patch.object(MODULE, "request_copilot") as request,
+            mock.patch.object(MODULE, "run_local_decision_worker") as worker,
+            mock.patch.object(MODULE, "load_agent_task_result") as old_result,
+        ):
+            self.assertEqual(0, MODULE.main())
+            first = MODULE.load_state(state_path)
+            first["agent_task"] = {
+                "status": "completed", "run_id": "completed-task",
+                "model": MODULE.MODEL_ALIASES["sol"], "github_mutation_policy": "allow",
+                "task": {"state": "completed", "id": "task-1"},
+            }
+            first["history"] = [{"task_id": "task-1", "outcome": "published"}]
+            MODULE.charge_iteration(first)
+            MODULE.charge_iteration(first)
+            MODULE.save_state(state_path, first)
+            (self.repo / "code.txt").write_text("later stage\n", encoding="utf-8")
+            MODULE.git(self.repo, "commit", "-am", "Later stage fix")
+            self.head = MODULE.git(self.repo, "rev-parse", "HEAD")
+            self.pr["head_sha"] = self.head
+            argv[argv.index("--pipeline-iteration") + 1] = "2"
+            self.assertEqual(0, MODULE.main(), emitted.call_args.args[0])
+        second = MODULE.load_state(state_path)
+        self.assertEqual("cleared", emitted.call_args.args[0]["stage_outcome"])
+        self.assertEqual(self.head, second["clean_at_head_sha"])
+        self.assertEqual(2, second["iterations"])
+        self.assertEqual(first["history"], second["history"])
+        self.assertEqual([first["agent_task"]], second["managed_task_history"])
+        self.assertEqual((2, 2), MODULE.budget_spent(
+            second, MODULE.scoped_pipeline_budget(second, second["pipeline_budget"]), 0
+        ))
+        for key, value in first["budget_charges"].items():
+            self.assertEqual(value, second["budget_charges"][key])
+        request.assert_not_called()
+        worker.assert_not_called()
+        old_result.assert_not_called()
 
     def test_detached_standalone_wrong_head_and_dirty_checkouts_fail(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "requires a Pipeline"):

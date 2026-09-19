@@ -6205,7 +6205,8 @@ def command_pipeline(args: argparse.Namespace) -> None:
     args._pipeline = True
     commits: list[str] = []
     tasks: list[dict[str, Any]] = []
-    for _ in range(args.max_iterations):
+    for iteration in range(args.max_iterations):
+        args._pipeline_entry = iteration == 0
         result = command_agent_task(args)
         commits.extend(result.get("commits", []))
         if result.get("task"):
@@ -6252,7 +6253,10 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
         if (existing.get("pr") or {}).get("pr_url") != target["pr_url"]:
             raise WorkflowError("pipeline state belongs to a different pull request")
         active_task = existing.get("agent_task") or {}
-        if active_task.get("status") != "completed":
+        if (
+            active_task.get("status") != "completed"
+            or (active_task.get("task") or {}).get("state") != "completed"
+        ):
             raise WorkflowError(
                 "pipeline state is unfinished audit evidence; start a fresh run"
             )
@@ -6261,6 +6265,18 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
             raise WorkflowError("pipeline state belongs to a different run")
         if recorded_budget.get("max_iterations") != args.max_iterations:
             raise WorkflowError("pipeline review iteration budget changed")
+        if getattr(args, "_pipeline_entry", False):
+            previous_iteration = recorded_budget.get("iteration")
+            if (
+                type(previous_iteration) is not int
+                or not 1 <= previous_iteration < args.pipeline_iteration
+            ):
+                raise WorkflowError("pipeline state requires a later sweep in the same run")
+            if existing.get("repo_root") != str(repo_root):
+                raise WorkflowError("pipeline checkout identity changed")
+            if active_task.get("model") != requested_model:
+                raise WorkflowError("pipeline worker model changed")
+            require_retained_github_mutation_policy(active_task)
     retained_task = (
         existing.get("agent_task") if isinstance(existing, dict) else None
     )
@@ -6471,6 +6487,17 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
             else agent_task_preflight(repo_root, target)
         )
         pr = preflight["pr"]
+        if pipeline_mode and existing is not None and getattr(args, "_pipeline_entry", False):
+            if load_state(state_path) != existing:
+                raise WorkflowError("pipeline state changed during sweep preflight")
+            if any(
+                existing["pr"].get(field) != pr.get(field)
+                for field in (
+                    "repo_name", "number", "head_repository", "head_branch", "base_branch",
+                    "title", "body", "is_draft",
+                )
+            ):
+                raise WorkflowError("pipeline source identity changed")
         previous_clean_at_head_sha = None
         if existing is None:
             state = {

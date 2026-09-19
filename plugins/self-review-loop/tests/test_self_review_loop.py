@@ -2218,7 +2218,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.42")
+        self.assertEqual(plugin["version"], "1.3.43")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -4140,6 +4140,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         live = copy.deepcopy(self.preflight["pr"])
         identity = {**self.preflight["identity"], "branch": ""}
+        self.pipeline_live = live
+        self.pipeline_identity = identity
         commands, emitted = [], []
 
         def preflight(*args, **kwargs):
@@ -4187,6 +4189,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             return MODULE.subprocess.CompletedProcess(command, 0, "", "")
 
         with (
+            mock.patch.object(MODULE, "ACTIVE_GITHUB_MUTATION_POLICY", "allow"),
             mock.patch.object(MODULE, "require_tools"),
             mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
             mock.patch.object(MODULE, "agent_task_preflight", side_effect=preflight),
@@ -4240,6 +4243,116 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertEqual(3, len(commands))
             self.assertEqual(3, emitted[-1]["iterations"])
             self.assertEqual("max_iterations_reached", emitted[-1]["stage_outcome"])
+
+    def pipeline_cli(self, args):
+        argv = [str(SCRIPT), "pipeline", args.target]
+        for name in (
+            "state", "pipeline_run", "pipeline_iteration", "pipeline_max_iterations",
+            "max_iterations", "github_mutation_policy", "model",
+        ):
+            argv.extend(["--" + name.replace("_", "-"), str(getattr(args, name))])
+        with mock.patch.object(MODULE.sys, "argv", argv):
+            return MODULE.main()
+
+    def test_later_sweep_inspects_new_head_with_original_remaining_budget(self):
+        with self.pipeline_run() as (args, commands, emitted):
+            self.assertEqual(0, self.pipeline_cli(args))
+            first = MODULE.load_state(Path(args.state))
+            self.assertEqual(2, first["iterations"])
+            self.pipeline_live["head_sha"] = "9" * 40
+            self.pipeline_identity["head"] = "9" * 40
+            args.pipeline_iteration = 2
+            emitted.clear()
+            self.assertEqual(0, self.pipeline_cli(args))
+            second = MODULE.load_state(Path(args.state))
+            self.assertEqual(3, len(commands))
+            self.assertEqual(3, second["iterations"])
+            self.assertEqual(1, second["agent_task"]["allowed_iterations"])
+            self.assertEqual("9" * 40, second["agent_task"]["preflight"]["pr"]["head_sha"])
+            self.assertEqual("9" * 40, MODULE.recorded_clean_at_head_sha(second))
+            self.assertNotEqual(first["agent_task"]["run_id"], second["agent_task"]["run_id"])
+            self.assertNotIn("--resume", commands[-1])
+
+    def test_later_sweep_new_head_does_not_replenish_exhausted_budget(self):
+        with self.pipeline_run(max_iterations=2) as (args, commands, emitted):
+            self.assertEqual(0, self.pipeline_cli(args))
+            self.pipeline_live["head_sha"] = "9" * 40
+            self.pipeline_identity["head"] = "9" * 40
+            args.pipeline_iteration = 2
+            emitted.clear()
+            self.assertEqual(0, self.pipeline_cli(args))
+            state = MODULE.load_state(Path(args.state))
+            self.assertEqual(2, len(commands))
+            self.assertEqual(2, state["iterations"])
+            self.assertEqual("max_iterations_reached", emitted[-1]["stage_outcome"])
+            self.assertIsNone(MODULE.recorded_clean_at_head_sha(state))
+
+    def test_later_sweep_rejects_same_or_older_completed_sweep(self):
+        with self.pipeline_run(fixes=0) as (args, commands, emitted):
+            self.assertEqual(0, self.pipeline_cli(args))
+            completed = MODULE.load_state(Path(args.state))
+            for previous in (1, 2):
+                with self.subTest(previous=previous):
+                    del commands[1:]
+                    state = copy.deepcopy(completed)
+                    state["pipeline_budget"]["iteration"] = previous
+                    MODULE.save_state(Path(args.state), state)
+                    emitted.clear()
+                    self.assertEqual(1, self.pipeline_cli(args))
+                    self.assertEqual(1, len(commands))
+
+    def test_later_sweep_rejects_unowned_or_unfinished_terminal_state(self):
+        mutations = {
+            "foreign run": lambda state: state["pipeline_budget"].update(run="other"),
+            "changed cap": lambda state: state["pipeline_budget"].update(max_iterations=9),
+            "wrong checkout": lambda state: state.update(repo_root="other"),
+            "wrong PR": lambda state: state["pr"].update(pr_url="https://github.com/owner/repo/pull/8"),
+            "changed head ref": lambda state: state["pr"].update(head_branch="other"),
+            "changed head repo": lambda state: state["pr"].update(head_repository="fork/repo"),
+            "changed base ref": lambda state: state["pr"].update(base_branch="other"),
+            "policy changed": lambda state: state["agent_task"].update(github_mutation_policy="allow"),
+            "model changed": lambda state: state["agent_task"].update(model="gpt-6-astra"),
+            "active": lambda state: state["agent_task"].update(status="running"),
+            "interrupted": lambda state: state["agent_task"].update(status="preparing"),
+            "failed": lambda state: state["agent_task"].update(status="failed"),
+            "active child": lambda state: state["agent_task"]["task"].update(state="running"),
+        }
+        with self.pipeline_run(fixes=0) as (args, commands, emitted):
+            self.assertEqual(0, self.pipeline_cli(args))
+            completed = MODULE.load_state(Path(args.state))
+            args.pipeline_iteration = 2
+            self.pipeline_live["head_sha"] = "9" * 40
+            self.pipeline_identity["head"] = "9" * 40
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    state = copy.deepcopy(completed)
+                    mutate(state)
+                    MODULE.save_state(Path(args.state), state)
+                    before = Path(args.state).read_bytes()
+                    emitted.clear()
+                    self.assertEqual(1, self.pipeline_cli(args))
+                    self.assertEqual(before, Path(args.state).read_bytes())
+                    self.assertEqual(1, len(commands))
+
+    def test_later_sweep_rejects_state_changed_during_preflight(self):
+        with self.pipeline_run(fixes=0) as (args, commands, emitted):
+            self.assertEqual(0, self.pipeline_cli(args))
+            args.pipeline_iteration = 2
+            emitted.clear()
+            fresh_preflight = MODULE.agent_task_preflight.side_effect
+
+            def preflight(*values, **kwargs):
+                result = fresh_preflight(*values, **kwargs)
+                state = MODULE.load_state(Path(args.state))
+                state["pipeline_budget"]["iteration"] = 3
+                MODULE.save_state(Path(args.state), state)
+                return result
+
+            with mock.patch.object(MODULE, "agent_task_preflight", side_effect=preflight):
+                self.assertEqual(1, self.pipeline_cli(args))
+            self.assertEqual(1, len(commands))
+            self.assertIn("state changed", emitted[-1]["error"])
+            self.assertEqual(3, MODULE.load_state(Path(args.state))["pipeline_budget"]["iteration"])
 
     def test_pipeline_charges_one_iteration_per_candidate_until_fifth_clean_pass(self):
         with self.pipeline_run(fixes=4, max_iterations=5) as (args, commands, emitted):

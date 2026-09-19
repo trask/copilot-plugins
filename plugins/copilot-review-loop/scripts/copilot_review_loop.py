@@ -9205,6 +9205,56 @@ def rescope_prepared_publication(
     )
 
 
+def command_pipeline(args: argparse.Namespace) -> None:
+    if (
+        not args.target
+        or not args.state
+        or not args.pipeline_run
+        or not args.pipeline_iteration
+        or not args.pipeline_max_iterations
+        or not 1 <= args.pipeline_iteration <= args.pipeline_max_iterations
+    ):
+        raise WorkflowError("pipeline requires a target, state, and valid run position")
+    args._pipeline_entry = True
+    command_agent_task(args)
+
+
+def require_completed_pipeline_sweep(
+    state: dict[str, Any],
+    args: argparse.Namespace,
+    target: dict[str, Any],
+    repo_root: Path,
+) -> None:
+    scope = state.get("pipeline_budget") or {}
+    if state.get("budget_scope") != "pipeline" or scope.get("run") != args.pipeline_run:
+        raise WorkflowError("pipeline state belongs to a different run")
+    previous_iteration = scope.get("iteration")
+    if (
+        type(previous_iteration) is not int
+        or not 1 <= previous_iteration < args.pipeline_iteration
+    ):
+        raise WorkflowError("pipeline state requires a later sweep in the same run")
+    if state.get("repo_root") != str(repo_root):
+        raise WorkflowError("pipeline checkout identity changed")
+    if state.get("github_mutation_policy") != ACTIVE_GITHUB_MUTATION_POLICY:
+        raise WorkflowError("pipeline GitHub mutation policy changed")
+    if state.get("terminal_exit") is not None:
+        raise WorkflowError("pipeline state has an interrupted or failed coordinator")
+    detail = terminal_agent_task_clearance_error(state, target)
+    if detail is not None:
+        raise WorkflowError(detail)
+    task = state.get("agent_task")
+    if isinstance(task, dict):
+        if task.get("model") != MODEL_ALIASES[args.model]:
+            raise WorkflowError("pipeline worker model changed")
+        require_retained_github_mutation_policy(task)
+        if task.get("task") is not None and (
+            not isinstance(task["task"], dict)
+            or task["task"].get("state") != "completed"
+        ):
+            raise WorkflowError("pipeline state still owns an unfinished task")
+
+
 def command_agent_task(args: argparse.Namespace) -> None:
     global ACTIVE_GITHUB_MUTATION_POLICY
 
@@ -9291,6 +9341,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
     require_outside_repository(state_path, repo_root)
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
+    previous_sweep = None
+    if getattr(args, "_pipeline_entry", False):
+        args._pipeline_entry = False
+        if existing is not None:
+            require_completed_pipeline_sweep(existing, args, target, repo_root)
+            previous_sweep = existing
     retained_task = (
         existing.get("agent_task") if isinstance(existing, dict) else None
     )
@@ -9747,6 +9803,25 @@ def command_agent_task(args: argparse.Namespace) -> None:
             state_path=state_path,
         )
         existing = load_state(state_path) if state_path.is_file() else None
+        if previous_sweep is not None:
+            if existing != previous_sweep:
+                raise WorkflowError("pipeline state changed during sweep preflight")
+            previous_skip = previous_sweep.get("policy_skip")
+            if (
+                preflight["repository_root"] != str(repo_root)
+                or (
+                    isinstance(previous_skip, dict)
+                    and previous_skip["viewer_login"] != preflight["viewer"]["login"]
+                )
+                or any(
+                    existing["pr"].get(field) != preflight["pr"].get(field)
+                    for field in (
+                        "repo_name", "number", "head_repository", "head_branch",
+                        "base_branch", "title", "body", "is_draft",
+                    )
+                )
+            ):
+                raise WorkflowError("pipeline source identity changed")
         require_no_credentials(
             json.dumps(preflight, ensure_ascii=False, sort_keys=True),
             source="Agent Task preflight",
@@ -9759,7 +9834,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 repo_root, target, allow_detached=bool(args.pipeline_run)
             )
             clean_head = empty_queue_clearance_head(
-                existing, preflight, confirmation, target,
+                None if previous_sweep is not None else existing,
+                preflight, confirmation, target,
                 allow_detached=bool(args.pipeline_run),
             )
         elif (
@@ -9773,7 +9849,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 sha256_file(state_path) if existing is not None else None
             )
             policy_skip_head = source_only_policy_skip_head(
-                existing,
+                None if previous_sweep is not None else existing,
                 preflight,
                 confirmation,
                 target,
@@ -9782,6 +9858,14 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 pipeline_iteration=getattr(args, "pipeline_iteration", None),
             )
         if policy_skip_head is not None:
+            if previous_sweep is not None and (
+                existing.get("agent_task") is not None
+                or any(
+                    existing.get(field) not in (None, [])
+                    for field in ("history", "managed_task_history", "local_validation")
+                )
+            ):
+                raise WorkflowError("source-only policy skip cannot discard review work")
             state = record_source_only_policy_skip(
                 existing,
                 preflight=preflight,
@@ -9831,11 +9915,16 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     for item in history
                 ):
                     history.append(active)
+        if previous_sweep is not None:
+            state.pop("policy_skip", None)
+            state.pop("coordinator", None)
+            state["clean_at_head_sha"] = None
         historical_fixes = historical_source_fixes(state, preflight, repo_root)
         if historical_fixes is not None:
             preflight["historical_fixes"] = historical_fixes
         state["repo_root"] = str(repo_root)
         state["pr"] = pr
+        state["github_mutation_policy"] = ACTIVE_GITHUB_MUTATION_POLICY
         state["queue"] = {
             "id": f"pr-{pr['number']}",
             "status": "active",
@@ -11873,7 +11962,10 @@ def main() -> int:
                 f"legacy command {args.command!r} is disabled; start a fresh "
                 "agent-task invocation"
             )
-        args.function(args)
+        if args.command == "pipeline":
+            command_pipeline(args)
+        else:
+            args.function(args)
         if args.command in {"agent-task", "pipeline"}:
             require_terminal_agent_task_clearance(args)
         return 0
