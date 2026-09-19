@@ -352,9 +352,9 @@ class StackPublicationTest(unittest.TestCase):
                 "preflight": {
                     "repository_root": str(self.workspace),
                     "stack_request": self.request,
-                    "request": {},
+                    "request": {"pull_request": {"number": 12}},
                 },
-                "code_refs": [{"lease_sha": "old", "new_sha": "new"}],
+                "code_refs": [{"pr_number": 12, "lease_sha": "old", "new_sha": "new"}],
                 "push_command": ["git", "push", "unselected"],
             },
         }

@@ -7075,6 +7075,18 @@ def cleared_head_sha(state: dict[str, Any] | None) -> str | None:
     """
     if not state or state.get("escalation"):
         return None
+    task = state.get("agent_task") or {}
+    if task.get("code_refs"):
+        try:
+            if (
+                task.get("status") != "completed"
+                or task.get("publication") is None
+                or task["publication"] != published_conflict_snapshot(task, state["pr"])
+                or task["publication"]["mergeability"] != "mergeable"
+            ):
+                return None
+        except (WorkflowError, KeyError, TypeError):
+            return None
     attempt = state.get("attempt") or {}
     marker = attempt.get("mergeable_at_head_sha")
     if not marker:
@@ -7121,6 +7133,22 @@ def stage_outcome(state: dict[str, Any] | None) -> str | None:
         return None
     if state.get("escalation"):
         return "escalated"
+    task = state.get("agent_task") or {}
+    if task.get("status") in {
+        "failed", "interrupted", "replacement_rejected", "normalization_required",
+    }:
+        return "escalated"
+    if task.get("code_refs"):
+        if task.get("status") != "completed":
+            return None
+        if task.get("publication") is None:
+            return None
+        try:
+            if task["publication"] != published_conflict_snapshot(task, state["pr"]):
+                return "escalated"
+        except (WorkflowError, KeyError, TypeError):
+            return "escalated"
+        return "cleared" if cleared_head_sha(state) else "completed"
     status = (state.get("attempt") or {}).get("status")
     if status not in RECORDED_ENDINGS:
         return None
@@ -9455,6 +9483,48 @@ def remote_publication_heads(
     return [remote_head(owner, repo, request["pull_request"]["head_ref"])]
 
 
+def published_conflict_snapshot(
+    task: dict[str, Any], metadata: dict[str, Any],
+) -> dict[str, Any]:
+    preflight = task["preflight"]
+    request = preflight["request"]
+    refs = task["code_refs"]
+    invoked = next(
+        (item for item in refs if item["pr_number"] == request["pull_request"]["number"]),
+        None,
+    )
+    if invoked is None or (
+        metadata["head_sha"] != invoked["new_sha"]
+        or metadata["base_sha"] != invoked["base_sha"]
+        or task.get("published_heads") != [item["new_sha"] for item in refs]
+    ):
+        raise WorkflowError("published conflict head, base, or member identity changed")
+    authorization = preflight.get("stack_request")
+    return {
+        "request_id": request["request_id"],
+        "request_sha256": request_digest(request),
+        "repository": request["repository"],
+        "invoked_pr": request["pull_request"]["number"],
+        "members": [
+            {
+                "number": item["pr_number"], "head_sha": item["new_sha"],
+                "base_sha": item["base_sha"], "source_head_sha": item["lease_sha"],
+            }
+            for item in refs
+        ],
+        "stack_authorization": (
+            {
+                "request_sha256": authorization["request_sha256"],
+                "owner": authorization["owner"],
+                "selected": authorization["selected"],
+                "topology_fingerprint": authorization["topology_fingerprint"],
+            }
+            if authorization is not None else None
+        ),
+        "mergeability": classify_mergeability(metadata, expected_head=invoked["new_sha"]),
+    }
+
+
 def publish_conflict_result(
     state_path: Path,
     state: dict[str, Any],
@@ -9463,6 +9533,15 @@ def publish_conflict_result(
     preflight = task["preflight"]
     request = preflight["request"]
     code_refs = task["code_refs"]
+    invoked = next(
+        (
+            item for item in code_refs
+            if item["pr_number"] == request["pull_request"]["number"]
+        ),
+        None,
+    )
+    if invoked is None:
+        raise WorkflowError("verified conflict members do not include the invoked pull request")
     repo_root = Path(preflight["repository_root"])
     require_clean_worktree(repo_root)
     require_no_integration_in_progress(repo_root)
@@ -9509,42 +9588,24 @@ def publish_conflict_result(
         pushed = True
     if not pushed:
         raise WorkflowError("publication could not be verified")
-    refreshed = metadata_for(parse_target(request["pull_request"]["url"]))
-    invoked = next(
-        (
-            item
-            for item in code_refs
-            if item["pr_number"] == request["pull_request"]["number"]
-        ),
-        code_refs[-1],
+    refreshed = live_mergeability(
+        parse_target(request["pull_request"]["url"]), expected_head=invoked["new_sha"]
     )
     if refreshed["head_sha"] != invoked["new_sha"]:
-        time.sleep(PR_HEAD_LAG_RETRY_DELAY)
-        refreshed = metadata_for(parse_target(request["pull_request"]["url"]))
-    if refreshed["head_sha"] != invoked["new_sha"]:
         raise WorkflowError("pull request head did not reach the published commit")
-    task["status"] = "completed"
+    task["status"] = "published_pending_verification"
     task["published_heads"] = expected_new
     task["published_at"] = utc_now()
     state["pr"] = refreshed
     state["last_result"] = "published"
     state["attempts"] = int(state.get("attempts", 0))
     save_state(state_path, state)
-    for role in [item["role"] for item in code_refs] + ["artifact"]:
-        git_try(repo_root, "update-ref", "-d", quarantine_ref(request["request_id"], role))
-    for member in task.get("artifact", {}).get("members", []):
-        git_try(
-            repo_root, "update-ref", "-d",
-            quarantine_ref(request["request_id"], f"artifact-member-{member['pr_number']}"),
-        )
-    for file_name in task.get("recovery_files") or []:
-        try:
-            Path(file_name).unlink(missing_ok=True)
-        except OSError:
-            pass
     mergeability = classify_mergeability(
         refreshed, expected_head=invoked["new_sha"]
     )
+    publication = published_conflict_snapshot(task, refreshed)
+    if preflight.get("stack_request") is not None:
+        require_stack_request_owner(preflight["stack_request"])
     if request["strategy"] == "native-stack":
         record_stack_member_clearances(
             state,
@@ -9558,7 +9619,38 @@ def publish_conflict_result(
             ],
             request["pull_request"]["number"],
         )
+    if preflight.get("stack_request") is not None:
+        require_stack_request_owner(preflight["stack_request"])
+    if remote_publication_heads(request, code_refs) != expected_new:
+        raise WorkflowError("published conflict member heads changed before completion")
+    archive_attempt(state)
+    state["attempt"] = {
+        "id": f"pr-{refreshed['number']}-attempt-{state['attempts']}",
+        "attempt_number": state["attempts"],
+        "status": "published",
+        "strategy": request["strategy"],
+        "head_sha": request["pull_request"]["head_sha"],
+        "base_sha": refreshed["base_sha"],
+        "published_head_sha": invoked["new_sha"],
+        "mergeable_at_head_sha": (
+            invoked["new_sha"] if mergeability == "mergeable" else None
+        ),
+    }
+    task["publication"] = publication
+    task["status"] = "completed"
     save_state(state_path, state)
+    for role in [item["role"] for item in code_refs] + ["artifact"]:
+        git_try(repo_root, "update-ref", "-d", quarantine_ref(request["request_id"], role))
+    for member in task.get("artifact", {}).get("members", []):
+        git_try(
+            repo_root, "update-ref", "-d",
+            quarantine_ref(request["request_id"], f"artifact-member-{member['pr_number']}"),
+        )
+    for file_name in task.get("recovery_files") or []:
+        try:
+            Path(file_name).unlink(missing_ok=True)
+        except OSError:
+            pass
     return {
         "result": "published",
         "state": str(state_path),
@@ -9567,7 +9659,7 @@ def publish_conflict_result(
         "previous_head_sha": request["pull_request"]["head_sha"],
         "published_heads": expected_new,
         "mergeability": mergeability,
-        "stage_outcome": "completed",
+        "stage_outcome": stage_outcome(state),
     }
 
 

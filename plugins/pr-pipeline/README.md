@@ -11,7 +11,7 @@ flowchart LR
     subgraph pipeline["Five-stage pipeline"]
         direction TB
         conflict["1. Conflict Resolver<br/>result v5, receipt v3<br/>marketplace-conflict-worker@9"]
-        copilotReview["2. Copilot Review<br/>local result v3, decision report v2<br/>marketplace-local-review-decision-worker@3"]
+        copilotReview["2. Copilot Review<br/>hosted Runtime result v5<br/>code-candidate@1"]
         selfReview["3. Self Review<br/>coordinator report v3<br/>code candidate policy @1"]
         ci["4. CI Fix<br/>coordinator report v7, receipt v3<br/>code candidate policy @1"]
         description["5. PR Description<br/>proposal v3<br/>report recommendation policy @1"]
@@ -44,6 +44,10 @@ Both the standalone terminal summary and the entire watch response fit within 8,
 
 Stack Pipeline uses the same rules. Each run has its own scheduler state, monitor handle, stage state files, worker records, and worktrees. A stack-wide lock permits one active owner for the selected suffix, but no new run resumes or imports a sealed run. Each worker request binds one run ID, nonce, head, base, and role. Native-stack Conflict Resolver runs one task per member in order, collecting committed code only from each task's authoritative generated branch.
 
+Stack worker cleanup removes only clean, owned worktrees through ordinary `git worktree remove`. Dirty worktrees, unreadable status, and removal failures retain the workspace and ownership record. The full `result.json` lists retained paths and reasons under `pipeline_result.cleanup`; it also preserves each worker's stage-result evidence under `pipeline_result.pull_requests`. Retention does not authorize replay, publication, or a replacement worker.
+
+An exit code of zero and changed heads do not establish conflict-stage completion. Conflict Resolver must record a terminal outcome before Stack Pipeline starts review. A recorded `completed` outcome without current clearance can continue the bounded pass, but cannot clear the conflict stage or make the final snapshot complete. An absent outcome blocks with `conflict_did_not_record_outcome`.
+
 Only a full native-stack selection authorizes `--whole-stack` conflict publication. A partial suffix never launches the conflict coordinator. Fresh GitHub mergeability clears each selected member only at its exact head and base. Conflicting, unknown, or stale metadata blocks rather than changing an unselected prefix.
 
 Both CI push propagation and predecessor alignment pass a versioned `--stack-request` and explicit run-scoped `--state` to Conflict Resolver. The request binds the active owner, original selected order and topology, fixed PR/head, canonical repository, and current source heads. Full-stack conflict dispatch carries the same authorization. New members, reordered or removed members, changed refs, or changed source heads block before hosted work and before publication.
@@ -58,7 +62,7 @@ Hosted workers use `.github/agent-task-output/`.
 - Self Review and CI Fix consume Runtime result v5 and candidate manifest v1. The coordinators derive commit parents, trees, patch digests, changed paths, and the code tip.
 - Conflict Resolver consumes result v5 and receipt v3. Its coordinator derives each member's candidate tip, replayed history, fix commits, changed paths, and publication mapping from Git before approving the atomic push.
 - PR Description requires `.github/agent-task-output/title.txt` and `.github/agent-task-output/body.md`. An optional `report.md` remains inert.
-- Copilot Review uses request-bound opaque finding IDs. The local coordinator derives all source and GitHub evidence.
+- Copilot Review consumes pinned Runtime `code-candidate@1` result v5. The hosted task produces at most one code commit and a separate `review-decisions.json` artifact using request-bound opaque finding IDs. The controller uses the pinned Runtime Git history verifier and independently checks candidate, task, session, model, prompt, and finding identity. Local source and GitHub snapshots must remain unchanged until code-only import. The local controller handles identity, guards, import, and publication, not semantic review.
 
 No stage trusts model-authored explanations, identities, SHAs, paths, mappings, validation claims, or canonical reports.
 
@@ -67,7 +71,7 @@ No stage trusts model-authored explanations, identities, SHAs, paths, mappings, 
 | Stage | Clearance rule |
 | --- | --- |
 | Conflict Resolver | A mechanically valid result names the current head and base, or GitHub already reports the pull request mergeable. Optional report prose does not matter. |
-| Copilot Review | The minimized local decision result clears the current head. Under `source-only`, a verified run-bound policy skip is clear with `clean_at_head_sha` set to `null`. |
+| Copilot Review | The controller's current-head review marker clears the stage after verified hosted candidate handling. A hosted decision artifact alone cannot clear the stage. Under `source-only`, a verified run-bound policy skip is clear with `clean_at_head_sha` set to `null`. |
 | Self Review | Terminal candidate handling clears the current head. Zero code commits means clean with no fixes. Imported commits advance the source only through the helper's exact source and publication guards. |
 | CI Fix | Candidate publication is pending. Only trusted GitHub checks and statuses bound to the exact published source SHA can record green. A coordinator-verified diagnosis of unrelated or pre-existing failures can instead clear orchestration with CI warnings at the exact head and base, never a clean marker. Unknown failures remain uncleared. The coordinator uses bounded polling and never runs candidate Gradle, Maven, tests, or builds locally. |
 | PR Description | A keep result clears without mutation. A replacement applies only when GitHub mutation policy is `allow`. Under `source-only`, the helper keeps the proposal but does not change title or body, so the stage remains uncleared. |

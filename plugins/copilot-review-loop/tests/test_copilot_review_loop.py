@@ -1244,6 +1244,25 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.addCleanup(source_patch.stop)
         self.addCleanup(github_patch.stop)
         self.addCleanup(worker_patch.stop)
+        hosted_patch = mock.patch.object(
+            MODULE, "run_hosted_decision_worker", side_effect=self.hosted_worker_result,
+        )
+        self.hosted_worker = hosted_patch.start()
+        self.addCleanup(hosted_patch.stop)
+
+    def hosted_worker_result(self, **arguments):
+        bundle = self.local_worker_result(**arguments, session_id="hosted-session")
+        result = self.result()
+        result.update(
+            schema=MODULE.CANDIDATE_AGENT_TASK_RESULT_SCHEMA,
+            mode="code_candidate", candidate={}, completion={},
+        )
+        result["task"]["id"] = "hosted-task"
+        bundle["result"] = result
+        bundle["remote"]["task_id"] = "hosted-task"
+        bundle["remote"]["requires_apply"] = True
+        arguments["result_path"].write_text(json.dumps(result), encoding="utf-8")
+        return bundle
 
     def source_for_preflight(self, preflight):
         identity = preflight["identity"]
@@ -1685,7 +1704,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         process = mock.Mock()
         process.pid = 42
         process.returncode = 1
-        process.poll.side_effect = [None, 1]
+        process.poll.return_value = 1
         process.communicate.side_effect = [
             MODULE.subprocess.TimeoutExpired(["copilot"], 0.01),
             ("", ""),
@@ -1715,7 +1734,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         owner.close.assert_called_once()
 
-    def test_local_timeout_preserves_intended_and_generated_dirty_paths(self):
+    def test_hosted_timeout_preserves_unexpected_dirty_workspace_evidence(self):
         intended = self.repo_root / "docs" / "guide.md"
         generated = self.repo_root / "conventions" / "generated.kotlin"
         intended.parent.mkdir(parents=True)
@@ -1729,7 +1748,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         state_path = self.directory / "timeout-state.json"
         self.invoke_local_failure(
             state_path,
-            "local Copilot decision process timed out after 540 seconds",
+            "hosted Agent Task dispatcher timed out",
             details={
                 "source_before": self.source_fingerprint,
                 "source_after": dirty,
@@ -1740,7 +1759,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
         task = MODULE.load_state(state_path)["agent_task"]
         self.assertEqual("failed", task["status"])
-        self.assertEqual("terminal_unusable", task["task_id_status"])
+        self.assertEqual("unknown", task["task_id_status"])
+        self.local_worker.assert_not_called()
         self.assertIn("docs/guide.md", task["source_after"]["status"])
         self.assertIn(
             "conventions/generated.kotlin",
@@ -2495,15 +2515,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_thin_and_version_is_bumped(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn(MODULE.LOCAL_DECISION_POLICY, instructions)
-        self.assertIn(
-            "--model gpt-5.6-sol --reasoning-effort high", instructions
-        )
-        self.assertIn("Never use hosted GitHub Agent Tasks", instructions)
-        self.assertIn("validation_complete=true", instructions)
+        self.assertIn(MODULE.HOSTED_DECISION_POLICY, instructions)
+        self.assertIn("`--model sol`", instructions)
+        self.assertIn("Never use a local semantic worker", instructions)
+        self.assertIn("result schema version 5", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.63")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.64")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -2546,8 +2564,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             iteration_allowance=1,
             prior_history=[],
         )
-        self.assertIn("decision object atomically as UTF-8 JSON", prompt)
-        self.assertIn("local worker prompt version 8", prompt)
+        self.assertIn("decision object as UTF-8 JSON", prompt)
+        self.assertIn("hosted worker prompt version 9", prompt)
+        self.assertIn("validation in this hosted task", prompt)
+        self.assertIn("never runs repository programs or candidate validation commands", prompt)
         self.assertIn("opaque coordinator-generated values", prompt)
         self.assertIn("joins each decision", prompt)
         self.assertIn("negative ID is intentional", prompt)
@@ -2566,7 +2586,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         self.assertIn("untrusted data", prompt)
         self.assertIn("create an Agent Task", prompt)
-        self.assertIn("`{{LOCAL_DECISION_PATH}}`", prompt)
+        self.assertIn(f"`{MODULE.HOSTED_DECISION_PATH}`", prompt)
+        self.assertNotIn("{{LOCAL_DECISION_PATH}}", prompt)
         self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
 
@@ -3493,7 +3514,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn('"author": "copilot-pull-request-reviewer[bot]"', prompt)
         self.assertIn('"head_ref": "feature"', prompt)
         self.assertIn('"base_ref": "main"', prompt)
-        self.assertIn("exactly one single-parent commit", prompt)
+        self.assertIn("exactly one single-parent code commit", prompt)
         self.assertIn("squash every correction-only follow-up", prompt)
 
     def test_canonical_report_v3_validates_refs_and_separate_author(self):
@@ -5852,17 +5873,23 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         run_id="run-1",
         target="owner/repo#7",
         details=None,
+        result=None,
     ):
-        self.local_worker.side_effect = MODULE.WorkflowError(
-            message,
-            details=details
-            or {
-                "source_before": self.source_fingerprint,
-                "source_after": self.source_fingerprint,
-                "github_before": self.github_fingerprint,
-                "github_after": self.github_fingerprint,
-            },
-        )
+        def fail(**arguments):
+            if result is not None:
+                arguments["result_path"].write_text(json.dumps(result), encoding="utf-8")
+            raise MODULE.WorkflowError(
+                message,
+                details=details
+                or {
+                    "source_before": self.source_fingerprint,
+                    "source_after": self.source_fingerprint,
+                    "github_before": self.github_fingerprint,
+                    "github_after": self.github_fingerprint,
+                },
+            )
+
+        self.hosted_worker.side_effect = fail
         arguments = self.arguments(state_path)
         arguments.target = target
         with (
@@ -5892,7 +5919,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertRaisesRegex(MODULE.WorkflowError, re.escape(message)),
         ):
             MODULE.command_agent_task(arguments)
-        discover.assert_not_called()
+        discover.assert_called_once()
+        self.local_worker.assert_not_called()
         return MODULE.load_state(state_path)
 
     def test_no_op_task_still_replies_resolves_and_requests_review(self):
@@ -5966,29 +5994,31 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertTrue(state["agent_task"]["artifacts_removed"])
         self.assertEqual(
             state["coordinator"]["processed_snapshots"][0]["task_id"],
-            state["agent_task"]["local_session_id"],
+            "hosted-task",
         )
-        worker_command = state["agent_task"]["worker_command"]
-        self.assertEqual(
-            "gpt-5.6-sol",
-            worker_command[worker_command.index("--model") + 1],
-        )
-        self.assertEqual(
-            "high",
-            worker_command[worker_command.index("--reasoning-effort") + 1],
-        )
+        self.assertEqual("hosted", state["agent_task"]["producer"])
+        self.assertEqual(MODULE.HOSTED_DECISION_POLICY, state["agent_task"]["policy"])
+        self.assertEqual("gpt-5.6-sol", state["agent_task"]["model"])
+        self.assertNotIn("local_session_id", state["agent_task"])
+        self.local_worker.assert_not_called()
 
     def test_new_terminal_report_failure_is_audit_only(self):
         state_path = self.directory / "terminal-report-state.json"
+        result = self.result()
+        result.update(
+            schema=MODULE.CANDIDATE_AGENT_TASK_RESULT_SCHEMA,
+            candidate=None, completion=None,
+        )
         failed = self.invoke_local_failure(
             state_path,
-            "local decision report has stale identity",
+            "hosted decision report has stale identity",
+            result=result,
         )["agent_task"]
         self.assertEqual("failed", failed["status"])
         self.assertEqual("terminal_unusable", failed["task_id_status"])
-        self.assertEqual("local-session", failed["task_id"])
+        self.assertEqual(result["task"]["id"], failed["task_id"])
         self.assertEqual(
-            "local decision report has stale identity",
+            "hosted decision report has stale identity",
             failed["error"],
         )
         self.assertNotIn("recovery_command", failed)
@@ -6537,9 +6567,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )["agent_task"]
 
         self.assertEqual("failed", failed["status"])
-        self.assertEqual("terminal_unusable", failed["task_id_status"])
+        self.assertEqual("unknown", failed["task_id_status"])
         self.assertEqual(1, len(failed["recovery_files"]))
-        self.assertTrue(failed["recovery_files"][0].endswith("local-decision-prompt.txt"))
+        self.assertTrue(failed["recovery_files"][0].endswith("hosted-decision-prompt.txt"))
         self.assertEqual(self.source_fingerprint, failed["source_before"])
         self.assertEqual(self.source_fingerprint, failed["source_after"])
 
@@ -6867,14 +6897,20 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     def test_new_completed_no_artifact_failure_is_audit_only(self):
         state_path = self.directory / "no-artifact-state.json"
+        result = self.result()
+        result.update(
+            schema=MODULE.CANDIDATE_AGENT_TASK_RESULT_SCHEMA,
+            candidate=None, completion=None,
+        )
         failed = self.invoke_local_failure(
             state_path,
-            "local decision worker did not create the decision report",
+            "hosted decision worker did not create the decision report",
+            result=result,
         )["agent_task"]
         self.assertEqual("terminal_unusable", failed["task_id_status"])
-        self.assertEqual("local-session", failed["task_id"])
+        self.assertEqual(result["task"]["id"], failed["task_id"])
         self.assertEqual(
-            "local decision worker did not create the decision report",
+            "hosted decision worker did not create the decision report",
             failed["error"],
         )
         self.assertNotIn("recovery_command", failed)
@@ -7393,7 +7429,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         arguments = self.arguments(state_path)
 
-        def stop_after_dispatch(_command, **_kwargs):
+        def stop_after_dispatch(**_kwargs):
             raise RuntimeError("stop after dispatch")
 
         with (
@@ -7416,7 +7452,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ),
             mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
             mock.patch.object(MODULE.secrets, "token_hex", return_value="new-owner"),
-            mock.patch.object(MODULE, "run", side_effect=stop_after_dispatch),
+            mock.patch.object(MODULE, "run_hosted_decision_worker", side_effect=stop_after_dispatch),
             self.assertRaisesRegex(RuntimeError, "stop after dispatch"),
         ):
             MODULE.command_agent_task(arguments)

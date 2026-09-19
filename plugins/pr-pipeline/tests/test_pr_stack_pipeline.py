@@ -825,6 +825,102 @@ class StackRunTest(StackFixture):
             "description_did_not_record_outcome", result["stopped"]["reason"]
         )
 
+    def test_conflict_head_movement_without_terminal_outcome_blocks_review(self):
+        self.stack = stack(members=(11, 12))
+        status_path = str(self.root / "conflict-state.json")
+        self.inspect_sequences[(11, MODULE.STAGE_CONFLICT)] = [
+            {},
+            {
+                "outcome": None,
+                "reason": "not_cleared",
+                "status_state": status_path,
+                "status": {"agent_task": {"status": "completed"}},
+            },
+        ]
+
+        def publish_heads(_request):
+            self.stack["members"][0]["head_sha"] = "a" * 40
+            self.stack["members"][1]["head_sha"] = "c" * 40
+
+        self.launcher.on_start = publish_heads
+        pipeline = self.pipeline(kickoff([11, 12]))
+
+        result = pipeline.execute()
+
+        self.assertEqual("blocked", result["result"])
+        self.assertEqual("conflict_did_not_record_outcome", result["reason"])
+        self.assertEqual(
+            [MODULE.STAGE_CONFLICT],
+            [request["stage"] for request in self.launcher.started],
+        )
+        recorded = COMMON.read_json(pipeline.result_path)["pipeline_result"]
+        stage = recorded["pull_requests"]["11"]["stages"][MODULE.STAGE_CONFLICT]
+        self.assertEqual(head_of(11), stage["dispatched_head_sha"])
+        self.assertEqual("a" * 40, stage["current_head_sha"])
+        self.assertFalse(stage["clear"])
+        self.assertEqual(status_path, stage["stage_result"]["status_state"])
+        self.assertEqual(
+            {"status": "completed"}, stage["stage_result"]["agent_task"]
+        )
+
+    def test_completed_uncleared_conflict_can_continue_without_claiming_clearance(self):
+        self.stack = stack(members=(11,))
+        self.clear_everything()
+        self.clear.remove((11, MODULE.STAGE_CONFLICT))
+        self.completed.add((11, MODULE.STAGE_CONFLICT))
+        pipeline = self.pipeline(kickoff([11]))
+
+        result = pipeline.execute()
+
+        self.assertEqual("partial", result["result"])
+        self.assertEqual(2, result["passes"])
+        self.assertTrue(any(
+            request["stage"] == MODULE.STAGE_COPILOT_REVIEW
+            for request in self.launcher.started
+        ))
+        self.assertFalse(result["phases"][0]["clear"])
+        self.assertEqual(["completed"], result["phases"][0]["reasons"])
+        self.assertIn(
+            MODULE.STAGE_CONFLICT, result["snapshot"]["pull_requests"][0]["uncleared"]
+        )
+
+    def test_conflict_clearance_requires_terminal_outcome_and_exact_head_and_base(self):
+        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT]
+        target = COMMON.target_for("owner/repo", 11)
+        current = {
+            "stage_outcome": "cleared",
+            "mergeable_at_head_sha": head_of(11),
+            "attempt": {"base_sha": BASE},
+        }
+        cases = [
+            (current, True, None),
+            ({**current, "stage_outcome": None}, False, "not_cleared"),
+            (
+                {**current, "mergeable_at_head_sha": "a" * 40},
+                False,
+                "clearance_is_for_an_older_head",
+            ),
+            (
+                {**current, "attempt": {"base_sha": "c" * 40}},
+                False,
+                "clearance_is_for_an_older_base",
+            ),
+        ]
+        for payload, clear, reason in cases:
+            with self.subTest(reason=reason), mock.patch.object(
+                MODULE,
+                "read_stage_status",
+                return_value={
+                    "ok": True,
+                    "installed": True,
+                    "state": str(self.root / "conflict-state.json"),
+                    "payload": payload,
+                },
+            ):
+                result = MODULE.inspect_stage(entry, target, head_of(11), BASE)
+                self.assertEqual(clear, result["clear"])
+                self.assertEqual(reason, result["reason"])
+
     def test_stale_clearance_is_collected_but_not_reported_complete(self):
         self.stack = stack(members=(11,))
         old_head = "9" * 40
@@ -1844,6 +1940,95 @@ class StackRunTest(StackFixture):
             result["cleanup"],
         )
 
+    def test_failed_review_replay_retains_dirty_workspace_and_result_evidence(self):
+        self.stack = stack(members=(11, 12))
+        pipeline = self.pipeline(kickoff([11, 12]))
+        with mock.patch.object(MODULE, "WINDOWS_WORKTREE_PATH_BUDGET", 4096):
+            cleaner = MODULE.WorkerLauncher(
+                repo_root=self.root / "repo",
+                repository="owner/repo",
+                run_id=pipeline.run_id,
+                run_directory=pipeline.run_directory,
+                worktree_root=self.root / "worktrees",
+                models=COMMON.stage_models(None),
+                effort="high",
+            )
+        paths = {
+            number: MODULE.worktree_path(cleaner.worktree_root, number)
+            for number in (11, 12)
+        }
+        records = {}
+        for number, path in paths.items():
+            path.mkdir(parents=True)
+            records[number] = MODULE.worktree_ownership_path(
+                cleaner.run_directory, number
+            )
+            COMMON.write_json_atomically(
+                records[number], {"run_id": pipeline.run_id, "path": str(path)}
+            )
+        evidence = paths[11] / "unfinished.txt"
+        evidence.write_bytes(b"synthetic unfinished change\n")
+        original_record = records[11].read_bytes()
+        task = {
+            "status": "failed",
+            "error": "local decision process timed out after 540 seconds",
+            "source_before": {"head": head_of(11), "status": ""},
+            "source_after": {
+                "head": head_of(11), "status": " M unfinished.txt",
+                "worktree": str(paths[11]),
+            },
+        }
+        self.inspect_sequences[(11, MODULE.STAGE_COPILOT_REVIEW)] = [
+            {},
+            {"outcome": "escalated", "reason": "escalated", "status": {"agent_task": task}},
+        ]
+        self.clear.add((12, MODULE.STAGE_COPILOT_REVIEW))
+
+        def replay_git(command, *, check):
+            self.assertFalse(check)
+            self.assertNotIn("--force", command)
+            if command[3] == "status":
+                output = " M unfinished.txt\n" if command[2] == str(paths[11]) else ""
+            else:
+                self.assertEqual(
+                    ["git", "-C", str(cleaner.repo_root), "worktree", "remove", str(paths[12])],
+                    command,
+                )
+                paths[12].rmdir()
+                output = ""
+            return subprocess.CompletedProcess(command, 0, output, "")
+
+        with (
+            mock.patch.object(
+                self.launcher, "wait",
+                side_effect=lambda worker: {"returncode": 1 if worker["number"] == 11 else 0},
+            ),
+            mock.patch.object(self.launcher, "cleanup", side_effect=cleaner.cleanup),
+            mock.patch.object(COMMON, "run", side_effect=replay_git),
+        ):
+            phase = pipeline.run_parallel_phase(
+                MODULE.STAGE_COPILOT_REVIEW, 1, self.stack["members"]
+            )
+            result = pipeline.finish(
+                "blocked", reason=phase["stopped"]["reason"], phases=[phase]
+            )
+
+        self.assertEqual("stage_execution_failed", result["reason"])
+        self.assertEqual("preserved", result["cleanup"][0]["result"])
+        self.assertEqual("worktree_is_dirty", result["cleanup"][0]["reason"])
+        self.assertEqual(str(paths[11]), result["cleanup"][0]["worktree"])
+        self.assertEqual(str(records[11]), result["cleanup"][0]["ownership_record"])
+        self.assertEqual({"number": 12, "result": "removed"}, result["cleanup"][1])
+        self.assertEqual(b"synthetic unfinished change\n", evidence.read_bytes())
+        self.assertEqual(original_record, records[11].read_bytes())
+        saved = COMMON.read_json(pipeline.result_path)["pipeline_result"]
+        self.assertEqual(result["cleanup"], saved["cleanup"])
+        stage = saved["pull_requests"]["11"]["stages"][MODULE.STAGE_COPILOT_REVIEW]
+        self.assertEqual(task, stage["stage_result"]["agent_task"])
+        self.assertTrue(
+            saved["pull_requests"]["12"]["stages"][MODULE.STAGE_COPILOT_REVIEW]["clear"]
+        )
+
     def test_finish_releases_the_lock_when_result_persistence_fails(self):
         pipeline = self.pipeline()
         MODULE.acquire_lock(pipeline.lock_path, pipeline.run_id)
@@ -2568,6 +2753,26 @@ class ProgressProtocolTest(StackFixture):
         self.assertIn("clearance was not verified", updates[1]["message"])
         self.assertNotIn(" complete.", updates[1]["message"])
 
+    def test_stage_failure_is_not_reported_as_a_launch_failure(self):
+        reporter, _ = self.reporter()
+        reporter({
+            "event": "phase_finished",
+            "phase": MODULE.STAGE_CONFLICT,
+            "pull_request_pass": 1,
+            "numbers": [11],
+            "clear": False,
+            "stopped": {
+                "step": "stage_status",
+                "reason": "conflict_did_not_record_outcome",
+            },
+        })
+
+        update = MODULE.read_progress_log(self.event_log)[0]
+        self.assertEqual(
+            "Stop the pipeline and report the stage failure.", update["next_action"]
+        )
+        self.assertFalse(update["waiting"])
+
     def test_stale_worker_progress_names_recorded_and_live_revisions(self):
         reporter, _ = self.reporter()
         reporter(
@@ -3001,6 +3206,7 @@ class LauncherTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        self.enterContext(mock.patch.object(MODULE, "WINDOWS_WORKTREE_PATH_BUDGET", 4096))
         self.launcher = MODULE.WorkerLauncher(
             repo_root=self.root / "repo",
             repository="owner/repo",
@@ -3071,10 +3277,16 @@ class LauncherTest(unittest.TestCase):
             {"run_id": self.launcher.run_id, "path": str(path)},
         )
 
-        def remove_worktree(_command, *, check):
+        def remove_worktree(command, *, check):
             self.assertFalse(check)
+            if command[3] == "status":
+                return subprocess.CompletedProcess(command, 0, "", "")
+            self.assertEqual(
+                ["git", "-C", str(self.launcher.repo_root), "worktree", "remove", str(path)],
+                command,
+            )
             path.rmdir()
-            return mock.Mock(returncode=0)
+            return subprocess.CompletedProcess(command, 0, "", "")
 
         with mock.patch.object(COMMON, "run", side_effect=remove_worktree):
             cleaned = self.launcher.cleanup(11)
@@ -3083,6 +3295,124 @@ class LauncherTest(unittest.TestCase):
         self.assertFalse(self.launcher.worktree_root.exists())
         self.assertFalse(record.exists())
         self.assertTrue(self.launcher.run_directory.exists())
+
+    def owned_worktree(self):
+        path = MODULE.worktree_path(self.launcher.worktree_root, 11)
+        path.mkdir(parents=True)
+        record = MODULE.worktree_ownership_path(self.launcher.run_directory, 11)
+        COMMON.write_json_atomically(
+            record, {"run_id": self.launcher.run_id, "path": str(path)}
+        )
+        return path, record
+
+    def test_cleanup_preserves_tracked_staged_and_untracked_changes(self):
+        path, record = self.owned_worktree()
+        evidence = path / "unfinished.txt"
+        evidence.write_bytes(b"synthetic evidence\n")
+        record_bytes = record.read_bytes()
+        for status in (" M unfinished.txt\n", "R  old.txt -> new.txt\n", "?? new.txt\n"):
+            with self.subTest(status=status), mock.patch.object(
+                COMMON, "run",
+                return_value=subprocess.CompletedProcess([], 0, status, ""),
+            ) as run:
+                cleaned = self.launcher.cleanup(11)
+
+                self.assertEqual("preserved", cleaned["result"])
+                self.assertEqual("worktree_is_dirty", cleaned["reason"])
+                self.assertEqual(status.strip(), cleaned["detail"])
+                self.assertEqual(str(path), cleaned["worktree"])
+                self.assertEqual(str(record), cleaned["ownership_record"])
+                run.assert_called_once_with(
+                    [
+                        "git", "-C", str(path), "status",
+                        "--porcelain=v1", "--untracked-files=all",
+                    ],
+                    check=False,
+                )
+                self.assertEqual(record_bytes, record.read_bytes())
+                self.assertEqual(b"synthetic evidence\n", evidence.read_bytes())
+
+    def test_cleanup_preserves_unreadable_worktree(self):
+        path, record = self.owned_worktree()
+        for outcome in (
+            subprocess.CompletedProcess([], 128, "", "cannot read index"),
+            OSError("git unavailable"),
+            MODULE.WorkflowError("status timed out"),
+        ):
+            with self.subTest(outcome=outcome), mock.patch.object(
+                COMMON, "run",
+                **(
+                    {"side_effect": outcome}
+                    if isinstance(outcome, Exception)
+                    else {"return_value": outcome}
+                ),
+            ) as run:
+                cleaned = self.launcher.cleanup(11)
+
+                self.assertEqual("preserved", cleaned["result"])
+                self.assertEqual("worktree_status_unavailable", cleaned["reason"])
+                self.assertTrue(cleaned["detail"])
+                self.assertTrue(path.exists())
+                self.assertTrue(record.exists())
+                self.assertEqual(1, run.call_count)
+
+    def test_cleanup_does_not_force_remove_when_the_worktree_changes_after_status(self):
+        path, record = self.owned_worktree()
+        evidence = path / "late-edit.txt"
+
+        def replay(command, *, check):
+            self.assertFalse(check)
+            if command[3] == "status":
+                return subprocess.CompletedProcess(command, 0, "", "")
+            self.assertNotIn("--force", command)
+            evidence.write_bytes(b"late synthetic edit\n")
+            return subprocess.CompletedProcess(command, 128, "", "worktree is dirty")
+
+        with mock.patch.object(COMMON, "run", side_effect=replay) as run:
+            cleaned = self.launcher.cleanup(11)
+
+        self.assertEqual(2, run.call_count)
+        self.assertEqual("preserved", cleaned["result"])
+        self.assertEqual("worktree_remove_failed", cleaned["reason"])
+        self.assertEqual("worktree is dirty", cleaned["detail"])
+        self.assertEqual(b"late synthetic edit\n", evidence.read_bytes())
+        self.assertTrue(record.exists())
+
+    def test_cleanup_preserves_worktree_when_remove_raises(self):
+        path, record = self.owned_worktree()
+        with mock.patch.object(
+            COMMON, "run",
+            side_effect=[
+                subprocess.CompletedProcess([], 0, "", ""),
+                OSError("remove failed"),
+            ],
+        ):
+            cleaned = self.launcher.cleanup(11)
+
+        self.assertEqual("preserved", cleaned["result"])
+        self.assertEqual("worktree_remove_failed", cleaned["reason"])
+        self.assertTrue(path.exists())
+        self.assertTrue(record.exists())
+
+    def test_cleanup_status_and_remove_use_hidden_windows_processes(self):
+        path, _record = self.owned_worktree()
+
+        def replay(command, **_kwargs):
+            if command[3] == "worktree":
+                path.rmdir()
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            mock.patch.object(COMMON, "IS_WINDOWS", True),
+            mock.patch.object(COMMON.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True),
+            mock.patch.object(COMMON.subprocess, "run", side_effect=replay) as run,
+        ):
+            cleaned = self.launcher.cleanup(11)
+
+        self.assertEqual("removed", cleaned["result"])
+        self.assertEqual(2, run.call_count)
+        for call in run.call_args_list:
+            self.assertEqual(0x08000000, call.kwargs["creationflags"])
 
     def test_readiness_needs_durable_evidence(self):
         request = self.request()

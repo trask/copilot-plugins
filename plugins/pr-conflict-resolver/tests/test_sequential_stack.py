@@ -514,7 +514,7 @@ class SequentialStackTest(unittest.TestCase):
     def test_safe_publication_is_atomic_and_excludes_advisory_output(self):
         state = self.publication_state()
         metadata = existing.pr_metadata()
-        metadata.update(number=6, head_sha=self.new_lower)
+        metadata.update(number=6, head_sha=self.new_lower, base_sha=self.trunk)
         with (
             mock.patch.object(MODULE, "require_live_conflict_guards") as guards,
             mock.patch.object(MODULE, "remote_publication_heads", side_effect=self.publication_heads),

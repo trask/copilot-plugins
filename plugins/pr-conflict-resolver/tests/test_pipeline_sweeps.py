@@ -101,6 +101,36 @@ class ConflictPipelineSweepTest(unittest.TestCase):
         self.assertEqual(1, self.calls["conflict_preflight"].call_count)
         self.calls["discover_conflict_task"].assert_not_called()
 
+    def test_completed_unknown_publication_can_be_reobserved_without_new_task(self):
+        state = self.first_sweep()
+        fixture = existing.ManagedConflictCoordinatorTest()
+        request = fixture.request()
+        refs = fixture.success_result(request)["generated"]["code_refs"]
+        refs[0].update(new_sha=self.metadata["head_sha"], base_sha=self.metadata["base_sha"])
+        state["last_result"] = "published"
+        state["pr"]["mergeable"] = "UNKNOWN"
+        state["attempt"].update(status="published", mergeable_at_head_sha=None)
+        state["agent_task"].update(
+            result={"status": "success", "task": {"state": "completed"}},
+            code_refs=refs, preflight={"request": request},
+            published_heads=[self.metadata["head_sha"]],
+        )
+        state["agent_task"]["publication"] = MODULE.published_conflict_snapshot(
+            state["agent_task"], state["pr"],
+        )
+        self.assertEqual("completed", MODULE.stage_outcome(state))
+        self.assertIsNone(MODULE.cleared_head_sha(state))
+        MODULE.save_state(self.path, state)
+
+        self.assertEqual(0, MODULE.command_pipeline(self.args))
+
+        current = MODULE.load_state(self.path)
+        self.assertEqual("cleared", MODULE.stage_outcome(current))
+        self.assertEqual(self.metadata["head_sha"], MODULE.cleared_head_sha(current))
+        self.assertEqual(state["managed_attempts"], current["managed_attempts"])
+        self.assertEqual(state["agent_task"], current["pipeline_sweep_history"][0]["agent_task"])
+        self.calls["discover_conflict_task"].assert_not_called()
+
     def test_invalid_or_unfinished_state_never_changes_or_reads_live(self):
         original = self.first_sweep()
         for mutate in (

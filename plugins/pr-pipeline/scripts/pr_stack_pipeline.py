@@ -17,7 +17,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import time
@@ -680,7 +679,11 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
             next_action = "Continue with the next stage."
         elif stopped:
             outcome = "failed"
-            next_action = "Stop the pipeline and report the launch failure."
+            next_action = (
+                "Stop the pipeline and report the stage failure."
+                if stopped.get("step") == "stage_status"
+                else "Stop the pipeline and report the launch failure."
+            )
         elif blocked:
             outcome = f"blocked: {blocked.get('reason', 'unknown reason')}"
             next_action = "Continue to the snapshot or next bounded pass."
@@ -1415,20 +1418,49 @@ class WorkerLauncher:
                 "reason": "worktree_is_not_owned_by_this_run",
                 "number": number,
             }
-        removed = common.run(
-            [
-                "git",
-                "-C",
-                str(self.repo_root),
-                "worktree",
-                "remove",
-                "--force",
-                str(path),
-            ],
-            check=False,
-        )
-        if removed.returncode != 0 and path.exists():
-            shutil.rmtree(path, ignore_errors=True)
+        preserved = {
+            "result": "preserved",
+            "number": number,
+            "worktree": str(path),
+            "ownership_record": str(record_path),
+        }
+        try:
+            status = common.run(
+                [
+                    "git", "-C", str(path), "status",
+                    "--porcelain=v1", "--untracked-files=all",
+                ],
+                check=False,
+            )
+        except (WorkflowError, OSError, subprocess.SubprocessError) as error:
+            return {
+                **preserved,
+                "reason": "worktree_status_unavailable",
+                "detail": str(error),
+            }
+        if status.returncode != 0:
+            return {
+                **preserved,
+                "reason": "worktree_status_unavailable",
+                "detail": status.stderr.strip() or status.stdout.strip() or "no output",
+            }
+        if status.stdout.strip():
+            return {
+                **preserved,
+                "reason": "worktree_is_dirty",
+                "detail": status.stdout.strip(),
+            }
+        try:
+            removed = common.run(
+                ["git", "-C", str(self.repo_root), "worktree", "remove", str(path)],
+                check=False,
+            )
+        except (WorkflowError, OSError, subprocess.SubprocessError) as error:
+            return {
+                **preserved,
+                "reason": "worktree_remove_failed",
+                "detail": str(error),
+            }
         if not path.exists():
             try:
                 record_path.unlink()
@@ -1438,9 +1470,11 @@ class WorkerLauncher:
                 self.worktree_root.rmdir()
             except OSError:
                 pass
+            return {"result": "removed", "number": number}
         return {
-            "result": "removed" if not path.exists() else "failed",
-            "number": number,
+            **preserved,
+            "reason": "worktree_remove_failed",
+            "detail": removed.stderr.strip() or removed.stdout.strip() or "no output",
         }
 
 
@@ -2209,14 +2243,17 @@ class StackPipeline:
             blocker = ("topology_changed", stage_result["detail"])
         if (
             blocker is None
-            and request["stage"] == STAGE_DESCRIPTION
+            and request["stage"] in {STAGE_CONFLICT, STAGE_DESCRIPTION}
             and stage_result.get("outcome") is None
         ):
+            label = (
+                "conflict" if request["stage"] == STAGE_CONFLICT else "description"
+            )
             blocker = (
-                "description_did_not_record_outcome",
+                f"{label}_did_not_record_outcome",
                 (
-                    "pr-description returned without recording a validation outcome; "
-                    "clearance cannot be verified"
+                    f"{request['stage']} returned without recording a terminal outcome; "
+                    "stage completion cannot be verified"
                 ),
             )
         completion["stage_result"] = stage_result_summary(stage_result)
@@ -2476,6 +2513,7 @@ class StackPipeline:
                     "clear": completion.get("clear"),
                     "outcome": completion.get("stage_result", {}).get("outcome"),
                     "reason": completion.get("reason"),
+                    "stage_result": completion["stage_result"],
                 },
             )
         stopped = launched["stopped"] or next(
@@ -2553,6 +2591,7 @@ class StackPipeline:
                     "clear": completion.get("clear"),
                     "outcome": completion.get("stage_result", {}).get("outcome"),
                     "reason": completion.get("reason"),
+                    "stage_result": completion["stage_result"],
                 },
             )
         stopped = launched["stopped"] or next(
@@ -3024,6 +3063,7 @@ class StackPipeline:
                     "current_base_sha": completion.get("current_base_sha"),
                     "outcome": completion.get("stage_result", {}).get("outcome"),
                     "reason": completion.get("reason"),
+                    "stage_result": completion["stage_result"],
                 },
             )
             previous = member
