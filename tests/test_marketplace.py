@@ -39,7 +39,7 @@ EXPECTED_PACKAGE_VERSIONS = {
     "historical-pr-audit": "1.1.22",
     "pr-conflict-resolver": "1.1.34",
     "pr-description": "1.0.65",
-    "pr-pipeline": "1.5.30",
+    "pr-pipeline": "1.5.31",
     "pr-reviewer": "1.8.11",
     "self-review-loop": "1.3.44",
 }

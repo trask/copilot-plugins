@@ -3194,9 +3194,15 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertIn("Next: <next_action>.", text)
         self.assertIn("Do not send these updates to the PR Flight canvas", text)
         self.assertIn(
-            "If `updates` is empty, invoke the returned `next_watch.arguments` again",
+            "If `updates` is empty and `finished` is false, invoke the returned `next_watch.arguments` again",
             text,
         )
+        self.assertIn("top-level `final_event`", text)
+        self.assertIn("`final_event.artifacts.result`", text)
+        self.assertIn("`artifacts.result_sha256`", text)
+        self.assertIn("`*_details_truncated`", text)
+        self.assertIn("Extract the needed JSON fields in bounded chunks", text)
+        self.assertIn("only the controller's top-level `ci_warnings`", text)
         self.assertIn("`final_event`", text)
         watch_lines = [
             line for line in text.splitlines() if "pr_pipeline.py" in line and " watch " in line
@@ -3220,14 +3226,21 @@ class AgentInstructionTest(unittest.TestCase):
 
 
 class CommandOutputTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        patch = mock.patch.object(MODULE, "copilot_home", return_value=Path(temporary.name))
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_run_emits_json_lines_ending_with_pipeline_result(self):
         def fake_pipeline(
-            _target, _repo, *, models, effort, conflict_strategy, report
+            _target, _repo, *, models, effort, conflict_strategy, report, run_id
         ):
             self.assertIsNotNone(models)
             self.assertEqual("high", effort)
             self.assertEqual("auto", conflict_strategy)
-            report({"event": "pipeline_started", "run_id": "run-1"})
+            report({"event": "pipeline_started", "run_id": run_id})
             report(
                 {
                     "event": "stage_started",
@@ -3237,7 +3250,7 @@ class CommandOutputTest(unittest.TestCase):
             )
             return {
                 "result": "complete",
-                "run_id": "run-1",
+                "run_id": run_id,
                 "head_sha": HEAD,
             }
 

@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -102,6 +104,10 @@ MONITOR_VERSION = 1
 PROGRESS_EVENT = common.PROGRESS_EVENT
 PROGRESS_UPDATE_EVENT = common.PROGRESS_UPDATE_EVENT
 PROGRESS_HEARTBEAT_INTERVAL = common.PROGRESS_HEARTBEAT_INTERVAL
+TERMINAL_RESULT_MAX_BYTES = 8192
+WATCH_MAX_BYTES = 8192
+TERMINAL_COLLECTION_LIMIT = 12
+TERMINAL_TEXT_LIMIT = 512
 STAGE_LABELS = {
     STAGE_CONFLICT: "conflict resolution",
     STAGE_COPILOT_REVIEW: "Copilot review",
@@ -148,6 +154,247 @@ def observer_state_path(target: dict[str, Any], run_id: str) -> Path:
 
 def scheduler_log_path(target: dict[str, Any], run_id: str) -> Path:
     return run_directory_for(target, run_id) / "scheduler.log"
+
+
+def run_result_path(target: dict[str, Any], run_id: str) -> Path:
+    return run_directory_for(target, run_id) / "result.json"
+
+
+def serialized_size(payload: Any) -> int:
+    return len((json.dumps(payload, sort_keys=True) + os.linesep).encode("utf-8"))
+
+
+def bounded_value(value: Any, *, depth: int = 0) -> tuple[Any, bool]:
+    """Bound diagnostic previews; the artifact retains their exact values."""
+    if isinstance(value, str):
+        return (
+            value[:TERMINAL_TEXT_LIMIT] + "..."
+            if len(value) > TERMINAL_TEXT_LIMIT else value,
+            len(value) > TERMINAL_TEXT_LIMIT,
+        )
+    if not isinstance(value, (dict, list)):
+        return value, False
+    if depth >= 5:
+        return None, bool(value)
+    items = list(value.items()) if isinstance(value, dict) else list(enumerate(value))
+    limit = 32 if isinstance(value, dict) else TERMINAL_COLLECTION_LIMIT
+    truncated = len(items) > limit
+    result: Any = {} if isinstance(value, dict) else []
+    for key, item in items[:limit]:
+        preview, shortened = bounded_value(item, depth=depth + 1)
+        truncated |= shortened
+        if isinstance(result, dict):
+            if len(key) > TERMINAL_TEXT_LIMIT:
+                truncated = True
+                continue
+            result[key] = preview
+        else:
+            result.append(preview)
+    return result, truncated
+
+
+def compact_stage(stage: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        key: value for key, value in stage.items()
+        if key not in {"status", "status_state", "log_path"}
+    }
+    if stage.get("clear") is not True:
+        result["status"] = stage.get("status", {})
+        if stage.get("log_path"):
+            result["log_path"] = stage["log_path"]
+    elif stage.get("status"):
+        result["diagnostics_omitted"] = True
+    return result
+
+
+def clean_ci_evidence(payload: dict[str, Any]) -> bool:
+    if payload.get("ci_warnings") or payload.get("ci_warning_revalidation_error"):
+        return False
+    pr = payload.get("pr") or {}
+    head, base = pr.get("head_sha"), pr.get("base_sha")
+    if not head or not base or payload.get("head_sha") != head:
+        return False
+    ci = next(
+        (stage for stage in payload.get("stages", []) if stage.get("stage") == STAGE_CI),
+        {},
+    )
+    status = ci.get("status") or {}
+    run_status = status.get("run") or {}
+    coordinator = status.get("coordinator") or {}
+    return (
+        ci.get("clear") is True
+        and ci.get("clearance_kind") == "stage_result"
+        and ci.get("clear_at_head_sha") == head
+        and status.get("outcome") == "green"
+        and run_status.get("head_sha") == head
+        and run_status.get("decision") == "green"
+        and run_status.get("reason") == "all_checks_passed"
+        and coordinator.get("status") == "ready"
+        and coordinator.get("head_sha") == head
+        and coordinator.get("base_sha") == base
+    )
+
+
+def compact_terminal_result(
+    payload: dict[str, Any], *, result_path: Path, result_sha256: str,
+    max_bytes: int = TERMINAL_RESULT_MAX_BYTES,
+) -> dict[str, Any]:
+    compact = {
+        key: payload[key]
+        for key in (
+            "event", "result", "run_id", "number", "head_sha", "local_head_sha", "sweeps",
+        )
+        if key in payload
+    }
+    compact["artifacts"] = {
+        "result": str(result_path.resolve()),
+        "result_sha256": result_sha256,
+    }
+    compact["summary_version"] = 1
+    pr = payload.get("pr") or {}
+    if pr.get("base_sha"):
+        compact["base_sha"] = pr["base_sha"]
+    if payload.get("all_ci_passed") is False or payload.get("ci_warnings"):
+        compact["all_ci_passed"] = False
+    elif clean_ci_evidence(payload):
+        compact["all_ci_passed"] = True
+
+    sections = {
+        key: payload[key] for key in (
+            "pr", "stage", "reason", "detail", "error", "ci_warnings",
+            "ci_warning_revalidation_error",
+        ) if key in payload
+    }
+    sections["stages"] = [compact_stage(stage) for stage in payload.get("stages", [])]
+    if isinstance(payload.get("stage_result"), dict):
+        sections["stage_result"] = compact_stage(payload["stage_result"])
+    runs = payload.get("runs", [])
+    sections["runs"] = [
+        {
+            key: record[key] for key in (
+                "stage", "sweep", "action", "outcome", "clear", "stage_reason",
+                "started_head_sha", "ended_head_sha", "history_rewritten",
+            ) if key in record
+        }
+        for record in runs
+    ]
+    for key in ("published_commits", "retained_commits", "commit_tracking_errors"):
+        values = list(payload.get(key) or [])
+        for record in runs:
+            for value in record.get(key) or []:
+                if value not in values:
+                    values.append(value)
+        sections[key] = values
+    if payload.get("history_rewritten") or any(run.get("history_rewritten") for run in runs):
+        compact["history_rewritten"] = True
+    ci = next(
+        (stage for stage in payload.get("stages", []) if stage.get("stage") == STAGE_CI),
+        None,
+    )
+    if ci and ci.get("status"):
+        sections["ci_status"] = ci["status"]
+
+    for key, value in sections.items():
+        compact[key], truncated = bounded_value(value)
+        if truncated:
+            compact[f"{key}_details_truncated"] = True
+        if isinstance(value, list) and len(value) > len(compact[key]):
+            compact[f"{key}_omitted"] = len(value) - len(compact[key])
+    compact["diagnostics_omitted"] = bool(runs or payload.get("stages"))
+
+    # Drop previews, not identity or outcome. Counts and flags require artifact retrieval.
+    for key in (
+        "ci_status", "runs", "stages", "stage_result", "ci_warnings",
+        "published_commits", "retained_commits", "commit_tracking_errors", "pr",
+        "ci_warning_revalidation_error", "detail", "error", "reason", "stage",
+    ):
+        if serialized_size(compact) <= max_bytes:
+            break
+        if key not in compact:
+            continue
+        compact.pop(key)
+        compact.pop(f"{key}_details_truncated", None)
+        value = sections[key]
+        compact[f"{key}_omitted"] = len(value) if isinstance(value, list) else True
+    if serialized_size(compact) > max_bytes:
+        raise WorkflowError("terminal result identity exceeds the output byte limit")
+    return compact
+
+
+def persist_terminal_result(payload: dict[str, Any], path: Path) -> dict[str, Any]:
+    path = path.resolve()
+    if path.exists():
+        if common.read_json(path) != payload:
+            raise WorkflowError(f"terminal result already exists with different content: {path}")
+    else:
+        common.write_json_atomically(path, payload)
+    return compact_terminal_result(
+        payload, result_path=path, result_sha256=hashlib.sha256(path.read_bytes()).hexdigest()
+    )
+
+
+def bounded_watch_result(
+    payload: dict[str, Any], *, target: dict[str, Any], run_id: str
+) -> dict[str, Any]:
+    result = dict(payload)
+    updates = payload.get("updates", [])
+    if payload.get("finished") and not payload.get("monitor_failure"):
+        terminal = next(
+            (update.get("final_event") for update in reversed(updates)
+             if isinstance(update.get("final_event"), dict)),
+            None,
+        )
+        if terminal is None:
+            records = common.read_progress_log(progress_log_path(target, run_id))
+            terminal = next(
+                (record.get("final_event") for record in reversed(records)
+                 if record.get("terminal")), None,
+            )
+        if not isinstance(terminal, dict):
+            raise WorkflowError("terminal progress record has no final_event")
+        path = run_result_path(target, run_id).resolve()
+        if terminal.get("summary_version") != 1:
+            terminal = persist_terminal_result(terminal, path)
+        artifacts = terminal.get("artifacts") or {}
+        if not paths_match(artifacts.get("result"), path):
+            raise WorkflowError("terminal result artifact path does not match the run")
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != artifacts.get("result_sha256"):
+            raise WorkflowError("terminal result artifact hash does not match the summary")
+        original = json.loads(raw)
+        if original.get("run_id") != run_id:
+            raise WorkflowError("terminal result artifact identity does not match the run")
+        envelope = {
+            **result, "updates": [], "updates_omitted": len(updates),
+            "artifacts": {"progress": str(progress_log_path(target, run_id).resolve())},
+        }
+        terminal = compact_terminal_result(
+            original, result_path=path, result_sha256=artifacts["result_sha256"],
+            max_bytes=WATCH_MAX_BYTES - serialized_size(envelope) - 256,
+        )
+        result["final_event"] = terminal
+    result["updates"] = []
+    for update in updates[-TERMINAL_COLLECTION_LIMIT:]:
+        preview, truncated = bounded_value(
+            {key: value for key, value in update.items() if key != "final_event"}
+        )
+        if truncated:
+            preview["details_truncated"] = True
+        result["updates"].append(preview)
+    result["artifacts"] = {"progress": str(progress_log_path(target, run_id).resolve())}
+    # Keep the legacy terminal location when both copies fit the watch budget.
+    if result.get("final_event") and result["updates"] and updates[-1].get("terminal"):
+        result["updates"][-1]["final_event"] = result["final_event"]
+        if serialized_size(result) > WATCH_MAX_BYTES:
+            result["updates"][-1].pop("final_event")
+    while result["updates"] and serialized_size(result) > WATCH_MAX_BYTES - 64:
+        result["updates"].pop(0)
+    omitted = len(updates) - len(result["updates"])
+    if omitted:
+        result["updates_omitted"] = omitted
+    if serialized_size(result) > WATCH_MAX_BYTES:
+        raise WorkflowError("watch result identity exceeds the output byte limit")
+    return result
 
 
 def monitor_locator_path(run_id: str) -> Path:
@@ -313,6 +560,7 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
     target_url = payload.get("target")
     number = payload.get("number")
     scope = f" for #{number}" if isinstance(number, int) else ""
+    has_ci_warnings = bool(payload.get("ci_warnings") or payload.get("ci_warnings_omitted"))
 
     update: dict[str, Any]
     if event == "pipeline_started":
@@ -415,14 +663,14 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
     elif event == "pipeline_finished":
         result = payload.get("result", "unknown")
         reported_result = (
-            "completed" if result == "complete" and payload.get("ci_warnings") else result
+            "completed" if result == "complete" and has_ci_warnings else result
         )
         update = {
             "message": (
                 f"PR pipeline {reported_result}"
                 + (
                     " WITH CI WARNINGS; not all CI passed"
-                    if payload.get("ci_warnings")
+                    if has_ci_warnings
                     else ""
                 )
                 + (f": {payload.get('reason')}." if payload.get("reason") else ".")
@@ -467,10 +715,14 @@ class ProgressReporter(common.ConversationProgressReporter):
         self,
         *,
         target: dict[str, Any] | None = None,
+        result_path: Path | None = None,
         event_log: Path | None = None,
         output: Callable[[dict[str, Any]], None] = emit,
         wall_time: Callable[[], float] = time.time,
     ) -> None:
+        self.result_path = result_path
+        self.target = target
+
         def transition(payload: dict[str, Any]) -> dict[str, Any] | None:
             if target is not None:
                 payload = {**payload, "number": target["number"]}
@@ -482,6 +734,13 @@ class ProgressReporter(common.ConversationProgressReporter):
             output=output,
             wall_time=wall_time,
         )
+
+    def __call__(self, payload: dict[str, Any]) -> None:
+        if payload.get("event") == "pipeline_finished" and self.result_path is not None:
+            if self.target is not None:
+                payload = {**payload, "number": self.target["number"]}
+            payload = persist_terminal_result(payload, self.result_path)
+        super().__call__(payload)
 
 
 def gh_json(arguments: list[str]) -> Any:
@@ -1301,39 +1560,60 @@ def command_watch(args: argparse.Namespace) -> None:
     else:
         raise WorkflowError(f"monitor handle does not exist for run {run_id}")
     validate_launch_record(target, run_id)
-    emit(
-        bind_next_watch(
-            common.watch_progress(
-                event_log=progress_log_path(target, run_id),
-                launch_path=launch_state_path(target, run_id),
-                observer_path=observer_state_path(target, run_id),
-                cursor=args.cursor,
-                wait_seconds=args.wait_seconds,
-            ),
-            target=target,
-            run_id=run_id,
-            legacy_target=legacy_target,
-        )
+    payload = common.watch_progress(
+        event_log=progress_log_path(target, run_id),
+        launch_path=launch_state_path(target, run_id),
+        observer_path=observer_state_path(target, run_id),
+        cursor=args.cursor,
+        wait_seconds=args.wait_seconds,
     )
+    bound = bind_next_watch(
+        payload, target=target, run_id=run_id, legacy_target=legacy_target,
+    )
+    emit(bounded_watch_result(bound, target=target, run_id=run_id))
 
 
 def command_run(args: argparse.Namespace) -> None:
     common.ACTIVE_GITHUB_MUTATION_POLICY = args.github_mutation_policy
+    args.run_id = common.validate_run_id(args.run_id) if args.run_id else uuid.uuid4().hex
     require_tools()
     repo_root = resolve_repo_root()
     target = resolve_target(args.target, repo_root)
     event_log = Path(args.event_log).resolve() if args.event_log else None
-    reporter = ProgressReporter(target=target, event_log=event_log)
+    args.result_path = run_result_path(target, args.run_id)
+    reporter = ProgressReporter(
+        target=target, event_log=event_log, result_path=args.result_path
+    )
     options = {
         "models": stage_models(args.stage_model, args.effort),
         "effort": args.effort,
         "conflict_strategy": args.conflict_strategy,
         "report": reporter,
+        "run_id": args.run_id,
     }
-    if args.run_id:
-        options["run_id"] = common.validate_run_id(args.run_id)
     result = run_pipeline(target, repo_root, **options)
     reporter({"event": "pipeline_finished", **result})
+
+
+def report_run_error(args: argparse.Namespace, error: str) -> None:
+    run_id = getattr(args, "run_id", None)
+    if not isinstance(run_id, str) or not common.RUN_ID_PATTERN.fullmatch(run_id):
+        run_id = uuid.uuid4().hex
+    event = {
+        "event": "pipeline_finished", "result": "error", "error": error, "run_id": run_id,
+    }
+    event_log = Path(args.event_log).resolve() if args.event_log else None
+    result_path = getattr(args, "result_path", None) or (
+        event_log.with_name("result.json") if event_log
+        else run_root() / "errors" / run_id / "result.json"
+    )
+    try:
+        ProgressReporter(event_log=event_log, result_path=result_path)(event)
+    except (WorkflowError, OSError, ValueError) as reporting_error:
+        emit({
+            "event": "pipeline_reporting_failed", "run_id": run_id,
+            "error": str(reporting_error), "pipeline_error": error,
+        })
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1439,11 +1719,7 @@ def main() -> int:
         if args.command == "start":
             emit({"event": "pipeline_launch_failed", "error": str(error)})
             return 1
-        event = {"event": "pipeline_finished", "result": "error", "error": str(error)}
-        event_log = getattr(args, "event_log", None)
-        ProgressReporter(
-            event_log=Path(event_log).resolve() if event_log else None
-        )(event)
+        report_run_error(args, str(error))
         return 1
     except KeyboardInterrupt:
         if args.command == "watch":
@@ -1461,15 +1737,7 @@ def main() -> int:
         if args.command == "start":
             emit({"event": "pipeline_launch_failed", "error": "interrupted"})
             return 130
-        event = {
-            "event": "pipeline_finished",
-            "result": "error",
-            "error": "interrupted",
-        }
-        event_log = getattr(args, "event_log", None)
-        ProgressReporter(
-            event_log=Path(event_log).resolve() if event_log else None
-        )(event)
+        report_run_error(args, "interrupted")
         return 130
 
 
