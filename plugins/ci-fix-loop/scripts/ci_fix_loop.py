@@ -1412,6 +1412,9 @@ PRIVATE_KEY_BLOCK_PATTERN = re.compile(
     r".*?(?:-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\Z)",
     re.DOTALL,
 )
+TERMINAL_CONTROL_PATTERN = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]|\r(?!\n)"
+)
 
 
 def contains_credentials(value: str) -> bool:
@@ -1430,6 +1433,13 @@ def require_no_credentials(value: str, *, source: str) -> None:
         raise WorkflowError(f"{source} appears to contain credentials")
 
 
+def escape_terminal_controls(value: str) -> str:
+    """Keep tabs and line endings, and render other terminal controls as text."""
+    return TERMINAL_CONTROL_PATTERN.sub(
+        lambda match: f"\\x{ord(match[0]):02x}", value
+    )
+
+
 def sanitize_external_command_text(value: str) -> str:
     sanitized = redact_credentials(value)
     sanitized = SENSITIVE_HEADER_PATTERN.sub(
@@ -1440,6 +1450,7 @@ def sanitize_external_command_text(value: str) -> str:
         lambda match: f"{match.group(1)}={REDACTED_CREDENTIAL}",
         sanitized,
     )
+    sanitized = escape_terminal_controls(sanitized)
     require_no_credentials(sanitized, source="external command diagnostic")
     return sanitized
 
@@ -6560,6 +6571,7 @@ def fetch_failed_check_log(
                     "-H",
                     f"X-GitHub-Api-Version: {AGENT_TASK_API_VERSION}",
                     job_log_endpoint,
+                    "--allow-escape-sequences",
                 ],
             )
         )
@@ -6800,7 +6812,7 @@ def fetch_failed_check_log(
             "download retry loop produced no result",
             details={"log_download": copy.deepcopy(download_evidence)},
         )
-    content = redact_credentials(decoded)
+    content = escape_terminal_controls(redact_credentials(decoded))
     require_no_credentials(content, source=f"redacted failing log for {check['key']}")
     download_evidence["content_sha256"] = sha256_text(content)
     publish_evidence()

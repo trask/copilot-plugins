@@ -2,6 +2,7 @@ import argparse
 import copy
 import contextlib
 import datetime as dt
+import hashlib
 import importlib.util
 import io
 import json
@@ -4607,7 +4608,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.52", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.53", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -4693,9 +4694,107 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
         self.assertEqual("focused failure log\n", content)
         self.assertEqual(content, destination.read_text(encoding="utf-8"))
-        self.assertIn("--job", run.call_args.args[0])
-        self.assertIn("2", run.call_args.args[0])
-        self.assertNotIn("--allow-escape-sequences", run.call_args.args[0])
+        self.assertEqual(
+            ["gh", "run", "view", "1", "--repo", "owner/repo", "--job", "2",
+             "--log-failed"],
+            run.call_args.args[0],
+        )
+
+    def test_failed_log_captures_escaped_primary_and_fallback_logs_without_rendering(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        raw = (
+            "first\n\t\x1b[31mfailed\x1b[0m\n"
+            "\x1b]52;c;clipboard\x07\x1b]0;title\x1b\\"
+            "\x9b2J\x00\x08\rhidden\n"
+            "github_pat_abcdefghijklmnopqrstuvwxyz\n"
+        ).encode("utf-8")
+        expected = (
+            "first\n\t\\x1b[31mfailed\\x1b[0m\n"
+            "\\x1b]52;c;clipboard\\x07\\x1b]0;title\\x1b\\"
+            "\\x9b2J\\x00\\x08\\x0dhidden\n[REDACTED]\n"
+        )
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback):
+                destination = self.root.parent / f"{self.root.name}-{fallback}.log"
+                self.addCleanup(destination.unlink, missing_ok=True)
+                commands = []
+
+                def download(command, **kwargs):
+                    commands.append(command)
+                    self.assertIs(kwargs["stdout"], MODULE.subprocess.PIPE)
+                    self.assertIs(kwargs["stderr"], MODULE.subprocess.PIPE)
+                    self.assertNotIn("text", kwargs)
+                    self.assertEqual(0x08000000, kwargs["creationflags"])
+                    if command[1] == "run":
+                        if "--allow-escape-sequences" in command:
+                            return MODULE.subprocess.CompletedProcess(
+                                command, 1, b"", b"unknown flag: --allow-escape-sequences"
+                            )
+                        if fallback:
+                            return MODULE.subprocess.CompletedProcess(command, 1, b"", b"HTTP 503")
+                    elif "--allow-escape-sequences" not in command:
+                        return MODULE.subprocess.CompletedProcess(
+                            command, 1, b"",
+                            b"the response contains terminal escape sequences; "
+                            b"pass --allow-escape-sequences to output it anyway\n",
+                        )
+                    return MODULE.subprocess.CompletedProcess(command, 0, raw, b"")
+
+                evidence = {}
+                output = io.StringIO()
+                with (
+                    mock.patch.object(MODULE, "verify_failed_log_download_identity"),
+                    mock.patch.object(MODULE, "IS_WINDOWS", True),
+                    mock.patch.object(MODULE.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True),
+                    mock.patch.object(MODULE.subprocess, "run", side_effect=download),
+                    mock.patch.object(MODULE.time, "sleep"),
+                    contextlib.redirect_stdout(output),
+                ):
+                    content = MODULE.fetch_failed_check_log(
+                        self.preflight["pr"], check, destination=destination,
+                        repo_root=self.root, evidence=evidence,
+                    )
+                self.assertEqual("", output.getvalue())
+                self.assertEqual(ascii(expected), ascii(content))
+                self.assertEqual(ascii(expected), ascii(destination.read_text(encoding="utf-8")))
+                self.assertEqual(hashlib.sha256(raw).hexdigest(), evidence["attempts"][-1]["content_sha256"])
+                self.assertEqual(MODULE.sha256_text(expected), evidence["content_sha256"])
+                self.assertEqual(
+                    len(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS) + 2 if fallback else 1,
+                    evidence["attempt_count"],
+                )
+                if fallback:
+                    self.assertEqual(
+                        ["gh", "api", "--method", "GET", "-H",
+                         "Accept: application/vnd.github+json", "-H",
+                         f"X-GitHub-Api-Version: {MODULE.AGENT_TASK_API_VERSION}",
+                         "repos/owner/repo/actions/jobs/2/logs", "--allow-escape-sequences"],
+                        commands[-1],
+                    )
+
+    def test_log_control_escaping_preserves_readable_lines(self):
+        self.assertEqual("first\r\n\tsecond\n", MODULE.escape_terminal_controls("first\r\n\tsecond\n"))
+        for code in (*range(9), 11, 12, *range(13, 32), *range(127, 160)):
+            with self.subTest(code=code):
+                self.assertEqual(
+                    f"before\\x{code:02x}after",
+                    MODULE.escape_terminal_controls(f"before{chr(code)}after"),
+                )
+
+    def test_failed_log_diagnostic_escapes_controls_and_redacts_credentials(self):
+        raw = b"\x1b]52;c;clipboard\x07HTTP 403\x1b[0m\nAuthorization: Bearer private-value\n"
+        process = MODULE.subprocess.CompletedProcess(["gh"], 1, b"untrusted log", raw)
+        error = MODULE.failed_log_command_failure("could not read log", process)
+        diagnostic = error.details["external_command_diagnostic"]
+        self.assertEqual(
+            ascii("\\x1b]52;c;clipboard\\x07HTTP 403\\x1b[0m\n[REDACTED]\n"),
+            ascii(diagnostic["stderr"]["text"]),
+        )
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), diagnostic["stderr"]["sha256"])
+        self.assertNotIn("private-value", str(error))
+        self.assertNotIn("untrusted log", str(error))
+        self.assertNotIn("\x1b", str(error))
+        self.assertNotIn("\x07", str(error))
 
     def test_failed_log_validates_identity_before_and_after_download(self):
         check = self.preflight["check_snapshot"]["failures"][0]
@@ -5020,6 +5119,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     command = run.call_args_list[0].args[0]
                     self.assertEqual("GET", command[command.index("--method") + 1])
                     self.assertNotIn("POST", command)
+                    self.assertNotIn("--allow-escape-sequences", command)
                     self.assertGreater(
                         run.call_args_list[0].kwargs["timeout"], 0
                     )
