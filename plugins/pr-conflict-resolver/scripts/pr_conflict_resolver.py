@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "67b75d394ea05079aa20f51ae1ddd480d269fead09328f76a39b88049378f2f9"
+    "665debbf18b2528a7fb6f63550a9c0698070f902a3b6ebaabcda364e1e2dc331"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 V5_CONFLICT_POLICY = "marketplace-conflict-worker@5"
@@ -84,13 +84,13 @@ V5_CONFLICT_POLICY_IDENTITY = {
     "version": 5,
     "sha256": V5_CONFLICT_POLICY_SHA256,
 }
-CONFLICT_POLICY = "marketplace-conflict-worker@7"
+CONFLICT_POLICY = "marketplace-conflict-worker@8"
 CONFLICT_POLICY_SHA256 = (
-    "60011fcbc545436fd6be68abc2776c8b9e4754580d038ae9b2b30a309b043900"
+    "0a0332c77a27cc6005095772289760fbde3d38328ba189e2a5b3e89553ff4c25"
 )
 CONFLICT_POLICY_IDENTITY = {
     "id": "marketplace-conflict-worker",
-    "version": 7,
+    "version": 8,
     "sha256": CONFLICT_POLICY_SHA256,
 }
 CONFLICT_REQUEST_SCHEMA = {
@@ -8372,11 +8372,6 @@ def validate_conflict_result_identity(
         "id": request["request_id"],
         "sha256": request["request_sha256"],
     }
-    expected_task_base = (
-        request["native_stack"]["members"][-1]["head_sha"]
-        if request["strategy"] == "native-stack"
-        else request["pull_request"]["head_sha"]
-    )
     if (
         result.get("error") is not None
         or result.get("model") != request["model"]
@@ -8391,8 +8386,6 @@ def validate_conflict_result_identity(
         or not isinstance(task.get("id"), str)
         or not task["id"]
         or task.get("state") != "completed"
-        or task.get("base_ref") != expected_task_base
-        or task.get("base_sha") != expected_task_base
         or not isinstance(generated, dict)
         or set(generated) != {"artifact", "code_refs"}
         or not isinstance(generated.get("code_refs"), list)
@@ -8402,13 +8395,32 @@ def validate_conflict_result_identity(
         raise WorkflowError("managed conflict result identity does not match the request")
     if request["strategy"] == "native-stack":
         members = generated["artifact"].get("members")
+        code_refs = generated["code_refs"]
         if (
             not isinstance(members, list)
             or not members
             or not isinstance(members[-1], dict)
             or members[-1].get("task") != task
+            or len(code_refs) != len(request["native_stack"]["members"])
+            or not all(isinstance(item, dict) for item in code_refs)
         ):
             raise WorkflowError("managed stack final task identity does not match")
+        expected_task_base = (
+            request["native_stack"]["trunk"]["sha"]
+            if len(code_refs) == 1
+            else code_refs[-2].get("new_sha")
+        )
+    else:
+        expected_task_base = request["pull_request"][
+            "base_sha" if request["strategy"] == "rebase" else "head_sha"
+        ]
+    if (
+        not isinstance(expected_task_base, str)
+        or not re.fullmatch(r"[0-9a-f]{40}", expected_task_base)
+        or task.get("base_ref") != expected_task_base
+        or task.get("base_sha") != expected_task_base
+    ):
+        raise WorkflowError("managed conflict task base does not match replay ancestry")
     return generated["code_refs"], generated["artifact"]
 
 
@@ -8570,8 +8582,8 @@ def verify_stack_task_artifacts(
             or not task["id"]
             or task["id"] in task_ids
             or task["state"] != "completed"
-            or task["base_ref"] != member["head_sha"]
-            or task["base_sha"] != member["head_sha"]
+            or task["base_ref"] != code_ref["base_sha"]
+            or task["base_sha"] != code_ref["base_sha"]
             or not isinstance(branch, str)
             or not branch
             or branch in branches | forbidden_branches

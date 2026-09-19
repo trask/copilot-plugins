@@ -13,6 +13,63 @@ MODULE = existing.MODULE
 CLOUD = existing.CLOUD_MODULE
 
 
+class ReplayTaskBaseTest(unittest.TestCase):
+    def test_creation_and_collection_share_base_without_changing_merge_or_legacy(self):
+        for policy, strategy, base_key in (
+            (CLOUD.SEQUENTIAL_POLICY, "merge", "head_sha"),
+            (CLOUD.SEQUENTIAL_POLICY, "rebase", "base_sha"),
+            (CLOUD.MINIMAL_POLICY, "merge", "head_sha"),
+            (CLOUD.MINIMAL_POLICY, "rebase", "head_sha"),
+        ):
+            with self.subTest(policy=policy["version"], strategy=strategy):
+                request = existing.ManagedTaskPromptTest().minimal_request()
+                request.update(policy=policy, strategy=strategy)
+                request["request_sha256"] = CLOUD.request_digest(request)
+                options = CLOUD.Options(
+                    strategy, request["model"], request["pull_request"]["url"],
+                    Path("request.json"), Path("prompt.txt"), Path("result.json"),
+                    None, request, "Resolve the frozen conflict.", None,
+                )
+                snapshot = CLOUD.LocalSnapshot(
+                    Path.cwd(), Path.cwd(), request["repository"], "origin",
+                    "", request["pull_request"]["head_sha"], "", None,
+                )
+                task = existing.MinimalConflictContractTest().task(request)
+                expected_base = request["pull_request"][base_key]
+                task["artifacts"][0]["data"]["base_ref"] = expected_base
+                task["sessions"][0]["base_ref"] = expected_base
+                with mock.patch.object(CLOUD, "api_json", return_value=task) as api:
+                    created = CLOUD.start_task(mock.sentinel.runner, snapshot, options)
+                self.assertEqual(expected_base, api.call_args.args[-1]["base_ref"])
+                self.assertEqual(
+                    "copilot/generated-task",
+                    CLOUD.discover_minimal_artifact_ref(created, request).ref,
+                )
+                prompt = api.call_args.args[-1]["prompt"]
+                self.assertEqual(
+                    policy == CLOUD.SEQUENTIAL_POLICY and strategy == "rebase",
+                    "The task branch starts at the exact replay base" in prompt,
+                )
+
+    def test_controller_keeps_source_identity_separate_from_rebase_task_base(self):
+        fixture = existing.ManagedConflictCoordinatorTest()
+        request = fixture.request()
+        request["strategy"] = "rebase"
+        request["request_sha256"] = MODULE.request_digest(request)
+        result = fixture.success_result(request)
+        result["task"].update(
+            base_ref=request["pull_request"]["base_sha"],
+            base_sha=request["pull_request"]["base_sha"],
+        )
+        MODULE.validate_conflict_result_identity(result, request)
+        result["task"].update(
+            base_ref=request["pull_request"]["head_sha"],
+            base_sha=request["pull_request"]["head_sha"],
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "base does not match"):
+            MODULE.validate_conflict_result_identity(result, request)
+
+
 class SequentialStackTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -137,8 +194,10 @@ class SequentialStackTest(unittest.TestCase):
         task["id"] = f"task-{len(self.launched)}"
         task["head_ref"] = branch
         task["artifacts"][0]["data"]["head_ref"] = branch
+        task["artifacts"][0]["data"]["base_ref"] = options.request["pull_request"]["base_sha"]
         task["sessions"][0]["head_ref"] = branch
         task["sessions"][0]["task_id"] = task["id"]
+        task["sessions"][0]["base_ref"] = options.request["pull_request"]["base_sha"]
         return task
 
     def execute(self, guard=None):
@@ -161,6 +220,13 @@ class SequentialStackTest(unittest.TestCase):
         self.assertEqual(2, len(self.launched))
         self.assertEqual(self.trunk, self.launched[0].request["pull_request"]["base_sha"])
         self.assertEqual(self.new_lower, self.launched[1].request["pull_request"]["base_sha"])
+        self.assertEqual(self.lower, self.launched[0].request["pull_request"]["head_sha"])
+        self.assertEqual(self.upper, self.launched[1].request["pull_request"]["head_sha"])
+        self.assertEqual(
+            [self.trunk, self.new_lower],
+            [item["task"]["base_sha"] for item in result.artifact["members"]],
+        )
+        self.assertEqual(self.new_lower, result.task_base_sha)
         self.assertEqual([self.new_lower], result.code_refs[0]["fix_commits"])
         self.assertEqual([], result.code_refs[1]["fix_commits"])
         self.assertEqual(self.new_upper, result.code_refs[1]["new_sha"])
@@ -194,6 +260,85 @@ class SequentialStackTest(unittest.TestCase):
             self.assertIn("authoritative Agent Task branch", prompt)
             self.assertNotIn("copilot/conflict-", prompt)
             self.assertNotIn("generated_refs", prompt)
+            self.assertIn(
+                f"`git rev-parse HEAD` equals `{options.request['pull_request']['base_sha']}`",
+                prompt,
+            )
+            self.assertIn(
+                f"`git fetch --no-tags origin {options.request['pull_request']['head_sha']}`",
+                prompt,
+            )
+            self.assertIn("Do not switch branches", prompt)
+            self.assertIn("Cherry-pick each `head_commits` SHA", prompt)
+
+    def test_task_creation_pins_replay_destination_and_preserves_source_identity(self):
+        lower_report = self.commit(
+            self.new_lower, "Lower notes", CLOUD.OUTPUT_REPORT_PATH, "advisory\n"
+        )
+        self.run_git(
+            "push", "--quiet", "--force", "origin",
+            f"{lower_report}:refs/heads/copilot/lower-task",
+        )
+        self.execute()
+        self.assertEqual(lower_report, self.result.artifact["members"][0]["head_sha"])
+        self.assertEqual(self.new_lower, self.result.artifact["members"][0]["source_tip_sha"])
+        for options, expected_base in zip(self.launched, [self.trunk, self.new_lower]):
+            with (
+                self.subTest(base=expected_base),
+                mock.patch.object(CLOUD, "api_json", return_value={
+                    "id": "fresh-task", "state": "queued",
+                }) as api,
+            ):
+                CLOUD.start_task(subprocess.run, self.snapshot, options)
+                payload = api.call_args.args[-1]
+                self.assertEqual(expected_base, payload["base_ref"])
+                self.assertFalse(payload["create_pull_request"])
+                self.assertIn(
+                    options.request["pull_request"]["head_sha"], payload["prompt"]
+                )
+                self.assertNotEqual(
+                    options.request["pull_request"]["head_sha"], payload["base_ref"]
+                )
+
+    def test_source_plus_rewritten_trunk_fails_even_with_correct_candidate_tree(self):
+        reversed_tip = self.commit(
+            self.lower, "Trunk", "app.py", "seed\ntrunk\none\ntwo\n"
+        )
+        self.assertEqual(
+            self.run_git("rev-parse", f"{self.new_lower2}^{{tree}}"),
+            self.run_git("rev-parse", f"{reversed_tip}^{{tree}}"),
+        )
+        self.assertEqual(self.lower, self.run_git("rev-parse", f"{reversed_tip}^"))
+        self.assertEqual(self.seed, self.run_git("merge-base", self.trunk, reversed_tip))
+        self.run_git(
+            "push", "--quiet", "--force", "origin",
+            f"{reversed_tip}:refs/heads/copilot/lower-task",
+        )
+        with self.assertRaisesRegex(CLOUD.ConflictError, "not rooted at pinned base"):
+            self.execute()
+        self.assertEqual(1, len(self.launched))
+        self.assertEqual("not_started", self.result.application_status)
+        self.assertEqual([], self.result.code_refs)
+        self.assertEqual(self.lower, self.run_git("rev-parse", "HEAD"))
+
+    def test_task_reporting_original_source_as_base_is_rejected(self):
+        original = self.start
+        for field in ("artifact", "session"):
+            def start(*args):
+                task = original(*args)
+                if field == "artifact":
+                    task["artifacts"][0]["data"]["base_ref"] = self.lower
+                else:
+                    task["sessions"][0]["base_ref"] = self.lower
+                return task
+
+            self.launched = []
+            self.start = start
+            with self.subTest(field=field), self.assertRaisesRegex(
+                CLOUD.ConflictError, "session identity changed"
+            ):
+                self.execute()
+            self.assertEqual("not_started", self.result.application_status)
 
     def test_missing_replay_commit_stops_before_next_task(self):
         self.run_git("push", "--quiet", "--force", "origin", f"{self.new_lower1}:refs/heads/copilot/lower-task")
@@ -235,12 +380,26 @@ class SequentialStackTest(unittest.TestCase):
 
     def test_controller_rejects_missing_reordered_or_divergent_member_evidence(self):
         self.execute()
+        result = self.result.as_dict()
+        result["task"] = {
+            **result["task"], "base_ref": self.upper, "base_sha": self.upper,
+        }
+        result["generated"]["artifact"] = copy.deepcopy(result["generated"]["artifact"])
+        result["generated"]["artifact"]["members"][-1]["task"] = result["task"]
+        with self.assertRaisesRegex(MODULE.WorkflowError, "base does not match"):
+            MODULE.validate_conflict_result_identity(result, self.request)
         for mutate in (
             lambda refs, artifact: artifact["members"].pop(),
             lambda refs, artifact: artifact["members"].reverse(),
             lambda refs, artifact: refs[1].update(base_sha=self.trunk),
             lambda refs, artifact: refs[0].update(fix_commits=[]),
             lambda refs, artifact: artifact["members"][1]["task"].update(id="task-1"),
+            lambda refs, artifact: artifact["members"][0]["task"].update(
+                base_ref=self.lower, base_sha=self.lower
+            ),
+            lambda refs, artifact: artifact["members"][1]["task"].update(
+                base_ref=self.upper, base_sha=self.upper
+            ),
         ):
             refs = copy.deepcopy(self.result.code_refs)
             artifact = copy.deepcopy(self.result.artifact)

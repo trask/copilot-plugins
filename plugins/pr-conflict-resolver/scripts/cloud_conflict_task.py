@@ -136,20 +136,21 @@ MINIMAL_POLICY = {
 }
 SEQUENTIAL_POLICY_SPEC = {
     **MINIMAL_POLICY_SPEC,
-    "version": 7,
+    "version": 8,
     "multi_role_code_refs": "one-authoritative-generated-branch-per-member-task",
     "native_stack_execution": "controller-sequenced-frozen-member-replay",
     "member_fix_commits": "linear-closed-path-suffix-after-complete-replay",
+    "replay_task_base": "pinned-destination-sha",
 }
 SEQUENTIAL_POLICY_SHA256 = hashlib.sha256(
     json.dumps(
         SEQUENTIAL_POLICY_SPEC, sort_keys=True, separators=(",", ":")
     ).encode("ascii")
 ).hexdigest()
-SEQUENTIAL_POLICY_SELECTOR = f"{POLICY_ID}@7"
+SEQUENTIAL_POLICY_SELECTOR = f"{POLICY_ID}@8"
 SEQUENTIAL_POLICY = {
     "id": POLICY_ID,
-    "version": 7,
+    "version": 8,
     "sha256": SEQUENTIAL_POLICY_SHA256,
 }
 MODEL_IDS = {
@@ -2286,6 +2287,38 @@ def receipt_contract_template(
     }
 
 
+def task_base_sha(request: Mapping[str, object]) -> str:
+    if request["policy"] == SEQUENTIAL_POLICY and request["strategy"] == "rebase":
+        return request["pull_request"]["base_sha"]
+    return request["pull_request"]["head_sha"]
+
+
+def replay_task_instructions(request: Mapping[str, object]) -> str:
+    if request["policy"] != SEQUENTIAL_POLICY or request["strategy"] != "rebase":
+        return ""
+    pr = request["pull_request"]
+    return (
+        f"The task branch starts at the exact replay base `{pr['base_sha']}`. "
+        "Keep that base unchanged. Before editing, verify "
+        f"`git rev-parse HEAD` equals `{pr['base_sha']}`; stop if it does not. "
+        "Stay on the existing authoritative task branch. Do not switch branches, "
+        "reset it to the source head, rebase it, or replay base/trunk commits "
+        "onto the source. The frozen source head is input evidence, not the "
+        "task base. Fetch its objects without checking it out using "
+        f"`git fetch --no-tags origin {pr['head_sha']}`. "
+        "Cherry-pick each `head_commits` SHA from the compact contract below "
+        "in its listed order onto the existing task branch. Resolve each "
+        "conflict and continue that cherry-pick before starting the next. "
+        "Preserve each subject and trailers; do not use `-x`, squash, reorder, "
+        "or skip a listed commit, including an empty replay. Do not derive "
+        "the replay range from main or from a commit count. "
+        "Before finishing, verify "
+        f"`git merge-base --is-ancestor {pr['base_sha']} HEAD` succeeds. "
+        "Commit the complete source deliverable on this same task branch; "
+        "a working tree or a final message is not the deliverable.\n"
+    )
+
+
 def policy_prompt(
     options: Options,
     *,
@@ -2339,6 +2372,7 @@ def policy_prompt(
             f"Policy SHA-256: {options.request['policy']['sha256']}\n"
             f"Mode: {MODE}\n"
             f"Strategy: {options.strategy}\n"
+            f"{replay_task_instructions(options.request)}"
             "The dispatcher owns and binds every request, repository, pull "
             "request, frozen head and base, model, policy, task, session, "
             "generated ref, commit, receipt, and completion identity. Do not "
@@ -2690,7 +2724,7 @@ def start_task(
         "prompt": validated_task_prompt(options),
         "model": options.model,
         "create_pull_request": False,
-        "base_ref": options.request["pull_request"]["head_sha"],
+        "base_ref": task_base_sha(options.request),
     }
     return validate_task(
         api_json(
@@ -2812,11 +2846,11 @@ def discover_semantic_artifact_ref(
         artifact.get("provider") != "github"
         or artifact.get("type") != "branch"
         or not isinstance(data, dict)
-        or data.get("base_ref") != request["pull_request"]["head_sha"]
+        or data.get("base_ref") != task_base_sha(request)
         or session.get("task_id") != task_id
         or session.get("state") != "completed"
         or session.get("model") != f"sweagent-capi:{request['model']}"
-        or session.get("base_ref") != request["pull_request"]["head_sha"]
+        or session.get("base_ref") != task_base_sha(request)
     ):
         raise ConflictError(
             "completed task session identity changed",
@@ -4817,7 +4851,6 @@ def execute_native_stack(
     request = options.request
     request_id = str(request["request_id"])
     base_sha = request["native_stack"]["trunk"]["sha"]
-    base_branch = request["native_stack"]["trunk"]["ref"]
     code_refs: list[Mapping[str, object]] = []
     artifacts: list[Mapping[str, object]] = []
     task_ids: set[str] = set()
@@ -4834,9 +4867,8 @@ def execute_native_stack(
         prompt = (
             "Resolve only this member of the frozen native stack. Replay exactly "
             "the listed old commits, in order, onto the exact supplied base SHA. "
-            "Fetch the predecessor branch "
-            f"`{base_branch}` to obtain base commit `{base_sha}`. Use that code "
-            "commit, not an optional report commit above it. Preserve both sides' "
+            "The controller starts this task at the verified predecessor code "
+            "commit, excluding any optional report commit above it. Preserve both sides' "
             "intent, subjects, trailers, and unaffected patches. Omit only the "
             "recorded topology-only synchronization merges. Do not replay the "
             "other stack members. After the complete replay you may append "
@@ -4869,7 +4901,7 @@ def execute_native_stack(
         result.task_id = progress.task_id = task_id
         result.task_state = progress.task_state = str(initial["state"])
         result.task_url = task_link(initial)
-        result.task_base_ref = result.task_base_sha = member["head_sha"]
+        result.task_base_ref = result.task_base_sha = base_sha
         atomic_write_json(options.result_file, result.as_dict())
         final = monitor_task(runner, snapshot, initial, progress, sleep)
         result.task_state = str(final["state"])
@@ -4918,8 +4950,8 @@ def execute_native_stack(
             "id": task_id,
             "url": result.task_url,
             "state": "completed",
-            "base_ref": member["head_sha"],
-            "base_sha": member["head_sha"],
+            "base_ref": base_sha,
+            "base_sha": base_sha,
         }
         member_artifact = {
             "pr_number": number,
@@ -4942,7 +4974,7 @@ def execute_native_stack(
         result.code_refs = list(code_refs)
         result.artifact = {"members": list(artifacts)}
         atomic_write_json(options.result_file, result.as_dict())
-        base_sha, base_branch = tip, remote.ref
+        base_sha = tip
     for artifact in artifacts:
         _, current_head = fetch_quarantined(
             runner,
@@ -5127,8 +5159,7 @@ def execute(
         result.task_id = progress.task_id
         result.task_state = progress.task_state
         result.task_url = task_link(initial)
-        result.task_base_ref = request["pull_request"]["head_sha"]
-        result.task_base_sha = request["pull_request"]["head_sha"]
+        result.task_base_ref = result.task_base_sha = task_base_sha(request)
     final = monitor_task(runner, snapshot, initial, progress, sleep)
     if result is not None:
         result.task_state = str(final["state"])
