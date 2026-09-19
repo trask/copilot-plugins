@@ -76,9 +76,14 @@ class ReplayMessageProofTest(unittest.TestCase):
         root = Path.cwd()
         message = b"Subject\r\n\r\nOpaque \xff\n"
         runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, b"tree abc\n\n" + message, b""))
-        with mock.patch.object(CLOUD.os, "name", "nt"), mock.patch.object(CLOUD, "_creation_flags", return_value=0x08000000):
+        with (
+            mock.patch.object(CLOUD, "stable_process_directory", return_value=root),
+            mock.patch.object(CLOUD.os, "name", "nt"),
+            mock.patch.object(CLOUD, "_creation_flags", return_value=0x08000000),
+        ):
             self.assertEqual(message, CLOUD.commit_message_bytes(runner, root, "a" * 40))
         self.assertEqual(0x08000000, runner.call_args.kwargs["creationflags"])
+        self.assertEqual(str(root), runner.call_args.kwargs["cwd"])
         self.assertNotIn("text", runner.call_args.kwargs)
         self.assertEqual(["git", "-C", str(root), "cat-file", "commit", "a" * 40], runner.call_args.args[0])
 
