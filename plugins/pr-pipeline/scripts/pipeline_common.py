@@ -1531,6 +1531,28 @@ def stage_status_summary(payload: Any) -> dict[str, Any]:
     return {key: payload[key] for key in STAGE_STATUS_FIELDS if key in payload}
 
 
+def stage_failure_summary(stage_result: Any, *, text_limit: int = 512) -> dict[str, Any]:
+    """Preview a retained task error without changing the controller's stop reason."""
+    if not isinstance(stage_result, dict):
+        return {}
+    status = stage_result.get("status")
+    sources = [stage_result, status] if isinstance(status, dict) else [stage_result]
+    for source in sources:
+        task = source.get("agent_task")
+        error = task.get("error") if isinstance(task, dict) else None
+        if not isinstance(error, str) or not error.strip():
+            continue
+        result = {}
+        for key, value in (("stage", stage_result.get("stage")), ("error", error)):
+            if not isinstance(value, str) or not value.strip():
+                continue
+            result[key] = value[: text_limit - 3] + "..." if len(value) > text_limit else value
+            if len(value) > text_limit:
+                result[f"{key}_details_truncated"] = True
+        return result
+    return {}
+
+
 def valid_ci_warnings(warnings: Any) -> bool:
     return (
         isinstance(warnings, list)

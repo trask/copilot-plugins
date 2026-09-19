@@ -284,6 +284,14 @@ COPILOT_REVIEW_REPORT_SCHEMA = {
     "id": "github.copilot.copilot-review-loop-report",
     "version": 3,
 }
+INDEXED_COPILOT_REVIEW_REPORT_SCHEMA = {
+    "id": "github.copilot.copilot-review-loop-report",
+    "version": 4,
+}
+HOSTED_DECISION_REPORT_SCHEMA = {
+    "id": "github.copilot.copilot-review-loop-decision-report",
+    "version": 3,
+}
 DECISION_COPILOT_REVIEW_REPORT_SCHEMA = {
     "id": "github.copilot.copilot-review-loop-decision-report",
     "version": 2,
@@ -292,7 +300,7 @@ LEGACY_DECISION_COPILOT_REVIEW_REPORT_SCHEMA = {
     "id": "github.copilot.copilot-review-loop-decision-report",
     "version": 1,
 }
-WORKER_PROMPT_VERSION = 9
+WORKER_PROMPT_VERSION = 10
 MODEL_ALIASES = {
     "sol": "gpt-5.6-sol",
 }
@@ -3453,9 +3461,19 @@ def request_first_copilot_review(pr: dict[str, Any]) -> str:
 
 
 def reply_body(comment: dict[str, Any]) -> str:
-    if comment.get("commit"):
-        return f"Addressed in {comment['commit']}.\n\n{comment['reply']}"
+    commits = (
+        comment["commits"] if "commits" in comment
+        else [comment["commit"]] if comment.get("commit") else []
+    )
+    if commits:
+        return f"Addressed in {', '.join(commits)}.\n\n{comment['reply']}"
     return f"No code change.\n\n{comment['reply']}"
+
+
+def review_comment_commit_fields(comment: dict[str, Any]) -> dict[str, Any]:
+    if "fixes" in comment:
+        return {"commits": [fix["commit"] for fix in comment["fixes"]]}
+    return {"commit": comment["commit"]}
 
 
 def fetch_review_comments(owner: str, repo: str, number: int) -> list[dict[str, Any]]:
@@ -5242,6 +5260,7 @@ def validate_copilot_review_report(
     remote: dict[str, Any],
     paths_by_commit: dict[str, list[str]],
     active_local_decisions: bool = False,
+    hosted_decisions: bool = False,
 ) -> dict[str, Any]:
     require_no_credentials(content, source="Copilot Review Loop report")
     report = parse_markdown_report(content, description="Copilot Review Loop report")
@@ -5251,7 +5270,12 @@ def validate_copilot_review_report(
         paths_by_commit,
     )
     supplemental_commits: list[str] = []
-    if isinstance(report, dict) and set(report) == {"decisions"}:
+    if hosted_decisions:
+        report = normalize_hosted_review_decisions(
+            report, request_id=request_id, preflight=preflight,
+            remote=remote, paths_by_commit=paths_by_commit,
+        )
+    elif isinstance(report, dict) and set(report) == {"decisions"}:
         report = normalize_decision_review_report(
             report,
             request_id=request_id,
@@ -5385,7 +5409,8 @@ def validate_copilot_review_report(
         "title_sha256": sha256_text(pr["title"]),
         "body_sha256": sha256_text(pr["body"]),
     }
-    if schema == COPILOT_REVIEW_REPORT_SCHEMA:
+    indexed = schema == INDEXED_COPILOT_REVIEW_REPORT_SCHEMA
+    if indexed or schema == COPILOT_REVIEW_REPORT_SCHEMA:
         expected_pull_request.update(
             {
                 "head_ref": pr["head_branch"],
@@ -5397,6 +5422,7 @@ def validate_copilot_review_report(
         or set(report) != expected_keys
         or schema
         not in (
+            INDEXED_COPILOT_REVIEW_REPORT_SCHEMA,
             COPILOT_REVIEW_REPORT_SCHEMA,
             POSITIONAL_COPILOT_REVIEW_REPORT_SCHEMA,
             LEGACY_COPILOT_REVIEW_REPORT_SCHEMA,
@@ -5411,37 +5437,61 @@ def validate_copilot_review_report(
         raise WorkflowError(
             "Copilot Review Loop report is malformed or has stale identity"
         )
+    if indexed and preflight.get("historical_fixes") is not None:
+        raise WorkflowError("indexed review decisions require only the current candidate history")
     accounted_commits: list[str] = []
+    declared: dict[str, set[str]] = {commit: set() for commit in fix_commits}
     for expected, item in zip(preflight["comment_identities"], report["comments"]):
         identity_keys = set(expected)
+        fix_keys = {"fixes"} if indexed else {"commit", "changed_paths"}
         if (
             not isinstance(item, dict)
             or set(item)
             != identity_keys
-            | {"disposition", "reason", "commit", "reply", "changed_paths"}
+            | {"disposition", "reason", "reply"} | fix_keys
             or {key: item.get(key) for key in expected} != expected
+            or not isinstance(item.get("disposition"), str)
             or item.get("disposition") not in {"fixed", "no_change"}
             or not isinstance(item.get("reason"), str)
             or not item["reason"].strip()
             or not isinstance(item.get("reply"), str)
             or not item["reply"].strip()
-            or not isinstance(item.get("changed_paths"), list)
+            or (indexed and not isinstance(item.get("fixes"), list))
+            or (not indexed and not isinstance(item.get("changed_paths"), list))
         ):
             raise WorkflowError(
                 "Copilot Review Loop report contains a malformed or mismatched comment"
             )
-        paths = item["changed_paths"]
-        if any(
-            not isinstance(path, str)
-            or not path
-            or Path(path).is_absolute()
-            or ".." in Path(path).parts
-            for path in paths
-        ) or len(paths) != len(set(paths)):
-            raise WorkflowError("Copilot Review Loop report contains invalid paths")
-        if item["disposition"] == "fixed":
-            commit = item.get("commit")
-            if commit not in fix_commits or not paths:
+        fixes = item["fixes"] if indexed else [
+            {"commit": item["commit"], "changed_paths": item["changed_paths"]}
+        ]
+        if indexed and bool(fixes) != (item["disposition"] == "fixed"):
+            raise WorkflowError("review disposition does not match its fix commit mapping")
+        mapped_commits: list[str] = []
+        for fix in fixes:
+            if (
+                not isinstance(fix, dict)
+                or set(fix) != {"commit", "changed_paths"}
+                or not isinstance(fix.get("changed_paths"), list)
+            ):
+                raise WorkflowError("review report contains a malformed fix mapping")
+            paths = fix["changed_paths"]
+            if any(
+                not isinstance(path, str)
+                or not path
+                or Path(path).is_absolute()
+                or ".." in Path(path).parts
+                for path in paths
+            ) or len(paths) != len(set(paths)):
+                raise WorkflowError("Copilot Review Loop report contains invalid paths")
+            commit = fix.get("commit")
+            if item["disposition"] == "no_change":
+                if commit is not None or paths:
+                    raise WorkflowError(
+                        "no-change comment must not name a commit or changed path"
+                    )
+                continue
+            if not isinstance(commit, str) or commit not in fix_commits or not paths:
                 raise WorkflowError(
                     "fixed comment does not name a fix commit and paths"
                 )
@@ -5454,21 +5504,26 @@ def validate_copilot_review_report(
                 )
             if commit not in accounted_commits:
                 accounted_commits.append(commit)
-        elif item.get("commit") is not None or paths:
+            mapped_commits.append(commit)
+            if indexed and set(paths) != set(verified_paths[commit]):
+                raise WorkflowError(f"fix commit {commit} changed unexpected paths")
+            declared[commit].update(paths)
+        if indexed and mapped_commits != [
+            commit for commit in fix_commits if commit in mapped_commits
+        ]:
             raise WorkflowError(
-                "no-change comment must not name a commit or changed path"
+                "review report contains duplicate or reordered fix commits"
             )
     if supplemental_commits:
         if accounted_commits + supplemental_commits != fix_commits:
             raise WorkflowError(
                 "forward repository report does not account for every fix commit"
             )
-    elif accounted_commits != fix_commits:
+    elif (
+        set(accounted_commits) != set(fix_commits)
+        if indexed else accounted_commits != fix_commits
+    ):
         raise WorkflowError("report comments do not account for every fix commit")
-    declared: dict[str, set[str]] = {commit: set() for commit in fix_commits}
-    for item in report["comments"]:
-        if item["disposition"] == "fixed":
-            declared[item["commit"]].update(item["changed_paths"])
     for commit, actual_paths in verified_paths.items():
         actual = set(actual_paths)
         if commit in supplemental_commits:
@@ -5482,6 +5537,91 @@ def validate_copilot_review_report(
     if bool(fix_commits) != (report["outcome"] == "addressed"):
         raise WorkflowError("report outcome does not match its fix commits")
     return report
+
+
+def normalize_hosted_review_decisions(
+    report: Any, *, request_id: str, preflight: dict[str, Any],
+    remote: dict[str, Any], paths_by_commit: dict[str, list[str]],
+) -> dict[str, Any]:
+    if (
+        not isinstance(report, dict)
+        or set(report) != {"schema", "decisions"}
+        or report.get("schema") != HOSTED_DECISION_REPORT_SCHEMA
+        or not isinstance(report.get("decisions"), list)
+    ):
+        raise WorkflowError(
+            "hosted review decisions require decision-report schema version 3 "
+            "with explicit commit indexes; legacy decisions are not accepted"
+        )
+    expected = {
+        decision_finding_id(request_id, position): identity
+        for position, identity in enumerate(preflight["comment_identities"])
+    }
+    decisions: dict[str, dict[str, Any]] = {}
+    commits = remote["commits"]
+    for item in report["decisions"]:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("finding_id"), str)
+            or item["finding_id"] not in expected
+            or item["finding_id"] in decisions
+        ):
+            raise WorkflowError("hosted review decisions have unknown or duplicate finding IDs")
+        disposition = item.get("disposition")
+        keys = {"finding_id", "disposition"}
+        keys |= {"fixes"} if disposition == "fixed" else {"reason", "proposed_reply"}
+        if (
+            not isinstance(disposition, str)
+            or disposition not in {"fixed", "no_change"} or set(item) != keys
+        ):
+            raise WorkflowError("hosted review decision fields or disposition are invalid")
+        fixes = []
+        if disposition == "fixed":
+            if not isinstance(item["fixes"], list) or not item["fixes"]:
+                raise WorkflowError("fixed hosted review decision requires a nonempty fix mapping")
+            indexes = []
+            for fix in item["fixes"]:
+                index = fix.get("commit_index") if isinstance(fix, dict) else None
+                if (
+                    not isinstance(fix, dict) or set(fix) != {"commit_index"}
+                    or type(index) is not int or not 1 <= index <= len(commits)
+                ):
+                    raise WorkflowError("hosted review decision has an invalid commit index")
+                indexes.append(index)
+            if indexes != sorted(set(indexes)):
+                raise WorkflowError("hosted review decision has duplicate or reordered commit indexes")
+            fixes = [
+                {"commit": commits[index - 1], "changed_paths": paths_by_commit[commits[index - 1]]}
+                for index in indexes
+            ]
+            references = ", ".join(fix["commit"] for fix in fixes)
+            reason = f"The coordinator verified the source transitions and exact changed paths for {references}."
+            reply = f"Fixed in the verified source changes {references}."
+        else:
+            if any(
+                not isinstance(item[field], str) or not item[field].strip()
+                for field in ("reason", "proposed_reply")
+            ):
+                raise WorkflowError("no-change hosted review decision requires a reason and proposed reply")
+            reason, reply = item["reason"].strip(), item["proposed_reply"].strip()
+        decisions[item["finding_id"]] = {
+            **expected[item["finding_id"]], "disposition": disposition,
+            "reason": reason, "reply": reply, "fixes": fixes,
+        }
+    if set(decisions) != set(expected):
+        raise WorkflowError("hosted review decisions have missing finding IDs")
+    pr = preflight["pr"]
+    return {
+        "schema": INDEXED_COPILOT_REVIEW_REPORT_SCHEMA,
+        "request_id": request_id, "repository": pr["repo_name"],
+        "pull_request": {
+            "number": pr["number"], "head_sha": pr["head_sha"], "base_sha": pr["base_sha"],
+            "head_ref": pr["head_branch"], "base_ref": pr["base_branch"],
+            "title_sha256": sha256_text(pr["title"]), "body_sha256": sha256_text(pr["body"]),
+        },
+        "outcome": "addressed" if commits else "no_changes",
+        "comments": [decisions[finding_id] for finding_id in expected],
+    }
 
 
 def decision_finding_key(identity: dict[str, Any]) -> str:
@@ -7473,18 +7613,21 @@ def validate_hosted_candidate(
     }
     code_commits = [item["sha"] for item in history.code_commits]
     artifact = history.artifact_commit
-    if (
-        result.get("candidate") != expected_manifest
-        or generated["commits"] != code_commits
-        or len(code_commits) > 1
-        or artifact is None or artifact["sha"] != generated["head_sha"]
-        or HOSTED_DECISION_PATH not in artifact["changed_paths"]
-        or any(
-            path.startswith(".github/agent-task-")
-            for item in history.code_commits for path in item["changed_paths"]
+    if result.get("candidate") != expected_manifest:
+        raise WorkflowError("hosted review candidate manifest does not match verified history")
+    if generated["commits"] != code_commits:
+        raise WorkflowError("hosted review generated commits do not match verified code commits")
+    if artifact is None or artifact["sha"] != generated["head_sha"]:
+        raise WorkflowError("hosted review candidate requires a final decisions artifact commit")
+    if HOSTED_DECISION_PATH not in artifact["changed_paths"]:
+        raise WorkflowError(
+            f"hosted review final artifact commit must include {HOSTED_DECISION_PATH}"
         )
+    if any(
+        path.startswith(".github/agent-task-")
+        for item in history.code_commits for path in item["changed_paths"]
     ):
-        raise WorkflowError("hosted review candidate manifest or decisions artifact is invalid")
+        raise WorkflowError("hosted review code commits contain reserved Agent Task paths")
     for commit in code_commits:
         require_no_credentials(
             git(repo_root, "show", "-s", "--format=%B", commit),
@@ -7508,6 +7651,10 @@ def run_hosted_decision_worker(
 ) -> dict[str, Any]:
     runtime = load_candidate_runtime(helper)
     prompt = prompt_path.read_text(encoding="utf-8")
+    if not prompt.startswith(
+        f"Copilot Review Loop hosted worker prompt version {WORKER_PROMPT_VERSION}.\n\n"
+    ):
+        raise WorkflowError("hosted review prompt version is not current; retained requests cannot be replayed")
     prompt_sha256 = sha256_file(prompt_path)
     pr = preflight["pr"]
     snapshot = runtime.PullRequestSnapshot(
@@ -7556,7 +7703,7 @@ def run_hosted_decision_worker(
     remote["request_id"] = run_id
     report = validate_copilot_review_report(
         decision_content, request_id=run_id, preflight=preflight,
-        remote=remote, paths_by_commit=paths, active_local_decisions=True,
+        remote=remote, paths_by_commit=paths, hosted_decisions=True,
     )
     canonical_content = render_canonical_review_report(report)
     atomic_write_text(canonical_path, canonical_content)
@@ -8268,10 +8415,12 @@ def build_worker_prompt(
         "prior_history": prior_history,
     }
     report_shape = {
+        "schema": HOSTED_DECISION_REPORT_SCHEMA,
         "decisions": [
             {
                 "finding_id": decision_finding_id(request_id, position),
                 "disposition": "fixed",
+                "fixes": [{"commit_index": 1}],
             }
             for position, _identity in enumerate(preflight["comment_identities"])
         ],
@@ -8290,11 +8439,13 @@ def build_worker_prompt(
         "repository programs or candidate validation commands. "
         "Do not sleep, poll, watch, wait for CI, wait for another review, or start "
         "another iteration. Produce this iteration's artifacts and exit.\n\n"
-        "Put all warranted fixes in exactly one single-parent code commit descended "
-        "from the frozen source head. Create no "
-        "empty code commit, tag, worktree, or merge commit. Before "
-        "writing the decision file, squash every correction-only follow-up into that "
-        "single fix commit. Do not put commit SHAs, parents, changed paths, patch "
+        "Put warranted fixes in linear single-parent code commits descended "
+        "from the frozen source head. Create no empty code commit, tag, worktree, "
+        "or merge commit. Preserve the validated code commits, including correction "
+        "follow-ups; the coordinator imports their exact history without squashing "
+        "or rewriting it. Number these code commits starting at 1 in oldest-first "
+        "order, excluding the final output-only commit. Do not put commit SHAs, "
+        "parents, changed paths, patch "
         "digests, repository or pull request identity, validation claims, session "
         "metadata, or GitHub outcomes in the decision file. The coordinator derives "
         "all of that evidence. Never publish to the source branch or mutate "
@@ -8318,10 +8469,20 @@ def build_worker_prompt(
         f"{len(preflight['comment_identities'])} decisions, one for each shown finding "
         "ID, without adding, dropping, combining, or renaming entries. The coordinator "
         "joins each decision to its pinned identity and rejects any missing, duplicate, "
-        "stale, or unexpected ID. A `fixed` decision has exactly `finding_id` and "
-        "`disposition`. A `no_change` decision has exactly `finding_id`, `disposition`, "
+        "stale, or unexpected ID. The root has exactly `schema` and `decisions`, "
+        "using decision-report schema version 3 as shown. Legacy unversioned "
+        "decisions are rejected. A `fixed` decision has exactly `finding_id`, "
+        "`disposition`, and `fixes`. Its nonempty `fixes` list contains only "
+        "`commit_index` objects with one-based integer indexes into the code commits "
+        "you produced, in increasing order without duplicates. Explicitly list every "
+        "commit that addresses that finding. A commit may address several findings "
+        "when each finding explicitly lists it. Every generated code commit must be "
+        "accounted for by at least one fixed finding. Never include an output commit, "
+        "source commit, or commit from a prior task. A `no_change` decision has "
+        "exactly `finding_id`, `disposition`, "
         "`reason`, and `proposed_reply`; both text values must be concise and non-empty. "
-        "Do not explain an accepted fix in the decision file.\n\n"
+        "It must not contain `fixes`. With no code commits, every decision must be "
+        "`no_change`. Do not explain an accepted fix in the decision file.\n\n"
         "A finding whose pinned `source` is `suppressed` came from a Copilot review "
         "body. Its negative ID is intentional, and its null thread ID is correct. It "
         "will not appear in GitHub's review-thread API. The complete finding text and "
@@ -10953,10 +11114,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
         handled = []
         for item in report["comments"]:
             comment = dict(by_id[item["id"]])
+            if "fixes" in item:
+                comment.pop("commit", None)
             comment.update(
                 {
                     "status": "handled",
-                    "commit": item["commit"],
+                    **review_comment_commit_fields(item),
                     "rationale": item["reason"],
                     "summary": item["reason"],
                     "reply": item["reply"],
@@ -10991,7 +11154,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "path": item["path"],
                 "body_sha256": item["body_sha256"],
                 "outcome": item["disposition"],
-                "commit": item["commit"],
+                **review_comment_commit_fields(item),
                 "rationale": item["reason"],
             }
             for item in report["comments"]

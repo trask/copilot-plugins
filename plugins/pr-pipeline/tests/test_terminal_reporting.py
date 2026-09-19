@@ -183,6 +183,89 @@ class TerminalReportingTest(unittest.TestCase):
         self.assertTrue(final["history_rewritten"])
         self.assertEqual(retained["sha"], final["local_head_sha"])
 
+    def test_published_review_sequence_reports_both_code_commits_not_output_commit(self):
+        code_shas = [
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+        ]
+        output_sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        target = MODULE.build_target("owner", "repo", 7)
+        code_commits = MODULE.common.read_pr_commits(
+            target,
+            api=mock.Mock(return_value={"commits": [
+                {"oid": code_shas[0], "messageHeadline": "First review fix"},
+                {"oid": code_shas[1], "messageHeadline": "Second review fix"},
+            ]}),
+        )
+        published, errors, rewritten = MODULE.commits_added(
+            {"commits": [{"sha": HEAD}]},
+            {"commits": [{"sha": HEAD}, *code_commits]},
+        )
+        self.assertEqual([], errors)
+        self.assertFalse(rewritten)
+        original = observed_clean_result()
+        original["runs"][1].update({
+            "published_commits": published,
+            "status": {"agent_task": {
+                "remote": {"ordered_commits": code_shas},
+                "diagnostics": {"output_commit_sha": output_sha},
+            }},
+        })
+        final = self.watch(original)["final_event"]
+        self.assertEqual(code_commits, final["published_commits"])
+        self.assertEqual(code_shas, [commit["sha"] for commit in final["published_commits"]])
+        self.assertNotIn(output_sha, [commit["sha"] for commit in final["published_commits"]])
+        self.assertEqual([], final["retained_commits"])
+        saved = json.loads(self.path.read_bytes())
+        self.assertEqual(published, saved["runs"][1]["published_commits"])
+        self.assertEqual(
+            code_shas, saved["runs"][1]["status"]["agent_task"]["remote"]["ordered_commits"],
+        )
+
+    def test_retained_review_sequence_reports_both_code_commits_not_output_commit(self):
+        code_shas = [
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+        ]
+        output_sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        repo = self.root / "synthetic-source"
+        with (
+            mock.patch.object(MODULE.common, "git_succeeds", return_value=True),
+            mock.patch.object(MODULE.common, "git_or_none", return_value=(
+                f"{code_shas[0]}\tFirst review fix\n{code_shas[1]}\tSecond review fix\n"
+            )) as git,
+        ):
+            retained = MODULE.local_commits_between(repo, HEAD, code_shas[-1])
+        git.assert_called_once_with(
+            repo, "log", "--reverse", "--first-parent", "--format=%H%x09%s",
+            f"{HEAD}..{code_shas[-1]}",
+        )
+        original = observed_clean_result()
+        original.update({
+            "result": "blocked", "reason": "stage_left_unpublished_commits",
+            "detail": "Review fixes remain local.", "local_head_sha": code_shas[-1],
+            "retained_commits": retained,
+        })
+        original["runs"][1].update({
+            "retained_commits": retained,
+            "status": {"agent_task": {
+                "remote": {"ordered_commits": code_shas},
+                "diagnostics": {"output_commit_sha": output_sha},
+            }},
+        })
+        final = self.watch(original)["final_event"]
+        self.assertEqual("blocked", final["result"])
+        self.assertEqual("stage_left_unpublished_commits", final["reason"])
+        self.assertEqual(code_shas, [commit["sha"] for commit in final["retained_commits"]])
+        self.assertNotIn(output_sha, [commit["sha"] for commit in final["retained_commits"]])
+        self.assertEqual([], final["published_commits"])
+        saved = json.loads(self.path.read_bytes())
+        self.assertEqual(retained, saved["retained_commits"])
+        self.assertEqual(retained, saved["runs"][1]["retained_commits"])
+        self.assertEqual(
+            code_shas, saved["runs"][1]["status"]["agent_task"]["remote"]["ordered_commits"],
+        )
+
     def test_verified_warning_is_complete_but_not_green(self):
         original = observed_clean_result()
         original.update({"ci_warnings": [warning()], "all_ci_passed": False})

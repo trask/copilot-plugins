@@ -2521,7 +2521,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("result schema version 5", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.64")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.65")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -2565,7 +2565,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             prior_history=[],
         )
         self.assertIn("decision object as UTF-8 JSON", prompt)
-        self.assertIn("hosted worker prompt version 9", prompt)
+        self.assertIn("hosted worker prompt version 10", prompt)
+        self.assertIn("decision-report schema version 3", prompt)
+        self.assertIn('"commit_index": 1', prompt)
+        self.assertIn("Every generated code commit must be accounted for", prompt)
         self.assertIn("validation in this hosted task", prompt)
         self.assertIn("never runs repository programs or candidate validation commands", prompt)
         self.assertIn("opaque coordinator-generated values", prompt)
@@ -3514,8 +3517,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn('"author": "copilot-pull-request-reviewer[bot]"', prompt)
         self.assertIn('"head_ref": "feature"', prompt)
         self.assertIn('"base_ref": "main"', prompt)
-        self.assertIn("exactly one single-parent code commit", prompt)
-        self.assertIn("squash every correction-only follow-up", prompt)
+        self.assertIn("linear single-parent code commits", prompt)
+        self.assertIn("without squashing or rewriting", prompt)
+        self.assertIn("increasing order without duplicates", prompt)
 
     def test_canonical_report_v3_validates_refs_and_separate_author(self):
         preflight = copy.deepcopy(self.preflight)

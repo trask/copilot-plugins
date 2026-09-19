@@ -99,7 +99,7 @@ Add only what changed the stack or needs attention:
 
 - Every pull request that still has an uncleared stage, with the stage's outcome and reason.
 - Every push that the bounded event says was propagated to descendants. If `propagations_omitted` is nonzero, read the complete list from `artifacts.result`.
-- A `blocked` result, with the stage ownership or status reason, retained detail, and artifact reference.
+- A `blocked` result, preserving the top-level safety reason, detail, and artifact reference. Include `stage_failure.error` and its affected pull request and stage when present. Read the full artifact when `stage_failure_omitted`, `stage_failure.error_details_truncated`, or `stage_failure.stage_details_truncated` is true. Do not replace the safety reason with this diagnostic or call an escalated stage successful.
 - A `stopped` result, with its reason and detail preserved exactly: a launch that could not be verified, a stack whose topology changed, a missing stage plugin, or another run holding the lock.
 - Any ignored worker result, which means the pull request moved under a worker that was already running.
 

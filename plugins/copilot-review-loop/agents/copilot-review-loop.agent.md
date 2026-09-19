@@ -36,11 +36,29 @@ When a pipeline position includes `github-mutation-policy: source-only`, pass `-
 
 The coordinator is the only workflow entry point. It owns review requests, bounded polling with backoff and jitter, debounce, stable actionable snapshots, restart state, publication, replies, thread resolution, and iteration transitions.
 
-For each fixing iteration, the coordinator freezes the exact repository, pull request, head, base, title, body, comments, suppressed findings, threads, reviews, and advertised refs. It assigns request-bound opaque IDs to the findings. Its hosted `marketplace-agent-code-candidate-worker@1` task writes only a disposition for an accepted fix. A no-change decision also includes a concise reason and proposed reply. The worker never writes commit SHAs, parents, changed paths, patch digests, finding fingerprints, repository or pull request identity, validation claims, model or session metadata, canonical report fields, or GitHub mutation outcomes.
+For each fixing iteration, the coordinator freezes the exact repository, pull request, head, base, title, body, comments, suppressed findings, threads, reviews, and advertised refs. It assigns request-bound opaque IDs to the findings. Its hosted `marketplace-agent-code-candidate-worker@1` task uses worker prompt version 10 and decision-report schema version 3. Each fixed decision explicitly attributes its code commits using one-based indexes. A no-change decision includes only a concise reason and proposed reply, with no fix mapping. The worker never writes commit SHAs, parents, changed paths, patch digests, finding fingerprints, repository or pull request identity, validation claims, model or session metadata, canonical report fields, or GitHub mutation outcomes.
 
-The hosted worker owns semantic diagnosis, candidate edits, and candidate validation. It creates at most one linear, single-parent code commit and one separate final output commit containing `.github/agent-task-output/review-decisions.json`. A no-code decision still requires that output artifact. Optional Markdown is advisory only. The local controller never executes candidate tests, builds, formatters, or a second semantic diagnosis.
+```json
+{
+  "schema": {
+    "id": "github.copilot.copilot-review-loop-decision-report",
+    "version": 3
+  },
+  "decisions": [
+    {
+      "finding_id": "finding-opaque-request-bound-id",
+      "disposition": "fixed",
+      "fixes": [{"commit_index": 1}, {"commit_index": 2}]
+    }
+  ]
+}
+```
 
-The pinned Runtime returns result schema version 5 without applying any commits. The controller reuses that pinned Runtime's history verifier to derive and compare the candidate's exact parents, trees, paths, and patch digests. It checks the task, completed session, actual model, submitted prompt, source base, generated ref, and finding identities before importing only the code tip. The final output commit is never imported. The canonical report, prompt, result, and copied decisions remain outside the source repository. Before import and publication, source identity, live PR metadata, comments, head and base refs must still match the frozen request. Draft status is preserved.
+The hosted worker owns semantic diagnosis, candidate edits, and candidate validation. It creates zero or more linear, single-parent code commits and one separate final output commit containing `.github/agent-task-output/review-decisions.json`. A no-code result requires that artifact and only no-change decisions. Optional Markdown is advisory only. The local controller never executes candidate tests, builds, formatters, or a second semantic diagnosis.
+
+Indexes select only the dispatcher-verified code commits in oldest-first order. Every fixed finding needs a nonempty, increasing list of unique indexes. Shared commits may address several findings, but every generated code commit must be explicitly accounted for. Unknown findings, invalid indexes, missing mappings, and unaccounted commits fail before import. Unversioned prompt-version-9 decisions remain rejected; the controller never invents a mapping for them.
+
+The pinned Runtime returns result schema version 5 without applying any commits. The controller reuses that pinned Runtime's history verifier to derive and compare the candidate's exact parents, trees, paths, and patch digests. It checks the task, completed session, actual model, submitted prompt, source base, generated ref, and finding identities before fast-forwarding to the exact code tip. It never squashes, amends, or rewrites candidate commits. The final output commit is never imported. Canonical report version 4 records each finding's complete list of verified commits and exact per-commit paths; replies and retained history keep every attributed commit. The canonical report, prompt, result, and copied decisions remain outside the source repository. Before import and publication, source identity, live PR metadata, comments, head and base refs must still match the frozen request. Draft status is preserved.
 
 All local-result versions, decision-report version 1, and the hosted Runtime apply policy at version 3 remain readable only as retained audit evidence. A fresh run never selects those contracts.
 
@@ -51,6 +69,8 @@ When authorization covers only one fresh Copilot review request, run `agent-task
 If the bounded wait expires, that invocation is abandoned. A later user action starts a new request rather than resuming the monitor.
 
 Every top-level call gets invocation-local state. Failed or interrupted local owners, prepared results, hosted-task results from older releases, and PR-level legacy state remain immutable audit evidence only. They cannot be resumed, imported, reconciled, replaced, or used to seed a fresh call.
+
+A malformed hosted candidate has no automatic retry. A new invocation requires its own authorization and fresh source evidence; it does not recover the rejected candidate or reset a failed Pipeline run's budget.
 
 Pipeline invokes the coordinator's `pipeline` command directly. A clean detached checkout is accepted only for a Pipeline run at the exact pull request head. Its fingerprint binds the worktree and detached HEAD rather than a named branch ref. Hosted dispatch leaves that checkout unchanged until verified import, which keeps it detached. Source-transition, GitHub, remote-ref, and publication guards still apply.
 

@@ -81,7 +81,7 @@ Add only the details that changed the pull request or need attention:
 
 The summary collects `published_commits`, `retained_commits`, and `commit_tracking_errors` from the top level and every run. Retrieve their complete lists and exact text when the corresponding omission or truncation flags are present. In the full artifact these fields may be nested in `runs`; inspect every run, not just the top level. Keep `history_rewritten` and replacement commit information.
 
-For `blocked`, preserve the top-level safety reason and detail exactly, then give the stage's underlying outcome and the useful fields from `stage_result.status`. Retrieve the full artifact for blocked or incomplete stage diagnostics when the summary omits them. For `error`, state the error exactly. Retrieve any truncated reason, detail, error, warning-revalidation error, or required action before reporting it. Never hide a retained commit, escalation, or required action to make the response shorter.
+For `blocked`, preserve the top-level safety reason and detail exactly, then give the stage's underlying outcome, `stage_failure.error` when present, and the useful fields from `stage_result.status`. Retrieve the full artifact for blocked or incomplete stage diagnostics when the summary omits them, including when `stage_failure.stage_details_truncated` is true. For `error`, state the error exactly. Retrieve any truncated reason, detail, error, warning-revalidation error, or required action before reporting it. Never hide a retained commit, escalation, or required action to make the response shorter.
 
 ## Retrospective
 

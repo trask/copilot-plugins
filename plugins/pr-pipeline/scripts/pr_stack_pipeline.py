@@ -3775,8 +3775,21 @@ def compact_terminal_result(
         }
         for warning in limited(warnings_source)
     ]
+    phases_source = payload.get("phases")
+    phases_source = phases_source if isinstance(phases_source, list) else []
+    stage_failure = {}
+    terminal_phase = phases_source[-1] if phases_source else None
+    stopped = terminal_phase.get("stopped") if isinstance(terminal_phase, dict) else None
+    if payload.get("result") != "complete" and isinstance(stopped, dict):
+        stage_failure = common.stage_failure_summary(
+            stopped.get("stage_result"), text_limit=TERMINAL_TEXT_MAX_CHARS,
+        )
+        if stage_failure and type(stopped.get("number")) is int:
+            stage_failure["number"] = stopped["number"]
     phases = []
-    for phase in payload.get("phases", [])[:TERMINAL_RESULT_MAX_PHASES]:
+    for phase in phases_source[:TERMINAL_RESULT_MAX_PHASES]:
+        if not isinstance(phase, dict):
+            continue
         stopped = phase.get("stopped")
         compact_stopped = (
             {
@@ -3838,6 +3851,7 @@ def compact_terminal_result(
             "result": payload.get("result"),
             "reason": payload.get("reason"),
             "detail": clipped_text(payload.get("detail")),
+            "stage_failure": stage_failure,
             "run_id": payload.get("run_id"),
             "repository": payload.get("repository"),
             "stack_number": payload.get("stack_number"),
@@ -3907,9 +3921,8 @@ def compact_terminal_result(
     }
 
     def size() -> int:
-        return len(
-            json.dumps(compact, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        )
+        event = {"event": "stack_pipeline_finished", **compact}
+        return len((json.dumps(event, sort_keys=True) + os.linesep).encode("utf-8"))
 
     while compact_requests and size() > TERMINAL_RESULT_MAX_BYTES:
         compact_requests.pop()
@@ -3925,6 +3938,10 @@ def compact_terminal_result(
     while warnings and size() > TERMINAL_RESULT_MAX_BYTES:
         warnings.pop()
         compact["ci_warnings_omitted"] = len(warnings_source) - len(warnings)
+    if size() > TERMINAL_RESULT_MAX_BYTES and compact.pop("stage_failure", None):
+        compact["stage_failure_omitted"] = True
+    if size() > TERMINAL_RESULT_MAX_BYTES:
+        raise WorkflowError("terminal result metadata exceeds the output byte limit")
     return compact
 
 

@@ -268,6 +268,10 @@ def compact_terminal_result(
     sections["stages"] = [compact_stage(stage) for stage in payload.get("stages", [])]
     if isinstance(payload.get("stage_result"), dict):
         sections["stage_result"] = compact_stage(payload["stage_result"])
+    if payload.get("result") != "complete":
+        failure = common.stage_failure_summary(payload.get("stage_result"))
+        if failure:
+            sections["stage_failure"] = failure
     runs = payload.get("runs", [])
     sections["runs"] = [
         {
@@ -306,7 +310,7 @@ def compact_terminal_result(
     for key in (
         "ci_status", "runs", "stages", "stage_result", "ci_warnings",
         "published_commits", "retained_commits", "commit_tracking_errors", "pr",
-        "ci_warning_revalidation_error", "detail", "error", "reason", "stage",
+        "ci_warning_revalidation_error", "stage_failure", "detail", "error", "reason", "stage",
     ):
         if serialized_size(compact) <= max_bytes:
             break

@@ -1,5 +1,6 @@
 import copy
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -78,18 +80,23 @@ class HostedReviewCandidateTest(unittest.TestCase):
     def git(self, *arguments):
         return MODULE.git(self.repo, *arguments)
 
-    def candidate(self, *, fixed=True, decision=None, extra_code=False):
+    def candidate(
+        self, *, fixed=True, decision=None, extra_code=False,
+        artifact=True, decision_artifact=True, advisory=None, code_path="example.txt",
+    ):
         self.git("checkout", "-q", "-b", "generated")
         code = []
         if fixed:
-            (self.repo / "example.txt").write_text("after\n", encoding="utf-8")
-            self.git("add", "example.txt")
+            path = self.repo / code_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("after\n", encoding="utf-8")
+            self.git("add", code_path)
             self.git("commit", "-q", "-m", "Handle fixture input")
             code.append(self.git("rev-parse", "HEAD"))
         if extra_code:
-            (self.repo / "extra.txt").write_text("extra\n", encoding="utf-8")
-            self.git("add", "extra.txt")
-            self.git("commit", "-q", "-m", "Extra")
+            (self.repo / "example.txt").write_text("corrected\n", encoding="utf-8")
+            self.git("add", "example.txt")
+            self.git("commit", "-q", "-m", "Correct fixture input")
             code.append(self.git("rev-parse", "HEAD"))
         if decision is None:
             item = {
@@ -98,82 +105,113 @@ class HostedReviewCandidateTest(unittest.TestCase):
             }
             if not fixed:
                 item.update(reason="Already handled.", proposed_reply="Already handled.")
-            decision = {"decisions": [item]}
-        path = self.repo / MODULE.HOSTED_DECISION_PATH
-        path.parent.mkdir(parents=True)
-        path.write_text(json.dumps(decision), encoding="utf-8")
-        self.git("add", str(path))
-        self.git("commit", "-q", "-m", "Review decisions")
-        artifact = self.git("rev-parse", "HEAD")
-        history = MODULE.candidate_git_repository(self.runtime).candidate_history(
-            self.repo, self.head, [*code, artifact], report_only=False
-        )
+            else:
+                item["fixes"] = [{"commit_index": index} for index in range(1, len(code) + 1)]
+            decision = self.decisions(item)
+        if artifact:
+            path = self.repo / (
+                MODULE.HOSTED_DECISION_PATH if decision_artifact
+                else ".github/agent-task-output/other.json"
+            )
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(decision), encoding="utf-8")
+            self.git("add", str(path))
+            if advisory is not None:
+                report = self.repo / self.runtime.OUTPUT_REPORT_PATH
+                report.write_bytes(advisory)
+                self.git("add", str(report))
+            self.git("commit", "-q", "-m", "Review decisions")
+        generated_head = self.git("rev-parse", "HEAD")
+        code_tip = code[-1] if code else self.head
         self.git("checkout", "-q", "--detach", self.head)
         snapshot = self.runtime.PullRequestSnapshot(
             state="OPEN", cross_repository=False,
             **MODULE.expected_cloud_pull_request(self.preflight),
         )
+        options = self.runtime.Options(
+            report=False, model="gpt-5.6-sol", prompt=self.prompt,
+            apply_with_report=True, policy=MODULE.HOSTED_DECISION_POLICY,
+            pull_request=self.runtime.PrReference(7, "owner/repo", "owner/repo#7"),
+            result_file=self.result_path, prompt_file=self.prompt_path,
+        )
         submitted = self.runtime.task_payload(
-            self.runtime.Options(
-                report=False, model="gpt-5.6-sol", prompt=self.prompt,
-                apply_with_report=True, policy=MODULE.HOSTED_DECISION_POLICY,
-            ),
+            options,
             report_path=self.runtime.OUTPUT_REPORT_PATH, pull_request=snapshot,
         )["prompt"]
-        digest = MODULE.sha256_text(submitted)
         timestamps = {
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:01:00Z",
             "completed_at": "2026-01-01T00:01:00Z",
         }
-        self.result = {
-            "schema": MODULE.CANDIDATE_AGENT_TASK_RESULT_SCHEMA,
-            "status": "success", "error": None, "mode": "code_candidate",
-            "requested_model": "gpt-5.6-sol",
-            "repository": {"name_with_owner": "owner/repo"},
-            "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
-            "policy": {
-                "id": self.runtime.MARKETPLACE_CODE_CANDIDATE_POLICY_ID,
-                "version": self.runtime.MARKETPLACE_CODE_CANDIDATE_POLICY_VERSION,
-                "sha256": self.runtime.MARKETPLACE_CODE_CANDIDATE_POLICY_HASH,
-            },
-            "task": {
-                "id": "task-fixture", "url": None, "state": "completed",
-                "base_ref": "feature", "base_sha": self.head,
-            },
-            "generated": {"branch": "generated", "head_sha": artifact, "commits": code},
-            "application": {"status": "not_applied", "final_local_head": self.head},
-            "report": None,
-            "attestation": {"kind": "dispatcher_candidate", "structural_complete": True},
-            "candidate": {
-                "schema": self.runtime.CANDIDATE_MANIFEST_SCHEMA,
-                "repository": {"name_with_owner": "owner/repo"},
-                "task": {"id": "task-fixture", "session_id": "session-fixture"},
-                "base": {"ref": "feature", "sha": self.head},
-                "generated": {
-                    "ref": "generated", "head_sha": artifact, "code_tip_sha": history.code_head,
-                },
-                "code_commits": list(history.code_commits),
-                "artifact_commit": history.artifact_commit,
-            },
-            "completion": {
-                "request": {"requested_model": "gpt-5.6-sol", "prompt_sha256": digest},
-                "task": {
-                    "id": "task-fixture", "state": "completed",
-                    "raw_response_sha256": "a" * 64, **timestamps,
-                },
-                "session": {
-                    "id": "session-fixture", "state": "completed",
-                    "actual_model": "gpt-5.6-sol", "prompt_sha256": digest, **timestamps,
-                },
-                "repository": {
-                    "name_with_owner": "owner/repo", "id": 1,
-                    "owner": {"login": "owner", "id": 2},
-                },
-                "refs": {"base": "feature", "generated": "generated"},
-            },
+        task = {
+            "id": "task-fixture", "state": "completed", **timestamps,
+            "repository": {"id": 1, "full_name": "owner/repo"},
+            "owner": {"login": "owner", "id": 2},
+            "artifacts": [{
+                "type": "branch", "provider": "github",
+                "data": {"head_ref": "generated", "base_ref": "feature"},
+            }],
+            "sessions": [{
+                "id": "session-fixture", "task_id": "task-fixture",
+                "state": "completed", **timestamps,
+                "model": "sweagent-capi:gpt-5.6-sol", "prompt": submitted,
+                "base_ref": "feature", "head_ref": "generated",
+                "repository": {"id": 1, "full_name": "owner/repo"},
+                "owner": {"login": "owner", "id": 2},
+            }],
         }
-        return history.code_head
+        repository = mock.Mock(wraps=MODULE.candidate_git_repository(self.runtime))
+        repository.snapshot.return_value = self.runtime.WorktreeSnapshot(
+            self.repo, "owner/repo", "origin", None, self.head,
+        )
+        repository.root.return_value = self.repo
+        repository.fetch_pr_inputs.return_value = {}
+        repository.align_to_pr.return_value = repository.snapshot.return_value
+        repository.fetch_generated.return_value = "generated"
+        api = mock.Mock()
+        api.last_response_sha256 = "a" * 64
+        result = self.runtime.ResultEnvelope()
+        with (
+            mock.patch.object(self.runtime, "GitRepository", return_value=repository),
+            mock.patch.object(self.runtime, "ApiClient", return_value=api),
+            mock.patch.object(
+                self.runtime, "repository_base",
+                return_value=SimpleNamespace(branch="main", sha=self.head),
+            ),
+            mock.patch.object(self.runtime, "resolve_pull_request", return_value=snapshot),
+            mock.patch.object(self.runtime, "validate_policy_before_post"),
+            mock.patch.object(self.runtime, "validate_policy_before_mutation"),
+            mock.patch.object(self.runtime, "start_task", return_value=task),
+            mock.patch.object(self.runtime, "monitor_task", return_value=task),
+            mock.patch.object(
+                self.runtime, "fetch_report",
+                side_effect=AssertionError("advisory report must stay inert"),
+            ),
+        ):
+            self.assertEqual(0, self.runtime.execute(
+                options, cwd=self.repo, result=result,
+                uuid_factory=lambda: "dispatcher-fixture",
+                stdout=io.StringIO(), stderr=io.StringIO(),
+            ))
+        repository.fast_forward.assert_not_called()
+        repository.cherry_pick.assert_not_called()
+        api.request_json.assert_not_called()
+        self.result = result.as_dict()
+        self.assertEqual(code, self.result["generated"]["commits"])
+        self.assertEqual(generated_head, self.result["generated"]["head_sha"])
+        self.assertEqual(code_tip, self.result["candidate"]["generated"]["code_tip_sha"])
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+        return code_tip
+
+    def decisions(self, *items):
+        return {"schema": MODULE.HOSTED_DECISION_REPORT_SCHEMA, "decisions": list(items)}
+
+    def fixed(self, *indexes, position=0):
+        return {
+            "finding_id": MODULE.decision_finding_id("fresh-run", position),
+            "disposition": "fixed",
+            "fixes": [{"commit_index": index} for index in indexes],
+        }
 
     def dispatch(self, command, **kwargs):
         self.commands.append((command, kwargs))
@@ -224,6 +262,11 @@ class HostedReviewCandidateTest(unittest.TestCase):
         self.assertEqual([], bundle["remote"]["commits"])
         self.assertEqual(self.head, bundle["remote"]["final_local_head"])
         self.assertEqual("no_change", bundle["report"]["comments"][0]["disposition"])
+        self.assertEqual([], bundle["report"]["comments"][0]["fixes"])
+        self.assertEqual("No code change.\n\nAlready handled.", MODULE.reply_body({
+            **MODULE.review_comment_commit_fields(bundle["report"]["comments"][0]),
+            "commit": "stale-reference", "reply": "Already handled.",
+        }))
 
     def test_identity_manifest_and_completion_drift_fail_before_import(self):
         self.candidate()
@@ -251,17 +294,370 @@ class HostedReviewCandidateTest(unittest.TestCase):
                 self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
 
     def test_bad_decisions_do_not_modify_source(self):
-        self.candidate(decision={"decisions": []})
-        with self.assertRaisesRegex(MODULE.WorkflowError, "stale or incomplete"):
+        self.candidate(decision=self.decisions())
+        with self.assertRaisesRegex(MODULE.WorkflowError, "missing finding IDs"):
             self.run_worker()
         self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
         self.assertTrue(self.result_path.is_file())
         self.assertTrue(self.decision_path.is_file())
 
-    def test_extra_code_commit_is_rejected(self):
-        self.candidate(extra_code=True)
-        with self.assertRaisesRegex(MODULE.WorkflowError, "manifest or decisions"):
+    def test_version_9_decisions_are_not_upgraded_for_two_code_commits(self):
+        decision = json.loads((
+            Path(__file__).parent / "fixtures" / "hosted-two-code-commits-decisions.json"
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(
+            MODULE.decision_finding_id("fresh-run", 0),
+            decision["decisions"][0]["finding_id"],
+        )
+        self.candidate(extra_code=True, decision=decision)
+        self.assertEqual(2, len(self.result["candidate"]["code_commits"]))
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "schema version 3.*legacy decisions are not accepted",
+        ):
             self.run_worker()
+        self.assertEqual(1, len(self.commands))
+        self.assertEqual(self.result, json.loads(self.result_path.read_text(encoding="utf-8")))
+        self.assertEqual(decision, json.loads(self.decision_path.read_text(encoding="utf-8")))
+        self.assertFalse(self.canonical_path.exists())
+        self.assertEqual(self.before_source, MODULE.local_source_fingerprint(self.repo))
+
+    def test_version_9_prompt_cannot_start_a_fresh_dispatch(self):
+        self.prompt_path.write_text(
+            "Copilot Review Loop hosted worker prompt version 9.\n\n"
+            "Put all warranted fixes in exactly one single-parent code commit.\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "retained requests cannot be replayed"):
+            self.run_worker()
+        self.assertEqual([], self.commands)
+        self.assertFalse(self.result_path.exists())
+        self.assertEqual(self.before_source, MODULE.local_source_fingerprint(self.repo))
+
+    def test_mapped_code_history_imports_exact_tip_and_all_commits(self):
+        tip = self.candidate(extra_code=True)
+        bundle = self.run_worker()
+        commits = self.result["generated"]["commits"]
+        self.assertEqual(2, len(commits))
+        self.assertEqual(commits, bundle["remote"]["commits"])
+        report = bundle["report"]
+        self.assertEqual(MODULE.INDEXED_COPILOT_REVIEW_REPORT_SCHEMA, report["schema"])
+        fixes = report["comments"][0]["fixes"]
+        self.assertEqual(commits, [fix["commit"] for fix in fixes])
+        for fix in fixes:
+            self.assertEqual(bundle["paths_by_commit"][fix["commit"]], fix["changed_paths"])
+        fields = MODULE.review_comment_commit_fields(report["comments"][0])
+        self.assertEqual({"commits": commits}, fields)
+        reply = MODULE.reply_body({**fields, "reply": report["comments"][0]["reply"]})
+        for commit in commits:
+            self.assertIn(commit, reply)
+        tree = self.git("rev-parse", f"{tip}^{{tree}}")
+        MODULE.apply_verified_import(
+            self.repo, result_path=self.result_path,
+            result_sha256=MODULE.sha256_file(self.result_path),
+            report_content=bundle["report_content"],
+            preflight=self.preflight, remote=bundle["remote"],
+        )
+        self.assertEqual(tip, self.git("rev-parse", "HEAD"))
+        self.assertEqual(tree, self.git("rev-parse", "HEAD^{tree}"))
+        self.assertEqual(commits, self.git("rev-list", "--reverse", f"{self.head}..HEAD").splitlines())
+        self.assertFalse((self.repo / MODULE.HOSTED_DECISION_PATH).exists())
+        self.assertEqual("", self.git("status", "--porcelain"))
+
+    def test_multiple_findings_can_explicitly_share_commits(self):
+        second = {**self.preflight["comments"][0], "id": 18, "thread_id": "PRRT_second"}
+        self.preflight["comments"].append(second)
+        self.preflight["comment_identities"].append(MODULE.comment_identity(second))
+        self.prompt = MODULE.build_worker_prompt(
+            self.preflight, request_id="fresh-run", iteration_allowance=1, prior_history=[],
+        )
+        self.prompt_path.write_text(self.prompt, encoding="utf-8")
+        self.candidate(extra_code=True, decision=self.decisions(
+            self.fixed(1, 2, position=1), self.fixed(2),
+        ))
+        bundle = self.run_worker()
+        commits = bundle["remote"]["commits"]
+        first, second = bundle["report"]["comments"]
+        self.assertEqual([commits[1]], [fix["commit"] for fix in first["fixes"]])
+        self.assertEqual(commits, [fix["commit"] for fix in second["fixes"]])
+
+    def test_controller_publishes_and_retains_every_mapped_commit_once(self):
+        self.preflight["pr"].update(head_owner="owner", head_repo="repo")
+        tip = self.candidate(extra_code=True)
+        commits = self.result["generated"]["commits"]
+        args = MODULE.build_parser().parse_args([
+            "agent-task", "owner/repo#7", "--model", "sol",
+            "--repo-root", str(self.repo), "--state", str(self.directory / "state.json"),
+            "--preserve-artifacts",
+        ])
+        published = self.head
+        pushes = []
+        original_run = MODULE.run
+        emitted = []
+
+        def run(command, **kwargs):
+            nonlocal published
+            if "push" in command:
+                pushes.append(command)
+                published = self.git("rev-parse", "HEAD")
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return original_run(command, **kwargs)
+
+        def dispatch(command, **_kwargs):
+            self.commands.append(command)
+            output = Path(command[command.index("--result-file") + 1])
+            output.write_text(json.dumps(self.result), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "wait_for_stable_review_preflight", return_value=self.preflight),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=RUNTIME_PATH),
+            mock.patch.object(MODULE, "github_decision_fingerprint", return_value=self.github),
+            mock.patch.object(MODULE, "run_owned_local_worker", side_effect=dispatch),
+            mock.patch.object(MODULE, "run_local_decision_worker", side_effect=AssertionError("local fallback")),
+            mock.patch.object(MODULE, "run", side_effect=run),
+            mock.patch.object(MODULE.secrets, "token_hex", return_value="fresh-run"),
+            mock.patch.object(MODULE, "metadata_for", side_effect=lambda _target: {
+                **self.preflight["pr"], "head_sha": published,
+            }),
+            mock.patch.object(MODULE, "remote_head", side_effect=lambda *_args: published),
+            mock.patch.object(MODULE, "wait_for_remote_head", side_effect=lambda *_args: published),
+            mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
+            mock.patch.object(MODULE, "require_live_comments", return_value=self.preflight["comments"]),
+            mock.patch.object(MODULE, "post_missing_replies", return_value={17: 71}) as replies,
+            mock.patch.object(MODULE, "resolve_threads") as resolve,
+            mock.patch.object(MODULE, "request_copilot", return_value={"status": "requested"}),
+            mock.patch.object(MODULE, "verify_publish", return_value={"head_matches": True}),
+            mock.patch.object(MODULE, "continue_after_review_request") as continuation,
+            mock.patch.object(MODULE, "emit", side_effect=emitted.append),
+        ):
+            MODULE.command_agent_task(args)
+        self.assertEqual(1, len(self.commands))
+        self.assertEqual(1, len(pushes))
+        self.assertEqual(f"HEAD:{self.preflight['pr']['head_branch']}", pushes[0][-1])
+        self.assertIn(
+            f"--force-with-lease=refs/heads/feature:{self.head}", pushes[0],
+        )
+        self.assertEqual(tip, published)
+        self.assertEqual(commits, emitted[-1]["commits"])
+        state = MODULE.load_state(args._coordinator_state_path)
+        self.assertEqual(1, state["iterations"])
+        self.assertEqual(0, state["agent_task"]["resume_attempts"])
+        self.assertEqual("completed", state["agent_task"]["status"])
+        self.assertEqual(commits, state["agent_task"]["ordered_commits"])
+        self.assertEqual(commits, state["queue"]["comments"][0]["commits"])
+        self.assertEqual(commits, state["history"][0]["commits"])
+        self.assertEqual(
+            commits, [fix["commit"] for fix in state["agent_task"]["comments"][0]["fixes"]],
+        )
+        handled = replies.call_args.args[1][0]
+        for commit in commits:
+            self.assertIn(commit, MODULE.reply_body(handled))
+        resolve.assert_called_once()
+        continuation.assert_called_once()
+        self.assertEqual(commits, self.git("rev-list", "--reverse", f"{self.head}..HEAD").splitlines())
+        self.assertFalse((self.repo / MODULE.HOSTED_DECISION_PATH).exists())
+
+    def test_missing_commit_mapping_does_not_infer_a_commit(self):
+        self.candidate(decision=self.decisions({
+            "finding_id": MODULE.decision_finding_id("fresh-run", 0), "disposition": "fixed",
+        }))
+        with self.assertRaisesRegex(MODULE.WorkflowError, "decision fields"):
+            self.run_worker()
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_unaccounted_code_commit_is_rejected(self):
+        self.candidate(extra_code=True, decision=self.decisions(self.fixed(1)))
+        with self.assertRaisesRegex(MODULE.WorkflowError, "account for every fix commit"):
+            self.run_worker()
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_fixed_decision_cannot_select_source_without_candidate_code(self):
+        self.candidate(fixed=False, decision=self.decisions(self.fixed(1)))
+        with self.assertRaisesRegex(MODULE.WorkflowError, "invalid commit index"):
+            self.run_worker()
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_invalid_index_mappings_fail_closed(self):
+        self.candidate(extra_code=True)
+        remote = {"commits": self.result["generated"]["commits"], "requires_apply": True}
+        paths = {item["sha"]: item["changed_paths"] for item in self.result["candidate"]["code_commits"]}
+        for indexes in ([], [0], [-1], [True], [False], [1.0], ["1"], [3], [1, 1], [2, 1]):
+            with self.subTest(indexes=indexes), self.assertRaises(MODULE.WorkflowError):
+                MODULE.validate_copilot_review_report(
+                    json.dumps(self.decisions(self.fixed(*indexes))),
+                    request_id="fresh-run", preflight=self.preflight, remote=remote,
+                    paths_by_commit=paths, hosted_decisions=True,
+                )
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_model_authored_shas_and_malformed_fix_objects_are_rejected(self):
+        self.candidate()
+        commits = self.result["generated"]["commits"]
+        paths = {item["sha"]: item["changed_paths"] for item in self.result["candidate"]["code_commits"]}
+        for fixes in (
+            None, {}, [1], [{"commit": commits[0]}],
+            [{"commit_index": 1, "commit": commits[0]}],
+            [{"commit_index": 1, "changed_paths": ["example.txt"]}],
+        ):
+            decision = {**self.fixed(1), "fixes": fixes}
+            with self.subTest(fixes=fixes), self.assertRaises(MODULE.WorkflowError):
+                MODULE.validate_copilot_review_report(
+                    json.dumps(self.decisions(decision)), request_id="fresh-run",
+                    preflight=self.preflight, remote={"commits": commits, "requires_apply": True},
+                    paths_by_commit=paths, hosted_decisions=True,
+                )
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_no_change_or_rejected_decisions_cannot_claim_code(self):
+        self.candidate()
+        commits = self.result["generated"]["commits"]
+        paths = {item["sha"]: item["changed_paths"] for item in self.result["candidate"]["code_commits"]}
+        for disposition in ("no_change", "rejected", None, []):
+            decision = {**self.fixed(1), "disposition": disposition}
+            with self.subTest(disposition=disposition), self.assertRaises(MODULE.WorkflowError):
+                MODULE.validate_copilot_review_report(
+                    json.dumps(self.decisions(decision)), request_id="fresh-run",
+                    preflight=self.preflight, remote={"commits": commits, "requires_apply": True},
+                    paths_by_commit=paths, hosted_decisions=True,
+                )
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_unknown_duplicate_or_missing_findings_fail_closed(self):
+        self.candidate(extra_code=True)
+        remote = {"commits": self.result["generated"]["commits"], "requires_apply": True}
+        paths = {item["sha"]: item["changed_paths"] for item in self.result["candidate"]["code_commits"]}
+        for decisions in (
+            self.decisions(), self.decisions(self.fixed(1, 2, position=1)),
+            self.decisions(self.fixed(1, 2), self.fixed(1, 2)),
+        ):
+            with self.subTest(decisions=decisions), self.assertRaises(MODULE.WorkflowError):
+                MODULE.validate_copilot_review_report(
+                    json.dumps(decisions), request_id="fresh-run", preflight=self.preflight,
+                    remote=remote, paths_by_commit=paths, hosted_decisions=True,
+                )
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_missing_workflow_artifact_is_not_a_runtime_manifest_failure(self):
+        self.candidate(artifact=False)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "requires a final decisions artifact"):
+            self.run_worker()
+        self.assertFalse(self.decision_path.exists())
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_unrelated_output_cannot_replace_required_decisions(self):
+        self.candidate(decision_artifact=False)
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "final artifact commit must include .*review-decisions.json",
+        ):
+            self.run_worker()
+        self.assertFalse(self.decision_path.exists())
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_reserved_agent_paths_cannot_be_imported_as_code(self):
+        self.candidate(code_path=".github/agent-task-private/metadata.json")
+        with self.assertRaisesRegex(MODULE.WorkflowError, "code commits contain reserved"):
+            self.run_worker()
+        self.assertFalse(self.decision_path.exists())
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_generated_commit_list_must_match_verified_history(self):
+        self.candidate()
+        self.result["generated"]["commits"] = []
+        with self.assertRaisesRegex(MODULE.WorkflowError, "generated commits do not match"):
+            self.run_worker()
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_manifest_drift_rejects_mapped_multicommit_candidate(self):
+        self.candidate(extra_code=True)
+        self.result["candidate"]["code_commits"][0]["patch_sha256"] = "f" * 64
+        with self.assertRaisesRegex(MODULE.WorkflowError, "manifest does not match verified history"):
+            self.run_worker()
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_canonical_mapping_cannot_drop_reorder_or_forge_commit_paths(self):
+        self.candidate(extra_code=True)
+        bundle = self.run_worker()
+        report = bundle["report"]
+        self.assertEqual(report, MODULE.validate_copilot_review_report(
+            bundle["report_content"], request_id="fresh-run", preflight=self.preflight,
+            remote=bundle["remote"], paths_by_commit=bundle["paths_by_commit"],
+        ))
+        fixes = report["comments"][0]["fixes"]
+        for altered in (
+            [], [fixes[0]], list(reversed(fixes)), [fixes[0], fixes[0], fixes[1]],
+            [{**fixes[0], "commit": self.result["generated"]["head_sha"]}, fixes[1]],
+            [{**fixes[0], "changed_paths": ["unrelated.txt"]}, fixes[1]],
+        ):
+            tampered = copy.deepcopy(report)
+            tampered["comments"][0]["fixes"] = altered
+            with self.subTest(altered=altered), self.assertRaises(MODULE.WorkflowError):
+                MODULE.validate_copilot_review_report(
+                    json.dumps(tampered), request_id="fresh-run", preflight=self.preflight,
+                    remote=bundle["remote"], paths_by_commit=bundle["paths_by_commit"],
+                )
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def append_candidate_paths(self, paths):
+        self.git("checkout", "-q", "generated")
+        for name in paths:
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("untrusted mutation\n", encoding="utf-8")
+            self.git("add", str(path))
+        self.git("commit", "-q", "-m", "Untrusted history")
+        self.result["generated"]["head_sha"] = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "--detach", self.head)
+
+    def test_code_after_output_commit_is_rejected_before_decisions(self):
+        self.candidate()
+        self.append_candidate_paths(["example.txt"])
+        with self.assertRaisesRegex(MODULE.WorkflowError, "candidate history rejected"):
+            self.run_worker()
+        self.assertFalse(self.decision_path.exists())
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_mixed_code_and_output_commit_is_rejected_before_decisions(self):
+        self.candidate(artifact=False)
+        self.append_candidate_paths(["example.txt", MODULE.HOSTED_DECISION_PATH])
+        with self.assertRaisesRegex(MODULE.WorkflowError, "mixes candidate code and output"):
+            self.run_worker()
+        self.assertFalse(self.decision_path.exists())
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_nonlinear_candidate_is_rejected_before_decisions(self):
+        self.candidate(artifact=False)
+        self.git("checkout", "-q", "-b", "side", self.head)
+        (self.repo / "side.txt").write_text("side\n", encoding="utf-8")
+        self.git("add", "side.txt")
+        self.git("commit", "-q", "-m", "Side")
+        self.git("checkout", "-q", "generated")
+        self.git("merge", "-q", "--no-ff", "side", "-m", "Merge")
+        self.result["generated"]["head_sha"] = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "--detach", self.head)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "candidate history rejected"):
+            self.run_worker()
+        self.assertFalse(self.decision_path.exists())
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_foreign_candidate_history_is_rejected_before_decisions(self):
+        self.candidate()
+        self.git("checkout", "-q", "--orphan", "foreign")
+        self.git("commit", "-q", "-m", "Foreign root")
+        self.result["generated"]["head_sha"] = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "--detach", self.head)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "candidate history rejected"):
+            self.run_worker()
+        self.assertFalse(self.decision_path.exists())
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_empty_advisory_report_does_not_invalidate_candidate(self):
+        self.candidate(advisory=b"")
+        self.assertEqual("fixed", self.run_worker()["report"]["comments"][0]["disposition"])
+
+    def test_non_utf8_advisory_report_does_not_invalidate_candidate(self):
+        self.candidate(advisory=b"\xff\x00not Markdown")
+        self.assertEqual("fixed", self.run_worker()["report"]["comments"][0]["disposition"])
 
     def test_legacy_result_cannot_supply_a_fresh_hosted_candidate(self):
         self.candidate()
@@ -311,12 +707,10 @@ class HostedReviewCandidateTest(unittest.TestCase):
         self.assertIsNone(bundle["report"]["comments"][0]["thread_id"])
 
     def test_no_change_cannot_conceal_candidate_code(self):
-        self.candidate(decision={
-            "decisions": [{
+        self.candidate(decision=self.decisions({
                 "finding_id": MODULE.decision_finding_id("fresh-run", 0),
                 "disposition": "no_change", "reason": "No fix", "proposed_reply": "No fix",
-            }],
-        })
+        }))
         with self.assertRaisesRegex(MODULE.WorkflowError, "account for every fix commit"):
             self.run_worker()
         self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
