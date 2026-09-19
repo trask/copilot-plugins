@@ -4608,7 +4608,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.53", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.54", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -4713,7 +4713,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "\\x1b]52;c;clipboard\\x07\\x1b]0;title\\x1b\\"
             "\\x9b2J\\x00\\x08\\x0dhidden\n[REDACTED]\n"
         )
-        for fallback in (False, True):
+        for fallback in (None, "transient", "empty"):
             with self.subTest(fallback=fallback):
                 destination = self.root.parent / f"{self.root.name}-{fallback}.log"
                 self.addCleanup(destination.unlink, missing_ok=True)
@@ -4730,8 +4730,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                             return MODULE.subprocess.CompletedProcess(
                                 command, 1, b"", b"unknown flag: --allow-escape-sequences"
                             )
-                        if fallback:
+                        if fallback == "transient":
                             return MODULE.subprocess.CompletedProcess(command, 1, b"", b"HTTP 503")
+                        if fallback == "empty":
+                            return MODULE.subprocess.CompletedProcess(command, 0, b"", b"")
                     elif "--allow-escape-sequences" not in command:
                         return MODULE.subprocess.CompletedProcess(
                             command, 1, b"",
@@ -4760,7 +4762,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(raw).hexdigest(), evidence["attempts"][-1]["content_sha256"])
                 self.assertEqual(MODULE.sha256_text(expected), evidence["content_sha256"])
                 self.assertEqual(
-                    len(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS) + 2 if fallback else 1,
+                    (
+                        len(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS) + 2
+                        if fallback == "transient" else 2 if fallback == "empty" else 1
+                    ),
                     evidence["attempt_count"],
                 )
                 if fallback:
@@ -5980,9 +5985,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     ],
                 )
 
-    def test_failed_log_malformed_success_does_not_retry(self):
+    def test_failed_log_malformed_utf8_does_not_retry_or_fallback(self):
         check = self.preflight["check_snapshot"]["failures"][0]
-        for output in (b"", b"\xff"):
+        for output in (b"\xff", b"failure \xff"):
             with self.subTest(output=output):
                 process = MODULE.subprocess.CompletedProcess(["gh"], 0, output, b"")
                 with (
@@ -5994,7 +5999,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     ) as run,
                     mock.patch.object(MODULE.time, "sleep") as sleep,
                     self.assertRaisesRegex(
-                        MODULE.WorkflowError, "empty response|malformed UTF-8"
+                        MODULE.WorkflowError, "malformed UTF-8"
                     ) as raised,
                 ):
                     MODULE.fetch_failed_check_log(self.preflight["pr"], check)
@@ -6006,6 +6011,189 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                         "classification"
                     ],
                 )
+
+    def test_empty_primary_uses_real_fallback_and_post_identity_checks(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        pr = self.preflight["pr"]
+        run_payload = {
+            "id": 1,
+            "head_sha": pr["head_sha"],
+            "repository": {"full_name": pr["repo_name"]},
+            "name": check["workflow"],
+            "workflow_id": 17,
+            "html_url": "https://github.com/owner/repo/actions/runs/1",
+            "status": "completed",
+            "conclusion": "failure",
+        }
+        job_payload = {
+            "id": 2,
+            "run_id": 1,
+            "head_sha": pr["head_sha"],
+            "name": check["name"],
+            "html_url": "https://github.com/owner/repo/actions/runs/1/job/2",
+            "status": "completed",
+            "conclusion": "failure",
+        }
+        for empty in (b"", b" \n\t"):
+            for rejected_phase in (None, "fallback", "post"):
+                with self.subTest(empty=empty, rejected_phase=rejected_phase):
+                    destination = self.root.parent / f"{self.root.name}-empty.log"
+                    self.addCleanup(destination.unlink, missing_ok=True)
+                    destination.write_text("existing artifact\n", encoding="utf-8")
+                    completed = []
+                    for phase in ("pre", "fallback", "post"):
+                        job = (
+                            {**job_payload, "head_sha": "f" * 40}
+                            if phase == rejected_phase else job_payload
+                        )
+                        for payload in (run_payload, job):
+                            completed.append(MODULE.subprocess.CompletedProcess(
+                                ["gh"], 0, json.dumps(payload).encode(), b""
+                            ))
+                        if phase != "post":
+                            completed.append(MODULE.subprocess.CompletedProcess(
+                                ["gh"], 0,
+                                empty if phase == "pre" else b"focused failure log\n",
+                                b"",
+                            ))
+                    evidence = {}
+                    with (
+                        mock.patch.object(
+                            MODULE, "run_bytes", side_effect=completed
+                        ) as run,
+                        mock.patch.object(MODULE.time, "sleep") as sleep,
+                    ):
+                        if rejected_phase is None:
+                            content = MODULE.fetch_failed_check_log(
+                                pr, check, destination=destination,
+                                repo_root=self.root, evidence=evidence,
+                            )
+                            self.assertEqual("focused failure log\n", content)
+                        else:
+                            with self.assertRaisesRegex(
+                                MODULE.WorkflowError, "identity does not match"
+                            ) as raised:
+                                MODULE.fetch_failed_check_log(
+                                    pr, check, destination=destination,
+                                    repo_root=self.root, evidence=evidence,
+                                )
+                            self.assertEqual(
+                                evidence, raised.exception.details["log_download"]
+                            )
+                    sleep.assert_not_called()
+                    expected_methods = [
+                        "pre-run-metadata", "pre-job-metadata", "gh-run-view",
+                        "fallback-run-metadata", "fallback-job-metadata",
+                        "rest-job-log", "post-run-metadata", "post-job-metadata",
+                    ]
+                    if rejected_phase is not None:
+                        if rejected_phase == "fallback":
+                            expected_methods = expected_methods[:5]
+                        expected_methods.append(f"{rejected_phase}-identity")
+                        self.assertEqual(
+                            "identity_mismatch",
+                            evidence["terminal_error"]["classification"],
+                        )
+                        self.assertIsNone(evidence["content_sha256"])
+                    else:
+                        self.assertIsNone(evidence["terminal_error"])
+                        self.assertEqual(
+                            MODULE.sha256_text("focused failure log\n"),
+                            evidence["content_sha256"],
+                        )
+                    self.assertEqual(
+                        expected_methods,
+                        [attempt["method"] for attempt in evidence["attempts"]],
+                    )
+                    self.assertEqual(
+                        {
+                            "attempt": 3, "method": "gh-run-view",
+                            "result": "malformed_response",
+                            "error_sha256": hashlib.sha256(empty).hexdigest(),
+                        },
+                        evidence["attempts"][2],
+                    )
+                    self.assertEqual(
+                        5 if rejected_phase == "fallback" else 8, run.call_count
+                    )
+                    self.assertEqual(
+                        "focused failure log\n" if rejected_phase is None
+                        else "existing artifact\n",
+                        destination.read_text(encoding="utf-8"),
+                    )
+
+    def test_empty_primary_fallback_failure_never_publishes_content(self):
+        check = self.preflight["check_snapshot"]["failures"][0]
+        for output, error, classification in (
+            (b"", b"", "malformed_response"),
+            (b" \n\t", b"", "malformed_response"),
+            (b"\xff", b"", "malformed_response"),
+            (b"not a log", b"HTTP 404 Not Found", "permanent_failure"),
+            (b"partial log", b"HTTP 403 Forbidden", "permanent_failure"),
+            (b"partial log", b"HTTP 503", "transient_retry_exhausted"),
+        ):
+            with self.subTest(error=error, output=output):
+                destination = self.root.parent / f"{self.root.name}-failed-empty.log"
+                self.addCleanup(destination.unlink, missing_ok=True)
+                destination.write_text("existing artifact\n", encoding="utf-8")
+                fallback_attempts = (
+                    len(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS) + 1
+                    if classification == "transient_retry_exhausted" else 1
+                )
+                completed = [
+                    MODULE.subprocess.CompletedProcess(["gh"], 0, b"", b"")
+                ] + [
+                    MODULE.subprocess.CompletedProcess(
+                        ["gh"], 1 if error else 0, output, error
+                    )
+                ] * fallback_attempts
+                evidence = {}
+                with (
+                    mock.patch.object(MODULE, "verify_failed_log_download_identity"),
+                    mock.patch.object(MODULE, "run_bytes", side_effect=completed) as run,
+                    mock.patch.object(MODULE.time, "sleep") as sleep,
+                    self.assertRaises(MODULE.WorkflowError) as raised,
+                ):
+                    MODULE.fetch_failed_check_log(
+                        self.preflight["pr"], check, destination=destination,
+                        repo_root=self.root, evidence=evidence,
+                    )
+                self.assertEqual(1 + fallback_attempts, run.call_count)
+                self.assertEqual(fallback_attempts - 1, sleep.call_count)
+                self.assertEqual(evidence, raised.exception.details["log_download"])
+                self.assertEqual(classification, evidence["terminal_error"]["classification"])
+                self.assertEqual("rest-job-log", evidence["terminal_error"]["method"])
+                self.assertIsNone(evidence["content_sha256"])
+                self.assertEqual("malformed_response", evidence["attempts"][0]["result"])
+                self.assertEqual(
+                    hashlib.sha256(b"").hexdigest(),
+                    evidence["attempts"][0]["error_sha256"],
+                )
+                self.assertEqual(
+                    "existing artifact\n", destination.read_text(encoding="utf-8")
+                )
+
+    def test_empty_run_only_log_fails_without_inventing_a_job_fallback(self):
+        check = copy.deepcopy(self.preflight["check_snapshot"]["failures"][0])
+        check.update(
+            name=check["workflow"], url="https://github.com/owner/repo/actions/runs/1"
+        )
+        evidence = {}
+        with (
+            mock.patch.object(MODULE, "verify_failed_log_download_identity"),
+            mock.patch.object(
+                MODULE, "run_bytes",
+                return_value=MODULE.subprocess.CompletedProcess(["gh"], 0, b"", b""),
+            ) as run,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+            self.assertRaisesRegex(MODULE.WorkflowError, "empty response"),
+        ):
+            MODULE.fetch_failed_check_log(self.preflight["pr"], check, evidence=evidence)
+        self.assertEqual(1, run.call_count)
+        sleep.assert_not_called()
+        self.assertEqual("gh-run-view", evidence["terminal_error"]["method"])
+        self.assertEqual("malformed_response", evidence["terminal_error"]["classification"])
+        self.assertIsNone(evidence["content_sha256"])
 
     def test_failed_log_verifies_exact_run_job_and_head_identity(self):
         check = self.preflight["check_snapshot"]["failures"][0]

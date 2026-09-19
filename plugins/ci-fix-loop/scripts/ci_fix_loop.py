@@ -6715,6 +6715,9 @@ def fetch_failed_check_log(
                         result="malformed_response",
                         error_sha256=error_sha256,
                     )
+                    if method_index + 1 < len(methods):
+                        decoded = None
+                        break
                     download_evidence["terminal_error"] = {
                         "classification": "malformed_response",
                         "method": method,

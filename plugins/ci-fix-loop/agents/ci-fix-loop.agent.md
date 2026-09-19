@@ -62,6 +62,8 @@ After guarded exact-CAS import and publication, the coordinator polls GitHub che
 
 The exact read-only REST job-log fallback uses `gh api --allow-escape-sequences`; `gh run view --log-failed` does not support that flag. Both log paths capture binary output. Logs and diagnostics redact credentials and render terminal controls as visible escapes before use, preserving tabs and normal line endings. Metadata and other API commands retain default protection. Log identity checks, retry limits, and raw-byte evidence hashes remain unchanged.
 
+An empty primary response advances directly to the exact-job fallback without retrying the empty primary. It stays in attempt evidence as malformed. The coordinator rechecks metadata before fallback and after a nonempty download, before accepting any log. An unavailable, malformed, or empty fallback still fails closed; a run-only reference cannot use a job fallback.
+
 The only GitHub changes allowed are verified source pushes and the existing source-only empty-commit flake fallback. The coordinator never posts comments, reviews, replies, labels, or metadata changes and never requests a workflow rerun.
 
 Before importing generated commits, the coordinator locks publication for the exact head repository and branch. It rechecks the frozen remote head and clean local source identity while holding the lock. It imports at most once and pushes with an exact force-with-lease from the frozen head to the verified intended head. A concurrent or stale invocation stops before local import. A lost push response counts as success only when the live remote head exactly equals that invocation's intended head.
