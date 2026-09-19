@@ -1,6 +1,6 @@
 ---
 name: PR Pipeline
-description: "Explicit invocation only: never select automatically; run only when the user asks for PR Pipeline by name or invokes `/pr-pipeline`. Once selected, drive an open draft pull request through every stage until each is green at the same head commit."
+description: "Explicit invocation only: never select automatically; run only when the user asks for PR Pipeline by name or invokes `/pr-pipeline`. Once selected, drive an explicitly selected open pull request, draft or ready for review, through every stage until each is green at the same head commit."
 argument-hint: "PR URL, PR number, or owner/repo#number; omit only from a worktree attached to the PR's branch"
 tools: [execute, rename_session]
 user-invocable: true
@@ -33,7 +33,9 @@ Choose the launch command for the active shell:
 - PowerShell on Windows: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; python "$copilotHome/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_pipeline.py" start`
 - POSIX shells: `python3 "${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_pipeline.py" start`
 
-Choose one GitHub mutation policy before `start` and never change it for that run. If the caller forbids any comment, reply, thread resolution, review request, draft change, title/body update, or other GitHub metadata mutation, pass `--github-mutation-policy source-only`. Otherwise pass `--github-mutation-policy allow`. A `source-only` run may publish verified source commits, but every stage must preserve comments, threads, reviews, draft state, title, body, and other pull request metadata exactly. The helper forwards this policy to Copilot Review, Self Review, and PR Description. Copilot Review may record only its run-bound policy skip, with `clean_at_head_sha` set to `null`. PR Description may preserve a replacement proposal but must not apply it.
+Normal execution uses `--github-mutation-policy allow`, the helper's default. Explicitly invoking PR Pipeline for a target authorizes its standard stage-owned actions: verified source publication, Copilot review requests, replies to and resolution of bot-authored review threads, and title/body updates. An explicitly selected open pull request may be draft or ready for review; preserve its draft state. This authorization does not extend to merging, approving, unsolicited comments, or replies to human-authored threads, which require a separate explicit request.
+
+Choose one GitHub mutation policy before `start` and never change it for that run. Use `--github-mutation-policy source-only` only when the caller explicitly requests source-only execution or forbids the normal stage-owned review or metadata updates. Do not infer source-only from draft status or the separate prohibitions on merging, approval, unsolicited comments, and human-thread replies. A `source-only` run may publish verified source commits, but every stage must preserve comments, threads, reviews, draft state, title, body, and other pull request metadata exactly. The helper forwards this policy to Copilot Review, Self Review, and PR Description. Copilot Review may record only its run-bound policy skip, with `clean_at_head_sha` set to `null`. PR Description may preserve a replacement proposal but must not apply it.
 
 Append the user's target exactly as given. Omit it only when the user omitted it.
 

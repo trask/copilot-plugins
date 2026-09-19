@@ -60,6 +60,8 @@ The worker may write free-form advisory prose to `.github/agent-task-output/repo
 
 After guarded exact-CAS import and publication, the coordinator polls GitHub checks and statuses for that exact source SHA. Only GitHub can prove green. Failed or pending checks continue through the bounded loop. A zero-commit candidate makes no green claim and cannot clear failed checks.
 
+A new terminal check snapshot resets the polling delay to the initial interval so its stability confirmation is not delayed by earlier waits for running checks. It still requires the configured identical observations and debounce within the same wait budget; neither the deadline nor repair allowance is reset.
+
 The exact read-only REST job-log fallback uses `gh api --allow-escape-sequences`; `gh run view --log-failed` does not support that flag. Both log paths capture binary output. Logs and diagnostics redact credentials and render terminal controls as visible escapes before use, preserving tabs and normal line endings. Metadata and other API commands retain default protection. Log identity checks, retry limits, and raw-byte evidence hashes remain unchanged.
 
 An empty primary response advances directly to the exact-job fallback without retrying the empty primary. It stays in attempt evidence as malformed. The coordinator rechecks metadata before fallback and after a nonempty download, before accepting any log. An unavailable, malformed, or empty fallback still fails closed; a run-only reference cannot use a job fallback.

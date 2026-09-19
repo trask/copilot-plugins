@@ -78,6 +78,16 @@ class GithubMutationPolicyTest(unittest.TestCase):
             self.previous,
         )
 
+    def test_scheduler_defaults_to_normal_policy(self):
+        args = MODULE.build_parser().parse_args(["start", "owner/repo#7"])
+        command = MODULE.scheduler_command(
+            args, target(), "run-1", Path("progress.jsonl")
+        )
+        self.assertEqual("allow", args.github_mutation_policy)
+        self.assertEqual(
+            "allow", command[command.index("--github-mutation-policy") + 1]
+        )
+
     def test_scheduler_preserves_source_only_policy(self):
         args = MODULE.build_parser().parse_args(
             [
@@ -133,8 +143,16 @@ class GithubMutationPolicyTest(unittest.TestCase):
                 )
                 self.assertNotIn("-p", command)
 
-    def test_agent_freezes_caller_mutation_prohibition_at_start(self):
+    def test_agent_documents_normal_authorization_and_explicit_restrictions(self):
         instructions = AGENT.read_text(encoding="utf-8")
+        self.assertIn("Normal execution uses `--github-mutation-policy allow`", instructions)
+        self.assertIn("draft or ready for review", instructions)
+        self.assertIn("standard stage-owned actions", instructions)
+        self.assertIn("bot-authored review threads", instructions)
+        self.assertIn("which require a separate explicit request", instructions)
+        self.assertIn("only when the caller explicitly requests", instructions)
+        self.assertIn("Do not infer source-only from draft status", instructions)
+        self.assertNotIn("open draft pull request", instructions)
         self.assertIn("--github-mutation-policy source-only", instructions)
         self.assertIn("never change it for that run", instructions)
 
@@ -1759,6 +1777,18 @@ class SweepTest(unittest.TestCase):
         self.assertEqual(
             [(stage, 1) for stage in MODULE.STAGE_NAMES],
             self.launched,
+        )
+
+    def test_ready_for_review_pull_request_runs_all_stages(self):
+        with mock.patch.object(
+            MODULE,
+            "read_pull_request",
+            return_value={**pull_request(), "is_draft": False},
+        ):
+            result = self.execute()
+        self.assertEqual("complete", result["result"])
+        self.assertEqual(
+            [(stage, 1) for stage in MODULE.STAGE_NAMES], self.launched
         )
 
     def test_every_scheduler_stage_read_uses_the_current_pipeline_run(self):

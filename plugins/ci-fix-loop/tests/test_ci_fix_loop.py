@@ -4608,7 +4608,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.54", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.55", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -8540,6 +8540,158 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
         self.assertEqual(result["pr"]["head_sha"], "9" * 40)
         self.assertEqual(preflight.call_count, 4)
+
+    def test_late_terminal_snapshot_gets_prompt_stability_confirmation(self):
+        pending = copy.deepcopy(self.preflight)
+        pending["check_snapshot"]["decision"]["pending_checks"] = ["check:queued"]
+        pending["check_snapshot"]["failures"] = []
+        for outcome in ("green", "failures", "no_checks", "escalate"):
+            with self.subTest(outcome=outcome):
+                stable = copy.deepcopy(self.preflight)
+                stable["check_snapshot"]["decision"] = {
+                    "decision": outcome,
+                    "detail": "terminal check set",
+                    "checks": [],
+                }
+                stable["check_snapshot"]["failures"] = []
+                stable["check_snapshot"]["sha256"] = MODULE.check_snapshot_sha256(
+                    stable["check_snapshot"]
+                )
+                args = SimpleNamespace(
+                    wait_timeout=33,
+                    poll_interval=1,
+                    poll_max_interval=16,
+                    poll_jitter=0,
+                    stability_polls=2,
+                    debounce_seconds=0,
+                    stack_state=None,
+                )
+                state_path = self.root / f"late-{outcome}.json"
+                clock = [0.0]
+
+                def sleep(seconds):
+                    clock[0] += seconds
+
+                with (
+                    mock.patch.object(
+                        MODULE, "agent_task_preflight",
+                        side_effect=[pending] * 5 + [stable, stable],
+                    ) as preflight,
+                    mock.patch.object(MODULE.time, "monotonic", side_effect=lambda: clock[0]),
+                    mock.patch.object(MODULE.time, "sleep", side_effect=sleep) as slept,
+                ):
+                    result = MODULE.wait_for_stable_ci_preflight(
+                        args, repo_root=self.root,
+                        target={"repo_name": "owner/repo", "number": 7},
+                        state_path=state_path,
+                    )
+
+                self.assertEqual(stable, result)
+                self.assertEqual(7, preflight.call_count)
+                self.assertEqual(
+                    [mock.call(seconds) for seconds in (1, 2, 4, 8, 16, 1)],
+                    slept.call_args_list,
+                )
+                self.assertEqual(32, clock[0])
+                coordinator = MODULE.load_state(state_path)["coordinator"]
+                self.assertEqual("ready", coordinator["status"])
+                self.assertEqual(2, coordinator["stable_polls"])
+
+    def test_stability_confirmation_does_not_extend_the_wait_budget(self):
+        pending = copy.deepcopy(self.preflight)
+        pending["check_snapshot"]["failures"] = []
+        pending["check_snapshot"]["decision"]["pending_checks"] = ["check:queued"]
+        stable = copy.deepcopy(pending)
+        stable["check_snapshot"]["decision"] = {
+            "decision": "green", "checks": [], "detail": "all checks passed"
+        }
+        for last_observation in (pending, stable):
+            with self.subTest(decision=last_observation["check_snapshot"]["decision"]):
+                args = SimpleNamespace(
+                    wait_timeout=31.5,
+                    poll_interval=1,
+                    poll_max_interval=16,
+                    poll_jitter=0,
+                    stability_polls=2,
+                    debounce_seconds=0,
+                    stack_state=None,
+                )
+                state_path = self.root / "bounded-stability.json"
+                clock = [0.0]
+
+                def sleep(seconds):
+                    clock[0] += seconds
+
+                with (
+                    mock.patch.object(
+                        MODULE, "agent_task_preflight",
+                        side_effect=[pending] * 5 + [last_observation],
+                    ) as preflight,
+                    mock.patch.object(MODULE.time, "monotonic", side_effect=lambda: clock[0]),
+                    mock.patch.object(MODULE.time, "sleep", side_effect=sleep) as slept,
+                    self.assertRaisesRegex(MODULE.WorkflowError, "timed out"),
+                ):
+                    MODULE.wait_for_stable_ci_preflight(
+                        args, repo_root=self.root,
+                        target={"repo_name": "owner/repo", "number": 7},
+                        state_path=state_path,
+                    )
+
+                self.assertEqual(6, preflight.call_count)
+                self.assertEqual(
+                    [mock.call(seconds) for seconds in (1, 2, 4, 8, 16)]
+                    + [mock.call(16 if last_observation is pending else 1)],
+                    slept.call_args_list,
+                )
+                state = MODULE.load_state(state_path)
+                self.assertEqual("blocked", state["coordinator"]["status"])
+                self.assertEqual(
+                    0 if last_observation is pending else 1,
+                    state["coordinator"]["stable_polls"],
+                )
+                self.assertEqual(0, state["iterations"])
+
+    def test_changed_terminal_snapshot_needs_new_observations_and_debounce(self):
+        first = copy.deepcopy(self.preflight)
+        first["check_snapshot"]["failures"] = []
+        changed = copy.deepcopy(first)
+        changed["check_snapshot"]["sha256"] = "9" * 64
+        args = SimpleNamespace(
+            wait_timeout=10,
+            poll_interval=1,
+            poll_max_interval=16,
+            poll_jitter=0,
+            stability_polls=2,
+            debounce_seconds=2,
+            stack_state=None,
+        )
+        state_path = self.root / "changed-stability.json"
+        clock = [0.0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        with (
+            mock.patch.object(
+                MODULE, "agent_task_preflight",
+                side_effect=[first, changed, changed, first, first, first, first],
+            ) as preflight,
+            mock.patch.object(MODULE.time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(MODULE.time, "sleep", side_effect=sleep) as slept,
+        ):
+            result = MODULE.wait_for_stable_ci_preflight(
+                args, repo_root=self.root,
+                target={"repo_name": "owner/repo", "number": 7},
+                state_path=state_path,
+            )
+
+        self.assertEqual(first, result)
+        self.assertEqual(7, preflight.call_count)
+        self.assertEqual(
+            [mock.call(seconds) for seconds in (1, 1, 2, 1, 2)],
+            slept.call_args_list,
+        )
+        self.assertEqual(2, MODULE.load_state(state_path)["coordinator"]["stable_polls"])
 
     def test_local_coordinator_records_a_bounded_wait_timeout(self):
         state_path = self.root / "timeout.json"

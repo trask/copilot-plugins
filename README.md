@@ -94,7 +94,8 @@ local-analysis fallback.
 ### PR Pipeline
 
 Runs conflict handling, Copilot review, self review, CI repair, and description
-validation for one pull request. The same plugin includes PR Stack Pipeline,
+validation for one explicitly selected open pull request, draft or ready for
+review. The same plugin includes PR Stack Pipeline,
 which applies those existing agents to a selected suffix of a native GitHub
 stack with at most two passes.
 
@@ -123,6 +124,14 @@ Stack state lives under `~/.copilot/run/pr-stack-pipeline/` and exposes the run
 ID, topology fingerprint, selected suffix, expected heads and bases, current
 pass and phase, per-PR stage state, dispatch nonces, result, and timestamps.
 
+Normal execution defaults to `--github-mutation-policy allow`. Requesting a
+Pipeline run authorizes its standard source fixes, Copilot review requests,
+bot-thread replies and resolution, and title/body updates on the selected PRs.
+It does not authorize merging, approval, changing draft state, unsolicited
+comments, or replies to human-authored threads.
+
+Use `source-only` only when explicitly requested or when the caller forbids
+the normal review or metadata updates, not merely because a PR is a draft.
 Under `source-only`, guarded source publication is allowed, but comments,
 reviews, review requests, thread changes, workflow reruns, and PR or stack
 metadata changes are not. A proposed description replacement remains blocked

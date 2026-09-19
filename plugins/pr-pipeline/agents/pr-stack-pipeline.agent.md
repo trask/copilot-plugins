@@ -37,7 +37,9 @@ Run `start` synchronously exactly once. It returns `stack_pipeline_launched` wit
 
 When the user explicitly chooses conflict strategy `merge` or `rebase`, append `--conflict-strategy merge` or `--conflict-strategy rebase` to `start`. Preserve that choice exactly. Otherwise omit the option and let the helper use `auto`.
 
-Choose one GitHub mutation policy before `start` and never change it for that run. Pass `--github-mutation-policy source-only` when the caller forbids pull request metadata changes. Otherwise pass `--github-mutation-policy allow`. The helper freezes and forwards the policy to Copilot Review, Self Review, and PR Description. Under `source-only`, PR Description may preserve a replacement proposal but must not apply its title or body.
+Normal execution uses `--github-mutation-policy allow`, the helper's default. Explicitly invoking PR Stack Pipeline for a selected suffix authorizes its standard stage-owned actions: verified source publication, Copilot review requests, replies to and resolution of bot-authored review threads, and title/body updates. Draft and ready-for-review pull requests are eligible; preserve their draft states and the exact selected suffix. This authorization does not extend to merging, approving, unsolicited comments, or replies to human-authored threads, which require a separate explicit request.
+
+Choose one GitHub mutation policy before `start` and never change it for that run. Use `--github-mutation-policy source-only` only when the caller explicitly requests source-only execution or forbids the normal stage-owned review or metadata updates. Do not infer source-only from draft status or the separate prohibitions on merging, approval, unsolicited comments, and human-thread replies. The helper freezes and forwards the policy to Copilot Review, Self Review, and PR Description. Under `source-only`, PR Description may preserve a replacement proposal but must not apply its title or body.
 
 `watch` only observes the detached scheduler. Interrupting `watch` does not cancel the run. When the user explicitly asks to stop the run, invoke the matching `cancel` command once with the exact kickoff and run ID:
 

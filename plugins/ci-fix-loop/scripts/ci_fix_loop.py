@@ -14136,6 +14136,7 @@ def wait_for_stable_ci_preflight(
         elif candidate:
             stable_identity = identity
             stable_polls = 1
+            attempt = 0
         else:
             stable_identity = None
             stable_polls = 0

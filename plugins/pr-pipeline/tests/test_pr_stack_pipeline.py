@@ -2854,6 +2854,16 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertIn('"pullRequests"', self.text)
         self.assertIn("Draft and non-draft members are both included", self.text)
 
+    def test_the_agent_documents_normal_authorization_and_explicit_restrictions(self):
+        self.assertIn("Normal execution uses `--github-mutation-policy allow`", self.text)
+        self.assertIn("Draft and ready-for-review pull requests are eligible", self.text)
+        self.assertIn("standard stage-owned actions", self.text)
+        self.assertIn("bot-authored review threads", self.text)
+        self.assertIn("which require a separate explicit request", self.text)
+        self.assertIn("only when the caller explicitly requests", self.text)
+        self.assertIn("Do not infer source-only from draft status", self.text)
+        self.assertIn("never change it for that run", self.text)
+
     def test_the_agent_names_the_delegated_agents_in_order(self):
         for agent in MODULE.PHASE_AGENTS.values():
             self.assertIn(agent, self.text)
