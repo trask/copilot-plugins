@@ -14524,7 +14524,7 @@ class DescendantPropagationTest(unittest.TestCase):
             "run_stack_cascade",
             return_value=completed(MODULE.STACK_FORMAT_EXIT),
         ), mock.patch.object(MODULE, "emit") as emit_mock:
-            MODULE.command_descendant_propagate(args)
+            MODULE.legacy_descendant_propagate(args)
 
         payload = emitted(emit_mock)
         self.assertEqual("formatting_required", payload["result"])
@@ -14586,7 +14586,7 @@ class DescendantPropagationTest(unittest.TestCase):
             "collect_stack_conflicts",
             return_value=[conflict_record("tip.txt")],
         ), mock.patch.object(MODULE, "emit") as emit_mock:
-            MODULE.command_descendant_propagate(args)
+            MODULE.legacy_descendant_propagate(args)
 
         payload = emitted(emit_mock)
         self.assertEqual("conflicted", payload["result"])
@@ -14712,7 +14712,7 @@ class DescendantPropagationTest(unittest.TestCase):
         ) as create_workspace, mock.patch.object(
             MODULE, "emit"
         ) as emit_mock:
-            MODULE.command_descendant_propagate(args)
+            MODULE.legacy_descendant_propagate(args)
 
         self.assertEqual("no_descendants", emitted(emit_mock)["result"])
         create_workspace.assert_not_called()
@@ -14776,5 +14776,5 @@ class DescendantPropagationTest(unittest.TestCase):
                 with self.assertRaisesRegex(
                     MODULE.WorkflowError, "earlier descendant propagation"
                 ):
-                    MODULE.command_descendant_propagate(args)
+                    MODULE.legacy_descendant_propagate(args)
             create_workspace.assert_not_called()

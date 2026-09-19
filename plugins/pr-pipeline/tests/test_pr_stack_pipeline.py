@@ -530,7 +530,13 @@ class StackFixture(unittest.TestCase):
     def worker_progress(self, repository, number, stage):
         return self.worker_progress_map.get(number)
 
-    def propagate(self, repository, number, head_sha, stack_number):
+    def propagate(self, repository, number, head_sha, stack_number, **authorization):
+        request = COMMON.read_json(Path(authorization["request_path"]))
+        self.assertEqual(self.pipeline_kickoff["pullRequests"], request["selected"])
+        self.assertEqual(number, request["fixed_pr"])
+        self.assertEqual(head_sha, request["fixed_head"])
+        self.assertEqual("run-1", request["owner"]["run_id"])
+        self.assertEqual(str(Path(authorization["state_path"]).resolve()), request["state"])
         self.propagated.append((number, head_sha))
         return {
             "result": "published",
@@ -545,6 +551,7 @@ class StackFixture(unittest.TestCase):
         return (ancestor, descendant) in self.contains_pairs
 
     def pipeline(self, payload=None, **overrides):
+        self.pipeline_kickoff = payload or kickoff()
         options = {
             "models": COMMON.stage_models(None),
             "effort": "high",
@@ -1049,7 +1056,7 @@ class StackRunTest(StackFixture):
         for number in (11, 12, 13):
             self.clear.add((number, MODULE.STAGE_CI))
 
-        def align(repository, number, head_sha, stack_number):
+        def align(repository, number, head_sha, stack_number, **authorization):
             self.propagated.append((number, head_sha))
             self.stack = stack(heads={12: "a" * 40, 13: "c" * 40})
             self.contains_pairs.update(
@@ -1079,7 +1086,7 @@ class StackRunTest(StackFixture):
         pipeline = self.pipeline()
         self.clear.add((11, MODULE.STAGE_CI))
 
-        def align(repository, number, head_sha, stack_number):
+        def align(repository, number, head_sha, stack_number, **authorization):
             self.stack = stack(heads={12: "a" * 40, 13: "c" * 40})
             self.contains_pairs.update(
                 {
@@ -1105,7 +1112,7 @@ class StackRunTest(StackFixture):
         self.contains_pairs = set()
         pipeline = self.pipeline()
         self.clear.add((11, MODULE.STAGE_CI))
-        pipeline.propagate = lambda *args: {"result": "conflicted"}
+        pipeline.propagate = lambda *args, **kwargs: {"result": "conflicted"}
 
         result = pipeline.run_ci_phase(1, self.stack["members"])
 
@@ -1427,7 +1434,7 @@ class StackRunTest(StackFixture):
                 {"result": "published"},
             ]
         )
-        pipeline.propagate = lambda *args: next(outcomes)
+        pipeline.propagate = lambda *args, **kwargs: next(outcomes)
         member = self.stack["members"][0]
 
         first = pipeline.propagate_ci_pushes(
@@ -1440,6 +1447,51 @@ class StackRunTest(StackFixture):
         self.assertEqual("failed", first[0]["result"])
         self.assertEqual("published", second[0]["result"])
         self.assertEqual(["push-1"], pipeline.state["propagated_pushes"])
+
+    def test_new_same_run_heads_keep_the_original_topology_authorization(self):
+        pipeline = self.pipeline()
+        first_path, first_state = pipeline.authorize_stack_publication(
+            11, head_of(11), operation="descendant-propagation"
+        )
+        first_bytes = first_path.read_bytes()
+        self.stack["members"][0]["head_sha"] = "a" * 40
+        self.stack["members"][1]["head_sha"] = "c" * 40
+        second_path, second_state = pipeline.authorize_stack_publication(
+            11, "a" * 40, operation="descendant-propagation"
+        )
+        first, second = COMMON.read_json(first_path), COMMON.read_json(second_path)
+        self.assertEqual(first["topology_fingerprint"], second["topology_fingerprint"])
+        self.assertEqual(first["owner"], second["owner"])
+        self.assertEqual(first["selected"], second["selected"])
+        self.assertNotEqual(first["source_snapshot"], second["source_snapshot"])
+        self.assertNotEqual(first_state, second_state)
+        self.assertEqual(first_bytes, first_path.read_bytes())
+        resolver_spec = importlib.util.spec_from_file_location(
+            "pipeline_stack_request_resolver",
+            SCRIPT.parents[2] / "pr-conflict-resolver" / "scripts" / "pr_conflict_resolver.py",
+        )
+        resolver = importlib.util.module_from_spec(resolver_spec)
+        resolver_spec.loader.exec_module(resolver)
+        self.assertEqual(
+            second,
+            resolver.load_stack_request(
+                str(second_path), operation="descendant-propagation",
+                run_id=pipeline.run_id,
+            ),
+        )
+
+    def test_changed_descendants_cannot_replace_an_existing_propagation_request(self):
+        pipeline = self.pipeline()
+        path, _ = pipeline.authorize_stack_publication(
+            11, head_of(11), operation="descendant-propagation"
+        )
+        original = path.read_bytes()
+        self.stack["members"][1]["head_sha"] = "c" * 40
+        with self.assertRaisesRegex(MODULE.WorkflowError, "request changed"):
+            pipeline.authorize_stack_publication(
+                11, head_of(11), operation="descendant-propagation"
+            )
+        self.assertEqual(original, path.read_bytes())
 
     def test_a_failed_checkpoint_is_retired_after_its_source_head_moves(self):
         self.stack = stack(heads={11: "2" * 40})
@@ -1572,7 +1624,7 @@ class StackRunTest(StackFixture):
             }
         ]
 
-        def align(repository, number, head_sha, stack_number):
+        def align(repository, number, head_sha, stack_number, **authorization):
             self.propagated.append((number, head_sha))
             self.stack = stack(heads={12: "a" * 40, 13: "c" * 40})
             self.contains_pairs.update(
@@ -1614,7 +1666,7 @@ class StackRunTest(StackFixture):
                 "pipeline_iteration": 1,
             },
         ]
-        pipeline.propagate = lambda *args: {"result": "published"}
+        pipeline.propagate = lambda *args, **kwargs: {"result": "published"}
 
         propagated = pipeline.propagate_ci_pushes(
             pipeline.request_for(
@@ -1978,8 +2030,8 @@ class CiWarningTest(StackFixture):
         self.record_warning(11)
         self.contains_pairs = set()
 
-        def propagate(*args):
-            result = self.propagate(*args)
+        def propagate(*args, **kwargs):
+            result = self.propagate(*args, **kwargs)
             self.contains_pairs = None
             self.invalidate_warning(11)
             return result
@@ -2849,6 +2901,8 @@ class DependencyTest(unittest.TestCase):
             11,
             "a" * 40,
             77,
+            request_path=self.root / "request.json",
+            state_path=self.root / "state.json",
             script_for=lambda entry: script,
             runner=runner,
         )
@@ -2865,6 +2919,10 @@ class DependencyTest(unittest.TestCase):
                 "a" * 40,
                 "--stack-number",
                 "77",
+                "--stack-request",
+                str(self.root / "request.json"),
+                "--state",
+                str(self.root / "state.json"),
             ],
             seen[0][2:],
         )
@@ -2875,6 +2933,8 @@ class DependencyTest(unittest.TestCase):
             11,
             "a" * 40,
             77,
+            request_path=self.root / "request.json",
+            state_path=self.root / "state.json",
             script_for=lambda entry: self.root / "absent.py",
             runner=lambda *args, **kwargs: None,
         )

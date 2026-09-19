@@ -14945,6 +14945,9 @@ def refresh_stack_state(state: dict[str, Any]) -> dict[str, Any]:
             f"the selected pull request moved from native stack "
             f"{state.get('stack_number')} to {stack['number']}"
         )
+    if stack_topology_fingerprint(stack) != state.get("authorized_topology"):
+        raise WorkflowError("the authorized native stack topology changed during the CI run")
+    state["source_stack"] = stack
     live_by_number = {member["number"]: member for member in stack["members"]}
     projected = open_native_stack(stack)
     state["inactive_members"] = [
@@ -15250,6 +15253,7 @@ def command_stack_start(args: argparse.Namespace) -> None:
             }
         )
         return
+    source_stack = stack
     stack = open_native_stack(stack)
     selected = next(
         (member for member in stack["members"] if member["number"] == target["number"]),
@@ -15326,6 +15330,8 @@ def command_stack_start(args: argparse.Namespace) -> None:
         "stack_id": stack.get("id"),
         "trunk": stack["trunk"],
         "topology_fingerprint": stack_topology_fingerprint(stack),
+        "authorized_topology": stack_topology_fingerprint(source_stack),
+        "source_stack": source_stack,
         "cursor": 0,
         "members": [
             {
@@ -15865,6 +15871,13 @@ def command_stack_propagate(args: argparse.Namespace) -> None:
     require_tools()
     path = cli_path(args.state)
     state = load_stack_state(path)
+    if (
+        not isinstance(state.get("authorized_topology"), str)
+        or not isinstance(state.get("source_stack"), dict)
+        or not isinstance(state.get("run_id"), str)
+        or not state["run_id"]
+    ):
+        raise WorkflowError("legacy native stack state has no propagation authorization")
     if state.get("status") not in {"active", "complete"}:
         raise WorkflowError("cannot propagate a finished native stack run")
     try:
@@ -15922,6 +15935,55 @@ def command_stack_propagate(args: argparse.Namespace) -> None:
     resolver_state_path = stack_propagation_state_path(
         path, args.fixed_pr, args.expected_head
     )
+    source = {
+        key: state["source_stack"].get(key) for key in ("id", "number", "size", "trunk")
+    }
+    source["members"] = [
+        {key: member[key] for key in ("number", "head_branch", "base_branch", "head_sha", "state")}
+        for member in state["source_stack"]["members"]
+    ]
+    snapshot = (
+        source["id"], source["number"], source["size"], source["trunk"],
+        tuple(tuple(member[key] for key in ("number", "head_branch", "base_branch", "head_sha"))
+              for member in source["members"]),
+    )
+    request = {
+        "schema": {"id": "github.copilot.stack-publication-request", "version": 1},
+        "operation": "descendant-propagation",
+        "request_id": f"{state['run_id']}-propagate-pr-{args.fixed_pr}-{args.expected_head}",
+        "request_sha256": "",
+        "owner": {
+            "kind": STACK_STATE_KIND, "run_id": state["run_id"],
+            "state": str(path.resolve()),
+        },
+        "repository": state["repository"].lower(),
+        "selected": [member["number"] for member in state["members"]],
+        "topology_fingerprint": state["authorized_topology"],
+        "source_stack": source,
+        "source_snapshot": hashlib.sha256(
+            json.dumps(snapshot, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "fixed_pr": args.fixed_pr,
+        "fixed_head": args.expected_head,
+        "state": str(resolver_state_path.resolve()),
+    }
+    request["request_sha256"] = hashlib.sha256(
+        json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    request_path = resolver_state_path.with_name(f"{resolver_state_path.stem}--request.json")
+    if request_path.exists():
+        if json.loads(request_path.read_text(encoding="utf-8")) != request:
+            stack_stop(path, state, "propagation_snapshot_changed",
+                       "the run's propagation request changed", member=args.fixed_pr)
+            return
+    else:
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        with request_path.open("x", encoding="utf-8") as stream:
+            json.dump(request, stream, ensure_ascii=False, sort_keys=True)
+    state.setdefault("stack_requests", {})[request["request_id"]] = request["request_sha256"]
+    state["stack_owner_pid"] = os.getpid()
+    state["stack_owner_recorded_at"] = time.time()
+    save_state(path, state)
     if resolver_state_path.is_file():
         resolver_state = json.loads(resolver_state_path.read_text(encoding="utf-8"))
         if resolver_state.get("status") == "resolved":
@@ -15963,6 +16025,8 @@ def command_stack_propagate(args: argparse.Namespace) -> None:
             state["repo_root"],
             "--state",
             str(resolver_state_path),
+            "--stack-request",
+            str(request_path),
         ],
         check=False,
     )

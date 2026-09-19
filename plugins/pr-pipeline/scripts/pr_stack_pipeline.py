@@ -1609,6 +1609,8 @@ def propagate_descendants(
     head_sha: str,
     stack_number: int,
     *,
+    request_path: Path,
+    state_path: Path,
     script_for: Callable[[dict[str, Any]], Path] = stage_script_path,
     runner: Callable[..., Any] = common.run,
 ) -> dict[str, Any]:
@@ -1638,6 +1640,10 @@ def propagate_descendants(
             head_sha,
             "--stack-number",
             str(stack_number),
+            "--stack-request",
+            str(request_path),
+            "--state",
+            str(state_path),
         ],
         check=False,
     )
@@ -1905,6 +1911,82 @@ class StackPipeline:
         )
         return None if member is None else member["head_sha"]
 
+    def authorize_stack_publication(
+        self, number: int, head_sha: str, *, operation: str, pass_number: int = 0
+    ) -> tuple[Path, Path]:
+        self.check_cancellation()
+        current = self.revalidate()
+        if (
+            current["result"] != "ready"
+            or current["fingerprint"] != self.state.get("topology_fingerprint")
+        ):
+            raise WorkflowError("stack publication authorization changed")
+        stack = current["stack"]
+        source = {
+            key: stack.get(key) for key in ("id", "number", "size", "trunk")
+        }
+        source["members"] = [
+            {key: member[key] for key in ("number", "head_branch", "base_branch", "head_sha")}
+            for member in stack["members"]
+        ]
+        fixed = next((member for member in source["members"] if member["number"] == number), None)
+        if fixed is None or fixed["head_sha"] != head_sha:
+            raise WorkflowError("fixed head changed before stack publication authorization")
+        snapshot = (
+            source["id"], source["number"], source["size"], source["trunk"],
+            tuple(tuple(member[key] for key in ("number", "head_branch", "base_branch", "head_sha"))
+                  for member in source["members"]),
+        )
+        name = (
+            f"propagate-pr-{number}-{head_sha}" if operation == "descendant-propagation"
+            else f"conflict-pass-{pass_number}-pr-{number}"
+        )
+        state_path = (self.run_directory / f"{name}.json").resolve()
+        request_path = state_path.with_name(f"{name}--request.json")
+        request = {
+            "schema": {"id": "github.copilot.stack-publication-request", "version": 1},
+            "operation": operation,
+            "request_id": f"{self.run_id}-{name}",
+            "request_sha256": "",
+            "owner": {
+                "kind": RUN_KIND, "run_id": self.run_id,
+                "state": str(self.state_path.resolve()),
+                "cancellation": str(self.cancellation_path.resolve()),
+            },
+            "repository": self.repository.lower(),
+            "selected": list(self.kickoff["pullRequests"]),
+            "topology_fingerprint": self.state["topology_fingerprint"],
+            "source_stack": source,
+            "source_snapshot": hashlib.sha256(
+                json.dumps(snapshot, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+            "fixed_pr": number,
+            "fixed_head": head_sha,
+            "state": str(state_path),
+        }
+        request["request_sha256"] = hashlib.sha256(
+            json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if request_path.exists():
+            if common.read_json(request_path) != request:
+                raise WorkflowError("the run's stack publication request changed")
+        else:
+            common.write_json_atomically(request_path, request)
+        self.state.setdefault("stack_requests", {})[request["request_id"]] = request["request_sha256"]
+        self.state["stack_owner_pid"] = os.getpid()
+        self.state["stack_owner_recorded_at"] = time.time()
+        self.save()
+        return request_path, state_path
+
+    def propagate_authorized(self, number: int, head_sha: str) -> dict[str, Any]:
+        request_path, state_path = self.authorize_stack_publication(
+            number, head_sha, operation="descendant-propagation"
+        )
+        return self.propagate(
+            self.repository, number, head_sha, self.kickoff["stackNumber"],
+            request_path=request_path, state_path=state_path,
+        )
+
     # Dispatch ------------------------------------------------------------
 
     def request_for(
@@ -1939,6 +2021,11 @@ class StackPipeline:
             )
             if scope is not None:
                 arguments.append("--whole-stack")
+                request_path, _ = self.authorize_stack_publication(
+                    member["number"], member["head_sha"],
+                    operation="whole-stack", pass_number=pass_number,
+                )
+                arguments.extend(["--stack-request", str(request_path)])
         return {
             "number": member["number"],
             "stage": stage,
@@ -2652,12 +2739,7 @@ class StackPipeline:
                 )
                 continue
             self.check_cancellation()
-            outcome = self.propagate(
-                self.repository,
-                request["number"],
-                head_sha,
-                self.kickoff["stackNumber"],
-            )
+            outcome = self.propagate_authorized(request["number"], head_sha)
             outcomes.append(outcome)
             self.propagations.append(outcome)
             result = outcome.get("result")
@@ -2735,12 +2817,7 @@ class StackPipeline:
                     predecessor_head = gate["predecessor_head_sha"]
                     self.check_cancellation()
                     alignment = {
-                        **self.propagate(
-                            self.repository,
-                            previous["number"],
-                            predecessor_head,
-                            self.kickoff["stackNumber"],
-                        ),
+                        **self.propagate_authorized(previous["number"], predecessor_head),
                         "trigger": "predecessor_alignment",
                     }
                     propagations.append(alignment)

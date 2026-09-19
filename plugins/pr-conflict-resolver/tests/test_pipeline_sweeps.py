@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 import test_pr_conflict_resolver as existing
+from test_stack_publication import write_authorization
 
 
 MODULE = existing.MODULE
@@ -253,15 +254,6 @@ class ConflictPipelineSweepTest(unittest.TestCase):
     def full_stack(self):
         self.args.whole_stack = True
         self.metadata.update(base_branch="v143")
-        state = self.first_sweep()
-        state["pipeline_native_scope"] = {
-            "trunk": {"ref": "main", "sha": "0" * 40},
-            "members": [
-                {"pr_number": 19483, "head_ref": "v143", "direct_base_ref": "main"},
-                {"pr_number": 7, "head_ref": "feature", "direct_base_ref": "v143"},
-            ],
-        }
-        MODULE.save_state(self.path, state)
         lower = existing.pr_metadata(
             number=19483, pr_url="https://github.com/owner/repo/pull/19483",
             head_branch="v143", head_sha="b" * 40, base_sha="d" * 40,
@@ -272,6 +264,22 @@ class ConflictPipelineSweepTest(unittest.TestCase):
             {**self.metadata, "base_sha": "cached-old-prefix"},
         ])
         self.calls["stack_membership"].return_value = detection
+        _, path, _, _ = write_authorization(
+            self.directory, detection["stack"], fixed=7, operation="whole-stack"
+        )
+        self.args.stack_request = str(path)
+        patch = mock.patch.object(MODULE, "metadata_for", return_value=self.metadata)
+        patch.start()
+        self.addCleanup(patch.stop)
+        state = self.first_sweep()
+        state["pipeline_native_scope"] = {
+            "trunk": {"ref": "main", "sha": "0" * 40},
+            "members": [
+                {"pr_number": 19483, "head_ref": "v143", "direct_base_ref": "main"},
+                {"pr_number": 7, "head_ref": "feature", "direct_base_ref": "v143"},
+            ],
+        }
+        MODULE.save_state(self.path, state)
         self.calls["base_ref_tip"].side_effect = lambda repo, ref: (
             "d" * 40 if ref == "main" else "b" * 40
         )
@@ -291,15 +299,19 @@ class ConflictPipelineSweepTest(unittest.TestCase):
 
     def test_full_scope_rejects_changed_membership_or_conflicting_prefix(self):
         original, detection, lower = self.full_stack()
-        for mutate in (
+        for index, mutate in enumerate((
             lambda: detection["stack"]["members"].reverse(),
             lambda: lower.update(mergeable="CONFLICTING"),
-        ):
+        )):
             MODULE.save_state(self.path, copy.deepcopy(original))
+            before = self.path.read_bytes()
             mutate()
             with self.subTest(mutation=mutate), self.assertRaises(MODULE.WorkflowError):
                 MODULE.command_pipeline(self.args)
-            self.assertIsNone(MODULE.cleared_head_sha(MODULE.load_state(self.path)))
+            if index == 0:
+                self.assertEqual(before, self.path.read_bytes())
+            else:
+                self.assertIsNone(MODULE.cleared_head_sha(MODULE.load_state(self.path)))
             detection["stack"]["members"].sort(key=lambda m: 0 if m["number"] == 19483 else 1)
         self.calls["discover_conflict_task"].assert_not_called()
 

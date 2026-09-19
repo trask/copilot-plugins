@@ -40,6 +40,10 @@ Stack Pipeline uses the same rules. Each run has its own scheduler state, monito
 
 Only a full native-stack selection authorizes `--whole-stack` conflict publication. A partial suffix never launches the conflict coordinator. Fresh GitHub mergeability clears each selected member only at its exact head and base. Conflicting, unknown, or stale metadata blocks rather than changing an unselected prefix.
 
+Both CI push propagation and predecessor alignment pass a versioned `--stack-request` and explicit run-scoped `--state` to Conflict Resolver. The request binds the active owner, original selected order and topology, fixed PR/head, canonical repository, and current source heads. Full-stack conflict dispatch carries the same authorization. New members, reordered or removed members, changed refs, or changed source heads block before hosted work and before publication.
+
+Descendant propagation uses the hosted conflict worker and its verified receipts, not local rebase/format/repair commands. Only authorized descendants enter its atomic push, each with an exact source-head lease. One hosted attempt belongs to each frozen propagation request. A controlled publication failure can retry those verified candidates within the same active run, without another hosted task or a fresh budget. Interrupted, foreign, and legacy state cannot publish, finalize receipts, or remove retained workspaces.
+
 ## Hosted outputs
 
 Hosted workers use `.github/agent-task-output/`.

@@ -4608,7 +4608,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.56", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.57", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -15685,6 +15685,28 @@ class NativeStackCoordinatorTest(unittest.TestCase):
         self.assertIn("77", command)
         self.assertIn("--expected-head", command)
         self.assertIn("lower1", command)
+        request_path = Path(command[command.index("--stack-request") + 1])
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        self.assertEqual([5, 7, 9], request["selected"])
+        self.assertEqual(saved["run_id"], request["owner"]["run_id"])
+        self.assertEqual(str(self.stack_state.resolve()), request["owner"]["state"])
+        self.assertEqual(saved["authorized_topology"], request["topology_fingerprint"])
+        self.assertEqual(["lower1", "middle1", "upper1"],
+                         [member["head_sha"] for member in request["source_stack"]["members"]])
+        self.assertEqual(request["request_sha256"], saved["stack_requests"][request["request_id"]])
+        resolver_spec = importlib.util.spec_from_file_location(
+            "ci_stack_request_resolver",
+            SCRIPT.parents[2] / "pr-conflict-resolver" / "scripts" / "pr_conflict_resolver.py",
+        )
+        resolver = importlib.util.module_from_spec(resolver_spec)
+        resolver_spec.loader.exec_module(resolver)
+        self.assertEqual(
+            request,
+            resolver.load_stack_request(
+                str(request_path), operation="descendant-propagation",
+                run_id=saved["run_id"],
+            ),
+        )
         state_index = command.index("--state")
         self.assertEqual(
             str(MODULE.stack_propagation_state_path(self.stack_state, 5, "lower1")),

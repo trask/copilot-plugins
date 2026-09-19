@@ -94,6 +94,8 @@ The latter blocks workflow reruns without an empty-commit workaround.
 Neither policy permits comments or pull request metadata changes.
 An interrupted command fails rather than continuing in a later invocation.
 
+The internal native-stack coordinator binds descendant propagation to its run-specific state and a versioned `--stack-request`. That request preserves the original selected open members and complete native topology, including unselected inactive members, while freezing current source heads for each propagation. Conflict Resolver uses hosted candidate preparation and validation, then publishes only the authorized descendants with atomic exact-head leases. A changed selection, source snapshot, owner, or run blocks; legacy propagation checkpoints are not adopted. This internal integration does not authorize this agent to invoke stack or recovery commands.
+
 ## Final response
 
 Report the terminal outcome returned by the command. Include the pull request, final head when present, and the coordinator's exact error when it failed. Do not post anything to GitHub.
