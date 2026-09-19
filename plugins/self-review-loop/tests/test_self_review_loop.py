@@ -158,6 +158,142 @@ class WindowsSubprocessTest(unittest.TestCase):
         self.assertNotIn("creationflags", subprocess_run.call_args.kwargs)
 
 
+class AtomicWriteTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+
+    def write(self, kind, path, value):
+        if kind == "state":
+            MODULE.save_state(path, {"version": MODULE.STATE_VERSION, "value": value})
+        else:
+            MODULE.atomic_write_text(path, value + "\n")
+
+    def permission_error(self, winerror):
+        error = PermissionError(13, "replacement denied")
+        error.winerror = winerror
+        return error
+
+    def test_retry_preserves_one_closed_temporary_file_and_atomic_contents(self):
+        replace = MODULE.os.replace
+        for kind in ("state", "text"):
+            for code in (5, 32):
+                with self.subTest(kind=kind, code=code):
+                    path = self.root / f"{kind}-{code}"
+                    self.write(kind, path, "old")
+                    before = path.read_bytes()
+                    attempts = []
+
+                    def fail_twice(source, destination):
+                        self.assertEqual(before, path.read_bytes())
+                        attempts.append((source, Path(source).read_bytes()))
+                        if kind == "text":
+                            fsync.assert_called_once()
+                        if len(attempts) < 3:
+                            raise self.permission_error(code)
+                        replace(source, destination)
+
+                    with (
+                        mock.patch.object(MODULE, "IS_WINDOWS", True),
+                        mock.patch.object(MODULE.os, "replace", side_effect=fail_twice),
+                        mock.patch.object(MODULE.os, "fsync", wraps=MODULE.os.fsync) as fsync,
+                        mock.patch.object(MODULE.time, "sleep") as sleep,
+                    ):
+                        self.write(kind, path, "new")
+                    self.assertEqual([mock.call(0.01), mock.call(0.02)], sleep.call_args_list)
+                    self.assertEqual([attempts[0]] * 3, attempts)
+                    self.assertNotEqual(before, path.read_bytes())
+                    self.assertEqual([], list(self.root.glob("*.tmp")))
+
+    def test_retry_exhaustion_preserves_destination_and_original_error(self):
+        for kind in ("state", "text"):
+            for code in (5, 32):
+                with self.subTest(kind=kind, code=code):
+                    path = self.root / f"{kind}-{code}"
+                    self.write(kind, path, "old")
+                    before = path.read_bytes()
+                    error = self.permission_error(code)
+                    with (
+                        mock.patch.object(MODULE, "IS_WINDOWS", True),
+                        mock.patch.object(MODULE.os, "replace", side_effect=error) as replace,
+                        mock.patch.object(MODULE.time, "sleep") as sleep,
+                        self.assertRaises(PermissionError) as raised,
+                    ):
+                        self.write(kind, path, "new")
+                    self.assertIs(error, raised.exception)
+                    self.assertEqual(6, replace.call_count)
+                    self.assertEqual(
+                        [mock.call(delay) for delay in (0.01, 0.02, 0.05, 0.1, 0.2)],
+                        sleep.call_args_list,
+                    )
+                    self.assertEqual(before, path.read_bytes())
+                    self.assertEqual([], list(self.root.glob("*.tmp")))
+
+    def test_other_errors_and_platforms_fail_without_retry(self):
+        for kind in ("state", "text"):
+            for windows, error in (
+                (False, self.permission_error(5)),
+                (False, self.permission_error(32)),
+                (True, self.permission_error(33)),
+                (True, PermissionError(13, "no Windows code")),
+                (True, FileNotFoundError(2, "missing")),
+                (True, OSError(28, "disk full")),
+            ):
+                with self.subTest(kind=kind, windows=windows, error=repr(error)):
+                    path = self.root / kind
+                    self.write(kind, path, "old")
+                    before = path.read_bytes()
+                    with (
+                        mock.patch.object(MODULE, "IS_WINDOWS", windows),
+                        mock.patch.object(MODULE.os, "replace", side_effect=error) as replace,
+                        mock.patch.object(MODULE.time, "sleep") as sleep,
+                        self.assertRaises(OSError) as raised,
+                    ):
+                        self.write(kind, path, "new")
+                    self.assertIs(error, raised.exception)
+                    replace.assert_called_once()
+                    sleep.assert_not_called()
+                    self.assertEqual(before, path.read_bytes())
+                    self.assertEqual([], list(self.root.glob("*.tmp")))
+
+    def test_fsync_failure_is_not_a_replacement_retry(self):
+        path = self.root / "text"
+        MODULE.atomic_write_text(path, "old")
+        error = self.permission_error(5)
+        with (
+            mock.patch.object(MODULE, "IS_WINDOWS", True),
+            mock.patch.object(MODULE.os, "fsync", side_effect=error),
+            mock.patch.object(MODULE.os, "replace") as replace,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+            self.assertRaises(PermissionError) as raised,
+        ):
+            MODULE.atomic_write_text(path, "new")
+        self.assertIs(error, raised.exception)
+        replace.assert_not_called()
+        sleep.assert_not_called()
+        self.assertEqual("old", path.read_text(encoding="utf-8"))
+        self.assertEqual([], list(self.root.glob("*.tmp")))
+
+    @unittest.skipUnless(MODULE.IS_WINDOWS, "requires Windows file sharing")
+    def test_real_windows_status_reader_releases_destination_before_retry(self):
+        for kind in ("state", "text"):
+            with self.subTest(kind=kind):
+                path = self.root / kind
+                self.write(kind, path, "old")
+                before = path.read_bytes()
+                with path.open("r", encoding="utf-8") as reader:
+                    def release_reader(_delay):
+                        self.assertEqual(before, path.read_bytes())
+                        reader.close()
+
+                    with mock.patch.object(MODULE.time, "sleep", side_effect=release_reader) as sleep:
+                        self.write(kind, path, "new")
+                sleep.assert_called_once_with(0.01)
+                self.assertNotEqual(before, path.read_bytes())
+                self.assertEqual([], list(self.root.glob("*.tmp")))
+
+
 DIFF = """diff --git a/app.py b/app.py
 --- a/app.py
 +++ b/app.py
@@ -2218,7 +2354,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.43")
+        self.assertEqual(plugin["version"], "1.3.44")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -4272,6 +4408,52 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertEqual("9" * 40, MODULE.recorded_clean_at_head_sha(second))
             self.assertNotEqual(first["agent_task"]["run_id"], second["agent_task"]["run_id"])
             self.assertNotIn("--resume", commands[-1])
+
+    def test_pipeline_retries_validated_state_write_without_repeating_task(self):
+        for failures, exit_code in ((1, 0), (6, 1)):
+            with self.subTest(failures=failures), self.pipeline_run(fixes=0) as (
+                args, commands, emitted
+            ):
+                args.state = str(self.directory / f"pipeline-{failures}.json")
+                replace = MODULE.os.replace
+                attempts = []
+
+                def replace_blocked(source, destination):
+                    payload = Path(source).read_bytes()
+                    if Path(destination) == Path(args.state):
+                        state = json.loads(payload)
+                        if state["agent_task"]["status"] == "validated":
+                            attempts.append(payload)
+                            if len(attempts) <= failures:
+                                error = PermissionError(13, "status reader is open")
+                                error.winerror = 5
+                                raise error
+                    replace(source, destination)
+
+                with (
+                    mock.patch.object(MODULE, "IS_WINDOWS", True),
+                    mock.patch.object(MODULE.os, "replace", side_effect=replace_blocked),
+                    mock.patch.object(MODULE.time, "sleep") as sleep,
+                    mock.patch.object(
+                        MODULE, "apply_verified_candidate_import",
+                        wraps=MODULE.apply_verified_candidate_import,
+                    ) as importer,
+                ):
+                    self.assertEqual(exit_code, self.pipeline_cli(args))
+                importer.assert_called_once()
+                self.assertEqual(1, len(commands))
+                self.assertFalse(any("push" in call.args[0] for call in MODULE.run.call_args_list))
+                self.assertEqual([attempts[0]] * (2 if exit_code == 0 else 6), attempts)
+                state = MODULE.load_state(Path(args.state))
+                self.assertEqual("completed" if exit_code == 0 else "failed", state["agent_task"]["status"])
+                self.assertEqual(1 if exit_code == 0 else 0, state["iterations"])
+                if exit_code == 0:
+                    self.assertEqual("cleared", emitted[-1]["stage_outcome"])
+                    sleep.assert_called_once_with(0.01)
+                else:
+                    self.assertEqual("error", emitted[-1]["result"])
+                    self.assertIsNone(MODULE.recorded_clean_at_head_sha(state))
+                    self.assertEqual(5, sleep.call_count)
 
     def test_later_sweep_new_head_does_not_replenish_exhausted_budget(self):
         with self.pipeline_run(max_iterations=2) as (args, commands, emitted):

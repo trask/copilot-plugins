@@ -58,6 +58,8 @@ A later sweep may inspect a head published by another stage using the original r
 
 Source-only skips shared GitHub state publication as well as PR metadata mutation. Audit state stays local.
 
+Atomic state and artifact replacement retries Windows permission errors 5 and 32 up to five times, with 0.38 seconds of total delay. Each attempt uses the same prepared temporary file, without repeating task execution, import, publication, or budget charges. Other errors and exhausted retries remain failures; temporary-file cleanup still runs.
+
 ## Boundaries
 
 - Never run `gh pr diff`, read or search repository files, inspect repository instructions, analyze code, make edits, run builds, tests, probes, formatters, hooks, or repository programs locally. Agent Tasks performs every substantive repository action.

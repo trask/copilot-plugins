@@ -29,6 +29,7 @@ STATE_VERSION = 1
 DEFAULT_MAX_ITERATIONS = 5
 DEFAULT_PIPELINE_MAX_ITERATIONS = 2
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
+WINDOWS_REPLACE_RETRY_DELAYS = (0.01, 0.02, 0.05, 0.1, 0.2)
 IS_WINDOWS = os.name == "nt"
 PR_URL_PATTERN = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
@@ -651,6 +652,21 @@ def discover_cloud_task() -> Path:
     return helper.resolve()
 
 
+def replace_atomic_file(source: str, destination: Path) -> None:
+    for attempt in range(len(WINDOWS_REPLACE_RETRY_DELAYS) + 1):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError as error:
+            if (
+                not IS_WINDOWS
+                or getattr(error, "winerror", None) not in {5, 32}
+                or attempt == len(WINDOWS_REPLACE_RETRY_DELAYS)
+            ):
+                raise
+            time.sleep(WINDOWS_REPLACE_RETRY_DELAYS[attempt])
+
+
 def atomic_write_text(path: Path, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary_name = tempfile.mkstemp(
@@ -661,7 +677,7 @@ def atomic_write_text(path: Path, value: str) -> None:
             stream.write(value)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_name, path)
+        replace_atomic_file(temporary_name, path)
     except BaseException:
         try:
             os.unlink(temporary_name)
@@ -799,7 +815,7 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
         with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
             json.dump(state, stream, indent=2, sort_keys=True)
             stream.write("\n")
-        os.replace(temporary_name, path)
+        replace_atomic_file(temporary_name, path)
     except BaseException:
         try:
             os.unlink(temporary_name)
