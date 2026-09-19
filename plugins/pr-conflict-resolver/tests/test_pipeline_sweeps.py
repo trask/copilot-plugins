@@ -28,7 +28,7 @@ class ConflictPipelineSweepTest(unittest.TestCase):
         )
         patches = {
             "require_tools": {},
-            "resolve_repo_root": {"return_value": self.root},
+            "resolve_repo_root": {"return_value": self.root.resolve()},
             "conflict_preflight": {"side_effect": lambda *a, **kw: {
                 "already_mergeable": True, "pr": copy.deepcopy(self.metadata), "strategy": None,
             }},
@@ -65,6 +65,25 @@ class ConflictPipelineSweepTest(unittest.TestCase):
         self.assertEqual(previous["agent_task"], current["pipeline_sweep_history"][0]["agent_task"])
         self.assertEqual(2, current["pipeline"]["iteration"])
         self.assertEqual("a" * 40, current["history"][0]["head_sha"])
+
+    def test_fixture_canonicalizes_an_aliased_temporary_directory(self):
+        parent = self.directory / "aliased"
+        child = parent / "child"
+        child.mkdir(parents=True)
+        temporary = mock.Mock()
+        temporary.name = str(child / "..")
+        case = ConflictPipelineSweepTest(
+            "test_later_sweep_revalidates_changed_head_without_hosted_work"
+        )
+        with mock.patch.object(tempfile, "TemporaryDirectory", return_value=temporary):
+            case.setUp()
+        try:
+            case.test_later_sweep_revalidates_changed_head_without_hosted_work()
+            state = MODULE.load_state(case.path)
+            self.assertEqual(str(case.root.resolve()), state["repo_root"])
+            self.assertEqual(state["repo_root"], state["pipeline"]["repo_root"])
+        finally:
+            case.doCleanups()
 
     def test_unchanged_head_still_checks_fresh_mergeability_and_live_base(self):
         self.first_sweep()
