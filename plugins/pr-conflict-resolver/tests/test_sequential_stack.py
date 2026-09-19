@@ -590,7 +590,9 @@ class PipelineConflictEntryTest(unittest.TestCase):
             root = directory / "repo"
             root.mkdir()
             state = directory / "state.json"
-            state.write_text('{"agent_task":{"status":"interrupted"}}', encoding="utf-8")
+            MODULE.save_state(state, {
+                "version": MODULE.STATE_VERSION, "agent_task": {"status": "interrupted"},
+            })
             with mock.patch.object(MODULE, "command_agent_task") as execute:
                 with self.assertRaisesRegex(MODULE.WorkflowError, "fresh invocation"):
                     MODULE.command_pipeline(self.arguments(root, state))
@@ -621,19 +623,15 @@ class PipelineConflictEntryTest(unittest.TestCase):
             root.mkdir()
             state = directory / "state.json"
             contents = '{"version":1,"agent_task":{"status":"completed"}}'
-            state.write_text(contents, encoding="utf-8")
-            actual_exists = Path.exists
-            checks = 0
+            actual_open = Path.open
 
-            def exists(path):
-                nonlocal checks
-                if path == state:
-                    checks += 1
-                    return checks > 1
-                return actual_exists(path)
+            def open_file(path, *args, **kwargs):
+                if path == state.with_name(state.name + ".lock"):
+                    state.write_text(contents, encoding="utf-8")
+                return actual_open(path, *args, **kwargs)
 
             with (
-                mock.patch.object(Path, "exists", exists),
+                mock.patch.object(Path, "open", open_file),
                 mock.patch.object(MODULE, "command_agent_task") as execute,
                 self.assertRaisesRegex(MODULE.WorkflowError, "fresh invocation"),
             ):

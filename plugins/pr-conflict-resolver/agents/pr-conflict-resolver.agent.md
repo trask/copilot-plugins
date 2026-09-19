@@ -42,10 +42,14 @@ Without pipeline position, the helper allows three managed attempts per invocati
 Pipeline invokes the deterministic `pipeline` entry point directly, without a model wrapper:
 
 ```text
-pipeline <target> --repo-root <workspace> --state <fresh-external-path> --pipeline-run <run-id> --strategy auto --model sol
+pipeline <target> --repo-root <workspace> --state <run-specific-external-path> --pipeline-run <run-id> --pipeline-iteration <sweep> --pipeline-max-iterations <maximum> --strategy auto --model sol
 ```
 
-It accepts the same optional iteration flags and `--whole-stack`. When iteration flags are absent, the fresh pipeline invocation starts at iteration one with the configured maximum. It waits synchronously through normal queued and active task states, including every stack member, and returns zero only for verified publication or current-head mergeability. Failures return nonzero. The iteration budget belongs to the whole invocation, not to individual member tasks. An existing state file or active owner fails closed. An interrupted invocation cannot continue; a later authorized call must use fresh state and tasks.
+It accepts `--whole-stack`. When iteration flags are absent, the fresh pipeline invocation starts at iteration one with the configured maximum. It waits synchronously through normal queued and active task states, including every stack member, and returns zero only for verified publication or current-head mergeability. Failures return nonzero. The iteration budget belongs to the whole invocation, not to individual member tasks.
+
+A completed earlier sweep of the same Pipeline run may reuse its state for fresh read-only mergeability checks. The target, workspace, model, strategy, whole-stack authorization, and maximum must match, and the sweep must strictly advance within that maximum. The helper checks the current head, live base branch tip, and native scope even when the head is unchanged. Without `--whole-stack`, it checks only the invoked PR and never expands to other members. With full native scope, every member must remain in the same order and be mergeable against its live direct base.
+
+Later sweeps preserve prior terminal evidence and managed-task counts. They do not launch hosted work or replenish any budget. A real conflict, unknown mergeability, changed identity or scope, or concurrent head/base change blocks explicitly and invalidates the old clearance. Same-sweep, foreign-run, active, interrupted, and unbound legacy state cannot be reused. An interrupted invocation still requires fresh state and tasks; later-sweep revalidation is not recovery.
 
 The `pipeline` entry point requires explicit `--whole-stack` authorization before resolving a native stack. Without it, a mergeable member can clear read-only, but a native conflict fails before task creation or publication. A selected suffix does not authorize rewriting an unselected prefix.
 

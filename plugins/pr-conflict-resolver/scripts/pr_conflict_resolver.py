@@ -9639,47 +9639,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     }
                 )
                 return
-            archive_attempt(state)
-            attempt_number = int(state.get("attempts", 0)) + 1
-            state["attempts"] = attempt_number
-            state["managed_attempts"] = prior_managed_attempts
-            state["last_result"] = "mergeable"
-            state["pr"] = preflight["pr"]
-            state["escalation"] = None
-            state["attempt"] = {
-                "id": f"pr-{preflight['pr']['number']}-attempt-{attempt_number}",
-                "status": "mergeable",
-                "attempt_number": attempt_number,
-                "strategy": preflight.get("strategy"),
-                "strategy_reason": None,
-                "strategy_warnings": [],
-                "head_sha": preflight["pr"]["head_sha"],
-                "base_sha": preflight["pr"]["base_sha"],
-                "merge_base": None,
-                "mergeable": preflight["pr"].get("mergeable"),
-                "merge_state_status": preflight["pr"].get("merge_state_status"),
-                "started_at": utc_now(),
-                "conflicts": [],
-                "conflict_signature": None,
-                "published_head_sha": None,
-                "mergeable_at_head_sha": preflight["pr"]["head_sha"],
-            }
-            state["agent_task"].update(
-                {
-                    "status": "completed",
-                    "task_id_status": "not_needed",
-                    "outcome": "already_mergeable",
-                }
-            )
-            save_state(state_path, state)
-            emit(
-                {
-                    "result": "mergeable",
-                    "state": str(state_path),
-                    "head_sha": preflight["pr"]["head_sha"],
-                    "stage_outcome": "cleared",
-                }
-            )
+            record_mergeable_conflict(state_path, state, preflight, prior_managed_attempts)
             return
         request_path = state_path.with_name(
             f"{state_path.stem}--{run_id}--request.json"
@@ -9953,17 +9913,234 @@ def command_agent_task(args: argparse.Namespace) -> None:
     emit(publish_conflict_result(state_path, state))
 
 
+def record_mergeable_conflict(
+    state_path: Path, state: dict[str, Any], preflight: dict[str, Any],
+    managed_attempts: int,
+) -> None:
+    archive_attempt(state)
+    attempt_number = int(state.get("attempts", 0)) + 1
+    state["attempts"] = attempt_number
+    state["managed_attempts"] = managed_attempts
+    state["last_result"] = "mergeable"
+    state["pr"] = preflight["pr"]
+    state["escalation"] = None
+    state["attempt"] = {
+        "id": f"pr-{preflight['pr']['number']}-attempt-{attempt_number}",
+        "status": "mergeable",
+        "attempt_number": attempt_number,
+        "strategy": preflight.get("strategy"),
+        "strategy_reason": None,
+        "strategy_warnings": [],
+        "head_sha": preflight["pr"]["head_sha"],
+        "base_sha": preflight["pr"]["base_sha"],
+        "merge_base": None,
+        "mergeable": preflight["pr"].get("mergeable"),
+        "merge_state_status": preflight["pr"].get("merge_state_status"),
+        "started_at": utc_now(),
+        "conflicts": [],
+        "conflict_signature": None,
+        "published_head_sha": None,
+        "mergeable_at_head_sha": preflight["pr"]["head_sha"],
+    }
+    state["agent_task"].update(
+        {"status": "completed", "task_id_status": "not_needed", "outcome": "already_mergeable"}
+    )
+    save_state(state_path, state)
+    emit({
+        "result": "mergeable", "state": str(state_path),
+        "head_sha": preflight["pr"]["head_sha"], "stage_outcome": "cleared",
+    })
+
+
+def pipeline_conflict_binding(args: argparse.Namespace) -> dict[str, Any]:
+    if args.new_invocation or args.invocation_run is not None:
+        raise WorkflowError("pipeline position cannot be combined with standalone invocation scope")
+    if (
+        type(args.pipeline_iteration) is not int
+        or type(args.pipeline_max_iterations) is not int
+        or not 1 <= args.pipeline_iteration <= args.pipeline_max_iterations
+    ):
+        raise WorkflowError("pipeline requires a valid iteration within its fixed budget")
+    root = cli_path(args.repo_root)
+    target = resolve_target(args.target, root)
+    return {
+        "run": args.pipeline_run,
+        "iteration": args.pipeline_iteration,
+        "budget": args.pipeline_max_iterations,
+        "target": target["pr_url"],
+        "repo_root": str(root),
+        "model": MODEL_ALIASES[args.model],
+        "strategy": args.strategy,
+        "whole_stack": args.whole_stack,
+    }
+
+
+def require_later_conflict_sweep(
+    state: dict[str, Any], binding: dict[str, Any],
+) -> None:
+    previous = state.get("pipeline")
+    task = state.get("agent_task")
+    result = task.get("result") if isinstance(task, dict) else None
+    result_task = result.get("task") if isinstance(result, dict) else None
+    pr = state.get("pr")
+    if (
+        not isinstance(previous, dict)
+        or set(previous) != set(binding)
+        or type(previous.get("iteration")) is not int
+        or not 1 <= previous["iteration"] < binding["iteration"]
+        or any(previous[key] != value for key, value in binding.items() if key != "iteration")
+        or not isinstance(task, dict)
+        or task.get("status") != "completed"
+        or task.get("policy") != CONFLICT_POLICY
+        or task.get("model") != binding["model"]
+        or task.get("invocation_id") != binding["run"]
+        or task.get("error")
+        or state.get("last_result") not in {"mergeable", "published"}
+        or (
+            state.get("last_result") == "mergeable"
+            and (task.get("task_id") is not None or task.get("task_id_status") != "not_needed")
+        )
+        or (
+            state.get("last_result") == "published"
+            and (
+                not isinstance(result, dict)
+                or result.get("status") != "success"
+                or not isinstance(result_task, dict)
+                or result_task.get("state") != "completed"
+            )
+        )
+        or state.get("escalation")
+        or state.get("repo_root") != binding["repo_root"]
+        or not isinstance(pr, dict)
+        or pr.get("pr_url") != binding["target"]
+        or type(state.get("attempts")) is not int
+        or state["attempts"] < 0
+        or not isinstance(state.get("history"), list)
+        or not isinstance(state.get("pipeline_sweep_history", []), list)
+    ):
+        raise WorkflowError(
+            "pipeline state requires a completed earlier sweep with unchanged identity "
+            "in the same run; otherwise start a fresh invocation"
+        )
+    managed_attempt_count(state)
+
+
+def revalidate_pipeline_conflict(
+    state_path: Path, state: dict[str, Any], binding: dict[str, Any],
+) -> None:
+    root = Path(binding["repo_root"])
+    target = parse_target(binding["target"])
+    previous_pr = state["pr"]
+    previous_task = state["agent_task"]
+    state.setdefault("pipeline_sweep_history", []).append({
+        "pipeline": state["pipeline"], "agent_task": previous_task,
+    })
+    archive_attempt(state)
+    state["pipeline"] = binding
+    state["last_result"] = "revalidating"
+    state["attempt"] = {"status": "aborted", "mergeable_at_head_sha": None}
+    state["agent_task"] = {
+        "status": "preparing", "task_id": None, "task_id_status": "not_created",
+        "invocation_id": binding["run"], "model": binding["model"],
+        "policy": CONFLICT_POLICY,
+    }
+    save_state(state_path, state)
+    require_tools()
+    require_clean_worktree(root)
+    require_no_integration_in_progress(root)
+    metadata = live_mergeability(target)
+    identity_keys = (
+        "number", "pr_url", "repo_name", "head_owner", "head_repo", "head_branch",
+        "base_branch", "upstream_owner", "upstream_repo",
+    )
+    if any(metadata.get(key) != previous_pr.get(key) for key in identity_keys):
+        raise WorkflowError("pipeline pull request identity or base branch changed")
+    require_open_pull_request(metadata)
+    conflict_preflight_identity(root, metadata)
+    detection = stack_membership(metadata)
+    stack = detection["stack"]
+    if stack is None and metadata["base_branch"] != detection["default_branch"]:
+        raise WorkflowError("pipeline non-default base has no native stack")
+    members = [metadata]
+    frozen = state.get("pipeline_native_scope")
+    if binding["whole_stack"] and (stack is not None or frozen is not None):
+        if (
+            stack is None
+            or not isinstance(frozen, dict)
+            or not isinstance(frozen.get("trunk"), dict)
+            or not isinstance(frozen.get("members"), list)
+            or not all(isinstance(item, dict) for item in frozen["members"])
+            or stack["trunk"] != frozen["trunk"].get("ref")
+            or [
+                (item["number"], item["head_branch"], item["base_branch"])
+                for item in stack["members"]
+            ] != [
+                (item.get("pr_number"), item.get("head_ref"), item.get("direct_base_ref"))
+                for item in frozen["members"]
+            ]
+        ):
+            raise WorkflowError("pipeline native stack scope changed")
+        members = []
+        parent_ref = stack["trunk"]
+        parent_sha = base_ref_tip(metadata["repo_name"], parent_ref)
+        for member in stack["members"]:
+            current = live_mergeability(
+                stack_member_target(metadata, member["number"]),
+                expected_head=member["head_sha"],
+            )
+            if (
+                current["head_branch"] != member["head_branch"]
+                or current["base_branch"] != parent_ref
+                or current["head_sha"] != member["head_sha"]
+                or current["base_sha"] != parent_sha
+            ):
+                raise WorkflowError("pipeline native stack head or direct base changed")
+            members.append(current)
+            parent_ref, parent_sha = current["head_branch"], current["head_sha"]
+    for current in members:
+        require_open_pull_request(current)
+        if current["mergeable"] != "MERGEABLE":
+            raise WorkflowError(
+                "later pipeline sweep is not freshly mergeable; conflict work requires "
+                "a fresh invocation with authorized scope"
+            )
+        refreshed = live_mergeability(
+            parse_target(current["pr_url"]), expected_head=current["head_sha"]
+        )
+        if (
+            any(refreshed.get(key) != current.get(key) for key in (
+                *identity_keys, "head_sha", "base_sha", "state", "mergeable",
+            ))
+            or base_ref_tip(current["repo_name"], current["base_branch"]) != current["base_sha"]
+        ):
+            raise WorkflowError("pipeline head or live base changed during revalidation")
+    if binding["whole_stack"] and stack is not None:
+        invoked = next((member for member in members if member["number"] == metadata["number"]), None)
+        if invoked is None or any(
+            invoked.get(key) != metadata.get(key)
+            for key in (*identity_keys, "head_sha", "base_sha")
+        ):
+            raise WorkflowError("pipeline invoked member changed during stack revalidation")
+    if stack_membership(metadata) != detection:
+        raise WorkflowError("pipeline native scope changed during revalidation")
+    require_clean_worktree(root)
+    require_no_integration_in_progress(root)
+    conflict_preflight_identity(root, metadata)
+    record_mergeable_conflict(
+        state_path, state, {"pr": metadata, "strategy": None}, managed_attempt_count(state)
+    )
+
+
 def command_pipeline(args: argparse.Namespace) -> int:
     require_fresh_invocation(args)
     if not args.state or not args.pipeline_run or not args.repo_root:
         raise WorkflowError("pipeline requires --state, --pipeline-run, and --repo-root")
     state_path = cli_path(args.state)
     require_external_path(state_path, cli_path(args.repo_root).resolve())
-    if state_path.exists():
-        raise WorkflowError("pipeline state already exists; start a fresh invocation")
     if args.pipeline_iteration is None and args.pipeline_max_iterations is None:
         args.pipeline_iteration = 1
         args.pipeline_max_iterations = args.max_iterations
+    binding = pipeline_conflict_binding(args)
     state_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = state_path.with_name(state_path.name + ".lock")
     try:
@@ -9973,14 +10150,30 @@ def command_pipeline(args: argparse.Namespace) -> int:
     started = False
     try:
         with lock:
-            if state_path.exists():
-                raise WorkflowError(
-                    "pipeline state already exists; start a fresh invocation"
-                )
+            previous = load_state(state_path) if state_path.exists() else None
+            if previous is not None:
+                require_later_conflict_sweep(previous, binding)
+                if args.expected_state_sha256 is not None and (
+                    not re.fullmatch(r"[0-9a-f]{64}", args.expected_state_sha256)
+                    or sha256_file(state_path) != args.expected_state_sha256
+                ):
+                    raise WorkflowError("expected state hash does not match")
             lock.write(str(os.getpid()))
             lock.flush()
             started = True
-            command_agent_task(args)
+            if previous is None:
+                command_agent_task(args)
+                if state_path.is_file():
+                    state = load_state(state_path)
+                    state["pipeline"] = binding
+                    if binding["whole_stack"]:
+                        request = (
+                            (state.get("agent_task") or {}).get("preflight") or {}
+                        ).get("request") or {}
+                        state["pipeline_native_scope"] = request.get("native_stack")
+                    save_state(state_path, state)
+            else:
+                revalidate_pipeline_conflict(state_path, previous, binding)
         state = load_state(state_path) if state_path.is_file() else {}
         task = state.get("agent_task", {})
         return (
