@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "665debbf18b2528a7fb6f63550a9c0698070f902a3b6ebaabcda364e1e2dc331"
+    "cb9d42ac2ca3b8d66f4d8ac98acfd23c9d2617fc03f511c24da8d79dff8f26c7"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 V5_CONFLICT_POLICY = "marketplace-conflict-worker@5"
@@ -84,13 +84,13 @@ V5_CONFLICT_POLICY_IDENTITY = {
     "version": 5,
     "sha256": V5_CONFLICT_POLICY_SHA256,
 }
-CONFLICT_POLICY = "marketplace-conflict-worker@8"
+CONFLICT_POLICY = "marketplace-conflict-worker@9"
 CONFLICT_POLICY_SHA256 = (
-    "0a0332c77a27cc6005095772289760fbde3d38328ba189e2a5b3e89553ff4c25"
+    "5fd71b5c27a96a1864bf68995d9fdac1cfbcee4d390f447cc00245537f773a52"
 )
 CONFLICT_POLICY_IDENTITY = {
     "id": "marketplace-conflict-worker",
-    "version": 8,
+    "version": 9,
     "sha256": CONFLICT_POLICY_SHA256,
 }
 CONFLICT_REQUEST_SCHEMA = {
@@ -99,7 +99,7 @@ CONFLICT_REQUEST_SCHEMA = {
 }
 CONFLICT_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-result",
-    "version": 4,
+    "version": 5,
 }
 V5_CONFLICT_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-result",
@@ -8421,7 +8421,110 @@ def validate_conflict_result_identity(
         or task.get("base_sha") != expected_task_base
     ):
         raise WorkflowError("managed conflict task base does not match replay ancestry")
+    if request["strategy"] != "merge":
+        attribution = generated["artifact"].get("attribution")
+        if not isinstance(attribution, dict) or attribution.get("task_id") != task["id"]:
+            raise WorkflowError("managed replay attribution does not match its task")
     return generated["code_refs"], generated["artifact"]
+
+
+def verify_replay_attribution(
+    request: dict[str, Any], artifact: dict[str, Any], base_sha: str,
+) -> dict[str, Any]:
+    value = artifact.get("attribution")
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"task_id", "creator_id", "creator_login"}
+        or not isinstance(value["task_id"], str)
+        or not re.fullmatch(r"[A-Za-z0-9_-]+", value["task_id"])
+        or type(value["creator_id"]) is not int
+        or value["creator_id"] <= 0
+        or not isinstance(value["creator_login"], str)
+        or not re.fullmatch(
+            r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", value["creator_login"]
+        )
+    ):
+        raise WorkflowError("replay attribution identity is malformed")
+    task = gh_json([
+        "api", "--method", "GET", "-H", "X-GitHub-Api-Version: 2026-03-10",
+        f"agents/repos/{request['repository']}/tasks/{value['task_id']}",
+    ])
+    if not isinstance(task, dict):
+        raise WorkflowError("replay attribution task is malformed")
+    sessions = task.get("sessions")
+    creator = task.get("creator")
+    artifacts = task.get("artifacts")
+    if (
+        task.get("id") != value["task_id"]
+        or task.get("state") != "completed"
+        or any(task.get(key) for key in ("error", "errors", "failure_reason"))
+        or not isinstance(creator, dict)
+        or type(creator.get("id")) is not int
+        or creator["id"] != value["creator_id"]
+        or not isinstance(sessions, list)
+        or len(sessions) != 1
+        or not isinstance(sessions[0], dict)
+        or not isinstance(artifacts, list)
+        or len(artifacts) != 1
+        or not isinstance(artifacts[0], dict)
+    ):
+        raise WorkflowError("replay attribution task identity changed")
+    session = sessions[0]
+    data = artifacts[0].get("data")
+    branch = artifact.get("branch")
+    if (
+        session.get("task_id") != value["task_id"]
+        or session.get("state") != "completed"
+        or session.get("model") not in (request["model"], f"sweagent-capi:{request['model']}")
+        or session.get("base_ref") != base_sha
+        or artifacts[0].get("provider") != "github"
+        or artifacts[0].get("type") != "branch"
+        or not isinstance(data, dict)
+        or data.get("base_ref") != base_sha
+        or not isinstance(branch, str)
+        or session.get("head_ref") not in (branch, f"refs/heads/{branch}")
+        or data.get("head_ref") not in (branch, f"refs/heads/{branch}")
+        or task.get("head_ref") not in (None, branch, f"refs/heads/{branch}")
+    ):
+        raise WorkflowError("replay attribution session identity changed")
+    user = gh_json(["api", "--method", "GET", f"user/{value['creator_id']}"])
+    if (
+        not isinstance(user, dict)
+        or type(user.get("id")) is not int
+        or user["id"] != value["creator_id"]
+        or user.get("login") != value["creator_login"]
+    ):
+        raise WorkflowError("replay attribution creator account changed")
+    return value
+
+
+def verify_replay_message_bytes(
+    repo_root: Path, old: dict[str, Any], new_sha: str, attribution: dict[str, Any],
+) -> None:
+    messages = []
+    for sha in (old["sha"], new_sha):
+        raw = git_bytes(repo_root, "cat-file", "commit", sha)
+        if raw is None or b"\n\n" not in raw:
+            raise WorkflowError("could not read raw replay commit message")
+        messages.append(raw.split(b"\n\n", 1)[1])
+    original, generated = messages
+    line = (
+        f"Co-authored-by: {attribution['creator_login']} "
+        f"<{attribution['creator_id']}+{attribution['creator_login']}@users.noreply.github.com>"
+    ).encode("ascii")
+    if (
+        conflict_commit_subject(repo_root, old["sha"]) != old["subject"]
+        or conflict_commit_trailers(repo_root, old["sha"]) != old["trailers"]
+        or (
+            generated != original
+            and (
+                not original.endswith(b"\n")
+                or line in original.splitlines()
+                or generated != original + b"\n" + line + b"\n"
+            )
+        )
+    ):
+        raise WorkflowError("rewritten commit message bytes changed")
 
 
 def mechanical_commit_mapping(
@@ -8430,13 +8533,17 @@ def mechanical_commit_mapping(
     new_sha: str,
     parent: str,
     allowed_paths: set[str],
+    attribution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     old_parents = commit_parents(repo_root, old["sha"])
     if len(old_parents) != 1:
         raise WorkflowError("old rewritten commit is not linear")
     subject = conflict_commit_subject(repo_root, new_sha)
     trailers = conflict_commit_trailers(repo_root, new_sha)
-    if subject != old["subject"] or trailers != old["trailers"]:
+    if attribution is not None:
+        verify_replay_message_bytes(repo_root, old, new_sha, attribution)
+        trailers = old["trailers"]
+    elif subject != old["subject"] or trailers != old["trailers"]:
         raise WorkflowError("rewritten commit subject or trailers changed")
     old_paths = list(old["paths"])
     new_paths = conflict_changed_paths(repo_root, new_sha)
@@ -8481,6 +8588,7 @@ def verify_rebased_range_mechanically(
     allowed_paths: set[str],
     *,
     fix_commits: list[str] | None = None,
+    attribution: dict[str, Any] | None = None,
 ) -> None:
     commits = ordered_commits(repo_root, base, tip)
     fixes = [] if fix_commits is None else fix_commits
@@ -8501,6 +8609,7 @@ def verify_rebased_range_mechanically(
             new_sha,
             parent,
             allowed_paths,
+            attribution,
         )
         if mapping != expected:
             raise WorkflowError(
@@ -8569,7 +8678,7 @@ def verify_stack_task_artifacts(
     for member, code_ref, item in zip(members, code_refs, artifacts):
         if not isinstance(item, dict) or set(item) != {
             "pr_number", "task", "request", "branch",
-            "head_sha", "source_tip_sha", "report",
+            "head_sha", "source_tip_sha", "report", "attribution",
         }:
             raise WorkflowError("stack task artifact is malformed")
         task = item["task"]
@@ -8584,6 +8693,8 @@ def verify_stack_task_artifacts(
             or task["state"] != "completed"
             or task["base_ref"] != code_ref["base_sha"]
             or task["base_sha"] != code_ref["base_sha"]
+            or not isinstance(item["attribution"], dict)
+            or item["attribution"].get("task_id") != task["id"]
             or not isinstance(branch, str)
             or not branch
             or branch in branches | forbidden_branches
@@ -8620,7 +8731,7 @@ def verify_stack_task_artifacts(
         )
     if any(
         artifact.get(key) != artifacts[-1][key]
-        for key in ("branch", "head_sha", "source_tip_sha", "report")
+        for key in ("branch", "head_sha", "source_tip_sha", "report", "attribution")
     ):
         raise WorkflowError("stack final artifact is not the last member")
 
@@ -8745,6 +8856,7 @@ def verify_quarantined_result(
                 request["head_commits"],
                 code_ref["commits"],
                 allowed_paths,
+                attribution=verify_replay_attribution(request, artifact, previous_tip),
             )
         else:
             member = request["native_stack"]["members"][index]
@@ -8766,9 +8878,14 @@ def verify_quarantined_result(
                 code_ref["commits"],
                 allowed_paths,
                 fix_commits=code_ref["fix_commits"],
+                attribution=verify_replay_attribution(
+                    request, artifact["members"][index], previous_tip
+                ),
             )
             previous_tip = code_ref["new_sha"]
     artifact_keys = {"branch", "head_sha", "source_tip_sha", "report", "receipt"}
+    if request["strategy"] != "merge":
+        artifact_keys.add("attribution")
     if request["strategy"] == "native-stack":
         artifact_keys.add("members")
     if not isinstance(artifact, dict) or set(artifact) != artifact_keys:

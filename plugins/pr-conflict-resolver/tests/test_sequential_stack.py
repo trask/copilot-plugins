@@ -61,6 +61,9 @@ class ReplayTaskBaseTest(unittest.TestCase):
             base_ref=request["pull_request"]["base_sha"],
             base_sha=request["pull_request"]["base_sha"],
         )
+        result["generated"]["artifact"]["attribution"] = {
+            "task_id": result["task"]["id"], "creator_id": 218610, "creator_login": "trask",
+        }
         MODULE.validate_conflict_result_identity(result, request)
         result["task"].update(
             base_ref=request["pull_request"]["head_sha"],
@@ -82,11 +85,15 @@ class SequentialStackTest(unittest.TestCase):
         self.run_git("init", "--bare", "--quiet", str(self.remote))
         self.run_git("remote", "add", "origin", str(self.remote))
         self.seed = self.commit(None, "Seed", "app.py", "seed\n")
-        self.lower1 = self.commit(self.seed, "Lower one", "app.py", "seed\none\n")
+        self.lower_message = (
+            "Lower one\n\nCo-authored-by: Copilot App "
+            "<223556219+Copilot@users.noreply.github.com>"
+        )
+        self.lower1 = self.commit(self.seed, self.lower_message, "app.py", "seed\none\n")
         self.lower = self.commit(self.lower1, "Lower two", "app.py", "seed\none\ntwo\n")
         self.upper = self.commit(self.lower, "Upper", "upper.py", "upper\n")
         self.trunk = self.commit(self.seed, "Trunk", "app.py", "seed\ntrunk\n")
-        self.new_lower1 = self.commit(self.trunk, "Lower one", "app.py", "seed\ntrunk\none\n")
+        self.new_lower1 = self.commit(self.trunk, self.lower_message, "app.py", "seed\ntrunk\none\n")
         self.new_lower2 = self.commit(self.new_lower1, "Lower two", "app.py", "seed\ntrunk\none\ntwo\n")
         self.new_lower = self.commit(self.new_lower2, "Focused fix", "app.py", "seed\ntrunk\none\ntwo\nfix\n")
         self.new_upper = self.commit(self.new_lower, "Upper", "upper.py", "upper\n")
@@ -162,15 +169,30 @@ class SequentialStackTest(unittest.TestCase):
             pull_request=request["pull_request"],
         )
         self.launched = []
+        self.tasks = {}
+        self.user = {"id": 218610, "login": "trask"}
+        for patch in (
+            mock.patch.object(CLOUD, "api_json", return_value=self.user),
+            mock.patch.object(MODULE, "gh_json", side_effect=self.lifecycle),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def lifecycle(self, arguments):
+        endpoint = arguments[-1]
+        if endpoint == "user/218610":
+            return self.user
+        return self.tasks[endpoint.rsplit("/", 1)[-1]]
 
     def run_git(self, *args, input=None, env=None):
         process = subprocess.run(
             ["git", "-C", str(self.root), *args],
-            input=input, capture_output=True, text=True, check=True,
+            input=input.encode("utf-8") if isinstance(input, str) else input,
+            capture_output=True, check=True,
             env=dict(os.environ) if env is None else env,
             **MODULE.windows_no_window_options(),
         )
-        return process.stdout.strip()
+        return process.stdout.decode("utf-8").strip()
 
     def commit(self, parent, subject, path, content):
         index = self.directory / "temporary-index"
@@ -198,6 +220,8 @@ class SequentialStackTest(unittest.TestCase):
         task["sessions"][0]["head_ref"] = branch
         task["sessions"][0]["task_id"] = task["id"]
         task["sessions"][0]["base_ref"] = options.request["pull_request"]["base_sha"]
+        task["creator"] = {"id": self.user["id"]}
+        self.tasks[task["id"]] = copy.deepcopy(task)
         return task
 
     def execute(self, guard=None):
@@ -339,6 +363,63 @@ class SequentialStackTest(unittest.TestCase):
             ):
                 self.execute()
             self.assertEqual("not_started", self.result.application_status)
+
+    def test_attribution_appendix_preserves_semantic_trailers_and_whole_stack(self):
+        appended = self.lower_message + (
+            "\n\nCo-authored-by: trask <218610+trask@users.noreply.github.com>"
+        )
+        self.new_lower1 = self.commit(self.trunk, appended, "app.py", "seed\ntrunk\none\n")
+        self.new_lower2 = self.commit(self.new_lower1, "Lower two", "app.py", "seed\ntrunk\none\ntwo\n")
+        self.new_lower = self.commit(self.new_lower2, "Focused fix", "app.py", "seed\ntrunk\none\ntwo\nfix\n")
+        self.new_upper = self.commit(self.new_lower, "Upper", "upper.py", "upper\n")
+        for branch, sha in (
+            ("copilot/lower-task", self.new_lower),
+            ("copilot/upper-task", self.new_upper),
+        ):
+            self.run_git("push", "--quiet", "--force", "origin", f"{sha}:refs/heads/{branch}")
+        self.execute()
+        mapping = self.result.code_refs[0]["commits"][0]
+        self.assertEqual(
+            self.request["native_stack"]["members"][0]["old_commits"][0]["trailers"],
+            mapping["trailers"],
+        )
+        self.assertNotEqual(
+            mapping["trailers"], CLOUD.commit_trailers(subprocess.run, self.root, self.new_lower1)
+        )
+        refs, artifact = MODULE.validate_conflict_result_identity(self.result.as_dict(), self.request)
+        MODULE.verify_quarantined_result(self.root, self.request, refs, artifact)
+        changed_refs = copy.deepcopy(refs)
+        changed_refs[0]["commits"][0]["trailers"] = CLOUD.commit_trailers(
+            subprocess.run, self.root, self.new_lower1
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "mapping"):
+            MODULE.verify_quarantined_result(self.root, self.request, changed_refs, artifact)
+        for mutation in (
+            {"creator_id": 123},
+            {"creator_login": "different"},
+            {"task_id": "task-2"},
+            {"creator_id": True},
+            {"creator_login": "trask\nSigned-off-by: forged"},
+            {"extra": "model declaration"},
+        ):
+            changed = copy.deepcopy(artifact)
+            changed["members"][0]["attribution"].update(mutation)
+            with self.subTest(mutation=mutation), self.assertRaises(MODULE.WorkflowError):
+                MODULE.verify_quarantined_result(self.root, self.request, refs, changed)
+        standalone = CLOUD.stack_member_request(
+            self.request, self.request["native_stack"]["members"][0], self.trunk
+        )
+        self.run_git(
+            "push", "--quiet", "--force", "origin",
+            f"{self.new_lower2}:refs/heads/copilot/lower-task",
+        )
+        with mock.patch.object(CLOUD, "local_snapshot", return_value=self.snapshot):
+            standalone_refs, standalone_artifact, _ = CLOUD.prove_generated_minimal(
+                subprocess.run, self.snapshot, standalone, self.tasks["task-1"]
+            )
+        MODULE.verify_quarantined_result(
+            self.root, standalone, standalone_refs, standalone_artifact
+        )
 
     def test_missing_replay_commit_stops_before_next_task(self):
         self.run_git("push", "--quiet", "--force", "origin", f"{self.new_lower1}:refs/heads/copilot/lower-task")

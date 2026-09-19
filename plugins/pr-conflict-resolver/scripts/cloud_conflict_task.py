@@ -42,6 +42,10 @@ MINIMAL_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-result",
     "version": 4,
 }
+REPLAY_RESULT_SCHEMA = {
+    "id": "github.copilot.agent-task-conflict-result",
+    "version": 5,
+}
 LEGACY_RESULT_SCHEMA = {"id": "github.copilot.agent-task-conflict-result", "version": 1}
 RECEIPT_SCHEMA = {"id": "github.copilot.agent-task-conflict-receipt", "version": 2}
 MINIMAL_RECEIPT_SCHEMA = {
@@ -136,21 +140,22 @@ MINIMAL_POLICY = {
 }
 SEQUENTIAL_POLICY_SPEC = {
     **MINIMAL_POLICY_SPEC,
-    "version": 8,
+    "version": 9,
     "multi_role_code_refs": "one-authoritative-generated-branch-per-member-task",
     "native_stack_execution": "controller-sequenced-frozen-member-replay",
     "member_fix_commits": "linear-closed-path-suffix-after-complete-replay",
     "replay_task_base": "pinned-destination-sha",
+    "replay_message": "exact-source-bytes-with-one-verified-creator-appendix",
 }
 SEQUENTIAL_POLICY_SHA256 = hashlib.sha256(
     json.dumps(
         SEQUENTIAL_POLICY_SPEC, sort_keys=True, separators=(",", ":")
     ).encode("ascii")
 ).hexdigest()
-SEQUENTIAL_POLICY_SELECTOR = f"{POLICY_ID}@8"
+SEQUENTIAL_POLICY_SELECTOR = f"{POLICY_ID}@9"
 SEQUENTIAL_POLICY = {
     "id": POLICY_ID,
-    "version": 8,
+    "version": 9,
     "sha256": SEQUENTIAL_POLICY_SHA256,
 }
 MODEL_IDS = {
@@ -317,7 +322,7 @@ class Result:
                 "outcomes": self.validations,
             },
         }
-        if self.schema == MINIMAL_RESULT_SCHEMA:
+        if self.schema in (MINIMAL_RESULT_SCHEMA, REPLAY_RESULT_SCHEMA):
             payload.pop("validation")
         return payload
 
@@ -1432,6 +1437,71 @@ def git(
     return checked(runner, ["git", *args], cwd=root, code=code)
 
 
+def commit_message_bytes(runner: Runner, root: Path, commit: str) -> bytes:
+    kwargs: dict[str, object] = {
+        "capture_output": True,
+        "check": False,
+        "cwd": str(stable_process_directory()),
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = _creation_flags()
+    try:
+        result = runner(["git", "-C", str(root), "cat-file", "commit", commit], **kwargs)
+    except OSError as error:
+        raise ConflictError(f"could not read commit message: {error}", "unexpected_history") from None
+    if result.returncode != 0 or not isinstance(result.stdout, bytes):
+        raise ConflictError("could not read raw commit message", "unexpected_history")
+    header, separator, message = result.stdout.partition(b"\n\n")
+    if not header or not separator:
+        raise ConflictError("commit object has no message boundary", "unexpected_history")
+    return message
+
+
+def task_attribution(
+    runner: Runner, snapshot: LocalSnapshot, task: Mapping[str, object]
+) -> Mapping[str, object]:
+    creator = task.get("creator")
+    creator_id = creator.get("id") if isinstance(creator, dict) else None
+    if type(creator_id) is not int or creator_id <= 0:
+        raise ConflictError("completed task creator is malformed", "task_failed")
+    user = api_json(runner, snapshot.control_root, "GET", f"user/{creator_id}")
+    login = user.get("login") if isinstance(user, dict) else None
+    if (
+        not isinstance(user, dict)
+        or type(user.get("id")) is not int
+        or user["id"] != creator_id
+        or not isinstance(login, str)
+        or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", login)
+    ):
+        raise ConflictError("completed task creator account is malformed", "task_failed")
+    return {"task_id": task["id"], "creator_id": creator_id, "creator_login": login}
+
+
+def preserved_replay_message(
+    runner: Runner, root: Path, old: Mapping[str, object], new_sha: str,
+    attribution: Mapping[str, object],
+) -> None:
+    original = commit_message_bytes(runner, root, str(old["sha"]))
+    generated = commit_message_bytes(runner, root, new_sha)
+    line = (
+        f"Co-authored-by: {attribution['creator_login']} "
+        f"<{attribution['creator_id']}+{attribution['creator_login']}@users.noreply.github.com>"
+    ).encode("ascii")
+    if (
+        commit_subject(runner, root, str(old["sha"])) != old["subject"]
+        or commit_trailers(runner, root, str(old["sha"])) != old["trailers"]
+        or (
+            generated != original
+            and (
+                not original.endswith(b"\n")
+                or line in original.splitlines()
+                or generated != original + b"\n" + line + b"\n"
+            )
+        )
+    ):
+        raise ConflictError("rewritten commit message bytes changed", "unexpected_history")
+
+
 def parse_git_root_output(value: str) -> Path:
     if value.endswith("\r\n"):
         path = value[:-2]
@@ -2309,7 +2379,9 @@ def replay_task_instructions(request: Mapping[str, object]) -> str:
         "Cherry-pick each `head_commits` SHA from the compact contract below "
         "in its listed order onto the existing task branch. Resolve each "
         "conflict and continue that cherry-pick before starting the next. "
-        "Preserve each subject and trailers; do not use `-x`, squash, reorder, "
+        "Preserve the complete original commit message bytes, including subjects, "
+        "body, trailers, and line endings. Do not add attribution yourself. "
+        "Do not use `-x`, squash, reorder, "
         "or skip a listed commit, including an empty replay. Do not derive "
         "the replay range from main or from a commit count. "
         "Before finishing, verify "
@@ -3620,13 +3692,17 @@ def mechanical_mapping(
     new_sha: str,
     parent: str,
     allowed_paths: set[str],
+    attribution: Mapping[str, object] | None = None,
 ) -> Mapping[str, object]:
     old_parents = parents(runner, root, str(old["sha"]))
     if len(old_parents) != 1:
         raise ConflictError("old rewritten commit is not linear", "unexpected_history")
     subject = commit_subject(runner, root, new_sha)
     trailers = commit_trailers(runner, root, new_sha)
-    if subject != old["subject"] or trailers != old["trailers"]:
+    if attribution is not None:
+        preserved_replay_message(runner, root, old, new_sha, attribution)
+        trailers = old["trailers"]
+    elif subject != old["subject"] or trailers != old["trailers"]:
         raise ConflictError(
             "rewritten commit subject or trailers changed",
             "unexpected_history",
@@ -3673,6 +3749,7 @@ def prove_rebase_range_mechanically(
     allowed_paths: set[str],
     *,
     allow_fix_suffix: bool = False,
+    attribution: Mapping[str, object] | None = None,
 ) -> tuple[list[str], list[Mapping[str, object]]]:
     commits = ordered_commits(runner, root, base_sha, tip)
     if len(commits) < len(old_commits) or (
@@ -3695,6 +3772,7 @@ def prove_rebase_range_mechanically(
                 new_sha,
                 parent,
                 allowed_paths,
+                attribution,
             )
         )
         parent = new_sha
@@ -4355,6 +4433,11 @@ def prove_generated_minimal(
             "unexpected_history",
         )
     artifact_remote = discover_minimal_artifact_ref(task, request)
+    attribution = (
+        task_attribution(runner, snapshot, task)
+        if request["policy"] == SEQUENTIAL_POLICY and request["strategy"] == "rebase"
+        else None
+    )
     request_id = str(request["request_id"])
     assigned = assigned_code_refs(request)
     if request["strategy"] == "native-stack" and (
@@ -4470,6 +4553,7 @@ def prove_generated_minimal(
             tip,
             request["head_commits"],
             allowed_paths,
+            attribution=attribution,
         )
         code_refs.append(build_code_ref(request, remote, tip, commits, mappings))
     else:
@@ -4514,6 +4598,8 @@ def prove_generated_minimal(
             "value": receipt,
         },
     }
+    if attribution is not None:
+        artifact["attribution"] = attribution
     if recovery_result is not None:
         recovery_result.code_refs = list(code_refs)
         recovery_result.artifact = artifact
@@ -4908,6 +4994,7 @@ def execute_native_stack(
         result.task_url = task_link(final) or result.task_url
         require_target_fresh(runner, snapshot, request)
         remote = discover_minimal_artifact_ref(final, member_request)
+        attribution = task_attribution(runner, snapshot, final)
         if (
             remote.ref in branches
             or remote.ref in {
@@ -4933,6 +5020,7 @@ def execute_native_stack(
             member["old_commits"],
             set(request["allowed_paths"]),
             allow_fix_suffix=True,
+            attribution=attribution,
         )
         code_ref = build_code_ref(
             request,
@@ -4964,6 +5052,7 @@ def execute_native_stack(
             "head_sha": artifact_head,
             "source_tip_sha": tip,
             "report": report,
+            "attribution": attribution,
         }
         atomic_write_json(
             member_options.result_file,
@@ -5000,7 +5089,7 @@ def execute_native_stack(
     )
     receipt = canonical_minimal_receipt(request, code_refs)
     result.artifact = {
-        **{key: last[key] for key in ("branch", "head_sha", "source_tip_sha", "report")},
+        **{key: last[key] for key in ("branch", "head_sha", "source_tip_sha", "report", "attribution")},
         "members": artifacts,
         "receipt": {"sha256": object_digest(receipt), "value": receipt},
     }
@@ -5093,6 +5182,8 @@ def execute(
         result.schema = (
             LEGACY_RESULT_SCHEMA
             if request_policy == LEGACY_POLICY
+            else REPLAY_RESULT_SCHEMA
+            if request_policy == SEQUENTIAL_POLICY
             else MINIMAL_RESULT_SCHEMA
             if request_policy in (MINIMAL_POLICY, SEQUENTIAL_POLICY)
             else RESULT_SCHEMA
@@ -5246,7 +5337,10 @@ def main(
         MINIMAL_POLICY_SELECTOR, SEQUENTIAL_POLICY_SELECTOR
     )
     result = Result(
-        schema=MINIMAL_RESULT_SCHEMA if active_policy_requested else RESULT_SCHEMA,
+        schema=(
+            REPLAY_RESULT_SCHEMA if selected_policy == SEQUENTIAL_POLICY_SELECTOR
+            else MINIMAL_RESULT_SCHEMA if active_policy_requested else RESULT_SCHEMA
+        ),
         policy=(
             SEQUENTIAL_POLICY
             if selected_policy == SEQUENTIAL_POLICY_SELECTOR

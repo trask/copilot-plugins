@@ -901,18 +901,19 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "665debbf18b2528a7fb6f63550a9c0698070f902a3b6ebaabcda364e1e2dc331",
+            "cb9d42ac2ca3b8d66f4d8ac98acfd23c9d2617fc03f511c24da8d79dff8f26c7",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
-            "0a0332c77a27cc6005095772289760fbde3d38328ba189e2a5b3e89553ff4c25",
+            "5fd71b5c27a96a1864bf68995d9fdac1cfbcee4d390f447cc00245537f773a52",
         )
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
             hashlib.sha256(CLOUD_SCRIPT.read_bytes()).hexdigest(),
         )
         self.assertEqual(MODULE.CONFLICT_POLICY_IDENTITY, CLOUD_MODULE.SEQUENTIAL_POLICY)
-        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@8")
+        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@9")
+        self.assertEqual(MODULE.CONFLICT_RESULT_SCHEMA, CLOUD_MODULE.REPLAY_RESULT_SCHEMA)
         self.assertEqual(MODULE.V5_CONFLICT_POLICY, "marketplace-conflict-worker@5")
         self.assertEqual(
             MODULE.V5_CONFLICT_POLICY_SHA256,
