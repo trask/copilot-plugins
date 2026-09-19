@@ -50,23 +50,33 @@ The artifact also binds:
 - frozen head, base, check, and native-stack identities;
 - `gpt-5.6-sol`;
 - built-in iteration limits;
-- source-only GitHub mutation policy.
+- GitHub mutation policy allowing verified source publication and guarded failed-job reruns.
 
 The coordinator checks the package and live identities twice before the loop. It starts no work if either pass differs. Within the invocation, its private state may retain the current iteration and budget. A crash or lost invocation is abandoned. No later invocation may resume, recover, import, or supersede it.
 
 Every hosted worker uses `gpt-5.6-sol` and `marketplace-agent-code-candidate-worker@1`. It may create zero or more linear code commits, then one optional path-only output commit under `.github/agent-task-output/`. Runtime 1.0.17 returns `github.copilot.agent-task-result` version 5 and candidate manifest version 1. The coordinator re-derives every commit parent, tree, patch digest, and changed path from fetched Git history. It imports only the manifest's code tip, never the output commit.
 
-The worker may write free-form advisory prose to `.github/agent-task-output/report.md`. Missing, malformed, or arbitrary report content is not mechanical evidence and cannot invalidate a valid candidate. The coordinator does not accept worker-authored failure dispositions, changed paths, commit indices, validation plans, command results, or green claims. It never runs Gradle, Maven, tests, builds, formatters, or candidate validation commands locally. The frozen failed-check snapshot remains authoritative.
+The worker may write free-form advisory prose to `.github/agent-task-output/report.md`. Missing, malformed, or arbitrary report content is not mechanical evidence and cannot invalidate a valid candidate. The coordinator does not accept worker-authored commit provenance, command results, or green claims. It never runs Gradle, Maven, tests, builds, formatters, or candidate validation commands locally.
+
+The local read-only log step summarizes evidence. The hosted worker owns diagnosis and source changes. With no code commits, it may recommend an action in `.github/agent-task-output/ci-diagnosis.json`: a `diagnoses` list covering every frozen failed check, with `check_key`, `diagnosis`, `reason`, and a nonempty string list `evidence`. Diagnoses are `pr_caused`, `transient`, `pre_existing`, `unrelated`, or `unknown`. These are model judgments bound to a verified task and snapshot, not proof that CI passed. A failed same-named base check alone does not establish a pre-existing defect; the worker must compare diagnostics or provide other concrete evidence.
+
+All checks remain visible, including non-required checks. A supported unrelated or pre-existing diagnosis records a warning for the exact head and base, never a clean-head marker. Pipeline can continue its other stages and finish with explicit CI warnings. Unknown failures remain escalated. A transient diagnosis can recommend a rerun, but only the local controller may request it.
+
+Before rerunning failed jobs, the controller rechecks the PR identity, source workflow ID, run ID, head, attempt, status, mutation policy, and repository write permission. The token must also permit the Actions request. Multiple failed jobs in one workflow produce one request. At most one retry is authorized per workflow run, counting external attempts too. Already-running or newly advanced attempts are observed instead of duplicated. A denied or unconfirmed request is not replaced by an empty source commit. Request intent is recorded before the API call and is never blindly resubmitted.
 
 After guarded exact-CAS import and publication, the coordinator polls GitHub checks and statuses for that exact source SHA. Only GitHub can prove green. Failed or pending checks continue through the bounded loop. A zero-commit candidate makes no green claim and cannot clear failed checks.
 
 A new terminal check snapshot resets the polling delay to the initial interval so its stability confirmation is not delayed by earlier waits for running checks. It still requires the configured identical observations and debounce within the same wait budget; neither the deadline nor repair allowance is reset.
 
+The settling window does not prove that repository automation has finished. Diagnosis can proceed while an external retry is being arranged. If CI changes during hosted work, the controller discards the stale recommendation or candidate without importing it, then observes the current attempt. These observations share the invocation's CI waiting allowance. It does not need repository-specific retry rules.
+
+Pipeline rechecks warning snapshots with `status --verify-warning-snapshot`. Any changed check, status, job identity, or failed workflow attempt invalidates the warning, even at the same head and base. The read does not change saved diagnoses or repair budgets, and API failures cannot confirm a warning. Description-only title and body edits do not invalidate an unchanged CI snapshot.
+
 The exact read-only REST job-log fallback uses `gh api --allow-escape-sequences`; `gh run view --log-failed` does not support that flag. Both log paths capture binary output. Logs and diagnostics redact credentials and render terminal controls as visible escapes before use, preserving tabs and normal line endings. Metadata and other API commands retain default protection. Log identity checks, retry limits, and raw-byte evidence hashes remain unchanged.
 
 An empty primary response advances directly to the exact-job fallback without retrying the empty primary. It stays in attempt evidence as malformed. The coordinator rechecks metadata before fallback and after a nonempty download, before accepting any log. An unavailable, malformed, or empty fallback still fails closed; a run-only reference cannot use a job fallback.
 
-The only GitHub changes allowed are verified source pushes and the existing source-only empty-commit flake fallback. The coordinator never posts comments, reviews, replies, labels, or metadata changes and never requests a workflow rerun.
+The only GitHub changes allowed are verified source pushes and authorized failed-job rerun requests. The coordinator never posts comments, reviews, replies, labels, or pull request metadata changes.
 
 Before importing generated commits, the coordinator locks publication for the exact head repository and branch. It rechecks the frozen remote head and clean local source identity while holding the lock. It imports at most once and pushes with an exact force-with-lease from the frozen head to the verified intended head. A concurrent or stale invocation stops before local import. A lost push response counts as success only when the live remote head exactly equals that invocation's intended head.
 
@@ -79,9 +89,9 @@ CI repairs for the entire Pipeline run. Later Pipeline sweeps share the remainin
 budget; `--pipeline-max-iterations` never multiplies it.
 
 The entrypoint accepts a clean detached checkout at the exact pull request head.
-`--github-mutation-policy` accepts only `source-only`, also the default.
-The command keeps this policy throughout the loop, including the empty-commit
-flake fallback. It never requests workflow reruns or changes GitHub metadata.
+`--github-mutation-policy` accepts `allow`, the default, and `source-only`.
+The latter blocks workflow reruns without an empty-commit workaround.
+Neither policy permits comments or pull request metadata changes.
 An interrupted command fails rather than continuing in a later invocation.
 
 ## Final response

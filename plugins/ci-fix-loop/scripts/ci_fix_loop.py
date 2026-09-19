@@ -115,11 +115,11 @@ SEALED_CI_FIX_RESULT_KEYS = {
     "state_identity",
 }
 SEALED_CI_FIX_MUTATION_POLICY = {
-    "id": "source-only",
+    "id": "allow",
     "allowed": [
         "create_managed_agent_task",
         "push_verified_fix_commits",
-        "push_empty_ci_rerun_commit",
+        "github_workflow_rerun",
     ],
     "forbidden": [
         "github_comments",
@@ -127,7 +127,6 @@ SEALED_CI_FIX_MUTATION_POLICY = {
         "github_review_threads",
         "github_labels",
         "github_pull_request_metadata",
-        "github_workflow_rerun",
     ],
 }
 COMMAND_RESULT_SCHEMAS = {
@@ -137,6 +136,7 @@ COMMAND_RESULT_SCHEMAS = {
 TERMINAL_CI_FIX_STAGE_OUTCOMES = {
     "green": "cleared",
     "no_checks": "skipped",
+    "warning": "warning",
     "nothing_to_publish": "no_progress",
     "pre_existing": "escalated",
     "escalate": "escalated",
@@ -286,7 +286,7 @@ CI_FIX_CANDIDATE_REPORT_SCHEMA = {
     "id": "github.copilot.ci-fix-loop-report",
     "version": 7,
 }
-WORKER_PROMPT_VERSION = 7
+WORKER_PROMPT_VERSION = 8
 LOCAL_TRIAGE_POLICY = "marketplace-local-ci-log-triage-worker@1"
 LOCAL_TRIAGE_MODEL = "gpt-5.6-sol"
 LOCAL_TRIAGE_REASONING_EFFORT = "high"
@@ -345,6 +345,8 @@ CI_FIX_CANDIDATE_RECEIPT_SCHEMA = {
 }
 AGENT_TASK_OUTPUT_DIRECTORY = ".github/agent-task-output/"
 AGENT_TASK_OUTPUT_REPORT = f"{AGENT_TASK_OUTPUT_DIRECTORY}report.md"
+CI_DIAGNOSIS_PATH = f"{AGENT_TASK_OUTPUT_DIRECTORY}ci-diagnosis.json"
+CI_DIAGNOSES = {"pr_caused", "transient", "pre_existing", "unrelated", "unknown"}
 TRUSTED_VALIDATION_TIMEOUT_SECONDS = 1_800
 TRUSTED_VALIDATION_MAX_COMMANDS = 8
 TRUSTED_VALIDATION_MAX_ARGUMENTS = 64
@@ -570,6 +572,8 @@ ESCALATION_REASONS = (
     "pre_existing_failures",
     "flake_failed_twice",
     "no_rerun_support",
+    "rerun_not_authorized",
+    "rerun_request_failed",
     "max_iterations_reached",
     "unfixable_failure",
     "head_changed",
@@ -599,12 +603,20 @@ ESCALATION_ACTIONS = {
         "so this loop must not edit the pull request to hide them."
     ),
     "flake_failed_twice": (
-        "Read the named check yourself. It failed again after one automatic re-run, "
-        "so it is not a flake."
+        "The retry allowance is exhausted. Inspect the remaining failure before "
+        "requesting another retry or choosing a fix."
     ),
     "no_rerun_support": (
         "Re-run the named check yourself from the pull request, then start this "
         "loop again."
+    ),
+    "rerun_not_authorized": (
+        "Ask a repository maintainer to rerun the failed jobs, or verify the "
+        "invocation's mutation policy and Actions permissions."
+    ),
+    "rerun_request_failed": (
+        "Inspect the source workflow run and the recorded request error. The "
+        "controller cannot safely repeat an unconfirmed rerun request."
     ),
     "max_iterations_reached": (
         "Read this loop's commits and the remaining failures, then finish them "
@@ -2403,7 +2415,7 @@ def command_pipeline(args: argparse.Namespace) -> None:
     previous_policy = ACTIVE_GITHUB_MUTATION_POLICY
     previous_detached = ALLOW_DETACHED_CHECKOUT
     try:
-        ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
+        ACTIVE_GITHUB_MUTATION_POLICY = args.github_mutation_policy
         ALLOW_DETACHED_CHECKOUT = True
         captured = capture_command(command_loop, args)
         if len(captured) != 1:
@@ -4405,7 +4417,7 @@ def fetch_workflow_run(pr: dict[str, Any], run_id: int) -> dict[str, Any]:
 def rerun_failed_jobs(pr: dict[str, Any], run_id: int) -> None:
     if ACTIVE_GITHUB_MUTATION_POLICY == "source-only":
         raise RerunPermissionDenied(
-            "source-only policy requires the empty-commit CI rerun fallback"
+            "source-only policy does not authorize GitHub workflow reruns"
         )
     process = run(
         [
@@ -4825,6 +4837,8 @@ def record_terminal_outcome(
     state["clean_at_head_sha"] = pinned
     state["outcome"] = outcome
     state["escalation"] = None
+    for key in ("ci_warnings", "warning_at_head_sha", "warning_at_base_sha", "warning_snapshot_sha256"):
+        state.pop(key, None)
     note = (
         f"CI Fix Loop skipped {state['pr']['repo_name']}#{state['pr']['number']}: "
         "the pull request head reports no applicable checks, so this repository ran "
@@ -6922,11 +6936,12 @@ def agent_task_preflight(
         ),
     )
     failing_keys = (
-        list(decision["checks"])
+        [check["key"] for check in checks if check["class"] == "failed"]
         if decision["decision"] == "failures"
         and not decision.get("pending_checks")
         else []
     )
+    workflow_runs = ci_failed_runs(pr, checks if failing_keys else [])
     baseline = baseline_conclusions(pr, pr["base_sha"]) if failing_keys else {}
     by_key = {check["key"]: check for check in checks}
     rollup = check_rollup_identity(checks)
@@ -6962,13 +6977,24 @@ def agent_task_preflight(
                 if log_directory is not None
                 else None
             )
-            log = fetch_failed_check_log(
-                pr,
-                check,
-                log_path,
-                repo_root=repo_root,
-                evidence=log_download,
-            )
+            try:
+                log = fetch_failed_check_log(
+                    pr,
+                    check,
+                    log_path,
+                    repo_root=repo_root,
+                    evidence=log_download,
+                )
+            except WorkflowError as error:
+                run_id = check.get("workflow_run_id")
+                if str(run_id) in workflow_runs and (
+                    ci_run_identity(pr, run_id) != workflow_runs[str(run_id)]
+                ):
+                    raise WorkflowError(
+                        "CI attempt changed while its failure log was being read",
+                        details={"reason": "ci_observation_changed"},
+                    ) from error
+                raise
             if log_path is not None:
                 created_logs.append(log_path)
             if log_download:
@@ -6990,6 +7016,11 @@ def agent_task_preflight(
                     "log_path": str(log_path) if log_path is not None else None,
                 }
             )
+        if ci_failed_runs(pr, checks if failing_keys else []) != workflow_runs:
+            raise WorkflowError(
+                "CI attempt changed during failed-check preflight",
+                details={"reason": "ci_observation_changed"},
+            )
     except BaseException:
         for path in created_logs:
             path.unlink(missing_ok=True)
@@ -7004,6 +7035,7 @@ def agent_task_preflight(
         "rollup_sha256": rollup_sha256,
         "decision": decision,
         "failures": failures,
+        "workflow_runs": workflow_runs,
     }
     snapshot["sha256"] = check_snapshot_sha256(snapshot)
     return {
@@ -7059,12 +7091,11 @@ def build_triage_prompt(
             "sha256": failure["log_sha256"],
         }
         for failure in snapshot["failures"]
-        if failure["baseline_verdict"] != "pre_existing"
     ]
     return (
-        "Inspect the failed CI logs listed below and prepare a useful summary for "
-        "the next fixing agent. Decide which failures look like root causes, which "
-        "look related or cascading, and what evidence will help the fixer. You do "
+        "Inspect the failed CI logs listed below and prepare a factual summary for "
+        "the hosted diagnosis agent. Include errors, failing tests, and relevant "
+        "excerpts. Do not decide attribution, authorize reruns, or dismiss failures. You do "
         "not need one diagnosis per check or perfect coverage. Remaining failures "
         "can be handled by a later CI Fix Loop iteration.\n\n"
         "Read the logs from their file paths in this artifact directory. Do not "
@@ -7295,6 +7326,15 @@ def github_triage_fingerprint(
     }
 
 
+def same_triage_github_state(before: Any, after: Any) -> bool:
+    return (
+        isinstance(before, dict)
+        and isinstance(after, dict)
+        and {key: value for key, value in before.items() if key != "checks"}
+        == {key: value for key, value in after.items() if key != "checks"}
+    )
+
+
 def run_local_triage_worker(
     *,
     repo_root: Path,
@@ -7373,7 +7413,7 @@ def run_local_triage_worker(
     after_github = github_triage_fingerprint(target, preflight)
     if before_source != after_source:
         raise WorkflowError("local CI triage session changed repository source state")
-    if before_github != after_github:
+    if not same_triage_github_state(before_github, after_github):
         raise WorkflowError("GitHub state changed during local CI triage")
     if sha256_file(prompt_path) != prompt_sha256:
         raise WorkflowError("local CI triage session changed its pinned prompt")
@@ -7482,7 +7522,7 @@ def validate_retained_local_triage(
         or result.get("logs") != expected_logs
         or result.get("source_before") != preflight["identity"]
         or result.get("source_before") != result.get("source_after")
-        or result.get("github_before") != result.get("github_after")
+        or not same_triage_github_state(result.get("github_before"), result.get("github_after"))
     ):
         raise WorkflowError("retained local CI triage result has stale identity")
     summary = validate_triage_summary(summary_path, preflight)
@@ -7497,7 +7537,9 @@ def validate_retained_local_triage(
             raise WorkflowError("retained failing-log artifact changed")
     if local_identity(repo_root) != result["source_after"]:
         raise WorkflowError("repository source state changed after local CI triage")
-    if github_triage_fingerprint(target, preflight) != result["github_after"]:
+    if not same_triage_github_state(
+        github_triage_fingerprint(target, preflight), result["github_after"]
+    ):
         raise WorkflowError("GitHub state changed after local CI triage")
     if local_session_model_attestation(result.get("session_id")) != result.get(
         "model_attestation"
@@ -7535,18 +7577,31 @@ def build_worker_prompt(
             "rollup_sha256": snapshot["rollup_sha256"],
             "sha256": snapshot["sha256"],
         },
+        "failures": [
+            {key: failure.get(key) for key in (
+                "key", "name", "workflow", "url", "conclusion",
+                "baseline_conclusion", "log_sha256",
+            )}
+            for failure in snapshot["failures"]
+        ],
+        "workflow_runs": snapshot.get("workflow_runs", {}),
     }
     return (
         f"CI Fix Loop Agent Tasks worker prompt version {WORKER_PROMPT_VERSION}.\n\n"
         "You are the sole repository worker for one CI Fix Loop iteration. Diagnose "
-        "only the supplied local triage summary. Perform every repository read, "
+        "the supplied failed-check evidence. Perform every repository read, "
         "search, edit, build, test, probe, and formatting step needed to produce the "
         "candidate changes and validate them in this hosted task. The local coordinator "
         "never executes candidate validation commands. Do not "
         "sleep, poll, watch, wait for CI, wait for reviews, or start "
         "another iteration. Use the summary below, then inspect the repository as "
-        "needed to distinguish pull-request failures, pre-existing failures, and "
-        "flakes. The summary may group root causes and omit cascading failures. Fix "
+        "needed to distinguish pull-request failures, pre-existing or unrelated failures, "
+        "transient infrastructure failures, flakes, and uncertain causes. The summary "
+        "is preparation, not a diagnosis. A same-named failure on the base is not proof "
+        "of the same defect: compare diagnostics and relevant code at the pinned base. "
+        "You may read the referenced GitHub logs for the pinned head and base to establish "
+        "that comparison. Never treat a base check conclusion alone as attribution. "
+        "If evidence is insufficient, classify it as unknown. Fix "
         "only failures caused by this pull request. Never weaken, skip, "
         "delete, or disable a check or test.\n\n"
         "Make the smallest complete fix and format it. Create zero or more linear, "
@@ -7559,6 +7614,19 @@ def build_worker_prompt(
         f"Keep every path in that optional commit under `{AGENT_TASK_OUTPUT_DIRECTORY}`. "
         "Do not mix output paths into code commits or create more than one output commit. "
         "The report may be missing or malformed without invalidating candidate code.\n\n"
+        f"When producing no code commits, you may put a JSON recommendation at `{CI_DIAGNOSIS_PATH}` "
+        "in that output commit. Its only field is `diagnoses`, a list covering each supplied "
+        "failed check exactly once. Each item has `check_key` from the supplied failures, "
+        "`diagnosis` (pr_caused, transient, pre_existing, unrelated, or unknown), "
+        "`reason` (nonempty text), and `evidence` (a nonempty list of precise supporting "
+        "excerpts or source references). Use transient to recommend a bounded retry for "
+        "likely infrastructure or flaky failures. For pre_existing or unrelated, cite "
+        "the matching base failure or concrete evidence that establishes independence "
+        "from this PR; do not infer it merely from a test name or a red base check. "
+        "These are model judgments, not CI clearance. The controller keeps every failure "
+        "visible and rechecks live identity, permissions, and shared retry allowance. "
+        "Do not author command strings, task identity, head identity, or claims that a "
+        "rerun succeeded. Missing recommendations cannot authorize reruns or dismiss failures.\n\n"
         "Do not push the pull request branch, rerun checks, post comments, reviews "
         "or replies, resolve threads, change labels, or change any GitHub metadata. "
         "The local coordinator owns guarded import and publication. GitHub "
@@ -9187,6 +9255,249 @@ def candidate_ci_fix_report(
     }
 
 
+def read_ci_diagnosis(
+    preflight: dict[str, Any], remote: dict[str, Any]
+) -> list[dict[str, Any]] | None:
+    artifact = remote["candidate_manifest"]["artifact_commit"]
+    if remote["commits"] or artifact is None or CI_DIAGNOSIS_PATH not in artifact["changed_paths"]:
+        return None
+    content = fetch_committed_text(
+        preflight["pr"]["repo_name"], CI_DIAGNOSIS_PATH, artifact["sha"],
+        description="hosted CI diagnosis",
+    )
+    if len(content.encode("utf-8")) > 32768:
+        raise WorkflowError("hosted CI diagnosis exceeds 32768 bytes")
+    require_no_credentials(content, source="hosted CI diagnosis")
+    payload = parse_strict_json(content, description="hosted CI diagnosis")
+    failures = {item["key"]: item for item in preflight["check_snapshot"]["failures"]}
+    if (
+        not failures
+        or not isinstance(payload, dict)
+        or set(payload) != {"diagnoses"}
+        or not isinstance(payload["diagnoses"], list)
+        or len(payload["diagnoses"]) != len(failures)
+    ):
+        raise WorkflowError("hosted CI diagnosis does not cover the frozen failures")
+    diagnoses = []
+    seen: set[str] = set()
+    for entry in payload["diagnoses"]:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"check_key", "diagnosis", "reason", "evidence"}
+            or not isinstance(entry["check_key"], str)
+            or entry["check_key"] not in failures
+            or entry["check_key"] in seen
+            or not isinstance(entry["diagnosis"], str)
+            or entry["diagnosis"] not in CI_DIAGNOSES
+            or not isinstance(entry["reason"], str)
+            or not entry["reason"].strip()
+            or not isinstance(entry["evidence"], list)
+            or not entry["evidence"]
+            or any(not isinstance(value, str) or not value.strip() for value in entry["evidence"])
+        ):
+            raise WorkflowError("hosted CI diagnosis contains an invalid recommendation")
+        seen.add(entry["check_key"])
+        diagnoses.append({**entry, "name": failures[entry["check_key"]]["name"]})
+    return diagnoses
+
+
+def ci_run_identity(pr: dict[str, Any], run_id: int) -> dict[str, Any]:
+    value = fetch_workflow_run(pr, run_id)
+    repository = value.get("repository")
+    if (
+        value.get("id") != run_id
+        or value.get("head_sha") != pr["head_sha"]
+        or not isinstance(repository, dict)
+        or str(repository.get("full_name") or "").casefold() != pr["repo_name"].casefold()
+        or type(value.get("run_attempt")) is not int
+        or value["run_attempt"] < 1
+        or type(value.get("workflow_id")) is not int
+        or value["workflow_id"] < 1
+        or value.get("status") not in {"completed", "in_progress", "queued", "waiting", "requested", "pending"}
+        or not isinstance(value.get("name"), str)
+        or not value["name"]
+    ):
+        raise WorkflowError("CI workflow run identity is missing or changed")
+    return {key: value.get(key) for key in (
+        "id", "workflow_id", "name", "head_sha", "run_attempt", "status", "conclusion",
+    )}
+
+
+def ci_check_runs(
+    pr: dict[str, Any], checks: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    run_ids = {
+        check["workflow_run_id"] for check in checks
+        if check.get("class") == "failed"
+        and type(check.get("workflow_run_id")) is int
+        and check["workflow_run_id"] > 0
+    }
+    return {str(run_id): ci_run_identity(pr, run_id) for run_id in sorted(run_ids)}
+
+
+def ci_failed_runs(
+    pr: dict[str, Any], checks: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    runs = ci_check_runs(pr, checks)
+    for check in checks:
+        run_id = check.get("workflow_run_id")
+        if check.get("class") != "failed" or type(run_id) is not int or run_id <= 0:
+            continue
+        identity = runs[str(run_id)]
+        if identity["status"] != "completed" or identity["name"] != check.get("workflow"):
+            raise WorkflowError(
+                "failing CI workflow is changing; observe its current attempt again",
+                details={"reason": "ci_observation_changed"},
+            )
+    return runs
+
+
+def ci_warning_snapshot_sha256(
+    pr: dict[str, Any], checks: list[dict[str, Any]], runs: dict[str, Any],
+) -> str:
+    rollup = [
+        {key: value for key, value in check.items() if key != "key"}
+        for check in check_rollup_identity(checks)
+    ]
+    rollup.sort(key=lambda item: json.dumps(item, separators=(",", ":"), sort_keys=True))
+    return canonical_json_sha256({
+        "head_sha": pr["head_sha"], "base_sha": pr["base_sha"],
+        "checks": rollup, "workflow_runs": runs,
+    })
+
+
+def verify_ci_warning_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    expected = state.get("warning_snapshot_sha256")
+    if not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+        raise WorkflowError("CI warning has no frozen check snapshot identity")
+    pr = state["pr"]
+    live = metadata_for(parse_target(pr["pr_url"]))
+    require_live_pr_snapshot(
+        {**pr, "title": live.get("title"), "body": live.get("body")},
+        live, expected_head=pr["head_sha"],
+    )
+    head, checks = fetch_rollup(live)
+    if head.lower() != pr["head_sha"]:
+        raise WorkflowError("pull request head changed while verifying CI warnings")
+    observed = ci_warning_snapshot_sha256(live, checks, ci_check_runs(live, checks))
+    current = observed == expected
+    fields: dict[str, Any] = {"warning_verification": {
+        "result": "current" if current else "stale",
+        "expected_snapshot_sha256": expected, "observed_snapshot_sha256": observed,
+        "reason": "ci_warning_snapshot_current" if current else "ci_warning_snapshot_changed",
+    }}
+    if not current:
+        fields.update({
+            "stage_outcome": "pending", "outcome": None,
+            "clean_at_head_sha": None, "warning_at_head_sha": None,
+            "warning_at_base_sha": None, "ci_warnings": [],
+            "all_ci_passed": False,
+        })
+    return fields
+
+
+def retry_diagnosed_ci(
+    state_path: Path, preflight: dict[str, Any], checks: list[str]
+) -> str:
+    state = load_state(state_path)
+    pr = preflight["pr"]
+    failures = {entry["key"]: entry for entry in preflight["check_snapshot"]["failures"]}
+    by_key = {entry["key"]: entry for entry in preflight["check_snapshot"]["rollup"]}
+    runs = preflight["check_snapshot"].get("workflow_runs") or {}
+    selected: dict[int, list[str]] = {}
+    for key in checks:
+        check = by_key.get(key)
+        run_id = check.get("workflow_run_id") if isinstance(check, dict) else None
+        if key not in failures or type(run_id) is not int or str(run_id) not in runs:
+            raise WorkflowError(
+                "diagnosed failure has no frozen GitHub Actions run to retry",
+                details={"reason": "no_rerun_support"},
+            )
+        selected.setdefault(run_id, []).append(key)
+    if not selected:
+        raise WorkflowError("CI retry recommendation selected no failures")
+    requested = False
+    with publication_lock(pr):
+        require_live_pr_snapshot(pr, metadata_for(parse_target(pr["pr_url"])), expected_head=pr["head_sha"])
+        for run_id, keys in selected.items():
+            frozen = runs[str(run_id)]
+            live = ci_run_identity(pr, run_id)
+            if (
+                live["workflow_id"] != frozen["workflow_id"]
+                or live["run_attempt"] < frozen["run_attempt"]
+            ):
+                raise WorkflowError("CI retry workflow identity changed")
+            if live["status"] != "completed" or live["run_attempt"] > frozen["run_attempt"]:
+                return "observing_retry"
+            if live["conclusion"] not in {"failure", "timed_out", "cancelled"}:
+                return "observing_retry"
+            retry_key = f"{pr['head_sha']}:{run_id}"
+            previous = state.setdefault("ci_retries", {}).get(retry_key)
+            if previous:
+                if live["run_attempt"] > previous["source_attempt"]:
+                    previous.update({
+                        "status": "completed", "completed_at": utc_now(),
+                        "completed_attempt": live["run_attempt"],
+                    })
+                    save_state(state_path, state)
+                    raise WorkflowError(
+                        "the requested retry completed without clearing the workflow",
+                        details={"reason": "flake_failed_twice"},
+                    )
+                if previous.get("status") in {"requesting", "requested"}:
+                    return "observing_retry"
+                raise WorkflowError("a CI rerun request already ended without confirmed dispatch")
+            if live["run_attempt"] - 1 >= MAX_RERUNS_PER_CHECK:
+                raise WorkflowError(
+                    "the workflow's retry allowance is exhausted, including external attempts",
+                    details={"reason": "flake_failed_twice"},
+                )
+            if ACTIVE_GITHUB_MUTATION_POLICY != "allow":
+                raise WorkflowError(
+                    "source-only policy does not authorize a GitHub workflow rerun",
+                    details={"reason": "rerun_not_authorized"},
+                )
+            repository = gh_json(["api", f"repos/{pr['repo_name']}"])
+            permissions = repository.get("permissions") if isinstance(repository, dict) else None
+            if not isinstance(permissions, dict) or not any(
+                permissions.get(name) is True for name in ("push", "maintain", "admin")
+            ):
+                raise WorkflowError(
+                    "repository write permission is required to request a CI rerun",
+                    details={"reason": "rerun_not_authorized"},
+                )
+            if ci_run_identity(pr, run_id) != live:
+                return "observing_retry"
+            require_live_pr_snapshot(pr, metadata_for(parse_target(pr["pr_url"])), expected_head=pr["head_sha"])
+            record = {
+                "run_id": run_id, "head_sha": pr["head_sha"],
+                "source_attempt": live["run_attempt"], "checks": keys,
+                "status": "requesting", "requested_at": utc_now(),
+            }
+            state["ci_retries"][retry_key] = record
+            save_state(state_path, state)
+            try:
+                rerun_failed_jobs(pr, run_id)
+            except WorkflowError as error:
+                record["status"] = "request_failed"
+                record["error"] = str(error)
+                save_state(state_path, state)
+                after = ci_run_identity(pr, run_id)
+                if after["run_attempt"] > live["run_attempt"] or after["status"] != "completed":
+                    record["status"] = "retry_observed"
+                    save_state(state_path, state)
+                    return "observing_retry"
+                raise WorkflowError(
+                    "CI rerun was not confirmed; no source commit or replacement request was made: "
+                    + str(error),
+                    details={"reason": "rerun_request_failed"},
+                ) from error
+            record["status"] = "requested"
+            save_state(state_path, state)
+            requested = True
+    return "rerun_requested" if requested else "observing_retry"
+
+
 def refuse_candidate_wrapper_changes(paths_by_commit: Mapping[str, list[str]]) -> None:
     protected = {"gradlew", "gradlew.bat", "mvnw", "mvnw.cmd"}
     protected_prefixes = ("gradle/wrapper/", ".mvn/")
@@ -9397,8 +9708,16 @@ def require_live_check_snapshot(preflight: dict[str, Any]) -> None:
     snapshot = preflight["check_snapshot"]
     rollup = check_rollup_identity(checks)
     digest = sha256_text(json.dumps(rollup, separators=(",", ":"), sort_keys=True))
-    if head.lower() != preflight["pr"]["head_sha"] or digest != snapshot["rollup_sha256"]:
+    if head.lower() != preflight["pr"]["head_sha"]:
         raise WorkflowError("live failing-check snapshot changed before publication")
+    if digest != snapshot["rollup_sha256"] or (
+        "workflow_runs" in snapshot
+        and ci_failed_runs(preflight["pr"], checks) != snapshot["workflow_runs"]
+    ):
+        raise WorkflowError(
+            "live failing-check snapshot changed before publication",
+            details={"reason": "ci_observation_changed"},
+        )
 
 
 def agent_task_recovery_command(
@@ -12075,7 +12394,7 @@ def command_run_sealed_ci_fix(args: argparse.Namespace) -> None:
     stage = "identity_pass_1"
     previous_policy = ACTIVE_GITHUB_MUTATION_POLICY
     try:
-        ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
+        ACTIVE_GITHUB_MUTATION_POLICY = "allow"
         expected_snapshot = request["initial_snapshot"]
         for pass_number in (1, 2):
             live = sealed_ci_fix_live_snapshot(
@@ -12641,7 +12960,16 @@ def command_agent_task(args: argparse.Namespace) -> None:
             )
         )
         if supplied_preflight is not None:
-            require_live_check_snapshot(preflight)
+            try:
+                require_live_check_snapshot(preflight)
+            except WorkflowError as error:
+                if error.details.get("reason") != "ci_observation_changed":
+                    raise
+                cleanup_superseded_preflight_logs(
+                    state_path, managed_task_log_paths({"preflight": preflight})
+                )
+                emit({"result": "ci_changed", "state": str(state_path), "detail": str(error)})
+                return
         pr = preflight["pr"]
         if existing is None:
             state = {
@@ -12805,30 +13133,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 }
             )
             return
-        actionable = [
-            failure
-            for failure in snapshot["failures"]
-            if failure["baseline_verdict"] != "pre_existing"
-        ]
-        if not actionable:
-            state["escalation"] = {
-                "reason": "pre_existing_failures",
-                "detail": "every failing check also fails at the pinned base commit",
-                "checks": [failure["key"] for failure in snapshot["failures"]],
-                "next_action": ESCALATION_ACTIONS["pre_existing_failures"],
-                "head_sha": pr["head_sha"],
-                "recorded_at": utc_now(),
-            }
-            save_state(state_path, state)
-            emit(
-                {
-                    "result": "pre_existing",
-                    "state": str(state_path),
-                    "head_sha": pr["head_sha"],
-                    "checks": state["escalation"]["checks"],
-                }
-            )
-            return
+        actionable = snapshot["failures"]
         if exhausted and not replacing_not_created_task:
             state["escalation"] = {
                 "reason": "max_iterations_reached",
@@ -12939,6 +13244,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
         state["outcome"] = None
         state["clean_at_head_sha"] = None
         state["escalation"] = None
+        for key in ("ci_warnings", "warning_at_head_sha", "warning_at_base_sha", "warning_snapshot_sha256"):
+            state.pop(key, None)
         save_state(state_path, state)
 
     pr = preflight["pr"]
@@ -13318,6 +13625,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             raise WorkflowError(
                 "local repository identity drifted before report validation"
             )
+        diagnoses = None
         if candidate_flow:
             paths_by_commit = validate_candidate_history(
                 repo_root,
@@ -13341,6 +13649,16 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     }
                 ),
             }
+            diagnoses = read_ci_diagnosis(preflight, remote)
+            if diagnoses is not None:
+                coordinator_report["diagnoses"] = diagnoses
+                report["outcome"] = (
+                    "warning"
+                    if all(item["diagnosis"] in {"pre_existing", "unrelated"} for item in diagnoses)
+                    else "rerun"
+                    if any(item["diagnosis"] == "transient" for item in diagnoses)
+                    else "unfixable"
+                )
             validation_evidence = []
         else:
             semantic_content = fetch_committed_text(
@@ -13418,7 +13736,28 @@ def command_agent_task(args: argparse.Namespace) -> None:
         if live["head_sha"].lower() not in allowed_heads:
             raise WorkflowError("pull request head moved before authenticated publication")
         if live["head_sha"].lower() == pr["head_sha"]:
-            require_live_check_snapshot(preflight)
+            try:
+                require_live_check_snapshot(preflight)
+            except WorkflowError as error:
+                if not candidate_flow or error.details.get("reason") != "ci_observation_changed":
+                    raise
+                task_state.update({
+                    "status": "completed", "task_id": remote["task_id"],
+                    "completed_at": utc_now(), "discarded_reason": str(error),
+                    "candidate_manifest": remote["candidate_manifest"],
+                    "completion": remote["completion"],
+                    "consumer_report": coordinator_report,
+                    "imported": False,
+                })
+                state["clean_at_head_sha"] = None
+                state["outcome"] = None
+                save_state(state_path, state)
+                emit({
+                    "result": "ci_changed", "state": str(state_path),
+                    "head_sha": pr["head_sha"], "detail": str(error),
+                    "task": {"id": remote["task_id"], "url": remote["task_url"]},
+                })
+                return
         require_live_pr_snapshot(pr, live, expected_head=live["head_sha"])
         validated_hosted_result = True
         task_state.update(
@@ -13533,6 +13872,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     raise WorkflowError(
                         "local source moved before verified local import"
                     )
+                require_live_check_snapshot(preflight)
                 imported = (
                     apply_verified_candidate_import(
                         repo_root,
@@ -13682,6 +14022,31 @@ def command_agent_task(args: argparse.Namespace) -> None:
 
         run_state = state["run"]
         if candidate_flow:
+            if diagnoses is not None:
+                run_state["diagnoses"] = diagnoses
+                state.setdefault("history", []).extend({
+                    "iteration": run_state["iteration"],
+                    "head_sha": pr["head_sha"],
+                    "task_id": remote["task_id"],
+                    **item,
+                } for item in diagnoses)
+                if report["outcome"] == "warning":
+                    state["outcome"] = "warning"
+                    state["clean_at_head_sha"] = None
+                    state["warning_at_head_sha"] = pr["head_sha"]
+                    state["warning_at_base_sha"] = pr["base_sha"]
+                    state["ci_warnings"] = diagnoses
+                    state["warning_snapshot_sha256"] = ci_warning_snapshot_sha256(
+                        pr, snapshot["rollup"], snapshot.get("workflow_runs", {}),
+                    )
+                elif report["outcome"] == "unfixable":
+                    state["escalation"] = {
+                        "reason": "unfixable_failure",
+                        "detail": "hosted diagnosis did not establish a scoped fix or a safe retry",
+                        "checks": [item["check_key"] for item in diagnoses],
+                        "head_sha": pr["head_sha"], "recorded_at": utc_now(),
+                        "next_action": ESCALATION_ACTIONS["unfixable_failure"],
+                    }
             manifest_by_sha = {
                 item["sha"]: item for item in remote["candidate_manifest"]["code_commits"]
             }
@@ -13826,6 +14191,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "rerun": "rerun",
             "pre_existing": "pre_existing",
             "unfixable": "escalated",
+            "warning": "warning",
         }[report["outcome"]]
         emit(
             {
@@ -13837,7 +14203,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "iterations": state["iterations"],
                 "outcome": report["outcome"],
                 "action_checks": (
-                    []
+                    [
+                        item["check_key"] for item in diagnoses or []
+                        if item["diagnosis"] == "transient"
+                    ]
                     if candidate_flow
                     else [
                         failure["key"]
@@ -13847,6 +14216,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 ),
                 "accepted_push": accepted_push,
                 "task": {"id": remote["task_id"], "url": remote["task_url"]},
+                **stage_outcome_fields(state),
                 "attestation": (
                     "dispatcher_candidate"
                     if candidate_flow
@@ -13871,6 +14241,27 @@ def command_agent_task(args: argparse.Namespace) -> None:
     except BaseException as error:
         current = load_state(state_path)
         task_state = current.get("agent_task")
+        if (
+            isinstance(error, WorkflowError)
+            and error.details.get("reason") == "ci_observation_changed"
+            and isinstance(task_state, dict)
+            and task_state.get("candidate_attestation") is True
+            and not task_state.get("published_head_sha")
+            and local_identity(repo_root) == preflight["identity"]
+        ):
+            task_state.update({
+                "status": "completed", "completed_at": utc_now(),
+                "discarded_reason": str(error), "imported": False,
+            })
+            current["outcome"] = None
+            current["clean_at_head_sha"] = None
+            save_state(state_path, current)
+            emit({
+                "result": "ci_changed", "state": str(state_path),
+                "head_sha": preflight["pr"]["head_sha"], "detail": str(error),
+                "task": {"id": task_state["task_id"], "url": task_state.get("task_url")},
+            })
+            return
         if isinstance(task_state, dict):
             try:
                 imported = (
@@ -14104,6 +14495,18 @@ def wait_for_stable_ci_preflight(
                 state_path=state_path,
             )
         except WorkflowError as error:
+            if error.details.get("reason") == "ci_observation_changed":
+                stable_identity = None
+                stable_polls = 0
+                update_coordinator_state(
+                    state_path, status="waiting_for_checks", detail=str(error),
+                )
+                time.sleep(min(
+                    coordinator_delay(args, attempt),
+                    max(0.0, deadline - time.monotonic()),
+                ))
+                attempt += 1
+                continue
             if not is_rate_limit_error(error):
                 cleanup_superseded_preflight_logs(state_path, active_log_paths)
                 raise
@@ -14157,15 +14560,31 @@ def wait_for_stable_ci_preflight(
         )
         if candidate and stable_polls >= required_stability:
             if float(args.debounce_seconds) > 0:
-                time.sleep(float(args.debounce_seconds))
-                confirmation = agent_task_preflight(
-                    repo_root,
-                    target,
-                    stack_state=(
-                        cli_path(args.stack_state) if args.stack_state else None
-                    ),
-                    state_path=state_path,
-                )
+                time.sleep(min(
+                    float(args.debounce_seconds),
+                    max(0.0, deadline - time.monotonic()),
+                ))
+                if time.monotonic() >= deadline:
+                    continue
+                try:
+                    confirmation = agent_task_preflight(
+                        repo_root,
+                        target,
+                        stack_state=(
+                            cli_path(args.stack_state) if args.stack_state else None
+                        ),
+                        state_path=state_path,
+                    )
+                except WorkflowError as error:
+                    if error.details.get("reason") != "ci_observation_changed":
+                        raise
+                    stable_identity = None
+                    stable_polls = 0
+                    attempt = 0
+                    update_coordinator_state(
+                        state_path, status="waiting_for_checks", detail=str(error),
+                    )
+                    continue
                 if confirmation["check_snapshot"]["sha256"] != identity:
                     confirmation_log_paths = set(
                         managed_task_log_paths({"preflight": confirmation})
@@ -14379,14 +14798,19 @@ def command_loop(args: argparse.Namespace) -> None:
     target = resolve_target(args.target, repo_root)
     state_path = cli_path(args.state) if args.state else default_state_path(target)
     require_outside_repository(state_path, repo_root)
+    remaining_wait = max(0.0, float(args.wait_timeout))
     try:
         while True:
+            wait_args = argparse.Namespace(**vars(args))
+            wait_args.wait_timeout = remaining_wait
+            wait_started = time.monotonic()
             preflight = wait_for_stable_ci_preflight(
-                args,
+                wait_args,
                 repo_root=repo_root,
                 target=target,
                 state_path=state_path,
             )
+            remaining_wait = max(0.0, remaining_wait - (time.monotonic() - wait_started))
             require_sealed_initial_preflight(args, preflight)
             iteration_args = argparse.Namespace(**vars(args))
             iteration_args._preflight = preflight
@@ -14394,6 +14818,10 @@ def command_loop(args: argparse.Namespace) -> None:
             result = results[-1]
             task = result.get("task")
             has_task = isinstance(task, dict) and isinstance(task.get("id"), str)
+            if result["result"] == "ci_changed":
+                if has_task:
+                    record_processed_ci_snapshot(state_path, preflight, result)
+                continue
             if result["result"] == "published":
                 if has_task:
                     record_processed_ci_snapshot(state_path, preflight, result)
@@ -14407,6 +14835,14 @@ def command_loop(args: argparse.Namespace) -> None:
                 check_keys = result.get("action_checks") or []
                 if not all(isinstance(check, str) for check in check_keys):
                     raise WorkflowError("CI re-run result has invalid check identities")
+                if result.get("attestation") == "dispatcher_candidate":
+                    record_processed_ci_snapshot(state_path, preflight, result)
+                    retry_result = retry_diagnosed_ci(state_path, preflight, check_keys)
+                    update_coordinator_state(
+                        state_path, status="waiting_for_checks",
+                        detail=retry_result,
+                    )
+                    continue
                 completed = prepare_pending_ci_rerun(
                     state_path,
                     preflight,
@@ -15980,6 +16416,14 @@ def stage_outcome(state: dict[str, Any]) -> str | None:
             return "carried"
         return "escalated"
     outcome = state.get("outcome")
+    if (
+        outcome == "warning"
+        and state.get("clean_at_head_sha") is None
+        and state.get("ci_warnings")
+        and state.get("warning_at_head_sha") == (state.get("pr") or {}).get("head_sha")
+        and state.get("warning_at_base_sha") == (state.get("pr") or {}).get("base_sha")
+    ):
+        return "warning"
     if outcome == "no_checks":
         return "skipped"
     if outcome == "green":
@@ -15989,10 +16433,18 @@ def stage_outcome(state: dict[str, Any]) -> str | None:
     return None
 
 
-def stage_outcome_fields(state: dict[str, Any]) -> dict[str, str]:
+def stage_outcome_fields(state: dict[str, Any]) -> dict[str, Any]:
     """Carry the stage outcome only when the state supports naming one."""
     outcome = stage_outcome(state)
-    return {"stage_outcome": outcome} if outcome else {}
+    fields: dict[str, Any] = {"stage_outcome": outcome} if outcome else {}
+    if outcome == "warning":
+        fields.update({
+            "ci_warnings": state["ci_warnings"],
+            "warning_at_head_sha": state["warning_at_head_sha"],
+            "warning_at_base_sha": state["warning_at_base_sha"],
+            "all_ci_passed": False,
+        })
+    return fields
 
 
 def work_progress(state: dict[str, Any]) -> dict[str, Any] | None:
@@ -16083,6 +16535,7 @@ def status_payload(state: dict[str, Any], path: Path) -> dict[str, Any]:
         "history": state.get("history") or [],
         "reruns": state.get("reruns") or {},
         "auto_retries": state.get("auto_retries") or {},
+        "ci_retries": state.get("ci_retries") or {},
         "local_validation": state.get("local_validation") or [],
         "escalation": state.get("escalation"),
         "outcome": state.get("outcome"),
@@ -16125,6 +16578,12 @@ def command_status(args: argparse.Namespace) -> None:
         path = cli_path(args.state)
     state = load_state(path)
     payload = status_payload(state, path)
+    warning_verification = (
+        verify_ci_warning_snapshot(state)
+        if getattr(args, "verify_warning_snapshot", False) and state.get("outcome") == "warning"
+        else {}
+    )
+    payload.update(warning_verification)
     status_path = status_path_for(path)
     write_result_file(status_path, payload, "status")
     pr = status_pr(state)
@@ -16185,6 +16644,7 @@ def command_status(args: argparse.Namespace) -> None:
             "accepted_pushes": state.get("accepted_pushes") or [],
             "progress": work_progress(state),
             "last_helper_activity": last_helper_activity(state),
+            **warning_verification,
         }
     )
 
@@ -16521,9 +16981,9 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument("--model", choices=["sol"], default="sol")
     pipeline.add_argument(
         "--github-mutation-policy",
-        choices=["source-only"],
-        default="source-only",
-        help="Pipeline permits source publication only, never GitHub metadata changes",
+        choices=["allow", "source-only"],
+        default="allow",
+        help="Allow guarded workflow reruns or restrict changes to verified source publication",
     )
     pipeline.add_argument("--pipeline-run", required=True)
     pipeline.add_argument("--pipeline-iteration", type=int, required=True)
@@ -16831,6 +17291,10 @@ def build_parser() -> argparse.ArgumentParser:
     status_source.add_argument("--state")
     status_source.add_argument("--current", action="store_true")
     status.add_argument("--repo-root")
+    status.add_argument(
+        "--verify-warning-snapshot", action="store_true",
+        help="verify acknowledged CI warnings against the live checks without changing state",
+    )
     status.set_defaults(function=command_status)
 
     cleanup = subparsers.add_parser("cleanup", help="delete completed external state")

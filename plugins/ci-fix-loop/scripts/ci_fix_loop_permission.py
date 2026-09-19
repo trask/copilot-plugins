@@ -62,11 +62,11 @@ SEALED_CI_FIX_INVOCATION_SCHEMA = (
     "github.copilot.ci-fix-loop-sealed-invocation.v2"
 )
 SEALED_CI_FIX_MUTATION_POLICY = {
-    "id": "source-only",
+    "id": "allow",
     "allowed": [
         "create_managed_agent_task",
         "push_verified_fix_commits",
-        "push_empty_ci_rerun_commit",
+        "github_workflow_rerun",
     ],
     "forbidden": [
         "github_comments",
@@ -74,7 +74,6 @@ SEALED_CI_FIX_MUTATION_POLICY = {
         "github_review_threads",
         "github_labels",
         "github_pull_request_metadata",
-        "github_workflow_rerun",
     ],
 }
 COMMAND_RESULT_SCHEMAS = {

@@ -1116,7 +1116,7 @@ class SealedCiFixCommandTest(unittest.TestCase):
             def loop(arguments):
                 loop_calls.append(arguments)
                 self.assertEqual(
-                    "source-only",
+                    "allow",
                     MODULE.ACTIVE_GITHUB_MUTATION_POLICY,
                 )
                 self.write_terminal_state(state_path)
@@ -1484,13 +1484,13 @@ class SealedCiFixCommandTest(unittest.TestCase):
             self.assertFalse(result["terminal"])
             self.assertEqual(os.getpid(), result["owner"]["process_id"])
 
-    def test_source_only_policy_uses_source_rerun_fallback(self):
+    def test_source_only_policy_refuses_reruns(self):
         MODULE.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
         with (
             mock.patch.object(MODULE, "run") as run,
             self.assertRaisesRegex(
                 MODULE.RerunPermissionDenied,
-                "empty-commit",
+                "does not authorize",
             ),
         ):
             MODULE.rerun_failed_jobs(
@@ -4608,7 +4608,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.55", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.56", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -4660,7 +4660,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn('"iteration_allowance": 1', prompt)
         self.assertIn("Never select a marketplace `custom_agent`", prompt)
         self.assertIn("use Cloud Sandboxes", prompt)
-        self.assertIn("worker prompt version 7", prompt)
+        self.assertIn("worker prompt version 8", prompt)
         self.assertIn("validate them in this hosted task", prompt)
         self.assertIn("never executes candidate validation commands", prompt)
         self.assertIn("rerun checks, post comments, reviews or replies", prompt)
@@ -7894,6 +7894,124 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("retry_command", task)
         self.assertNotIn("recovery_command", task)
 
+    def hosted_diagnosis_flow(self, diagnosis, *, changed=False, candidate=False):
+        repo = self.root / "repo"
+        repo.mkdir()
+        state_path = self.root / "diagnosis-state.json"
+        preflight = copy.deepcopy(self.preflight)
+        preflight["repository_root"] = str(repo)
+        preflight["check_snapshot"]["failures"][0]["baseline_verdict"] = "pre_existing"
+        result = self.candidate_result(["5" * 40] if candidate else [])
+        artifact = self.candidate_metadata(
+            self.artifact, "5" * 40 if candidate else self.head, [MODULE.CI_DIAGNOSIS_PATH]
+        )
+        result["candidate"]["artifact_commit"] = artifact
+        result["candidate"]["generated"]["head_sha"] = self.artifact
+        result["generated"]["head_sha"] = self.artifact
+        commands = []
+
+        def run_command(command, **kwargs):
+            commands.append(command)
+            if "--result-file" in command:
+                Path(command[command.index("--result-file") + 1]).write_text(
+                    json.dumps(result), encoding="utf-8"
+                )
+            return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        payload = {"diagnoses": [{
+            "check_key": preflight["check_snapshot"]["failures"][0]["key"],
+            "diagnosis": diagnosis,
+            "reason": "Compared the pinned failure with repository evidence",
+            "evidence": ["Same failing assertion in the exact base revision log"],
+        }]}
+        arguments = MODULE.build_parser().parse_args([
+            "agent-task", preflight["pr"]["pr_url"],
+            "--repo-root", str(repo), "--state", str(state_path),
+        ])
+        changed_error = MODULE.WorkflowError(
+            "CI changed", details={"reason": "ci_observation_changed"}
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
+            mock.patch.object(MODULE, "resolve_target", return_value={"repo_name": "owner/repo", "number": 7}),
+            mock.patch.object(MODULE, "agent_task_preflight", return_value=preflight),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=self.root / "cloud_task.py"),
+            mock.patch.object(MODULE, "run", side_effect=run_command),
+            mock.patch.object(MODULE, "local_identity", return_value=preflight["identity"]),
+            mock.patch.object(MODULE, "validate_candidate_history", return_value={}),
+            mock.patch.object(MODULE, "refuse_test_suppression"),
+            mock.patch.object(
+                MODULE, "require_live_check_snapshot",
+                side_effect=(
+                    [None, changed_error] if changed == "publication"
+                    else changed_error if changed else None
+                ),
+            ),
+            mock.patch.object(MODULE, "metadata_for", return_value=preflight["pr"]),
+            mock.patch.object(MODULE, "remote_head", return_value=self.head),
+            mock.patch.object(MODULE, "fetch_committed_text", return_value=json.dumps(payload)),
+            mock.patch.object(
+                MODULE, "apply_verified_candidate_import",
+                wraps=MODULE.apply_verified_candidate_import,
+            ) as apply,
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(arguments)
+        self.assertTrue(any("--apply-with-report" in command for command in commands))
+        self.assertFalse(any("push" in command for command in commands))
+        return emit.call_args.args[0], MODULE.load_state(state_path), apply
+
+    def test_hosted_unrelated_diagnosis_is_a_warning_not_ci_green(self):
+        payload, state, _ = self.hosted_diagnosis_flow("unrelated")
+        self.assertEqual("warning", payload["result"])
+        self.assertEqual("warning", MODULE.stage_outcome(state))
+        self.assertIsNone(state["clean_at_head_sha"])
+        self.assertEqual(self.head, state["warning_at_head_sha"])
+        self.assertEqual(self.base, state["warning_at_base_sha"])
+        self.assertEqual("unrelated", payload["ci_warnings"][0]["diagnosis"])
+        self.assertEqual("completed", state["agent_task"]["status"])
+
+    def test_hosted_pre_existing_diagnosis_does_not_use_base_conclusion_as_clearance(self):
+        payload, state, _ = self.hosted_diagnosis_flow("pre_existing")
+        self.assertEqual("warning", payload["result"])
+        self.assertEqual("completed", state["agent_task"]["status"])
+        self.assertIsNone(state["clean_at_head_sha"])
+        self.assertEqual("pre_existing", state["run"]["diagnoses"][0]["diagnosis"])
+
+    def test_hosted_transient_diagnosis_recommends_controller_rerun_only(self):
+        payload, state, _ = self.hosted_diagnosis_flow("transient")
+        self.assertEqual("rerun", payload["result"])
+        self.assertEqual(["check:CI/test"], payload["action_checks"])
+        self.assertIsNone(state["clean_at_head_sha"])
+        self.assertFalse(state.get("ci_retries"))
+
+    def test_hosted_unknown_diagnosis_stays_escalated(self):
+        payload, state, _ = self.hosted_diagnosis_flow("unknown")
+        self.assertEqual("escalated", payload["result"])
+        self.assertEqual("escalated", MODULE.stage_outcome(state))
+        self.assertNotIn("ci_warnings", state)
+
+    def test_retry_during_hosted_work_discards_candidate_before_import(self):
+        payload, state, apply = self.hosted_diagnosis_flow(
+            "transient", changed=True, candidate=True
+        )
+        self.assertEqual("ci_changed", payload["result"])
+        self.assertEqual("completed", state["agent_task"]["status"])
+        self.assertFalse(state["agent_task"]["imported"])
+        apply.assert_not_called()
+        self.assertIsNone(MODULE.stage_outcome(state))
+
+    def test_retry_after_publication_lock_discards_candidate_before_import(self):
+        payload, state, apply = self.hosted_diagnosis_flow(
+            "transient", changed="publication", candidate=True
+        )
+        self.assertEqual("ci_changed", payload["result"])
+        self.assertEqual("completed", state["agent_task"]["status"])
+        self.assertFalse(state["agent_task"]["imported"])
+        apply.assert_not_called()
+        self.assertIsNone(MODULE.stage_outcome(state))
+
     def test_managed_fix_publishes_only_the_verified_fix_commit(self):
         repo = self.root / "repo"
         repo.mkdir()
@@ -8247,7 +8365,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         ]
         self.assertEqual(1, len(pushes))
         apply_import.assert_called_once()
-        self.assertEqual(1, check_snapshot.call_count)
+        self.assertEqual(2, check_snapshot.call_count)
         self.assertEqual("published", emit.call_args.args[0]["result"])
         self.assertEqual(
             commit, MODULE.load_state(state_path)["agent_task"]["published_head_sha"]
@@ -8692,6 +8810,45 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             slept.call_args_list,
         )
         self.assertEqual(2, MODULE.load_state(state_path)["coordinator"]["stable_polls"])
+
+    def test_retry_start_during_poll_or_confirmation_restarts_stability(self):
+        stable = copy.deepcopy(self.preflight)
+        stable["check_snapshot"]["failures"] = []
+        stable["check_snapshot"]["decision"] = {
+            "decision": "green", "checks": [], "detail": "all checks passed",
+        }
+        changed = MODULE.WorkflowError(
+            "CI attempt changed", details={"reason": "ci_observation_changed"}
+        )
+        for position, sequence in (
+            ("poll", [stable, changed, stable, stable, stable]),
+            ("confirmation", [stable, stable, changed, stable, stable, stable]),
+        ):
+            with self.subTest(position=position):
+                args = SimpleNamespace(
+                    wait_timeout=60, poll_interval=1, poll_max_interval=10,
+                    poll_jitter=0, stability_polls=2, debounce_seconds=1,
+                    stack_state=None,
+                )
+                state_path = self.root / f"retry-{position}.json"
+                clock = [0.0]
+
+                def sleep(seconds):
+                    clock[0] += seconds
+
+                with (
+                    mock.patch.object(MODULE, "agent_task_preflight", side_effect=sequence) as preflight,
+                    mock.patch.object(MODULE.time, "monotonic", side_effect=lambda: clock[0]),
+                    mock.patch.object(MODULE.time, "sleep", side_effect=sleep),
+                ):
+                    result = MODULE.wait_for_stable_ci_preflight(
+                        args, repo_root=self.root,
+                        target={"repo_name": "owner/repo", "number": 7},
+                        state_path=state_path,
+                    )
+                self.assertEqual(stable, result)
+                self.assertEqual(len(sequence), preflight.call_count)
+                self.assertEqual(2, MODULE.load_state(state_path)["coordinator"]["stable_polls"])
 
     def test_local_coordinator_records_a_bounded_wait_timeout(self):
         state_path = self.root / "timeout.json"
@@ -14101,6 +14258,8 @@ class MainTest(unittest.TestCase):
     def pipeline_args(self, state):
         return argparse.Namespace(
             command="pipeline",
+            github_mutation_policy="allow",
+            wait_timeout=MODULE.DEFAULT_COORDINATOR_WAIT_TIMEOUT,
             function=MODULE.command_pipeline,
             invocation_run=None,
             model="sol",
@@ -14163,7 +14322,7 @@ class MainTest(unittest.TestCase):
             def command(loop_args):
                 observed.append(loop_args)
                 self.assertEqual(
-                    "source-only",
+                    "allow",
                     MODULE.ACTIVE_GITHUB_MUTATION_POLICY,
                 )
                 self.assertTrue(MODULE.ALLOW_DETACHED_CHECKOUT)
@@ -14198,16 +14357,18 @@ class MainTest(unittest.TestCase):
             mock.patch.object(MODULE, "command_loop", side_effect=rerun),
             mock.patch.object(MODULE, "run") as run,
             mock.patch.object(MODULE, "gh_json") as gh_json,
-            self.assertRaisesRegex(MODULE.RerunPermissionDenied, "empty-commit"),
+            self.assertRaisesRegex(MODULE.RerunPermissionDenied, "does not authorize"),
         ):
-            MODULE.command_pipeline(self.pipeline_args(Path("unused-state.json")))
+            args = self.pipeline_args(Path("unused-state.json"))
+            args.github_mutation_policy = "source-only"
+            MODULE.command_pipeline(args)
 
         run.assert_not_called()
         gh_json.assert_not_called()
         self.assertEqual("allow", MODULE.ACTIVE_GITHUB_MUTATION_POLICY)
         self.assertFalse(MODULE.ALLOW_DETACHED_CHECKOUT)
 
-    def test_pipeline_policy_argument_accepts_only_source_only(self):
+    def test_pipeline_policy_defaults_to_allow_and_preserves_explicit_restrictions(self):
         parser = MODULE.build_parser()
         arguments = [
             "pipeline", "owner/repo#7",
@@ -14216,12 +14377,16 @@ class MainTest(unittest.TestCase):
             "--pipeline-iteration", "1",
             "--pipeline-max-iterations", "2",
         ]
-        for policy_args in ([], ["--github-mutation-policy", "source-only"]):
+        for policy_args, expected in (
+            ([], "allow"),
+            (["--github-mutation-policy", "allow"], "allow"),
+            (["--github-mutation-policy", "source-only"], "source-only"),
+        ):
             with self.subTest(policy_args=policy_args):
                 args = parser.parse_args(arguments + policy_args)
-                self.assertEqual("source-only", args.github_mutation_policy)
+                self.assertEqual(expected, args.github_mutation_policy)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            parser.parse_args(arguments + ["--github-mutation-policy", "allow"])
+            parser.parse_args(arguments + ["--github-mutation-policy", "invalid"])
 
     def test_pipeline_runs_remaining_iterations_before_returning(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -14235,7 +14400,7 @@ class MainTest(unittest.TestCase):
             observed = []
 
             def iteration(iteration_args):
-                self.assertEqual("source-only", MODULE.ACTIVE_GITHUB_MUTATION_POLICY)
+                self.assertEqual("allow", MODULE.ACTIVE_GITHUB_MUTATION_POLICY)
                 self.assertIs(args, iteration_args._preflight["caller"])
                 observed.append(iteration_args)
                 MODULE.emit({

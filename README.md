@@ -170,6 +170,18 @@ native stack keeps the single-PR behavior.
 The plugin verifies the shared Agent Tasks runtime. Authentication stays in
 local `gh api`; CI diagnosis, edits, and validation stay in GitHub Agent Tasks.
 
+CI Fix Loop considers all checks, not just required checks. The hosted worker
+diagnoses failures; the local controller rechecks live identity and permissions
+before publishing fixes or requesting a failed-jobs rerun. Its one-retry
+allowance per workflow run includes retries started by repository automation.
+An explicit `source-only` policy blocks reruns without an empty-commit workaround.
+
+Unrelated or pre-existing failures remain visible with the hosted worker's
+reason and evidence. They can finish the stage with a CI warning, allowing
+Pipeline to continue without claiming that CI passed. Unknown causes remain
+unresolved. A retry or other CI change during hosted work invalidates the
+candidate before publication.
+
 Each member gets five charged iterations. PR Pipeline does not reset this
 budget between passes. Every accepted push records a machine-readable
 checkpoint. Install `pr-conflict-resolver@trask-plugins` to use native-stack
