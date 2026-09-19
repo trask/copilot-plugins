@@ -10,7 +10,7 @@ flowchart LR
 
     subgraph pipeline["Five-stage pipeline"]
         direction TB
-        conflict["1. Conflict Resolver<br/>result v4, receipt v3<br/>marketplace-conflict-worker@7"]
+        conflict["1. Conflict Resolver<br/>result v4, receipt v3<br/>marketplace-conflict-worker@8"]
         copilotReview["2. Copilot Review<br/>local result v3, decision report v2<br/>marketplace-local-review-decision-worker@3"]
         selfReview["3. Self Review<br/>coordinator report v3<br/>code candidate policy @1"]
         ci["4. CI Fix<br/>coordinator report v7, receipt v3<br/>code candidate policy @1"]

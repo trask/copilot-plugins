@@ -135,9 +135,10 @@ behind each conflicted file first, then keeps what both sides meant to do rather
 than picking a side. It stops and reports
 when the two sides genuinely contradict each other. It refuses to rewrite an
 ordinary branch with dependents. For a native GitHub stack, the coordinator
-processes members in order, with one hosted task per member and committed code
-on each task's authoritative generated branch. It verifies the complete result
-before publishing with one atomic, exact-lease push. A run that publishes and
+starts each member's hosted task at its verified new base. The worker replays
+only that member's commits onto its assigned branch. The coordinator collects
+committed code from each task's authoritative branch and verifies the complete
+result before publishing with one atomic, exact-lease push. A run that publishes and
 then still reads as conflicting is finished rather than failed, and a caller
 that wants another integration starts another run. It never posts anything to
 GitHub. Its
