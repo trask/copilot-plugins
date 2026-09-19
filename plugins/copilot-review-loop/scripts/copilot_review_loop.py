@@ -185,7 +185,7 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "1601dfcb7f9228ad4d59fb3653ba0548b219c2de2b28d33921a4f1e7fd687297"
+    "737e831defbc5d0066b49d125d981a3d219a3d67e8b47642cac41f0211fc2547"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"

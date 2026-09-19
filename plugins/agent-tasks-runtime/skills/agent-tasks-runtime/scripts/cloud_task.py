@@ -469,7 +469,7 @@ class WorktreeSnapshot:
     root: Path
     repository: str
     remote: str
-    branch: str
+    branch: str | None
     head: str
 
 
@@ -2858,9 +2858,11 @@ class GitRepository:
             f"no git remote in this worktree points to https://github.com/{repository}"
         )
 
-    def branch(self, root: Path) -> str:
+    def branch(self, root: Path, *, allow_detached: bool = False) -> str | None:
         result = self._run(root, "symbolic-ref", "--quiet", "--short", "HEAD", allowed={0, 1})
         branch = result.stdout.strip()
+        if result.returncode == 1 and allow_detached:
+            return None
         if result.returncode != 0 or not branch:
             raise CloudError("code mode requires a checked-out local branch")
         return branch
@@ -2947,7 +2949,9 @@ class GitRepository:
         if operation:
             raise CloudError(f"code mode cannot run during an in-progress {operation}")
 
-    def snapshot(self, cwd: Path) -> WorktreeSnapshot:
+    def snapshot(
+        self, cwd: Path, *, allow_detached: bool = False
+    ) -> WorktreeSnapshot:
         root = self.root(cwd)
         repository = self.repository_name(root)
         remote = self.matching_remote(root, repository)
@@ -2957,14 +2961,16 @@ class GitRepository:
             root=root,
             repository=repository,
             remote=remote,
-            branch=self.branch(root),
+            branch=self.branch(root, allow_detached=allow_detached),
             head=self.head(root),
         )
 
     def require_unchanged(self, snapshot: WorktreeSnapshot) -> None:
         self.require_clean(snapshot.root)
         self.require_no_operation(snapshot.root)
-        branch = self.branch(snapshot.root)
+        branch = self.branch(
+            snapshot.root, allow_detached=snapshot.branch is None
+        )
         head = self.head(snapshot.root)
         if branch != snapshot.branch:
             raise CloudError(
@@ -3097,6 +3103,13 @@ class GitRepository:
     ) -> WorktreeSnapshot:
         if snapshot.head == pull_request.head_sha:
             return snapshot
+        if snapshot.branch is None:
+            raise CloudError(
+                "a detached code candidate checkout must already match the "
+                f"pull request head {pull_request.head_sha}; "
+                "the local checkout was not changed",
+                "local_drift",
+            )
         local_commits = self.commits_outside_default(snapshot, refs.default)
         if local_commits:
             raise CloudError(
@@ -5078,7 +5091,11 @@ def execute(
         repository = git.repository_name(root)
         snapshot = None
     else:
-        snapshot = git.snapshot(cwd)
+        snapshot = (
+            git.snapshot(cwd, allow_detached=True)
+            if options.policy == MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR
+            else git.snapshot(cwd)
+        )
         root = snapshot.root
         repository = snapshot.repository
     if result is not None:
@@ -5175,8 +5192,13 @@ def execute(
             git.require_unchanged(snapshot)
             aligned = git.align_to_pr(snapshot, pull_request, tracking_refs)
             print(
-                f"Aligned local branch {aligned.branch} to PR "
-                f"#{pull_request.number} head {pull_request.head_sha}.",
+                (
+                    f"Validated detached checkout at PR "
+                    f"#{pull_request.number} head {pull_request.head_sha}."
+                    if aligned.branch is None
+                    else f"Aligned local branch {aligned.branch} to PR "
+                    f"#{pull_request.number} head {pull_request.head_sha}."
+                ),
                 file=stderr,
             )
             refreshed = resolve_pull_request(

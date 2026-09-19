@@ -23,6 +23,11 @@ history, including each code commit's SHA, parent, tree, patch digest, and exact
 changed paths. The optional artifact commit is excluded from the code candidate
 tip. The dispatcher never imports or applies candidate commits.
 
+Code-candidate mode accepts a clean detached checkout only when its HEAD already
+equals the frozen pull request head. It never aligns a detached checkout to a
+different commit. Branch, HEAD, worktree, and operation-state guards remain in
+effect; code modes that apply commits still require a named branch.
+
 Policy `marketplace-agent-report-recommendation-worker@1` is the matching
 report-only recommendation contract. It forbids code commits and requires one
 final output commit under `.github/agent-task-output/`. Output contents are

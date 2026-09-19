@@ -11,31 +11,31 @@
     {
       "name": "agent-tasks-runtime",
       "description": "Shared GitHub Agent Tasks runtime for Trask pull request agents.",
-      "version": "1.0.17",
+      "version": "1.0.18",
       "source": "./plugins/agent-tasks-runtime"
     },
     {
       "name": "pr-reviewer",
       "description": "Review a GitHub pull request and create a verified pending review with high-confidence inline comments.",
-      "version": "1.8.10",
+      "version": "1.8.11",
       "source": "./plugins/pr-reviewer"
     },
     {
       "name": "copilot-review-loop",
       "description": "Address Copilot pull request review comments, publish fixes, and repeat until the review is clean.",
-      "version": "1.1.61",
+      "version": "1.1.62",
       "source": "./plugins/copilot-review-loop"
     },
     {
       "name": "self-review-loop",
       "description": "Review a GitHub pull request, verify each finding independently, and commit the fixes without posting review comments.",
-      "version": "1.3.41",
+      "version": "1.3.42",
       "source": "./plugins/self-review-loop"
     },
     {
       "name": "pr-description",
       "description": "Review and update a pull request title and description through a managed GitHub Agent Task.",
-      "version": "1.0.63",
+      "version": "1.0.64",
       "source": "./plugins/pr-description"
     },
     {
@@ -53,13 +53,13 @@
     {
       "name": "ci-fix-loop",
       "description": "Run one sealed, stateless CI repair invocation against a frozen pull request head.",
-      "version": "1.6.51",
+      "version": "1.6.52",
       "source": "./plugins/ci-fix-loop"
     },
     {
       "name": "historical-pr-audit",
       "description": "Audit an already-merged GitHub pull request against its own historical snapshot, verify each finding independently, and commit the fixes on a separate audit branch.",
-      "version": "1.1.21",
+      "version": "1.1.22",
       "source": "./plugins/historical-pr-audit"
     }
   ]

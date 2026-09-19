@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -2432,8 +2433,105 @@ class FreshCompletionEvidenceTest(unittest.TestCase):
         )
 
 
+class DetachedCandidateCheckoutTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.git("init", "--quiet", "--initial-branch", "main")
+        self.git("config", "user.name", "Test")
+        self.git("config", "user.email", "test@example.com")
+        self.git("commit", "--quiet", "--allow-empty", "-m", "source")
+        self.git("remote", "add", "origin", "https://github.com/owner/repo.git")
+        self.head = self.git("rev-parse", "HEAD")
+        self.git("checkout", "--quiet", "--detach", self.head)
+        self.repository = MODULE.GitRepository(
+            runner=lambda command, **kwargs: subprocess.run(
+                command, env=dict(os.environ), **kwargs
+            )
+        )
+        self.repository.repository_name = mock.Mock(return_value="owner/repo")
+
+    def git(self, *arguments):
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=self.root,
+            env=dict(os.environ),
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        ).stdout.strip()
+
+    def test_exact_head_detached_candidate_preserves_checkout(self):
+        snapshot = self.repository.snapshot(self.root, allow_detached=True)
+
+        self.assertIsNone(snapshot.branch)
+        self.assertEqual(self.head, snapshot.head)
+        self.repository.require_unchanged(snapshot)
+        self.assertEqual(
+            snapshot,
+            self.repository.align_to_pr(
+                snapshot,
+                SimpleNamespace(number=7, head_sha=self.head),
+                MODULE.PrTrackingRefs("refs/heads/main", "refs/heads/main"),
+            ),
+        )
+        self.assertIsNone(self.repository.identity(self.root).branch)
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+
+    def test_legacy_code_mode_still_requires_a_branch(self):
+        with self.assertRaisesRegex(MODULE.CloudError, "checked-out local branch"):
+            self.repository.snapshot(self.root)
+
+    def test_detached_candidate_cannot_align_a_different_head(self):
+        self.git("commit", "--quiet", "--allow-empty", "-m", "different head")
+        snapshot = self.repository.snapshot(self.root, allow_detached=True)
+        with self.assertRaisesRegex(
+            MODULE.CloudError, "must already match the pull request head"
+        ) as error:
+            self.repository.align_to_pr(
+                snapshot,
+                SimpleNamespace(number=7, head_sha=self.head),
+                MODULE.PrTrackingRefs("refs/heads/main", "refs/heads/main"),
+            )
+        self.assertEqual("local_drift", error.exception.code)
+        self.assertEqual(snapshot.head, self.git("rev-parse", "HEAD"))
+        self.assertIsNone(self.repository.identity(self.root).branch)
+
+    def test_detached_candidate_rejects_dirty_worktrees(self):
+        (self.root / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+        with self.assertRaisesRegex(MODULE.CloudError, "clean worktree"):
+            self.repository.snapshot(self.root, allow_detached=True)
+
+    def test_detached_candidate_rejects_in_progress_operations(self):
+        marker = self.root / self.git("rev-parse", "--git-path", "MERGE_HEAD")
+        marker.write_text(self.head + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(MODULE.CloudError, "in-progress merge"):
+            self.repository.snapshot(self.root, allow_detached=True)
+
+    def test_detached_candidate_rejects_branch_drift(self):
+        snapshot = self.repository.snapshot(self.root, allow_detached=True)
+        self.git("checkout", "--quiet", "main")
+        with self.assertRaisesRegex(MODULE.CloudError, "worktree moved from branch"):
+            self.repository.require_unchanged(snapshot)
+
+    def test_detached_candidate_rejects_head_drift(self):
+        snapshot = self.repository.snapshot(self.root, allow_detached=True)
+        self.git("commit", "--quiet", "--allow-empty", "-m", "head drift")
+        with self.assertRaisesRegex(MODULE.CloudError, "worktree HEAD moved"):
+            self.repository.require_unchanged(snapshot)
+
+
 class CandidateDispatcherTest(unittest.TestCase):
     def test_derives_manifest_without_reading_or_applying_worker_output(self):
+        self.check_candidate("feature")
+
+    def test_derives_manifest_from_exact_head_detached_checkout(self):
+        self.check_candidate(None)
+
+    def check_candidate(self, branch):
         root = Path("C:/repo")
         base_sha = "1" * 40
         code_commit = "2" * 40
@@ -2442,7 +2540,7 @@ class CandidateDispatcherTest(unittest.TestCase):
             root,
             "owner/repo",
             "origin",
-            "feature",
+            branch,
             base_sha,
         )
         pull_request = MODULE.PullRequestSnapshot(
@@ -2528,7 +2626,7 @@ class CandidateDispatcherTest(unittest.TestCase):
         repository.fetch_pr_inputs.return_value = {}
         repository.align_to_pr.return_value = snapshot
         repository.identity.return_value = MODULE.LocalIdentity(
-            "feature",
+            branch,
             base_sha,
             "",
             None,
@@ -2615,6 +2713,7 @@ class CandidateDispatcherTest(unittest.TestCase):
         )
         repository.fast_forward.assert_not_called()
         repository.cherry_pick.assert_not_called()
+        repository.snapshot.assert_called_once_with(root, allow_detached=True)
 
 
 if __name__ == "__main__":
