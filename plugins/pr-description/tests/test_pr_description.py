@@ -1205,7 +1205,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.64")
+        self.assertEqual(plugin["version"], "1.0.65")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -2060,7 +2060,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_prompt_uses_dispatcher_assigned_artifact_paths(self):
         prompt = MODULE.build_worker_prompt(agent_task_preflight())
 
-        self.assertIn("worker prompt version 4", prompt)
+        self.assertIn("worker prompt version 5", prompt)
+        self.assertIn("copy the pinned current_body exactly", prompt)
+        self.assertIn("takes precedence over transport decoding", prompt)
         self.assertIn(MODULE.AGENT_TASK_OUTPUT_TITLE, prompt)
         self.assertIn(MODULE.AGENT_TASK_OUTPUT_BODY, prompt)
         self.assertIn(MODULE.AGENT_TASK_OUTPUT_REPORT, prompt)
@@ -3320,6 +3322,74 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("validated_head_sha", state)
         self.assertEqual("excluded", MODULE.stage_outcome(state))
 
+    def test_pipeline_source_only_exact_body_copies_clear_but_real_changes_stay_excluded(self):
+        cases = (
+            ("Body\n", b"Body\n", "Current title", "keep"),
+            ("Body\n\n", b"Body\n\n", "Current title", "keep"),
+            ("Body\n", b"Body\n\n", "Current title", "keep"),
+            ("Body\n", b"Changed body\n", "Current title", "replace"),
+            ("Body\n", b"Body\n", "Better title", "replace"),
+        )
+        for index, (current, raw, title, decision) in enumerate(cases):
+            with self.subTest(index=index):
+                self.preflight["pr"]["body"] = current
+                report = self.proposal_report()
+                patches, emitted, _ = self.command_patches(
+                    self.result(report), report, self.receipt()
+                )
+                patches = tuple(
+                    p for p in patches if p.attribute != "validate_no_change"
+                )
+                state_path = self.directory / f"pipeline-body-{index}.json"
+                argv = [
+                    str(SCRIPT), "pipeline", "owner/repo#7", "--state", str(state_path),
+                    "--pipeline-run", "pipeline-1", "--pipeline-iteration", "1",
+                    "--pipeline-max-iterations", "2", "--model", "sol",
+                    "--github-mutation-policy", "source-only",
+                ]
+                with contextlib.ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    stack.enter_context(mock.patch.object(MODULE.sys, "argv", argv))
+                    stack.enter_context(
+                        mock.patch.object(
+                            MODULE, "metadata_for",
+                            return_value=pr_metadata(
+                                head_sha=self.preflight["pr"]["head_sha"], body=current
+                            ),
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            MODULE, "fetch_committed_bytes",
+                            side_effect=[(title + "\n").encode(), raw],
+                        )
+                    )
+                    apply = stack.enter_context(
+                        mock.patch.object(MODULE, "apply_proposal")
+                    )
+                    update = stack.enter_context(
+                        mock.patch.object(MODULE, "update_pr")
+                    )
+                    self.assertEqual(0, MODULE.main(), emitted[-1] if emitted else None)
+                apply.assert_not_called()
+                update.assert_not_called()
+                state = MODULE.load_run_state(state_path)
+                self.assertEqual(decision, emitted[-1]["decision"])
+                self.assertEqual("completed", state["agent_task"]["status"])
+                if decision == "keep":
+                    self.assertEqual("cleared", emitted[-1]["stage_outcome"])
+                    self.assertEqual(current, state["validation"]["body"])
+                    self.assertEqual(
+                        self.preflight["pr"]["head_sha"], state["validated_head_sha"]
+                    )
+                else:
+                    self.assertEqual("excluded", emitted[-1]["stage_outcome"])
+                    self.assertIsNone(emitted[-1]["validated_head_sha"])
+                    self.assertNotIn("validated_head_sha", state)
+                if raw == current.encode():
+                    self.assertEqual(current, emitted[-1]["proposal"]["body"])
+
     def test_pipeline_waits_for_terminal_proposal_before_returning_excluded(self):
         report = self.proposal_report(
             decision="replace", title="Better title", body="Better body"
@@ -3763,6 +3833,117 @@ class RecommendationContractTest(unittest.TestCase):
             replace["identity"]["current_title_sha256"],
         )
         self.assertRegex(replace["proposal_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_exact_body_copy_preference_preserves_markdown_and_proposal_hashes(self):
+        for current in ("", "\n", "Body", "Body\n", "Body\n\n", "Body  \n\n"):
+            for transport in (b"", b"\n", b"\r\n"):
+                with self.subTest(current=current, transport=transport):
+                    self.preflight["pr"]["body"] = current
+                    raw = current.encode("utf-8") + transport
+                    proposal = MODULE.recommendation_from_outputs(
+                        preflight=self.preflight, remote=self.remote(),
+                        title_raw=b"Current title\n", body_raw=raw,
+                    )
+                    self.assertEqual("keep", proposal["decision"])
+                    self.assertEqual(current, proposal["proposal"]["body"])
+                    self.assertEqual(
+                        MODULE.hashlib.sha256(raw).hexdigest(),
+                        proposal["identity"]["body_sha256"],
+                    )
+                    self.assertEqual(
+                        MODULE.sha256_text(current),
+                        proposal["identity"]["normalized_body_sha256"],
+                    )
+                    self.assertEqual(
+                        MODULE.canonical_json_sha256(
+                            {
+                                key: value for key, value in proposal.items()
+                                if key != "proposal_sha256"
+                            }
+                        ),
+                        proposal["proposal_sha256"],
+                    )
+
+    def test_title_only_replacement_preserves_exact_body_bytes(self):
+        self.preflight["pr"]["body"] = "Body\n\n"
+        proposal = MODULE.recommendation_from_outputs(
+            preflight=self.preflight, remote=self.remote(),
+            title_raw=b"Better title\n", body_raw=b"Body\n\n",
+        )
+        self.assertEqual("replace", proposal["decision"])
+        self.assertEqual("Body\n\n", proposal["proposal"]["body"])
+
+    def test_nonidentical_body_keeps_only_existing_transport_decoding(self):
+        self.preflight["pr"]["body"] = "Body\n"
+        for raw, expected in (
+            (b"Changed\n", "Changed"),
+            (b"Body\n\n\n", "Body\n\n"),
+            (b"Body \n", "Body "),
+            (b"Body\n ", "Body\n "),
+            (b"Body\r\n", "Body"),
+        ):
+            with self.subTest(raw=raw):
+                proposal = MODULE.recommendation_from_outputs(
+                    preflight=self.preflight, remote=self.remote(),
+                    title_raw=b"Current title\n", body_raw=raw,
+                )
+                self.assertEqual("replace", proposal["decision"])
+                self.assertEqual(expected, proposal["proposal"]["body"])
+
+    def test_exact_body_copies_still_obey_encoding_and_content_limits(self):
+        invalid = (
+            ("\ufeffBody\n", "\ufeffBody\n".encode("utf-8")),
+            ("Body\0\n", b"Body\0\n"),
+            ("Body\r\n", b"Body\r\n"),
+            ("Body\rBody", b"Body\rBody"),
+            ("\ufffd", b"\xff"),
+            (
+                "x" * MODULE.BODY_MAX_CHARS + "\n",
+                b"x" * MODULE.BODY_MAX_CHARS + b"\n",
+            ),
+            (
+                chr(0x1F600) * MODULE.BODY_MAX_CHARS + "\n",
+                (chr(0x1F600) * MODULE.BODY_MAX_CHARS + "\n").encode("utf-8"),
+            ),
+        )
+        for index, (current, raw) in enumerate(invalid):
+            with self.subTest(index=index):
+                self.preflight["pr"]["body"] = current
+                with self.assertRaisesRegex(MODULE.WorkflowError, "recommendation body"):
+                    MODULE.recommendation_from_outputs(
+                        preflight=self.preflight, remote=self.remote(),
+                        title_raw=b"Current title\n", body_raw=raw,
+                    )
+
+    def test_exact_body_copy_and_transport_at_size_boundaries(self):
+        for current in (
+            "x" * (MODULE.BODY_MAX_CHARS - 1) + "\n",
+            chr(0x1F600) * MODULE.BODY_MAX_CHARS,
+        ):
+            for transport in (b"", b"\n", b"\r\n"):
+                with self.subTest(length=len(current), transport=transport):
+                    self.assertEqual(
+                        current,
+                        MODULE.decode_recommendation_body(
+                            current.encode("utf-8") + transport, current_body=current
+                        ),
+                    )
+        with mock.patch.object(MODULE, "BODY_MAX_BYTES", 8):
+            for current in ("1234567\n", "\u00e9\u00e9\u00e9\n\n"):
+                self.assertEqual(
+                    current,
+                    MODULE.decode_recommendation_body(
+                        current.encode("utf-8"), current_body=current
+                    ),
+                )
+            for current in (
+                "12345678\n", "\u00e9\u00e9\u00e9\u00e9\n", "12345678901"
+            ):
+                with self.subTest(byte_length=len(current.encode("utf-8"))):
+                    with self.assertRaises(MODULE.WorkflowError):
+                        MODULE.decode_recommendation_body(
+                            current.encode("utf-8"), current_body=current
+                        )
 
     def test_optional_arbitrary_report_is_advisory(self):
         remote = self.remote(report=True)

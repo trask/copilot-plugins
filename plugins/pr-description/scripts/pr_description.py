@@ -97,7 +97,7 @@ PR_DESCRIPTION_PROPOSAL_SCHEMA = {
     "id": "github.copilot.pr-description-proposal",
     "version": 3,
 }
-WORKER_PROMPT_VERSION = 4
+WORKER_PROMPT_VERSION = 5
 LEGACY_TASKLESS_POLICY = {
     "id": "marketplace-agent-worker",
     "version": 4,
@@ -1556,8 +1556,11 @@ def build_worker_prompt(preflight: dict[str, Any]) -> str:
         "It must be one nonblank title of at most 256 characters, without NUL or "
         "line breaks. A single conventional final newline is transport only. Write "
         f"the complete proposed body as UTF-8 Markdown to `{AGENT_TASK_OUTPUT_BODY}`. "
-        "The body file is required and may be empty. A single conventional final "
-        "newline is transport only; otherwise preserve the intended Markdown exactly. "
+        "The body file is required and may be empty. To keep the body, copy the "
+        "pinned current_body exactly, including its trailing newlines. A valid exact "
+        "UTF-8 copy takes precedence over transport decoding. Otherwise, the "
+        "coordinator removes exactly one final LF or CRLF as transport; append that "
+        "transport newline after the intended Markdown, preserving all its whitespace. "
         "Create no code commits. Commit both files together in the one final "
         "output-only commit required by the marketplace policy. Do not add schemas, "
         "wrappers, JSON, front matter, identity, hashes, decisions, changed-file "
@@ -2258,13 +2261,15 @@ def decode_recommendation_title(raw: bytes) -> str:
     return title
 
 
-def decode_recommendation_body(raw: bytes) -> str:
+def decode_recommendation_body(raw: bytes, *, current_body: str | None = None) -> str:
     if len(raw) > BODY_MAX_BYTES + 2:
         raise WorkflowError("recommendation body exceeds the UTF-8 byte limit")
     try:
-        body = remove_transport_newline(raw.decode("utf-8"))
+        body = raw.decode("utf-8")
     except UnicodeDecodeError as error:
         raise WorkflowError("recommendation body is not valid UTF-8") from error
+    if body != current_body:
+        body = remove_transport_newline(body)
     if (
         len(body) > BODY_MAX_CHARS
         or len(body.encode("utf-8")) > BODY_MAX_BYTES
@@ -2307,7 +2312,7 @@ def recommendation_from_outputs(
             "coordinator changed-file evidence is malformed or noncanonical"
         )
     title = decode_recommendation_title(title_raw)
-    body = decode_recommendation_body(body_raw)
+    body = decode_recommendation_body(body_raw, current_body=pr["body"])
     decision = (
         "keep"
         if title == pr["title"] and body == pr["body"]
