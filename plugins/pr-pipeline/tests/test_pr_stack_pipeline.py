@@ -327,6 +327,8 @@ class ModelTest(unittest.TestCase):
                 "2",
                 "--state",
                 "state.json",
+                "--github-mutation-policy",
+                "allow",
             ],
             command,
         )
@@ -1858,6 +1860,246 @@ class StackRunTest(StackFixture):
             [event["phase"] for event in self.events_named("phase_started")],
         )
         self.assertEqual(1, len(self.events_named("snapshot_taken")))
+
+
+class CiWarningTest(StackFixture):
+    def setUp(self):
+        super().setUp()
+        self.warnings = {}
+        self.addCleanup(
+            setattr, COMMON, "ACTIVE_GITHUB_MUTATION_POLICY",
+            COMMON.ACTIVE_GITHUB_MUTATION_POLICY,
+        )
+
+    def record_warning(self, number, head=None, base=BASE):
+        self.warnings[number] = {
+            "stage_outcome": "warning",
+            "clean_at_head_sha": None,
+            "warning_at_head_sha": head or head_of(number),
+            "warning_at_base_sha": base,
+            "ci_warnings": [{
+                "check_key": f"check:{number}",
+                "name": "Integration tests",
+                "diagnosis": "unrelated",
+                "reason": "A service outage affects the same test on the base.",
+                "evidence": ["The base and PR job logs report the same service outage."],
+            }],
+        }
+
+    def inspect(self, entry, target, head_sha, base_sha=None):
+        if entry["stage"] != MODULE.STAGE_CI or target["number"] not in self.warnings:
+            return super().inspect(entry, target, head_sha, base_sha)
+        return COMMON.inspect_stage(
+            entry, target, head_sha, base_sha,
+            pipeline_run="run-1",
+            read_status=lambda *_: {
+                "ok": True, "installed": True, "state": "state.json",
+                "payload": self.warnings[target["number"]],
+            },
+        )
+
+    def complete_worker(self, request):
+        self.clear.add((request["number"], request["stage"]))
+        if request["stage"] == MODULE.STAGE_CI:
+            self.record_warning(request["number"], request["head_sha"], request["base_sha"])
+
+    def test_stack_completes_with_warnings_and_runs_description_for_every_member(self):
+        self.launcher.on_start = self.complete_worker
+        self.clear_everything()
+        for member in self.stack["members"]:
+            self.clear.remove((member["number"], MODULE.STAGE_CI))
+        pipeline = self.pipeline()
+        result = pipeline.execute()
+        self.assertEqual("complete", result["result"])
+        self.assertEqual(1, result["passes"])
+        self.assertFalse(result["all_ci_passed"])
+        self.assertEqual([11, 12, 13], [item["number"] for item in result["ci_warnings"]])
+        for warning in result["ci_warnings"]:
+            self.assertEqual(head_of(warning["number"]), warning["head_sha"])
+            self.assertEqual(BASE, warning["base_sha"])
+            self.assertTrue(warning["reason"])
+            self.assertTrue(warning["evidence"])
+        self.assertEqual(
+            [11, 12, 13],
+            [request["number"] for request in self.launcher.started if request["stage"] == MODULE.STAGE_DESCRIPTION],
+        )
+        compact = MODULE.compact_terminal_result(result, result_path=self.root / "result.json")
+        self.assertEqual(result["ci_warnings"], compact["ci_warnings"])
+        self.assertFalse(compact["all_ci_passed"])
+        for event in [
+            *[
+                event for event in self.events
+                if event["event"] in ("worker_finished", "phase_finished")
+                and (event.get("stage") or event.get("phase")) == MODULE.STAGE_CI
+            ],
+            *self.events_named("snapshot_taken"),
+            {"event": "stack_pipeline_finished", **compact},
+        ]:
+            transition = MODULE.progress_transition(event)
+            self.assertIn("WITH CI WARNINGS", transition["message"])
+            self.assertFalse(transition["all_ci_passed"])
+        persisted = json.loads((self.root / "run" / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["ci_warnings"], persisted["pipeline_result"]["ci_warnings"])
+
+    def test_warning_predecessor_allows_bottom_up_ci_without_calling_it_green(self):
+        self.launcher.on_start = self.complete_worker
+        pipeline = self.pipeline()
+        first = pipeline.run_ci_phase(1, self.stack["members"])
+        second = pipeline.run_ci_phase(2, self.stack["members"])
+        self.assertEqual(
+            ["lowest_selected", "predecessor_has_ci_warning", "predecessor_has_ci_warning"],
+            [gate["reason"] for gate in first["gates"]],
+        )
+        self.assertTrue(first["clear"])
+        self.assertTrue(second["clear"])
+        self.assertEqual(0, second["dispatches"])
+        self.assertEqual(first["ci_warnings"], second["ci_warnings"])
+        self.assertFalse(second["all_ci_passed"])
+        self.assertEqual(3, len(self.launcher.started))
+        for member in self.stack["members"]:
+            state = pipeline.state["pull_requests"][str(member["number"])]["stages"][MODULE.STAGE_CI]
+            self.assertEqual("already_clear", state["action"])
+            self.assertEqual("ci_warning", state["clearance_kind"])
+
+    def test_later_stage_failure_keeps_current_stack_warnings_visible(self):
+        self.clear_everything()
+        self.record_warning(11)
+        original_wait = self.launcher.wait
+
+        def wait(worker):
+            result = original_wait(worker)
+            if worker["stage"] == MODULE.STAGE_DESCRIPTION:
+                result["returncode"] = 1
+            return result
+
+        self.launcher.wait = wait
+        result = self.pipeline().execute()
+        self.assertEqual("blocked", result["result"])
+        self.assertFalse(result["all_ci_passed"])
+        self.assertEqual([11], [warning["number"] for warning in result["ci_warnings"]])
+        compact = MODULE.compact_terminal_result(result)
+        self.assertFalse(compact["all_ci_passed"])
+        self.assertEqual(result["ci_warnings"], compact["ci_warnings"])
+
+    def test_stale_warnings_are_not_carried_to_a_later_blocked_result(self):
+        self.record_warning(11)
+        self.clear_everything()
+        pipeline = self.pipeline()
+        pipeline.run_ci_phase(1, self.stack["members"])
+        self.stack = stack(heads={11: "e" * 40})
+        result = pipeline.finish("blocked", reason="stage_execution_failed")
+        self.assertNotIn("ci_warnings", result)
+        self.assertNotIn("all_ci_passed", result)
+
+    def test_warning_revalidation_failure_is_visible_in_the_terminal_result(self):
+        self.record_warning(11)
+        self.clear_everything()
+        pipeline = self.pipeline()
+        pipeline.run_ci_phase(1, self.stack["members"])
+        pipeline.inspect = lambda *_: {"clear": False, "reason": "status_failed"}
+        result = pipeline.finish("blocked", reason="stage_execution_failed")
+        self.assertEqual("#11: status_failed", result["ci_warning_revalidation_error"])
+        compact = MODULE.compact_terminal_result(result)
+        transition = MODULE.progress_transition({"event": "stack_pipeline_finished", **compact})
+        self.assertIn("#11: status_failed", transition["message"])
+
+    def test_stale_warning_head_requires_a_fresh_worker(self):
+        for number in (11, 12, 13):
+            self.record_warning(number)
+        self.stack = stack(heads={11: "e" * 40})
+        self.launcher.on_start = self.complete_worker
+        result = self.pipeline().run_ci_phase(2, self.stack["members"])
+        self.assertTrue(result["clear"])
+        self.assertEqual([11], [request["number"] for request in self.launcher.started])
+        self.assertEqual("e" * 40, result["ci_warnings"][0]["head_sha"])
+
+    def test_stale_warning_base_requires_fresh_workers(self):
+        for number in (11, 12, 13):
+            self.record_warning(number)
+        self.launcher.on_start = self.complete_worker
+        pipeline = self.pipeline(base_tip=lambda *_: "e" * 40)
+        result = pipeline.run_ci_phase(2, self.stack["members"])
+        self.assertTrue(result["clear"])
+        self.assertEqual([11, 12, 13], [request["number"] for request in self.launcher.started])
+        self.assertEqual({"e" * 40}, {warning["base_sha"] for warning in result["ci_warnings"]})
+
+    def test_predecessor_warning_base_movement_blocks_the_next_member(self):
+        self.record_warning(11)
+        moved = False
+
+        def inspect(entry, target, head, base):
+            nonlocal moved
+            result = self.inspect(entry, target, head, base)
+            if entry["stage"] == MODULE.STAGE_CI and target["number"] == 11:
+                moved = True
+            return result
+
+        pipeline = self.pipeline(
+            inspect=inspect,
+            base_tip=lambda *_: "e" * 40 if moved else BASE,
+        )
+        result = pipeline.run_ci_phase(1, self.stack["members"])
+        self.assertFalse(result["clear"])
+        self.assertEqual(12, result["blocked"]["number"])
+        self.assertEqual([], self.launcher.started)
+
+    def test_stale_warning_snapshot_is_not_complete(self):
+        self.clear_everything()
+        self.record_warning(11, base="e" * 40)
+        result = self.pipeline().final_snapshot()
+        self.assertEqual("incomplete", result["result"])
+        self.assertNotIn("ci_warnings", result)
+        self.assertEqual([MODULE.STAGE_CI], result["pull_requests"][0]["uncleared"])
+
+    def test_warning_snapshot_that_moves_does_not_report_current_warnings(self):
+        self.clear_everything()
+        self.record_warning(11)
+        calls = 0
+
+        def read_stack(*_):
+            nonlocal calls
+            calls += 1
+            return self.stack if calls == 1 else stack(heads={11: "e" * 40})
+
+        result = self.pipeline(read_stack=read_stack).final_snapshot()
+        self.assertEqual("heads_moved_during_snapshot", result["reason"])
+        self.assertNotIn("ci_warnings", result)
+        self.assertNotIn("all_ci_passed", result)
+
+    def test_compact_warning_result_stays_bounded_and_never_loses_warning_flag(self):
+        self.record_warning(11)
+        warning = {
+            **self.warnings[11]["ci_warnings"][0],
+            "number": 11, "head_sha": head_of(11), "base_sha": BASE,
+            "reason": "failure " * 1000,
+            "evidence": ["evidence " * 1000] * 20,
+        }
+        payload = {"result": "complete", "all_ci_passed": False, "ci_warnings": [warning] * 100}
+        result = MODULE.compact_terminal_result(payload, result_path=self.root / "result.json")
+        self.assertLessEqual(
+            len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()),
+            MODULE.TERMINAL_RESULT_MAX_BYTES,
+        )
+        self.assertFalse(result["all_ci_passed"])
+        self.assertTrue(result["ci_warning_details_truncated"])
+        self.assertEqual(100, len(result["ci_warnings"]) + result["ci_warnings_omitted"])
+        self.assertIn("WITH CI WARNINGS", MODULE.progress_transition({
+            "event": "stack_pipeline_finished", **result,
+        })["message"])
+
+    def test_stack_worker_command_preserves_frozen_policy_for_ci(self):
+        for policy in ("allow", "source-only"):
+            with self.subTest(policy=policy):
+                pipeline = self.pipeline(github_mutation_policy=policy)
+                request = pipeline.request_for(self.stack["members"][0], MODULE.STAGE_CI, 2)
+                command = COMMON.stage_command(
+                    MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
+                    COMMON.target_for("owner/repo", 11),
+                    model="gpt-5.6-sol", effort="high", arguments=request["arguments"],
+                )
+                self.assertEqual(policy, command[command.index("--github-mutation-policy") + 1])
+                self.assertEqual("run-1", command[command.index("--pipeline-run") + 1])
+                self.assertEqual("2", command[command.index("--pipeline-max-iterations") + 1])
 
 
 class SnapshotTest(StackFixture):

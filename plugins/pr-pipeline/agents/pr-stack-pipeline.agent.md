@@ -1,6 +1,6 @@
 ---
 name: PR Stack Pipeline
-description: "Explicit invocation only: never select automatically; run only when the user asks for PR Stack Pipeline by name or invokes `/pr-stack-pipeline`. Once selected, drive a native GitHub stack suffix through every stage until each member is green at the same snapshot."
+description: "Explicit invocation only: never select automatically; run only when the user asks for PR Stack Pipeline by name or invokes `/pr-stack-pipeline`. Once selected, drive a native GitHub stack suffix through every stage at one snapshot, preserving any verified CI warnings."
 argument-hint: "the structured kickoff JSON: {\"version\":1,\"repository\":\"owner/repo\",\"stackNumber\":77,\"startPullRequest\":11,\"pullRequests\":[11,12]}"
 tools: [execute, rename_session]
 user-invocable: true
@@ -37,9 +37,9 @@ Run `start` synchronously exactly once. It returns `stack_pipeline_launched` wit
 
 When the user explicitly chooses conflict strategy `merge` or `rebase`, append `--conflict-strategy merge` or `--conflict-strategy rebase` to `start`. Preserve that choice exactly. Otherwise omit the option and let the helper use `auto`.
 
-Normal execution uses `--github-mutation-policy allow`, the helper's default. Explicitly invoking PR Stack Pipeline for a selected suffix authorizes its standard stage-owned actions: verified source publication, Copilot review requests, replies to and resolution of bot-authored review threads, and title/body updates. Draft and ready-for-review pull requests are eligible; preserve their draft states and the exact selected suffix. This authorization does not extend to merging, approving, unsolicited comments, or replies to human-authored threads, which require a separate explicit request.
+Normal execution uses `--github-mutation-policy allow`, the helper's default. Explicitly invoking PR Stack Pipeline for a selected suffix authorizes its standard stage-owned actions: verified source publication, bounded guarded CI failed-job reruns, Copilot review requests, replies to and resolution of bot-authored review threads, and title/body updates. Draft and ready-for-review pull requests are eligible; preserve their draft states and the exact selected suffix. This authorization does not extend to merging, approving, unsolicited comments, or replies to human-authored threads, which require a separate explicit request.
 
-Choose one GitHub mutation policy before `start` and never change it for that run. Use `--github-mutation-policy source-only` only when the caller explicitly requests source-only execution or forbids the normal stage-owned review or metadata updates. Do not infer source-only from draft status or the separate prohibitions on merging, approval, unsolicited comments, and human-thread replies. The helper freezes and forwards the policy to Copilot Review, Self Review, and PR Description. Under `source-only`, PR Description may preserve a replacement proposal but must not apply its title or body.
+Choose one GitHub mutation policy before `start` and never change it for that run. Use `--github-mutation-policy source-only` only when the caller explicitly requests source-only execution or forbids the normal stage-owned review or metadata updates. Do not infer source-only from draft status or the separate prohibitions on merging, approval, unsolicited comments, and human-thread replies. The helper freezes and forwards the policy to Copilot Review, Self Review, CI Fix, and PR Description. Under `source-only`, CI reruns are forbidden and PR Description may preserve a replacement proposal but must not apply its title or body. Neither policy permits empty commits as a rerun workaround.
 
 `watch` only observes the detached scheduler. Interrupting `watch` does not cancel the run. When the user explicitly asks to stop the run, invoke the matching `cancel` command once with the exact kickoff and run ID:
 
@@ -70,12 +70,14 @@ The helper runs at most two passes. Each pass invokes the installed Python coord
 1. `pr-conflict-resolver:pr-conflict-resolver`, dispatched once for the clicked pull request when the entire native stack is selected. A partial suffix never launches the conflict coordinator. Fresh GitHub mergeability clears each selected member only at its exact head and base; conflicting, unknown, or stale metadata blocks the run rather than authorizing changes to an unselected prefix.
 2. `copilot-review-loop:copilot-review-loop`, one worker per selected pull request
 3. `self-review-loop:self-review-loop`, one worker per selected pull request
-4. `ci-fix-loop:ci-fix-loop`, bottom-up, where a higher member starts only after the member below it is green at its current head; when containment is missing, the helper first asks the conflict plugin to atomically align descendants to that live head
+4. `ci-fix-loop:ci-fix-loop`, bottom-up, where a higher member starts only after the member below it has current CI clearance, either green or coordinator-verified warnings; when containment is missing, the helper first asks the conflict plugin to atomically align descendants to that live head
 5. `pr-description:pr-description`, one worker per selected pull request
 
 Workers are Python coordinator subprocesses in isolated worktrees, not model wrappers or app sessions. Each coordinator waits for its children and spends its configured iteration allowance before returning. Passes never reset or multiply that allowance. Every run has new scheduler state, stage state paths, worker records, and worktrees. It never resumes or imports a sealed run. The stack lock permits one active owner. The helper starts workers one at a time and only continues after the previous worker is verified and active. Once active, workers run concurrently. A nonzero worker exit, unreadable stage status, or active child after worker exit blocks the run. A zero exit is only a collected result until current-head and current-base clearance is verified. Failed propagation checkpoints remain retryable only within this run while their source head is current. Success needs all five markers current for every selected pull request at one final snapshot of the stack, its heads, and its bases.
 
 Hosted workers use `.github/agent-task-output/`. Optional `report.md` is free-form advice and never stage evidence. PR Description alone requires `title.txt` and `body.md`. Do not trust model-authored findings, explanations, identities, SHAs, paths, commit mappings, validation claims, or canonical reports. Conflict Resolver keeps each stack role on its request-bound ref. Self Review treats zero candidate commits as clean. CI candidate publication stays pending until trusted GitHub checks and statuses bound to the exact published source SHA are terminal and green. Never run candidate Gradle, Maven, tests, or builds locally.
+
+CI can instead finish with unrelated or pre-existing failures diagnosed by a fresh hosted task and verified by the CI coordinator. Pipeline accepts only its run-bound warning status at the exact head and base, with nonempty reasons and evidence. `clearance_kind: "ci_warning"` permits orchestration to continue but never means green CI. Unknown failures remain uncleared. Every failure stays visible; no required-only filtering or repository-specific gating applies. Unchanged warnings do not spend another CI attempt, and head or base movement invalidates them.
 
 A PR Conflict Resolver run is not launched again during that stack-pipeline run only after current-head and current-base clearance is verified.
 
@@ -84,6 +86,8 @@ Never mark a pull request ready for review, approve one, create one, or post a c
 ## Final response
 
 Write a concise final response from the complete `stack_pipeline_finished` event. Lead with the repository, the stack, the selected pull requests as links, the plain-language result, and the pass count. A clean run that pushed no commits should usually fit in one sentence.
+
+When `all_ci_passed` is false or `ci_warnings` is nonempty, say **completed WITH CI WARNINGS** for a complete workflow, never all CI green or all checks passed. Name each affected pull request and head, then its failed checks, diagnoses, reasons, and evidence. Read `artifacts.result` when `ci_warnings_omitted` or `ci_warning_details_truncated` is present. Preserve blocked or partial outcomes even when some warnings were accepted. Report any `ci_warning_revalidation_error`; do not assume those warnings are still current.
 
 Do not organize the response by pass or list every stage for every pull request when all are clear. Omit routine details: models, return codes, nonces, state paths, worktree paths, and log paths. The terminal event is bounded and links to `artifacts.result` for the full durable result.
 

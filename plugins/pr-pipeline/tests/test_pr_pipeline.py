@@ -68,6 +68,22 @@ def uncleared_stage(stage: str, outcome: str | None = "carried") -> dict:
     }
 
 
+def ci_warning_payload(head=HEAD, base=BASE) -> dict:
+    return {
+        "stage_outcome": "warning",
+        "clean_at_head_sha": None,
+        "warning_at_head_sha": head,
+        "warning_at_base_sha": base,
+        "ci_warnings": [{
+            "check_key": "check:77",
+            "name": "Integration tests",
+            "diagnosis": "pre_existing",
+            "reason": "The same failure occurs on the base revision.",
+            "evidence": ["Base run 123 fails with the same error at the same line."],
+        }],
+    }
+
+
 class GithubMutationPolicyTest(unittest.TestCase):
     def setUp(self):
         self.previous = MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY
@@ -113,6 +129,7 @@ class GithubMutationPolicyTest(unittest.TestCase):
         for stage in (
             MODULE.common.STAGE_COPILOT_REVIEW,
             MODULE.common.STAGE_SELF_REVIEW,
+            MODULE.common.STAGE_CI,
             MODULE.common.STAGE_DESCRIPTION,
         ):
             with self.subTest(stage=stage):
@@ -142,6 +159,23 @@ class GithubMutationPolicyTest(unittest.TestCase):
                     "source-only", command[command.index("--github-mutation-policy") + 1]
                 )
                 self.assertNotIn("-p", command)
+
+    def test_ci_stage_receives_frozen_policy_for_both_modes(self):
+        for policy in ("allow", "source-only"):
+            with self.subTest(policy=policy):
+                MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = policy
+                command = MODULE.stage_command(
+                    MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
+                    target(),
+                    model="gpt-5.6-sol",
+                    effort="high",
+                    run_id=PIPELINE_RUN,
+                    sweep=2,
+                )
+                self.assertEqual(1, command.count("--github-mutation-policy"))
+                self.assertEqual(policy, command[command.index("--github-mutation-policy") + 1])
+                self.assertEqual(PIPELINE_RUN, command[command.index("--pipeline-run") + 1])
+                self.assertNotIn("--new-invocation", command)
 
     def test_agent_documents_normal_authorization_and_explicit_restrictions(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -788,6 +822,8 @@ class StageContractTest(unittest.TestCase):
                 "2",
                 "--state",
                 str(expected),
+                "--github-mutation-policy",
+                "allow",
             ],
             command,
         )
@@ -937,6 +973,124 @@ class MarkerTest(unittest.TestCase):
         for stage, payload in payloads.items():
             with self.subTest(stage=stage):
                 self.assertTrue(self.status(stage, payload)["clear"])
+
+    def test_ci_warning_clears_orchestration_without_a_clean_marker(self):
+        for diagnosis in ("unrelated", "pre_existing"):
+            payload = ci_warning_payload()
+            payload["ci_warnings"][0]["diagnosis"] = diagnosis
+            with self.subTest(diagnosis=diagnosis):
+                result = self.status(MODULE.STAGE_CI, payload)
+                self.assertTrue(result["clear"])
+                self.assertEqual("ci_warning", result["clearance_kind"])
+                self.assertEqual(HEAD, result["clear_at_head_sha"])
+                self.assertEqual(BASE, result["clear_at_base_sha"])
+                self.assertFalse(result["all_ci_passed"])
+                self.assertEqual(payload["ci_warnings"], result["ci_warnings"])
+                self.assertEqual(payload["ci_warnings"], result["status"]["ci_warnings"])
+                self.assertIsNone(payload["clean_at_head_sha"])
+
+    def test_ci_warning_markers_must_match_both_live_revisions(self):
+        for head, base, inspected_base, reason in (
+            (NEXT_HEAD, BASE, BASE, "clearance_is_for_an_older_head"),
+            (HEAD, NEXT_BASE, BASE, "clearance_is_for_an_older_base"),
+            (HEAD, BASE, NEXT_BASE, "clearance_is_for_an_older_base"),
+            (None, BASE, BASE, "ci_warning_not_verified"),
+            (HEAD, None, BASE, "ci_warning_not_verified"),
+            (HEAD, BASE, None, "clearance_is_for_an_older_base"),
+            (" " + HEAD, BASE, BASE, "ci_warning_not_verified"),
+            (HEAD, BASE + " ", BASE, "ci_warning_not_verified"),
+        ):
+            with self.subTest(head=head, base=base, inspected_base=inspected_base):
+                result = self.status(
+                    MODULE.STAGE_CI, ci_warning_payload(head, base), inspected_base
+                )
+                self.assertFalse(result["clear"])
+                self.assertEqual(reason, result["reason"])
+                self.assertNotIn("all_ci_passed", result)
+                self.assertIsNone(result["clearance_kind"])
+
+    def test_ci_warning_requires_well_formed_diagnoses_and_evidence(self):
+        valid = ci_warning_payload()
+        malformed = [None, {}, [], [None], ["advice"]]
+        for key, values in {
+            "check_key": [None, "", " "],
+            "name": [None, "", " "],
+            "reason": [None, "", " ", 7],
+            "diagnosis": ["unknown", "transient", "pr_caused", None, {}],
+            "evidence": [None, [], "", [" "], [1], [{}], ["valid", ""]],
+        }.items():
+            for value in values:
+                malformed.append([{**valid["ci_warnings"][0], key: value}])
+            missing = dict(valid["ci_warnings"][0])
+            missing.pop(key)
+            malformed.append([missing])
+        for warnings in malformed:
+            with self.subTest(warnings=warnings):
+                result = self.status(MODULE.STAGE_CI, {**valid, "ci_warnings": warnings})
+                self.assertFalse(result["clear"])
+                self.assertEqual("ci_warning_not_verified", result["reason"])
+
+    def test_ci_warning_rejects_missing_or_populated_clean_marker(self):
+        for payload in (
+            {key: value for key, value in ci_warning_payload().items() if key != "clean_at_head_sha"},
+            {**ci_warning_payload(), "clean_at_head_sha": HEAD},
+        ):
+            result = self.status(MODULE.STAGE_CI, payload)
+            self.assertFalse(result["clear"])
+            self.assertEqual("ci_warning_not_verified", result["reason"])
+
+    def test_non_ci_stages_cannot_clear_with_warnings(self):
+        for entry in MODULE.STAGES:
+            if entry["stage"] == MODULE.STAGE_CI:
+                continue
+            with self.subTest(stage=entry["stage"]):
+                result = self.status(entry["stage"], {
+                    **ci_warning_payload(),
+                    "clean_at_head_sha": HEAD,
+                    "mergeable_at_head_sha": HEAD,
+                    "attempt": {"base_sha": BASE},
+                    "review": {"clean_at_head_sha": HEAD},
+                    "validated_head_sha": HEAD,
+                })
+                self.assertFalse(result["clear"])
+                self.assertEqual("ci_warning_not_verified", result["reason"])
+
+    def test_ci_warning_cannot_clear_without_the_exact_run_status_envelope(self):
+        for reason in ("no_state", "status_identity_mismatch", "status_state_mismatch"):
+            with (
+                self.subTest(reason=reason),
+                mock.patch.object(MODULE, "read_stage_status", return_value={
+                    "ok": False, "installed": True, "state": "current-run.json",
+                    "reason": reason, "payload": ci_warning_payload(),
+                }),
+            ):
+                result = MODULE.inspect_stage(
+                    MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
+                    target(), HEAD, BASE, PIPELINE_RUN,
+                )
+                self.assertFalse(result["clear"])
+                self.assertEqual(reason, result["reason"])
+                self.assertNotIn("ci_warnings", result)
+
+    def test_hosted_report_warning_is_not_a_coordinator_clearance(self):
+        result = self.status(MODULE.STAGE_CI, {
+            "stage_outcome": None,
+            "clean_at_head_sha": None,
+            "report": ci_warning_payload(),
+            "canonical_report": ci_warning_payload(),
+        })
+        self.assertFalse(result["clear"])
+        self.assertNotIn("ci_warnings", result)
+
+    def test_ci_warning_cannot_skip_owned_active_or_failed_work(self):
+        for state in ("running", "publishing", "failed", "interrupted"):
+            with self.subTest(state=state):
+                result = self.status(
+                    MODULE.STAGE_CI,
+                    {**ci_warning_payload(), "agent_task": {"status": state}},
+                )
+                self.assertFalse(result["clear"])
+                self.assertIsNotNone(MODULE.stage_blocker(result, after_launch=False))
 
     def test_minimized_stage_results_clear_without_hosted_report_fields(self):
         payloads = {
@@ -1778,6 +1932,157 @@ class SweepTest(unittest.TestCase):
             [(stage, 1) for stage in MODULE.STAGE_NAMES],
             self.launched,
         )
+
+    def enable_ci_warnings(self):
+        self.warning_payload = None
+        launch = self.run_stage
+
+        def run_stage(entry, *args, **kwargs):
+            result = launch(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_CI:
+                self.warning_payload = ci_warning_payload(self.sync_heads[-1], self.base_sha)
+            return result
+
+        def inspect(entry, selected, head, base, run_id=None):
+            if entry["stage"] != MODULE.STAGE_CI or self.warning_payload is None:
+                return self.inspect(entry, selected, head, base, run_id)
+            return MODULE.common.inspect_stage(
+                entry, selected, head, base,
+                pipeline_run=run_id,
+                read_status=lambda *_: {
+                    "ok": True, "installed": True, "state": "state.json",
+                    "payload": self.warning_payload,
+                },
+            )
+
+        for patch in (
+            mock.patch.object(MODULE, "run_stage", side_effect=run_stage),
+            mock.patch.object(MODULE, "inspect_stage", side_effect=inspect),
+            mock.patch.object(
+                MODULE, "inspect_stages",
+                side_effect=lambda selected, head, base, run_id=None: [
+                    inspect(entry, selected, head, base, run_id) for entry in MODULE.STAGES
+                ],
+            ),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_ci_warning_finishes_workflow_and_continues_description(self):
+        self.enable_ci_warnings()
+        result = self.execute()
+        self.assertEqual("complete", result["result"])
+        self.assertEqual(1, result["sweeps"])
+        self.assertFalse(result["all_ci_passed"])
+        self.assertEqual(self.warning_payload["ci_warnings"], result["ci_warnings"])
+        self.assertEqual([(stage, 1) for stage in MODULE.STAGE_NAMES], self.launched)
+        for event in [
+            *[
+                event for event in self.events
+                if event["event"] == "sweep_finished"
+                or event["event"] == "stage_finished" and event["stage"] == MODULE.STAGE_CI
+            ],
+            {"event": "pipeline_finished", **result},
+        ]:
+            update = MODULE.progress_transition(event)
+            self.assertIn("WITH CI WARNINGS", update["message"])
+            self.assertNotIn("all stages are clear", update["message"])
+            self.assertFalse(update["all_ci_passed"])
+
+    def test_unchanged_ci_warning_does_not_repeat_ci_in_second_sweep(self):
+        self.enable_ci_warnings()
+        original_run_stage = MODULE.run_stage.side_effect
+
+        def run_stage(entry, *args, **kwargs):
+            result = original_run_stage(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_SELF_REVIEW and kwargs["sweep"] == 1:
+                self.sync_heads.append(NEXT_HEAD)
+            return result
+
+        MODULE.run_stage.side_effect = run_stage
+        result = self.execute()
+        self.assertEqual("complete", result["result"])
+        self.assertEqual(2, result["sweeps"])
+        self.assertFalse(result["all_ci_passed"])
+        self.assertEqual([(MODULE.STAGE_CI, 1)], [item for item in self.launched if item[0] == MODULE.STAGE_CI])
+        skipped = next(
+            event for event in self.events
+            if event["event"] == "stage_finished" and event["stage"] == MODULE.STAGE_CI
+            and event["sweep"] == 2
+        )
+        self.assertEqual("already_clear", skipped["action"])
+        self.assertEqual("ci_warning", skipped["clearance_kind"])
+        self.assertIn("WITH CI WARNINGS", MODULE.progress_transition(skipped)["message"])
+
+    def assert_ci_warning_refreshed_after_movement(self, revision):
+        self.enable_ci_warnings()
+        launch = MODULE.run_stage.side_effect
+
+        def run_stage(entry, *args, **kwargs):
+            result = launch(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_DESCRIPTION and kwargs["sweep"] == 1:
+                if revision == "head":
+                    self.sync_heads.append(NEXT_HEAD)
+                else:
+                    self.base_sha = NEXT_BASE
+            return result
+
+        MODULE.run_stage.side_effect = run_stage
+        result = self.execute()
+        self.assertEqual("complete", result["result"])
+        self.assertEqual(2, result["sweeps"])
+        self.assertEqual(
+            [(MODULE.STAGE_CI, 1), (MODULE.STAGE_CI, 2)],
+            [item for item in self.launched if item[0] == MODULE.STAGE_CI],
+        )
+        ci = next(stage for stage in result["stages"] if stage["stage"] == MODULE.STAGE_CI)
+        self.assertEqual(self.sync_heads[-1], ci["clear_at_head_sha"])
+        self.assertEqual(self.base_sha, ci["clear_at_base_sha"])
+
+    def test_head_movement_requires_fresh_ci_warning_work(self):
+        self.assert_ci_warning_refreshed_after_movement("head")
+
+    def test_base_movement_requires_fresh_ci_warning_work(self):
+        self.assert_ci_warning_refreshed_after_movement("base")
+
+    def test_ci_warning_does_not_hide_a_later_stage_failure(self):
+        self.enable_ci_warnings()
+        launch = MODULE.run_stage.side_effect
+
+        def run_stage(entry, *args, **kwargs):
+            result = launch(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_DESCRIPTION:
+                result["returncode"] = 1
+            return result
+
+        MODULE.run_stage.side_effect = run_stage
+        result = self.execute()
+        self.assertEqual("blocked", result["result"])
+        self.assertEqual("stage_execution_failed", result["reason"])
+        self.assertFalse(result["all_ci_passed"])
+        self.assertEqual(self.warning_payload["ci_warnings"], result["ci_warnings"])
+
+    def test_ci_warning_does_not_override_a_nonzero_ci_exit(self):
+        self.enable_ci_warnings()
+        launch = MODULE.run_stage.side_effect
+
+        def run_stage(entry, *args, **kwargs):
+            result = launch(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_CI:
+                result["returncode"] = 1
+            return result
+
+        MODULE.run_stage.side_effect = run_stage
+        result = self.execute()
+        self.assertEqual("blocked", result["result"])
+        self.assertEqual("stage_execution_failed", result["reason"])
+        self.assertNotIn((MODULE.STAGE_DESCRIPTION, 1), self.launched)
+        event = next(
+            event for event in self.events
+            if event["event"] == "stage_finished" and event["stage"] == MODULE.STAGE_CI
+        )
+        self.assertIn("failed with exit code 1", MODULE.progress_transition(event)["message"])
+        self.assertNotIn("completed", MODULE.progress_transition(event)["message"])
 
     def test_ready_for_review_pull_request_runs_all_stages(self):
         with mock.patch.object(

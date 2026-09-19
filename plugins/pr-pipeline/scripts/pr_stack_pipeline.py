@@ -172,6 +172,8 @@ def stage_result_summary(stage_result: dict[str, Any]) -> dict[str, Any]:
             "clear": stage_result.get("clear"),
             "clear_at_head_sha": stage_result.get("clear_at_head_sha"),
             "clear_at_base_sha": stage_result.get("clear_at_base_sha"),
+            "clearance_kind": stage_result.get("clearance_kind"),
+            **common.ci_warning_fields([stage_result]),
             "outcome": stage_result.get("outcome"),
             "reason": stage_result.get("reason"),
             "status_state": stage_result.get("status_state"),
@@ -182,6 +184,20 @@ def stage_result_summary(stage_result: dict[str, Any]) -> dict[str, Any]:
         }.items()
         if value is not None
     }
+
+
+def stack_ci_warning_fields(pull_requests: list[dict[str, Any]]) -> dict[str, Any]:
+    warnings = [
+        {
+            **warning,
+            "number": pull_request["number"],
+            "head_sha": pull_request["head_sha"],
+            "base_sha": pull_request["base_sha"],
+        }
+        for pull_request in pull_requests
+        for warning in pull_request.get("ci_warnings", [])
+    ]
+    return {"ci_warnings": warnings, "all_ci_passed": False} if warnings else {}
 
 
 def gh_json(arguments: list[str]) -> Any:
@@ -574,6 +590,9 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
         elif blocked:
             outcome = f"blocked for #{number}: {blocked}"
             next_action = "Stop without launching a replacement worker."
+        elif clear and payload.get("clearance_kind") == "ci_warning":
+            outcome = f"completed WITH CI WARNINGS for #{number}"
+            next_action = "Collect any remaining worker results; not all CI passed."
         elif clear:
             outcome = f"completed for #{number}"
             next_action = "Collect any remaining worker results."
@@ -664,6 +683,10 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
         elif blocked:
             outcome = f"blocked: {blocked.get('reason', 'unknown reason')}"
             next_action = "Continue to the snapshot or next bounded pass."
+        elif clear and payload.get("ci_warnings"):
+            affected = sorted({warning["number"] for warning in payload["ci_warnings"]})
+            outcome = f"completed WITH CI WARNINGS for {format_pull_requests(affected)}"
+            next_action = "Continue with the next stage; not all CI passed."
         elif clear:
             outcome = "complete"
             next_action = "Revalidate the stack, then start the next stage."
@@ -687,6 +710,11 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
             "message": (
                 f"{prefix}snapshot {payload.get('result')}"
                 + (
+                    " WITH CI WARNINGS; not all CI passed"
+                    if payload.get("ci_warnings")
+                    else ""
+                )
+                + (
                     f": {payload.get('reason')}."
                     if payload.get("reason")
                     else "."
@@ -702,9 +730,19 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
         }
     elif event == "stack_pipeline_finished":
         result = payload.get("result", "unknown")
+        reported_result = (
+            "completed"
+            if result == "complete" and payload.get("all_ci_passed") is False
+            else result
+        )
         update = {
             "message": (
-                f"Stack pipeline {result}"
+                f"Stack pipeline {reported_result}"
+                + (
+                    " WITH CI WARNINGS; not all CI passed"
+                    if payload.get("all_ci_passed") is False
+                    else ""
+                )
                 + (f": {payload.get('reason')}." if payload.get("reason") else ".")
             ),
             "next_action": "Report the final pipeline result.",
@@ -716,6 +754,16 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
     else:
         return None
 
+    if payload.get("ci_warnings"):
+        update["ci_warnings"] = payload["ci_warnings"]
+        update["all_ci_passed"] = False
+        if "WITH CI WARNINGS" not in update["message"]:
+            update["message"] += " WITH CI WARNINGS; not all CI passed."
+    if payload.get("ci_warning_revalidation_error"):
+        update["message"] += (
+            " CI warning status could not be revalidated: "
+            f"{payload['ci_warning_revalidation_error']}."
+        )
     update.update(
         {
             "event": PROGRESS_EVENT,
@@ -2104,6 +2152,8 @@ class StackPipeline:
             clear_at_base_sha=completion["stage_result"].get("clear_at_base_sha"),
             current_head_sha=completion.get("current_head_sha"),
             current_base_sha=completion.get("current_base_sha"),
+            clearance_kind=stage_result.get("clearance_kind"),
+            **common.ci_warning_fields([stage_result]),
             status=(
                 "blocked"
                 if blocker is not None
@@ -2455,14 +2505,12 @@ class StackPipeline:
     ) -> dict[str, Any]:
         """Decide whether repairing this member can start yet.
 
-        A higher member is only repaired once the member directly below it is
-        green at the head it currently has, and once this member's own head
-        already contains that commit. Repairing above a red or unmerged
-        predecessor produces failures that belong to the predecessor.
+        A higher member starts once its predecessor has current CI clearance,
+        including verified warnings, and its own head contains that commit.
         """
         if predecessor is None:
             return {"ready": True, "reason": "lowest_selected"}
-        if not (predecessor_state or {}).get("green"):
+        if not (predecessor_state or {}).get("clear"):
             return {
                 "ready": False,
                 "reason": "predecessor_is_not_green",
@@ -2482,7 +2530,14 @@ class StackPipeline:
                 "predecessor": predecessor["number"],
                 "predecessor_head_sha": predecessor_head,
             }
-        return {"ready": True, "reason": "predecessor_is_green"}
+        return {
+            "ready": True,
+            "reason": (
+                "predecessor_has_ci_warning"
+                if predecessor_state.get("clearance_kind") == "ci_warning"
+                else "predecessor_is_green"
+            ),
+        }
 
     def monitor_ci_worker(
         self, worker: dict[str, Any], request: dict[str, Any]
@@ -2630,6 +2685,7 @@ class StackPipeline:
         gates: list[dict[str, Any]] = []
         propagations: list[dict[str, Any]] = []
         verified_clear: set[int] = set()
+        warning_members: list[dict[str, Any]] = []
         blocked: dict[str, Any] | None = None
         stopped: dict[str, Any] | None = None
         current_selected = selected
@@ -2644,10 +2700,16 @@ class StackPipeline:
                 if (
                     previous is not None
                     and previous_state is not None
-                    and previous["head_sha"] != previous_state["head_sha"]
+                    and (
+                        previous["head_sha"] != previous_state["head_sha"]
+                        or (
+                            previous_state.get("clearance_kind") == "ci_warning"
+                            and self.base_sha_for(previous) != previous_state["base_sha"]
+                        )
+                    )
                 ):
                     previous_state = {
-                        "green": False,
+                        "clear": False,
                         "head_sha": previous["head_sha"],
                     }
                 gate = self.ci_gate(member, previous, previous_state)
@@ -2689,9 +2751,12 @@ class StackPipeline:
                         current_selected = refreshed
                         member = current_selected[index]
                         previous = current_selected[index - 1]
-                        if previous["head_sha"] != predecessor_head:
+                        if previous["head_sha"] != predecessor_head or (
+                            previous_state.get("clearance_kind") == "ci_warning"
+                            and self.base_sha_for(previous) != previous_state["base_sha"]
+                        ):
                             previous_state = {
-                                "green": False,
+                                "clear": False,
                                 "head_sha": previous["head_sha"],
                             }
                         gate = self.ci_gate(member, previous, previous_state)
@@ -2770,12 +2835,24 @@ class StackPipeline:
                 self.record_stage(
                     member["number"],
                     STAGE_CI,
-                    {"pass": pass_number, "action": "already_clear"},
+                    {
+                        "pass": pass_number,
+                        "action": "already_clear",
+                        **stage_result_summary(before),
+                    },
                 )
                 previous, previous_state = member, {
-                    "green": True,
+                    "clear": True,
+                    "clearance_kind": before.get("clearance_kind"),
                     "head_sha": member["head_sha"],
+                    "base_sha": base_sha,
                 }
+                warning_members.append({
+                    "number": member["number"],
+                    "head_sha": member["head_sha"],
+                    "base_sha": base_sha,
+                    **common.ci_warning_fields([before]),
+                })
                 verified_clear.add(member["number"])
                 continue
             launched = self.dispatch([request], STAGE_CI, pass_number)
@@ -2827,7 +2904,7 @@ class StackPipeline:
                 member["head_sha"],
                 base_sha,
             )
-            green = (
+            clear = (
                 bool(after["clear"])
                 and completion["accepted"]
                 and completion.get("returncode") == 0
@@ -2841,6 +2918,9 @@ class StackPipeline:
                     "returncode": completion.get("returncode"),
                     "clear": after["clear"],
                     "clear_at_head_sha": after.get("clear_at_head_sha"),
+                    "clear_at_base_sha": after.get("clear_at_base_sha"),
+                    "clearance_kind": after.get("clearance_kind"),
+                    **common.ci_warning_fields([after]),
                     "current_head_sha": completion.get("current_head_sha"),
                     "current_base_sha": completion.get("current_base_sha"),
                     "outcome": completion.get("stage_result", {}).get("outcome"),
@@ -2849,11 +2929,19 @@ class StackPipeline:
             )
             previous = member
             previous_state = {
-                "green": green,
+                "clear": clear,
+                "clearance_kind": after.get("clearance_kind"),
                 "head_sha": after.get("clear_at_head_sha") or member["head_sha"],
+                "base_sha": base_sha,
             }
-            if green:
+            if clear:
                 verified_clear.add(member["number"])
+                warning_members.append({
+                    "number": member["number"],
+                    "head_sha": member["head_sha"],
+                    "base_sha": base_sha,
+                    **common.ci_warning_fields([after]),
+                })
             if stopped is not None:
                 break
         result = {
@@ -2872,6 +2960,7 @@ class StackPipeline:
                     member["number"] in verified_clear for member in current_selected
                 )
             ),
+            **stack_ci_warning_fields(warning_members),
         }
         self.emit(
             "phase_finished",
@@ -2967,6 +3056,7 @@ class StackPipeline:
                     "uncleared": [
                         stage["stage"] for stage in stages if not stage["clear"]
                     ],
+                    **common.ci_warning_fields(stages),
                 }
             )
         closing = self.revalidate()
@@ -3016,6 +3106,7 @@ class StackPipeline:
             "reason": None if complete else "stages_not_clear",
             "fingerprint": opening["fingerprint"],
             "pull_requests": pull_requests,
+            **stack_ci_warning_fields(pull_requests),
         }
 
     # Run -----------------------------------------------------------------
@@ -3051,6 +3142,52 @@ class StackPipeline:
             },
         )
 
+    def current_ci_warnings(self) -> dict[str, Any]:
+        recorded = self.state.get("pull_requests", {})
+        numbers = [
+            int(number)
+            for number, record in recorded.items()
+            if record.get("stages", {}).get(STAGE_CI, {}).get("ci_warnings")
+        ]
+        if not numbers:
+            return {}
+        current = self.revalidate()
+        if (
+            current["result"] != "ready"
+            or current["fingerprint"] != self.state.get("topology_fingerprint")
+        ):
+            return {
+                "ci_warning_revalidation_error": (
+                    "the live stack identity could not be revalidated"
+                )
+            }
+        warnings = []
+        errors = []
+        for member in current["selected"]:
+            if member["number"] not in numbers:
+                continue
+            base_sha = self.base_sha_for(member)
+            if base_sha is None:
+                errors.append(f"#{member['number']}: the live base revision could not be read")
+                continue
+            stage = self.clearance(
+                member["number"], STAGE_CI, member["head_sha"], base_sha
+            )
+            if stage.get("reason") in common.UNAVAILABLE_STATUS_REASONS | {"no_state"}:
+                errors.append(f"#{member['number']}: {stage['reason']}")
+            warnings.append(
+                {
+                    "number": member["number"],
+                    "head_sha": member["head_sha"],
+                    "base_sha": base_sha,
+                    **common.ci_warning_fields([stage]),
+                }
+            )
+        return {
+            **stack_ci_warning_fields(warnings),
+            **({"ci_warning_revalidation_error": "; ".join(errors)} if errors else {}),
+        }
+
     def finish(
         self,
         result: str,
@@ -3084,6 +3221,17 @@ class StackPipeline:
             payload["detail"] = detail
         if snapshot is not None:
             payload["snapshot"] = snapshot
+        if result in {"complete", "partial"} and snapshot is not None:
+            if snapshot.get("ci_warnings"):
+                payload.update({
+                    "ci_warnings": snapshot["ci_warnings"],
+                    "all_ci_passed": False,
+                })
+        else:
+            try:
+                payload.update(self.current_ci_warnings())
+            except (WorkflowError, json.JSONDecodeError, OSError) as error:
+                payload["ci_warning_revalidation_error"] = str(error)
         if self.session_title is not None:
             payload["session_title"] = self.session_title
         try:
@@ -3329,6 +3477,11 @@ class StackPipeline:
                 pull_request_pass=pass_number,
                 result=snapshot["result"],
                 reason=snapshot.get("reason"),
+                **(
+                    {"ci_warnings": snapshot["ci_warnings"], "all_ci_passed": False}
+                    if snapshot.get("ci_warnings")
+                    else {}
+                ),
             )
             if snapshot["result"] == "complete":
                 return self.finish(
@@ -3399,6 +3552,11 @@ def summarize_phase(phase: dict[str, Any]) -> dict[str, Any]:
         summary["blocked"] = phase["blocked"]
     if phase.get("action") is not None:
         summary["action"] = phase["action"]
+    if phase.get("ci_warnings"):
+        summary.update({
+            "ci_warnings": phase["ci_warnings"],
+            "all_ci_passed": False,
+        })
     return summary
 
 
@@ -3432,6 +3590,8 @@ def compact_terminal_result(
                         "reason": stage.get("reason"),
                         "clear_at_head_sha": stage.get("clear_at_head_sha"),
                         "clear_at_base_sha": stage.get("clear_at_base_sha"),
+                        "clearance_kind": stage.get("clearance_kind"),
+                        "all_ci_passed": stage.get("all_ci_passed"),
                     }.items()
                     if value is not None
                 }
@@ -3453,6 +3613,26 @@ def compact_terminal_result(
     def limited(values: Any) -> list[Any]:
         return list(values[:TERMINAL_RESULT_MAX_PULL_REQUESTS]) if isinstance(values, list) else []
 
+    warnings_source = payload.get("ci_warnings", [])
+    warnings = [
+        {
+            **{
+                key: warning[key]
+                for key in ("number", "head_sha", "base_sha", "diagnosis")
+            },
+            **{
+                key: clipped_text(warning[key])
+                for key in ("check_key", "name", "reason")
+            },
+            "evidence": [clipped_text(item) for item in limited(warning["evidence"])],
+            **(
+                {"evidence_omitted": len(warning["evidence"]) - len(limited(warning["evidence"]))}
+                if len(warning["evidence"]) > TERMINAL_RESULT_MAX_PULL_REQUESTS
+                else {}
+            ),
+        }
+        for warning in limited(warnings_source)
+    ]
     phases = []
     for phase in payload.get("phases", [])[:TERMINAL_RESULT_MAX_PHASES]:
         stopped = phase.get("stopped")
@@ -3475,6 +3655,7 @@ def compact_terminal_result(
                     "accepted": limited(phase.get("accepted")),
                     "ignored": limited(phase.get("ignored")),
                     "clear": phase.get("clear"),
+                    "all_ci_passed": phase.get("all_ci_passed"),
                     "reasons": [
                         clipped_text(reason, 128) for reason in limited(phase.get("reasons"))
                     ],
@@ -3527,6 +3708,31 @@ def compact_terminal_result(
                 else None
             ),
             "passes": payload.get("passes"),
+            "all_ci_passed": payload.get("all_ci_passed"),
+            "ci_warnings": warnings,
+            "ci_warning_revalidation_error": clipped_text(
+                payload.get("ci_warning_revalidation_error")
+            ),
+            "ci_warnings_omitted": (
+                len(warnings_source) - len(warnings)
+                if len(warnings_source) > len(warnings)
+                else None
+            ),
+            "ci_warning_details_truncated": (
+                True
+                if any(
+                    len(warning[key]) > TERMINAL_TEXT_MAX_CHARS
+                    for warning in warnings_source
+                    for key in ("check_key", "name", "reason")
+                )
+                or any(
+                    len(item) > TERMINAL_TEXT_MAX_CHARS
+                    or len(warning["evidence"]) > TERMINAL_RESULT_MAX_PULL_REQUESTS
+                    for warning in warnings_source
+                    for item in warning["evidence"]
+                )
+                else None
+            ),
             "session_title": clipped_text(payload.get("session_title")),
             "phases": phases,
             "propagations": propagations,
@@ -3574,6 +3780,9 @@ def compact_terminal_result(
     if size() > TERMINAL_RESULT_MAX_BYTES:
         compact.pop("snapshot", None)
         compact["terminal_detail_omitted"] = True
+    while warnings and size() > TERMINAL_RESULT_MAX_BYTES:
+        warnings.pop()
+        compact["ci_warnings_omitted"] = len(warnings_source) - len(warnings)
     return compact
 
 

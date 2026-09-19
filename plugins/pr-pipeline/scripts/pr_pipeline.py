@@ -365,7 +365,11 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
     elif event == "stage_finished":
         clear = payload.get("clear")
         action = payload.get("action")
-        if action == "already_clear":
+        if payload.get("returncode") not in (None, 0):
+            outcome = f"failed with exit code {payload['returncode']}"
+        elif clear and payload.get("clearance_kind") == "ci_warning":
+            outcome = "completed WITH CI WARNINGS"
+        elif action == "already_clear":
             outcome = "already clear"
         elif clear:
             outcome = "complete"
@@ -392,10 +396,12 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
         uncleared = payload.get("uncleared_stages") or []
         update = {
             "message": (
-                f"{prefix}complete"
+                f"{prefix}{'completed' if payload.get('ci_warnings') else 'complete'}"
                 + (
                     f"; still uncleared: {', '.join(uncleared)}."
                     if uncleared
+                    else " WITH CI WARNINGS; not all CI passed."
+                    if payload.get("ci_warnings")
                     else "; all stages are clear."
                 )
             ),
@@ -408,9 +414,17 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
         }
     elif event == "pipeline_finished":
         result = payload.get("result", "unknown")
+        reported_result = (
+            "completed" if result == "complete" and payload.get("ci_warnings") else result
+        )
         update = {
             "message": (
-                f"PR pipeline {result}"
+                f"PR pipeline {reported_result}"
+                + (
+                    " WITH CI WARNINGS; not all CI passed"
+                    if payload.get("ci_warnings")
+                    else ""
+                )
                 + (f": {payload.get('reason')}." if payload.get("reason") else ".")
             ),
             "next_action": "Report the final pipeline result.",
@@ -422,6 +436,11 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
     else:
         return None
 
+    if payload.get("ci_warnings"):
+        update["ci_warnings"] = payload["ci_warnings"]
+        update["all_ci_passed"] = False
+        if "WITH CI WARNINGS" not in update["message"]:
+            update["message"] += " WITH CI WARNINGS; not all CI passed."
     update.update(
         {
             "event": PROGRESS_EVENT,
@@ -740,6 +759,20 @@ def blocked_result(
         payload["retained_commits"] = retained_commits
     if stages is not None:
         payload["stages"] = stages
+    current_stages = stages
+    if current_stages is None:
+        last_ci = next(
+            (record for record in reversed(runs) if record["stage"] == STAGE_CI),
+            None,
+        )
+        current_stages = (
+            [last_ci]
+            if last_ci
+            and last_ci.get("clear_at_head_sha") == pr.get("head_sha")
+            and last_ci.get("clear_at_base_sha") == pr.get("base_sha")
+            else []
+        )
+    payload.update(common.ci_warning_fields(current_stages))
     return payload
 
 
@@ -854,6 +887,10 @@ def run_pipeline(
                     "clear": True,
                     "stage_reason": before["reason"],
                     "status": before["status"],
+                    "clearance_kind": before.get("clearance_kind"),
+                    "clear_at_head_sha": before.get("clear_at_head_sha"),
+                    "clear_at_base_sha": before.get("clear_at_base_sha"),
+                    **common.ci_warning_fields([before]),
                     "published_commits": [],
                 }
                 runs.append(record)
@@ -982,6 +1019,8 @@ def run_pipeline(
                         "clear_at_base_sha": stage_result.get("clear_at_base_sha"),
                         "inspected_base_sha": current_pr["base_sha"],
                         "status": stage_result["status"],
+                        "clearance_kind": stage_result.get("clearance_kind"),
+                        **common.ci_warning_fields([stage_result]),
                         "retained_commits": retained_commits,
                     }
                 )
@@ -1022,6 +1061,8 @@ def run_pipeline(
                     "clear_at_base_sha": after.get("clear_at_base_sha"),
                     "inspected_base_sha": current_pr["base_sha"],
                     "status": after["status"],
+                    "clearance_kind": after.get("clearance_kind"),
+                    **common.ci_warning_fields([after]),
                 }
             )
             runs.append(record)
@@ -1099,6 +1140,7 @@ def run_pipeline(
             uncleared_stages=[
                 stage["stage"] for stage in stages if not stage["clear"]
             ],
+            **common.ci_warning_fields(stages),
         )
         if all(stage["clear"] for stage in stages):
             return {
@@ -1109,6 +1151,7 @@ def run_pipeline(
                 "sweeps": completed_sweeps,
                 "stages": stages,
                 "runs": runs,
+                **common.ci_warning_fields(stages),
             }
         if sweep == MAX_SWEEPS:
             return {
@@ -1120,6 +1163,7 @@ def run_pipeline(
                 "sweeps": completed_sweeps,
                 "stages": stages,
                 "runs": runs,
+                **common.ci_warning_fields(stages),
             }
         if not head_changed and not base_changed:
             return {
@@ -1131,6 +1175,7 @@ def run_pipeline(
                 "sweeps": completed_sweeps,
                 "stages": stages,
                 "runs": runs,
+                **common.ci_warning_fields(stages),
             }
 
     raise WorkflowError("the pipeline ended without a result")

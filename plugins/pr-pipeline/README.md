@@ -20,6 +20,7 @@ flowchart LR
         conflict --> copilotReview --> selfReview --> ci --> description
         ci -->|"candidate publication stays pending"| checks
         checks -->|"trusted terminal green"| description
+        ci -->|"verified unrelated/pre-existing warning"| description
     end
 
     scheduler --> conflict
@@ -58,7 +59,13 @@ No stage trusts model-authored explanations, identities, SHAs, paths, mappings, 
 | Conflict Resolver | A mechanically valid result names the current head and base, or GitHub already reports the pull request mergeable. Optional report prose does not matter. |
 | Copilot Review | The minimized local decision result clears the current head. Under `source-only`, a verified run-bound policy skip is clear with `clean_at_head_sha` set to `null`. |
 | Self Review | Terminal candidate handling clears the current head. Zero code commits means clean with no fixes. Imported commits advance the source only through the helper's exact source and publication guards. |
-| CI Fix | Candidate publication is pending. Only trusted GitHub checks and statuses bound to the exact published source SHA can record green. The coordinator uses bounded polling and never runs candidate Gradle, Maven, tests, or builds locally. |
+| CI Fix | Candidate publication is pending. Only trusted GitHub checks and statuses bound to the exact published source SHA can record green. A coordinator-verified diagnosis of unrelated or pre-existing failures can instead clear orchestration with CI warnings at the exact head and base, never a clean marker. Unknown failures remain uncleared. The coordinator uses bounded polling and never runs candidate Gradle, Maven, tests, or builds locally. |
 | PR Description | A keep result clears without mutation. A replacement applies only when GitHub mutation policy is `allow`. Under `source-only`, the helper keeps the proposal but does not change title or body, so the stage remains uncleared. |
 
-The caller freezes `--github-mutation-policy` at `start`. Both single-PR and stack schedulers forward it to Copilot Review, Self Review, and PR Description. `source-only` permits guarded source publication but forbids comments, reviews, thread changes, draft changes, title changes, body changes, and all other pull request metadata mutation.
+The caller freezes `--github-mutation-policy` at `start`. Both single-PR and stack schedulers forward it to Copilot Review, Self Review, CI Fix, and PR Description. `allow` permits bounded, guarded failed-job reruns through CI Fix. `source-only` permits guarded source publication but forbids reruns, comments, reviews, thread changes, draft changes, title changes, body changes, and all other pull request metadata mutation. No policy permits empty commits as a rerun workaround.
+
+CI warning clearance requires `stage_outcome: "warning"`, `clean_at_head_sha: null`, exact `warning_at_head_sha` and `warning_at_base_sha` markers, and a nonempty `ci_warnings` list. Each entry names its `check_key`, `name`, `diagnosis` of `unrelated` or `pre_existing`, nonempty `reason`, and nonempty string `evidence` list. The CI coordinator derives these warnings from a fresh completed hosted task. Pipeline reads only its run-bound status envelope, never a hosted report or an old task.
+
+Warnings remain visible while review and description work continues. Unchanged warning clearance does not spend another CI attempt; either head or base movement invalidates it. In a stack, a warning-cleared predecessor can unblock the next member only while that clearance is current and the descendant contains its head. This does not filter failures by required-check status or repository-specific rules.
+
+A finished workflow retains `result: "complete"` for compatibility. With current CI warnings, its terminal result also contains `ci_warnings` and `all_ci_passed: false`, and observers report **completed WITH CI WARNINGS**, never all CI green. Stack warnings include each affected pull request's `number`, `head_sha`, and `base_sha`. The bounded stack event points to its full result artifact when warning details are omitted or truncated.

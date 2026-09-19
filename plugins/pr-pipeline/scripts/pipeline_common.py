@@ -102,6 +102,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "marker": ("clean_at_head_sha",),
         "model": DEFAULT_STAGE_MODEL,
         "required_model": DEFAULT_STAGE_MODEL,
+        "github_mutation_policy": True,
     },
     {
         "stage": STAGE_DESCRIPTION,
@@ -1460,6 +1461,7 @@ STAGE_STATUS_FIELDS = (
     "agent_task",
     "attempt",
     "budget_scope",
+    "ci_warnings",
     "coordinator",
     "escalation",
     "github_mutation_policy",
@@ -1483,6 +1485,8 @@ STAGE_STATUS_FIELDS = (
     "terminal_exit",
     "thread_mutations",
     "validated_head_sha",
+    "warning_at_head_sha",
+    "warning_at_base_sha",
 )
 
 ACTIVE_TASK_STATES = frozenset(
@@ -1521,6 +1525,40 @@ def stage_status_summary(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
     return {key: payload[key] for key in STAGE_STATUS_FIELDS if key in payload}
+
+
+def valid_ci_warnings(warnings: Any) -> bool:
+    return (
+        isinstance(warnings, list)
+        and bool(warnings)
+        and all(
+            isinstance(warning, dict)
+            and all(
+                isinstance(warning.get(key), str) and bool(warning[key].strip())
+                for key in ("check_key", "name", "reason")
+            )
+            and warning.get("diagnosis") in ("unrelated", "pre_existing")
+            and isinstance(warning.get("evidence"), list)
+            and bool(warning["evidence"])
+            and all(
+                isinstance(evidence, str) and bool(evidence.strip())
+                for evidence in warning["evidence"]
+            )
+            for warning in warnings
+        )
+    )
+
+
+def ci_warning_fields(stages: list[dict[str, Any]]) -> dict[str, Any]:
+    warnings = [
+        warning
+        for stage in stages
+        if stage.get("stage") == STAGE_CI
+        and stage.get("clear") is True
+        and stage.get("clearance_kind") == "ci_warning"
+        for warning in stage.get("ci_warnings", [])
+    ]
+    return {"ci_warnings": warnings, "all_ci_passed": False} if warnings else {}
 
 
 def stage_blocker(
@@ -1637,6 +1675,18 @@ def inspect_stage(
     )
     outcome = payload.get("stage_outcome") if isinstance(payload, dict) else None
     marker = skip_marker if outcome == "skipped" and skip_marker_path else review_marker
+    warning_is_valid = False
+    if outcome == "warning" and entry["stage"] == STAGE_CI:
+        marker = string_at(payload, ("warning_at_head_sha",))
+        base_marker_path = ("warning_at_base_sha",)
+        base_marker = string_at(payload, base_marker_path)
+        warning_is_valid = (
+            "clean_at_head_sha" in payload
+            and payload["clean_at_head_sha"] is None
+            and payload.get("warning_at_head_sha") == marker
+            and payload.get("warning_at_base_sha") == base_marker
+            and valid_ci_warnings(payload.get("ci_warnings"))
+        )
     head_is_clear = marker == head_sha
     base_is_clear = base_marker_path is None or (
         base_sha is not None and base_marker == base_sha
@@ -1732,9 +1782,14 @@ def inspect_stage(
         status.get("ok") is True
         and head_is_clear
         and base_is_clear
-        and outcome in CLEARING_OUTCOMES
+        and (outcome in CLEARING_OUTCOMES or warning_is_valid)
         and policy_skip_is_valid
     )
+    if clear and outcome == "warning":
+        clear = stage_blocker(
+            {"stage": entry["stage"], "status": stage_status_summary(payload)},
+            after_launch=False,
+        ) is None
     if clear:
         reason = None
     elif not status.get("ok"):
@@ -1749,6 +1804,8 @@ def inspect_stage(
         reason = "clearance_is_for_an_older_base"
     elif outcome == "skipped" and not policy_skip_is_valid:
         reason = "policy_skip_not_verified"
+    elif outcome == "warning":
+        reason = "ci_warning_not_verified"
     else:
         reason = status.get("reason") or outcome or "not_cleared"
     return {
@@ -1757,7 +1814,9 @@ def inspect_stage(
         "clear_at_head_sha": marker,
         "clear_at_base_sha": base_marker,
         "clearance_kind": (
-            "policy_skip"
+            "ci_warning"
+            if clear and outcome == "warning"
+            else "policy_skip"
             if clear and outcome == "skipped" and skip_marker_path is not None
             else "stage_result" if clear else None
         ),
@@ -1766,6 +1825,11 @@ def inspect_stage(
         "installed": status["installed"],
         "status_state": status["state"],
         "status": stage_status_summary(payload),
+        **(
+            {"ci_warnings": payload["ci_warnings"], "all_ci_passed": False}
+            if clear and outcome == "warning"
+            else {}
+        ),
         **({"detail": status["detail"]} if status.get("detail") else {}),
     }
 
