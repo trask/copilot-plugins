@@ -41,7 +41,7 @@ EXPECTED_PACKAGE_VERSIONS = {
     "pr-description": "1.0.64",
     "pr-pipeline": "1.5.27",
     "pr-reviewer": "1.8.11",
-    "self-review-loop": "1.3.43",
+    "self-review-loop": "1.3.44",
 }
 
 
