@@ -63,6 +63,8 @@ Write a concise final response from the complete `pipeline_finished` event. Lead
 
 When `all_ci_passed` is false or `ci_warnings` is nonempty, say **completed WITH CI WARNINGS** for a complete workflow, never all CI green or all checks passed. Include every warning's check name, diagnosis, reason, and evidence. Preserve blocked or incomplete results even when some CI warnings were accepted. Workflow completion does not prove that the failed checks passed.
 
+The helper asks CI to verify warning snapshots on every status read. A changed check or run attempt invalidates warning clearance even when the head and base are unchanged. Only a current verification with matching fingerprints can preserve warnings in completion or blocked results. Report any `ci_warning_revalidation_error`; do not reuse the earlier warning or infer that CI passed.
+
 Do not organize the response by sweep or list every stage when all are clear. Omit routine details: models, return codes, unchanged head transitions, iteration and candidate counts, empty commit lists, successful validation, state paths, and log paths. Include a successful stage detail only when it explains user-visible work, such as review findings that the run fixed.
 
 Add only the details that changed the pull request or need attention:

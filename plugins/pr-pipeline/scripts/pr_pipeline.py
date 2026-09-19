@@ -441,6 +441,11 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
         update["all_ci_passed"] = False
         if "WITH CI WARNINGS" not in update["message"]:
             update["message"] += " WITH CI WARNINGS; not all CI passed."
+    if payload.get("ci_warning_revalidation_error"):
+        update["message"] += (
+            " CI warning status could not be revalidated: "
+            f"{payload['ci_warning_revalidation_error']}."
+        )
     update.update(
         {
             "event": PROGRESS_EVENT,
@@ -772,7 +777,22 @@ def blocked_result(
             and last_ci.get("clear_at_base_sha") == pr.get("base_sha")
             else []
         )
-    payload.update(common.ci_warning_fields(current_stages))
+    if common.ci_warning_fields(current_stages):
+        try:
+            current_ci = inspect_stage_for_run(
+                STAGE_BY_NAME[STAGE_CI],
+                common.target_for(pr["repo_name"], pr["number"]),
+                pr["head_sha"],
+                pr["base_sha"],
+                run_id,
+            )
+            payload.update(common.ci_warning_fields([current_ci]))
+            if current_ci.get("reason") in UNAVAILABLE_STATUS_REASONS | {
+                "no_state", "ci_warning_not_verified",
+            }:
+                payload["ci_warning_revalidation_error"] = current_ci["reason"]
+        except (WorkflowError, json.JSONDecodeError, OSError) as error:
+            payload["ci_warning_revalidation_error"] = str(error)
     return payload
 
 

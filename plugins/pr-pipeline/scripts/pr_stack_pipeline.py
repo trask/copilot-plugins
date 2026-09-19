@@ -173,6 +173,7 @@ def stage_result_summary(stage_result: dict[str, Any]) -> dict[str, Any]:
             "clear_at_head_sha": stage_result.get("clear_at_head_sha"),
             "clear_at_base_sha": stage_result.get("clear_at_base_sha"),
             "clearance_kind": stage_result.get("clearance_kind"),
+            "warning_verification": stage_result.get("warning_verification"),
             **common.ci_warning_fields([stage_result]),
             "outcome": stage_result.get("outcome"),
             "reason": stage_result.get("reason"),
@@ -2516,6 +2517,20 @@ class StackPipeline:
                 "reason": "predecessor_is_not_green",
                 "predecessor": predecessor["number"],
             }
+        if predecessor_state.get("clearance_kind") == "ci_warning":
+            current = self.clearance(
+                predecessor["number"],
+                STAGE_CI,
+                predecessor["head_sha"],
+                self.base_sha_for(predecessor),
+            )
+            if not current["clear"]:
+                return {
+                    "ready": False,
+                    "reason": current.get("reason") or "ci_warning_not_verified",
+                    "predecessor": predecessor["number"],
+                    "stage_result": stage_result_summary(current),
+                }
         predecessor_head = (predecessor_state or {}).get("head_sha")
         if not predecessor_head:
             return {
@@ -2778,6 +2793,13 @@ class StackPipeline:
                         }
                         break
                 if not gate["ready"]:
+                    if gate["reason"] != "predecessor_head_is_not_contained":
+                        verified_clear.discard(gate["predecessor"])
+                        warning_members = [
+                            warning_member
+                            for warning_member in warning_members
+                            if warning_member["number"] != gate["predecessor"]
+                        ]
                     self.record_stage(
                         member["number"],
                         STAGE_CI,
@@ -3041,6 +3063,7 @@ class StackPipeline:
                     in {
                         "clearance_is_for_an_older_head",
                         "clearance_is_for_an_older_base",
+                        "ci_warning_snapshot_changed",
                     }
                     else "unverified"
                 )
@@ -3173,7 +3196,9 @@ class StackPipeline:
             stage = self.clearance(
                 member["number"], STAGE_CI, member["head_sha"], base_sha
             )
-            if stage.get("reason") in common.UNAVAILABLE_STATUS_REASONS | {"no_state"}:
+            if stage.get("reason") in common.UNAVAILABLE_STATUS_REASONS | {
+                "no_state", "ci_warning_not_verified",
+            }:
                 errors.append(f"#{member['number']}: {stage['reason']}")
             warnings.append(
                 {

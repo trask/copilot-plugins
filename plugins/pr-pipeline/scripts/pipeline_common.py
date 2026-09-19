@@ -1361,9 +1361,12 @@ def read_stage_status(
         return {**common, "ok": False, "reason": "plugin_not_installed"}
     if not state.is_file():
         return {**common, "ok": False, "reason": "no_state"}
+    command = [sys.executable, str(script), "status", "--state", str(state)]
+    if entry["stage"] == STAGE_CI:
+        command.append("--verify-warning-snapshot")
     try:
         process = run(
-            [sys.executable, str(script), "status", "--state", str(state)],
+            command,
             check=False,
             timeout=30,
         )
@@ -1487,6 +1490,7 @@ STAGE_STATUS_FIELDS = (
     "validated_head_sha",
     "warning_at_head_sha",
     "warning_at_base_sha",
+    "warning_verification",
 )
 
 ACTIVE_TASK_STATES = frozenset(
@@ -1546,6 +1550,19 @@ def valid_ci_warnings(warnings: Any) -> bool:
             )
             for warning in warnings
         )
+    )
+
+
+def current_ci_warning_verification(verification: Any) -> bool:
+    if not isinstance(verification, dict):
+        return False
+    expected = verification.get("expected_snapshot_sha256")
+    return (
+        verification.get("result") == "current"
+        and verification.get("reason") == "ci_warning_snapshot_current"
+        and isinstance(expected, str)
+        and re.fullmatch(r"[0-9a-f]{64}", expected) is not None
+        and verification.get("observed_snapshot_sha256") == expected
     )
 
 
@@ -1674,6 +1691,9 @@ def inspect_stage(
         else None
     )
     outcome = payload.get("stage_outcome") if isinstance(payload, dict) else None
+    warning_verification = (
+        payload.get("warning_verification") if isinstance(payload, dict) else None
+    )
     marker = skip_marker if outcome == "skipped" and skip_marker_path else review_marker
     warning_is_valid = False
     if outcome == "warning" and entry["stage"] == STAGE_CI:
@@ -1686,6 +1706,7 @@ def inspect_stage(
             and payload.get("warning_at_head_sha") == marker
             and payload.get("warning_at_base_sha") == base_marker
             and valid_ci_warnings(payload.get("ci_warnings"))
+            and current_ci_warning_verification(warning_verification)
         )
     head_is_clear = marker == head_sha
     base_is_clear = base_marker_path is None or (
@@ -1806,6 +1827,12 @@ def inspect_stage(
         reason = "policy_skip_not_verified"
     elif outcome == "warning":
         reason = "ci_warning_not_verified"
+    elif (
+        entry["stage"] == STAGE_CI
+        and isinstance(warning_verification, dict)
+        and warning_verification.get("result") == "stale"
+    ):
+        reason = "ci_warning_snapshot_changed"
     else:
         reason = status.get("reason") or outcome or "not_cleared"
     return {
@@ -1825,6 +1852,11 @@ def inspect_stage(
         "installed": status["installed"],
         "status_state": status["state"],
         "status": stage_status_summary(payload),
+        **(
+            {"warning_verification": warning_verification}
+            if entry["stage"] == STAGE_CI and isinstance(warning_verification, dict)
+            else {}
+        ),
         **(
             {"ci_warnings": payload["ci_warnings"], "all_ci_passed": False}
             if clear and outcome == "warning"

@@ -1877,6 +1877,12 @@ class CiWarningTest(StackFixture):
             "clean_at_head_sha": None,
             "warning_at_head_sha": head or head_of(number),
             "warning_at_base_sha": base,
+            "warning_verification": {
+                "result": "current",
+                "expected_snapshot_sha256": "e" * 64,
+                "observed_snapshot_sha256": "e" * 64,
+                "reason": "ci_warning_snapshot_current",
+            },
             "ci_warnings": [{
                 "check_key": f"check:{number}",
                 "name": "Integration tests",
@@ -1902,6 +1908,98 @@ class CiWarningTest(StackFixture):
         self.clear.add((request["number"], request["stage"]))
         if request["stage"] == MODULE.STAGE_CI:
             self.record_warning(request["number"], request["head_sha"], request["base_sha"])
+
+    def invalidate_warning(self, number):
+        self.warnings[number] = {
+            "stage_outcome": "pending",
+            "outcome": None,
+            "clean_at_head_sha": None,
+            "warning_at_head_sha": None,
+            "warning_at_base_sha": None,
+            "ci_warnings": [],
+            "all_ci_passed": False,
+            "warning_verification": {
+                "result": "stale",
+                "expected_snapshot_sha256": "e" * 64,
+                "observed_snapshot_sha256": "f" * 64,
+                "reason": "ci_warning_snapshot_changed",
+            },
+        }
+
+    def test_new_failure_at_same_revisions_invalidates_stack_snapshot(self):
+        self.clear_everything()
+        self.record_warning(11)
+        pipeline = self.pipeline()
+        self.assertEqual("complete", pipeline.final_snapshot()["result"])
+        self.invalidate_warning(11)
+        result = pipeline.final_snapshot()
+        self.assertEqual("incomplete", result["result"])
+        self.assertNotIn("ci_warnings", result)
+        ci = next(
+            stage for stage in result["pull_requests"][0]["stages"]
+            if stage["stage"] == MODULE.STAGE_CI
+        )
+        self.assertFalse(ci["clear"])
+        self.assertEqual("ci_warning_snapshot_changed", ci["reason"])
+        self.assertEqual("stale", ci["identity"])
+
+    def test_new_failure_at_same_revisions_is_not_reused_in_later_ci_phase(self):
+        self.clear_everything()
+        self.record_warning(11)
+        pipeline = self.pipeline()
+        pipeline.run_ci_phase(1, self.stack["members"])
+        self.invalidate_warning(11)
+        self.launcher.on_start = self.complete_worker
+        result = pipeline.run_ci_phase(2, self.stack["members"])
+        self.assertTrue(result["clear"])
+        self.assertEqual([11], [request["number"] for request in self.launcher.started])
+        request = self.launcher.started[0]
+        self.assertEqual("run-1", request["arguments"][request["arguments"].index("--pipeline-run") + 1])
+        self.assertEqual("2", request["arguments"][request["arguments"].index("--pipeline-iteration") + 1])
+
+    def test_predecessor_snapshot_is_revalidated_before_releasing_successor(self):
+        self.record_warning(11)
+
+        def inspect(entry, target, head, base):
+            result = self.inspect(entry, target, head, base)
+            if entry["stage"] == MODULE.STAGE_CI and target["number"] == 11:
+                self.invalidate_warning(11)
+            return result
+
+        result = self.pipeline(inspect=inspect).run_ci_phase(1, self.stack["members"])
+        self.assertFalse(result["clear"])
+        self.assertEqual(12, result["blocked"]["number"])
+        self.assertEqual("ci_warning_snapshot_changed", result["blocked"]["reason"])
+        self.assertEqual([], self.launcher.started)
+        self.assertNotIn("ci_warnings", result)
+        self.assertEqual("stale", result["gates"][-1]["stage_result"]["warning_verification"]["result"])
+
+    def test_predecessor_snapshot_is_revalidated_after_descendant_alignment(self):
+        self.record_warning(11)
+        self.contains_pairs = set()
+
+        def propagate(*args):
+            result = self.propagate(*args)
+            self.contains_pairs = None
+            self.invalidate_warning(11)
+            return result
+
+        result = self.pipeline(propagate=propagate).run_ci_phase(1, self.stack["members"])
+        self.assertFalse(result["clear"])
+        self.assertEqual("ci_warning_snapshot_changed", result["blocked"]["reason"])
+        self.assertEqual([(11, head_of(11))], self.propagated)
+        self.assertEqual([], self.launcher.started)
+        self.assertNotIn("ci_warnings", result)
+
+    def test_blocked_stack_result_drops_changed_warning_snapshot(self):
+        self.record_warning(11)
+        self.clear_everything()
+        pipeline = self.pipeline()
+        pipeline.run_ci_phase(1, self.stack["members"])
+        self.invalidate_warning(11)
+        result = pipeline.finish("blocked", reason="stage_execution_failed")
+        self.assertNotIn("ci_warnings", result)
+        self.assertNotIn("all_ci_passed", result)
 
     def test_stack_completes_with_warnings_and_runs_description_for_every_member(self):
         self.launcher.on_start = self.complete_worker

@@ -79,6 +79,8 @@ Hosted workers use `.github/agent-task-output/`. Optional `report.md` is free-fo
 
 CI can instead finish with unrelated or pre-existing failures diagnosed by a fresh hosted task and verified by the CI coordinator. Pipeline accepts only its run-bound warning status at the exact head and base, with nonempty reasons and evidence. `clearance_kind: "ci_warning"` permits orchestration to continue but never means green CI. Unknown failures remain uncleared. Every failure stays visible; no required-only filtering or repository-specific gating applies. Unchanged warnings do not spend another CI attempt, and head or base movement invalidates them.
 
+The helper asks CI to verify the whole live check snapshot on every status read. Warning clearance requires a current verification with matching fingerprints. Changed checks or run attempts invalidate warnings even at unchanged revisions. Before releasing a higher member, the helper revalidates its predecessor's warning snapshot, including after descendant alignment.
+
 A PR Conflict Resolver run is not launched again during that stack-pipeline run only after current-head and current-base clearance is verified.
 
 Never mark a pull request ready for review, approve one, create one, or post a comment.

@@ -74,6 +74,12 @@ def ci_warning_payload(head=HEAD, base=BASE) -> dict:
         "clean_at_head_sha": None,
         "warning_at_head_sha": head,
         "warning_at_base_sha": base,
+        "warning_verification": {
+            "result": "current",
+            "expected_snapshot_sha256": "e" * 64,
+            "observed_snapshot_sha256": "e" * 64,
+            "reason": "ci_warning_snapshot_current",
+        },
         "ci_warnings": [{
             "check_key": "check:77",
             "name": "Integration tests",
@@ -81,6 +87,24 @@ def ci_warning_payload(head=HEAD, base=BASE) -> dict:
             "reason": "The same failure occurs on the base revision.",
             "evidence": ["Base run 123 fails with the same error at the same line."],
         }],
+    }
+
+
+def stale_ci_warning_payload() -> dict:
+    return {
+        "stage_outcome": "pending",
+        "outcome": None,
+        "clean_at_head_sha": None,
+        "warning_at_head_sha": None,
+        "warning_at_base_sha": None,
+        "ci_warnings": [],
+        "all_ci_passed": False,
+        "warning_verification": {
+            "result": "stale",
+            "expected_snapshot_sha256": "e" * 64,
+            "observed_snapshot_sha256": "f" * 64,
+            "reason": "ci_warning_snapshot_changed",
+        },
     }
 
 
@@ -1030,6 +1054,39 @@ class MarkerTest(unittest.TestCase):
                 self.assertFalse(result["clear"])
                 self.assertEqual("ci_warning_not_verified", result["reason"])
 
+    def test_ci_warning_requires_fresh_matching_snapshot_verification(self):
+        payload = ci_warning_payload()
+        verified = payload["warning_verification"]
+        malformed = [None, {}, "current"]
+        for key, values in {
+            "result": ["stale", None, True],
+            "reason": ["ci_warning_snapshot_changed", None, ""],
+            "expected_snapshot_sha256": ["", "e" * 63, "z" * 64, None, 1],
+            "observed_snapshot_sha256": ["f" * 64, "", None],
+        }.items():
+            for value in values:
+                malformed.append({**verified, key: value})
+            malformed.append({field: value for field, value in verified.items() if field != key})
+        for verification in malformed:
+            with self.subTest(verification=verification):
+                result = self.status(
+                    MODULE.STAGE_CI, {**payload, "warning_verification": verification}
+                )
+                self.assertFalse(result["clear"])
+                self.assertEqual("ci_warning_not_verified", result["reason"])
+                self.assertNotIn("ci_warnings", result)
+        payload.pop("warning_verification")
+        self.assertFalse(self.status(MODULE.STAGE_CI, payload)["clear"])
+
+    def test_ci_snapshot_change_is_stale_at_the_same_head_and_base(self):
+        payload = stale_ci_warning_payload()
+        result = self.status(MODULE.STAGE_CI, payload)
+        self.assertFalse(result["clear"])
+        self.assertEqual("ci_warning_snapshot_changed", result["reason"])
+        self.assertEqual(payload["warning_verification"], result["warning_verification"])
+        self.assertEqual(payload["warning_verification"], result["status"]["warning_verification"])
+        self.assertNotIn("ci_warnings", result)
+
     def test_ci_warning_rejects_missing_or_populated_clean_marker(self):
         for payload in (
             {key: value for key, value in ci_warning_payload().items() if key != "clean_at_head_sha"},
@@ -1448,6 +1505,33 @@ class InvocationStateIsolationTest(unittest.TestCase):
     HEAD = "028894b47c864dc5ea068751017788d3e6966740"
     BASE = "737354d8" + ("0" * 32)
     OLD_HEAD = "a48b898a" + ("0" * 32)
+
+    def test_only_ci_status_requests_live_warning_verification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            script = Path(temporary) / "stage.py"
+            state = Path(temporary) / "invocation-state.json"
+            script.write_text("", encoding="utf-8")
+            state.write_text("{}", encoding="utf-8")
+            completed = subprocess.CompletedProcess(
+                ["python", str(script)], 0,
+                json.dumps({"result": "ready", "state": str(state), "pr": target()}),
+                "",
+            )
+            for entry in MODULE.STAGES:
+                with (
+                    self.subTest(stage=entry["stage"]),
+                    mock.patch.object(MODULE.common, "run", return_value=completed) as run,
+                ):
+                    result = MODULE.common.read_stage_status(
+                        entry, target(),
+                        script_for=lambda _: script,
+                        state_for=lambda *_: state,
+                    )
+                    self.assertTrue(result["ok"])
+                    command = run.call_args.args[0]
+                    self.assertEqual(entry["stage"] == MODULE.STAGE_CI, "--verify-warning-snapshot" in command)
+                    self.assertEqual(str(state), command[command.index("--state") + 1])
+                    self.assertEqual(30, run.call_args.kwargs["timeout"])
 
     def test_20075_reads_only_fresh_stage_state(self):
         stale_owner = "e9a8f3877a7e86e16973f9ebe01caaa2"
@@ -2061,6 +2145,66 @@ class SweepTest(unittest.TestCase):
         self.assertEqual("stage_execution_failed", result["reason"])
         self.assertFalse(result["all_ci_passed"])
         self.assertEqual(self.warning_payload["ci_warnings"], result["ci_warnings"])
+
+    def test_ci_snapshot_change_during_description_invalidates_final_completion(self):
+        self.enable_ci_warnings()
+        launch = MODULE.run_stage.side_effect
+
+        def run_stage(entry, *args, **kwargs):
+            result = launch(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_DESCRIPTION:
+                self.warning_payload = stale_ci_warning_payload()
+            return result
+
+        MODULE.run_stage.side_effect = run_stage
+        result = self.execute()
+        self.assertEqual("incomplete", result["result"])
+        self.assertEqual("stages_not_clear", result["reason"])
+        self.assertEqual(1, result["sweeps"])
+        ci = next(stage for stage in result["stages"] if stage["stage"] == MODULE.STAGE_CI)
+        self.assertEqual("ci_warning_snapshot_changed", ci["reason"])
+        self.assertNotIn("ci_warnings", result)
+        self.assertEqual(
+            [(MODULE.STAGE_CI, 1)],
+            [item for item in self.launched if item[0] == MODULE.STAGE_CI],
+        )
+
+    def test_blocked_result_rechecks_same_head_base_warning_snapshot(self):
+        self.enable_ci_warnings()
+        launch = MODULE.run_stage.side_effect
+
+        def run_stage(entry, *args, **kwargs):
+            result = launch(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_DESCRIPTION:
+                self.warning_payload = stale_ci_warning_payload()
+                result["returncode"] = 1
+            return result
+
+        MODULE.run_stage.side_effect = run_stage
+        result = self.execute()
+        self.assertEqual("blocked", result["result"])
+        self.assertEqual("stage_execution_failed", result["reason"])
+        self.assertNotIn("ci_warnings", result)
+        self.assertNotIn("all_ci_passed", result)
+
+    def test_blocked_result_reports_unverified_warning_snapshot(self):
+        self.enable_ci_warnings()
+        launch = MODULE.run_stage.side_effect
+
+        def run_stage(entry, *args, **kwargs):
+            result = launch(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_DESCRIPTION:
+                self.warning_payload.pop("warning_verification")
+                result["returncode"] = 1
+            return result
+
+        MODULE.run_stage.side_effect = run_stage
+        result = self.execute()
+        self.assertEqual("blocked", result["result"])
+        self.assertEqual("ci_warning_not_verified", result["ci_warning_revalidation_error"])
+        self.assertNotIn("ci_warnings", result)
+        update = MODULE.progress_transition({"event": "pipeline_finished", **result})
+        self.assertIn("CI warning status could not be revalidated", update["message"])
 
     def test_ci_warning_does_not_override_a_nonzero_ci_exit(self):
         self.enable_ci_warnings()
