@@ -28,6 +28,9 @@ CCR_V2_REVIEW = (
 CCR_V2_RESOLVED_REVIEW = (
     Path(__file__).parent / "fixtures" / "ccr-v2-resolved-only-review.json"
 )
+LEGACY_REVIEW_DETAILS = (
+    Path(__file__).parent / "fixtures" / "legacy-review-details-review.json"
+)
 CCA_DISABLED_RESULT = (
     Path(__file__).parent / "fixtures" / "cca-disabled-agent-task-result.json"
 )
@@ -2527,7 +2530,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("result schema version 5", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.68")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.69")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -9677,6 +9680,128 @@ class CarryOverProgressTest(unittest.TestCase):
 
 
 class SuppressedCommentTest(unittest.TestCase):
+    def test_parses_exact_legacy_review_details_body(self):
+        review = json.loads(LEGACY_REVIEW_DETAILS.read_text(encoding="utf-8"))
+        self.assertEqual(
+            hashlib.sha256(review["body"].encode("utf-8")).hexdigest(),
+            "c57a8daa9046648b080ad31ff5e4f7c7606bbdc093b25035fd661b1c3647b7b8",
+        )
+        self.assertEqual(MODULE.latest_copilot_review([review], None), review)
+        self.assertEqual(MODULE.latest_copilot_review_for_head(
+            [review], None, review["commit_id"]
+        ), review)
+        entries = MODULE.parse_suppressed_comments(review["body"])
+        self.assertEqual(entries, [{
+            "path": "instrumentation/jedis/jedis-3.0/javaagent/src/main/java/io/"
+            "opentelemetry/javaagent/instrumentation/jedis/v3_0/JedisRequest.java",
+            "line": 36,
+            "body": "[Performance] This target lookup now runs for every Redis "
+            "command, including the default legacy-semconv mode, even though both "
+            "server getters ignore `getServerTarget()` in that mode. That adds a "
+            "`Context.current()` plus `VirtualField` lookup on the command hot "
+            "path without affecting legacy telemetry; gate the lookup on stable "
+            "database semconv.",
+        }])
+        queued = MODULE.suppressed_queue(review, entries)
+        self.assertEqual(queued[0]["id"], -5203651790000)
+        self.assertEqual(queued[0]["review_id"], review["id"])
+        self.assertEqual(queued[0]["source"], "suppressed")
+        self.assertIsNone(queued[0]["thread_id"])
+        self.assertIsNone(queued[0]["reply_id"])
+
+    def test_legacy_review_details_fail_on_unparsed_or_unknown_active_feedback(self):
+        body = json.loads(LEGACY_REVIEW_DETAILS.read_text(encoding="utf-8"))["body"]
+        cases = [
+            body.replace("Suppressed comments (1)", "Suppressed comments (2)"),
+            body.replace("Suppressed comments (1)", "Suppressed comments (unknown)"),
+            body.replace("Previously missed (1)", "Previously missed (2)"),
+            body.replace("Previously missed (1)", "Previously missed (unknown)"),
+            body.replace("Previously missed (1)", "Unknown feedback (1)"),
+            body.replace("### Suppressed comments (1)", "**Suppressed comments (1)**"),
+            body.replace("### Suppressed comments (1)", ""),
+            body.replace("JedisRequest.java:36**", "JedisRequest.java**"),
+            body.replace(
+                "- **Files reviewed:**", "#### Additional concern\n"
+                "Unsupported nested feedback.\n- **Files reviewed:**"
+            ),
+            body[:body.index("* [Performance]")] + "</details>",
+            body.replace("</details>", ""),
+            body.replace("</summary>", ""),
+            "<details><summary>Review details</summary>\n"
+            "### Suppressed comments (0)\nUnexpected feedback.\n</details>",
+        ]
+        for malformed in cases:
+            with self.subTest(body=malformed), self.assertRaisesRegex(
+                MODULE.WorkflowError, "review body"
+            ):
+                MODULE.parse_suppressed_comments(malformed)
+
+    def test_legacy_review_details_exclude_markdown_and_html_resolved_history(self):
+        body = """
+<details><summary>Review details</summary>
+### Resolved since last review (1)
+#### Suppressed comments (1)
+**old.py:1**
+* Resolved markdown finding.
+<details><summary>Previously missed (1)</summary>
+<details><summary>Resolved nested finding</summary>
+`old.py:4`
+Resolved nested concern.
+</details>
+</details>
+### Suppressed comments (1)
+**src/active.py:2**
+* Active finding.
+<details><summary>Resolved since last review (1)</summary>
+### Suppressed comments (1)
+**old.py:3**
+* Resolved HTML finding.
+</details>
+- **Files reviewed:** 1/1 changed files
+- **Comments generated:** 0 new
+- **Review effort level:** Balanced
+</details>
+"""
+        self.assertEqual(MODULE.parse_suppressed_comments(body), [
+            {"path": "src/active.py", "line": 2, "body": "Active finding."},
+        ])
+        self.assertEqual(MODULE.parse_suppressed_comments(
+            body.replace("### Suppressed comments (1)\n**src/active.py:2**\n"
+                         "* Active finding.", "### Suppressed comments (0)")
+        ), [])
+
+    def test_legacy_review_details_keep_multiple_findings_and_nested_v2_feedback(self):
+        body = """
+<details><summary>Review details</summary>
+### Suppressed comments (2)
+**Previously missed (2)** - in unchanged code.
+**src/first.py:1**
+* First finding.
+```python
+### This heading is code, not a feedback boundary.
+value = 1
+```
+**src/second.py:2**
+* Second finding.
+### Review summary
+Not part of the second finding.
+<details><summary>Previously missed (1)</summary>
+<details><summary>Third finding</summary>
+`src/third.py:3`
+Third concern.
+</details>
+</details>
+</details>
+"""
+        self.assertEqual(MODULE.parse_suppressed_comments(body), [
+            {"path": "src/first.py", "line": 1,
+             "body": "First finding.\n```python\n"
+             "### This heading is code, not a feedback boundary.\nvalue = 1\n```"},
+            {"path": "src/second.py", "line": 2, "body": "Second finding."},
+            {"path": "src/third.py", "line": 3,
+             "body": "Third finding\n\nThird concern."},
+        ])
+
     def test_parses_exact_ccr_v2_previously_missed_body(self):
         review = json.loads(CCR_V2_REVIEW.read_text(encoding="utf-8"))
         self.assertEqual(
@@ -11551,6 +11676,15 @@ class CleanAtHeadShaTest(unittest.TestCase):
         self.assertIsNone(payload["clean_at_head_sha"])
         self.assertIsNone(saved.get("clean_at_head_sha"))
 
+    def test_watch_routes_legacy_review_details_without_clean_marker(self):
+        review = json.loads(LEGACY_REVIEW_DETAILS.read_text(encoding="utf-8"))
+        payload, saved = self.run_watch(review_comments=[], body=review["body"])
+        self.assertEqual(payload["result"], "review_comments")
+        self.assertEqual(payload["comment_ids"], [])
+        self.assertEqual(payload["suppressed_comment_count"], 1)
+        self.assertIsNone(payload["clean_at_head_sha"])
+        self.assertIsNone(saved.get("clean_at_head_sha"))
+
     def test_watch_fails_on_unparsed_body_feedback(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "review body"):
             self.run_watch(
@@ -12851,6 +12985,29 @@ class PreflightTargetTest(unittest.TestCase):
         self.assertEqual(len(payload["queue"]["comments"]), 1)
         self.assertEqual(payload["queue"]["comments"][0]["source"], "suppressed")
         self.assertIsNone(payload["queue"]["comments"][0]["thread_id"])
+
+    def test_preflight_queues_legacy_review_details_without_clearance(self):
+        review = json.loads(LEGACY_REVIEW_DETAILS.read_text(encoding="utf-8"))
+        review["commit_id"] = "head"
+        payload = self.run_preflight(reviews=[review])
+        self.assertEqual(payload["result"], "ready")
+        self.assertFalse(payload["head_review_clean"])
+        self.assertIsNone(payload["clean_at_head_sha"])
+        self.assertEqual(payload["suppressed_review_id"], review["id"])
+        self.assertEqual(payload["head_review_id"], review["id"])
+        self.assertEqual(len(payload["queue"]["comments"]), 1)
+        self.assertEqual(payload["queue"]["comments"][0]["id"], -5203651790000)
+        self.assertEqual(payload["queue"]["comments"][0]["source"], "suppressed")
+        self.assertIsNone(payload["queue"]["comments"][0]["thread_id"])
+
+    def test_preflight_rejects_unparsed_legacy_review_details(self):
+        review = json.loads(LEGACY_REVIEW_DETAILS.read_text(encoding="utf-8"))
+        review["commit_id"] = "head"
+        review["body"] = review["body"].replace(
+            "Suppressed comments (1)", "Suppressed comments (unknown)"
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "review body"):
+            self.run_preflight(reviews=[review])
 
     def test_preflight_reports_when_only_human_comments_remain(self):
         metadata = {"head_branch": "branch", "head_sha": "head"}

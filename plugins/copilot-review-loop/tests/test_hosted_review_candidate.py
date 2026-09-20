@@ -710,8 +710,18 @@ class HostedReviewCandidateTest(unittest.TestCase):
         self.assertIsNone(bundle["report"]["comments"][0]["thread_id"])
 
     def test_ccr_v2_body_finding_reaches_hosted_decisions_without_thread_mutation(self):
+        self.assert_body_finding_reaches_hosted_decisions(
+            "ccr-v2-previously-missed-review.json", -5259532804000
+        )
+
+    def test_legacy_review_details_reach_hosted_decisions_without_thread_mutation(self):
+        self.assert_body_finding_reaches_hosted_decisions(
+            "legacy-review-details-review.json", -5203651790000
+        )
+
+    def assert_body_finding_reaches_hosted_decisions(self, fixture, synthetic_id):
         review = json.loads((
-            Path(__file__).parent / "fixtures" / "ccr-v2-previously-missed-review.json"
+            Path(__file__).parent / "fixtures" / fixture
         ).read_text(encoding="utf-8"))
         review["commit_id"] = self.head
         pr = {
@@ -746,7 +756,7 @@ class HostedReviewCandidateTest(unittest.TestCase):
         self.candidate(fixed=False)
         bundle = self.run_worker()
         decisions = bundle["report"]["comments"]
-        self.assertEqual(decisions[0]["id"], -5259532804000)
+        self.assertEqual(decisions[0]["id"], synthetic_id)
         self.assertEqual(decisions[0]["source"], "suppressed")
         self.assertEqual(decisions[0]["disposition"], "no_change")
         self.assertIsNone(decisions[0]["thread_id"])

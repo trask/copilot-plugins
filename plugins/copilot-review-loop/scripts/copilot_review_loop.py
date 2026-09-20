@@ -2426,6 +2426,7 @@ class _ReviewBodyDetails(HTMLParser):
     ) -> None:
         if tag == "details":
             section = {
+                "start": self.source_offset(),
                 "summary_start": None, "summary_end": None,
                 "body_start": None, "end": None, "children": [],
             }
@@ -2453,6 +2454,141 @@ class _ReviewBodyDetails(HTMLParser):
             section["body_start"] = self.body.index(">", self.source_offset()) + 1
 
 
+def _legacy_suppressed_entries(content: str) -> list[dict[str, Any]]:
+    headers = list(re.finditer(
+        r"^\s*\*\*(?P<path>.+):(?P<line>\d+)\*\*\s*$",
+        content, flags=re.MULTILINE,
+    ))
+    parsed: list[dict[str, Any]] = []
+    for index, header in enumerate(headers):
+        end = (
+            headers[index + 1].start()
+            if index + 1 < len(headers) else len(content)
+        )
+        comment_body = content[header.end():end].strip()
+        comment_body = re.sub(r"^\*(?:\s+|$)", "", comment_body)
+        parsed.append({
+            "path": header["path"], "line": int(header["line"]),
+            "body": comment_body,
+        })
+    return parsed
+
+
+def _validate_body_entries(
+    parsed: list[dict[str, Any]], expected_count: int | None
+) -> None:
+    if (
+        (not parsed and expected_count != 0)
+        or (expected_count is not None and len(parsed) != expected_count)
+        or any(not entry["body"] or not entry["path"] for entry in parsed)
+    ):
+        raise WorkflowError(
+            "Copilot review body feedback could not be completely parsed"
+        )
+
+
+def _legacy_review_details(content: str) -> list[dict[str, Any]]:
+    # Nested HTML sections have their own summaries and history boundaries.
+    visible = content
+    for section in reversed(_ReviewBodyDetails(content).sections):
+        end = (
+            content.index(">", section["end"]) + 1
+            if section["end"] is not None else len(content)
+        )
+        visible = (
+            visible[:section["start"]]
+            + re.sub(r"[^\r\n]", " ", visible[section["start"]:end])
+            + visible[end:]
+        )
+    heading_text: list[str] = []
+    fence = ""
+    for line in visible.splitlines(keepends=True):
+        marker = re.match(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)", line)
+        in_fence = bool(fence)
+        if marker:
+            if not fence:
+                fence = marker[1]
+            elif (
+                marker[1][0] == fence[0] and len(marker[1]) >= len(fence)
+                and not marker[2].strip()
+            ):
+                fence = ""
+        heading_text.append(
+            re.sub(r"[^\r\n]", " ", line) if in_fence or fence else line
+        )
+    headings = list(re.finditer(
+        r"^(#{1,6})[ \t]+([^\r\n]+)", "".join(heading_text), flags=re.MULTILINE
+    ))
+    unparsed = "".join(heading_text)
+    ancestors: list[tuple[int, str]] = []
+    entries = parse_suppressed_comments(
+        content[:headings[0].start()] if headings else content
+    )
+    for index, heading in enumerate(headings):
+        level, title = len(heading[1]), heading[2].strip()
+        while ancestors and ancestors[-1][0] >= level:
+            ancestors.pop()
+        resolved = any(
+            re.match(r"Resolved since last review\b", label, re.IGNORECASE)
+            for _, label in [*ancestors, (level, title)]
+        )
+        ancestors.append((level, title))
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(content)
+        if resolved:
+            unparsed = (
+                unparsed[:heading.start()]
+                + re.sub(r"[^\r\n]", " ", unparsed[heading.start():end])
+                + unparsed[end:]
+            )
+            continue
+        if any(re.match(
+            r"(?:Suppressed comments|Previously missed)\b", label, re.IGNORECASE
+        ) for _, label in ancestors[:-1]):
+            raise WorkflowError("Copilot review body contains unparsed nested feedback")
+        if not re.match(
+            r"(?:Suppressed comments|Previously missed)\b", title, re.IGNORECASE
+        ):
+            entries.extend(parse_suppressed_comments(content[heading.end():end]))
+            continue
+        label = re.fullmatch(
+            r"(?:Suppressed comments|Previously missed)\s*\((\d+)\)",
+            title, re.IGNORECASE,
+        )
+        if label is None:
+            raise WorkflowError("Copilot review body contains an unparsed feedback section")
+        block = visible[heading.end():end]
+        block = re.sub(
+            r"(?:\r?\n[ \t]*-[ \t]+\*\*(?:Files reviewed|Comments generated|"
+            r"Review effort level):\*\*[^\r\n]*)+\s*$",
+            "", block,
+        )
+        group = re.match(
+            r"\s*\*\*Previously missed\s*\((\d+)\)\*\*[^\r\n]*(?:\r?\n|$)",
+            block, re.IGNORECASE,
+        )
+        if group:
+            if int(group[1]) != int(label[1]):
+                raise WorkflowError("Copilot review body feedback count is inconsistent")
+            block = block[group.end():]
+        if block.strip() and not re.match(r"\s*\*\*[^*\r\n]+:\d+\*\*", block):
+            raise WorkflowError("Copilot review body contains unparsed legacy feedback")
+        parsed = _legacy_suppressed_entries(block)
+        _validate_body_entries(parsed, int(label[1]))
+        entries.extend(parsed)
+        entries.extend(parse_suppressed_comments(content[heading.end():end]))
+        unparsed = (
+            unparsed[:heading.start()]
+            + re.sub(r"[^\r\n]", " ", unparsed[heading.start():end])
+            + unparsed[end:]
+        )
+    if re.search(
+        r"(?mi)^[ \t]*(?:#{1,6}[ \t]+|\*\*)?"
+        r"(?:Suppressed comments|Previously missed)\b", unparsed,
+    ):
+        raise WorkflowError("Copilot review body contains unparsed legacy feedback")
+    return entries
+
+
 def parse_suppressed_comments(body: str | None) -> list[dict[str, Any]]:
     if not body:
         return []
@@ -2463,6 +2599,12 @@ def parse_suppressed_comments(body: str | None) -> list[dict[str, Any]]:
         summary = html.unescape(re.sub(
             r"<[^>]+>", "", body[section["summary_start"]:section["summary_end"]]
         )).strip()
+        if summary.casefold() == "review details":
+            if section["body_start"] is None or section["end"] is None:
+                raise WorkflowError("Copilot review body contains unparsed review details")
+            content = body[section["body_start"]:section["end"]]
+            entries.extend(_legacy_review_details(content))
+            continue
         label = re.search(
             r"suppressed comments\b|^previously missed\b", summary, re.IGNORECASE
         )
@@ -2504,29 +2646,8 @@ def parse_suppressed_comments(body: str | None) -> list[dict[str, Any]]:
                     "body": f"{title}\n\n{location['body'].strip()}",
                 })
         else:
-            headers = list(re.finditer(
-                r"^\s*\*\*(?P<path>.+):(?P<line>\d+)\*\*\s*$",
-                content, flags=re.MULTILINE,
-            ))
-            for index, header in enumerate(headers):
-                end = (
-                    headers[index + 1].start()
-                    if index + 1 < len(headers) else len(content)
-                )
-                comment_body = content[header.end():end].strip()
-                comment_body = re.sub(r"^\*(?:\s+|$)", "", comment_body)
-                parsed.append({
-                    "path": header["path"], "line": int(header["line"]),
-                    "body": comment_body,
-                })
-        if (
-            (not parsed and expected_count != 0)
-            or (expected_count is not None and len(parsed) != expected_count)
-            or any(not entry["body"] or not entry["path"] for entry in parsed)
-        ):
-            raise WorkflowError(
-                "Copilot review body feedback could not be completely parsed"
-            )
+            parsed = _legacy_suppressed_entries(content)
+        _validate_body_entries(parsed, expected_count)
         entries.extend(parsed)
     return entries
 

@@ -1,0 +1,9 @@
+{
+  "id": 5203651790,
+  "commit_id": "fd2921bd3fc40d65883d74b743826155b44bb8ff",
+  "submitted_at": "2026-09-14T22:50:32Z",
+  "state": "COMMENTED",
+  "user": {"login": "copilot-pull-request-reviewer"},
+  "html_url": "https://github.com/open-telemetry/opentelemetry-java-instrumentation/pull/20071#pullrequestreview-5203651790",
+  "body": "### \ud83d\udd35 Needs a closer look\n\nLegacy mode unnecessarily performs target lookups on every Redis command.\n\n<details>\n<summary>Review details</summary>\n\n### Suppressed comments (1)\n\n**Previously missed (1)** \u2014 in code that hasn't changed since the last review.\n\n**instrumentation/jedis/jedis-3.0/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/jedis/v3_0/JedisRequest.java:36**\n* [Performance] This target lookup now runs for every Redis command, including the default legacy-semconv mode, even though both server getters ignore `getServerTarget()` in that mode. That adds a `Context.current()` plus `VirtualField` lookup on the command hot path without affecting legacy telemetry; gate the lookup on stable database semconv.\n\n- **Files reviewed:** 20/20 changed files\n- **Comments generated:** 0 new\n- **Review effort level:** Balanced\n</details>"
+}
