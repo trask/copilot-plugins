@@ -31,10 +31,6 @@ TASK_PROMPT_MAX_CHARACTERS = (
 TASK_PROMPT_MAX_UTF8_BYTES = (
     AGENT_TASK_PROMPT_MAX_UTF8_BYTES - TASK_PROMPT_HEADROOM_UTF8_BYTES
 )
-EXACT_PATH_EVIDENCE_MAX_COUNT = 64
-EXACT_PATH_EVIDENCE_MAX_BYTES = 4_096
-PATH_EVIDENCE_BOUNDARY_COUNT = 8
-PATH_EVIDENCE_VALUE_MAX_BYTES = 256
 MODE = "conflict_with_report"
 REQUEST_SCHEMA = {"id": "github.copilot.agent-task-conflict-request", "version": 1}
 RESULT_SCHEMA = {"id": "github.copilot.agent-task-conflict-result", "version": 3}
@@ -2058,41 +2054,11 @@ def value_digest(value: object) -> str:
 
 def compact_path_evidence(paths: Sequence[str]) -> Mapping[str, object]:
     values = list(paths)
-    digest = value_digest(values)
-    encoded = canonical_json(values)
-    if (
-        len(values) <= EXACT_PATH_EVIDENCE_MAX_COUNT
-        and len(encoded) <= EXACT_PATH_EVIDENCE_MAX_BYTES
-    ):
-        return {
-            "representation": "exact",
-            "count": len(values),
-            "sha256": digest,
-            "paths": values,
-        }
-
-    def marker(path: str) -> Mapping[str, object]:
-        encoded_path = path.encode("utf-8")
-        return {
-            "path": (
-                path
-                if len(encoded_path) <= PATH_EVIDENCE_VALUE_MAX_BYTES
-                else None
-            ),
-            "utf8_sha256": hashlib.sha256(encoded_path).hexdigest(),
-            "utf8_bytes": len(encoded_path),
-        }
-
-    boundary = [
-        *values[:PATH_EVIDENCE_BOUNDARY_COUNT],
-        *values[-PATH_EVIDENCE_BOUNDARY_COUNT:],
-    ]
     return {
-        "representation": "digest_with_boundary_samples",
+        "representation": "exact",
         "count": len(values),
-        "sha256": digest,
-        "boundary": [marker(path) for path in dict.fromkeys(boundary)],
-        "complete_values_in_retained_request": True,
+        "sha256": value_digest(values),
+        "paths": values,
     }
 
 
@@ -2396,6 +2362,14 @@ def policy_prompt(
     *,
     include_per_commit_paths: bool = False,
 ) -> str:
+    path_scope = (
+        "Before editing, read the complete `allowed_paths.paths` array below. "
+        "It is the exact frozen permission set for conflict-resolution patch "
+        "differences and appended fixes, not directory or rename permission. "
+        "Preserve unaffected source patches. If a resolution requires a path "
+        "outside that set, stop rather than widening scope. The retained local "
+        "request is dispatcher evidence, not a file available to this worker.\n"
+    )
     if options.request["policy"] in (MINIMAL_POLICY, SEQUENTIAL_POLICY):
         if (
             options.request["policy"] == SEQUENTIAL_POLICY
@@ -2449,6 +2423,7 @@ def policy_prompt(
             "request, frozen head and base, model, policy, task, session, "
             "generated ref, commit, receipt, and completion identity. Do not "
             "author or echo those fields in a hosted result file.\n"
+            f"{path_scope}"
             "Compact immutable task contract (input evidence only): "
             f"{canonical_json(compact_request).decode('utf-8')}\n"
             f"{code_locator_policy}"
@@ -2544,6 +2519,7 @@ def policy_prompt(
             "frozen head/base, model, policy, task, session, generated-ref, commit, "
             "report, receipt, and completion identity. Do not author or echo those "
             "fields in the semantic artifact.\n"
+            f"{path_scope}"
             "Compact immutable task contract (input evidence only): "
             f"{canonical_json(compact_request).decode('utf-8')}\n"
             f"{code_locator_policy}"
@@ -2582,12 +2558,12 @@ def policy_prompt(
         f"Strategy: {options.strategy}\n"
         "The full retained local request is immutable evidence identified by "
         f"request SHA-256 {options.request['request_sha256']}. The compact contract "
-        "below contains every execution identity plus explicit exact or digest "
-        "representations of larger retained evidence. Never infer a replacement "
-        "identity or treat a digest summary as omitted permission.\n"
+        "below contains every execution identity, the complete allowed path set, "
+        "and digest representations of retained commit evidence. Never infer a "
+        "replacement identity or treat a digest summary as omitted permission.\n"
         "Canonical evidence digests use SHA-256 over UTF-8 JSON with sorted keys, "
-        "comma and colon separators, and non-ASCII values preserved. Boundary "
-        "sample utf8_sha256 values hash the raw UTF-8 path bytes.\n"
+        "comma and colon separators, and non-ASCII values preserved.\n"
+        f"{path_scope}"
         "Compact immutable task contract: "
         f"{canonical_json(compact_request).decode('utf-8')}\n"
         "Compact required receipt contract: "
