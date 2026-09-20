@@ -66,6 +66,41 @@ def stack_result():
     }
 
 
+def native_conflict_result():
+    error = {"code": "stale_target", "message": "pull request target changed"}
+    stage = {
+        "stage": STACK.STAGE_CONFLICT, "clear": False,
+        "outcome": "escalated", "reason": "escalated",
+        "agent_task": {
+            "status": "interrupted", "error": error, "task_id": "synthetic-task",
+            "preflight": {"evidence": ["preflight-only evidence"] * 2000},
+            "result": {
+                "status": "error", "error": error,
+                "task": {"id": "synthetic-task", "state": "completed"},
+                "application": {"status": "not_started"},
+                "generated": {"artifact": None, "code_refs": []},
+            },
+        },
+    }
+    return {
+        "result": "blocked", "reason": "stage_execution_failed",
+        "detail": f"{STACK.STAGE_CONFLICT} exited with code 1",
+        "run_id": RUN_ID, "repository": "owner/repo",
+        "stack_number": 77, "start_pull_request": 7, "selected": [7, 8], "passes": 0,
+        "phases": [{
+            "phase": STACK.STAGE_CONFLICT, "mode": STACK.PHASE_STACK_DISPATCH,
+            "dispatches": 1, "accepted": [7], "ignored": [], "clear": False,
+            "reasons": ["escalated"],
+            "stopped": {
+                "step": "stage_status", "number": 7, "stage": STACK.STAGE_CONFLICT,
+                "reason": "stage_execution_failed",
+                "detail": f"{STACK.STAGE_CONFLICT} exited with code 1",
+                "stage_result": stage,
+            },
+        }],
+    }
+
+
 def captured_bytes(callback):
     with TextIOWrapper(BytesIO(), encoding="utf-8", newline=os.linesep) as output:
         with redirect_stdout(output):
@@ -142,6 +177,53 @@ class StageFailureReportingTest(unittest.TestCase):
         self.assertEqual("stage_execution_failed", result["phases"][0]["stopped"]["reason"])
         self.assertNotIn("all_ci_passed", result)
         self.assertNotIn("synthetic evidence", json.dumps(result))
+
+    def test_native_conflict_structured_error_is_reported_by_both_summaries(self):
+        payload = native_conflict_result()
+        stage = payload["phases"][0]["stopped"]["stage_result"]
+        stack = self.stack_summary(payload)
+        standalone_stage = copy.deepcopy(stage)
+        standalone_stage["status"] = {"agent_task": standalone_stage.pop("agent_task")}
+        standalone = self.standalone_summary(standalone_stage)
+        for result in (stack, standalone):
+            self.assertEqual(
+                "stale_target: pull request target changed", result["stage_failure"]["error"],
+            )
+            self.assertEqual(STACK.STAGE_CONFLICT, result["stage_failure"]["stage"])
+            self.assertEqual("blocked", result["result"])
+            self.assertEqual("stage_execution_failed", result["reason"])
+            self.assertNotIn("all_ci_passed", result)
+        self.assertEqual(payload["detail"], stack["detail"])
+        self.assertEqual(7, stack["stage_failure"]["number"])
+        self.assertEqual(0, stack["passes"])
+        self.assertNotIn("preflight-only evidence", json.dumps(stack))
+        self.assertNotIn("synthetic-task", json.dumps(stack))
+
+    def test_large_native_structured_error_is_bounded_and_deterministic(self):
+        for field in ("code", "message"):
+            with self.subTest(field=field):
+                payload = native_conflict_result()
+                payload["phases"] *= 10
+                stage = payload["phases"][-1]["stopped"]["stage_result"]
+                error = stage["agent_task"]["error"]
+                error[field] += "\U0001f680" * 2000 + "\x00\"\\\r\n" * 2000
+                result = self.stack_summary(payload)
+                repeated = STACK.compact_terminal_result(
+                    payload, result_path=self.root / "result.json",
+                )
+                self.assertEqual(result, repeated)
+                self.assertNotIn("phases", result)
+                self.assertTrue(result["terminal_detail_omitted"])
+                failure = result["stage_failure"]
+                self.assertEqual(
+                    f"{error['code']}: {error['message']}"[:509] + "...", failure["error"],
+                )
+                self.assertTrue(failure["error_details_truncated"])
+                self.assertEqual(7, failure["number"])
+                for key in ("result", "reason", "detail"):
+                    self.assertEqual(payload[key], result[key])
+                self.assertNotIn("preflight-only evidence", json.dumps(result))
+                self.assertNotIn("synthetic-task", json.dumps(result))
 
     def test_stack_durable_result_keeps_the_complete_review_commit_sequence(self):
         code_shas = [
@@ -381,16 +463,41 @@ class StageFailureReportingTest(unittest.TestCase):
         result = STACK.common.stage_failure_summary(stage)
         self.assertEqual(ERROR, result["error"])
         self.assertNotIn("Generic stage detail", json.dumps(result))
+        stage["agent_task"]["error"] = {"code": "stale_target", "message": "Target changed"}
+        self.assertEqual(
+            "stale_target: Target changed", STACK.common.stage_failure_summary(stage)["error"],
+        )
         stage["agent_task"]["error"] = " \n "
         self.assertEqual(
             "Other task error", STACK.common.stage_failure_summary(stage)["error"],
         )
 
+    def test_structured_error_uses_only_nonempty_code_and_message_strings(self):
+        for error, expected in (
+            ({"code": "stale_target"}, "stale_target"),
+            ({"message": "Target changed"}, "Target changed"),
+            ({"code": " \n ", "message": "Target changed"}, "Target changed"),
+            ({"code": "stale_target", "message": ["invalid"]}, "stale_target"),
+            ({"code": False, "message": "Target changed"}, "Target changed"),
+            ({"code": {"nested": "ignored"}, "message": "Target changed"}, "Target changed"),
+            ({"code": "stale_target", "message": "Target changed", "detail": "ignored"},
+             "stale_target: Target changed"),
+        ):
+            with self.subTest(error=error):
+                self.assertEqual(
+                    {"error": expected},
+                    STACK.common.stage_failure_summary({"agent_task": {"error": error}}),
+                )
+
     def test_malformed_status_and_errors_are_not_stringified_or_searched(self):
         for status in (None, False, 17, "", "bad shape", [], ["error"], {}):
             with self.subTest(status=status):
                 self.assertEqual({}, STACK.common.stage_failure_summary({"status": status}))
-        for error in (None, False, 17, "", " \n ", [], ["error"], {"detail": ERROR}):
+        for error in (
+            None, False, 17, "", " \n ", [], ["error"], {"detail": ERROR},
+            {"code": 17, "message": []}, {"code": " \n ", "message": "\t"},
+            {"error": {"code": "stale_target", "message": ERROR}},
+        ):
             with self.subTest(error=error):
                 stage = {
                     "reason": "escalated",

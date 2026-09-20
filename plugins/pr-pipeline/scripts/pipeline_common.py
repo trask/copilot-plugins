@@ -1540,6 +1540,11 @@ def stage_failure_summary(stage_result: Any, *, text_limit: int = 512) -> dict[s
     for source in sources:
         task = source.get("agent_task")
         error = task.get("error") if isinstance(task, dict) else None
+        if isinstance(error, dict):
+            error = ": ".join(
+                value for key in ("code", "message")
+                if isinstance(value := error.get(key), str) and value.strip()
+            )
         if not isinstance(error, str) or not error.strip():
             continue
         result = {}
