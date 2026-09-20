@@ -506,6 +506,10 @@ class WindowsSubprocessTest(unittest.TestCase):
     def test_windows_background_worker_is_assigned_before_it_resumes(self):
         process = mock.Mock(pid=123)
         owner = mock.Mock()
+        identity = {
+            "pid": 123, "creation_time": "456", "running": True,
+            "in_job": True, "job_query_error": None,
+        }
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with (
@@ -535,6 +539,9 @@ class WindowsSubprocessTest(unittest.TestCase):
                     MODULE.common, "create_windows_kill_job", return_value=owner
                 ) as create_job,
                 mock.patch.object(MODULE.common, "resume_windows_process") as resume,
+                mock.patch.object(
+                    MODULE.common, "windows_process_identity", return_value=identity,
+                ) as process_identity,
             ):
                 started = MODULE.common.start_background(
                     ["copilot"],
@@ -546,10 +553,17 @@ class WindowsSubprocessTest(unittest.TestCase):
         create_job.assert_called_once_with(123)
         resume.assert_called_once_with(123)
         self.assertEqual(0x09000204, popen.call_args.kwargs["creationflags"])
+        process_identity.assert_called_once_with(123)
+        self.assertEqual(identity, started.launch_receipt["process_identity"])
+        self.assertTrue(started.launch_receipt["scheduler_owned_job"])
 
     def test_windows_background_worker_falls_back_inside_the_parent_job(self):
         process = mock.Mock(pid=123)
         job_error = self.access_denied()
+        identity = {
+            "pid": 123, "creation_time": "456", "running": True,
+            "in_job": True, "job_query_error": None,
+        }
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with (
@@ -580,6 +594,9 @@ class WindowsSubprocessTest(unittest.TestCase):
                     side_effect=job_error,
                 ) as create_job,
                 mock.patch.object(MODULE.common, "resume_windows_process") as resume,
+                mock.patch.object(
+                    MODULE.common, "windows_process_identity", return_value=identity,
+                ) as process_identity,
             ):
                 started = MODULE.common.start_background(
                     [r"C:\Program Files\GitHub Copilot\copilot.exe"],
@@ -594,6 +611,9 @@ class WindowsSubprocessTest(unittest.TestCase):
         self.assertEqual(0x08000204, popen.call_args_list[1].kwargs["creationflags"])
         create_job.assert_called_once_with(123)
         resume.assert_called_once_with(123)
+        process_identity.assert_called_once_with(123)
+        self.assertEqual(identity, started.launch_receipt["process_identity"])
+        self.assertFalse(started.launch_receipt["scheduler_owned_job"])
 
 
 class TargetTest(unittest.TestCase):
