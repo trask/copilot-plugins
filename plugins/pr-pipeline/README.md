@@ -10,7 +10,7 @@ flowchart LR
 
     subgraph pipeline["Five-stage pipeline"]
         direction TB
-        conflict["1. Conflict Resolver<br/>result v5, receipt v3<br/>marketplace-conflict-worker@9"]
+        conflict["1. Conflict Resolver<br/>request v2, result v5, receipt v3<br/>marketplace-conflict-worker@10"]
         copilotReview["2. Copilot Review<br/>hosted Runtime result v5<br/>code-candidate@1"]
         selfReview["3. Self Review<br/>coordinator report v3<br/>code candidate policy @1"]
         ci["4. CI Fix<br/>coordinator report v7, receipt v3<br/>code candidate policy @1"]
@@ -30,17 +30,21 @@ The scheduler runs these stages in order. A second sweep starts only when the he
 
 Every stage is an installed Python coordinator subprocess. No model translates its command or exit status. Each coordinator waits for child completion and consumes its own configured iteration allowance. That allowance belongs to the entire run and is neither reset nor multiplied by sweeps. A nonzero exit or unfinished child blocks the Pipeline even if a clearance marker exists. An interrupted run is abandoned; a later invocation starts from the beginning.
 
+Verified Review exhaustion is terminal `carried`, not clean. Pending feedback and spent allowance remain in its status while Self Review, CI and Description continue. Later sweeps cannot turn exhaustion into another allowance. The final result stays incomplete or partial while Review remains unresolved.
+
 Both schedulers load `pipeline_common.py` from its pinned source bytes without reading or writing installed bytecode caches or changing interpreter-wide bytecode settings. A shared-source change requires updating both scheduler digest pins.
 
 Model overrides use canonical IDs, for example `--stage-model pr-description=gpt-6-astra`. PR Description supports `gpt-5.6-sol`, `gpt-5.6-luna`, `gpt-5.6-terra`, and `gpt-6-astra`; the other stages require `gpt-5.6-sol`. The scheduler rejects unsupported routes before launching a stage.
 
-Every stage launch and status read uses a state path derived from the Pipeline run ID. The helpers never fall back to pull-request-wide state. A status envelope must name the exact state file and pull request before its current-head marker can clear a stage. Conflict Resolver also binds the current base. Old owners, reports, results, and clearances cannot enter a fresh run.
+Every stage launch and status read uses a state path derived from the Pipeline run ID. The helpers never fall back to pull-request-wide state. A status envelope must name the exact state file and pull request, current head and actual base tip. Old owners, reports, results, and clearances cannot enter a fresh run.
 
 Description status reads pass `--verify-clearance-snapshot`. Successful KEEP and replacement publication record the final validated title and body bytes, head, live base branch tip, branch identities, draft state, and authenticated viewer permissions. Status compares that recorded snapshot with fresh authenticated metadata and the authoritative branch-tip resolver. It never rewrites a receipt, starts a task, or spends an iteration. Missing historical identity is not reconstructed. Changed or unreadable inputs cannot clear the stage.
 
 On a later native pass, an unchanged member reuses Description only when this run already collected its accepted exit-zero completion and its recorded snapshot is still current. The invocation, model, mutation policy, and earlier pass must match. Other members whose heads advanced still run Description normally. Invalid same-head clearance blocks without another semantic evaluation; Description's once-per-head guard remains in force. Phase and terminal results list reused members separately from dispatched workers and accepted completions, including when all members reuse clearance. A failed worker exit always blocks even if its state retains an older clear marker.
 
 `start` creates a random run ID and a versioned monitor handle. The handle binds the canonical target, launch record, and progress log. Each unfinished `watch` response returns the complete arguments for the next call. Callers pass those arguments unchanged. The helpers do not scan for a latest run or reconstruct a target from shared state.
+
+On Windows, scheduler launch requests suspended, no-window breakaway and records the flags, result, PID, creation identity and available job membership. Denied breakaway fails before any fallback scheduler starts. No-window and a new process group do not prove lifetime independence. Workers have a separate scheduler-owned kill job. Watch compares the recorded process generation; missing, changed or unreadable identity is a monitoring failure, not workflow completion. A racing final journal event still wins. The inert lifetime tests qualify only the host where they run; a denied test-parent breakaway leaves that qualification unavailable.
 
 Standalone `watch` exposes its terminal summary directly as `final_event`, including on a repeated terminal watch with no new updates. Before publishing that summary, the scheduler saves the complete controller event to the run's `result.json`. `final_event.artifacts.result` names the canonical file; `result_sha256` in the same object hashes its exact bytes. Artifact failures are explicit reporting or monitoring failures, never successful pipeline outcomes.
 
@@ -64,25 +68,28 @@ Both CI push propagation and predecessor alignment pass a versioned `--stack-req
 
 Descendant propagation uses the hosted conflict worker and its verified receipts, not local rebase/format/repair commands. Only authorized descendants enter its atomic push, each with an exact source-head lease. One hosted attempt belongs to each frozen propagation request. A controlled publication failure can retry those verified candidates within the same active run, without another hosted task or a fresh budget. Interrupted, foreign, and legacy state cannot publish, finalize receipts, or remove retained workspaces.
 
+Conflict request v2 supplies `resolution_context_paths` as context, not filename permission. Hosted workers may make necessary scoped companion changes and relocate tests while preserving both sides' intent and behavior. Both local verifiers retain path safety, reserved-output separation, member order, source identity, attribution and history checks. Structural acceptance does not prove a candidate correct.
+
 ## Hosted outputs
 
 Hosted workers use `.github/agent-task-output/`.
 
 - `report.md` is optional free-form advice. No stage parses it as identity, validation, changed-file evidence, a commit map, or a clearance result.
 - Self Review and CI Fix consume Runtime result v5 and candidate manifest v1. The coordinators derive commit parents, trees, patch digests, changed paths, and the code tip.
+- Self Review requires `self-review-result.json` with only `outcome` and `iterations_used`. One hosted loop gets the remaining allowance. Review passes, task counts and publications differ; zero commits alone proves neither clean nor exhausted.
 - Conflict Resolver consumes result v5 and receipt v3. Its coordinator derives each member's candidate tip, replayed history, fix commits, changed paths, and publication mapping from Git before approving the atomic push.
 - PR Description requires `.github/agent-task-output/title.txt` and `.github/agent-task-output/body.md`. An optional `report.md` remains inert.
 - Copilot Review consumes pinned Runtime `code-candidate@1` result v5. The hosted task produces at most one code commit and a separate `review-decisions.json` artifact using request-bound opaque finding IDs. The controller uses the pinned Runtime Git history verifier and independently checks candidate, task, session, model, prompt, and finding identity. Local source and GitHub snapshots must remain unchanged until code-only import. The local controller handles identity, guards, import, and publication, not semantic review.
 
-No stage trusts model-authored explanations, identities, SHAs, paths, mappings, validation claims, or canonical reports.
+Required workflow-specific semantic outputs remain untrusted input checked by their owning coordinator. Workers do not restate dispatcher identity, SHAs, parents or path inventories. A semantic outcome never proves GitHub CI green.
 
 ## Stage clearance
 
 | Stage | Clearance rule |
 | --- | --- |
 | Conflict Resolver | A mechanically valid result names the current head and base, or GitHub already reports the pull request mergeable. Optional report prose does not matter. |
-| Copilot Review | The controller's current-head review marker clears the stage after verified hosted candidate handling. A hosted decision artifact alone cannot clear the stage. Under `source-only`, a verified run-bound policy skip is clear with `clean_at_head_sha` set to `null`. |
-| Self Review | Terminal candidate handling clears the current head. Zero code commits means clean with no fixes. Imported commits advance the source only through the helper's exact source and publication guards. |
+| Copilot Review | Current head and actual base markers clear the stage after verified hosted candidate handling. Exhaustion is carried and unresolved. Under `source-only`, a verified run-bound policy skip is clear with `clean_at_head_sha` set to `null`. |
+| Self Review | A verified explicit hosted clean outcome clears the published head and actual base. Exhaustion stays unresolved; incomplete output cannot authorize import. Zero commits alone does not clear the stage. |
 | CI Fix | Candidate publication is pending. Only trusted GitHub checks and statuses bound to the exact published source SHA can record green. A coordinator-verified diagnosis of unrelated or pre-existing failures can instead clear orchestration with CI warnings at the exact head and base, never a clean marker. Unknown failures remain uncleared. The coordinator uses bounded polling and never runs candidate Gradle, Maven, tests, or builds locally. |
 | PR Description | A keep result clears without mutation. A replacement applies only when GitHub mutation policy is `allow`. Under `source-only`, the helper keeps the proposal but does not change title or body, so the stage remains uncleared. |
 
@@ -90,8 +97,8 @@ The caller freezes `--github-mutation-policy` at `start`. Both single-PR and sta
 
 CI warning clearance requires `stage_outcome: "warning"`, `clean_at_head_sha: null`, exact `warning_at_head_sha` and `warning_at_base_sha` markers, and a nonempty `ci_warnings` list. Each entry names its `check_key`, `name`, `diagnosis` of `unrelated` or `pre_existing`, nonempty `reason`, and nonempty string `evidence` list. The CI coordinator derives these warnings from a fresh completed hosted task. Pipeline reads only its run-bound status envelope, never a hosted report or an old task.
 
-Every CI status read passes `--verify-warning-snapshot`. Warning clearance also requires `warning_verification.result: "current"`, reason `ci_warning_snapshot_current`, and matching 64-digit SHA-256 values in `expected_snapshot_sha256` and `observed_snapshot_sha256`. CI owns the live comparison of the entire visible check snapshot, including failed run attempts. Changed checks at the same head and base invalidate warnings; unreadable snapshots never count as current. Status verification neither starts work nor resets a budget.
+Every CI status read passes `--verify-clearance-snapshot`. Green and warnings require current verification with matching snapshot fingerprints. CI compares all visible checks and current workflow attempts, including newly started same-head runs absent from the rollup. Changed checks at the same head and actual base invalidate clearance; unreadable snapshots never count as current. Status verification neither starts hosted work nor resets a budget.
 
-Warnings remain visible while review and description work continues. Unchanged warning clearance does not spend another CI attempt; head, base, or check snapshot movement invalidates it. In a stack, the helper revalidates a warning-cleared predecessor before releasing its successor, including after descendant alignment. The descendant must still contain its head. This does not filter failures by required-check status or repository-specific rules.
+Warnings remain visible while review and description work continues. Unchanged clearance does not spend another CI attempt. Final completion revalidates green and warnings. In a stack, the helper revalidates either kind of predecessor clearance before releasing its successor, including after descendant alignment. The descendant must still contain its head. This does not filter failures by required-check status or repository-specific rules.
 
 A finished workflow retains `result: "complete"` for compatibility. With current CI warnings, its terminal result also contains `ci_warnings` and `all_ci_passed: false`, and observers report **completed WITH CI WARNINGS**, never all CI green. Standalone summaries set `all_ci_passed: true` only when the final CI stage's clearance and controller green evidence match the current head and base. Missing evidence leaves the field absent; completion alone does not imply green. Historical run warnings do not become current clearance, and a warning-revalidation error remains visible without reusing old warnings. Stack warnings include each affected pull request's `number`, `head_sha`, and `base_sha`. Both bounded terminal events point to their full result artifacts when warning details are omitted or truncated.

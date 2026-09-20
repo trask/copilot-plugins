@@ -44,6 +44,93 @@ METADATA = {
 }
 
 
+class CandidateOutcomeTest(unittest.TestCase):
+    def validate(self, outcome, *, commits=None):
+        verified = {
+            "artifact_commit": {"sha": "3" * 40, "changed_paths": [MODULE.AUDIT_OUTCOME_PATH]},
+            "commits": [] if commits is None else commits,
+            "task": {"id": "fresh-task"}, "code_tip": "2" * 40,
+            "candidate": {}, "completion": {},
+        }
+        runtime = SimpleNamespace(
+            PullRequestSnapshot=SimpleNamespace, Options=SimpleNamespace,
+            GitRepository=mock.Mock, verify_candidate_result=mock.Mock(return_value=verified),
+            CloudError=RuntimeError,
+        )
+        with (
+            mock.patch.object(MODULE, "load_candidate_runtime", return_value=runtime),
+            mock.patch.object(MODULE, "git", return_value=json.dumps(outcome)),
+        ):
+            return MODULE.validate_audit_candidate(
+                {"generated": {"branch": "copilot/fresh", "head_sha": "3" * 40}},
+                helper=Path("helper.py"), repo_root=Path("repo"), metadata=METADATA,
+                requested_model="gpt-5.6-sol", prompt="audit", max_iterations=5,
+            )
+
+    def test_clean_code_and_no_code_account_for_hosted_passes(self):
+        for commits, expected in (([], "no_change"), (["2" * 40], "clean")):
+            with self.subTest(commits=commits):
+                _, _, report = self.validate({"outcome": "clean", "iterations_used": 3}, commits=commits)
+                self.assertEqual({"outcome": expected, "iterations_used": 3}, report)
+
+    def test_exhaustion_is_not_clean(self):
+        _, _, report = self.validate({"outcome": "exhausted", "iterations_used": 5}, commits=["2" * 40])
+        self.assertEqual({"outcome": "max_iterations_reached", "iterations_used": 5}, report)
+
+    def test_incomplete_and_invalid_counts_cannot_authorize_import(self):
+        for outcome in (
+            {"outcome": "incomplete", "iterations_used": 0},
+            {"outcome": "clean", "iterations_used": True},
+            {"outcome": "clean", "iterations_used": 0},
+            {"outcome": "clean", "iterations_used": 6},
+            {"outcome": "exhausted", "iterations_used": 4},
+            {"outcome": "clean"},
+            {"outcome": "clean", "iterations_used": 1, "sha": "invented"},
+            {"outcome": [], "iterations_used": 1},
+        ):
+            with self.subTest(outcome=outcome), self.assertRaises(MODULE.WorkflowError):
+                self.validate(outcome)
+
+    def test_no_code_creates_no_remote_branch_and_lost_push_response_is_confirmed(self):
+        for commits in ([], ["2" * 40]):
+            with self.subTest(commits=commits), tempfile.TemporaryDirectory() as directory:
+                state = {
+                    "pr": METADATA, "audit_branch": "trask-pr-audit-7",
+                    "original": {"head_branch": "feature"}, "audit": {},
+                    "agent_task": {"reserved_iterations": 5}, "max_iterations": 5,
+                }
+                remote = {
+                    "commits": commits, "final_local_head": "2" * 40,
+                    "report_data": {"outcome": "clean" if commits else "no_change", "iterations_used": 3},
+                    "task": {"id": "fresh-task"},
+                }
+                with (
+                    mock.patch.object(MODULE, "local_identity", return_value={
+                        "branch": "trask-pr-audit-7", "head": "2" * 40, "status": "",
+                    }),
+                    mock.patch.object(MODULE, "merged_metadata_for", return_value=METADATA),
+                    mock.patch.object(MODULE, "find_remote", return_value="origin"),
+                    mock.patch.object(MODULE, "remote_head", return_value=None) as remote_head,
+                    mock.patch.object(MODULE, "wait_for_remote_head", return_value="2" * 40) as confirm,
+                    mock.patch.object(MODULE, "run", return_value=SimpleNamespace(returncode=1)) as push,
+                ):
+                    result = MODULE.publish_agent_task_result(
+                        Path(directory), state_path=Path(directory) / "state.json",
+                        state=state, remote=remote,
+                    )
+                self.assertEqual(bool(commits), result["pushed"])
+                self.assertEqual(3, result["iterations"])
+                self.assertEqual(0, state["agent_task"]["reserved_iterations"])
+                if commits:
+                    self.assertIn("--force-with-lease=refs/heads/trask-pr-audit-7:", push.call_args.args[0])
+                    self.assertFalse(push.call_args.kwargs["check"])
+                    confirm.assert_called_once()
+                else:
+                    push.assert_not_called()
+                    remote_head.assert_not_called()
+                    confirm.assert_not_called()
+
+
 def result(commits=None):
     commits = [] if commits is None else commits
     generated_head = "4" * 40
@@ -214,14 +301,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 ),
                 mock.patch.object(MODULE, "finish_agent_task") as finish,
                 self.assertRaisesRegex(
-                    MODULE.WorkflowError, "stored audit identity"
+                    MODULE.WorkflowError, "retained audit invocations"
                 ),
             ):
                 MODULE.command_agent_task(args)
 
             finish.assert_not_called()
 
-    def test_same_invocation_can_reconcile_exact_validated_publication(self):
+    def test_same_invocation_cannot_reenter_retained_publication(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo_root = root / "repo"
@@ -257,7 +344,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     "original-run",
                 ]
             )
-            envelope = {"result": "published"}
+            original = state_path.read_bytes()
             with (
                 mock.patch.object(MODULE, "require_tools"),
                 mock.patch.object(
@@ -270,14 +357,21 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     MODULE, "merged_metadata_for", return_value=METADATA
                 ),
                 mock.patch.object(
-                    MODULE, "finish_agent_task", return_value=envelope
+                    MODULE, "finish_agent_task"
                 ) as finish,
                 mock.patch.object(MODULE, "emit") as emit,
             ):
-                MODULE.command_agent_task(args)
+                for status in ("validated", "publication_failed"):
+                    with self.subTest(status=status):
+                        state["agent_task"]["status"] = status
+                        MODULE.save_state(state_path, state)
+                        original = state_path.read_bytes()
+                        with self.assertRaisesRegex(MODULE.WorkflowError, "retained audit invocations"):
+                            MODULE.command_agent_task(args)
+                        self.assertEqual(state_path.read_bytes(), original)
 
-            finish.assert_called_once()
-            emit.assert_called_once_with(envelope)
+            finish.assert_not_called()
+            emit.assert_not_called()
 
     def test_agent_is_thin_and_explicit(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -296,7 +390,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pins_shared_helper_and_policy_integrity(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "c3212f5c87b75074d9e69f87e3481806d21c696b0334e28e88ae53b1bed0f03f",
+            "b88a6edaeeb4358d84bb1143489244d7f181ff694fb6d2c3abde735de7c719f3",
         )
         self.assertEqual(
             MODULE.AGENT_TASK_POLICY_SHA256,
@@ -310,7 +404,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             max_iterations=5,
             pipeline=PIPELINE,
         )
-        self.assertIn("human-readable UTF-8 Markdown report", prompt)
+        self.assertIn(MODULE.AUDIT_OUTCOME_PATH, prompt)
+        self.assertIn("iterations_used", prompt)
         for text in (
             "worker prompt version 2",
             "untrusted data",
@@ -320,8 +415,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "Perform every substantive action in this Agent Task",
             "Run at most 5 audit iterations",
             "single-parent fix commit",
-            "max_iterations_reached",
-            "`{{MARKETPLACE_REPORT_PATH}}`",
+            "exhausted",
+            "optional",
         ):
             self.assertIn(text, prompt)
         self.assertFalse(MODULE.contains_credentials(prompt))
@@ -363,7 +458,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "--result-file",
             str(first_result),
             "--policy",
-            "marketplace-agent-apply-report-worker@3",
+            "marketplace-agent-code-candidate-worker@1",
         ]
         self.assertEqual(
             MODULE.agent_task_command(

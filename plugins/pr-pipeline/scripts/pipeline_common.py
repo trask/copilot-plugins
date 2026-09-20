@@ -77,6 +77,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "agent": f"{STAGE_COPILOT_REVIEW}:{STAGE_COPILOT_REVIEW}",
         "module": "copilot_review_loop",
         "marker": ("clean_at_head_sha",),
+        "base_marker": ("clean_at_base_sha",),
         "skip_marker": ("policy_skip", "head_sha"),
         "model": DEFAULT_STAGE_MODEL,
         "required_model": DEFAULT_STAGE_MODEL,
@@ -89,6 +90,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "agent": f"{STAGE_SELF_REVIEW}:{STAGE_SELF_REVIEW}",
         "module": "self_review_loop",
         "marker": ("review", "clean_at_head_sha"),
+        "base_marker": ("review", "clean_at_base_sha"),
         "model": SELF_REVIEW_MODEL,
         "required_model": SELF_REVIEW_MODEL,
         "required_effort": SELF_REVIEW_EFFORT,
@@ -100,6 +102,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "agent": f"{STAGE_CI}:{STAGE_CI}",
         "module": "ci_fix_loop",
         "marker": ("clean_at_head_sha",),
+        "base_marker": ("clean_at_base_sha",),
         "model": DEFAULT_STAGE_MODEL,
         "required_model": DEFAULT_STAGE_MODEL,
         "github_mutation_policy": True,
@@ -136,6 +139,12 @@ SHIM_SUFFIXES = (".cmd", ".bat")
 
 class WorkflowError(RuntimeError):
     pass
+
+
+class LaunchError(WorkflowError):
+    def __init__(self, message: str, launch_receipt: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.launch_receipt = launch_receipt
 
 
 class WindowsKillJob:
@@ -305,9 +314,13 @@ def resume_windows_process(pid: int) -> None:
 class OwnedProcess:
     """A subprocess whose descendants share its cancellable ownership scope."""
 
-    def __init__(self, process: subprocess.Popen[Any], owner: Any = None) -> None:
+    def __init__(
+        self, process: subprocess.Popen[Any], owner: Any = None,
+        launch_receipt: dict[str, Any] | None = None,
+    ) -> None:
         self.process = process
         self.owner = owner
+        self.launch_receipt = launch_receipt
 
     @property
     def pid(self) -> int:
@@ -584,7 +597,7 @@ def watch_progress(
     wall_time: Callable[[], float] = time.time,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
-    alive: Callable[[int], bool] = lambda pid: process_is_alive(pid),
+    alive: Callable[[int], bool] | None = None,
 ) -> dict[str, Any]:
     if cursor < 0:
         raise WorkflowError("cursor cannot be negative")
@@ -625,7 +638,25 @@ def watch_progress(
             and current_monotonic - last_liveness_check >= PROGRESS_LIVENESS_INTERVAL
         ):
             last_liveness_check = current_monotonic
-            if not alive(pid):
+            failure = None
+            if alive is not None:
+                running = alive(pid)
+            elif IS_WINDOWS:
+                expected = launch.get("process_identity")
+                if not isinstance(expected, dict) or not expected.get("creation_time"):
+                    running, failure = False, "scheduler_generation_unverified"
+                else:
+                    try:
+                        observed = windows_process_identity(pid)
+                    except OSError:
+                        running, failure = False, "scheduler_generation_unreadable"
+                    else:
+                        running = observed is not None and observed["running"]
+                        if observed is not None and observed["creation_time"] != expected["creation_time"]:
+                            running, failure = False, "scheduler_generation_changed"
+            else:
+                running = process_is_alive(pid)
+            if not running:
                 records = read_progress_log(event_log)
                 cursor = min(cursor, len(records))
                 if len(records) > cursor:
@@ -642,7 +673,7 @@ def watch_progress(
                     "cursor": len(records),
                     "updates": [],
                     "finished": True,
-                    "monitor_failure": "scheduler_exited_without_final_event",
+                    "monitor_failure": failure or "scheduler_exited_without_final_event",
                 }
 
         observer = read_json(observer_path)
@@ -700,15 +731,34 @@ def start_detached(
             getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
             | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
         )
     else:
         options["start_new_session"] = True
     try:
-        process, _ = popen_with_windows_breakaway_fallback(
+        process, used_breakaway = popen_with_windows_breakaway_fallback(
             command,
             options,
             operation="detached scheduler",
+            require_breakaway=True,
         )
+        try:
+            identity = windows_process_identity(process.pid) if IS_WINDOWS else None
+            if IS_WINDOWS and identity is None:
+                raise WorkflowError("scheduler process identity is unavailable")
+            process.launch_receipt = {
+                "creationflags": options.get("creationflags", 0),
+                "breakaway_requested": IS_WINDOWS,
+                "breakaway_accepted": bool(IS_WINDOWS and used_breakaway),
+                "fallback_used": False,
+                "process_identity": identity,
+            }
+            if IS_WINDOWS:
+                resume_windows_process(process.pid)
+        except BaseException:
+            process.terminate()
+            process.wait(timeout=10)
+            raise
         return process
     finally:
         log.close()
@@ -719,6 +769,7 @@ def popen_with_windows_breakaway_fallback(
     options: dict[str, Any],
     *,
     operation: str,
+    require_breakaway: bool = False,
 ) -> tuple[subprocess.Popen[Any], bool]:
     """Start once, retrying only a rejected Windows job breakaway request."""
     try:
@@ -731,6 +782,17 @@ def popen_with_windows_breakaway_fallback(
             or not options.get("creationflags", 0) & breakaway
         ):
             raise
+        if require_breakaway:
+            raise LaunchError(
+                f"{operation} requires Windows job breakaway for {command[0]}; "
+                "denied before fallback execution",
+                {
+                    "creationflags": options.get("creationflags", 0),
+                    "breakaway_requested": True, "breakaway_accepted": False,
+                    "fallback_used": False, "process_identity": None,
+                    "launch_error_code": getattr(error, "winerror", None),
+                },
+            ) from error
 
     fallback_options = dict(options)
     fallback_options["creationflags"] &= ~breakaway
@@ -1364,7 +1426,7 @@ def read_stage_status(
         return {**common, "ok": False, "reason": "no_state"}
     command = [sys.executable, str(script), "status", "--state", str(state)]
     if entry["stage"] == STAGE_CI:
-        command.append("--verify-warning-snapshot")
+        command.append("--verify-clearance-snapshot")
     if entry["stage"] == STAGE_DESCRIPTION:
         command.append("--verify-clearance-snapshot")
     try:
@@ -1464,6 +1526,8 @@ def string_at(payload: dict[str, Any], path: tuple[str, ...]) -> str | None:
 
 
 STAGE_STATUS_FIELDS = (
+    "clean_at_head_sha",
+    "clean_at_base_sha",
     "agent_task",
     "attempt",
     "budget_scope",
@@ -1596,6 +1660,19 @@ def current_ci_warning_verification(verification: Any) -> bool:
     return (
         verification.get("result") == "current"
         and verification.get("reason") == "ci_warning_snapshot_current"
+        and isinstance(expected, str)
+        and re.fullmatch(r"[0-9a-f]{64}", expected) is not None
+        and verification.get("observed_snapshot_sha256") == expected
+    )
+
+
+def current_ci_clearance_verification(verification: Any) -> bool:
+    if not isinstance(verification, dict):
+        return False
+    expected = verification.get("expected_snapshot_sha256")
+    return (
+        verification.get("result") == "current"
+        and verification.get("reason") == "ci_snapshot_current"
         and isinstance(expected, str)
         and re.fullmatch(r"[0-9a-f]{64}", expected) is not None
         and verification.get("observed_snapshot_sha256") == expected
@@ -1757,6 +1834,9 @@ def inspect_stage(
         payload.get("warning_verification") if isinstance(payload, dict) else None
     )
     marker = skip_marker if outcome == "skipped" and skip_marker_path else review_marker
+    if outcome == "skipped" and skip_marker_path:
+        base_marker_path = ("policy_skip", "base_sha")
+        base_marker = string_at(payload, base_marker_path)
     warning_is_valid = False
     if outcome == "warning" and entry["stage"] == STAGE_CI:
         marker = string_at(payload, ("warning_at_head_sha",))
@@ -1868,6 +1948,11 @@ def inspect_stage(
         and (outcome in CLEARING_OUTCOMES or warning_is_valid)
         and policy_skip_is_valid
         and (
+            entry["stage"] != STAGE_CI
+            or warning_is_valid
+            or current_ci_clearance_verification(payload.get("clearance_verification"))
+        )
+        and (
             entry["stage"] != STAGE_DESCRIPTION
             or current_description_verification(payload, pipeline_run)
         )
@@ -1893,6 +1978,8 @@ def inspect_stage(
         reason = "policy_skip_not_verified"
     elif outcome == "warning":
         reason = "ci_warning_not_verified"
+    elif entry["stage"] == STAGE_CI and outcome in CLEARING_OUTCOMES:
+        reason = "ci_clearance_not_verified"
     elif entry["stage"] == STAGE_DESCRIPTION and outcome == "cleared":
         reason = "description_clearance_not_verified"
     elif (
@@ -2119,6 +2206,16 @@ def start_background(
             options,
             operation="background stage worker",
         )
+        receipt = {
+            "creationflags": options.get("creationflags", 0) & (
+                ~getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+                if not used_breakaway else -1
+            ),
+            "breakaway_requested": IS_WINDOWS,
+            "breakaway_accepted": bool(IS_WINDOWS and used_breakaway),
+            "fallback_used": IS_WINDOWS and not used_breakaway,
+            "process_identity": None,
+        }
         owner = None
         try:
             if IS_WINDOWS:
@@ -2128,6 +2225,11 @@ def start_background(
                     if used_breakaway or getattr(error, "winerror", None) != 5:
                         raise
             if IS_WINDOWS:
+                try:
+                    receipt["process_identity"] = windows_process_identity(process.pid)
+                except OSError as error:
+                    receipt["process_identity_error"] = str(error)
+                receipt["scheduler_owned_job"] = owner is not None
                 resume_windows_process(process.pid)
         except BaseException:
             if owner is not None:
@@ -2136,7 +2238,7 @@ def start_background(
                 process.terminate()
             process.wait()
             raise
-        return OwnedProcess(process, owner)
+        return OwnedProcess(process, owner, receipt)
     finally:
         log.close()
 
@@ -2176,7 +2278,50 @@ def run_monitored(
         "log_path": str(log_path),
         "started_at": started_at,
         "ended_at": utc_now(),
+        "launch_receipt": process.launch_receipt if isinstance(process, OwnedProcess) else None,
     }
+
+
+def windows_process_identity(pid: int) -> dict[str, Any] | None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+    kernel32.IsProcessInJob.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    handle = kernel32.OpenProcess(0x00100000 | 0x1000, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == 87:
+            return None
+        raise OSError(error, f"cannot identify process {pid}")
+    try:
+        creation, exit_time, kernel_time, user_time = (wintypes.FILETIME() for _ in range(4))
+        if not kernel32.GetProcessTimes(handle, ctypes.byref(creation), ctypes.byref(exit_time),
+                                        ctypes.byref(kernel_time), ctypes.byref(user_time)):
+            raise OSError(ctypes.get_last_error(), f"cannot read process generation {pid}")
+        wait = kernel32.WaitForSingleObject(handle, 0)
+        if wait not in (0, 258):
+            raise OSError(ctypes.get_last_error(), f"cannot query process state {pid}")
+        in_job = wintypes.BOOL()
+        job_known = kernel32.IsProcessInJob(handle, None, ctypes.byref(in_job))
+        return {
+            "pid": pid,
+            "creation_time": str((creation.dwHighDateTime << 32) | creation.dwLowDateTime),
+            "running": wait == 258,
+            "in_job": bool(in_job.value) if job_known else None,
+            "job_query_error": None if job_known else ctypes.get_last_error(),
+        }
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def windows_process_is_alive(pid: int) -> bool:

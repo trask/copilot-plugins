@@ -90,6 +90,17 @@ def ci_warning_payload(head=HEAD, base=BASE) -> dict:
     }
 
 
+def ci_green_payload(head=HEAD, base=BASE) -> dict:
+    return {
+        "stage_outcome": "cleared", "outcome": "green",
+        "clean_at_head_sha": head, "clean_at_base_sha": base,
+        "clearance_verification": {
+            "result": "current", "reason": "ci_snapshot_current",
+            "expected_snapshot_sha256": "e" * 64, "observed_snapshot_sha256": "e" * 64,
+        },
+    }
+
+
 def description_payload(head=HEAD, base=BASE) -> dict:
     return {
         "validated_head_sha": head,
@@ -308,7 +319,12 @@ class WindowsSubprocessTest(unittest.TestCase):
                     0x00000008,
                     create=True,
                 ),
-                mock.patch.object(MODULE.common.subprocess, "Popen") as popen,
+                mock.patch.object(MODULE.common.subprocess, "Popen", return_value=mock.Mock(pid=321)) as popen,
+                mock.patch.object(
+                    MODULE.common, "windows_process_identity",
+                    return_value={"pid": 321, "creation_time": "123", "running": True, "in_job": False},
+                ),
+                mock.patch.object(MODULE.common, "resume_windows_process") as resume,
             ):
                 MODULE.common.start_detached(
                     ["python", "scheduler.py"],
@@ -319,8 +335,10 @@ class WindowsSubprocessTest(unittest.TestCase):
         flags = popen.call_args.kwargs["creationflags"]
         self.assertEqual(0x08000000, flags & 0x08000000)
         self.assertEqual(0, flags & 0x00000008)
+        self.assertEqual(4, flags & 4)
+        resume.assert_called_once_with(321)
 
-    def test_detached_scheduler_retries_without_breakaway_when_access_is_denied(self):
+    def test_detached_scheduler_denied_breakaway_never_starts_a_fallback(self):
         process = mock.Mock()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -347,16 +365,17 @@ class WindowsSubprocessTest(unittest.TestCase):
                     side_effect=[self.access_denied(), process],
                 ) as popen,
             ):
-                started = MODULE.common.start_detached(
-                    [r"C:\Python\python.exe", "scheduler.py"],
-                    cwd=root,
-                    log_path=root / "scheduler.log",
-                )
+                with self.assertRaisesRegex(MODULE.common.LaunchError, "denied before fallback") as failure:
+                    MODULE.common.start_detached(
+                        [r"C:\Python\python.exe", "scheduler.py"],
+                        cwd=root,
+                        log_path=root / "scheduler.log",
+                    )
 
-        self.assertIs(process, started)
-        self.assertEqual(2, popen.call_count)
-        self.assertEqual(0x09000200, popen.call_args_list[0].kwargs["creationflags"])
-        self.assertEqual(0x08000200, popen.call_args_list[1].kwargs["creationflags"])
+        self.assertEqual(1, popen.call_count)
+        self.assertEqual(0x09000204, popen.call_args_list[0].kwargs["creationflags"])
+        self.assertFalse(failure.exception.launch_receipt["breakaway_accepted"])
+        self.assertFalse(failure.exception.launch_receipt["fallback_used"])
 
     def test_detached_scheduler_fallback_reports_operation_and_program(self):
         fallback_error = OSError("fallback failed")
@@ -381,7 +400,7 @@ class WindowsSubprocessTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     MODULE.common.WorkflowError,
-                    r"detached scheduler launch failed for C:\\Python\\python.exe",
+                    r"detached scheduler requires Windows job breakaway for C:\\Python\\python.exe",
                 ):
                     MODULE.common.start_detached(
                         [r"C:\Python\python.exe", "scheduler.py"],
@@ -1002,15 +1021,29 @@ class MarkerTest(unittest.TestCase):
                 "attempt": {"base_sha": BASE},
             },
             MODULE.STAGE_SELF_REVIEW: {
-                "review": {"outcome": "clean", "clean_at_head_sha": HEAD}
+                "review": {"outcome": "clean", "clean_at_head_sha": HEAD, "clean_at_base_sha": BASE}
             },
-            MODULE.STAGE_COPILOT_REVIEW: {"clean_at_head_sha": HEAD},
-            MODULE.STAGE_CI: {"clean_at_head_sha": HEAD},
+            MODULE.STAGE_COPILOT_REVIEW: {"clean_at_head_sha": HEAD, "clean_at_base_sha": BASE},
+            MODULE.STAGE_CI: ci_green_payload(),
             MODULE.STAGE_DESCRIPTION: description_payload(),
         }
         for stage, payload in payloads.items():
             with self.subTest(stage=stage):
                 self.assertTrue(self.status(stage, payload)["clear"])
+
+    def test_current_head_still_requires_current_base_and_ci_snapshot(self):
+        for stage, payload in (
+            (MODULE.STAGE_COPILOT_REVIEW, {"clean_at_head_sha": HEAD, "clean_at_base_sha": BASE}),
+            (MODULE.STAGE_SELF_REVIEW, {"review": {"clean_at_head_sha": HEAD, "clean_at_base_sha": BASE}}),
+            (MODULE.STAGE_CI, ci_green_payload()),
+        ):
+            with self.subTest(stage=stage):
+                stale = self.status(stage, payload, base_sha=NEXT_HEAD)
+                self.assertFalse(stale["clear"])
+                self.assertEqual("clearance_is_for_an_older_base", stale["reason"])
+        cached = ci_green_payload()
+        del cached["clearance_verification"]
+        self.assertFalse(self.status(MODULE.STAGE_CI, cached)["clear"])
 
     def test_ci_warning_clears_orchestration_without_a_clean_marker(self):
         for diagnosis in ("unrelated", "pre_existing"):
@@ -1181,13 +1214,14 @@ class MarkerTest(unittest.TestCase):
                 "review": {
                     "outcome": "clean",
                     "clean_at_head_sha": HEAD,
+                    "clean_at_base_sha": BASE,
                     "report_version": 3,
                     "candidate_commits": 0,
                 },
                 "agent_task": {"status": "completed"},
             },
             MODULE.STAGE_CI: {
-                "clean_at_head_sha": HEAD,
+                **ci_green_payload(),
                 "run": {
                     "head_sha": HEAD,
                     "status": "completed",
@@ -1246,16 +1280,14 @@ class MarkerTest(unittest.TestCase):
         green = self.status(
             MODULE.STAGE_CI,
             {
-                "stage_outcome": "cleared",
-                "clean_at_head_sha": HEAD,
+                **ci_green_payload(),
                 "run": {"status": "completed", "head_sha": HEAD},
             },
         )
         stale_green = self.status(
             MODULE.STAGE_CI,
             {
-                "stage_outcome": "cleared",
-                "clean_at_head_sha": NEXT_HEAD,
+                **ci_green_payload(head=NEXT_HEAD),
                 "run": {"status": "completed", "head_sha": NEXT_HEAD},
             },
         )
@@ -1385,7 +1417,10 @@ class MarkerTest(unittest.TestCase):
                         run_id=PIPELINE_RUN,
                     )
                     self.assertFalse(result["clear"])
-                    self.assertEqual("policy_skip_not_verified", result["reason"])
+                    self.assertEqual(
+                        "clearance_is_for_an_older_base" if name == "base" else "policy_skip_not_verified",
+                        result["reason"],
+                    )
         finally:
             MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
 
@@ -1542,7 +1577,10 @@ class InvocationStateIsolationTest(unittest.TestCase):
                     )
                     self.assertTrue(result["ok"])
                     command = run.call_args.args[0]
-                    self.assertEqual(entry["stage"] == MODULE.STAGE_CI, "--verify-warning-snapshot" in command)
+                    self.assertEqual(
+                        entry["stage"] in {MODULE.STAGE_CI, MODULE.STAGE_DESCRIPTION},
+                        "--verify-clearance-snapshot" in command,
+                    )
                     self.assertEqual(str(state), command[command.index("--state") + 1])
                     self.assertEqual(30, run.call_args.kwargs["timeout"])
 
@@ -2540,6 +2578,32 @@ class SweepTest(unittest.TestCase):
             self.launched,
         )
 
+    def test_review_exhaustion_preserves_unresolved_status_and_runs_remaining_stages(self):
+        original_run, original_inspect = self.run_stage, self.inspect
+
+        def run(entry, *args, **kwargs):
+            result = original_run(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_COPILOT_REVIEW:
+                self.clear_at[entry["stage"]] = None
+            return result
+
+        def inspect(entry, *args, **kwargs):
+            result = original_inspect(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_COPILOT_REVIEW and self.launched:
+                result["status"] = {
+                    "iterations": 5, "max_iterations": 5,
+                    "pending_comments": [{"id": "pending-finding"}],
+                }
+            return result
+
+        MODULE.run_stage.side_effect = run
+        MODULE.inspect_stage.side_effect = inspect
+        result = self.execute()
+        self.assertEqual("incomplete", result["result"])
+        self.assertEqual([(stage, 1) for stage in MODULE.STAGE_NAMES], self.launched)
+        self.assertFalse(result["stages"][1]["clear"])
+        self.assertTrue(all(stage["clear"] for stage in result["stages"][2:]))
+
     def test_pipeline_stops_when_a_launched_stage_still_owns_failed_task_state(self):
         self.clear_at[MODULE.STAGE_CONFLICT] = HEAD
         self.clear_base_at = BASE
@@ -3215,7 +3279,7 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertIn("`artifacts.result_sha256`", text)
         self.assertIn("`*_details_truncated`", text)
         self.assertIn("Extract the needed JSON fields in bounded chunks", text)
-        self.assertIn("only the controller's top-level `ci_warnings`", text)
+        self.assertIn("only top-level `ci_warnings`", text)
         self.assertIn("`final_event`", text)
         watch_lines = [
             line for line in text.splitlines() if "pr_pipeline.py" in line and " watch " in line
@@ -3479,7 +3543,7 @@ class ProgressProtocolTest(unittest.TestCase):
                 "merge",
             ]
         )
-        process = mock.Mock(pid=4321)
+        process = mock.Mock(pid=4321, launch_receipt={"creationflags": 0, "process_identity": None})
         output = StringIO()
         with (
             mock.patch.object(MODULE, "resolve_repo_root", return_value=self.root),
@@ -3532,6 +3596,33 @@ class ProgressProtocolTest(unittest.TestCase):
             event["next_watch"]["arguments"],
         )
         self.assertNotIn("owner/repo#7", event["next_watch"]["arguments"])
+
+    def test_denied_scheduler_launch_persists_receipt_without_success_event(self):
+        args = MODULE.build_parser().parse_args(["start", "owner/repo#7"])
+        receipt = {
+            "creationflags": 0x09000204, "breakaway_requested": True,
+            "breakaway_accepted": False, "fallback_used": False,
+            "process_identity": None, "launch_error_code": 5,
+        }
+        with (
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.root),
+            mock.patch.object(MODULE, "resolve_target", return_value=target()),
+            mock.patch.object(MODULE, "copilot_home", return_value=self.root),
+            mock.patch.object(MODULE.uuid, "uuid4", return_value=mock.Mock(hex="a" * 32)),
+            mock.patch.object(MODULE.common, "start_detached", side_effect=MODULE.common.LaunchError(
+                "breakaway denied before fallback", receipt,
+            )) as start,
+            mock.patch.object(MODULE.common, "emit") as emit,
+            self.assertRaisesRegex(MODULE.common.LaunchError, "breakaway denied"),
+        ):
+            MODULE.command_start(args)
+        launch = MODULE.common.read_json(
+            self.root / "run" / MODULE.RUN_KIND / MODULE.run_slug(target()) / ("a" * 32) / "launch.json"
+        )
+        self.assertEqual("launch_failed", launch["status"])
+        self.assertEqual(receipt, {key: launch[key] for key in receipt})
+        start.assert_called_once()
+        emit.assert_not_called()
 
     def write_monitor_run(
         self,

@@ -2354,7 +2354,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.45")
+        self.assertEqual(plugin["version"], "1.3.46")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -2372,7 +2372,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             max_iterations=5,
             prior_history=[],
         )
-        self.assertIn("worker prompt version 11", prompt)
+        self.assertIn("worker prompt version 12", prompt)
         self.assertIn("zero or more linear, single-parent code commits", prompt)
         self.assertIn("The dispatcher derives the exact candidate history", prompt)
         self.assertIn(MODULE.AGENT_TASK_OUTPUT_REPORT, prompt)
@@ -2385,7 +2385,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("maximum_review_iterations", prompt)
         self.assertIn("untrusted data", prompt)
         self.assertNotIn("`Finding: <identifier>`", prompt)
-        self.assertIn("Zero code commits means no fixes were needed", prompt)
+        self.assertIn("Zero code commits does not establish a clean review", prompt)
+        self.assertIn(MODULE.AGENT_TASK_OUTPUT_RESULT, prompt)
         self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
         MODULE.require_no_credentials(prompt, source="prompt")
 
@@ -4178,6 +4179,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         helper = self.directory / "cloud_task.py"
         helper.write_text("# helper\n", encoding="utf-8")
         result = self.candidate_result()
+        result["candidate"]["artifact_commit"] = self.candidate_metadata(
+            self.artifact, self.head, [MODULE.AGENT_TASK_OUTPUT_RESULT],
+        )
+        result["candidate"]["generated"]["head_sha"] = self.artifact
+        result["generated"]["head_sha"] = self.artifact
         commands = []
         emitted = []
 
@@ -4211,6 +4217,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ),
             mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
             mock.patch.object(MODULE, "run", side_effect=helper_run),
+            mock.patch.object(MODULE, "git", return_value='{"outcome":"clean","iterations_used":1}'),
             mock.patch.object(
                 MODULE,
                 "local_identity",
@@ -4297,21 +4304,31 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 self.assertFalse(emitted)
                 commands.append(command)
                 state = MODULE.load_state(Path(args.state))
-                self.assertEqual(len(commands) - 1, state["iterations"])
                 self.assertEqual(
-                    max_iterations - len(commands) + 1,
+                    0 if len(commands) == 1 else min(fixes + 1, max_iterations),
+                    state["iterations"],
+                )
+                self.assertEqual(
+                    max_iterations - state["iterations"],
                     state["agent_task"]["allowed_iterations"],
                 )
                 self.assertEqual("sol", command[command.index("--model") + 1])
                 prompt = Path(command[command.index("--prompt-file") + 1])
                 self.assertIn(
-                    '"maximum_review_iterations": 1',
+                    f'"maximum_review_iterations": {state["agent_task"]["allowed_iterations"]}',
                     prompt.read_text(encoding="utf-8"),
                 )
                 commits = (
-                    [f"{len(commands) + 5:040x}"] if len(commands) <= fixes else []
+                    [f"{index + 6:040x}" for index in range(min(fixes, max_iterations))]
+                    if len(commands) == 1 else []
                 )
                 result = self.candidate_result(commits=commits)
+                result["candidate"]["artifact_commit"] = self.candidate_metadata(
+                    self.artifact, commits[-1] if commits else self.head,
+                    [MODULE.AGENT_TASK_OUTPUT_RESULT],
+                )
+                result["candidate"]["generated"]["head_sha"] = self.artifact
+                result["generated"]["head_sha"] = self.artifact
                 result["task"]["state"] = task_state
                 result["completion"]["task"]["state"] = task_state
                 if task_error is not None:
@@ -4331,6 +4348,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 self.fail(f"unexpected command: {command}")
             return MODULE.subprocess.CompletedProcess(command, 0, "", "")
 
+        def outcome_git(_root, *arguments):
+            self.assertEqual(("show", f"{self.artifact}:{MODULE.AGENT_TASK_OUTPUT_RESULT}"), arguments)
+            return json.dumps({
+                "outcome": "exhausted" if fixes >= max_iterations else "clean",
+                "iterations_used": min(fixes + 1, max_iterations) if len(commands) == 1 else 1,
+            })
+
         with (
             mock.patch.object(MODULE, "ACTIVE_GITHUB_MUTATION_POLICY", "allow"),
             mock.patch.object(MODULE, "require_tools"),
@@ -4340,6 +4364,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 MODULE, "discover_cloud_task", return_value=self.directory / "runtime.py"
             ),
             mock.patch.object(MODULE, "run", side_effect=run),
+            mock.patch.object(MODULE, "git", side_effect=outcome_git),
             mock.patch.object(MODULE, "local_identity", side_effect=lambda _: dict(identity)),
             mock.patch.object(
                 MODULE, "validate_candidate_history",
@@ -4364,13 +4389,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pipeline_waits_for_fixes_then_a_terminal_clean_pass(self):
         with self.pipeline_run() as (args, commands, emitted):
             MODULE.command_pipeline(args)
-            self.assertEqual(2, len(commands))
+            self.assertEqual(1, len(commands))
             self.assertEqual(1, len(emitted))
             self.assertEqual("published", emitted[0]["result"])
             self.assertEqual("cleared", emitted[0]["stage_outcome"])
             self.assertEqual(2, emitted[0]["iterations"])
             self.assertEqual(1, len(emitted[0]["commits"]))
-            self.assertEqual(2, len(emitted[0]["tasks"]))
+            self.assertEqual(1, len(emitted[0]["tasks"]))
             state = MODULE.load_state(Path(args.state))
             self.assertEqual("", state["agent_task"]["preflight"]["identity"]["branch"])
             self.assertEqual(state["pr"]["head_sha"], MODULE.recorded_clean_at_head_sha(state))
@@ -4378,12 +4403,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pipeline_spends_its_budget_once_across_all_sweeps(self):
         with self.pipeline_run(fixes=5) as (args, commands, emitted):
             MODULE.command_pipeline(args)
-            self.assertEqual(3, len(commands))
+            self.assertEqual(1, len(commands))
             self.assertEqual("max_iterations_reached", emitted[-1]["stage_outcome"])
             self.assertIsNone(MODULE.recorded_clean_at_head_sha(MODULE.load_state(Path(args.state))))
             args.pipeline_iteration = 2
             MODULE.command_pipeline(args)
-            self.assertEqual(3, len(commands))
+            self.assertEqual(1, len(commands))
             self.assertEqual(3, emitted[-1]["iterations"])
             self.assertEqual("max_iterations_reached", emitted[-1]["stage_outcome"])
 
@@ -4408,7 +4433,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             emitted.clear()
             self.assertEqual(0, self.pipeline_cli(args))
             second = MODULE.load_state(Path(args.state))
-            self.assertEqual(3, len(commands))
+            self.assertEqual(2, len(commands))
             self.assertEqual(3, second["iterations"])
             self.assertEqual(1, second["agent_task"]["allowed_iterations"])
             self.assertEqual("9" * 40, second["agent_task"]["preflight"]["pr"]["head_sha"])
@@ -4471,7 +4496,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             emitted.clear()
             self.assertEqual(0, self.pipeline_cli(args))
             state = MODULE.load_state(Path(args.state))
-            self.assertEqual(2, len(commands))
+            self.assertEqual(1, len(commands))
             self.assertEqual(2, state["iterations"])
             self.assertEqual("max_iterations_reached", emitted[-1]["stage_outcome"])
             self.assertIsNone(MODULE.recorded_clean_at_head_sha(state))
@@ -4543,14 +4568,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertIn("state changed", emitted[-1]["error"])
             self.assertEqual(3, MODULE.load_state(Path(args.state))["pipeline_budget"]["iteration"])
 
-    def test_pipeline_charges_one_iteration_per_candidate_until_fifth_clean_pass(self):
+    def test_pipeline_charges_five_hosted_passes_in_one_task(self):
         with self.pipeline_run(fixes=4, max_iterations=5) as (args, commands, emitted):
             MODULE.command_pipeline(args)
-            self.assertEqual(5, len(commands))
+            self.assertEqual(1, len(commands))
             self.assertEqual(1, len(emitted))
             self.assertEqual(5, emitted[0]["iterations"])
             self.assertEqual(4, len(emitted[0]["commits"]))
-            self.assertEqual(5, len(emitted[0]["tasks"]))
+            self.assertEqual(1, len(emitted[0]["tasks"]))
             self.assertEqual("cleared", emitted[0]["stage_outcome"])
 
     def test_pipeline_rejects_nonzero_exit_even_with_success_result(self):
@@ -6000,6 +6025,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             commits=[fix],
             changed_paths=["src/app.py"],
         )
+        result["candidate"]["artifact_commit"] = self.candidate_metadata(
+            self.artifact, fix, [MODULE.AGENT_TASK_OUTPUT_RESULT],
+        )
+        result["candidate"]["generated"]["head_sha"] = self.artifact
+        result["generated"]["head_sha"] = self.artifact
         live = {**self.preflight["pr"], "head_sha": fix}
         commands = []
 
@@ -6033,6 +6063,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ),
             mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
             mock.patch.object(MODULE, "run", side_effect=helper_run),
+            mock.patch.object(MODULE, "git", return_value='{"outcome":"clean","iterations_used":2}'),
             mock.patch.object(
                 MODULE,
                 "local_identity",

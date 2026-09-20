@@ -1,4 +1,5 @@
 import copy
+from contextlib import nullcontext
 import hashlib
 import importlib.util
 import io
@@ -808,7 +809,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             },
             "merge_base": "a" * 40,
             "strategy": strategy,
-            "allowed_paths": ["app.py"],
+            "resolution_context_paths": ["app.py"],
             "iteration": {"id": "iteration-1", "number": 1, "budget": 3},
             "guards": {
                 "merge_methods": {
@@ -901,18 +902,18 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "c2333f2fa487056c84123e7e3bcf98d8dce1198f6b2d43461b220a74117d264d",
+            "3412b829b54819e50bdbc8d6983d8d8a9c3f8f9d4398059e40c8712bccf043fc",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
-            "5fd71b5c27a96a1864bf68995d9fdac1cfbcee4d390f447cc00245537f773a52",
+            "7d934b95e5e0b8ef83228e95464a5c4f70d8de9114a50c98811e55b4825a0435",
         )
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
             hashlib.sha256(CLOUD_SCRIPT.read_bytes()).hexdigest(),
         )
         self.assertEqual(MODULE.CONFLICT_POLICY_IDENTITY, CLOUD_MODULE.SEQUENTIAL_POLICY)
-        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@9")
+        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@10")
         self.assertEqual(MODULE.CONFLICT_RESULT_SCHEMA, CLOUD_MODULE.REPLAY_RESULT_SCHEMA)
         self.assertEqual(MODULE.V5_CONFLICT_POLICY, "marketplace-conflict-worker@5")
         self.assertEqual(
@@ -3861,7 +3862,7 @@ class ManagedRequestStrategyTest(unittest.TestCase):
             },
             "merge_base": "a" * 40,
             "strategy": "merge",
-            "allowed_paths": ["app.py"],
+            "resolution_context_paths": ["app.py"],
             "iteration": {"id": "iteration-1", "number": 1, "budget": 1},
             "guards": {
                 "merge_methods": methods,
@@ -4077,20 +4078,20 @@ class ManagedTaskPromptTest(unittest.TestCase):
 
     def test_large_path_corpus_fails_before_submission_without_losing_scope(self):
         request = self.request()
-        request["allowed_paths"] = [
+        request["resolution_context_paths"] = [
             f"instrumentation/library-{number:04d}/src/main/java/Type{number}.java"
             for number in range(2291)
         ]
         request["request_sha256"] = CLOUD_MODULE.request_digest(request)
 
         compact = CLOUD_MODULE.compact_request_contract(request)
-        evidence = compact["allowed_paths"]
+        evidence = compact["resolution_context_paths"]
 
         self.assertEqual("exact", evidence["representation"])
-        self.assertEqual(request["allowed_paths"], evidence["paths"])
+        self.assertEqual(request["resolution_context_paths"], evidence["paths"])
         self.assertEqual(2291, evidence["count"])
         self.assertEqual(
-            CLOUD_MODULE.value_digest(request["allowed_paths"]),
+            CLOUD_MODULE.value_digest(request["resolution_context_paths"]),
             evidence["sha256"],
         )
         with mock.patch.object(CLOUD_MODULE, "api_json") as api, self.assertRaises(
@@ -4111,6 +4112,10 @@ class ManagedTaskPromptTest(unittest.TestCase):
         )
 
     def test_actual_66_path_scope_is_delivered_exactly_in_hosted_payload(self):
+        self.assertIn(
+            "not filename permissions",
+            MODULE.build_conflict_prompt({"request": self.request()}),
+        )
         paths = self.native_scope_paths()
         self.assertEqual(
             "6d35c77707906847ff3ab01d755889c040883c7c81ffd170ea2f394086770432",
@@ -4124,7 +4129,7 @@ class ManagedTaskPromptTest(unittest.TestCase):
         ):
             with self.subTest(policy=policy):
                 request = self.request()
-                request.update(policy=policy, strategy="rebase", allowed_paths=paths)
+                request.update(policy=policy, strategy="rebase", resolution_context_paths=paths)
                 request["head_commits"] = [
                     self.commit(number, paths[number]) for number in range(18)
                 ]
@@ -4154,7 +4159,7 @@ class ManagedTaskPromptTest(unittest.TestCase):
                         "sha256": CLOUD_MODULE.value_digest(paths),
                         "paths": paths,
                     },
-                    contract["allowed_paths"],
+                    contract["resolution_context_paths"],
                 )
                 self.assertEqual(original, request)
                 for key in (
@@ -4178,7 +4183,7 @@ class ManagedTaskPromptTest(unittest.TestCase):
 
     def test_exact_scope_at_prompt_limit_is_kept_and_overflow_never_posts(self):
         request = self.request()
-        request["allowed_paths"] = self.native_scope_paths()
+        request["resolution_context_paths"] = self.native_scope_paths()
         request["request_sha256"] = CLOUD_MODULE.request_digest(request)
         for character in ("x", "é"):
             with self.subTest(character=character):
@@ -4195,7 +4200,7 @@ class ManagedTaskPromptTest(unittest.TestCase):
                     CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES, len(prompt.encode("utf-8"))
                 )
                 self.assertIn(
-                    CLOUD_MODULE.canonical_json(request["allowed_paths"]).decode("utf-8"),
+                    CLOUD_MODULE.canonical_json(request["resolution_context_paths"]).decode("utf-8"),
                     prompt,
                 )
                 options.prompt += "x"
@@ -4824,7 +4829,7 @@ class ManagedTaskPromptTest(unittest.TestCase):
         request = self.request()
         request["strategy"] = "native-stack"
         request["head_commits"] = []
-        request["allowed_paths"] = [
+        request["resolution_context_paths"] = [
             f"instrumentation/library-{number:04d}/src/main/java/Type{number}.java"
             for number in range(100)
         ]
@@ -4982,14 +4987,14 @@ class ManagedTaskPromptTest(unittest.TestCase):
             )
         self.assertEqual(first, api_json.call_args.args[4]["prompt"])
 
-        request["allowed_paths"] = [
+        request["resolution_context_paths"] = [
             f"instrumentation/library-{number:04d}/src/main/java/Type{number}.java"
             for number in range(397)
         ]
         request["request_sha256"] = CLOUD_MODULE.request_digest(request)
         oversized = CLOUD_MODULE.compact_request_contract(request)
         self.assertEqual(compact["native_stack"], oversized["native_stack"])
-        self.assertEqual(request["allowed_paths"], oversized["allowed_paths"]["paths"])
+        self.assertEqual(request["resolution_context_paths"], oversized["resolution_context_paths"]["paths"])
         with (
             mock.patch.object(CLOUD_MODULE, "api_json") as api,
             self.assertRaises(CLOUD_MODULE.ConflictError) as failure,
@@ -5258,7 +5263,7 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
     def test_repeated_output_commit_fails_closed(self):
         with self.assertRaisesRegex(
             CLOUD_MODULE.ConflictError,
-            "reserved path",
+            "reserved.*path",
         ):
             self.prove_merge(report=True, repeated_report=True)
 
@@ -5345,13 +5350,13 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
             }.isdisjoint(mapping)
         )
 
-    def test_mechanical_mapping_rejects_an_unapproved_patch_difference(self):
+    def test_mechanical_mapping_rejects_an_unsafe_patch_path(self):
         old = {
             "sha": "1" * 40,
             "subject": "Retained subject",
             "trailers": [],
             "patch_sha256": "2" * 64,
-            "paths": ["unsafe.py"],
+            "paths": ["../unsafe.py"],
         }
         with (
             mock.patch.object(CLOUD_MODULE, "parents", return_value=["0" * 40]),
@@ -5364,14 +5369,14 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
             mock.patch.object(
                 CLOUD_MODULE,
                 "changed_paths",
-                return_value=["unsafe.py"],
+                return_value=["../unsafe.py"],
             ),
             mock.patch.object(
                 CLOUD_MODULE,
                 "path_patch_sha256",
                 side_effect=["old", "new"],
             ),
-            self.assertRaisesRegex(CLOUD_MODULE.ConflictError, "undeclared"),
+            self.assertRaisesRegex(CLOUD_MODULE.ConflictError, "unsafe"),
         ):
             CLOUD_MODULE.mechanical_mapping(
                 mock.sentinel.runner,
@@ -5382,7 +5387,7 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
                 {"app.py"},
             )
 
-    def test_exact_scope_keeps_undeclared_destinations_and_reserved_output_rejected(self):
+    def test_mapping_18_accepts_companion_relocations_but_not_reserved_output(self):
         allowed = set(self.native_scope_paths())
         prefix = (
             "instrumentation/vertx/vertx-redis-client/"
@@ -5398,7 +5403,8 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
         for path in [*undeclared, CLOUD_MODULE.OUTPUT_REPORT_PATH]:
             with self.subTest(path=path):
                 self.assertNotIn(path, allowed)
-                old = self.commit(1, "unchanged.py")
+                old = self.commit(18, "unchanged.py")
+                reserved = path == CLOUD_MODULE.OUTPUT_REPORT_PATH
                 scope = allowed | (
                     {path} if path == CLOUD_MODULE.OUTPUT_REPORT_PATH else set()
                 )
@@ -5417,14 +5423,39 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
                         CLOUD_MODULE, "path_patch_sha256",
                         side_effect=["old", "new", "same", "same"],
                     ),
-                    self.assertRaisesRegex(
-                        CLOUD_MODULE.ConflictError, "undeclared or reserved path"
+                    mock.patch.object(CLOUD_MODULE, "patch_sha256", return_value="7" * 64),
+                    (
+                        self.assertRaisesRegex(CLOUD_MODULE.ConflictError, "reserved output path")
+                        if reserved else nullcontext()
                     ) as failure,
                 ):
-                    CLOUD_MODULE.mechanical_mapping(
+                    mapping = CLOUD_MODULE.mechanical_mapping(
                         mock.sentinel.runner, Path("repo"), old, "4" * 40, "5" * 40, scope
                     )
-                self.assertEqual("unexpected_history", failure.exception.code)
+                if reserved:
+                    self.assertEqual("unexpected_history", failure.exception.code)
+                else:
+                    self.assertEqual([path], mapping["changed_paths"])
+                    self.assertEqual(old["sha"], mapping["old_sha"])
+
+                with (
+                    mock.patch.object(MODULE, "commit_parents", return_value=["0" * 40]),
+                    mock.patch.object(MODULE, "conflict_commit_subject", return_value=old["subject"]),
+                    mock.patch.object(MODULE, "conflict_commit_trailers", return_value=old["trailers"]),
+                    mock.patch.object(MODULE, "conflict_changed_paths", return_value=[path, "unchanged.py"]),
+                    mock.patch.object(
+                        MODULE, "conflict_patch_sha256",
+                        side_effect=["old", "new", "same", "same", "7" * 64],
+                    ),
+                    (
+                        self.assertRaisesRegex(MODULE.WorkflowError, "reserved path")
+                        if reserved else nullcontext()
+                    ),
+                ):
+                    consumer_mapping = MODULE.mechanical_commit_mapping(
+                        Path("repo"), old, "4" * 40, "5" * 40, scope
+                    )
+                    self.assertEqual(mapping, consumer_mapping)
 
                 with (
                     mock.patch.object(
@@ -5432,15 +5463,20 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
                     ),
                     mock.patch.object(CLOUD_MODULE, "parents", return_value=["0" * 40]),
                     mock.patch.object(CLOUD_MODULE, "changed_paths", return_value=[path]),
-                    self.assertRaisesRegex(
-                        CLOUD_MODULE.ConflictError, "undeclared or reserved path"
+                    (
+                        self.assertRaisesRegex(CLOUD_MODULE.ConflictError, "reserved output path")
+                        if reserved else nullcontext()
                     ) as failure,
                 ):
-                    CLOUD_MODULE.prove_rebase_range_mechanically(
+                    commits, mappings = CLOUD_MODULE.prove_rebase_range_mechanically(
                         mock.sentinel.runner, Path("repo"), "0" * 40, "4" * 40,
                         [], scope, allow_fix_suffix=True,
                     )
-                self.assertEqual("unexpected_history", failure.exception.code)
+                if reserved:
+                    self.assertEqual("unexpected_history", failure.exception.code)
+                else:
+                    self.assertEqual(["4" * 40], commits)
+                    self.assertEqual([], mappings)
 
     def test_non_linear_rebase_range_fails_closed(self):
         old = {

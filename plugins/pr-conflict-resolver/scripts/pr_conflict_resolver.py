@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "c2333f2fa487056c84123e7e3bcf98d8dce1198f6b2d43461b220a74117d264d"
+    "3412b829b54819e50bdbc8d6983d8d8a9c3f8f9d4398059e40c8712bccf043fc"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 V5_CONFLICT_POLICY = "marketplace-conflict-worker@5"
@@ -84,18 +84,18 @@ V5_CONFLICT_POLICY_IDENTITY = {
     "version": 5,
     "sha256": V5_CONFLICT_POLICY_SHA256,
 }
-CONFLICT_POLICY = "marketplace-conflict-worker@9"
+CONFLICT_POLICY = "marketplace-conflict-worker@10"
 CONFLICT_POLICY_SHA256 = (
-    "5fd71b5c27a96a1864bf68995d9fdac1cfbcee4d390f447cc00245537f773a52"
+    "7d934b95e5e0b8ef83228e95464a5c4f70d8de9114a50c98811e55b4825a0435"
 )
 CONFLICT_POLICY_IDENTITY = {
     "id": "marketplace-conflict-worker",
-    "version": 9,
+    "version": 10,
     "sha256": CONFLICT_POLICY_SHA256,
 }
 CONFLICT_REQUEST_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-request",
-    "version": 1,
+    "version": 2,
 }
 CONFLICT_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-result",
@@ -8280,7 +8280,7 @@ def conflict_preflight(
         },
         "merge_base": merge_base,
         "strategy": strategy,
-        "allowed_paths": sorted(allowed_paths),
+        "resolution_context_paths": sorted(allowed_paths),
         "iteration": {
             "id": iteration_id,
             "number": iteration_number,
@@ -8347,8 +8347,9 @@ def build_conflict_prompt(preflight: dict[str, Any]) -> str:
         f"{request['request_id']} with retained request SHA-256 "
         f"{request['request_sha256']}. The full request remains outside the "
         "repository as dispatcher-owned evidence. The hosted contract includes "
-        "the complete exact allowed path set; it never substitutes samples or a "
-        "digest for that permission set. Do not write a result schema, receipt, validation "
+        "the complete resolution context paths. These are location evidence, not "
+        "filename permissions; necessary scoped companion edits and relocations are "
+        "allowed. Preserve test discovery, execution and coverage. Do not write a result schema, receipt, validation "
         "objects, commit annotations, path classifications, or rationale. You may "
         f"add one final path-only `{AGENT_TASK_OUTPUT_REPORT}` commit with free-form "
         "notes. The helper treats those notes as advisory and derives all acceptance "
@@ -8611,7 +8612,7 @@ def verify_quarantined_result(
     )
     if [item.get("role") for item in code_refs] != expected_roles:
         raise WorkflowError("generated code roles are missing, duplicated, or reordered")
-    allowed_paths = set(request["allowed_paths"])
+    allowed_paths = set(request["resolution_context_paths"])
     previous_tip = (
         request["native_stack"]["trunk"]["sha"]
         if request["strategy"] == "native-stack"
@@ -9081,6 +9082,21 @@ def verify_replay_message_bytes(
         raise WorkflowError("rewritten commit message bytes changed")
 
 
+def require_candidate_code_paths(paths: list[str]) -> None:
+    for path in paths:
+        if (
+            not isinstance(path, str) or not path or path.startswith("/")
+            or any(part.casefold() in {"", ".", "..", ".git"} for part in path.split("/"))
+            or "\\" in path or ":" in path or any(ord(char) < 32 for char in path)
+            or path.casefold().startswith((
+                ".github/agent-task-output/", ".github/agent-task-reports/",
+                ".github/agent-task-receipts/", ".github/agent-task-semantic/",
+                ".github/agent-task-validations/",
+            ))
+        ):
+            raise WorkflowError("code history touches an unsafe or reserved path")
+
+
 def mechanical_commit_mapping(
     repo_root: Path,
     old: dict[str, Any],
@@ -9113,13 +9129,7 @@ def mechanical_commit_mapping(
         )
         != conflict_patch_sha256(repo_root, parent, new_sha, path)
     ]
-    if (
-        AGENT_TASK_OUTPUT_REPORT in compared_paths
-        or not set(changed_paths) <= allowed_paths
-    ):
-        raise WorkflowError(
-            "rewritten commit changed an undeclared or reserved path"
-        )
+    require_candidate_code_paths(compared_paths)
     return {
         "old_sha": old["sha"],
         "new_sha": new_sha,
@@ -9174,8 +9184,7 @@ def verify_rebased_range_mechanically(
         if commit_parents(repo_root, new_sha) != [parent]:
             raise WorkflowError("member fix suffix is not linear")
         paths = conflict_changed_paths(repo_root, new_sha)
-        if AGENT_TASK_OUTPUT_REPORT in paths or not set(paths) <= allowed_paths:
-            raise WorkflowError("member fix changed an undeclared or reserved path")
+        require_candidate_code_paths(paths)
         parent = new_sha
 
 
@@ -9317,7 +9326,7 @@ def verify_quarantined_result(
             or not all(isinstance(item, dict) for item in artifacts)
         ):
             raise WorkflowError("stack task artifacts are incomplete")
-    allowed_paths = set(request["allowed_paths"])
+    allowed_paths = set(request["resolution_context_paths"])
     previous_tip = (
         request["native_stack"]["trunk"]["sha"]
         if request["strategy"] == "native-stack"
@@ -9388,13 +9397,7 @@ def verify_quarantined_result(
                         "merge result has reversed or unexpected parents"
                     )
                 paths = conflict_diff_paths(repo_root, parent, commit)
-                if (
-                    AGENT_TASK_OUTPUT_REPORT in paths
-                    or not set(paths) <= allowed_paths
-                ):
-                    raise WorkflowError(
-                        "merge result changed an undeclared or reserved path"
-                    )
+                require_candidate_code_paths(paths)
                 parent = commit
         elif request["strategy"] == "rebase":
             if (

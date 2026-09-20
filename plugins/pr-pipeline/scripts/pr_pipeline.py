@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "1d499ec7561e5e9817f50fa3881523e3ff01fa9e99f71099de41a86b3986ee96"
+COMMON_SHA256 = "e06214907cb138784c00c1cef30f678f61abe095ca9ccc3ef2e796c681c2462b"
 
 
 def load_common() -> Any:
@@ -232,6 +232,8 @@ def clean_ci_evidence(payload: dict[str, Any]) -> bool:
         ci.get("clear") is True
         and ci.get("clearance_kind") == "stage_result"
         and ci.get("clear_at_head_sha") == head
+        and ci.get("clear_at_base_sha") == base
+        and common.current_ci_clearance_verification(status.get("clearance_verification"))
         and status.get("outcome") == "green"
         and run_status.get("head_sha") == head
         and run_status.get("decision") == "green"
@@ -1522,13 +1524,21 @@ def command_start(args: argparse.Namespace) -> None:
         "github_mutation_policy": args.github_mutation_policy,
     }
     common.write_json_atomically(launch_path, launch)
-    process = common.start_detached(
-        scheduler_command(args, target, run_id, event_log),
-        cwd=repo_root,
-        log_path=scheduler_log_path(target, run_id),
-    )
     try:
-        common.write_json_atomically(launch_path, {**launch, "pid": process.pid})
+        process = common.start_detached(
+            scheduler_command(args, target, run_id, event_log),
+            cwd=repo_root,
+            log_path=scheduler_log_path(target, run_id),
+        )
+    except common.LaunchError as error:
+        common.write_json_atomically(
+            launch_path, {**launch, **error.launch_receipt, "error": str(error), "status": "launch_failed"}
+        )
+        raise
+    try:
+        common.write_json_atomically(
+            launch_path, {**launch, "pid": process.pid, **process.launch_receipt}
+        )
         common.write_json_atomically(locator_path, monitor_locator(target, run_id))
     except OSError:
         process.terminate()
@@ -1539,6 +1549,7 @@ def command_start(args: argparse.Namespace) -> None:
             "run_id": run_id,
             "target": f"{target['owner']}/{target['repo']}#{target['number']}",
             "pid": process.pid,
+            **process.launch_receipt,
             "cursor": 0,
             "next_watch": {
                 "arguments": watch_arguments(

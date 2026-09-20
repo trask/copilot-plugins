@@ -77,7 +77,7 @@ VALIDATION_SOURCE_NAMES = {
     "tox.ini",
 }
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "c3212f5c87b75074d9e69f87e3481806d21c696b0334e28e88ae53b1bed0f03f"
+    "b88a6edaeeb4358d84bb1143489244d7f181ff694fb6d2c3abde735de7c719f3"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -155,7 +155,7 @@ LEGACY_SELF_REVIEW_SEMANTIC_OUTPUT_SCHEMA = {
     "id": "github.copilot.agent-task-semantic-output",
     "version": 1,
 }
-WORKER_PROMPT_VERSION = 11
+WORKER_PROMPT_VERSION = 12
 MODEL_ALIASES = {
     "luna": "gpt-5.6-luna",
     "terra": "gpt-5.6-terra",
@@ -175,6 +175,7 @@ RECEIPT_PATH_PATTERN = re.compile(
 )
 AGENT_TASK_OUTPUT_DIRECTORY = ".github/agent-task-output/"
 AGENT_TASK_OUTPUT_REPORT = f"{AGENT_TASK_OUTPUT_DIRECTORY}report.md"
+AGENT_TASK_OUTPUT_RESULT = f"{AGENT_TASK_OUTPUT_DIRECTORY}self-review-result.json"
 class WorkflowError(RuntimeError):
     def __init__(self, message: str, *, details: dict[str, Any] | None = None):
         super().__init__(message)
@@ -1435,13 +1436,22 @@ def build_worker_prompt(
         "clean or after the supplied maximum number of review iterations. Never ask "
         "the local coordinator to run code, inspect files, or retry validation.\n\n"
         "Create zero or more linear, single-parent code commits. Zero code commits "
-        "means no fixes were needed. Do not encode findings, mappings, changed-path "
+        "does not establish a clean review. Do not encode findings, mappings, changed-path "
         "claims, validation results, pull request metadata, or workflow identity for "
         "the coordinator. The dispatcher derives the exact candidate history.\n\n"
-        "You may create one final single-parent output commit after all code commits. "
+        "Create one final single-parent output commit after all code commits. "
+        f"Write `{AGENT_TASK_OUTPUT_RESULT}` with exactly `outcome` and "
+        "`iterations_used`. Outcome is `clean` only after a complete review pass "
+        "finds nothing left to fix; `exhausted` when the entire supplied allowance "
+        "was consumed with concerns remaining; `incomplete` when analysis or "
+        "validation could not finish. Count every review pass, including a final "
+        "clean pass, not commits or pushes. Clean/exhausted counts are integers "
+        "from 1 through the allowance; exhausted consumes the full allowance. "
+        "Incomplete may use zero through the allowance and never authorizes "
+        "publication. Correct output and validation problems within this task.\n\n"
         f"If useful, write a free-form report to `{AGENT_TASK_OUTPUT_REPORT}` with a "
         "work summary, validation attempts, unresolved concerns, and retrospective. "
-        "The report is advisory and may be absent. Keep every path in that optional "
+        "The report is advisory and may be absent. Keep every path in that output "
         f"commit under `{AGENT_TASK_OUTPUT_DIRECTORY}`. Do not mix output paths into "
         "code commits or create more than one output commit.\n\n"
         "Do not push the pull request branch or change pull request metadata. The local "
@@ -3373,6 +3383,33 @@ def candidate_self_review_report(
         },
         "completion": remote["completion"],
         "report_evidence": remote["report_evidence"],
+    }
+
+
+def candidate_review_outcome(
+    repo_root: Path, remote: dict[str, Any], *, allowed_iterations: int
+) -> dict[str, Any]:
+    artifact = remote["candidate_manifest"]["artifact_commit"]
+    if artifact is None or AGENT_TASK_OUTPUT_RESULT not in artifact["changed_paths"]:
+        raise WorkflowError("Self Review candidate has no terminal outcome artifact")
+    content = git(repo_root, "show", f"{artifact['sha']}:{AGENT_TASK_OUTPUT_RESULT}")
+    if len(content.encode("utf-8")) > 4096:
+        raise WorkflowError("Self Review terminal outcome exceeds 4096 bytes")
+    result = parse_strict_json(content, description="Self Review terminal outcome")
+    if not isinstance(result, dict) or set(result) != {"outcome", "iterations_used"}:
+        raise WorkflowError("Self Review terminal outcome has invalid fields")
+    outcome, used = result["outcome"], result["iterations_used"]
+    if (
+        not isinstance(outcome, str) or outcome not in {"clean", "exhausted", "incomplete"}
+        or type(used) is not int
+        or not (0 if outcome == "incomplete" else 1) <= used <= allowed_iterations
+        or (outcome == "exhausted" and used != allowed_iterations)
+    ):
+        raise WorkflowError("Self Review terminal outcome has invalid consumption")
+    return {
+        "outcome": {"clean": "cleared", "exhausted": "max_iterations_reached",
+                    "incomplete": "incomplete"}[outcome],
+        "iterations_used": used,
     }
 
 
@@ -6219,20 +6256,9 @@ def command_pipeline(args: argparse.Namespace) -> None:
     ):
         raise WorkflowError("pipeline requires a target, state, and valid run position")
     args._pipeline = True
-    commits: list[str] = []
-    tasks: list[dict[str, Any]] = []
-    for iteration in range(args.max_iterations):
-        args._pipeline_entry = iteration == 0
-        result = command_agent_task(args)
-        commits.extend(result.get("commits", []))
-        if result.get("task"):
-            tasks.append(result["task"])
-        if result.get("outcome") != "continue":
-            if commits and result.get("result") == "nothing_to_publish":
-                result["result"] = "published"
-            emit({**result, "commits": commits, "tasks": tasks})
-            return
-    raise WorkflowError("Self Review Loop exceeded its configured iteration budget")
+    args._pipeline_entry = True
+    result = command_agent_task(args)
+    emit({**result, "tasks": [result["task"]] if result.get("task") else []})
 
 
 def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
@@ -6612,6 +6638,7 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
             state["review"] = {
                 "id": f"pr-{pr['number']}-agent-task-cap",
                 "status": "max_iterations_reached",
+                "outcome": "budget_exhausted",
                 "iteration": int(state.get("iterations", 0)) + 1,
                 "head_sha": pr["head_sha"],
                 "candidates": [],
@@ -6662,6 +6689,7 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
             "github_mutation_policy": ACTIVE_GITHUB_MUTATION_POLICY,
             "policy": AGENT_TASK_POLICY,
             "allowed_iterations": allowed_iterations,
+            "reserved_iterations": allowed_iterations,
             "preflight": preflight,
             "prompt_file": str(prompt_path),
             "result_file": str(result_path),
@@ -6687,7 +6715,7 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
             helper = discover_cloud_task()
             prompt = build_worker_prompt(
                 preflight,
-                max_iterations=1 if pipeline_mode else allowed_iterations,
+                max_iterations=allowed_iterations,
                 prior_history=state.get("history") or [],
             )
             require_no_credentials(prompt, source="Agent Task prompt")
@@ -6939,16 +6967,13 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
                 remote=remote,
             )
             report_content = None
-            report = {
-                "outcome": (
-                    "continue"
-                    if pipeline_mode and remote["commits"] and allowed_iterations > 1
-                    else "max_iterations_reached"
-                    if pipeline_mode and remote["commits"]
-                    else "cleared"
-                ),
-                "iterations_used": 1,
-            }
+            report = candidate_review_outcome(
+                repo_root, remote, allowed_iterations=allowed_iterations
+            )
+            state["agent_task"]["review_outcome"] = report
+            save_state(state_path, state)
+            if report["outcome"] == "incomplete":
+                raise WorkflowError("hosted Self Review is incomplete; candidate not imported")
             metadata_result = None
         else:
             paths_by_commit = validate_generated_history(
@@ -7366,6 +7391,12 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
         if report["outcome"] == "cleared":
             review["outcome"] = "clean"
             review["clean_at_head_sha"] = published_head
+            review["clean_at_base_sha"] = pr["base_sha"]
+        else:
+            review["outcome"] = "exhausted"
+        review["iterations_used"] = report["iterations_used"]
+        current["agent_task"]["reserved_iterations"] = 0
+        current["agent_task"]["consumed_iterations"] = report["iterations_used"]
         if not candidate_flow:
             current.setdefault("history", []).extend(
                 {
@@ -7540,32 +7571,16 @@ def recorded_clean_at_head_sha(state: dict[str, Any]) -> str | None:
 
 
 def stage_outcome(state: dict[str, Any]) -> str | None:
-    """Name this run's ending in the vocabulary an orchestrator records.
-
-    `resolve` is the only command that records an ending, so `cleared` is the
-    only word this state can support, and it is read straight off the same
-    clean-at-head record a reader consults for the review's cleanness. This says
-    how the run ended. It never says whether the review is clean.
-
-    Returning `None` means this state supports no claim about an ending, and the
-    field is then left out so a reader sees an absent answer rather than a
-    manufactured one. State exists from the moment `preflight` writes it, so a
-    run killed at any point leaves exactly the same state as a run still in
-    flight. Nothing in that state distinguishes them, so neither is `no_progress`
-    and neither is `escalated`.
-
-    A blocked batch and a state at its iteration cap are conditions that persist
-    across runs, not endings that happened. Both outlive the run that caused
-    them, so a run that never started would inherit them and answer for a run it
-    never made. The agent that watched the run reports those endings itself,
-    through the orchestrator's own `finish`.
-
-    A reader is entitled to take any value it finds at face value, so a value
-    this function cannot support must not appear at all.
-    """
+    """Report verified completion separately from review clearance."""
 
     if recorded_clean_at_head_sha(state) is not None:
         return "cleared"
+    task = state.get("agent_task") or {}
+    review = state.get("review") or {}
+    if task.get("status") == "completed" and review.get("outcome") in {
+        "exhausted", "budget_exhausted",
+    }:
+        return "max_iterations_reached"
     return None
 
 
@@ -7643,6 +7658,8 @@ def command_status(args: argparse.Namespace) -> None:
                 "diff_path": review.get("diff_path"),
                 "outcome": review.get("outcome"),
                 "clean_at_head_sha": review.get("clean_at_head_sha"),
+                "clean_at_base_sha": review.get("clean_at_base_sha"),
+                "iterations_used": review.get("iterations_used"),
                 "candidate_statuses": count_by_status(review.get("candidates")),
                 "batch_statuses": count_by_status(review.get("batches")),
             },

@@ -1210,7 +1210,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.68")
+        self.assertEqual(plugin["version"], "1.0.69")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -3801,7 +3801,7 @@ class RecommendationContractTest(unittest.TestCase):
 
     def test_runtime_policy_and_proposal_versions_are_pinned(self):
         self.assertEqual(
-            "c3212f5c87b75074d9e69f87e3481806d21c696b0334e28e88ae53b1bed0f03f",
+            "b88a6edaeeb4358d84bb1143489244d7f181ff694fb6d2c3abde735de7c719f3",
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
         )
         self.assertEqual(

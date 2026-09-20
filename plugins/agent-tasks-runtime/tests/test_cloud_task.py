@@ -2079,10 +2079,18 @@ class CandidatePolicyTest(unittest.TestCase):
                 report.policy,
                 MODULE.MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR,
             )
-            with self.assertRaisesRegex(MODULE.CloudError, "disabled|does not support"):
+            historical = MODULE.parse_args(
+                [
+                    "--apply-with-report", "--allow-merged-pr", "--pr", "owner/repo#1",
+                    "--prompt-file", str(prompt_path), "--result-file", str(result_path),
+                    "--policy", MODULE.MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR,
+                ]
+            )
+            self.assertTrue(historical.allow_merged_pr)
+            with self.assertRaisesRegex(MODULE.CloudError, "disabled|does not support|only"):
                 MODULE.parse_args(
                     [
-                        "--apply-with-report",
+                        "--report",
                         "--allow-merged-pr",
                         "--pr",
                         "owner/repo#1",
@@ -2091,7 +2099,7 @@ class CandidatePolicyTest(unittest.TestCase):
                         "--result-file",
                         str(result_path),
                         "--policy",
-                        MODULE.MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR,
+                        MODULE.MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR,
                     ]
                 )
 
@@ -2532,6 +2540,9 @@ class CandidateDispatcherTest(unittest.TestCase):
     def test_derives_manifest_from_exact_head_detached_checkout(self):
         self.check_candidate(None)
 
+    def test_historical_merged_source_dispatches_on_its_immutable_head(self):
+        self.check_candidate("trask-pr-audit-7", historical=True)
+
     def test_head_movement_during_preparation_does_not_start_a_task(self):
         self.check_candidate(None, drift_phase="preparation")
 
@@ -2550,7 +2561,7 @@ class CandidateDispatcherTest(unittest.TestCase):
                         drift_fields={field: value},
                     )
 
-    def check_candidate(self, branch, *, drift_phase=None, drift_fields=None):
+    def check_candidate(self, branch, *, drift_phase=None, drift_fields=None, historical=False):
         root = Path("C:/repo")
         base_sha = "1" * 40
         code_commit = "2" * 40
@@ -2565,7 +2576,7 @@ class CandidateDispatcherTest(unittest.TestCase):
         pull_request = MODULE.PullRequestSnapshot(
             7,
             "https://github.com/owner/repo/pull/7",
-            "OPEN",
+            "MERGED" if historical else "OPEN",
             "owner/repo",
             "main",
             "4" * 40,
@@ -2583,6 +2594,7 @@ class CandidateDispatcherTest(unittest.TestCase):
             result_file=Path("C:/state/result.json"),
             policy=MODULE.MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR,
             prompt_file=Path("C:/state/prompt.txt"),
+            allow_merged_pr=historical,
         )
         submitted_prompt = MODULE.task_payload(
             options,
@@ -2604,7 +2616,7 @@ class CandidateDispatcherTest(unittest.TestCase):
                     "provider": "github",
                     "data": {
                         "head_ref": "copilot/task-1",
-                        "base_ref": "feature",
+                        "base_ref": base_sha if historical else "feature",
                     },
                 }
             ],
@@ -2616,7 +2628,7 @@ class CandidateDispatcherTest(unittest.TestCase):
                     "created_at": "2026-09-18T12:00:01Z",
                     "completed_at": "2026-09-18T12:03:00Z",
                     "model": "sweagent-capi:gpt-5.6-sol",
-                    "base_ref": "feature",
+                    "base_ref": base_sha if historical else "feature",
                     "head_ref": "copilot/task-1",
                     "repository": {"id": 11, "full_name": "owner/repo"},
                     "owner": {"id": 12, "login": "owner"},
@@ -2789,6 +2801,57 @@ class CandidateDispatcherTest(unittest.TestCase):
                 "structural_complete": True,
             },
         )
+        verified = MODULE.verify_candidate_result(
+            envelope, options=options, pull_request=pull_request, root=root, git=repository,
+        )
+        self.assertEqual(verified["code_tip"], code_commit)
+        if historical:
+            self.assertEqual(envelope["task"]["base_ref"], base_sha)
+            return
+        for state in ("CLOSED", "MERGED"):
+            with self.subTest(ordinary_source_state=state):
+                with self.assertRaisesRegex(MODULE.CloudError, "source state"):
+                    MODULE.verify_candidate_result(
+                        envelope, options=options, pull_request=replace(pull_request, state=state),
+                        root=root, git=repository,
+                    )
+        for field in ("head_sha", "base_sha"):
+            with self.subTest(stale=field):
+                with self.assertRaisesRegex(MODULE.CloudError, "identity"):
+                    MODULE.verify_candidate_result(
+                        envelope, options=options, pull_request=replace(pull_request, **{field: "9" * 40}),
+                        root=root, git=repository,
+                    )
+        wrong_model = json.loads(json.dumps(envelope))
+        wrong_model["completion"]["session"]["actual_model"] = "gpt-6-astra"
+        with self.assertRaisesRegex(MODULE.CloudError, "completion identity"):
+            MODULE.verify_candidate_result(
+                wrong_model, options=options, pull_request=pull_request, root=root, git=repository,
+            )
+        historical_pr = replace(pull_request, state="MERGED")
+        historical_options = replace(options, allow_merged_pr=True)
+        historical_result = json.loads(json.dumps(envelope))
+        historical_result["task"]["base_ref"] = base_sha
+        historical_result["candidate"]["base"]["ref"] = base_sha
+        historical_result["completion"]["refs"]["base"] = base_sha
+        historical_prompt = MODULE.task_payload(
+            historical_options, MODULE.OUTPUT_REPORT_PATH, historical_pr,
+        )["prompt"]
+        prompt_sha = hashlib.sha256(historical_prompt.encode("utf-8")).hexdigest()
+        historical_result["completion"]["request"]["prompt_sha256"] = prompt_sha
+        historical_result["completion"]["session"]["prompt_sha256"] = prompt_sha
+        repository.identity.return_value = MODULE.LocalIdentity("trask-pr-audit-7", base_sha, "", None)
+        historical = MODULE.verify_candidate_result(
+            historical_result, options=historical_options, pull_request=historical_pr,
+            root=root, git=repository,
+        )
+        self.assertEqual(historical["code_tip"], code_commit)
+        repository.identity.return_value = MODULE.LocalIdentity("feature", base_sha, "", None)
+        with self.assertRaisesRegex(MODULE.CloudError, "frozen audit branch"):
+            MODULE.verify_candidate_result(
+                historical_result, options=historical_options, pull_request=historical_pr,
+                root=root, git=repository,
+            )
 
 
 if __name__ == "__main__":

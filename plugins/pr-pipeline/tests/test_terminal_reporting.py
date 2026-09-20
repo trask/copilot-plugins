@@ -32,7 +32,7 @@ def observed_clean_result():
     stages = [
         {
             "stage": stage, "clear": True, "clear_at_head_sha": HEAD,
-            "clear_at_base_sha": BASE if stage == MODULE.STAGE_CONFLICT else None,
+            "clear_at_base_sha": BASE,
             "clearance_kind": "stage_result", "installed": True,
             "outcome": "cleared", "reason": None, "status_state": "run-bound-state.json",
             "status": {
@@ -43,6 +43,11 @@ def observed_clean_result():
         for stage in MODULE.STAGE_NAMES
     ]
     stages[3]["status"] = {
+        "clean_at_head_sha": HEAD, "clean_at_base_sha": BASE,
+        "clearance_verification": {
+            "result": "current", "reason": "ci_snapshot_current",
+            "expected_snapshot_sha256": "c" * 64, "observed_snapshot_sha256": "c" * 64,
+        },
         "budget_scope": "pipeline", "iterations": 0, "escalation": None,
         "outcome": "green", "progress": None, "skip_note": None,
         "coordinator": {

@@ -318,6 +318,7 @@ class GenericCiDiagnosisTest(unittest.TestCase):
     def test_warning_verification_ignores_order_and_description_edits(self):
         state = self.warning_state()
         with (
+            mock.patch.object(MODULE, "gh_json", return_value=[{"workflow_runs": []}]),
             mock.patch.object(
                 MODULE, "metadata_for",
                 return_value={**self.pr, "title": "Updated description", "body": "New body"},
@@ -340,6 +341,7 @@ class GenericCiDiagnosisTest(unittest.TestCase):
         ]
         for checks in snapshots:
             with (
+                mock.patch.object(MODULE, "gh_json", return_value=[{"workflow_runs": []}]),
                 self.subTest(checks=checks),
                 mock.patch.object(MODULE, "metadata_for", return_value=self.pr),
                 mock.patch.object(MODULE, "fetch_rollup", return_value=(self.pr["head_sha"], checks)),
@@ -360,6 +362,7 @@ class GenericCiDiagnosisTest(unittest.TestCase):
             {**self.run, "status": "queued", "conclusion": None},
         ):
             with (
+                mock.patch.object(MODULE, "gh_json", return_value=[{"workflow_runs": []}]),
                 self.subTest(live=live),
                 mock.patch.object(MODULE, "metadata_for", return_value=self.pr),
                 mock.patch.object(MODULE, "fetch_rollup", return_value=(self.pr["head_sha"], self.checks)),
@@ -387,6 +390,7 @@ class GenericCiDiagnosisTest(unittest.TestCase):
             "status", "--state", str(self.path), "--verify-warning-snapshot",
         ])
         with (
+            mock.patch.object(MODULE, "gh_json", return_value=[{"workflow_runs": []}]),
             mock.patch.object(MODULE, "metadata_for", return_value=self.pr),
             mock.patch.object(MODULE, "fetch_rollup", return_value=(self.pr["head_sha"], [])),
             mock.patch.object(MODULE, "emit") as emit,

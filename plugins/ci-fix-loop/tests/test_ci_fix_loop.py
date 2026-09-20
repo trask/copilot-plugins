@@ -4608,7 +4608,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.59", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.60", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -4650,7 +4650,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             iteration_allowance=1,
             prior_history=[],
             requested_model="gpt-5.6-sol",
-            triage_summary=(
+            ci_evidence=(
                 f"{MODULE.triage_identity_line(self.preflight)}\n"
                 "The test failure is the root failure.\n"
             ),
@@ -4660,7 +4660,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertIn('"iteration_allowance": 1', prompt)
         self.assertIn("Never select a marketplace `custom_agent`", prompt)
         self.assertIn("use Cloud Sandboxes", prompt)
-        self.assertIn("worker prompt version 8", prompt)
+        self.assertIn("worker prompt version 9", prompt)
         self.assertIn("validate them in this hosted task", prompt)
         self.assertIn("never executes candidate validation commands", prompt)
         self.assertIn("rerun checks, post comments, reviews or replies", prompt)
@@ -7762,7 +7762,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 )
 
         self.assertEqual(1, len(helper_commands))
-        self.assertEqual(1, self.triage_worker_mock.call_count)
+        self.triage_worker_mock.assert_not_called()
         self.assertEqual(0, self.retained_triage_mock.call_count)
         state = MODULE.load_state(state_path)
         self.assertEqual(1, state["iterations"])
@@ -7777,7 +7777,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertTrue(MODULE.task_matches_preflight(task, self.preflight))
         self.assertFalse(MODULE.task_matches_preflight(task, changed))
 
-    def test_local_triage_failure_dispatches_no_hosted_task(self):
+    def test_controller_evidence_failure_dispatches_no_hosted_task(self):
         repo = self.root / "repo"
         repo.mkdir()
         state_path = self.root / "state.json"
@@ -7811,12 +7811,16 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 MODULE, "local_identity", return_value=preflight["identity"]
             ),
             mock.patch.object(MODULE, "require_live_check_snapshot"),
+            mock.patch.object(
+                MODULE, "controller_ci_evidence", side_effect=MODULE.WorkflowError("evidence unavailable")
+            ),
             mock.patch.object(MODULE, "discover_cloud_task") as discover,
-            self.assertRaisesRegex(MODULE.WorkflowError, "triage failed"),
+            self.assertRaisesRegex(MODULE.WorkflowError, "evidence unavailable"),
         ):
             MODULE.command_agent_task(arguments)
 
         discover.assert_not_called()
+        self.triage_worker_mock.assert_not_called()
         state = MODULE.load_state(state_path)
         self.assertEqual("failed", state["agent_task"]["status"])
         self.assertEqual(
@@ -7950,6 +7954,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             ),
             mock.patch.object(MODULE, "metadata_for", return_value=preflight["pr"]),
             mock.patch.object(MODULE, "remote_head", return_value=self.head),
+            mock.patch.object(MODULE, "ci_snapshot_runs", return_value={}),
             mock.patch.object(MODULE, "fetch_committed_text", return_value=json.dumps(payload)),
             mock.patch.object(
                 MODULE, "apply_verified_candidate_import",
@@ -8021,9 +8026,15 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         commit = "5" * 40
         result = self.candidate_result(
             [commit],
-            changed_paths=["src/widget.py"],
+            changed_paths=[
+                "gradlew",
+                "legacyProtostellarTest/ConnectionTest.java",
+                "legacyProtostellarUnitTests/ConnectionTest.java",
+                "src/widget.py",
+            ],
         )
         commands = []
+        identity = dict(preflight["identity"])
 
         def run_command(command, **kwargs):
             commands.append(command)
@@ -8031,6 +8042,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 Path(command[command.index("--result-file") + 1]).write_text(
                     json.dumps(result), encoding="utf-8"
                 )
+            if command[:4] == ["git", "-C", str(repo), "merge"]:
+                identity["head"] = command[-1]
             return MODULE.subprocess.CompletedProcess(command, 0, "", "")
 
         arguments = MODULE.build_parser().parse_args(
@@ -8057,17 +8070,17 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "local_identity",
-                side_effect=[
-                    preflight["identity"],
-                    preflight["identity"],
-                    preflight["identity"],
-                    preflight["identity"],
-                    imported_identity,
-                    imported_identity,
-                ],
+                side_effect=lambda *_: dict(identity),
             ),
             mock.patch.object(MODULE, "validate_candidate_history"),
-            mock.patch.object(MODULE, "refuse_test_suppression"),
+            mock.patch.object(
+                MODULE, "refuse_test_suppression",
+                side_effect=AssertionError("local test-shape veto"),
+            ),
+            mock.patch.object(
+                MODULE, "refuse_candidate_wrapper_changes",
+                side_effect=AssertionError("local wrapper veto"),
+            ),
             mock.patch.object(MODULE, "require_live_check_snapshot"),
             mock.patch.object(
                 MODULE, "metadata_for", side_effect=[preflight["pr"], live_after_push]
@@ -8105,6 +8118,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertEqual("published", emit.call_args.args[0]["result"])
         state = MODULE.load_state(state_path)
+        self.assertIsNone(state.get("clean_at_head_sha"))
+        self.assertNotEqual("cleared", MODULE.stage_outcome(state))
         self.assertEqual(commit, state["agent_task"]["published_head_sha"])
         self.assertEqual([commit], state["agent_task"]["ordered_commits"])
         self.assertEqual(
@@ -8297,6 +8312,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             changed_paths=["src/widget.py"],
         )
         commands = []
+        identity = dict(preflight["identity"])
 
         def run_command(command, **kwargs):
             commands.append(command)
@@ -8330,12 +8346,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "local_identity",
-                side_effect=[
-                    preflight["identity"],
-                    preflight["identity"],
-                    preflight["identity"],
-                    imported_identity,
-                ],
+                side_effect=lambda *_: dict(identity),
             ),
             mock.patch.object(MODULE, "validate_candidate_history"),
             mock.patch.object(MODULE, "refuse_test_suppression"),
@@ -8350,7 +8361,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 return_value=live_after_push,
             ),
             mock.patch.object(
-                MODULE, "apply_verified_candidate_import", return_value=True
+                MODULE, "apply_verified_candidate_import",
+                side_effect=lambda *a, **kw: identity.update(head=commit) or True,
             ) as apply_import,
             mock.patch.object(MODULE, "emit") as emit,
         ):
@@ -9634,11 +9646,11 @@ class LocalCiLogTriageTest(unittest.TestCase):
             iteration_allowance=1,
             prior_history=[],
             requested_model="gpt-5.6-sol",
-            triage_summary=self.summary,
+            ci_evidence=self.summary,
         )
 
-        start = "----- BEGIN LOCAL CI TRIAGE SUMMARY -----\n"
-        end = "----- END LOCAL CI TRIAGE SUMMARY -----\n"
+        start = "----- BEGIN CONTROLLER CI EVIDENCE -----\n"
+        end = "----- END CONTROLLER CI EVIDENCE -----\n"
         handed_off = prompt.split(start, 1)[1].split(end, 1)[0]
         self.assertEqual(self.summary, handed_off)
         self.assertNotIn(self.log_text, prompt)
@@ -14809,6 +14821,12 @@ class NativeStackCoordinatorTest(unittest.TestCase):
         self.stack_state = self.root / "stack.json"
         self.resolver = self.root / "pr_conflict_resolver.py"
         self.resolver.write_text("# test", encoding="utf-8")
+        verification = mock.patch.object(
+            MODULE, "verify_ci_clearance_snapshot",
+            return_value={"clearance_verification": {"result": "current"}},
+        )
+        self.verification = verification.start()
+        self.addCleanup(verification.stop)
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -15316,6 +15334,43 @@ class NativeStackCoordinatorTest(unittest.TestCase):
             MODULE.verify_stack_member_guard(
                 self.stack_state, MODULE.parse_target("owner/repo#7"), "middle1"
             )
+
+    def test_same_head_new_attempt_blocks_successor_and_active_child_guard(self):
+        stack = native_stack()
+        started = self.start(stack)
+        lower_state = self.member_state(5, "lower1", started["run_id"])
+        self.record(stack, lower_state)
+        self.verification.return_value = {"clearance_verification": {"result": "stale"}}
+        with (
+            mock.patch.object(MODULE, "read_native_stack", return_value=stack),
+            self.assertRaisesRegex(MODULE.WorkflowError, "CI snapshot changed"),
+        ):
+            MODULE.verify_stack_member_guard(
+                self.stack_state, MODULE.parse_target("owner/repo#7"), "middle1"
+            )
+        result = self.next(stack)
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual("ci_snapshot_changed", result["reason"])
+
+    def test_same_head_new_attempt_blocks_final_stack_completion(self):
+        stack = native_stack()
+        started = self.start(stack)
+        for number, head in ((5, "lower1"), (7, "middle1"), (9, "upper1")):
+            self.next(stack)
+            self.record(stack, self.member_state(number, head, started["run_id"]))
+        self.verification.return_value = {"clearance_verification": {"result": "stale"}}
+        result = self.next(stack)
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual("ci_snapshot_changed", result["reason"])
+
+    def test_new_attempt_during_member_record_does_not_clear_member(self):
+        stack = native_stack()
+        started = self.start(stack)
+        member_state = self.member_state(5, "lower1", started["run_id"])
+        self.verification.return_value = {"clearance_verification": {"result": "stale"}}
+        result = self.record(stack, member_state)
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual("member_not_clear", result["reason"])
 
     def test_unexplained_active_member_movement_stops_before_more_work(self):
         stack = native_stack()
@@ -16105,6 +16160,10 @@ class NativeStackCoordinatorTest(unittest.TestCase):
             member["stage_outcome"] = (
                 "skipped" if member["number"] == 7 else "cleared"
             )
+            member["ci_state_path"] = str(self.member_state(
+                member["number"], member["head_sha"], state["run_id"],
+                outcome="no_checks" if member["number"] == 7 else "green",
+            ))
         MODULE.save_state(self.stack_state, state)
         result = self.next(stack)
         self.assertEqual("complete", result["result"])

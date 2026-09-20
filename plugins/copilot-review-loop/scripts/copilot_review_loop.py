@@ -189,7 +189,7 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "c3212f5c87b75074d9e69f87e3481806d21c696b0334e28e88ae53b1bed0f03f"
+    "b88a6edaeeb4358d84bb1143489244d7f181ff694fb6d2c3abde735de7c719f3"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -1049,6 +1049,8 @@ def policy_skip_clearance_error(
         "pipeline_budget",
         "github_mutation_policy",
         "clean_at_head_sha",
+        "clean_at_base_sha",
+        "max_iterations",
         "last_result",
         "policy_skip",
         "coordinator",
@@ -1133,6 +1135,7 @@ def policy_skip_clearance_error(
         state.get("github_mutation_policy") != "source-only"
         or state.get("last_result") != SOURCE_ONLY_POLICY_SKIP_RESULT
         or state.get("clean_at_head_sha") is not None
+        or state.get("clean_at_base_sha") is not None
     ):
         return "terminal policy skip conflicts with recorded stage state"
     pipeline_run = skip.get("pipeline_run")
@@ -1402,6 +1405,7 @@ def record_source_only_policy_skip(
     observed_at = utc_now()
     result["github_mutation_policy"] = "source-only"
     result["clean_at_head_sha"] = None
+    result["clean_at_base_sha"] = None
     result["last_result"] = SOURCE_ONLY_POLICY_SKIP_RESULT
     result["policy_skip"] = {
         "policy": "source-only",
@@ -1438,7 +1442,7 @@ def record_source_only_policy_skip(
 
 
 def terminal_agent_task_clearance_error(
-    state: dict[str, Any], target: dict[str, Any]
+    state: dict[str, Any], target: dict[str, Any], *, allow_exhausted: bool = False
 ) -> str | None:
     if state.get("policy_skip") is not None:
         return policy_skip_clearance_error(state, target)
@@ -1453,13 +1457,6 @@ def terminal_agent_task_clearance_error(
     ):
         return "terminal state has invalid or mismatched pull request identity"
     head = pr["head_sha"]
-    if state.get("clean_at_head_sha") != head or stage_outcome(state) != "cleared":
-        return "coordinator returned without validated current-head clearance"
-    if state.get("last_result") not in {
-        *CLEAN_PREFLIGHT_RESULTS,
-        WATCHER_REVIEW_CLEAN,
-    }:
-        return "terminal clearance has no validated clean result"
     coordinator = state.get("coordinator")
     escalation = state.get("escalation")
     if (
@@ -1492,6 +1489,29 @@ def terminal_agent_task_clearance_error(
         or queue["batches"]
     ):
         return "terminal clearance has malformed or unfinished queue state"
+    if allow_exhausted and state.get("last_result") == "max_iterations_reached":
+        cap = state.get("max_iterations")
+        scope = state.get("pipeline_budget") if state.get("budget_scope") == "pipeline" else None
+        spent, run_spent = budget_spent(state, scope, state.get("iterations", 0))
+        if (
+            type(cap) is not int or cap < 1
+            or type(spent) is not int or type(run_spent) is not int
+            or max(spent, run_spent) < cap
+            or state.get("clean_at_head_sha") is not None
+            or state.get("clean_at_base_sha") is not None
+            or state.get("terminal_exit") is not None
+            or queue.get("status") != "active"
+            or any(not isinstance(comment, dict) for comment in queue["comments"])
+        ):
+            return "terminal exhaustion lacks a spent allowance and retained queue"
+        return None
+    if state.get("clean_at_head_sha") != head or stage_outcome(state) != "cleared":
+        return "coordinator returned without validated current-head clearance"
+    if state.get("last_result") not in {
+        *CLEAN_PREFLIGHT_RESULTS,
+        WATCHER_REVIEW_CLEAN,
+    }:
+        return "terminal clearance has no validated clean result"
     status = queue.get("status")
     if status == "clean":
         if queue["comments"]:
@@ -1527,7 +1547,7 @@ def require_terminal_agent_task_clearance(args: argparse.Namespace) -> None:
     if not isinstance(state_path, Path) or not isinstance(target, dict):
         raise WorkflowError("coordinator did not retain its terminal state identity")
     state = load_state(state_path)
-    detail = terminal_agent_task_clearance_error(state, target)
+    detail = terminal_agent_task_clearance_error(state, target, allow_exhausted=True)
     if detail is not None:
         raise WorkflowError(
             detail,
@@ -1558,6 +1578,7 @@ def persist_agent_task_coordinator_error(
             save_state(state_path, state)
             return None
         state["clean_at_head_sha"] = None
+        state["clean_at_base_sha"] = None
         state["last_result"] = "coordinator_error"
         coordinator = state.setdefault("coordinator", {})
         if not isinstance(coordinator, dict):
@@ -3244,6 +3265,7 @@ def command_preflight(args: argparse.Namespace) -> None:
         result = "no_unresolved_comments"
     clean_at_head_sha = head if result in CLEAN_PREFLIGHT_RESULTS else None
     state["clean_at_head_sha"] = clean_at_head_sha
+    state["clean_at_base_sha"] = metadata["base_sha"] if clean_at_head_sha else None
     state["last_result"] = result
     if result == "ready":
         set_stage_progress(state, "addressing_comments")
@@ -4198,6 +4220,7 @@ def command_publish(args: argparse.Namespace) -> None:
         state.setdefault("local_validation", []).append(validation)
     charge_iteration(state)
     state["clean_at_head_sha"] = None
+    state["clean_at_base_sha"] = None
     set_stage_progress(state, "waiting_for_review")
     save_state(path, state)
     emit(
@@ -4420,6 +4443,7 @@ def command_watch(args: argparse.Namespace) -> None:
                     clean = not comments and not suppressed
                     if clean:
                         state["clean_at_head_sha"] = monitoring["head_sha"]
+                        state["clean_at_base_sha"] = state["pr"]["base_sha"]
                     result = watcher_result(
                         state,
                         {
@@ -9908,7 +9932,9 @@ def require_completed_pipeline_sweep(
         raise WorkflowError("pipeline GitHub mutation policy changed")
     if state.get("terminal_exit") is not None:
         raise WorkflowError("pipeline state has an interrupted or failed coordinator")
-    detail = terminal_agent_task_clearance_error(state, target)
+    if state.get("max_iterations", args.max_iterations) != args.max_iterations:
+        raise WorkflowError("pipeline review iteration budget changed")
+    detail = terminal_agent_task_clearance_error(state, target, allow_exhausted=True)
     if detail is not None:
         raise WorkflowError(detail)
     task = state.get("agent_task")
@@ -10015,6 +10041,19 @@ def command_agent_task(args: argparse.Namespace) -> None:
         if existing is not None:
             require_completed_pipeline_sweep(existing, args, target, repo_root)
             previous_sweep = existing
+            if existing.get("last_result") == "max_iterations_reached":
+                existing["pipeline_budget"] = pipeline_scope(existing, args)
+                save_state(state_path, existing)
+                emit({
+                    "result": "max_iterations_reached",
+                    "state": str(state_path),
+                    "pr": existing["pr"]["pr_url"],
+                    "head_sha": existing["pr"]["head_sha"],
+                    "iterations": existing["iterations"],
+                    "stage_outcome": "carried",
+                    "pending_comments": existing["queue"]["comments"],
+                })
+                return
     retained_task = (
         existing.get("agent_task") if isinstance(existing, dict) else None
     )
@@ -10587,11 +10626,13 @@ def command_agent_task(args: argparse.Namespace) -> None:
             state.pop("policy_skip", None)
             state.pop("coordinator", None)
             state["clean_at_head_sha"] = None
+            state["clean_at_base_sha"] = None
         historical_fixes = historical_source_fixes(state, preflight, repo_root)
         if historical_fixes is not None:
             preflight["historical_fixes"] = historical_fixes
         state["repo_root"] = str(repo_root)
         state["pr"] = pr
+        state["max_iterations"] = args.max_iterations
         state["github_mutation_policy"] = ACTIVE_GITHUB_MUTATION_POLICY
         state["queue"] = {
             "id": f"pr-{pr['number']}",
@@ -10624,11 +10665,13 @@ def command_agent_task(args: argparse.Namespace) -> None:
         ):
             state["github_mutation_policy"] = "source-only"
             state["clean_at_head_sha"] = None
+            state["clean_at_base_sha"] = None
             state["last_result"] = "ready"
             save_state(state_path, state)
             raise WorkflowError(SOURCE_ONLY_ACTIONABLE_REVIEW_ERROR)
         if clean_head is not None:
             state["clean_at_head_sha"] = clean_head
+            state["clean_at_base_sha"] = pr["base_sha"]
             state["last_result"] = "no_unresolved_comments"
             state["queue"]["status"] = "clean"
             save_state(state_path, state)
@@ -10646,6 +10689,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
             )
             return
         if remaining <= 0:
+            state["clean_at_head_sha"] = None
+            state["clean_at_base_sha"] = None
             state["last_result"] = "max_iterations_reached"
             save_state(state_path, state)
             emit(
@@ -10655,6 +10700,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     "pr": pr["pr_url"],
                     "head_sha": pr["head_sha"],
                     "iterations": state["iterations"],
+                    "pending_comments": state["queue"]["comments"],
                     **(
                         {"stage_outcome": stage_outcome(state)}
                         if stage_outcome(state)
@@ -10665,6 +10711,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             return
         if not preflight["comments"]:
             state["clean_at_head_sha"] = None
+            state["clean_at_base_sha"] = None
             state["last_result"] = "review_required"
             save_state(state_path, state)
             if prepare_only:
@@ -11551,6 +11598,8 @@ def command_status(args: argparse.Namespace) -> None:
         "managed_task_history": state.get("managed_task_history") or [],
         "iterations": int(state.get("iterations", 0)),
         "clean_at_head_sha": state.get("clean_at_head_sha"),
+        "clean_at_base_sha": state.get("clean_at_base_sha"),
+        "max_iterations": state.get("max_iterations"),
         "policy_skip": state.get("policy_skip"),
         "github_mutation_policy": state.get("github_mutation_policy"),
         "last_result": state.get("last_result"),

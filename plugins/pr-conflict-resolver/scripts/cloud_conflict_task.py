@@ -32,7 +32,7 @@ TASK_PROMPT_MAX_UTF8_BYTES = (
     AGENT_TASK_PROMPT_MAX_UTF8_BYTES - TASK_PROMPT_HEADROOM_UTF8_BYTES
 )
 MODE = "conflict_with_report"
-REQUEST_SCHEMA = {"id": "github.copilot.agent-task-conflict-request", "version": 1}
+REQUEST_SCHEMA = {"id": "github.copilot.agent-task-conflict-request", "version": 2}
 RESULT_SCHEMA = {"id": "github.copilot.agent-task-conflict-result", "version": 3}
 MINIMAL_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-result",
@@ -136,10 +136,11 @@ MINIMAL_POLICY = {
 }
 SEQUENTIAL_POLICY_SPEC = {
     **MINIMAL_POLICY_SPEC,
-    "version": 9,
+    "version": 10,
     "multi_role_code_refs": "one-authoritative-generated-branch-per-member-task",
     "native_stack_execution": "controller-sequenced-frozen-member-replay",
-    "member_fix_commits": "linear-closed-path-suffix-after-complete-replay",
+    "member_fix_commits": "linear-scoped-companion-suffix-after-complete-replay",
+    "resolution_context_paths": "informational-not-a-permission-set",
     "replay_task_base": "pinned-destination-sha",
     "replay_message": "exact-source-bytes-with-one-verified-creator-appendix",
 }
@@ -148,10 +149,10 @@ SEQUENTIAL_POLICY_SHA256 = hashlib.sha256(
         SEQUENTIAL_POLICY_SPEC, sort_keys=True, separators=(",", ":")
     ).encode("ascii")
 ).hexdigest()
-SEQUENTIAL_POLICY_SELECTOR = f"{POLICY_ID}@9"
+SEQUENTIAL_POLICY_SELECTOR = f"{POLICY_ID}@10"
 SEQUENTIAL_POLICY = {
     "id": POLICY_ID,
-    "version": 9,
+    "version": 10,
     "sha256": SEQUENTIAL_POLICY_SHA256,
 }
 MODEL_IDS = {
@@ -403,9 +404,23 @@ def require_path(value: object, description: str) -> str:
     if not isinstance(value, str) or not value:
         raise ConflictError(f"{description} is invalid", "policy_rejected")
     path = PurePosixPath(value)
-    if path.is_absolute() or ".." in path.parts or "\\" in value:
+    if (
+        path.is_absolute() or any(part.casefold() in {"", ".", "..", ".git"} for part in value.split("/"))
+        or "\\" in value or ":" in value or any(ord(char) < 32 for char in value)
+    ):
         raise ConflictError(f"{description} is unsafe", "policy_rejected")
     return value
+
+
+def require_code_paths(paths: Sequence[str]) -> None:
+    for path in paths:
+        require_path(path, "candidate code path")
+        if path.casefold().startswith((
+            ".github/agent-task-output/", ".github/agent-task-reports/",
+            ".github/agent-task-receipts/", ".github/agent-task-semantic/",
+            ".github/agent-task-validations/",
+        )):
+            raise ConflictError("code history touches a reserved output path", "unexpected_history")
 
 
 def validate_commit_identity(value: object, description: str) -> Mapping[str, object]:
@@ -728,7 +743,7 @@ def validate_request(
             "pull_request",
             "merge_base",
             "strategy",
-            "allowed_paths",
+            "resolution_context_paths",
             "iteration",
             "guards",
             "head_commits",
@@ -763,13 +778,13 @@ def validate_request(
     require_sha(request["merge_base"], "merge_base")
     if request["strategy"] != expected_strategy:
         raise ConflictError("conflict request strategy mismatch", "unsupported_strategy")
-    allowed_paths = request["allowed_paths"]
+    allowed_paths = request["resolution_context_paths"]
     if (
         not isinstance(allowed_paths, list)
-        or allowed_paths != sorted(set(allowed_paths))
         or any(not isinstance(path, str) for path in allowed_paths)
+        or allowed_paths != sorted(set(allowed_paths))
     ):
-        raise ConflictError("allowed_paths is not exact and ordered", "policy_rejected")
+        raise ConflictError("resolution_context_paths is not ordered and unique", "policy_rejected")
     for path in allowed_paths:
         require_path(path, "allowed path")
     if (
@@ -2155,7 +2170,7 @@ def compact_request_contract(
         "strategy": request["strategy"],
         "iteration": request["iteration"],
         "guards": request["guards"],
-        "allowed_paths": compact_path_evidence(request["allowed_paths"]),
+        "resolution_context_paths": compact_path_evidence(request["resolution_context_paths"]),
         "head_commits": [
             compact_commit_evidence(
                 commit,
@@ -2363,12 +2378,15 @@ def policy_prompt(
     include_per_commit_paths: bool = False,
 ) -> str:
     path_scope = (
-        "Before editing, read the complete `allowed_paths.paths` array below. "
-        "It is the exact frozen permission set for conflict-resolution patch "
-        "differences and appended fixes, not directory or rename permission. "
-        "Preserve unaffected source patches. If a resolution requires a path "
-        "outside that set, stop rather than widening scope. The retained local "
-        "request is dispatcher evidence, not a file available to this worker.\n"
+        "Use `resolution_context_paths.paths` as conflict-location context, not a "
+        "filename permission set. Resolve the assigned member while preserving both "
+        "sides' intent and unaffected work. Make necessary scoped companion edits "
+        "and relocations, including test/support files, when the resolution requires "
+        "them. Preserve test discovery, execution and coverage; a move neither proves "
+        "nor disproves that. Run relevant validation and correct failures inside this "
+        "task. Do not alter unselected members or unrelated behavior. Keep reserved "
+        "outputs separate from code history. The retained local request is dispatcher "
+        "evidence, not a file available to this worker.\n"
     )
     if options.request["policy"] in (MINIMAL_POLICY, SEQUENTIAL_POLICY):
         if (
@@ -3698,11 +3716,7 @@ def mechanical_mapping(
         )
         != path_patch_sha256(runner, root, parent, new_sha, path)
     ]
-    if OUTPUT_REPORT_PATH in compared_paths or not set(differences) <= allowed_paths:
-        raise ConflictError(
-            "rewritten commit changed an undeclared or reserved path",
-            "unexpected_history",
-        )
+    require_code_paths(compared_paths)
     return {
         "old_sha": old["sha"],
         "new_sha": new_sha,
@@ -3756,11 +3770,7 @@ def prove_rebase_range_mechanically(
         if parents(runner, root, new_sha) != [parent]:
             raise ConflictError("member fix suffix is not linear", "unexpected_history")
         paths = changed_paths(runner, root, new_sha)
-        if OUTPUT_REPORT_PATH in paths or not set(paths) <= allowed_paths:
-            raise ConflictError(
-                "member fix changed an undeclared or reserved path",
-                "unexpected_history",
-            )
+        require_code_paths(paths)
         parent = new_sha
     return commits, mappings
 
@@ -4226,7 +4236,7 @@ def prove_generated_semantic(
             )
         )
     require_local_unchanged(runner, snapshot, quarantine)
-    allowed_paths = set(request["allowed_paths"])
+    allowed_paths = set(request["resolution_context_paths"])
     code_refs: list[Mapping[str, object]] = []
     if request["strategy"] == "merge":
         if annotations != [[]]:
@@ -4476,7 +4486,7 @@ def prove_generated_minimal(
             )
         )
     require_local_unchanged(runner, snapshot, quarantine)
-    allowed_paths = set(request["allowed_paths"])
+    allowed_paths = set(request["resolution_context_paths"])
     code_refs: list[Mapping[str, object]] = []
     if request["strategy"] == "merge":
         remote, _, tip = fetched_code[0]
@@ -4510,11 +4520,7 @@ def prove_generated_minimal(
                     "unexpected_history",
                 )
             paths = changed_paths(runner, snapshot.root, commit)
-            if OUTPUT_REPORT_PATH in paths or not set(paths) <= allowed_paths:
-                raise ConflictError(
-                    "merge result changed an undeclared or reserved path",
-                    "unexpected_history",
-                )
+            require_code_paths(paths)
             parent = commit
         code_ref = build_code_ref(request, remote, tip, commits, [])
         code_ref["base_ref"] = request["pull_request"]["base_ref"]
@@ -4670,7 +4676,7 @@ def prove_generated(
     mappings_by_role: dict[str, Sequence[object]] = {}
     for role, ref in receipt_refs.items():
         mappings_by_role[role] = ref["commits"]
-    allowed_paths = set(request["allowed_paths"])
+    allowed_paths = set(request["resolution_context_paths"])
     code_refs: list[Mapping[str, object]] = []
     if request["strategy"] == "merge":
         remote, tip = fetched_code[0]
@@ -4934,7 +4940,8 @@ def execute_native_stack(
             "intent, subjects, trailers, and unaffected patches. Omit only the "
             "recorded topology-only synchronization merges. Do not replay the "
             "other stack members. After the complete replay you may append "
-            "linear source-only fixes within the allowed paths. Run required "
+            "necessary scoped linear companion fixes, including test relocations. "
+            "Resolution context paths are informational, not permissions. Run required "
             "formatting and focused tests on the hosted worker. Commit only on "
             "this task's authoritative generated branch. Do not create any "
             "additional remote refs or modify source branches, PR metadata, "
@@ -4994,7 +5001,7 @@ def execute_native_stack(
             base_sha,
             tip,
             member["old_commits"],
-            set(request["allowed_paths"]),
+            set(request["resolution_context_paths"]),
             allow_fix_suffix=True,
             attribution=attribution,
         )

@@ -134,6 +134,11 @@ class NativeStackClearanceTest(StackFixture):
                 for key in keys[:-1]:
                     node = node.setdefault(key, {})
                 node[keys[-1]] = value
+        if request["stage"] == MODULE.STAGE_CI:
+            payload["clearance_verification"] = {
+                "result": "current", "reason": "ci_snapshot_current",
+                "expected_snapshot_sha256": "a" * 64, "observed_snapshot_sha256": "a" * 64,
+            }
         if request["stage"] == MODULE.STAGE_DESCRIPTION:
             payload.update(
                 run_id=f"description-{request['number']}",

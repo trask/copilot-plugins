@@ -81,50 +81,48 @@ index 3333333..4444444 100644
 
 
 class ThinCoordinatorInstructionsTest(unittest.TestCase):
-    def test_uses_only_the_coordinator_and_fixed_evaluator(self):
+    def test_uses_only_the_coordinator_with_independent_hosted_critique(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn("tools: [execute, agent, rename_session]", instructions)
+        self.assertIn("tools: [execute, rename_session]", instructions)
         self.assertIn("disable-model-invocation: true", instructions)
         self.assertIn("`PR Review: <PR number> - <PR title>`", instructions)
-        self.assertIn("`python \"$helper\" check <target> --model <model>`", instructions)
-        self.assertIn("`check` is the sole authoritative local preflight", instructions)
-        self.assertIn("model exactly `gpt-5.6-sol`", instructions)
-        self.assertIn("reasoning effort exactly `max`", instructions)
-        self.assertIn("Never replace it with the selected worker model", instructions)
-        self.assertIn("must not call tools, execute code, run probes", instructions)
-        self.assertIn("If the runtime cannot guarantee that exact evaluator", instructions)
+        self.assertIn("`python \"$helper\" check <target> --model sol`", instructions)
+        self.assertIn("separate fresh Astra task", instructions)
+        self.assertIn("verifies each task's actual model", instructions)
+        self.assertIn("no hosted max-effort attestation", instructions)
+        self.assertIn("Sol fallback for Astra", instructions)
+        self.assertIn("Empty discovery uses one task; nonempty discovery uses two", instructions)
 
     def test_forbids_local_analysis_and_fallbacks(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn("Never run another local repository command", instructions)
-        self.assertIn("Never run repository scripts", instructions)
-        self.assertIn("Never invoke `gh pr diff` yourself", instructions)
-        self.assertIn("Never use a local diff", instructions)
+        self.assertIn("Never invoke `gh pr diff`", instructions)
+        self.assertIn("install or execute PR code locally", instructions)
         self.assertIn("Cloud Sandboxes", instructions)
-        self.assertIn("local fallback after managed cloud failure", instructions)
-        self.assertIn("Do not invoke `cloud_task.py` yourself", instructions)
+        self.assertIn("local critique, replacement task", instructions)
+        self.assertIn("All semantic work stays hosted", instructions)
 
     def test_preserves_pending_review_and_recovery_contract(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn("--state <state> --run-id <run_id>", instructions)
-        self.assertIn("creates exactly one viewer-owned pending review", instructions)
+        self.assertIn("creates and verifies one viewer-owned pending review", instructions)
         self.assertIn("never submits it", instructions)
-        self.assertIn("Never call `post` again", instructions)
-        self.assertIn("Never use direct `gh api` mutation as a fallback", instructions)
-        self.assertIn("no findings and no GitHub mutation", instructions)
+        self.assertIn("Run `post` exactly once", instructions)
+        self.assertIn("Never retry or use direct `gh api` as a fallback", instructions)
+        self.assertIn("no findings with no mutation", instructions)
 
     def test_all_evaluator_rejections_end_without_posting(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn(
-            "every fixed evaluator rejects them, report no findings",
+            "Astra rejecting every candidate",
             instructions,
         )
-        self.assertIn("Do not serialize a comments file", instructions)
-        self.assertIn("do not call `post`", instructions)
+        self.assertIn("no review mutation is needed", instructions)
+        self.assertIn("comments_file` unchanged", instructions)
 
 
 class ParseTargetTest(unittest.TestCase):
@@ -1491,118 +1489,108 @@ class ManagedCoordinatorTest(unittest.TestCase):
         )
         self.assertEqual(str(error), "Agent Task failed [task_failed]: worker stopped")
 
-    def test_check_invokes_managed_helper_once_and_cleans_transient_files(self):
-        report_text = self.report()
-        result = self.result()
-        result["report"]["sha256"] = MODULE.sha256_text(report_text)
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            repo_root = root / "repo"
-            repo_root.mkdir()
-            state_path = root / "state" / "run.json"
-            helper = root / "managed" / "cloud_task.py"
-            helper.parent.mkdir()
-            helper.write_text("helper", encoding="utf-8")
-            calls = []
+    def hosted_check(self, *, nonempty=False, reject_all=False, incomplete=False):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        repo_root = root / "repo"
+        repo_root.mkdir()
+        state_path = root / "state" / "run.json"
+        helper = root / "cloud_task.py"
+        commands = []
+        runtime = mock.Mock()
+        runtime.CloudError = RuntimeError
+        runtime.Options.side_effect = lambda **kwargs: SimpleNamespace(**kwargs)
+        runtime.PullRequestSnapshot.side_effect = lambda **kwargs: SimpleNamespace(**kwargs)
 
-            def invoke(command, **kwargs):
-                calls.append(command)
-                result_path = Path(command[command.index("--result-file") + 1])
-                result_path.write_text(json.dumps(result), encoding="utf-8")
-                return MODULE.subprocess.CompletedProcess(command, 0, "ignored", "")
+        def invoke(command, **kwargs):
+            if "--result-file" in command:
+                commands.append(command)
+                phase = len(commands)
+                result = {
+                    "status": "success",
+                    "task": {"id": f"task-{phase}", "state": "completed"},
+                    "generated": {"branch": f"copilot/task-{phase}", "head_sha": str(phase) * 40},
+                }
+                Path(command[command.index("--result-file") + 1]).write_text(json.dumps(result), encoding="utf-8")
+                return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+            self.assertEqual(["git", "-C", str(repo_root), "show"], command[:4])
+            if command[-1].endswith(MODULE.DISCOVERY_PATH):
+                output = {"outcome": "incomplete" if incomplete else "complete", "candidates": [{
+                    "path": "src/one.py", "line": 2, "side": "RIGHT",
+                    "body": "Wrong result", "evidence": "The changed branch returns the wrong result.",
+                }] if nonempty else []}
+            else:
+                self.assertTrue(command[-1].endswith(MODULE.CRITIQUE_PATH))
+                output = {"outcome": "complete", "comments": [] if reject_all else [{
+                    "candidate_id": "candidate-001", "body": "This returns the wrong result.",
+                }]}
+            return MODULE.subprocess.CompletedProcess(command, 0, json.dumps(output), "")
 
-            with (
-                mock.patch.object(
-                    MODULE,
-                    "preflight",
-                    return_value=(
-                        self.pr,
-                        "viewer",
-                        MODULE.parse_unified_diff(DIFF),
-                        None,
-                        None,
-                        [],
-                        [],
-                        DIFF,
-                    ),
-                ),
-                mock.patch.object(MODULE, "fetch_review_threads", return_value=[]),
-                mock.patch.object(
-                    MODULE,
-                    "fetch_changed_paths",
-                    return_value=["src/one.py", "docs/two.md"],
-                ),
-                mock.patch.object(MODULE, "ensure_head_unchanged"),
-                mock.patch.object(MODULE, "ensure_snapshot_unchanged"),
-                mock.patch.object(
-                    MODULE,
-                    "resolve_viewer_permissions",
-                    return_value={
-                        "login": "viewer",
-                        "repository_role": "write",
-                        "permissions": {
-                            "admin": False,
-                            "maintain": False,
-                            "push": True,
-                            "triage": True,
-                            "pull": True,
-                        },
-                    },
-                ),
-                mock.patch.object(MODULE, "local_identity", return_value=self.identity),
-                mock.patch.object(MODULE, "state_path_for", return_value=state_path),
-                mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
-                mock.patch.object(MODULE, "run", side_effect=invoke),
-                mock.patch.object(MODULE, "validate_report_commit"),
-                mock.patch.object(
-                    MODULE,
-                    "fetch_committed_text",
-                    return_value=report_text,
-                ),
-                mock.patch.object(MODULE, "ensure_snapshot_unchanged"),
-                mock.patch.object(MODULE, "emit") as emit,
-            ):
-                MODULE.command_check(
-                    SimpleNamespace(
-                        target=self.pr["pr_url"],
-                        model="sol",
-                        repo_root=str(repo_root),
-                    )
-                )
+        def verify(result, **kwargs):
+            model = kwargs["options"].model
+            phase = 1 if model == "gpt-5.6-sol" else 2
+            self.assertEqual("gpt-5.6-sol" if len(commands) == 1 else "gpt-6-astra", model)
+            self.assertEqual(MODULE.HOSTED_REVIEW_POLICY, kwargs["options"].policy)
+            return {
+                "task": result["task"], "completion": {"session": {"id": f"session-{phase}"}},
+                "candidate": {"phase": phase}, "artifact_commit": {
+                    "sha": str(phase) * 40,
+                    "changed_paths": [MODULE.DISCOVERY_PATH if phase == 1 else MODULE.CRITIQUE_PATH],
+                },
+            }
+        runtime.verify_candidate_result.side_effect = verify
+        with (
+            mock.patch.object(MODULE, "preflight", return_value=(
+                self.pr, "viewer", MODULE.parse_unified_diff(DIFF), None, None, [], [], DIFF,
+            )),
+            mock.patch.object(MODULE, "resolve_viewer_permissions", return_value={"login": "viewer"}),
+            mock.patch.object(MODULE, "local_identity", return_value=self.identity),
+            mock.patch.object(MODULE, "state_path_for", return_value=state_path),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "load_candidate_runtime", return_value=runtime),
+            mock.patch.object(MODULE, "ensure_snapshot_unchanged"),
+            mock.patch.object(MODULE, "run", side_effect=invoke),
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            args = SimpleNamespace(target=self.pr["pr_url"], model="sol", repo_root=str(repo_root))
+            if incomplete:
+                with self.assertRaisesRegex(MODULE.WorkflowError, "incomplete") as failure:
+                    MODULE.command_check(args)
+                self.assertEqual(str(state_path), failure.exception.details["state"])
+                payload = None
+            else:
+                MODULE.command_check(args)
+                payload = emit.call_args.args[0]
+        return commands, json.loads(state_path.read_text(encoding="utf-8")), payload
 
-            self.assertEqual(len(calls), 1)
-            self.assertEqual(
-                calls[0],
-                [
-                    MODULE.sys.executable,
-                    str(helper),
-                    "--report",
-                    "--model",
-                    "sol",
-                    "--pr",
-                    self.pr["url"],
-                    "--prompt-file",
-                    str(state_path.with_name("run--prompt.txt")),
-                    "--result-file",
-                    str(state_path.with_name("run--result.json")),
-                    "--policy",
-                    "marketplace-agent-report-worker@1",
-                ],
-            )
-            self.assertFalse(state_path.with_name("run--prompt.txt").exists())
-            self.assertFalse(state_path.with_name("run--result.json").exists())
-            self.assertTrue(state_path.with_name("run--report.md").exists())
-            self.assertEqual(
-                state_path.with_name("run--report.md").read_text(encoding="utf-8"),
-                report_text,
-            )
-            self.assertEqual(emit.call_args.args[0]["candidate_count"], 0)
-            self.assertEqual(emit.call_args.args[0]["report_markdown"], report_text)
-            saved = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved["agent_task"]["status"], "validated")
-            self.assertEqual(saved["mutation"]["status"], "not_attempted")
-            self.assertNotIn("authoritative_diff", saved)
-            self.assertNotIn("context", saved)
+    def test_empty_discovery_uses_one_hosted_task(self):
+        commands, state, payload = self.hosted_check()
+        self.assertEqual(["sol"], [command[command.index("--model") + 1] for command in commands])
+        self.assertEqual("no_findings", payload["result"])
+        self.assertEqual([], state["hosted_comments"])
+        self.assertEqual("not_attempted", state["mutation"]["status"])
+        self.assertEqual("completed", state["agent_task"]["status"])
+        for phase in state["phases"]:
+            self.assertFalse(Path(phase["prompt_file"]).exists())
+            self.assertFalse(Path(phase["result_file"]).exists())
+
+    def test_nonempty_discovery_uses_fresh_astra_critique_and_exact_bodies(self):
+        commands, state, payload = self.hosted_check(nonempty=True)
+        self.assertEqual(["sol", "astra"], [command[command.index("--model") + 1] for command in commands])
+        self.assertEqual(2, payload["hosted_task_count"])
+        self.assertEqual("ready", payload["result"])
+        self.assertNotEqual(state["phases"][0]["task"]["id"], state["phases"][1]["task"]["id"])
+        self.assertNotEqual(state["phases"][0]["session_id"], state["phases"][1]["session_id"])
+        self.assertEqual("This returns the wrong result.", payload["comments"][0]["body"])
+        self.assertEqual(payload["comments"], json.loads(Path(payload["comments_file"]).read_text(encoding="utf-8")))
+
+    def test_astra_rejecting_every_candidate_does_not_create_a_review(self):
+        commands, state, payload = self.hosted_check(nonempty=True, reject_all=True)
+        self.assertEqual(2, len(commands))
+        self.assertEqual("no_findings", payload["result"])
+        self.assertEqual([], state["hosted_comments"])
+        self.assertEqual("not_attempted", state["mutation"]["status"])
 
     def test_check_failure_preserves_recovery_state_without_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1663,107 +1651,15 @@ class ManagedCoordinatorTest(unittest.TestCase):
             self.assertNotIn("authoritative_diff", saved)
             self.assertNotIn("context", saved)
 
-    def test_reportless_completed_task_returns_recovery_details(self):
-        failure = self.result(
-            status="error",
-            generated={
-                "branch": "copilot/task-1",
-                "head_sha": None,
-                "commits": [],
-            },
-            report=None,
-            attestation={
-                "kind": "dispatcher_structural",
-                "structural_complete": False,
-            },
-            error={
-                "code": "malformed_history",
-                "message": "the generated branch did not contain a report commit",
-            },
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            repo_root = root / "repo"
-            repo_root.mkdir()
-            state_path = root / "state" / "run.json"
-            helper = root / "managed" / "cloud_task.py"
-            helper.parent.mkdir()
-            helper.write_text("helper", encoding="utf-8")
-
-            def invoke(command, **kwargs):
-                result_path = Path(command[command.index("--result-file") + 1])
-                result_path.write_text(json.dumps(failure), encoding="utf-8")
-                return MODULE.subprocess.CompletedProcess(command, 2, "", "")
-
-            with (
-                mock.patch.object(
-                    MODULE,
-                    "preflight",
-                    return_value=(
-                        self.pr,
-                        "viewer",
-                        MODULE.parse_unified_diff(DIFF),
-                        None,
-                        None,
-                        [],
-                        [],
-                        DIFF,
-                    ),
-                ),
-                mock.patch.object(MODULE, "fetch_review_threads", return_value=[]),
-                mock.patch.object(
-                    MODULE,
-                    "fetch_changed_paths",
-                    return_value=["src/one.py", "docs/two.md"],
-                ),
-                mock.patch.object(MODULE, "ensure_head_unchanged"),
-                mock.patch.object(MODULE, "ensure_snapshot_unchanged"),
-                mock.patch.object(
-                    MODULE,
-                    "resolve_viewer_permissions",
-                    return_value={"login": "viewer"},
-                ),
-                mock.patch.object(MODULE, "local_identity", return_value=self.identity),
-                mock.patch.object(MODULE, "state_path_for", return_value=state_path),
-                mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
-                mock.patch.object(MODULE, "run", side_effect=invoke),
-            ):
-                with self.assertRaisesRegex(
-                    MODULE.WorkflowError, "report commit"
-                ) as raised:
-                    MODULE.command_check(
-                        SimpleNamespace(
-                            target=self.pr["pr_url"],
-                            model="sol",
-                            repo_root=str(repo_root),
-                        )
-                    )
-
-            details = raised.exception.details
-            self.assertEqual(details["state"], str(state_path))
-            self.assertEqual(details["task_id"], "task-1")
-            self.assertEqual(
-                details["task_url"],
-                "https://github.com/owner/repo/agent-tasks/1",
-            )
-            self.assertEqual(details["generated_branch"], "copilot/task-1")
-            self.assertIsNone(details["generated_head"])
-            self.assertEqual(details["ordered_commits"], [])
-            self.assertIsNone(details["report_path"])
-            self.assertEqual(
-                details["recovery_files"],
-                [
-                    str(state_path),
-                    str(state_path.with_name("run--prompt.txt")),
-                    str(state_path.with_name("run--result.json")),
-                ],
-            )
-            saved = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved["mutation"]["status"], "not_attempted")
-            self.assertEqual(saved["agent_task"]["task"]["id"], "task-1")
-            self.assertEqual(
-                saved["agent_task"]["generated"]["branch"], "copilot/task-1"
-            )
+    def test_incomplete_discovery_stops_without_critique_or_fallback(self):
+        commands, state, payload = self.hosted_check(nonempty=True, incomplete=True)
+        self.assertEqual(1, len(commands))
+        self.assertIsNone(payload)
+        self.assertEqual("failed", state["agent_task"]["status"])
+        self.assertEqual("not_attempted", state["mutation"]["status"])
+        self.assertEqual("task-1", state["agent_task"]["task"]["id"])
+        self.assertEqual(3, len(state["agent_task"]["recovery_files"]))
+        self.assertTrue(all(Path(path).exists() for path in state["agent_task"]["recovery_files"]))
 
     def test_main_emits_workflow_error_details(self):
         error = MODULE.WorkflowError(
@@ -1812,12 +1708,13 @@ class ManagedCoordinatorTest(unittest.TestCase):
                 ):
                     MODULE.remove_transient_artifacts([first, second])
 
-    def test_evaluator_rejection_and_failure_are_fail_closed(self):
+    def test_independent_hosted_critique_has_no_local_semantic_fallback(self):
         instructions = AGENT.read_text(encoding="utf-8")
-
-        self.assertIn("Keep a candidate only when both booleans are true", instructions)
-        self.assertIn("A failure or malformed verdict gets one fresh replacement", instructions)
-        self.assertIn("If that also fails, stop before mutation", instructions)
+        self.assertIn("separate fresh Astra task", instructions)
+        self.assertIn("no hosted max-effort attestation", instructions)
+        self.assertIn("Do not filter candidates", instructions)
+        self.assertIn("comments_file", instructions)
+        self.assertNotIn("tools: [execute, agent", instructions)
 
 
 class GuardedPostingTest(unittest.TestCase):
@@ -1880,6 +1777,11 @@ class GuardedPostingTest(unittest.TestCase):
                     "pr": self.pr,
                     "viewer": {"login": "viewer"},
                     "candidates": [self.candidate],
+                    "agent_task": {"status": "completed", "model": "gpt-6-astra"},
+                    "hosted_comments": [{
+                        "candidate_id": "candidate-1", "path": "src/one.py",
+                        "line": 2, "side": "RIGHT", "body": "This returns the wrong result.",
+                    }],
                     "mutation": {"status": status},
                 }
             ),
@@ -2049,7 +1951,7 @@ class GuardedPostingTest(unittest.TestCase):
                 DIFF,
             ),
         ):
-            with self.assertRaisesRegex(MODULE.WorkflowError, "changed its validated"):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "exactly match completed hosted"):
                 MODULE.command_post(self.args())
 
     def test_final_snapshot_recheck_blocks_every_live_identity_change(self):

@@ -36,6 +36,71 @@ PIPELINE = load("ci_warning_contract_consumer", PLUGIN / "scripts" / "pr_pipelin
 
 
 class CiWarningProducerContractTest(unittest.TestCase):
+    def test_green_status_revalidates_same_head_attempts_without_hosted_work(self):
+        pr = {
+            "repo_name": "owner/repo", "upstream_owner": "owner", "upstream_repo": "repo",
+            "number": 7, "pr_url": "https://github.com/owner/repo/pull/7",
+            "head_sha": "a" * 40, "base_sha": "b" * 40, "head_branch": "topic",
+            "base_branch": "main", "title": "Example",
+        }
+        checks = [{"key": "check:Build/test", "name": "test", "workflow": "Build",
+                   "workflow_run_id": 11, "class": "passed"}]
+        run = {"id": 11, "workflow_id": 22, "name": "Build", "head_sha": pr["head_sha"],
+               "run_attempt": 1, "status": "completed", "conclusion": "success"}
+        state = {
+            "version": CI.STATE_VERSION, "pr": pr, "history": [], "iterations": 2,
+            "reruns": {}, "outcome": "green", "clean_at_head_sha": pr["head_sha"],
+            "clean_at_base_sha": pr["base_sha"],
+            "green_snapshot_sha256": CI.ci_warning_snapshot_sha256(pr, checks, {"11": run}),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text(json.dumps(state), encoding="utf-8")
+            original = path.read_bytes()
+            for status, conclusion, attempt, current in (
+                ("completed", "success", 1, True),
+                ("in_progress", None, 2, False),
+                ("completed", "failure", 2, False),
+                ("completed", "success", 2, False),
+            ):
+                with self.subTest(status=status, attempt=attempt, conclusion=conclusion):
+                    output = StringIO()
+                    with (
+                        mock.patch.object(CI, "metadata_for", return_value=pr),
+                        mock.patch.object(CI, "fetch_rollup", return_value=(pr["head_sha"], checks)),
+                        mock.patch.object(CI, "ci_snapshot_runs", return_value={
+                            "11": {**run, "status": status, "conclusion": conclusion, "run_attempt": attempt},
+                        }),
+                        mock.patch.object(CI, "run", side_effect=AssertionError("hosted or executable work forbidden")),
+                        redirect_stdout(output),
+                    ):
+                        CI.command_status(CI.build_parser().parse_args([
+                            "status", "--state", str(path), "--verify-clearance-snapshot",
+                        ]))
+                    payload = json.loads(output.getvalue())
+                    observed = PIPELINE.common.inspect_stage(
+                        PIPELINE.STAGE_BY_NAME[PIPELINE.STAGE_CI], pr,
+                        pr["head_sha"], pr["base_sha"], read_status=lambda *_: {
+                            "ok": True, "installed": True, "state": str(path), "payload": payload,
+                        },
+                    )
+                    self.assertEqual(current, observed["clear"])
+                    self.assertEqual(original, path.read_bytes())
+                    self.assertEqual(2, payload["iterations"])
+
+    def test_snapshot_sees_new_runs_before_they_appear_in_check_rollup(self):
+        pr = {"repo_name": "owner/repo", "head_sha": "a" * 40}
+        old = {"id": 11, "workflow_id": 22, "event": "pull_request", "head_sha": pr["head_sha"]}
+        latest = {**old, "id": 12}
+        with (
+            mock.patch.object(CI, "gh_json", return_value=[{"workflow_runs": [old, latest]}]),
+            mock.patch.object(CI, "ci_check_runs", return_value={}),
+            mock.patch.object(CI, "ci_run_identity", return_value={**latest, "status": "in_progress"}) as observe,
+        ):
+            runs = CI.ci_snapshot_runs(pr, [])
+        self.assertEqual({"12"}, set(runs))
+        observe.assert_called_once_with(pr, 12)
+
     def test_actual_status_outputs_clear_only_the_unchanged_snapshot(self):
         pr = {
             "repo_name": "owner/repo",
@@ -128,7 +193,7 @@ class CiWarningProducerContractTest(unittest.TestCase):
                             return_value=(pr["head_sha"], copy.deepcopy(live_checks)),
                         ),
                         mock.patch.object(
-                            CI, "ci_check_runs", return_value=copy.deepcopy(live_runs)
+                            CI, "ci_snapshot_runs", return_value=copy.deepcopy(live_runs)
                         ),
                         mock.patch.object(
                             CI, "run", side_effect=AssertionError("external command forbidden")
@@ -176,7 +241,7 @@ class CiWarningProducerContractTest(unittest.TestCase):
                                     ),
                                 )
                             self.assertIn(
-                                "--verify-warning-snapshot",
+                                "--verify-clearance-snapshot",
                                 status_command.call_args.args[0],
                             )
                             self.assertEqual(current, result["clear"])

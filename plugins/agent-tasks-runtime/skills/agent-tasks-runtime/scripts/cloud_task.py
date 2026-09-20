@@ -1046,7 +1046,6 @@ def parse_args(args: Sequence[str]) -> Options:
         or task_id is not None
         or worker_receipt is not None
         or input_result_file is not None
-        or allow_merged_pr
     ):
         raise CloudError(
             f"{MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR} requires "
@@ -1083,7 +1082,10 @@ def parse_args(args: Sequence[str]) -> Options:
         )
     if allow_merged_pr and (
         policy
-        not in {MARKETPLACE_POLICY_SELECTOR, *MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS}
+        not in {
+            MARKETPLACE_POLICY_SELECTOR, *MARKETPLACE_APPLY_REPORT_POLICY_SELECTORS,
+            MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR,
+        }
         or result_file is None
         or prompt_file is None
     ):
@@ -2152,7 +2154,10 @@ def validate_policy_before_post(
         or options.semantic_kind is not None
         or options.input_result_file is not None
         or options.prior_result is not None
-        or options.allow_merged_pr
+        or (
+            options.allow_merged_pr
+            and options.policy != MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR
+        )
         or (
             options.policy == MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR
             and (not options.apply_with_report or options.report)
@@ -3534,6 +3539,116 @@ class GitRepository:
 def _resolve_git_path(root: Path, value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else root / path
+
+
+def verify_candidate_result(
+    result: Mapping[str, object], *, options: Options,
+    pull_request: PullRequestSnapshot, root: Path, git: GitRepository,
+) -> dict[str, object]:
+    """Recheck dispatcher provenance and fetched history for a candidate consumer."""
+    report_only = options.policy == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR
+    if options.policy not in CANDIDATE_POLICY_SELECTORS:
+        raise CloudError("consumer requires a candidate policy", "policy_rejected")
+    pr = pull_request
+    if pr.state != ("MERGED" if options.allow_merged_pr else "OPEN"):
+        raise CloudError("candidate source state is not authorized by the caller", "stale_pr_head")
+    if options.allow_merged_pr and (
+        report_only or git.identity(root).branch != f"trask-pr-audit-{pr.number}"
+        or git.head(root) != pr.head_sha
+    ):
+        raise CloudError("historical candidate source is not the frozen audit branch", "policy_rejected")
+    repository = pr.base_repository
+    source_ref = pr.head_sha if options.allow_merged_pr or pr.cross_repository else pr.head_ref
+    expected_pr = {name: getattr(pr, name) for name in (
+        "number", "url", "base_repository", "base_ref", "base_sha",
+        "head_repository", "head_ref", "head_sha",
+    )}
+    if (
+        result.get("schema") != {"id": RESULT_SCHEMA_ID, "version": 5}
+        or result.get("status") != "success" or result.get("error") is not None
+        or result.get("policy") != policy_metadata(options)
+        or result.get("mode") != ("report_recommendation" if report_only else "code_candidate")
+        or result.get("repository") != {"name_with_owner": repository}
+        or result.get("pull_request") != expected_pr
+        or result.get("requested_model") != options.model
+        or result.get("report") is not None
+        or result.get("attestation") != {"kind": "dispatcher_candidate", "structural_complete": True}
+        or result.get("application") != {
+            "status": "not_applicable" if report_only else "not_applied",
+            "final_local_head": git.head(root) if report_only else pr.head_sha,
+        }
+    ):
+        raise CloudError("candidate consumer identity or policy mismatch", "candidate_invalid")
+    task, generated, completion = (result.get(name) for name in ("task", "generated", "completion"))
+    if (
+        not isinstance(task, dict) or not isinstance(task.get("id"), str) or not task["id"]
+        or task.get("state") != "completed"
+        or task.get("base_ref") != source_ref or task.get("base_sha") != pr.head_sha
+        or not isinstance(generated, dict)
+        or not isinstance(generated.get("branch"), str) or not generated["branch"]
+        or not isinstance(generated.get("head_sha"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", generated["head_sha"]) is None
+        or not isinstance(completion, dict)
+        or set(completion) != {"request", "task", "session", "repository", "refs"}
+    ):
+        raise CloudError("candidate task completion is malformed", "candidate_invalid")
+    submitted = task_payload(options, OUTPUT_REPORT_PATH, pr)["prompt"]
+    prompt_hash = hashlib.sha256(str(submitted).encode("utf-8")).hexdigest()
+    session, completed_task, repo_identity = (
+        completion.get(name) for name in ("session", "task", "repository")
+    )
+    if (
+        completion["request"] != {"requested_model": options.model, "prompt_sha256": prompt_hash}
+        or completion["refs"] != {"base": source_ref, "generated": generated["branch"]}
+        or not isinstance(session, dict) or not isinstance(session.get("id"), str) or not session["id"]
+        or session.get("state") != "completed"
+        or not isinstance(session.get("actual_model"), str)
+        or session.get("actual_model") not in {options.model, f"sweagent-capi:{options.model}"}
+        or session.get("prompt_sha256") != prompt_hash
+        or not isinstance(completed_task, dict) or completed_task.get("id") != task["id"]
+        or completed_task.get("state") != "completed"
+        or not isinstance(completed_task.get("raw_response_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", completed_task["raw_response_sha256"]) is None
+        or not isinstance(repo_identity, dict)
+        or repo_identity.get("name_with_owner") != repository
+        or type(repo_identity.get("id")) is not int or repo_identity["id"] <= 0
+        or not isinstance(repo_identity.get("owner"), dict)
+        or not isinstance(repo_identity["owner"].get("login"), str)
+        or repo_identity["owner"].get("login", "").casefold() != repository.split("/")[0].casefold()
+        or type(repo_identity["owner"].get("id")) is not int or repo_identity["owner"]["id"] <= 0
+    ):
+        raise CloudError("candidate completion identity mismatch", "candidate_invalid")
+    for owner in (session, completed_task):
+        for field in ("created_at", "updated_at", "completed_at"):
+            value = owner.get(field)
+            if value is None and field != "created_at":
+                continue
+            try:
+                timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                if timestamp.tzinfo is None:
+                    raise ValueError("timezone missing")
+            except ValueError as error:
+                raise CloudError("candidate completion timestamp invalid", "candidate_invalid") from error
+    commits = git.cloud_commits(root, pr.head_sha, generated["head_sha"])
+    history = git.candidate_history(root, pr.head_sha, commits, report_only=report_only)
+    manifest = {
+        "schema": CANDIDATE_MANIFEST_SCHEMA,
+        "repository": {"name_with_owner": repository},
+        "task": {"id": task["id"], "session_id": session["id"]},
+        "base": {"ref": source_ref, "sha": pr.head_sha},
+        "generated": {"ref": generated["branch"], "head_sha": generated["head_sha"],
+                      "code_tip_sha": history.code_head},
+        "code_commits": list(history.code_commits),
+        "artifact_commit": history.artifact_commit,
+    }
+    code_commits = [entry["sha"] for entry in history.code_commits]
+    if result.get("candidate") != manifest or generated.get("commits") != code_commits:
+        raise CloudError("candidate manifest differs from fetched history", "candidate_invalid")
+    if generated["head_sha"] != (commits[-1] if commits else pr.head_sha):
+        raise CloudError("candidate generated tip differs from history", "candidate_invalid")
+    return {"task": task, "completion": completion, "candidate": manifest,
+            "commits": code_commits, "code_tip": history.code_head,
+            "artifact_commit": history.artifact_commit}
 
 
 def _validate_candidate_path(path: str) -> None:

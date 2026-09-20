@@ -2530,7 +2530,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("result schema version 5", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.69")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.70")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -11591,7 +11591,7 @@ class CleanAtHeadShaTest(unittest.TestCase):
     def run_preflight(
         self, *, threads=None, reviews=None, prior_clean_at_head_sha=None
     ):
-        metadata = {"head_branch": "branch", "head_sha": "head"}
+        metadata = {"head_branch": "branch", "head_sha": "head", "base_sha": "base"}
 
         def fake_git(repo_root, *arguments):
             del repo_root
@@ -11703,7 +11703,7 @@ class CleanAtHeadShaTest(unittest.TestCase):
     def run_watch(self, *, review_comments, body):
         state = {
             "version": MODULE.STATE_VERSION,
-            "pr": {"upstream_owner": "owner", "upstream_repo": "repo", "number": 42},
+            "pr": {"upstream_owner": "owner", "upstream_repo": "repo", "number": 42, "base_sha": "base"},
             "monitoring": {
                 "status": "requested",
                 "head_sha": "head",
@@ -12301,7 +12301,7 @@ class CopilotReviewTest(unittest.TestCase):
     def test_watch_retries_rate_limited_review_comments_with_local_backoff(self):
         state = {
             "version": MODULE.STATE_VERSION,
-            "pr": {"upstream_owner": "owner", "upstream_repo": "repo", "number": 7},
+            "pr": {"upstream_owner": "owner", "upstream_repo": "repo", "number": 7, "base_sha": "base"},
             "monitoring": {
                 "status": "requested",
                 "head_sha": "abc123",
@@ -12714,7 +12714,7 @@ class CopilotReviewTest(unittest.TestCase):
                 "cancel_requested": False,
             },
         }
-        metadata = {"head_branch": "branch", "head_sha": "head"}
+        metadata = {"head_branch": "branch", "head_sha": "head", "base_sha": "base"}
 
         def fake_git(repo_root, *arguments):
             del repo_root
@@ -12769,7 +12769,7 @@ class PreflightTargetTest(unittest.TestCase):
         pipeline=None,
         state_path=None,
     ):
-        metadata = {"head_branch": "branch", "head_sha": "head"}
+        metadata = {"head_branch": "branch", "head_sha": "head", "base_sha": "base"}
 
         def fake_git(repo_root, *arguments):
             del repo_root
@@ -12827,7 +12827,7 @@ class PreflightTargetTest(unittest.TestCase):
         self.assertEqual(payload["pr"]["head_sha"], "head")
 
     def test_targetless_preflight_uses_the_current_branch_pr(self):
-        metadata = {"head_branch": "branch", "head_sha": "head"}
+        metadata = {"head_branch": "branch", "head_sha": "head", "base_sha": "base"}
         target = MODULE.parse_target("https://github.com/owner/repo/pull/7")
 
         def fake_git(repo_root, *arguments):
@@ -13010,7 +13010,7 @@ class PreflightTargetTest(unittest.TestCase):
             self.run_preflight(reviews=[review])
 
     def test_preflight_reports_when_only_human_comments_remain(self):
-        metadata = {"head_branch": "branch", "head_sha": "head"}
+        metadata = {"head_branch": "branch", "head_sha": "head", "base_sha": "base"}
         threads = [
             {
                 "id": "thread-1",
@@ -13161,7 +13161,7 @@ class PreflightTargetTest(unittest.TestCase):
         self.assertEqual(payload["published_iterations"], 12)
 
     def test_preflight_stops_at_the_iteration_cap(self):
-        metadata = {"head_branch": "branch", "head_sha": "head"}
+        metadata = {"head_branch": "branch", "head_sha": "head", "base_sha": "base"}
         threads = [
             {
                 "id": "thread-1",
@@ -13429,7 +13429,7 @@ class DerivedCeilingTest(unittest.TestCase):
         return MODULE.pipeline_scope(state, SimpleNamespace(**pipeline))
 
     def run_preflight(self, stored, threads=None, **pipeline):
-        metadata = {"head_branch": "branch", "head_sha": "head"}
+        metadata = {"head_branch": "branch", "head_sha": "head", "base_sha": "base"}
 
         def fake_git(repo_root, *arguments):
             del repo_root

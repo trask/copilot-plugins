@@ -1280,9 +1280,22 @@ class StackRunTest(StackFixture):
         result = pipeline.run_ci_phase(1, self.stack["members"])
 
         self.assertTrue(result["clear"])
+
         self.assertEqual(0, result["dispatches"])
         event = self.events_named("phase_finished")[0]
         self.assertTrue(event["clear"])
+
+    def test_gate_uses_verified_current_head_without_calling_no_checks_green(self):
+        pipeline = self.pipeline()
+        predecessor, member = self.stack["members"][:2]
+        with (
+            mock.patch.object(pipeline, "clearance", return_value={"clear": True, "outcome": "skipped"}),
+            mock.patch.object(pipeline, "contains", return_value=True) as contains,
+        ):
+            result = pipeline.ci_gate(member, predecessor, {"clear": True, "head_sha": "stale-head"})
+        self.assertTrue(result["ready"])
+        self.assertEqual("predecessor_has_no_checks", result["reason"])
+        self.assertEqual(predecessor["head_sha"], contains.call_args.args[1])
 
     def test_ci_workers_carry_the_pipeline_position_with_a_two_pass_budget(self):
         pipeline = self.pipeline()
@@ -3677,7 +3690,7 @@ class MonitorHandleTest(unittest.TestCase):
             ]
         )
         output = StringIO()
-        process = SimpleNamespace(pid=4321, terminate=mock.Mock())
+        process = SimpleNamespace(pid=4321, terminate=mock.Mock(), launch_receipt={"creationflags": 0, "process_identity": None})
         with (
             mock.patch.object(COMMON, "resolve_repo_root", return_value=self.root),
             mock.patch.object(MODULE, "start_scheduler", return_value=process),
@@ -3710,6 +3723,29 @@ class MonitorHandleTest(unittest.TestCase):
             event["next_watch"]["arguments"],
         )
         self.assertNotIn("--kickoff", event["next_watch"]["arguments"])
+
+    def test_denied_scheduler_launch_persists_receipt_without_success_event(self):
+        args = MODULE.build_parser().parse_args(["start", "--kickoff", json.dumps(self.payload)])
+        receipt = {
+            "creationflags": 0x09000204, "breakaway_requested": True,
+            "breakaway_accepted": False, "fallback_used": False,
+            "process_identity": None, "launch_error_code": 5,
+        }
+        with (
+            mock.patch.object(COMMON, "resolve_repo_root", return_value=self.root),
+            mock.patch.object(MODULE.uuid, "uuid4", return_value=SimpleNamespace(hex=self.run_id)),
+            mock.patch.object(MODULE, "start_scheduler", side_effect=COMMON.LaunchError(
+                "breakaway denied before fallback", receipt,
+            )) as start,
+            mock.patch.object(COMMON, "emit") as emit,
+            self.assertRaisesRegex(COMMON.LaunchError, "breakaway denied"),
+        ):
+            MODULE.command_start(args)
+        launch = COMMON.read_json(MODULE.launch_state_path(self.payload, self.run_id))
+        self.assertEqual("launch_failed", launch["status"])
+        self.assertEqual(receipt, {key: launch[key] for key in receipt})
+        start.assert_called_once()
+        emit.assert_not_called()
 
     def test_watch_uses_only_the_exact_monitor_handle(self):
         self.write_monitor_run()
@@ -3745,6 +3781,33 @@ class MonitorHandleTest(unittest.TestCase):
             MODULE.watch_arguments(self.run_id, 5),
             event["next_watch"]["arguments"],
         )
+
+    def test_cursor_38_heartbeat_empty_and_monitor_failure_remain_distinct(self):
+        self.write_monitor_run()
+        cases = (
+            {"cursor": 38, "updates": [{"kind": "heartbeat", "waiting": True}], "finished": False},
+            {"cursor": 38, "updates": [], "finished": False},
+            {"cursor": 38, "updates": [], "finished": True, "monitor_failure": "scheduler_exited_without_final_event"},
+            {"cursor": 39, "updates": [{"terminal": True}], "finished": True, "final_event": {"result": "partial"}},
+        )
+        args = MODULE.build_parser().parse_args(["watch", "--run-id", self.run_id, "--cursor", "38"])
+        for recorded in cases:
+            with self.subTest(recorded=recorded):
+                output = StringIO()
+                with (
+                    mock.patch.object(MODULE, "watch_progress", return_value={
+                        "event": MODULE.PROGRESS_UPDATE_EVENT, **recorded,
+                    }),
+                    redirect_stdout(output),
+                ):
+                    MODULE.command_watch(args)
+                event = json.loads(output.getvalue())
+                self.assertEqual(recorded["finished"], event["finished"])
+                self.assertEqual(not recorded["finished"], "next_watch" in event)
+                self.assertEqual(recorded.get("monitor_failure"), event.get("monitor_failure"))
+                self.assertEqual(recorded.get("final_event"), event.get("final_event"))
+                if "monitor_failure" in recorded:
+                    self.assertNotIn("final_event", event)
 
     def test_watch_never_scans_or_falls_back_to_another_run(self):
         requested = "a" * 32

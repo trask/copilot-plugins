@@ -44,16 +44,15 @@ runtime is missing, disabled, or incompatible.
 
 ### PR Reviewer
 
-Uses a managed GitHub Agent Task to inspect the complete pinned pull request
-diff and run focused probes in isolation. The local coordinator validates the
-task's committed report and receipt, then checks each candidate with a separate
-fixed evaluator before it creates and verifies one pending review.
+Uses one hosted Sol task to discover findings in the pinned pull request.
+Nonempty discovery starts one separate hosted Astra task to critique the whole
+batch and draft the retained comments. Empty discovery needs no second task.
+The local coordinator checks provenance, anchors, permissions and freshness,
+then creates one pending review containing the exact hosted comments.
 
-Run this agent with GPT-5.6 Sol at high reasoning effort. It checks each finding
-with a separate GPT-5.6 Sol evaluator at max reasoning effort. The evaluator is
-independent of the selected managed worker model. The plugin verifies the shared
-Agent Tasks runtime and uses policy `marketplace-agent-worker@1`. It never uses
-Cloud Sandboxes or a local-analysis fallback.
+Run this agent with GPT-5.6 Sol at high reasoning effort. Both hosted phases use
+`marketplace-agent-report-recommendation-worker@1`. There is no hosted
+max-effort guarantee, local evaluator, per-finding task or model fallback.
 
 ### Copilot Review Loop
 
@@ -61,6 +60,10 @@ Works through the Copilot pull request review comments that nobody has resolved
 yet. It groups comments that share one cause into one commit, pushes the fixes,
 and asks Copilot to review again when the current head has no clean review. It
 repeats until the review is clean or it reaches a stop condition.
+
+Five spent fixes with remaining feedback is terminal but unresolved. Pipeline
+continues Self Review, CI and Description without clearing Review or granting
+another allowance. Later sweeps retain the pending feedback and spent budget.
 
 The plugin verifies the shared Agent Tasks runtime. Authentication stays in
 local `gh api`; repository analysis and execution stay in GitHub Agent Tasks.
@@ -72,7 +75,10 @@ it verified. It neither reads nor writes installed Python bytecode caches.
 Uses managed GitHub Agent Tasks to review the pinned pull request and fix
 findings in scope. Formatting, tests, and builds stay hosted. The local
 coordinator validates committed code and the live branch identity before it
-imports and pushes fixes. A clean review leaves the branch unchanged.
+imports and pushes fixes. One hosted loop receives the remaining review-pass
+allowance and returns `clean`, `exhausted` or `incomplete` with the passes used.
+A clean result may include fixes. Zero commits alone does not establish clean.
+Hosted passes, Runtime tasks and source publications are separate counts.
 
 The plugin locates and verifies the shared `cloud_task.py`, then runs it with
 policy `marketplace-agent-code-candidate-worker@1`. The backend is GitHub Agent
@@ -92,6 +98,10 @@ The plugin locates and verifies the shared `cloud_task.py`, then runs it with
 policy `marketplace-agent-report-recommendation-worker@1`. The backend is GitHub
 Agent Tasks through local `gh api`; there is no Cloud Sandbox, custom agent, or
 local-analysis fallback.
+
+Description deliberately invalidates same-head clearance when metadata or the
+actual base tip changes. It does not create a replacement task for that head.
+A source-only replacement proposal remains excluded, not cleared.
 
 ### PR Pipeline
 
@@ -172,6 +182,11 @@ native stack keeps the single-PR behavior.
 The plugin verifies the shared Agent Tasks runtime. Authentication stays in
 local `gh api`; CI diagnosis, edits, and validation stay in GitHub Agent Tasks.
 
+The controller supplies sanitized, attempt-bound logs directly to the worker.
+Large logs carry exact retrieval references rather than truncated excerpts or
+a local model summary. Test moves, skip-like strings and wrapper edits are not
+local semantic vetoes; the hosted worker must preserve test execution and coverage.
+
 CI Fix Loop considers all checks, not just required checks. The hosted worker
 diagnoses failures; the local controller rechecks live identity and permissions
 before publishing fixes or requesting a failed-jobs rerun. Its one-retry
@@ -184,6 +199,10 @@ Pipeline to continue without claiming that CI passed. Unknown causes remain
 unresolved. A retry or other CI change during hosted work invalidates the
 candidate before publication.
 
+Green and warning clearance both require fresh head, actual base, check and
+workflow-attempt observations, including new same-head runs not yet in the
+check rollup. Revalidation starts no hosted task and spends no repair allowance.
+
 Each member gets five charged iterations. PR Pipeline does not reset this
 budget between passes. Every accepted push records a machine-readable
 checkpoint. Install `pr-conflict-resolver@trask-plugins` to use native-stack
@@ -195,7 +214,7 @@ Uses one managed GitHub Agent Task to audit a merged pull request against its
 pinned historical base, head, diff, and discussion. The worker compares changed
 areas with sibling implementations, fixes every validated finding, and runs the
 historical tree's formatting, tests, and builds. The local coordinator validates
-the task's commit history, report, receipt, and live repository identity before
+the task's commit history, outcome, pass count and repository identity before
 it imports and pushes the fixes to `trask-pr-audit-<number>`.
 
 It also compares each changed area with the closest sibling implementations in
@@ -206,7 +225,12 @@ The merged pull request never changes. The audit branch is the only thing this
 agent pushes, and a first pass that finds nothing pushes no branch at all.
 
 The plugin locates and verifies the shared `cloud_task.py`, then runs it with
-policy `marketplace-agent-worker@1`. The backend is GitHub Agent Tasks through
+policy `marketplace-agent-code-candidate-worker@1` with an explicitly bound
+merged historical source. Its required `audit-result.json` contains only
+`outcome` and `iterations_used`; optional prose is not acceptance evidence.
+Every top-level invocation is fresh. Retained validated or publication-failed
+state cannot be re-entered. Exact-ref confirmation of a lost push response is
+allowed only inside the still-active invocation. The backend is GitHub Agent Tasks through
 local `gh api`; there is no Cloud Sandbox, custom agent, local repository
 analysis, or local execution fallback.
 

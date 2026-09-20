@@ -80,7 +80,7 @@ The stage's `--max-iterations` value bounds the entire run. Pipeline sweeps neve
 
 The coordinator records work equivalent to `progress --state <path> --phase addressing_comments` before hosted dispatch and `progress --state <path> --phase validating` before guarded import.
 
-A strictly later sweep in the same run can revalidate a head published by another stage after the previous sweep reached terminal clearance or policy exclusion. It retains spent iterations and audit history, and checks the checkout, PR source identity, mutation policy, and completed ownership before reading fresh review evidence. Same or older sweeps, foreign runs, active owners, and failed coordinators are rejected. A current-head clean review returns `cleared`; an unreviewed source-only head returns only `skipped` with a fresh policy proof, never a reviewed-head marker or a review request.
+A strictly later sweep in the same run can revalidate a head published by another stage after terminal clearance, policy exclusion or verified allowance exhaustion. It retains spent iterations, pending feedback and audit history. Five spent fixes with remaining feedback returns `carried`, not Review clearance, so Pipeline can continue Self Review, CI and Description. A later exhausted sweep starts no task and grants no allowance. Same or older sweeps, foreign runs, active owners, malformed exhausted state and failed coordinators are rejected. A clean review requires current head and actual base markers. An unreviewed source-only head returns only `skipped` with a fresh policy proof, never a reviewed-head marker or a review request.
 
 ## Boundaries
 

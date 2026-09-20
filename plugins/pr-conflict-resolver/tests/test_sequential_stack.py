@@ -280,6 +280,8 @@ class SequentialStackTest(unittest.TestCase):
             },
         )
         for options in self.launched:
+            self.assertIn("scoped linear companion fixes", options.prompt)
+            self.assertNotIn("within the allowed paths", options.prompt)
             prompt = CLOUD.policy_prompt(options)
             self.assertIn("authoritative Agent Task branch", prompt)
             self.assertNotIn("copilot/conflict-", prompt)
