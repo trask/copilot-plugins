@@ -9,6 +9,8 @@ import binascii
 import copy
 import datetime as dt
 import hashlib
+import html
+from html.parser import HTMLParser
 import importlib.util
 import json
 import os
@@ -2405,51 +2407,128 @@ def review_has_inline_findings(
     )
 
 
+class _ReviewBodyDetails(HTMLParser):
+    def __init__(self, body: str) -> None:
+        super().__init__(convert_charrefs=False)
+        self.body = body
+        self.offsets = [0, *(match.end() for match in re.finditer("\n", body))]
+        self.sections: list[dict[str, Any]] = []
+        self.stack: list[dict[str, Any]] = []
+        self.feed(body)
+        self.close()
+
+    def source_offset(self) -> int:
+        line, column = self.getpos()
+        return self.offsets[line - 1] + column
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag == "details":
+            section = {
+                "summary_start": None, "summary_end": None,
+                "body_start": None, "end": None, "children": [],
+            }
+            if self.stack:
+                self.stack[-1]["children"].append(section)
+            else:
+                self.sections.append(section)
+            self.stack.append(section)
+        elif tag == "summary" and self.stack:
+            section = self.stack[-1]
+            if section["summary_start"] is None:
+                section["summary_start"] = self.source_offset() + len(
+                    self.get_starttag_text()
+                )
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self.stack:
+            return
+        section = self.stack[-1]
+        if tag == "details":
+            section["end"] = self.source_offset()
+            self.stack.pop()
+        elif tag == "summary" and section["summary_end"] is None:
+            section["summary_end"] = self.source_offset()
+            section["body_start"] = self.body.index(">", self.source_offset()) + 1
+
+
 def parse_suppressed_comments(body: str | None) -> list[dict[str, Any]]:
     if not body:
         return []
-    for details_match in re.finditer(
-        r"<details\b[^>]*>(?P<body>.*?)</details\s*>",
-        body,
-        flags=re.IGNORECASE | re.DOTALL,
-    ):
-        details = details_match.group("body")
-        summary_match = re.search(
-            r"<summary\b[^>]*>(?P<summary>.*?)</summary\s*>",
-            details,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if (
-            not summary_match
-            or "suppressed comments"
-            not in re.sub(r"<[^>]+>", "", summary_match.group("summary")).lower()
-        ):
+    entries: list[dict[str, Any]] = []
+    for section in _ReviewBodyDetails(body).sections:
+        if section["summary_start"] is None:
             continue
-        content = details[summary_match.end() :]
-        headers = list(
-            re.finditer(
-                r"^\s*\*\*(?P<path>.+):(?P<line>\d+)\*\*\s*$",
-                content,
-                flags=re.MULTILINE,
-            )
+        summary = html.unescape(re.sub(
+            r"<[^>]+>", "", body[section["summary_start"]:section["summary_end"]]
+        )).strip()
+        label = re.search(
+            r"suppressed comments\b|^previously missed\b", summary, re.IGNORECASE
         )
-        entries = []
-        for index, header in enumerate(headers):
-            end = (
-                headers[index + 1].start() if index + 1 < len(headers) else len(content)
+        if not label:
+            continue
+        count = re.fullmatch(r"\s*(?:\((\d+)\))?\s*", summary[label.end():])
+        if count is None or section["body_start"] is None or section["end"] is None:
+            raise WorkflowError(
+                "Copilot review body contains an unparsed feedback section"
             )
-            comment_body = content[header.end() : end].strip()
-            if comment_body.startswith("* "):
-                comment_body = comment_body[2:].lstrip()
-            entries.append(
-                {
-                    "path": header.group("path"),
-                    "line": int(header.group("line")),
+        expected_count = int(count[1]) if count[1] is not None else None
+        content = body[section["body_start"]:section["end"]]
+        parsed: list[dict[str, Any]] = []
+        if label[0].lower() == "previously missed":
+            for finding in section["children"]:
+                if any(finding[key] is None for key in (
+                    "summary_start", "summary_end", "body_start", "end"
+                )):
+                    raise WorkflowError(
+                        "Copilot review body contains an unparsed Previously missed finding"
+                    )
+                title = html.unescape(re.sub(
+                    r"<[^>]+>", "",
+                    body[finding["summary_start"]:finding["summary_end"]],
+                )).strip()
+                location = re.fullmatch(
+                    r"\s*`(?P<path>[^`\r\n]+):(?P<line>\d+)`[ \t]*"
+                    r"(?:\r?\n|$)(?P<body>.*)",
+                    body[finding["body_start"]:finding["end"]],
+                    flags=re.DOTALL,
+                )
+                if not title or not location or not location["body"].strip():
+                    raise WorkflowError(
+                        "Copilot review body contains an unparsed Previously missed finding"
+                    )
+                parsed.append({
+                    "path": location["path"].replace("\u200b", ""),
+                    "line": int(location["line"]),
+                    "body": f"{title}\n\n{location['body'].strip()}",
+                })
+        else:
+            headers = list(re.finditer(
+                r"^\s*\*\*(?P<path>.+):(?P<line>\d+)\*\*\s*$",
+                content, flags=re.MULTILINE,
+            ))
+            for index, header in enumerate(headers):
+                end = (
+                    headers[index + 1].start()
+                    if index + 1 < len(headers) else len(content)
+                )
+                comment_body = content[header.end():end].strip()
+                comment_body = re.sub(r"^\*(?:\s+|$)", "", comment_body)
+                parsed.append({
+                    "path": header["path"], "line": int(header["line"]),
                     "body": comment_body,
-                }
+                })
+        if (
+            (not parsed and expected_count != 0)
+            or (expected_count is not None and len(parsed) != expected_count)
+            or any(not entry["body"] or not entry["path"] for entry in parsed)
+        ):
+            raise WorkflowError(
+                "Copilot review body feedback could not be completely parsed"
             )
-        return entries
-    return []
+        entries.extend(parsed)
+    return entries
 
 
 def suppressed_queue(

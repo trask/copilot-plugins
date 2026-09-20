@@ -22,6 +22,12 @@ import uuid
 SCRIPT = Path(__file__).parents[1] / "scripts" / "copilot_review_loop.py"
 AGENT = Path(__file__).parents[1] / "agents" / "copilot-review-loop.agent.md"
 PLUGIN = Path(__file__).parents[1] / "plugin.json"
+CCR_V2_REVIEW = (
+    Path(__file__).parent / "fixtures" / "ccr-v2-previously-missed-review.json"
+)
+CCR_V2_RESOLVED_REVIEW = (
+    Path(__file__).parent / "fixtures" / "ccr-v2-resolved-only-review.json"
+)
 CCA_DISABLED_RESULT = (
     Path(__file__).parent / "fixtures" / "cca-disabled-agent-task-result.json"
 )
@@ -2521,7 +2527,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("result schema version 5", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.67")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.68")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -9671,6 +9677,119 @@ class CarryOverProgressTest(unittest.TestCase):
 
 
 class SuppressedCommentTest(unittest.TestCase):
+    def test_parses_exact_ccr_v2_previously_missed_body(self):
+        review = json.loads(CCR_V2_REVIEW.read_text(encoding="utf-8"))
+        self.assertEqual(
+            hashlib.sha256(review["body"].encode("utf-8")).hexdigest(),
+            "27359ec30de8bd1fd5adcebb1ca6d64fa219eb824c746773ad8e202c62f2b458",
+        )
+        entries = MODULE.parse_suppressed_comments(review["body"])
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(
+            entries[0]["path"],
+            "instrumentation/grpc-1.6/library/src/main/java/io/opentelemetry/"
+            "instrumentation/grpc/v1_6/GrpcTelemetry.java",
+        )
+        self.assertEqual(entries[0]["line"], 93)
+        self.assertEqual(
+            entries[0]["body"],
+            "Document capability-based fallback for gRPC 1.64+ builders\n\n"
+            "[Documentation] This version-based guarantee is too broad: gRPC 1.64 "
+            "adds the hook to `ManagedChannelBuilder`, but its default implementation "
+            "throws `UnsupportedOperationException`. Custom builders that do not "
+            "override/delegate the hook therefore take this method's fallback path "
+            "even on 1.64+, so their target is not captured. Please document the "
+            "capability-based fallback as well as the version boundary.",
+        )
+        queued = MODULE.suppressed_queue(review, entries)
+        self.assertEqual(queued[0]["id"], -5259532804000)
+        self.assertEqual(queued[0]["source"], "suppressed")
+        self.assertIsNone(queued[0]["thread_id"])
+
+    def test_parses_all_nested_findings_and_legacy_sections_in_order(self):
+        body = """
+<details><summary><strong>Previously missed (2)</strong></summary>
+<details><summary>First &amp; second</summary>
+`src/\u200bFirst.java:1`
+First concern.
+</details>
+<details><summary>Third</summary>
+`src/Second.java:2`
+Second concern.
+</details>
+</details>
+<details><summary>Suppressed comments (1)</summary>
+**src/Third.java:3**
+* Legacy concern.
+</details>
+"""
+        self.assertEqual(MODULE.parse_suppressed_comments(body), [
+            {"path": "src/First.java", "line": 1,
+             "body": "First & second\n\nFirst concern."},
+            {"path": "src/Second.java", "line": 2,
+             "body": "Third\n\nSecond concern."},
+            {"path": "src/Third.java", "line": 3, "body": "Legacy concern."},
+        ])
+
+    def test_rejects_recognized_but_unparsed_body_feedback(self):
+        body = json.loads(CCR_V2_REVIEW.read_text(encoding="utf-8"))["body"]
+        cases = [
+            body.replace("Previously missed (1)", "Previously missed (2)"),
+            body.replace("Previously missed (1)", "Previously missed (zero)"),
+            body.replace("GrpcTelemetry.java:93`", "GrpcTelemetry.java`"),
+            body.rsplit("</details>", 1)[0],
+            body.replace("</summary>", "", 2),
+            "<details><summary>Previously missed (1)</summary>Unreadable</details>",
+            "<details><summary>Suppressed comments (1)</summary>Unreadable</details>",
+            "<details><summary>Suppressed comments (2)</summary>"
+            "**a.java:1**\n* Only one.\n</details>",
+            "<details><summary>Suppressed comments (1)</summary>"
+            "**a.java:1**\n* \n</details>",
+        ]
+        for malformed in cases:
+            with self.subTest(body=malformed), self.assertRaisesRegex(
+                MODULE.WorkflowError, "review body"
+            ):
+                MODULE.parse_suppressed_comments(malformed)
+
+    def test_exact_ccr_v2_resolved_only_body_has_no_feedback(self):
+        body = json.loads(CCR_V2_RESOLVED_REVIEW.read_text(encoding="utf-8"))["body"]
+        self.assertEqual(
+            hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            "cc02b2d01ec84c0ef95d21308df46258f4ce7de471239de27350efcc86b5ad51",
+        )
+        self.assertEqual(MODULE.parse_suppressed_comments(body), [])
+
+    def test_body_feedback_supports_html_tag_case_and_spacing(self):
+        body = """
+<DETAILS class="feedback"><SUMMARY ><strong>Previously missed (1)</strong></SUMMARY >
+<DETAILS ><SUMMARY >A concern</SUMMARY >
+`src/First.java:1`
+Full text.
+</DETAILS >
+</DETAILS >
+"""
+        self.assertEqual(MODULE.parse_suppressed_comments(body), [
+            {"path": "src/First.java", "line": 1, "body": "A concern\n\nFull text."},
+        ])
+
+    def test_summary_prose_and_resolved_sections_are_not_feedback(self):
+        body = """
+<!-- ccr-overview-v2 -->
+### Needs a closer look
+**Findings:** None
+<details><summary>Resolved since last review (1)</summary>
+<details><summary>Previously missed (1)</summary>
+<details><summary>Old concern</summary>
+`src/First.java:1`
+Already resolved.
+</details>
+</details>
+</details>
+<details><summary>Previously missed (0)</summary></details>
+"""
+        self.assertEqual(MODULE.parse_suppressed_comments(body), [])
+
     def test_parses_multiple_suppressed_comments_with_fenced_context(self):
         body = """
 <details>
@@ -11423,6 +11542,30 @@ class CleanAtHeadShaTest(unittest.TestCase):
         self.assertIsNone(payload["clean_at_head_sha"])
         self.assertIsNone(saved.get("clean_at_head_sha"))
 
+    def test_watch_routes_ccr_v2_body_only_feedback_without_clean_marker(self):
+        review = json.loads(CCR_V2_REVIEW.read_text(encoding="utf-8"))
+        payload, saved = self.run_watch(review_comments=[], body=review["body"])
+        self.assertEqual(payload["result"], "review_comments")
+        self.assertEqual(payload["comment_ids"], [])
+        self.assertEqual(payload["suppressed_comment_count"], 1)
+        self.assertIsNone(payload["clean_at_head_sha"])
+        self.assertIsNone(saved.get("clean_at_head_sha"))
+
+    def test_watch_fails_on_unparsed_body_feedback(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "review body"):
+            self.run_watch(
+                review_comments=[],
+                body="<details><summary>Previously missed (1)</summary>"
+                "Unparsed feedback</details>",
+            )
+
+    def test_watch_keeps_ccr_v2_resolved_only_review_clean(self):
+        body = json.loads(CCR_V2_RESOLVED_REVIEW.read_text(encoding="utf-8"))["body"]
+        payload, saved = self.run_watch(review_comments=[], body=body)
+        self.assertEqual(payload["result"], "review_no_comments")
+        self.assertEqual(payload["suppressed_comment_count"], 0)
+        self.assertEqual(saved["clean_at_head_sha"], "head")
+
     def run_watch(self, *, review_comments, body):
         state = {
             "version": MODULE.STATE_VERSION,
@@ -12698,6 +12841,16 @@ class PreflightTargetTest(unittest.TestCase):
         self.assertEqual(payload["result"], "ready")
         self.assertEqual(payload["queue"]["comments"][0]["source"], "suppressed")
         self.assertFalse(payload["head_review_clean"])
+
+    def test_preflight_queues_ccr_v2_body_only_feedback(self):
+        review = json.loads(CCR_V2_REVIEW.read_text(encoding="utf-8"))
+        review["commit_id"] = "head"
+        payload = self.run_preflight(reviews=[review])
+        self.assertEqual(payload["result"], "ready")
+        self.assertFalse(payload["head_review_clean"])
+        self.assertEqual(len(payload["queue"]["comments"]), 1)
+        self.assertEqual(payload["queue"]["comments"][0]["source"], "suppressed")
+        self.assertIsNone(payload["queue"]["comments"][0]["thread_id"])
 
     def test_preflight_reports_when_only_human_comments_remain(self):
         metadata = {"head_branch": "branch", "head_sha": "head"}

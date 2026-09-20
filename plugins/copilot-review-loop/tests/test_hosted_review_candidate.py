@@ -709,6 +709,57 @@ class HostedReviewCandidateTest(unittest.TestCase):
         self.assertEqual(-17, bundle["report"]["comments"][0]["id"])
         self.assertIsNone(bundle["report"]["comments"][0]["thread_id"])
 
+    def test_ccr_v2_body_finding_reaches_hosted_decisions_without_thread_mutation(self):
+        review = json.loads((
+            Path(__file__).parent / "fixtures" / "ccr-v2-previously-missed-review.json"
+        ).read_text(encoding="utf-8"))
+        review["commit_id"] = self.head
+        pr = {
+            **self.preflight["pr"], "head_owner": "owner", "head_repo": "repo",
+            "upstream_owner": "owner", "upstream_repo": "repo",
+        }
+        with (
+            mock.patch.object(MODULE, "metadata_for", return_value=pr),
+            mock.patch.object(MODULE, "gh_json", side_effect=[
+                {"permissions": {key: True for key in (
+                    "admin", "maintain", "push", "triage", "pull"
+                )}},
+                {"login": "fixture"},
+            ]),
+            mock.patch.object(MODULE, "remote_head", return_value=self.head),
+            mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
+            mock.patch.object(MODULE, "fetch_copilot_threads", return_value=([], [])),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=[review]),
+        ):
+            self.preflight = MODULE.agent_task_preflight(
+                self.repo, {"owner": "owner", "repo": "repo", "number": 7},
+                allow_detached=True,
+            )
+        self.assertFalse(self.preflight["head_review_clean"])
+        comments = self.preflight["comments"]
+        self.assertEqual(len(comments), 1)
+        self.prompt = MODULE.build_worker_prompt(
+            self.preflight, request_id="fresh-run", iteration_allowance=1, prior_history=[]
+        )
+        self.prompt_path.write_text(self.prompt, encoding="utf-8")
+        self.assertIn(json.dumps(comments[0]["body"]), self.prompt)
+        self.candidate(fixed=False)
+        bundle = self.run_worker()
+        decisions = bundle["report"]["comments"]
+        self.assertEqual(decisions[0]["id"], -5259532804000)
+        self.assertEqual(decisions[0]["source"], "suppressed")
+        self.assertEqual(decisions[0]["disposition"], "no_change")
+        self.assertIsNone(decisions[0]["thread_id"])
+        with (
+            mock.patch.object(MODULE, "gh_json", side_effect=AssertionError("mutation")),
+            mock.patch.object(MODULE, "graphql", side_effect=AssertionError("mutation")),
+            mock.patch.object(
+                MODULE, "fetch_review_comments", side_effect=AssertionError("reply")
+            ),
+        ):
+            self.assertEqual(MODULE.post_missing_replies({}, decisions), {})
+            MODULE.resolve_threads(decisions)
+
     def test_no_change_cannot_conceal_candidate_code(self):
         self.candidate(decision=self.decisions({
                 "finding_id": MODULE.decision_finding_id("fresh-run", 0),
