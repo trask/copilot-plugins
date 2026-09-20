@@ -1,4 +1,5 @@
 import base64
+from dataclasses import replace
 import hashlib
 import importlib.util
 import io
@@ -2531,7 +2532,25 @@ class CandidateDispatcherTest(unittest.TestCase):
     def test_derives_manifest_from_exact_head_detached_checkout(self):
         self.check_candidate(None)
 
-    def check_candidate(self, branch):
+    def test_head_movement_during_preparation_does_not_start_a_task(self):
+        self.check_candidate(None, drift_phase="preparation")
+
+    def test_post_completion_drift_retains_completed_task_without_accepting_work(self):
+        for branch in ("feature", None):
+            for field, value in (
+                ("head_sha", "9" * 40),
+                ("head_ref", "foreign-branch"),
+                ("head_repository", "foreign/repo"),
+                ("state", "CLOSED"),
+            ):
+                with self.subTest(branch=branch, field=field):
+                    self.check_candidate(
+                        branch,
+                        drift_phase="completion",
+                        drift_fields={field: value},
+                    )
+
+    def check_candidate(self, branch, *, drift_phase=None, drift_fields=None):
         root = Path("C:/repo")
         base_sha = "1" * 40
         code_commit = "2" * 40
@@ -2643,7 +2662,14 @@ class CandidateDispatcherTest(unittest.TestCase):
         )
         api = mock.Mock()
         api.last_response_sha256 = "e" * 64
-        result = MODULE.ResultEnvelope()
+        drifted = replace(
+            pull_request, **(drift_fields or {"head_sha": "9" * 40})
+        )
+        observations = [
+            pull_request,
+            drifted if drift_phase == "preparation" else pull_request,
+            drifted if drift_phase == "completion" else pull_request,
+        ]
         with (
             mock.patch.object(MODULE, "GitRepository", return_value=repository),
             mock.patch.object(MODULE, "ApiClient", return_value=api),
@@ -2655,26 +2681,78 @@ class CandidateDispatcherTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "resolve_pull_request",
-                return_value=pull_request,
-            ),
+                side_effect=observations,
+            ) as resolve,
             mock.patch.object(MODULE, "validate_policy_before_post"),
-            mock.patch.object(MODULE, "validate_policy_before_mutation"),
-            mock.patch.object(MODULE, "start_task", return_value=task),
-            mock.patch.object(MODULE, "monitor_task", return_value=task),
+            mock.patch.object(
+                MODULE, "start_task", return_value={**task, "state": "queued"}
+            ) as start,
+            mock.patch.object(MODULE, "monitor_task", return_value=task) as monitor,
             mock.patch.object(
                 MODULE,
                 "fetch_report",
                 side_effect=AssertionError("candidate policy parsed worker prose"),
             ),
+            mock.patch.object(MODULE, "parse_args", return_value=options),
+            mock.patch.object(MODULE, "atomic_write_json") as write_result,
         ):
-            code = MODULE.execute(
-                options,
+            code = MODULE.main(
+                [
+                    "--result-file", str(options.result_file),
+                    "--policy", options.policy,
+                ],
                 cwd=root,
                 uuid_factory=lambda: "request-1",
-                result=result,
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
             )
 
-        envelope = result.as_dict()
+        write_result.assert_called_once()
+        self.assertEqual(write_result.call_args.args[0], options.result_file)
+        envelope = write_result.call_args.args[1]
+        repository.fast_forward.assert_not_called()
+        repository.cherry_pick.assert_not_called()
+        repository.snapshot.assert_called_once_with(root, allow_detached=True)
+        if drift_phase is not None:
+            self.assertEqual(code, 2)
+            self.assertEqual(envelope["status"], "error")
+            self.assertEqual(envelope["error"]["code"], "stale_pr_head")
+            message = envelope["error"]["message"]
+            for field in drift_fields or {"head_sha": "9" * 40}:
+                self.assertIn(
+                    f"{field} expected={getattr(pull_request, field)!r} "
+                    f"observed={getattr(drifted, field)!r}",
+                    message,
+                )
+            self.assertIsNone(envelope["candidate"])
+            self.assertIsNone(envelope["completion"])
+            self.assertFalse(envelope["attestation"]["structural_complete"])
+            self.assertEqual(envelope["application"]["status"], "not_applied")
+            self.assertEqual(envelope["application"]["final_local_head"], base_sha)
+            self.assertIsNone(envelope["generated"]["head_sha"])
+            self.assertEqual(envelope["generated"]["commits"], [])
+            repository.fetch_generated.assert_not_called()
+            repository.candidate_history.assert_not_called()
+            if drift_phase == "preparation":
+                start.assert_not_called()
+                monitor.assert_not_called()
+                self.assertEqual(resolve.call_count, 2)
+                self.assertIsNone(envelope["task"]["id"])
+                self.assertIsNone(envelope["generated"]["branch"])
+                self.assertIn("the Agent Task was not started", message)
+                self.assertNotIn("post-completion", message)
+            else:
+                start.assert_called_once()
+                monitor.assert_called_once()
+                self.assertEqual(resolve.call_count, 3)
+                self.assertEqual(envelope["task"]["id"], "task-1")
+                self.assertEqual(envelope["task"]["state"], "completed")
+                self.assertEqual(envelope["task"]["base_sha"], base_sha)
+                self.assertEqual(envelope["generated"]["branch"], "copilot/task-1")
+                self.assertIn("post-completion validation", message)
+                self.assertIn("refusing to accept generated work", message)
+                self.assertNotIn("not started", message)
+            return
         self.assertEqual(code, 0)
         self.assertEqual(envelope["schema"]["version"], 5)
         self.assertEqual(
@@ -2711,9 +2789,6 @@ class CandidateDispatcherTest(unittest.TestCase):
                 "structural_complete": True,
             },
         )
-        repository.fast_forward.assert_not_called()
-        repository.cherry_pick.assert_not_called()
-        repository.snapshot.assert_called_once_with(root, allow_detached=True)
 
 
 if __name__ == "__main__":

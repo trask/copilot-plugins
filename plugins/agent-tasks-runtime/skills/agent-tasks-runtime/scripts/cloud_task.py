@@ -3778,6 +3778,7 @@ def require_pr_unchanged(
     current: PullRequestSnapshot,
     *,
     full_identity: bool = False,
+    task_completed: bool = False,
 ) -> None:
     fields = (
         (
@@ -3795,10 +3796,24 @@ def require_pr_unchanged(
         if full_identity
         else ("state", "head_repository", "head_ref", "head_sha")
     )
-    if any(getattr(original, field) != getattr(current, field) for field in fields):
+    changed = [
+        field for field in fields
+        if getattr(original, field) != getattr(current, field)
+    ]
+    if changed:
+        phase = (
+            "no longer matches the frozen source at post-completion validation; "
+            "refusing to accept generated work"
+            if task_completed
+            else "moved during local preparation; the Agent Task was not started"
+        )
+        detail = "; ".join(
+            f"{field} expected={getattr(original, field)!r} "
+            f"observed={getattr(current, field)!r}"
+            for field in changed
+        )
         raise CloudError(
-            f"pull request #{original.number} moved during local preparation; "
-            "the Agent Task was not started",
+            f"pull request #{original.number} {phase}; {detail}",
             "stale_pr_head",
         )
 
@@ -3829,6 +3844,7 @@ def validate_policy_before_mutation(
             pull_request,
             current,
             full_identity=allow_merged_pr,
+            task_completed=True,
         )
     except CloudError as error:
         raise CloudError(str(error), "stale_pr_head") from None

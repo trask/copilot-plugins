@@ -2354,7 +2354,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.44")
+        self.assertEqual(plugin["version"], "1.3.45")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
@@ -4260,7 +4260,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     @contextlib.contextmanager
     def pipeline_run(
-        self, *, fixes=1, exit_code=0, task_state="completed", max_iterations=3
+        self, *, fixes=1, exit_code=0, task_state="completed", max_iterations=3,
+        task_error=None,
     ):
         args = MODULE.build_parser().parse_args(
             [
@@ -4313,6 +4314,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 result = self.candidate_result(commits=commits)
                 result["task"]["state"] = task_state
                 result["completion"]["task"]["state"] = task_state
+                if task_error is not None:
+                    result.update(
+                        status="error", error=task_error, candidate=None, completion=None
+                    )
+                    result["attestation"]["structural_complete"] = False
+                    result["generated"].update(head_sha=None, commits=[])
                 result_path = Path(command[command.index("--result-file") + 1])
                 result_path.write_text(json.dumps(result), encoding="utf-8")
                 return MODULE.subprocess.CompletedProcess(command, exit_code, "", "")
@@ -4556,6 +4563,52 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertEqual("failed", state["agent_task"]["status"])
             self.assertEqual(0, state["iterations"])
             self.assertIsNone(MODULE.recorded_clean_at_head_sha(state))
+
+    def test_pipeline_preserves_completed_task_rejected_by_runtime_head_guard(self):
+        message = (
+            "pull request #7 no longer matches the frozen source at "
+            "post-completion validation; refusing to accept generated work"
+        )
+        with self.pipeline_run(
+            fixes=0,
+            exit_code=2,
+            task_error={"code": "stale_pr_head", "message": message},
+        ) as (args, commands, emitted):
+            with (
+                mock.patch.object(MODULE, "apply_verified_candidate_import") as apply,
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError, "stale_pr_head.*post-completion validation"
+                ),
+            ):
+                MODULE.command_pipeline(args)
+            apply.assert_not_called()
+            MODULE.validate_candidate_history.assert_not_called()
+            MODULE.metadata_for.assert_not_called()
+            self.assertEqual(1, len(commands))
+            self.assertFalse(emitted)
+            state_path = Path(args.state)
+            state = MODULE.load_state(state_path)
+            task = state["agent_task"]
+            self.assertEqual("failed", task["status"])
+            self.assertEqual("completed", task["task"]["state"])
+            self.assertIsNotNone(task["task"]["id"])
+            self.assertIsNotNone(task["generated"]["branch"])
+            self.assertIsNone(task["candidate"])
+            self.assertIsNone(task["completion"])
+            self.assertNotIn("task_id_status", task)
+            self.assertNotIn("published_head_sha", task)
+            self.assertNotIn("confirmed_remote_head_sha", task)
+            self.assertEqual(0, state["iterations"])
+            self.assertTrue(all(value == 0 for value in state["budget_charges"].values()))
+            self.assertIsNone(MODULE.recorded_clean_at_head_sha(state))
+            self.assertIn(message, task["error"])
+            self.assertTrue(Path(task["result_file"]).is_file())
+            self.assertTrue(Path(task["prompt_file"]).is_file())
+            before = state_path.read_bytes()
+            with self.assertRaisesRegex(MODULE.WorkflowError, "unfinished audit"):
+                MODULE.command_pipeline(args)
+            self.assertEqual(before, state_path.read_bytes())
+            self.assertEqual(1, len(commands))
 
     def test_pipeline_cli_returns_nonzero_for_execution_errors(self):
         argv = [

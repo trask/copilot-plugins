@@ -45,6 +45,12 @@ or any local application path fails closed. These contracts support only fresh
 invocations. They do not accept task IDs, prior results, resume, monitor-only,
 or historical recovery.
 
+The live pull request guard can reject a task after it completes but before
+candidate attestation. Such an error retains the completed task identity while
+`completion` and `candidate` remain null. The diagnostic identifies
+post-completion validation and the mismatched fields; it does not mean the task
+was never started or authorize accepting its generated work.
+
 Consumers migrate explicitly. Code-candidate callers keep
 `--apply-with-report` but select `marketplace-agent-code-candidate-worker@1`;
 report callers keep `--report` and select
