@@ -1479,6 +1479,7 @@ STAGE_STATUS_FIELDS = (
     "managed_task_history",
     "mergeable_at_head_sha",
     "monitoring",
+    "native_stack_clearance",
     "outcome",
     "pipeline_budget",
     "pipeline_run",

@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "6aa03b8cd2254faf27722f25b99a56e457f034f01ffcf7668cb43b88e39719ff"
+COMMON_SHA256 = "1d499ec7561e5e9817f50fa3881523e3ff01fa9e99f71099de41a86b3986ee96"
 
 
 def load_common() -> Any:
@@ -183,6 +183,7 @@ def stage_result_summary(stage_result: dict[str, Any]) -> dict[str, Any]:
             "clearance_verification": (status or {}).get("clearance_verification"),
             "run_id": (status or {}).get("run_id"),
             "pipeline_run": (status or {}).get("pipeline_run"),
+            "native_stack_clearance": (status or {}).get("native_stack_clearance"),
             **common.ci_warning_fields([stage_result]),
             "outcome": stage_result.get("outcome"),
             "reason": stage_result.get("reason"),
@@ -961,6 +962,22 @@ def topology_fingerprint(stack: dict[str, Any]) -> str:
         sort_keys=True,
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def stack_source_identity(stack: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    source = {key: stack.get(key) for key in ("id", "number", "size", "trunk")}
+    member_keys = ("number", "head_branch", "base_branch", "head_sha")
+    source["members"] = [
+        {key: member[key] for key in member_keys} for member in stack["members"]
+    ]
+    snapshot = (
+        source["id"], source["number"], source["size"], source["trunk"],
+        tuple(tuple(member[key] for key in member_keys) for member in source["members"]),
+    )
+    digest = hashlib.sha256(
+        json.dumps(snapshot, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return source, digest
 
 
 def validate_selection(
@@ -1985,22 +2002,10 @@ class StackPipeline:
             or current["fingerprint"] != self.state.get("topology_fingerprint")
         ):
             raise WorkflowError("stack publication authorization changed")
-        stack = current["stack"]
-        source = {
-            key: stack.get(key) for key in ("id", "number", "size", "trunk")
-        }
-        source["members"] = [
-            {key: member[key] for key in ("number", "head_branch", "base_branch", "head_sha")}
-            for member in stack["members"]
-        ]
+        source, source_snapshot = stack_source_identity(current["stack"])
         fixed = next((member for member in source["members"] if member["number"] == number), None)
         if fixed is None or fixed["head_sha"] != head_sha:
             raise WorkflowError("fixed head changed before stack publication authorization")
-        snapshot = (
-            source["id"], source["number"], source["size"], source["trunk"],
-            tuple(tuple(member[key] for key in ("number", "head_branch", "base_branch", "head_sha"))
-                  for member in source["members"]),
-        )
         name = (
             f"propagate-pr-{number}-{head_sha}" if operation == "descendant-propagation"
             else f"conflict-pass-{pass_number}-pr-{number}"
@@ -2021,9 +2026,7 @@ class StackPipeline:
             "selected": list(self.kickoff["pullRequests"]),
             "topology_fingerprint": self.state["topology_fingerprint"],
             "source_stack": source,
-            "source_snapshot": hashlib.sha256(
-                json.dumps(snapshot, separators=(",", ":")).encode("utf-8")
-            ).hexdigest(),
+            "source_snapshot": source_snapshot,
             "fixed_pr": number,
             "fixed_head": head_sha,
             "state": str(state_path),
@@ -2544,6 +2547,12 @@ class StackPipeline:
                     "outcome": completion.get("stage_result", {}).get("outcome"),
                     "reason": completion.get("reason"),
                     "stage_result": completion["stage_result"],
+                    "configuration": {
+                        "model": self.models[STAGE_CONFLICT],
+                        "effort": self.effort,
+                        "strategy": self.conflict_strategy,
+                        "github_mutation_policy": self.github_mutation_policy,
+                    },
                 },
             )
         stopped = launched["stopped"] or next(
@@ -3232,6 +3241,166 @@ class StackPipeline:
 
     # Snapshot ------------------------------------------------------------
 
+    def apply_native_stack_clearance(
+        self, validation: dict[str, Any], pull_requests: list[dict[str, Any]]
+    ) -> None:
+        """Use accepted no-op evidence only for missing member conflict state."""
+        if (
+            self.state.get("kind") != RUN_KIND
+            or self.state.get("run_id") != self.run_id
+            or self.state.get("kickoff") != self.kickoff
+            or self.state.get("selected") != self.kickoff["pullRequests"]
+            or validation["fingerprint"] != self.state.get("topology_fingerprint")
+            or [member["number"] for member in validation["stack"]["members"]]
+            != self.kickoff["pullRequests"]
+        ):
+            return
+        clicked = self.kickoff["startPullRequest"]
+        snapshot = next(item for item in pull_requests if item["number"] == clicked)
+        current = next(stage for stage in snapshot["stages"] if stage["stage"] == STAGE_CONFLICT)
+        previous = (
+            self.state.get("pull_requests", {}).get(str(clicked), {})
+            .get("stages", {}).get(STAGE_CONFLICT, {})
+        )
+        status = current.get("status") or {}
+        clearance = status.get("native_stack_clearance")
+        task = status.get("agent_task")
+        prior_result = previous.get("stage_result") or {}
+        prior_pass = previous.get("pass")
+        iteration = task.get("iteration") if isinstance(task, dict) else None
+        if (
+            not isinstance(clearance, dict)
+            or not isinstance(task, dict)
+            or current.get("clear") is not True
+            or current.get("outcome") != "cleared"
+            or common.stage_blocker(current, after_launch=True) is not None
+            or previous.get("accepted") is not True
+            or previous.get("returncode") != 0
+            or previous.get("clear") is not True
+            or previous.get("outcome") != "cleared"
+            or type(prior_pass) is not int
+            or type(self.state.get("pass")) is not int
+            or not 1 <= prior_pass <= self.state.get("pass", 0) <= MAX_PASSES
+            or previous.get("dispatched_head_sha") != snapshot["head_sha"]
+            or previous.get("current_head_sha") != snapshot["head_sha"]
+            or previous.get("current_base_sha") != snapshot["base_sha"]
+            or previous.get("configuration") != {
+                "model": self.models[STAGE_CONFLICT],
+                "effort": self.effort,
+                "strategy": self.conflict_strategy,
+                "github_mutation_policy": self.github_mutation_policy,
+            }
+            or clearance != prior_result.get("native_stack_clearance")
+            or task != prior_result.get("agent_task")
+            or not paths_match(current.get("status_state"), stage_state_path(
+                STAGE_BY_NAME[STAGE_CONFLICT],
+                common.target_for(self.repository, clicked), self.run_id,
+            ))
+            or current.get("status_state") != prior_result.get("status_state")
+            or task.get("invocation_id") != self.run_id
+            or not isinstance(task.get("run_id"), str) or not task["run_id"]
+            or task.get("status") != "completed"
+            or task.get("outcome") != "already_mergeable"
+            or task.get("task_id") is not None
+            or task.get("task_id_status") != "not_needed"
+            or task.get("whole_stack") is not True
+            or task.get("requested_strategy") != "auto"
+            or self.conflict_strategy != "auto"
+            or task.get("model") != self.models[STAGE_CONFLICT]
+            or not isinstance(task.get("policy"), str) or not task["policy"]
+            or task.get("target") != common.target_for(self.repository, clicked)["pr_url"]
+            or not isinstance(iteration, dict)
+            or type(iteration.get("number")) is not int
+            or type(iteration.get("budget")) is not int
+            or iteration != {
+                "id": f"{self.run_id}-{prior_pass}", "number": prior_pass, "budget": MAX_PASSES,
+            }
+        ):
+            return
+        authorization = clearance.get("authorization")
+        if not isinstance(authorization, dict):
+            return
+        name = f"conflict-pass-{prior_pass}-pr-{clicked}"
+        digest = hashlib.sha256(json.dumps(
+            {**authorization, "request_sha256": ""},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        stack = validation["stack"]
+        source, source_snapshot = stack_source_identity(stack)
+        if (
+            authorization.get("schema") != {
+                "id": "github.copilot.stack-publication-request", "version": 1,
+            }
+            or authorization.get("operation") != "whole-stack"
+            or authorization.get("request_id") != f"{self.run_id}-{name}"
+            or authorization.get("request_sha256") != digest
+            or self.state.get("stack_requests", {}).get(authorization["request_id"]) != digest
+            or authorization.get("owner") != {
+                "kind": RUN_KIND, "run_id": self.run_id,
+                "state": str(self.state_path.resolve()),
+                "cancellation": str(self.cancellation_path.resolve()),
+            }
+            or authorization.get("state") != str((self.run_directory / f"{name}.json").resolve())
+            or authorization.get("repository") != self.repository.lower()
+            or authorization.get("selected") != self.kickoff["pullRequests"]
+            or authorization.get("fixed_pr") != clicked
+            or authorization.get("fixed_head") != snapshot["head_sha"]
+            or authorization.get("source_stack") != source
+            or authorization.get("source_snapshot") != source_snapshot
+            or authorization.get("topology_fingerprint") != validation["fingerprint"]
+            or clearance.get("topology_fingerprint") != validation["fingerprint"]
+            or clearance.get("source_snapshot") != source_snapshot
+            or not isinstance(clearance.get("observed_at"), str) or not clearance["observed_at"]
+            or clearance.get("trunk") != {"ref": stack["trunk"], "sha": pull_requests[0]["base_sha"]}
+            or any(
+                member.get("state") != "OPEN"
+                or member.get("mergeable") != "MERGEABLE"
+                or member.get("base_sha") != item["base_sha"]
+                for member, item in zip(validation["selected"], pull_requests)
+            )
+            or clearance.get("members") != [
+                {
+                    "pr_number": member["number"],
+                    "repository": self.repository,
+                    "head_ref": member["head_branch"],
+                    "head_sha": item["head_sha"],
+                    "direct_base_ref": member["base_branch"],
+                    "direct_base_sha": item["base_sha"],
+                    "merge_base": item["base_sha"],
+                    "mergeable": "MERGEABLE",
+                }
+                for member, item in zip(validation["selected"], pull_requests)
+            ]
+        ):
+            return
+        for item in pull_requests:
+            conflict = next(stage for stage in item["stages"] if stage["stage"] == STAGE_CONFLICT)
+            if (
+                conflict.get("reason") != "no_state"
+                or conflict.get("clear") is not False
+                or conflict.get("outcome") is not None
+                or conflict.get("status")
+                or conflict.get("clear_at_head_sha") is not None
+                or conflict.get("clear_at_base_sha") is not None
+                or conflict.get("installed") is not True
+                or not paths_match(conflict.get("status_state"), stage_state_path(
+                    STAGE_BY_NAME[STAGE_CONFLICT],
+                    common.target_for(self.repository, item["number"]), self.run_id,
+                ))
+            ):
+                continue
+            conflict.update(
+                clear=True, outcome="cleared", reason=None, identity="current",
+                clear_at_head_sha=item["head_sha"], clear_at_base_sha=item["base_sha"],
+                clearance_kind="native_stack_clearance",
+                clearance_source={
+                    "number": clicked, "status_state": current["status_state"],
+                    "request_id": authorization["request_id"], "request_sha256": digest,
+                    "run_id": task["run_id"], "invocation_id": self.run_id,
+                },
+            )
+            item["uncleared"] = [stage["stage"] for stage in item["stages"] if not stage["clear"]]
+
     def final_snapshot(self) -> dict[str, Any]:
         """Require all five markers current for every selected pull request.
 
@@ -3361,6 +3530,8 @@ class StackPipeline:
                 "pull_requests": pull_requests,
                 "moved": bases_moved,
             }
+        if whole_stack:
+            self.apply_native_stack_clearance(closing, pull_requests)
         complete = all(not entry["uncleared"] for entry in pull_requests)
         return {
             "result": "complete" if complete else "incomplete",
