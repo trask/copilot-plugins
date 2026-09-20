@@ -7212,6 +7212,7 @@ def command_status(args: argparse.Namespace) -> None:
             "escalation": state.get("escalation"),
             "history": history,
             "agent_task": state.get("agent_task"),
+            "native_stack_clearance": state.get("native_stack_clearance"),
             "attempts": int(state.get("attempts", 0)),
             "last_helper_activity": last_helper_activity(state),
         },
@@ -7235,6 +7236,7 @@ def command_status(args: argparse.Namespace) -> None:
                 },
                 "attempt": attempt_summary(attempt),
                 "agent_task": state.get("agent_task"),
+                "native_stack_clearance": state.get("native_stack_clearance"),
                 "escalation": state.get("escalation"),
                 "mergeable_at_head_sha": (attempt or {}).get("mergeable_at_head_sha"),
                 "counts": {
@@ -7860,6 +7862,141 @@ def conflict_preflight_identity(
     }
 
 
+def native_stack_clearance_key(detection: dict[str, Any]) -> tuple[Any, ...]:
+    """Compare source topology without GitHub's transient mergeability cache."""
+    stack = detection.get("stack")
+    return (
+        detection.get("default_branch"),
+        None if stack is None else tuple(
+            (
+                stack_snapshot_key(scope),
+                tuple(
+                    (member.get("position"), member.get("state"), member.get("base_sha"))
+                    for member in scope["members"]
+                ),
+            )
+            for scope in (stack, stack.get("source_stack", stack))
+        ),
+    )
+
+
+def aligned_native_stack_clearance(
+    repo_root: Path,
+    metadata: dict[str, Any],
+    detection: dict[str, Any],
+    stack_request: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Prove a whole native stack needs neither conflict work nor a restack."""
+    stack = detection["stack"]
+    validate_stack_snapshot({**stack, "invoked_number": metadata["number"]})
+    if stack_request is not None:
+        if (
+            stack_request["operation"] != "whole-stack"
+            or stack_request["selected"] != [member["number"] for member in stack["members"]]
+        ):
+            raise WorkflowError("native stack clearance requires whole-stack authorization")
+        require_authorized_stack(stack_request, metadata, stack)
+    identity = conflict_preflight_identity(repo_root, metadata)
+    remote = find_remote(repo_root, metadata["repo_name"], push=False)
+    trunk_sha = base_ref_tip(metadata["repo_name"], stack["trunk"])
+    fetch_preflight_ref(
+        repo_root, remote, f"refs/heads/{stack['trunk']}", trunk_sha
+    )
+    identity_keys = (
+        "number", "pr_url", "repo_name", "upstream_owner", "upstream_repo",
+        "head_owner", "head_repo", "head_branch", "head_sha", "base_branch", "base_sha",
+        "state",
+    )
+    observed = []
+    members = []
+    parent_sha = trunk_sha
+    aligned = True
+    outside = external_stack_dependents(metadata, stack)
+    for member in stack["members"]:
+        target = stack_member_target(metadata, member["number"])
+        current = live_mergeability(target, expected_head=member["head_sha"])
+        require_open_pull_request(current)
+        if (
+            current["number"] != member["number"]
+            or current["pr_url"] != target["pr_url"]
+            or current["repo_name"] != metadata["repo_name"]
+            or current["upstream_owner"] != metadata["upstream_owner"]
+            or current["upstream_repo"] != metadata["upstream_repo"]
+            or f"{current['head_owner']}/{current['head_repo']}".casefold()
+            != metadata["repo_name"].casefold()
+            or current["head_branch"] != member["head_branch"]
+            or current["head_sha"] != member["head_sha"]
+            or current["base_branch"] != member["base_branch"]
+            or current["base_sha"] != parent_sha
+            or base_ref_tip(current["repo_name"], current["base_branch"]) != parent_sha
+            or (
+                current["number"] == metadata["number"]
+                and any(current.get(key) != metadata.get(key) for key in identity_keys)
+            )
+        ):
+            raise WorkflowError("native stack identity, head, or direct base changed")
+        if current.get("mergeable") not in {"MERGEABLE", "CONFLICTING"}:
+            raise WorkflowError("GitHub did not return stable native stack mergeability")
+        fetch_preflight_ref(
+            repo_root, remote, f"refs/heads/{current['head_branch']}", current["head_sha"]
+        )
+        merge_base = git(
+            repo_root, "merge-base", "--all", parent_sha, current["head_sha"]
+        )
+        aligned = aligned and merge_base == parent_sha and current["mergeable"] == "MERGEABLE"
+        observed.append(current)
+        members.append({
+            "pr_number": current["number"],
+            "repository": current["repo_name"],
+            "head_ref": current["head_branch"],
+            "head_sha": current["head_sha"],
+            "direct_base_ref": current["base_branch"],
+            "direct_base_sha": parent_sha,
+            "merge_base": merge_base,
+            "mergeable": current["mergeable"],
+        })
+        parent_sha = current["head_sha"]
+    if not aligned:
+        return None
+    for current in observed:
+        refreshed = live_mergeability(
+            parse_target(current["pr_url"]), expected_head=current["head_sha"]
+        )
+        if (
+            any(refreshed.get(key) != current.get(key) for key in identity_keys)
+            or refreshed.get("mergeable") != "MERGEABLE"
+            or base_ref_tip(current["repo_name"], current["base_branch"]) != current["base_sha"]
+            or base_ref_tip(current["repo_name"], current["head_branch"]) != current["head_sha"]
+        ):
+            raise WorkflowError("native stack changed during clearance observation")
+    refreshed_scope = stack_membership(metadata)
+    if (
+        native_stack_clearance_key(refreshed_scope) != native_stack_clearance_key(detection)
+        or any(
+            member.get("mergeable") != "MERGEABLE"
+            for member in refreshed_scope["stack"]["members"]
+        )
+        or external_stack_dependents(metadata, stack) != outside
+    ):
+        raise WorkflowError("native stack scope changed during clearance observation")
+    if stack_request is not None:
+        require_authorized_stack(stack_request, metadata, refreshed_scope["stack"])
+    require_clean_worktree(repo_root)
+    require_no_integration_in_progress(repo_root)
+    if conflict_preflight_identity(repo_root, metadata) != identity:
+        raise WorkflowError("local repository changed during clearance observation")
+    if stack_request is not None:
+        require_stack_request_owner(stack_request)
+    return {
+        "trunk": {"ref": stack["trunk"], "sha": trunk_sha},
+        "members": members,
+        "source_snapshot": stack_snapshot_fingerprint(stack),
+        "topology_fingerprint": stack_topology_fingerprint(stack),
+        "authorization": stack_request,
+        "observed_at": utc_now(),
+    }
+
+
 def conflict_preflight(
     repo_root: Path,
     target: dict[str, Any],
@@ -7924,6 +8061,19 @@ def conflict_preflight(
             "native-stack publication is outside the pipeline scope; "
             "full-stack authorization requires --whole-stack"
         )
+    if (
+        stack is not None and whole_stack and requested_strategy == "auto"
+        and metadata["mergeable"] == "MERGEABLE"
+        and (stack_request is None or stack_request["operation"] == "whole-stack")
+    ):
+        clearance = aligned_native_stack_clearance(
+            repo_root, metadata, detection, stack_request
+        )
+        if clearance is not None:
+            return {
+                "already_mergeable": True, "pr": metadata, "strategy": None,
+                "native_stack_clearance": clearance,
+            }
     relations = stack_relations(metadata)
     methods = repository_merge_methods(metadata["repo_name"])
     strategy_choice = choose_strategy(
@@ -10422,6 +10572,7 @@ def record_mergeable_conflict(
     state["managed_attempts"] = managed_attempts
     state["last_result"] = "mergeable"
     state["pr"] = preflight["pr"]
+    state["native_stack_clearance"] = preflight.get("native_stack_clearance")
     state["escalation"] = None
     state["attempt"] = {
         "id": f"pr-{preflight['pr']['number']}-attempt-{attempt_number}",
@@ -10448,6 +10599,8 @@ def record_mergeable_conflict(
     emit({
         "result": "mergeable", "state": str(state_path),
         "head_sha": preflight["pr"]["head_sha"], "stage_outcome": "cleared",
+        "published_commits": [],
+        "native_stack_clearance": state["native_stack_clearance"],
     })
 
 
@@ -10536,6 +10689,7 @@ def require_later_conflict_sweep(
 
 def revalidate_pipeline_conflict(
     state_path: Path, state: dict[str, Any], binding: dict[str, Any],
+    stack_request: dict[str, Any] | None = None,
 ) -> None:
     root = Path(binding["repo_root"])
     target = parse_target(binding["target"])
@@ -10547,6 +10701,7 @@ def revalidate_pipeline_conflict(
     archive_attempt(state)
     state["pipeline"] = binding
     state["last_result"] = "revalidating"
+    state["native_stack_clearance"] = None
     state["attempt"] = {"status": "aborted", "mergeable_at_head_sha": None}
     state["agent_task"] = {
         "status": "preparing", "task_id": None, "task_id_status": "not_created",
@@ -10589,6 +10744,21 @@ def revalidate_pipeline_conflict(
             ]
         ):
             raise WorkflowError("pipeline native stack scope changed")
+        if binding["strategy"] == "auto":
+            clearance = aligned_native_stack_clearance(
+                root, metadata, detection, stack_request
+            )
+            if clearance is None:
+                raise WorkflowError(
+                    "later pipeline sweep is not freshly mergeable and aligned; "
+                    "conflict work requires a fresh invocation with authorized scope"
+                )
+            record_mergeable_conflict(
+                state_path, state,
+                {"pr": metadata, "strategy": None, "native_stack_clearance": clearance},
+                managed_attempt_count(state),
+            )
+            return
         members = []
         parent_ref = stack["trunk"]
         parent_sha = base_ref_tip(metadata["repo_name"], parent_ref)
@@ -10650,6 +10820,7 @@ def command_pipeline(args: argparse.Namespace) -> int:
         args.pipeline_iteration = 1
         args.pipeline_max_iterations = args.max_iterations
     binding = pipeline_conflict_binding(args)
+    authorization = None
     if args.whole_stack:
         authorization = load_stack_request(
             args.stack_request, operation="whole-stack", run_id=args.pipeline_run
@@ -10687,10 +10858,12 @@ def command_pipeline(args: argparse.Namespace) -> int:
                         request = (
                             (state.get("agent_task") or {}).get("preflight") or {}
                         ).get("request") or {}
-                        state["pipeline_native_scope"] = request.get("native_stack")
+                        state["pipeline_native_scope"] = (
+                            state.get("native_stack_clearance") or request.get("native_stack")
+                        )
                     save_state(state_path, state)
             else:
-                revalidate_pipeline_conflict(state_path, previous, binding)
+                revalidate_pipeline_conflict(state_path, previous, binding, authorization)
         state = load_state(state_path) if state_path.is_file() else {}
         task = state.get("agent_task", {})
         return (

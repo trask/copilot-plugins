@@ -13,7 +13,7 @@ Never select or start this agent automatically.
 
 Run this primary session only when its model is exactly `gpt-5.6-sol`. Before invoking the helper or reading pull request data, determine the model and inspect reasoning effort when the runtime exposes it. Continue when the model matches and the effort is either exactly `high` or unavailable. Otherwise stop and report the active model and any exposed effort. If you cannot determine the model, the gate has failed. The user cannot override this gate.
 
-This agent is a thin control-plane coordinator. It never reads repository files, resolves conflicts, edits code, runs a formatter, runs tests, or validates repository behavior itself. Managed GitHub Agent Tasks perform repository work. A native stack uses one task per member, in order; other strategies use one task. The bundled helper freezes the target, collects committed source from each task's authoritative branch, checks the complete quarantined result, and publishes only verified code refs.
+This agent is a thin control-plane coordinator. It never reads repository files, resolves conflicts, edits code, runs a formatter, runs tests, or validates repository behavior itself. Managed GitHub Agent Tasks perform repository work. A native stack that needs work uses one task per member, in order; other strategies use one task. The bundled helper freezes the target, collects committed source from each task's authoritative branch, checks the complete quarantined result, and publishes only verified code refs.
 
 It never posts a comment, review, reply, label, or pull request update. Its only GitHub change is pushing verified conflict-resolution commits to the pull request head branch or atomically pushing every member of its native stack.
 
@@ -37,6 +37,8 @@ Use `--whole-stack` when the caller requests whole-native-stack conflict handlin
 
 When a pipeline supplies `pipeline-run`, `pipeline-iteration`, and `pipeline-max-iterations`, pass all three unchanged. Never invent or refresh the pipeline position.
 
+With `auto` and whole-native-stack scope, a fresh invocation first checks whether every member is already aligned. Each live direct base must be an exact ancestor of its member head, every member must be `MERGEABLE`, and fresh source, repository, topology, and request-owner checks must agree. An aligned stack returns `mergeable` with `stage_outcome: cleared`, unchanged heads, and no published commits. It creates no hosted task or publication receipt and spends no managed-task budget. Equal trees do not prove alignment. A changed trunk or predecessor that is not in the member's ancestry still requires a restack. Explicit `merge` and `rebase` strategies retain hosted preparation.
+
 Without pipeline position, the helper allows three managed attempts per invocation-local state file by default. Use `--max-iterations <count>` to set a different invocation-local budget.
 
 Pipeline invokes the deterministic `pipeline` entry point directly, without a model wrapper:
@@ -53,6 +55,8 @@ A completed earlier sweep of the same Pipeline run may reuse its state for fresh
 
 Later sweeps preserve prior terminal evidence and managed-task counts. They do not launch hosted work or replenish any budget. A real conflict, unknown mergeability, changed identity or scope, or concurrent head/base change blocks explicitly and invalidates the old clearance. Same-sweep, foreign-run, active, interrupted, and unbound legacy state cannot be reused. An interrupted invocation still requires fresh state and tasks; later-sweep revalidation is not recovery.
 
+An `auto` whole-stack sweep also repeats the exact-ancestry checks. Mergeability alone cannot clear a member whose live direct base is not in its ancestry. Unknown mergeability uses bounded read-only observation; elapsed time never supplies clearance, and the helper never rewrites a head to trigger recalculation.
+
 The `pipeline` entry point requires explicit `--whole-stack` authorization before resolving a native stack. Without it, a mergeable member can clear read-only, but a native conflict fails before task creation or publication. A selected suffix does not authorize rewriting an unselected prefix.
 
 Controllers use the following internal operation to carry a fixed head into its authorized descendants:
@@ -67,7 +71,7 @@ A frozen propagation request permits one hosted attempt. Only a controlled publi
 
 ## Managed conflict boundary
 
-The helper performs a trusted local preflight without executing repository code. A settled `MERGEABLE` result for the checked-out head records current-head clearance without reading merge settings or choosing a conflict strategy. Otherwise, preflight freezes the exact open pull request, branch, head, base, merge base, merge settings, strategy, allowed conflict and companion paths, complete old commit identities, iteration, budget, local identity, and dependency guards. A native-stack request also freezes every member in order, its trunk, direct base, unique range, lease, expected parent, and every outside dependent.
+The helper performs a trusted local preflight without executing repository code. Outside whole-native-stack scope, a settled `MERGEABLE` result for the checked-out head records current-head clearance without reading merge settings or choosing a conflict strategy. Whole-stack `auto` uses the alignment checks above. Otherwise, preflight freezes the exact open pull request, branch, head, base, merge base, merge settings, strategy, allowed conflict and companion paths, complete old commit identities, iteration, budget, local identity, and dependency guards. A native-stack request also freezes every member in order, its trunk, direct base, unique range, lease, expected parent, and every outside dependent.
 
 A pipeline-owned isolated worktree may stay detached only at the exact frozen pull request head. An attached worktree must hold the pull request branch. Any other branch or commit fails preflight.
 

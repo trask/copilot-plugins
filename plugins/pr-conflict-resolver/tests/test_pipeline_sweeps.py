@@ -283,11 +283,11 @@ class ConflictPipelineSweepTest(unittest.TestCase):
 
     def full_stack(self):
         self.args.whole_stack = True
-        self.metadata.update(base_branch="v143")
+        self.metadata.update(base_branch="v143", head_owner="owner")
         lower = existing.pr_metadata(
             number=19483, pr_url="https://github.com/owner/repo/pull/19483",
             head_branch="v143", head_sha="b" * 40, base_sha="d" * 40,
-            mergeable="MERGEABLE",
+            mergeable="MERGEABLE", head_owner="owner",
         )
         detection = existing.native_stack_detection(members=[
             {**lower, "base_sha": "cached-old-base"},
@@ -311,8 +311,17 @@ class ConflictPipelineSweepTest(unittest.TestCase):
         }
         MODULE.save_state(self.path, state)
         self.calls["base_ref_tip"].side_effect = lambda repo, ref: (
-            "d" * 40 if ref == "main" else "b" * 40
+            {"main": "d" * 40, "v143": "b" * 40, "feature": "a" * 40}[ref]
         )
+        for name, options in {
+            "find_remote": {"return_value": "origin"},
+            "fetch_preflight_ref": {},
+            "external_stack_dependents": {"return_value": []},
+            "git": {"side_effect": lambda root, command, option, base, head: base},
+        }.items():
+            patch = mock.patch.object(MODULE, name, **options)
+            self.calls[name] = patch.start()
+            self.addCleanup(patch.stop)
         self.calls["live_mergeability"].side_effect = lambda target, **kw: copy.deepcopy(
             lower if target["number"] == 19483 else self.metadata
         )
