@@ -124,6 +124,9 @@ class GenericCiDiagnosisTest(unittest.TestCase):
             mock.patch.object(MODULE, "gh_json", side_effect=[
                 {"permissions": dict.fromkeys(("admin", "maintain", "push", "triage", "pull"), True)},
                 {"login": "viewer"},
+                [{"workflow_runs": [{**self.run, "event": "pull_request"}]}],
+                [{"workflow_runs": [{**self.run, "event": "pull_request"}]}],
+                [{"workflow_runs": [{**self.run, "event": "pull_request"}]}],
             ]),
             mock.patch.object(MODULE, "fetch_rollup", return_value=(self.pr["head_sha"], checks)),
             mock.patch.object(MODULE, "decide", return_value={

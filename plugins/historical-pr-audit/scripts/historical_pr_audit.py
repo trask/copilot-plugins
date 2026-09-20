@@ -2749,6 +2749,63 @@ def validate_audit_candidate(
     return remote, content, report
 
 
+def validate_candidate_result_identity(
+    result: dict[str, Any], *, helper: Path, metadata: dict[str, Any],
+    requested_model: str,
+) -> None:
+    runtime = load_candidate_runtime(helper)
+    options = runtime.Options(
+        report=False, model=requested_model, prompt="", apply_with_report=True,
+        allow_merged_pr=True, policy=AGENT_TASK_POLICY,
+    )
+    task = result.get("task")
+    attestation = result.get("attestation")
+    if (
+        result.get("schema") != CANDIDATE_RESULT_SCHEMA
+        or result.get("status") not in {"success", "error", "interrupted"}
+        or result.get("mode") != "code_candidate"
+        or result.get("requested_model") != requested_model
+        or result.get("policy") != runtime.policy_metadata(options)
+        or result.get("repository") != {"name_with_owner": metadata["repo_name"]}
+        or result.get("pull_request") != expected_result_pull_request(metadata)
+        or result.get("application") != {
+            "status": "not_applied", "final_local_head": metadata["head_sha"],
+        }
+        or not isinstance(attestation, dict)
+        or attestation.get("kind") != "dispatcher_candidate"
+        or type(attestation.get("structural_complete")) is not bool
+        or not isinstance(task, dict)
+        or set(task) != {"id", "url", "state", "base_ref", "base_sha"}
+    ):
+        raise WorkflowError("Agent Task candidate result has the wrong identity")
+    if task["id"] is None:
+        if (
+            result["status"] != "error"
+            or any(value is not None for value in task.values())
+            or result.get("generated") != {"branch": None, "head_sha": None, "commits": []}
+            or any(result.get(key) is not None for key in ("report", "candidate", "completion"))
+            or attestation["structural_complete"]
+        ):
+            raise WorkflowError("Agent Task candidate creation failure is malformed")
+    elif (
+        not isinstance(task["id"], str) or not task["id"]
+        or task["base_ref"] != metadata["head_sha"]
+        or task["base_sha"] != metadata["head_sha"]
+        or not isinstance(task["state"], str) or not task["state"]
+        or (task["url"] is not None and (
+            not isinstance(task["url"], str) or not task["url"]
+        ))
+    ):
+        raise WorkflowError("Agent Task candidate task identity is malformed")
+    if result["status"] != "success":
+        error = result.get("error")
+        if (
+            not isinstance(error, dict) or set(error) != {"code", "message"}
+            or any(not isinstance(error[key], str) or not error[key] for key in error)
+        ):
+            raise WorkflowError("Agent Task candidate failure has no diagnostic")
+
+
 def validate_success_result(
     result: dict[str, Any],
     *,
@@ -3646,106 +3703,47 @@ def command_agent_task(args: argparse.Namespace) -> None:
         "head": metadata["head_sha"].lower(),
         "status": "",
     }
-    prior_result_path: Path | None = None
-    prior_result: dict[str, Any] | None = None
-    reuse_success = False
-    if state["agent_task"]["status"] in {"failed", "running", "ready"}:
-        previous_value = state["agent_task"].get("result_file")
-        if state["agent_task"]["status"] in {"failed", "running"}:
-            if not isinstance(previous_value, str):
-                raise WorkflowError(
-                    "failed Agent Task state has no deterministic result file"
-                )
-            prior_result_path = Path(previous_value)
-            if not prior_result_path.is_file():
-                raise WorkflowError("prior Agent Task result file is missing")
-            prior_result = load_agent_task_result(prior_result_path)
-            if prior_result.get("status") == "success":
-                validate_success_result(
-                    prior_result,
-                    metadata=metadata,
-                    requested_model=requested_model,
-                )
-                reusable = True
-                reuse_success = True
-            else:
-                reusable = validate_recovery_result_identity(
-                    prior_result,
-                    metadata=metadata,
-                    requested_model=requested_model,
-                )
-            if reusable:
-                generated = prior_result["generated"]
-                allowed_heads = {metadata["head_sha"]}
-                if generated.get("commits"):
-                    allowed_heads.add(generated["commits"][-1])
-            else:
-                prior_result_path = None
-                prior_result = None
-                allowed_heads = {metadata["head_sha"]}
-        else:
-            allowed_heads = {metadata["head_sha"]}
     identity = local_identity(repo_root)
-    if (
-        identity["branch"] != expected_identity["branch"]
-        or identity["status"]
-        or identity["head"] not in allowed_heads
-    ):
+    if identity != expected_identity:
         raise WorkflowError(
-            "local audit branch is dirty or drifted from the recoverable task identity"
+            "local audit branch is dirty or drifted from the frozen source identity"
         )
 
-    if reuse_success:
-        assert prior_result_path is not None and prior_result is not None
-        result_path = prior_result_path
-        process = subprocess.CompletedProcess([], 0, "", "")
-        state["agent_task"]["status"] = "running"
-        save_state(state_path, state)
-    else:
-        attempt = int(state["agent_task"].get("attempt", 0)) + 1
-        result_path = agent_task_artifacts(state_path, attempt)["result"].resolve()
-        require_outside_repository(result_path, repo_root)
-        if result_path.exists():
-            raise WorkflowError(f"refusing to overwrite Agent Task result: {result_path}")
-        state["agent_task"].update(
-            {
-                "status": "running",
-                "attempt": attempt,
-                "result_file": str(result_path),
-                "prior_result_file": (
-                    str(prior_result_path) if prior_result_path is not None else None
-                ),
-                "started_at": utc_now(),
-            }
-        )
-        state["agent_task"].setdefault("result_files", []).append(str(result_path))
-        save_state(state_path, state)
+    result_path = artifacts["result"].resolve()
+    if result_path.exists():
+        raise WorkflowError(f"refusing to overwrite Agent Task result: {result_path}")
+    state["agent_task"].update(
+        {
+            "status": "running",
+            "attempt": 1,
+            "result_file": str(result_path),
+            "started_at": utc_now(),
+        }
+    )
+    state["agent_task"]["result_files"].append(str(result_path))
+    save_state(state_path, state)
 
-        try:
-            process = execute_managed_agent_task(
-                helper,
-                repo_root=repo_root,
-                metadata=metadata,
-                model_alias=args.model,
-                prompt_path=prompt_path.resolve(),
-                result_path=result_path,
-                prior_result_path=prior_result_path,
+    try:
+        process = execute_managed_agent_task(
+            helper,
+            repo_root=repo_root,
+            metadata=metadata,
+            model_alias=args.model,
+            prompt_path=prompt_path.resolve(),
+            result_path=result_path,
+        )
+    except BaseException as error:
+        failed = record_missing_agent_task_result(
+            state_path,
+            message=f"managed helper could not start: {error}",
+        )
+        if isinstance(error, WorkflowError):
+            error.details.setdefault("state", str(state_path))
+            error.details.setdefault(
+                "recovery_files",
+                [str(prompt_path), *(failed["agent_task"].get("result_files") or [])],
             )
-        except BaseException as error:
-            failed = record_missing_agent_task_result(
-                state_path,
-                message=f"managed helper could not start: {error}",
-            )
-            if isinstance(error, WorkflowError):
-                error.details.setdefault("state", str(state_path))
-                error.details.setdefault(
-                    "recovery_files",
-                    [
-                        str(prompt_path),
-                        *(failed["agent_task"].get("result_files") or []),
-                    ],
-                )
-            raise
+        raise
     if not result_path.is_file():
         message = (
             f"managed helper exited {process.returncode} without an atomic result file"
@@ -3762,21 +3760,9 @@ def command_agent_task(args: argparse.Namespace) -> None:
     result: dict[str, Any] | None = None
     try:
         result = load_agent_task_result(result_path)
-        if result.get("status") == "success":
-            validate_success_result(
-                result,
-                metadata=metadata,
-                requested_model=requested_model,
-            )
-            reusable = True
-        else:
-            reusable = validate_recovery_result_identity(
-                result,
-                metadata=metadata,
-                requested_model=requested_model,
-            )
-        if prior_result is not None:
-            require_same_agent_task(prior_result, result)
+        validate_candidate_result_identity(
+            result, helper=helper, metadata=metadata, requested_model=requested_model,
+        )
     except BaseException as error:
         failed = load_state(state_path)
         if result is not None:
@@ -3795,9 +3781,9 @@ def command_agent_task(args: argparse.Namespace) -> None:
     assert result is not None
     state = load_state(state_path)
     preserve_agent_task_result(state, result, result_path=result_path)
-    state["agent_task"]["reusable_task"] = reusable
+    state["agent_task"]["reusable_task"] = False
     state["agent_task"]["task_id_status"] = (
-        "known" if reusable else "not_created"
+        "known" if result["task"]["id"] is not None else "not_created"
     )
     save_state(state_path, state)
     if process.returncode != 0 or result.get("status") != "success":

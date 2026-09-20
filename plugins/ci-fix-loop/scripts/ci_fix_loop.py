@@ -27,7 +27,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Iterable, Iterator, Mapping
+from types import ModuleType
+from typing import Any, Callable, Iterable, Iterator, Mapping
 import urllib.parse
 import uuid
 
@@ -303,6 +304,8 @@ LOCAL_TRIAGE_RESULT_SCHEMA = {
     "version": 1,
 }
 MAX_TRIAGE_SUMMARY_BYTES = 64 * 1024
+AGENT_TASK_PROMPT_MAX_CHARACTERS = 28000
+AGENT_TASK_PROMPT_MAX_UTF8_BYTES = 28000
 TRIAGE_SUMMARY_BOUNDARIES = (
     "----- BEGIN LOCAL CI TRIAGE SUMMARY -----",
     "----- END LOCAL CI TRIAGE SUMMARY -----",
@@ -6942,7 +6945,9 @@ def agent_task_preflight(
         and not decision.get("pending_checks")
         else []
     )
-    workflow_runs = ci_failed_runs(pr, checks if failing_keys else [])
+    workflow_runs = ci_snapshot_runs(pr, checks)
+    if failing_keys:
+        require_diagnosable_ci_runs(checks, workflow_runs, set(failing_keys))
     baseline = baseline_conclusions(pr, pr["base_sha"]) if failing_keys else {}
     by_key = {check["key"]: check for check in checks}
     rollup = check_rollup_identity(checks)
@@ -7017,7 +7022,7 @@ def agent_task_preflight(
                     "log_path": str(log_path) if log_path is not None else None,
                 }
             )
-        if ci_failed_runs(pr, checks if failing_keys else []) != workflow_runs:
+        if ci_snapshot_runs(pr, checks) != workflow_runs:
             raise WorkflowError(
                 "CI attempt changed during failed-check preflight",
                 details={"reason": "ci_observation_changed"},
@@ -7549,7 +7554,25 @@ def validate_retained_local_triage(
     return summary
 
 
-def controller_ci_evidence(preflight: dict[str, Any]) -> str:
+def load_candidate_runtime(helper: Path) -> ModuleType:
+    source = helper.read_bytes()
+    if hashlib.sha256(source).hexdigest() != REQUIRED_CLOUD_TASK_SHA256:
+        raise WorkflowError("Agent Tasks runtime source digest changed")
+    name = "_ci_fix_candidate_runtime"
+    runtime = ModuleType(name)
+    runtime.__file__ = str(helper)
+    sys.modules[name] = runtime
+    try:
+        exec(compile(source, str(helper), "exec"), runtime.__dict__)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return runtime
+
+
+def controller_ci_evidence(
+    preflight: dict[str, Any], *, prompt_fits: Callable[[str], bool] | None = None,
+) -> str:
     snapshot = preflight["check_snapshot"]
     records = []
     for failure in snapshot["failures"]:
@@ -7579,9 +7602,14 @@ def controller_ci_evidence(preflight: dict[str, Any]) -> str:
     def render():
         return json.dumps({"logs": records}, ensure_ascii=False, sort_keys=True)
 
+    def fits(evidence):
+        return len(evidence.encode("utf-8")) <= MAX_TRIAGE_SUMMARY_BYTES and (
+            prompt_fits is None or prompt_fits(evidence)
+        )
+
     # Full logs that do not fit are retrieved by immutable job/attempt identity.
     for record in sorted(records, key=lambda item: item["utf8_bytes"], reverse=True):
-        if len(render().encode("utf-8")) <= MAX_TRIAGE_SUMMARY_BYTES:
+        if fits(render()):
             break
         if (
             not isinstance(record["run"], dict)
@@ -7596,10 +7624,43 @@ def controller_ci_evidence(preflight: dict[str, Any]) -> str:
         record["retrieve_full_log"] = True
         record["omitted_utf8_bytes"] = record["utf8_bytes"]
     evidence = render()
-    if len(evidence.encode("utf-8")) > MAX_TRIAGE_SUMMARY_BYTES:
+    if not fits(evidence):
         raise WorkflowError("failed-check evidence identities exceed the inline limit")
     require_no_credentials(evidence, source="hosted CI evidence")
     return evidence
+
+
+def bounded_worker_prompt(
+    preflight: dict[str, Any], *, helper: Path, iteration_allowance: int,
+    prior_history: list[dict[str, Any]], requested_model: str,
+) -> tuple[str, str]:
+    runtime = load_candidate_runtime(helper)
+    source = expected_cloud_pull_request(preflight)
+    snapshot = runtime.PullRequestSnapshot(
+        **source, state="OPEN",
+        cross_repository=source["head_repository"] != source["base_repository"],
+    )
+
+    def worker_prompt(evidence: str) -> str:
+        return build_worker_prompt(
+            preflight, iteration_allowance=iteration_allowance,
+            prior_history=prior_history, requested_model=requested_model,
+            ci_evidence=evidence,
+        )
+
+    def fits(evidence: str) -> bool:
+        options = runtime.Options(
+            report=False, apply_with_report=True, model=requested_model,
+            policy=AGENT_TASK_POLICY, prompt=worker_prompt(evidence),
+        )
+        submitted = runtime.task_payload(options, runtime.OUTPUT_REPORT_PATH, snapshot)["prompt"]
+        return (
+            len(submitted) <= AGENT_TASK_PROMPT_MAX_CHARACTERS
+            and len(submitted.encode("utf-8")) <= AGENT_TASK_PROMPT_MAX_UTF8_BYTES
+        )
+
+    evidence = controller_ci_evidence(preflight, prompt_fits=fits)
+    return worker_prompt(evidence), evidence
 
 
 def build_worker_prompt(
@@ -9459,6 +9520,35 @@ def ci_warning_snapshot_sha256(
     })
 
 
+def require_diagnosable_ci_runs(
+    checks: list[dict[str, Any]], runs: dict[str, Any], failure_keys: set[str],
+) -> None:
+    observed_failures = {
+        str(check["workflow_run_id"])
+        for check in checks
+        if check.get("class") == "failed" and check.get("key") in failure_keys
+        and type(check.get("workflow_run_id")) is int
+    }
+    changed_failure = any(
+        str(check["workflow_run_id"]) not in runs
+        or runs[str(check["workflow_run_id"])]["name"] != check.get("workflow")
+        for check in checks
+        if check.get("class") == "failed" and type(check.get("workflow_run_id")) is int
+    )
+    if changed_failure or any(
+        run["status"] != "completed"
+        or (
+            run["conclusion"] not in {"success", "neutral", "skipped"}
+            and run_id not in observed_failures
+        )
+        for run_id, run in runs.items()
+    ):
+        raise WorkflowError(
+            "CI workflow evidence is pending or contains an unobserved failure",
+            details={"reason": "ci_observation_changed"},
+        )
+
+
 def verify_ci_warning_snapshot(state: dict[str, Any]) -> dict[str, Any]:
     expected = state.get("warning_snapshot_sha256")
     if not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
@@ -9854,9 +9944,9 @@ def require_live_check_snapshot(preflight: dict[str, Any]) -> None:
     digest = sha256_text(json.dumps(rollup, separators=(",", ":"), sort_keys=True))
     if head.lower() != preflight["pr"]["head_sha"]:
         raise WorkflowError("live failing-check snapshot changed before publication")
-    if digest != snapshot["rollup_sha256"] or (
-        "workflow_runs" in snapshot
-        and ci_failed_runs(preflight["pr"], checks) != snapshot["workflow_runs"]
+    if (
+        digest != snapshot["rollup_sha256"]
+        or ci_snapshot_runs(preflight["pr"], checks) != snapshot.get("workflow_runs")
     ):
         raise WorkflowError(
             "live failing-check snapshot changed before publication",
@@ -13214,18 +13304,32 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "budget_run_charge_key": None if scope is None else scope["_run_charge_key"],
         }
         if decision["decision"] in {"green", "no_checks"}:
-            runs = ci_snapshot_runs(pr, snapshot["rollup"])
-            if any(
-                run["status"] != "completed" or run["conclusion"] not in {"success", "neutral", "skipped"}
-                for run in runs.values()
+            require_live_pr_snapshot(pr, metadata_for(target), expected_head=pr["head_sha"])
+            live_head, live_checks = fetch_rollup(pr)
+            live_decision = decide(
+                live_checks, now=dt.datetime.now(dt.timezone.utc),
+                tracking={}, deadline_expired=True,
+            )
+            runs = ci_snapshot_runs(pr, live_checks)
+            if (
+                live_head.lower() != pr["head_sha"]
+                or live_decision["decision"] not in {"green", "no_checks"}
+                or any(
+                    run["status"] != "completed"
+                    or run["conclusion"] not in {"success", "neutral", "skipped"}
+                    for run in runs.values()
+                )
             ):
                 raise WorkflowError(
                     "CI workflow attempt changed before clearance",
                     details={"reason": "ci_observation_changed"},
                 )
+            decision = live_decision
+            state["run"]["checks"] = check_rollup_identity(live_checks)
+            state["run"]["decision"] = decision
             record_terminal_outcome(state, state["run"], decision["decision"])
             state["green_snapshot_sha256"] = ci_warning_snapshot_sha256(
-                pr, snapshot["rollup"], runs
+                pr, live_checks, runs
             )
             save_state(state_path, state)
             emit(
@@ -13349,15 +13453,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
     pr = preflight["pr"]
     task_state = state["agent_task"]
     recovery = None
-    try:
-        ci_evidence = controller_ci_evidence(preflight)
-    except WorkflowError as error:
-        task_state.update(
-            status="failed", task_id_status="not_created", error=str(error), failed_at=utc_now(),
-        )
-        save_state(state_path, state)
-        raise
-    task_state["evidence_sha256"] = sha256_text(ci_evidence)
     if args.resume and resume_identity is not None:
         try:
             helper = discover_cloud_task()
@@ -13451,16 +13546,16 @@ def command_agent_task(args: argparse.Namespace) -> None:
             raise
     elif not result_path.is_file():
         try:
-            if ci_evidence is None:
-                raise WorkflowError("controller CI evidence is missing")
+            task_state["phase"] = "controller_evidence"
+            save_state(state_path, state)
             helper = discover_cloud_task()
-            prompt = build_worker_prompt(
-                preflight,
+            prompt, ci_evidence = bounded_worker_prompt(
+                preflight, helper=helper,
                 iteration_allowance=iteration_allowance,
                 prior_history=state.get("history") or [],
                 requested_model=requested_model,
-                ci_evidence=ci_evidence,
             )
+            task_state["evidence_sha256"] = sha256_text(ci_evidence)
             require_no_credentials(prompt, source="Agent Task prompt")
             atomic_write_text(prompt_path, prompt)
             command = [
@@ -13514,7 +13609,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 )
                 if path.exists()
             ]
-            if task_state.get("phase") == "local_triage":
+            if task_state.get("phase") == "controller_evidence":
                 task_state["task_id_status"] = "not_created"
                 task_state.pop("recovery_command", None)
             else:
@@ -14074,12 +14169,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     **item,
                 } for item in diagnoses)
                 if report["outcome"] == "warning":
-                    warning_runs = ci_snapshot_runs(pr, snapshot["rollup"])
-                    if any(run["status"] != "completed" for run in warning_runs.values()):
-                        raise WorkflowError(
-                            "CI workflow attempt changed before warning clearance",
-                            details={"reason": "ci_observation_changed"},
-                        )
+                    require_live_check_snapshot(preflight)
+                    warning_runs = snapshot["workflow_runs"]
+                    require_diagnosable_ci_runs(
+                        snapshot["rollup"], warning_runs,
+                        {item["check_key"] for item in diagnoses},
+                    )
                     state["outcome"] = "warning"
                     state["clean_at_head_sha"] = None
                     state["clean_at_base_sha"] = None

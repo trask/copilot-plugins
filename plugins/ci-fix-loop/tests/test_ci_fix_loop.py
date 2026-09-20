@@ -4094,6 +4094,16 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.head = "1" * 40
         self.base = "2" * 40
         self.artifact = "3" * 40
+        helper = (
+            SCRIPT.parents[2] / "agent-tasks-runtime" / "skills"
+            / "agent-tasks-runtime" / "scripts" / "cloud_task.py"
+        )
+        self.runtime = MODULE.load_candidate_runtime(helper)
+        runtime_loader = mock.patch.object(
+            MODULE, "load_candidate_runtime", return_value=self.runtime,
+        )
+        runtime_loader.start()
+        self.addCleanup(runtime_loader.stop)
         failure = {
             "key": "check:CI/test",
             "kind": "check_run",
@@ -4124,6 +4134,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 "detail": "test failed",
             },
             "failures": [failure],
+            "workflow_runs": {},
         }
         snapshot["sha256"] = MODULE.check_snapshot_sha256(snapshot)
         self.preflight = {
@@ -7819,7 +7830,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         ):
             MODULE.command_agent_task(arguments)
 
-        discover.assert_not_called()
+        discover.assert_called_once()
+        self.hosted_helper_mock.assert_not_called()
         self.triage_worker_mock.assert_not_called()
         state = MODULE.load_state(state_path)
         self.assertEqual("failed", state["agent_task"]["status"])
@@ -8508,6 +8520,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                                 ("admin", "maintain", "push", "triage", "pull"), True
                             )},
                             {"login": "viewer"},
+                            [{"workflow_runs": []}],
+                            [{"workflow_runs": []}],
                         ],
                     ),
                     mock.patch.object(
@@ -8959,7 +8973,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(MODULE, "require_fork_head"),
             mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
             mock.patch.object(
-                MODULE, "gh_json", side_effect=[repository, {"login": "viewer"}]
+                MODULE, "gh_json", side_effect=[
+                    repository, {"login": "viewer"}, [{"workflow_runs": []}],
+                ]
             ),
             mock.patch.object(
                 MODULE,
@@ -16589,6 +16605,7 @@ class CandidateContractTest(unittest.TestCase):
         self.preflight["check_snapshot"]["rollup_sha256"] = MODULE.sha256_text(
             json.dumps(rollup, separators=(",", ":"), sort_keys=True)
         )
+        self.preflight["check_snapshot"]["workflow_runs"] = {}
         with (
             mock.patch.object(
                 MODULE, "fetch_rollup", return_value=("9" * 40, checks)
@@ -16596,8 +16613,9 @@ class CandidateContractTest(unittest.TestCase):
             self.assertRaisesRegex(MODULE.WorkflowError, "snapshot changed"),
         ):
             MODULE.require_live_check_snapshot(self.preflight)
-        with mock.patch.object(
-            MODULE, "fetch_rollup", return_value=(self.head, checks)
+        with (
+            mock.patch.object(MODULE, "fetch_rollup", return_value=(self.head, checks)),
+            mock.patch.object(MODULE, "gh_json", return_value=[{"workflow_runs": []}]),
         ):
             MODULE.require_live_check_snapshot(self.preflight)
 
