@@ -14384,6 +14384,7 @@ def record_coordinator_identity(
             "base_sha": pr["base_sha"],
             "detail": "reading the current-head CI check set",
             "observed_at": utc_now(),
+            "check_snapshot": None,
         }
     )
     state["preflight_identity"] = identity
@@ -14398,6 +14399,7 @@ def update_coordinator_state(
     snapshot_sha256: str | None = None,
     stable_polls: int | None = None,
     detail: str | None = None,
+    check_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     state = coordinator_file_state(path)
     coordinator = state.setdefault("coordinator", {})
@@ -14411,6 +14413,9 @@ def update_coordinator_state(
         coordinator["stable_polls"] = stable_polls
     if detail is not None:
         coordinator["detail"] = detail
+    if check_snapshot is not None:
+        coordinator["check_snapshot"] = copy.deepcopy(check_snapshot)
+        coordinator["base_sha"] = check_snapshot["base_sha"]
     save_state(path, state)
     return state
 
@@ -14557,6 +14562,7 @@ def wait_for_stable_ci_preflight(
             snapshot_sha256=identity,
             stable_polls=stable_polls,
             detail=decision["detail"],
+            check_snapshot=snapshot,
         )
         if candidate and stable_polls >= required_stability:
             if float(args.debounce_seconds) > 0:
@@ -14596,6 +14602,16 @@ def wait_for_stable_ci_preflight(
                     stable_identity = None
                     stable_polls = 0
                     attempt = 0
+                    changed_snapshot = confirmation["check_snapshot"]
+                    update_coordinator_state(
+                        state_path,
+                        status="waiting_for_checks",
+                        head_sha=changed_snapshot["head_sha"],
+                        snapshot_sha256=changed_snapshot["sha256"],
+                        stable_polls=0,
+                        detail=changed_snapshot["decision"]["detail"],
+                        check_snapshot=changed_snapshot,
+                    )
                     continue
                 cleanup_superseded_preflight_logs(
                     state_path,
@@ -14610,6 +14626,7 @@ def wait_for_stable_ci_preflight(
                 snapshot_sha256=identity,
                 stable_polls=stable_polls,
                 detail=decision["detail"],
+                check_snapshot=preflight["check_snapshot"],
             )
             return preflight
         time.sleep(coordinator_delay(args, attempt))
@@ -14640,6 +14657,7 @@ def record_processed_ci_snapshot(
             }
         )
     coordinator.pop("pending_rerun", None)
+    coordinator["check_snapshot"] = None
     coordinator["status"] = "waiting_for_checks"
     coordinator["observed_at"] = utc_now()
     save_state(state_path, state)
@@ -14697,22 +14715,53 @@ def record_completed_ci_rerun(state_path: Path, check: str) -> None:
     save_state(state_path, state)
 
 
+def coordinator_failure_context(state: dict[str, Any]) -> dict[str, Any]:
+    coordinator = state.get("coordinator") or {}
+    pr = state.get("pr") or {}
+    run_state = state.get("run") or {}
+    identity = coordinator if coordinator.get("head_sha") else pr
+    snapshot = coordinator.get("check_snapshot")
+    observed = (
+        isinstance(snapshot, dict)
+        and snapshot.get("head_sha") == identity.get("head_sha")
+        and snapshot.get("base_sha") == identity.get("base_sha")
+        and (not pr or (
+            snapshot.get("head_sha") == pr.get("head_sha")
+            and snapshot.get("base_sha") == pr.get("base_sha")
+        ))
+        and isinstance(snapshot.get("observed_at"), str)
+        and isinstance(snapshot.get("rollup"), list)
+        and isinstance(snapshot.get("decision"), dict)
+        and isinstance(snapshot["decision"].get("checks"), list)
+        and snapshot.get("sha256") == coordinator.get("snapshot_sha256")
+        and snapshot.get("sha256") == check_snapshot_sha256(snapshot)
+    )
+    decision = snapshot["decision"] if observed else {}
+    return {
+        "head_sha": identity.get("head_sha"),
+        "base_sha": identity.get("base_sha"),
+        "checks": copy.deepcopy(decision.get("checks", [])),
+        "pending_checks": copy.deepcopy(decision.get("pending_checks", [])),
+        "aggregate_checks": copy.deepcopy(decision.get("aggregate_checks", [])),
+        "check_context": "last_observed" if observed else "unavailable",
+        "check_snapshot": copy.deepcopy(snapshot) if observed else None,
+        "frozen_run": {
+            key: copy.deepcopy(run_state.get(key))
+            for key in ("id", "head_sha", "base_sha", "published_head_sha", "decision")
+        } if run_state else None,
+    }
+
+
 def record_coordinator_failure(state_path: Path, error: WorkflowError) -> None:
     state = coordinator_file_state(state_path)
-    run_state = state.get("run") or {}
-    decision = run_state.get("decision") or {}
     reason = error.details.get("reason")
     if reason not in ESCALATION_ACTIONS:
         reason = "coordinator_error"
     state["escalation"] = {
         "reason": reason,
         "detail": str(error),
-        "checks": list(decision.get("checks") or []),
+        **coordinator_failure_context(state),
         "next_action": ESCALATION_ACTIONS[reason],
-        "head_sha": (
-            run_state.get("head_sha")
-            or (state.get("coordinator") or {}).get("head_sha")
-        ),
         "recorded_at": utc_now(),
     }
     coordinator = state.setdefault("coordinator", {})

@@ -298,6 +298,64 @@ class TerminalReportingTest(unittest.TestCase):
         self.assertNotIn("ci_warnings", final)
         self.assertNotIn("all_ci_passed", final)
 
+    def test_ci_timeout_keeps_observed_and_frozen_context_separate(self):
+        old_head = "d" * 40
+        escalation = {
+            "reason": "timeout", "detail": "timed out waiting for stable terminal CI",
+            "head_sha": HEAD, "base_sha": BASE, "check_context": "last_observed",
+            "checks": ["check:CI/test"], "pending_checks": ["check:CI/running"],
+            "aggregate_checks": ["check:CI/aggregate"],
+            "check_snapshot": {
+                "head_sha": HEAD, "observed_at": "2026-09-20T07:48:00Z",
+                "sha256": "e" * 64, "decision": {"decision": "failures"},
+                "workflow_runs": {"42": {"run_attempt": 2, "status": "in_progress"}},
+            },
+            "frozen_run": {
+                "head_sha": old_head, "published_head_sha": HEAD,
+                "decision": {"decision": "failures", "checks": ["check:CI/spotless"]},
+            },
+        }
+        for context in ("last_observed", "unavailable"):
+            with self.subTest(context=context), mock.patch.object(
+                MODULE, "copilot_home", return_value=self.root / context,
+            ):
+                self.path = MODULE.run_result_path(self.target, RUN_ID)
+                diagnostic = copy.deepcopy(escalation)
+                if context == "unavailable":
+                    diagnostic.update({
+                        "check_context": context, "check_snapshot": None,
+                        "checks": [], "pending_checks": [], "aggregate_checks": [],
+                    })
+                status = MODULE.common.stage_status_summary({
+                    "escalation": diagnostic, "outcome": None,
+                    "coordinator": {"head_sha": HEAD, "status": "blocked"},
+                    "run": {"head_sha": old_head, "status": "published"},
+                })
+                original = observed_clean_result()
+                original.update({
+                    "result": "blocked", "reason": "stage_execution_failed",
+                    "detail": "ci-fix-loop exited with code 1", "stage": MODULE.STAGE_CI,
+                    "stage_result": {
+                        "stage": MODULE.STAGE_CI, "clear": False, "outcome": "escalated",
+                        "status": status,
+                    },
+                })
+                original["stages"][3] = original["stage_result"]
+                final = self.watch(original)["final_event"]
+                self.assertEqual("blocked", final["result"])
+                self.assertFalse(final["stage_result"]["clear"])
+                preview = final["stage_result"]["status"]["escalation"]
+                for field in (
+                    "head_sha", "base_sha", "check_context", "checks",
+                    "pending_checks", "aggregate_checks",
+                ):
+                    self.assertEqual(diagnostic[field], preview[field])
+                self.assertEqual(old_head, preview["frozen_run"]["head_sha"])
+                self.assertTrue(final["stage_result_details_truncated"])
+                saved = json.loads(self.path.read_bytes())
+                self.assertEqual(diagnostic, saved["stage_result"]["status"]["escalation"])
+                self.assertNotIn("all_ci_passed", final)
+
     def test_many_long_warning_check_and_commit_details_have_explicit_flags(self):
         original = observed_clean_result()
         long_text = "\u96ea\U0001f680" * 2000
