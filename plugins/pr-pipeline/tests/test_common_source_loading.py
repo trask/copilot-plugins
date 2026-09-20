@@ -19,7 +19,7 @@ class CommonSourceLoadingTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name) / "installed-plugins" / "trask-plugins" / "pr-pipeline" / "scripts"
+        self.root = Path(temporary.name).resolve() / "installed-plugins" / "trask-plugins" / "pr-pipeline" / "scripts"
         self.root.mkdir(parents=True)
         self.path = self.root / "pipeline_common.py"
         self.source = (SCRIPTS / "pipeline_common.py").read_bytes()
