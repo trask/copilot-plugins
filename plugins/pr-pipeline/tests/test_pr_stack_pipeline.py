@@ -868,7 +868,30 @@ class StackRunTest(StackFixture):
         self.clear_everything()
         self.clear.remove((11, MODULE.STAGE_CONFLICT))
         self.completed.add((11, MODULE.STAGE_CONFLICT))
-        pipeline = self.pipeline(kickoff([11]))
+        def inspect(entry, *args):
+            result = self.inspect(entry, *args)
+            if entry["stage"] == MODULE.STAGE_DESCRIPTION:
+                result["status"] = {
+                    "run_id": "description-1",
+                    "pipeline_run": "run-1",
+                    "pipeline_iteration": 1,
+                    "pipeline_max_iterations": 2,
+                    "clearance_verification": {
+                        "result": "current",
+                        "reason": "description_snapshot_current",
+                        "expected_snapshot_sha256": "a" * 64,
+                        "observed_snapshot_sha256": "a" * 64,
+                    },
+                    "agent_task": {
+                        "status": "completed",
+                        "task": {"id": "task-1", "state": "completed"},
+                        "model": "gpt-5.6-sol",
+                        "github_mutation_policy": "allow",
+                    },
+                }
+            return result
+
+        pipeline = self.pipeline(kickoff([11]), inspect=inspect)
 
         result = pipeline.execute()
 

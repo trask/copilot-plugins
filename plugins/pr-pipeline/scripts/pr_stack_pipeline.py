@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "a85f248ecc94ba9ae5f5129186f5f8842f6d596d6785b0d045b0e44ec907b6cc"
+COMMON_SHA256 = "6aa03b8cd2254faf27722f25b99a56e457f034f01ffcf7668cb43b88e39719ff"
 
 
 def load_common() -> Any:
@@ -180,6 +180,9 @@ def stage_result_summary(stage_result: dict[str, Any]) -> dict[str, Any]:
             "clear_at_base_sha": stage_result.get("clear_at_base_sha"),
             "clearance_kind": stage_result.get("clearance_kind"),
             "warning_verification": stage_result.get("warning_verification"),
+            "clearance_verification": (status or {}).get("clearance_verification"),
+            "run_id": (status or {}).get("run_id"),
+            "pipeline_run": (status or {}).get("pipeline_run"),
             **common.ci_warning_fields([stage_result]),
             "outcome": stage_result.get("outcome"),
             "reason": stage_result.get("reason"),
@@ -521,6 +524,21 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
             "waiting": True,
             "wait_reason": "starting workers and checking GitHub state",
         }
+        if payload.get("phase") == STAGE_DESCRIPTION and "reused" in payload:
+            dispatch_numbers = payload.get("dispatch_numbers") or []
+            update = {
+                "message": (
+                    f"{prefix}{label}: reusing clearance for "
+                    f"{format_pull_requests(payload['reused'])}; starting workers for "
+                    f"{format_pull_requests(dispatch_numbers)}."
+                ),
+                "next_action": (
+                    "Create, verify, and start the required worker processes."
+                    if dispatch_numbers else "Collect the phase outcome without new workers."
+                ),
+                "waiting": bool(dispatch_numbers),
+                "wait_reason": "starting Description workers" if dispatch_numbers else None,
+            }
     elif event == "worker_starting":
         update = {
             "message": f"{prefix}{label} worker starting for #{number}.",
@@ -700,6 +718,11 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
             next_action = "Continue with the next stage; not all CI passed."
         elif clear:
             outcome = "complete"
+            if payload.get("reused"):
+                outcome += (
+                    f"; reused current Description clearance for "
+                    f"{format_pull_requests(payload['reused'])}"
+                )
             next_action = "Revalidate the stack, then start the next stage."
         else:
             outcome = "results collected; current clearance was not verified"
@@ -2565,23 +2588,113 @@ class StackPipeline:
     def run_parallel_phase(
         self, phase: str, pass_number: int, selected: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        """Start one worker per selected pull request, then let them run together.
+        """Run selected members, reusing verified same-run Description clearance.
 
         Startup stays serialized, so exactly one worktree and one process are
         created and verified at a time. Once every worker is active they work
         concurrently.
         """
-        requests = [
-            self.request_for(member, phase, pass_number) for member in selected
-        ]
+        requests = []
+        reused = []
+        stopped = None
+        for member in selected:
+            previous = (
+                self.state.get("pull_requests", {})
+                .get(str(member["number"]), {})
+                .get("stages", {})
+                .get(phase, {})
+            )
+            if (
+                phase == STAGE_DESCRIPTION
+                and previous.get("dispatched_head_sha") == member["head_sha"]
+                and (previous.get("clear") or previous.get("outcome") == "cleared")
+            ):
+                base_sha = self.base_sha_for(member)
+                current = self.clearance(
+                    member["number"], phase, member["head_sha"], base_sha
+                )
+                status = current.get("status") or {}
+                task = status.get("agent_task") or {}
+                prior_result = previous.get("stage_result") or {}
+                prior_pass = previous.get("pass")
+                if (
+                    self.state.get("run_id") == self.run_id
+                    and previous.get("accepted") is True
+                    and previous.get("returncode") == 0
+                    and previous.get("clear") is True
+                    and previous.get("outcome") == "cleared"
+                    and type(prior_pass) is int
+                    and 1 <= prior_pass < pass_number
+                    and previous.get("current_head_sha") == member["head_sha"]
+                    and base_sha is not None
+                    and previous.get("current_base_sha") == base_sha
+                    and current.get("clear") is True
+                    and current.get("outcome") == "cleared"
+                    and common.current_description_verification(status, self.run_id)
+                    and type(status.get("pipeline_iteration")) is int
+                    and status.get("pipeline_iteration") == prior_pass
+                    and type(status.get("pipeline_max_iterations")) is int
+                    and status.get("pipeline_max_iterations") == MAX_PASSES
+                    and isinstance(status.get("run_id"), str)
+                    and bool(status["run_id"])
+                    and status["run_id"] == prior_result.get("run_id")
+                    and prior_result.get("pipeline_run") == self.run_id
+                    and task == prior_result.get("agent_task")
+                    and task.get("model") == self.models[phase]
+                    and task.get("github_mutation_policy") == self.github_mutation_policy
+                ):
+                    reuse = {
+                        "number": member["number"],
+                        "source_pass": prior_pass,
+                        "head_sha": member["head_sha"],
+                        "base_sha": base_sha,
+                        "stage_result": stage_result_summary(current),
+                    }
+                    reused.append(reuse)
+                    self.record_stage(
+                        member["number"],
+                        phase,
+                        {
+                            **previous,
+                            "reused_in_pass": pass_number,
+                            "stage_result": reuse["stage_result"],
+                        },
+                    )
+                    continue
+                stopped = {
+                    "step": "stage_status",
+                    "number": member["number"],
+                    "stage": phase,
+                    "reason": "description_clearance_not_reusable",
+                    "detail": (
+                        "same-head Description clearance could not be verified for "
+                        "this run and its current inputs; no repeat evaluation was launched"
+                    ),
+                    "stage_result": stage_result_summary(current),
+                }
+                break
+            requests.append(self.request_for(member, phase, pass_number))
         self.emit(
             "phase_started",
             phase=phase,
             pull_request_pass=pass_number,
-            numbers=[request["number"] for request in requests],
+            numbers=[member["number"] for member in selected],
             mode=PHASE_PARALLEL,
+            **(
+                {
+                    "reused": [item["number"] for item in reused],
+                    "dispatch_numbers": (
+                        [] if stopped else [request["number"] for request in requests]
+                    ),
+                }
+                if phase == STAGE_DESCRIPTION else {}
+            ),
         )
-        launched = self.dispatch(requests, phase, pass_number)
+        launched = (
+            {"workers": [], "stopped": stopped}
+            if stopped
+            else self.dispatch(requests, phase, pass_number)
+        )
         by_number = {request["number"]: request for request in requests}
         completions = self.collect_parallel_workers(launched["workers"], by_number)
         for completion in completions:
@@ -2622,6 +2735,7 @@ class StackPipeline:
             "dispatches": len(launched["workers"]),
             "completions": completions,
             "stopped": stopped,
+            **({"reused": reused} if phase == STAGE_DESCRIPTION else {}),
         }
         self.emit(
             "phase_finished",
@@ -3660,6 +3774,7 @@ class StackPipeline:
 
 def summarize_phase(phase: dict[str, Any]) -> dict[str, Any]:
     completions = phase.get("completions", [])
+    reused = phase.get("reused", [])
     accepted = [
         completion["number"]
         for completion in completions
@@ -3686,7 +3801,8 @@ def summarize_phase(phase: dict[str, Any]) -> dict[str, Any]:
         "clear": (
             phase["clear"]
             if isinstance(phase.get("clear"), bool)
-            else bool(accepted)
+            else not phase.get("stopped")
+            and bool(accepted or reused)
             and len(accepted) == len(completions)
             and all(
                 completion.get("returncode") == 0
@@ -3695,6 +3811,8 @@ def summarize_phase(phase: dict[str, Any]) -> dict[str, Any]:
             )
         ),
     }
+    if "reused" in phase:
+        summary["reused"] = [item["number"] for item in reused]
     if reasons:
         summary["reasons"] = reasons
     if phase.get("blocked") is not None:
@@ -3815,6 +3933,13 @@ def compact_terminal_result(
                     "mode": phase.get("mode"),
                     "dispatches": phase.get("dispatches"),
                     "accepted": limited(phase.get("accepted")),
+                    "reused": limited(phase.get("reused")),
+                    "reused_omitted": (
+                        len(phase["reused"]) - TERMINAL_RESULT_MAX_PULL_REQUESTS
+                        if isinstance(phase.get("reused"), list)
+                        and len(phase["reused"]) > TERMINAL_RESULT_MAX_PULL_REQUESTS
+                        else None
+                    ),
                     "ignored": limited(phase.get("ignored")),
                     "clear": phase.get("clear"),
                     "all_ci_passed": phase.get("all_ci_passed"),

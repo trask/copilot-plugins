@@ -1116,6 +1116,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
         def validated_no_change(path, state, **kwargs):
             state["validated_head_sha"] = self.preflight["pr"]["head_sha"]
+            state["validation"] = {
+                "mode": "no_change",
+                "run_id": state["run_id"],
+                **{key: state["pr"][key] for key in ("head_sha", "title", "body")},
+            }
             MODULE.save_state(path, state)
             return {
                 "result": "validated",
@@ -1205,7 +1210,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.67")
+        self.assertEqual(plugin["version"], "1.0.68")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -3621,6 +3626,58 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         ])
         self.assertIsNone(emitted[-1]["validated_head_sha"])
         update.assert_not_called()
+
+    def test_same_head_keep_still_rejects_before_state_write_or_second_dispatch(self):
+        report = self.proposal_report()
+        patches, _, _ = self.command_patches(
+            self.result(report), report, self.receipt()
+        )
+        args = self.pipeline_arguments()
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            MODULE.command_pipeline(args)
+            before = Path(args.state).read_bytes()
+            args.pipeline_iteration = 2
+            with self.assertRaisesRegex(MODULE.WorkflowError, "already evaluated at this head"):
+                MODULE.command_pipeline(args)
+        self.assertEqual(before, Path(args.state).read_bytes())
+        self.assertEqual(1, len(self.helper_commands))
+
+    def test_applied_pipeline_captures_final_literal_metadata_not_original_inputs(self):
+        title = "Describe `literal` examples"
+        body = "Use `List<T>` and &amp; unchanged.\n\n"
+        report = self.proposal_report(decision="replace", title=title, body=body)
+        patches, _, _ = self.command_patches(
+            self.result(report), report, self.receipt()
+        )
+        args = self.pipeline_arguments()
+        args.github_mutation_policy = "allow"
+        live = copy.deepcopy(self.preflight)
+
+        def update(_path, _state, proposal):
+            live["pr"].update(title=proposal["title"], body=proposal["body"])
+
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                if patcher.attribute not in {"metadata_for", "agent_task_preflight"}:
+                    stack.enter_context(patcher)
+            stack.enter_context(mock.patch.object(
+                MODULE, "agent_task_preflight", side_effect=lambda *_: copy.deepcopy(live)
+            ))
+            stack.enter_context(mock.patch.object(
+                MODULE, "metadata_for", side_effect=lambda *_: copy.deepcopy(live["pr"])
+            ))
+            publish = stack.enter_context(mock.patch.object(MODULE, "update_pr", side_effect=update))
+            MODULE.command_pipeline(args)
+            state = MODULE.load_run_state(Path(args.state))
+            self.assertEqual("current", MODULE.verify_clearance_snapshot(state)["result"])
+        publish.assert_called_once()
+        snapshot = state["validation"]["clearance_snapshot"]
+        self.assertEqual(title, snapshot["title"])
+        self.assertEqual(body, snapshot["body"])
+        self.assertEqual("applied", state["validation"]["mode"])
+        self.assertEqual("Current body", state["agent_task"]["preflight"]["pr"]["body"])
 
     def test_later_sweep_cli_keep_rechecks_changed_head_with_a_fresh_task(self):
         report = self.proposal_report()

@@ -110,6 +110,7 @@ STAGES: tuple[dict[str, Any], ...] = (
         "agent": f"{STAGE_DESCRIPTION}:{STAGE_DESCRIPTION}",
         "module": "pr_description",
         "marker": ("validated_head_sha",),
+        "base_marker": ("pr", "base", "sha"),
         "model": DEFAULT_STAGE_MODEL,
         "github_mutation_policy": True,
     },
@@ -1364,6 +1365,8 @@ def read_stage_status(
     command = [sys.executable, str(script), "status", "--state", str(state)]
     if entry["stage"] == STAGE_CI:
         command.append("--verify-warning-snapshot")
+    if entry["stage"] == STAGE_DESCRIPTION:
+        command.append("--verify-clearance-snapshot")
     try:
         process = run(
             command,
@@ -1465,6 +1468,7 @@ STAGE_STATUS_FIELDS = (
     "attempt",
     "budget_scope",
     "ci_warnings",
+    "clearance_verification",
     "coordinator",
     "escalation",
     "github_mutation_policy",
@@ -1477,6 +1481,9 @@ STAGE_STATUS_FIELDS = (
     "monitoring",
     "outcome",
     "pipeline_budget",
+    "pipeline_run",
+    "pipeline_iteration",
+    "pipeline_max_iterations",
     "policy_skip",
     "proposal",
     "proposal_count",
@@ -1484,6 +1491,7 @@ STAGE_STATUS_FIELDS = (
     "queue",
     "review",
     "run",
+    "run_id",
     "skip_note",
     "terminal_exit",
     "thread_mutations",
@@ -1590,6 +1598,32 @@ def current_ci_warning_verification(verification: Any) -> bool:
         and isinstance(expected, str)
         and re.fullmatch(r"[0-9a-f]{64}", expected) is not None
         and verification.get("observed_snapshot_sha256") == expected
+    )
+
+
+def current_description_verification(payload: Any, pipeline_run: str | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    verification = payload.get("clearance_verification")
+    task = payload.get("agent_task") or {}
+    if not isinstance(verification, dict):
+        return False
+    expected = verification.get("expected_snapshot_sha256")
+    return (
+        verification.get("result") == "current"
+        and verification.get("reason") == "description_snapshot_current"
+        and isinstance(expected, str)
+        and re.fullmatch(r"[0-9a-f]{64}", expected) is not None
+        and verification.get("observed_snapshot_sha256") == expected
+        and task.get("status") == "completed"
+        and (task.get("task") or {}).get("state") == "completed"
+        and (
+            pipeline_run is None
+            or (
+                payload.get("pipeline_run") == pipeline_run
+                and task.get("github_mutation_policy") == ACTIVE_GITHUB_MUTATION_POLICY
+            )
+        )
     )
 
 
@@ -1832,6 +1866,10 @@ def inspect_stage(
         and base_is_clear
         and (outcome in CLEARING_OUTCOMES or warning_is_valid)
         and policy_skip_is_valid
+        and (
+            entry["stage"] != STAGE_DESCRIPTION
+            or current_description_verification(payload, pipeline_run)
+        )
     )
     if clear and outcome == "warning":
         clear = stage_blocker(
@@ -1854,6 +1892,8 @@ def inspect_stage(
         reason = "policy_skip_not_verified"
     elif outcome == "warning":
         reason = "ci_warning_not_verified"
+    elif entry["stage"] == STAGE_DESCRIPTION and outcome == "cleared":
+        reason = "description_clearance_not_verified"
     elif (
         entry["stage"] == STAGE_CI
         and isinstance(warning_verification, dict)

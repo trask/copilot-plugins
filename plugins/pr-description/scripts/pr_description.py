@@ -5055,6 +5055,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 expected_proposal_token=proposal["token"],
             )
         completed = load_run_state(path)
+        if action["validated_head_sha"] is not None:
+            record_clearance_snapshot(completed, repo_root, target)
         completed["agent_task"] = {
             **completed["agent_task"],
             "status": "completed",
@@ -5147,6 +5149,104 @@ def stage_outcome_fields(state: dict[str, Any]) -> dict[str, str]:
     return {"stage_outcome": outcome} if outcome else {}
 
 
+def clearance_snapshot(state: dict[str, Any]) -> dict[str, Any] | None:
+    pr = state.get("pr") or {}
+    viewer = state.get("viewer") or {}
+    fields = stable_pr_fields(pr)
+    if (
+        any(
+            not isinstance(fields[key], str) or not fields[key]
+            for key in fields if key not in {"number", "is_draft", "body"}
+        )
+        or type(fields["number"]) is not int
+        or not isinstance(fields["body"], str)
+        or type(fields["is_draft"]) is not bool
+        or pr.get("state") != "open"
+        or not isinstance(viewer.get("login"), str)
+        or not viewer["login"]
+        or not isinstance(viewer.get("permissions"), dict)
+        or any(
+            type(viewer["permissions"].get(key)) is not bool
+            for key in ("admin", "maintain", "push", "triage", "pull")
+        )
+    ):
+        return None
+    head = pr.get("head") or {}
+    base = pr.get("base") or {}
+    if (
+        head.get("sha") != pr.get("head_sha")
+        or any(
+            not isinstance(sha, str) or not SHA_PATTERN.fullmatch(sha)
+            for sha in (head.get("sha"), base.get("sha"))
+        )
+    ):
+        return None
+    return {
+        **fields,
+        "head_sha": head["sha"],
+        "base_sha": base["sha"],
+        "viewer": viewer,
+    }
+
+
+def verify_clearance_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    """Compare a completed validation with live inputs without changing state."""
+    task = state.get("agent_task") or {}
+    validation = state.get("validation") or {}
+    expected = validation.get("clearance_snapshot")
+    head = recorded_validated_head_sha(state)
+    if (
+        state.get("kind") != RUN_KIND
+        or not isinstance(state.get("run_id"), str)
+        or not state["run_id"]
+        or not isinstance(expected, dict)
+        or expected != clearance_snapshot(state)
+        or task.get("status") != "completed"
+        or (task.get("task") or {}).get("state") != "completed"
+        or head != expected["head_sha"]
+        or validation.get("mode") not in {"applied", "no_change"}
+        or validation.get("run_id") != state["run_id"]
+        or any(validation.get(key) != expected[key] for key in ("head_sha", "title", "body"))
+    ):
+        return {"result": "unverified", "reason": "description_clearance_unavailable"}
+    require_tools()
+    live = agent_task_preflight(Path(state["repo_root"]), target_from_state(state))
+    observed = clearance_snapshot(live)
+    expected_hash = canonical_json_sha256(expected)
+    observed_hash = canonical_json_sha256(observed) if observed is not None else None
+    current = observed is not None and expected == observed
+    return {
+        "result": "current" if current else "stale",
+        "reason": (
+            "description_snapshot_current" if current else "description_snapshot_changed"
+        ),
+        "expected_snapshot_sha256": expected_hash,
+        "observed_snapshot_sha256": observed_hash,
+    }
+
+
+def record_clearance_snapshot(
+    state: dict[str, Any], repo_root: Path, target: dict[str, Any]
+) -> None:
+    expected = clearance_snapshot(state)
+    live = agent_task_preflight(repo_root, target)
+    observed = clearance_snapshot(live)
+    validation = state.get("validation") or {}
+    if (
+        expected is None
+        or expected != observed
+        or recorded_validated_head_sha(state) != expected["head_sha"]
+        or validation.get("run_id") != state.get("run_id")
+        or validation.get("mode") not in {"applied", "no_change"}
+        or any(validation.get(key) != expected[key] for key in ("head_sha", "title", "body"))
+    ):
+        raise WorkflowError(
+            "description inputs changed or could not be verified after validation; "
+            "no reusable clearance was recorded"
+        )
+    validation["clearance_snapshot"] = observed
+
+
 def command_status(args: argparse.Namespace) -> None:
     if args.current:
         require_tools()
@@ -5168,6 +5268,11 @@ def command_status(args: argparse.Namespace) -> None:
     else:
         path = cli_path(args.state)
     state = load_state(path)
+    verification = (
+        {"clearance_verification": verify_clearance_snapshot(state)}
+        if getattr(args, "verify_clearance_snapshot", False)
+        else {}
+    )
     if state.get("kind") == INDEX_KIND:
         latest_agent_task = None
         latest_state = state.get("latest_state")
@@ -5187,6 +5292,7 @@ def command_status(args: argparse.Namespace) -> None:
                 "agent_task": latest_agent_task,
                 **stage_outcome_fields(state),
                 "last_helper_activity": last_helper_activity(state),
+                **verification,
             }
         )
         return
@@ -5204,6 +5310,12 @@ def command_status(args: argparse.Namespace) -> None:
             "validated_head_sha": state.get("validated_head_sha"),
             "validation": state.get("validation"),
             "agent_task": state.get("agent_task"),
+            **{
+                key: state[key]
+                for key in ("pipeline_run", "pipeline_iteration", "pipeline_max_iterations")
+                if key in state
+            },
+            **verification,
             **stage_outcome_fields(state),
             "last_helper_activity": last_helper_activity(state),
         }
@@ -5420,6 +5532,11 @@ def build_parser() -> argparse.ArgumentParser:
     status_source.add_argument("--state")
     status_source.add_argument("--current", action="store_true")
     status.add_argument("--repo-root")
+    status.add_argument(
+        "--verify-clearance-snapshot",
+        action="store_true",
+        help="read live inputs to verify completed description clearance without mutation",
+    )
     status.set_defaults(function=command_status)
 
     cleanup = subparsers.add_parser("cleanup", help="delete external workflow state")

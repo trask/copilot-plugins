@@ -90,6 +90,20 @@ def ci_warning_payload(head=HEAD, base=BASE) -> dict:
     }
 
 
+def description_payload(head=HEAD, base=BASE) -> dict:
+    return {
+        "validated_head_sha": head,
+        "pr": {"base": {"sha": base}},
+        "agent_task": {"status": "completed", "task": {"state": "completed"}},
+        "clearance_verification": {
+            "result": "current",
+            "reason": "description_snapshot_current",
+            "expected_snapshot_sha256": "a" * 64,
+            "observed_snapshot_sha256": "a" * 64,
+        },
+    }
+
+
 def stale_ci_warning_payload() -> dict:
     return {
         "stage_outcome": "pending",
@@ -992,7 +1006,7 @@ class MarkerTest(unittest.TestCase):
             },
             MODULE.STAGE_COPILOT_REVIEW: {"clean_at_head_sha": HEAD},
             MODULE.STAGE_CI: {"clean_at_head_sha": HEAD},
-            MODULE.STAGE_DESCRIPTION: {"validated_head_sha": HEAD},
+            MODULE.STAGE_DESCRIPTION: description_payload(),
         }
         for stage, payload in payloads.items():
             with self.subTest(stage=stage):
@@ -1182,9 +1196,8 @@ class MarkerTest(unittest.TestCase):
                 },
             },
             MODULE.STAGE_DESCRIPTION: {
-                "validated_head_sha": HEAD,
+                **description_payload(),
                 "proposal": {"version": 3, "decision": "keep"},
-                "agent_task": {"status": "completed"},
             },
         }
         forbidden = {

@@ -35,13 +35,13 @@
     {
       "name": "pr-description",
       "description": "Review and update a pull request title and description through a managed GitHub Agent Task.",
-      "version": "1.0.67",
+      "version": "1.0.68",
       "source": "./plugins/pr-description"
     },
     {
       "name": "pr-pipeline",
       "description": "Drive one pull request or a selected native-stack suffix through conflict resolution, review, CI fixing, and description validation.",
-      "version": "1.5.35",
+      "version": "1.5.36",
       "source": "./plugins/pr-pipeline"
     },
     {

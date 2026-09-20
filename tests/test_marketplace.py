@@ -38,8 +38,8 @@ EXPECTED_PACKAGE_VERSIONS = {
     "copilot-review-loop": "1.1.68",
     "historical-pr-audit": "1.1.23",
     "pr-conflict-resolver": "1.1.37",
-    "pr-description": "1.0.67",
-    "pr-pipeline": "1.5.35",
+    "pr-description": "1.0.68",
+    "pr-pipeline": "1.5.36",
     "pr-reviewer": "1.8.12",
     "self-review-loop": "1.3.45",
 }
