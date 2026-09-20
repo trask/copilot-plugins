@@ -1492,7 +1492,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
     def hosted_check(self, *, nonempty=False, reject_all=False, incomplete=False):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        root = Path(temporary.name)
+        root = Path(temporary.name).resolve()
         repo_root = root / "repo"
         repo_root.mkdir()
         state_path = root / "state" / "run.json"
