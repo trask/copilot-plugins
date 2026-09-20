@@ -7450,15 +7450,28 @@ def local_process_diagnostic(process: subprocess.CompletedProcess[str]) -> str:
 
 
 def load_candidate_runtime(helper: Path) -> ModuleType:
-    if sha256_file(helper) != REQUIRED_CLOUD_TASK_SHA256:
+    try:
+        source = helper.read_bytes()
+    except OSError as error:
+        raise WorkflowError(f"could not read the pinned Agent Tasks runtime: {error}") from error
+    if hashlib.sha256(source).hexdigest() != REQUIRED_CLOUD_TASK_SHA256:
         raise WorkflowError("shared Agent Tasks runtime integrity changed")
     name = "_copilot_review_candidate_runtime"
     spec = importlib.util.spec_from_file_location(name, helper)
     if spec is None or spec.loader is None:
         raise WorkflowError("could not load the pinned Agent Tasks runtime")
+    code = compile(source, str(helper), "exec", dont_inherit=True)
     module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(name)
     sys.modules[name] = module
-    spec.loader.exec_module(module)
+    try:
+        exec(code, module.__dict__)
+    except BaseException:
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+        raise
     return module
 
 

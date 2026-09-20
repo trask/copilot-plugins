@@ -64,6 +64,8 @@ repeats until the review is clean or it reaches a stop condition.
 
 The plugin verifies the shared Agent Tasks runtime. Authentication stays in
 local `gh api`; repository analysis and execution stay in GitHub Agent Tasks.
+Local candidate validation compiles the exact runtime source bytes whose digest
+it verified. It neither reads nor writes installed Python bytecode caches.
 
 ### Self Review Loop
 

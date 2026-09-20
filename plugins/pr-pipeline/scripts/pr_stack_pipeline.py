@@ -24,23 +24,30 @@ import uuid
 from typing import Any, Callable
 
 
-sys.dont_write_bytecode = True
-
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
+COMMON_SHA256 = "06cd36be72a9d2b0920ecc2109e53bf72147699428e1e929374ec00fabc759e4"
 
 
 def load_common() -> Any:
     """Load the shared pipeline module that sits beside this script."""
+    source = COMMON_PATH.read_bytes()
+    if hashlib.sha256(source).hexdigest() != COMMON_SHA256:
+        raise RuntimeError("shared pipeline module integrity changed")
     cached = sys.modules.get(COMMON_MODULE_NAME)
     if cached is not None:
         return cached
     spec = importlib.util.spec_from_file_location(COMMON_MODULE_NAME, COMMON_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"could not load {COMMON_PATH}")
+    code = compile(source, str(COMMON_PATH), "exec", dont_inherit=True)
     module = importlib.util.module_from_spec(spec)
     sys.modules[COMMON_MODULE_NAME] = module
-    spec.loader.exec_module(module)
+    try:
+        exec(code, module.__dict__)
+    except BaseException:
+        sys.modules.pop(COMMON_MODULE_NAME, None)
+        raise
     return module
 
 

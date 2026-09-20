@@ -30,7 +30,10 @@ class HostedReviewCandidateTest(unittest.TestCase):
         self.directory = Path(self.temporary.name)
         self.repo = self.directory / "source"
         self.repo.mkdir()
-        self.runtime = MODULE.load_candidate_runtime(RUNTIME_PATH)
+        runtime_path = self.directory / "runtime" / "cloud_task.py"
+        runtime_path.parent.mkdir()
+        runtime_path.write_bytes(RUNTIME_PATH.read_bytes())
+        self.runtime = MODULE.load_candidate_runtime(runtime_path)
         self.git("init", "-q", "-b", "feature")
         self.git("config", "user.name", "Fixture")
         self.git("config", "user.email", "fixture@example.invalid")
