@@ -30,6 +30,34 @@ sys.modules[CLOUD_SPEC.name] = CLOUD_MODULE
 CLOUD_SPEC.loader.exec_module(CLOUD_MODULE)
 
 
+def decode_compact_path_evidence(evidence):
+    if evidence.get("representation") != "ordered-prefix-delta-v1":
+        raise ValueError("unsupported path evidence representation")
+    entries = evidence.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("path evidence entries are missing")
+    paths = []
+    previous = ""
+    for entry in entries:
+        if (
+            not isinstance(entry, list)
+            or len(entry) != 2
+            or isinstance(entry[0], bool)
+            or not isinstance(entry[0], int)
+            or entry[0] < 0
+            or entry[0] > len(previous)
+            or not isinstance(entry[1], str)
+        ):
+            raise ValueError("path evidence entry is invalid")
+        previous = previous[: entry[0]] + entry[1]
+        paths.append(previous)
+    if len(paths) != evidence.get("count"):
+        raise ValueError("path evidence count does not match")
+    if CLOUD_MODULE.value_digest(paths) != evidence.get("sha256"):
+        raise ValueError("path evidence digest does not match")
+    return paths
+
+
 class WindowsSubprocessTest(unittest.TestCase):
     def windows_patches(self, completed):
         return (
@@ -902,7 +930,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "762a6570bf219c8d5be4f0530a29649b20134c6c73bd50289945d18a6c9191a9",
+            "d22684f684af52a3a0a6caa6afd4b25f5733260e2127db81763b2b13946c323a",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -4089,8 +4117,11 @@ class ManagedTaskPromptTest(unittest.TestCase):
         compact = CLOUD_MODULE.compact_request_contract(request)
         evidence = compact["resolution_context_paths"]
 
-        self.assertEqual("exact", evidence["representation"])
-        self.assertEqual(request["resolution_context_paths"], evidence["paths"])
+        self.assertEqual("ordered-prefix-delta-v1", evidence["representation"])
+        self.assertEqual(
+            request["resolution_context_paths"],
+            decode_compact_path_evidence(evidence),
+        )
         self.assertEqual(2291, evidence["count"])
         self.assertEqual(
             CLOUD_MODULE.value_digest(request["resolution_context_paths"]),
@@ -4109,6 +4140,14 @@ class ManagedTaskPromptTest(unittest.TestCase):
     def native_scope_paths():
         return json.loads(
             (Path(__file__).parent / "fixtures" / "native-scope-66.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+    @staticmethod
+    def real_native_scope_paths():
+        return json.loads(
+            (Path(__file__).parent / "fixtures" / "native-scope-152.json").read_text(
                 encoding="utf-8"
             )
         )
@@ -4155,13 +4194,14 @@ class ManagedTaskPromptTest(unittest.TestCase):
                 )
                 contract = json.loads(contract_line.split(": ", 1)[1])
                 self.assertEqual(
-                    {
-                        "representation": "exact",
-                        "count": 66,
-                        "sha256": CLOUD_MODULE.value_digest(paths),
-                        "paths": paths,
-                    },
-                    contract["resolution_context_paths"],
+                    paths,
+                    decode_compact_path_evidence(
+                        contract["resolution_context_paths"]
+                    ),
+                )
+                self.assertEqual(
+                    CLOUD_MODULE.value_digest(paths),
+                    contract["resolution_context_paths"]["sha256"],
                 )
                 self.assertEqual(original, request)
                 for key in (
@@ -4183,6 +4223,67 @@ class ManagedTaskPromptTest(unittest.TestCase):
                     {"prompt", "model", "create_pull_request", "base_ref"}, set(payload)
                 )
 
+    def test_actual_152_path_scope_fits_both_prompt_limits_without_losing_scope(self):
+        paths = self.real_native_scope_paths()
+        self.assertEqual(152, len(paths))
+        self.assertEqual(
+            "d2c74f81c3db76718a6e549cb10e7b44bb31a94bd8a72619ed6e491e32d9b1b8",
+            CLOUD_MODULE.value_digest(paths),
+        )
+        request = self.request()
+        request.update(
+            policy=CLOUD_MODULE.SEQUENTIAL_POLICY,
+            strategy="rebase",
+            native_stack=None,
+            resolution_context_paths=paths,
+            head_commits=[
+                self.commit(number, paths[number])
+                for number in range(12)
+            ],
+        )
+        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
+        options = self.options(request)
+        snapshot = SimpleNamespace(
+            control_root=Path("control"),
+            repository=request["repository"],
+        )
+        with mock.patch.object(
+            CLOUD_MODULE,
+            "api_json",
+            return_value={"id": "task-1", "state": "queued"},
+        ) as api_json:
+            CLOUD_MODULE.start_task(mock.sentinel.runner, snapshot, options)
+
+        prompt = api_json.call_args.args[4]["prompt"]
+        contract_line = next(
+            line for line in prompt.splitlines()
+            if line.startswith("Compact immutable task contract")
+        )
+        contract = json.loads(contract_line.split(": ", 1)[1])
+        self.assertEqual(
+            paths,
+            decode_compact_path_evidence(contract["resolution_context_paths"]),
+        )
+        self.assertEqual(18134, len(prompt))
+        self.assertEqual(18134, len(prompt.encode("utf-8")))
+        self.assertLessEqual(
+            len(prompt), CLOUD_MODULE.TASK_PROMPT_MAX_CHARACTERS
+        )
+        self.assertLessEqual(
+            len(prompt.encode("utf-8")), CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES
+        )
+        for required in (
+            request["request_id"],
+            request["request_sha256"],
+            request["model"],
+            request["policy"]["sha256"],
+            request["pull_request"]["head_sha"],
+            "Create only the requested conflict-resolution history.",
+            "The report is optional and advisory.",
+            "Do not update any user branch or pull request",
+        ):
+            self.assertIn(required, prompt)
+
     def test_exact_scope_at_prompt_limit_is_kept_and_overflow_never_posts(self):
         request = self.request()
         request["resolution_context_paths"] = self.native_scope_paths()
@@ -4201,9 +4302,16 @@ class ManagedTaskPromptTest(unittest.TestCase):
                 self.assertEqual(
                     CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES, len(prompt.encode("utf-8"))
                 )
-                self.assertIn(
-                    CLOUD_MODULE.canonical_json(request["resolution_context_paths"]).decode("utf-8"),
-                    prompt,
+                contract_line = next(
+                    line for line in prompt.splitlines()
+                    if line.startswith("Compact immutable task contract")
+                )
+                contract = json.loads(contract_line.split(": ", 1)[1])
+                self.assertEqual(
+                    request["resolution_context_paths"],
+                    decode_compact_path_evidence(
+                        contract["resolution_context_paths"]
+                    ),
                 )
                 options.prompt += "x"
                 with (
@@ -4787,13 +4895,14 @@ class ManagedTaskPromptTest(unittest.TestCase):
 
         self.assertEqual(
             {
-                "representation": "exact",
+                "representation": "ordered-prefix-delta-v1",
                 "count": 2,
                 "sha256": CLOUD_MODULE.value_digest(paths),
-                "paths": paths,
+                "entries": [[0, "src/main.py"], [4, "café.py"]],
             },
             evidence,
         )
+        self.assertEqual(paths, decode_compact_path_evidence(evidence))
 
     def test_path_count_and_byte_boundaries_preserve_every_value(self):
         for count in (0, 64, 65, 66):
@@ -4807,8 +4916,10 @@ class ManagedTaskPromptTest(unittest.TestCase):
                         paths[-1] += "x" * padding
                         self.assertEqual(byte_size, len(CLOUD_MODULE.canonical_json(paths)))
                     evidence = CLOUD_MODULE.compact_path_evidence(paths)
-                    self.assertEqual("exact", evidence["representation"])
-                    self.assertEqual(paths, evidence["paths"])
+                    self.assertEqual(
+                        "ordered-prefix-delta-v1", evidence["representation"]
+                    )
+                    self.assertEqual(paths, decode_compact_path_evidence(evidence))
                     self.assertEqual(CLOUD_MODULE.value_digest(paths), evidence["sha256"])
 
     def test_long_and_multibyte_paths_are_delivered_without_truncation(self):
@@ -4821,11 +4932,39 @@ class ManagedTaskPromptTest(unittest.TestCase):
 
         evidence = CLOUD_MODULE.compact_path_evidence(paths)
 
-        self.assertEqual("exact", evidence["representation"])
-        self.assertEqual(paths, evidence["paths"])
+        self.assertEqual("ordered-prefix-delta-v1", evidence["representation"])
+        self.assertEqual(paths, decode_compact_path_evidence(evidence))
         self.assertEqual(
             CLOUD_MODULE.value_digest(paths), evidence["sha256"],
         )
+
+    def test_path_evidence_preserves_order_duplicates_and_unicode_code_points(self):
+        paths = [
+            "src/😀/café.py",
+            "src/😀/café.py",
+            "src/😀/caféteria.py",
+            "src/βeta.py",
+        ]
+
+        evidence = CLOUD_MODULE.compact_path_evidence(paths)
+
+        self.assertEqual(paths, decode_compact_path_evidence(evidence))
+        self.assertEqual([0, len(paths[0]), 10, 4], [
+            entry[0] for entry in evidence["entries"]
+        ])
+
+    def test_path_evidence_decoder_rejects_invalid_count_prefix_and_digest(self):
+        evidence = CLOUD_MODULE.compact_path_evidence(["src/a.py", "src/b.py"])
+        defects = [
+            {**evidence, "count": 3},
+            {**evidence, "sha256": "0" * 64},
+            {**evidence, "entries": [[1, "src/a.py"], *evidence["entries"][1:]]},
+            {**evidence, "entries": [[0, "src/a.py"], [100, "b.py"]]},
+        ]
+
+        for defect in defects:
+            with self.subTest(defect=defect), self.assertRaises(ValueError):
+                decode_compact_path_evidence(defect)
 
     def test_native_stack_retains_every_member_and_commit_identity(self):
         request = self.request()
@@ -4996,7 +5135,10 @@ class ManagedTaskPromptTest(unittest.TestCase):
         request["request_sha256"] = CLOUD_MODULE.request_digest(request)
         oversized = CLOUD_MODULE.compact_request_contract(request)
         self.assertEqual(compact["native_stack"], oversized["native_stack"])
-        self.assertEqual(request["resolution_context_paths"], oversized["resolution_context_paths"]["paths"])
+        self.assertEqual(
+            request["resolution_context_paths"],
+            decode_compact_path_evidence(oversized["resolution_context_paths"]),
+        )
         with (
             mock.patch.object(CLOUD_MODULE, "api_json") as api,
             self.assertRaises(CLOUD_MODULE.ConflictError) as failure,

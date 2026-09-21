@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "GitHub Copilot plugins by Trask Stalnaker",
-    "version": "2.2.3"
+    "version": "2.2.4"
   },
   "plugins": [
     {
@@ -41,13 +41,13 @@
     {
       "name": "pr-pipeline",
       "description": "Drive one pull request or a selected native-stack suffix through conflict resolution, review, CI fixing, and description validation.",
-      "version": "1.5.39",
+      "version": "1.5.40",
       "source": "./plugins/pr-pipeline"
     },
     {
       "name": "pr-conflict-resolver",
       "description": "Resolve the merge conflicts on a pull request in one pass by keeping both sides' intent, then push the resolution.",
-      "version": "1.1.39",
+      "version": "1.1.40",
       "source": "./plugins/pr-conflict-resolver"
     },
     {

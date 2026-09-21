@@ -1976,6 +1976,175 @@ class StackRunTest(StackFixture):
             result["cleanup"],
         )
 
+    def test_finish_rejects_completion_when_worktree_removal_evidence_fails(self):
+        failures = (
+            {
+                "result": "failed",
+                "reason": "ownership_record_update_failed",
+                "detail": "cannot retain tombstone",
+                "number": 11,
+                "ownership_record": "11.worktree.json",
+                "worktree_removed": True,
+            },
+            {
+                "result": "failed",
+                "reason": "worktree_remove_failed",
+                "detail": "remove failed",
+                "number": 11,
+                "ownership_record": "11.worktree.json",
+                "worktree_removed": True,
+            },
+        )
+        for failure in failures:
+            with self.subTest(reason=failure["reason"]):
+                pipeline = self.pipeline()
+                with mock.patch.object(
+                    pipeline, "cleanup", return_value=[failure]
+                ):
+                    result = pipeline.finish(
+                        "complete",
+                        snapshot={"result": "complete", "pull_requests": []},
+                        passes=1,
+                    )
+
+                state = COMMON.read_json(pipeline.state_path)
+                persisted = COMMON.read_json(
+                    pipeline.result_path
+                )["pipeline_result"]
+                compact = MODULE.compact_terminal_result(
+                    result, result_path=pipeline.result_path
+                )
+                for recorded in (result, state, persisted, compact):
+                    self.assertEqual("error", recorded["result"])
+                    self.assertEqual(
+                        "worktree_cleanup_failed", recorded["reason"]
+                    )
+                    self.assertEqual(
+                        [failure], recorded["cleanup_failures"]
+                    )
+                self.assertEqual(
+                    "complete", result["snapshot"]["result"]
+                )
+                self.assertEqual(
+                    "complete", compact["snapshot"]["result"]
+                )
+                transition = MODULE.progress_transition(
+                    {"event": "stack_pipeline_finished", **compact}
+                )
+                self.assertEqual("error", transition["result"])
+                self.assertEqual(
+                    [failure],
+                    transition["final_event"]["cleanup_failures"],
+                )
+
+    def test_finish_preserves_a_primary_blocker_when_cleanup_also_fails(self):
+        failure = {
+            "result": "failed",
+            "reason": "ownership_record_update_failed",
+            "detail": "cannot retain tombstone",
+            "number": 11,
+            "ownership_record": "11.worktree.json",
+            "worktree_removed": True,
+        }
+        pipeline = self.pipeline()
+        with mock.patch.object(
+            pipeline, "cleanup", return_value=[failure]
+        ):
+            result = pipeline.finish(
+                "blocked",
+                reason="stage_execution_failed",
+                detail="primary stage failure",
+            )
+
+        state = COMMON.read_json(pipeline.state_path)
+        persisted = COMMON.read_json(pipeline.result_path)["pipeline_result"]
+        compact = MODULE.compact_terminal_result(
+            result, result_path=pipeline.result_path
+        )
+        for recorded in (result, state, persisted, compact):
+            self.assertEqual("blocked", recorded["result"])
+            self.assertEqual("stage_execution_failed", recorded["reason"])
+            self.assertEqual([failure], recorded["cleanup_failures"])
+        self.assertEqual("primary stage failure", result["detail"])
+        self.assertEqual("primary stage failure", state["detail"])
+        self.assertEqual("primary stage failure", persisted["detail"])
+        self.assertEqual("primary stage failure", compact["detail"])
+
+    def test_cleanup_failure_summary_stays_bounded(self):
+        failures = [
+            {
+                "result": "failed",
+                "reason": "ownership_record_update_failed",
+                "detail": "cannot retain tombstone " * 100,
+                "number": number,
+                "worktree": f"C:\\worktrees\\{number}",
+                "ownership_record": f"C:\\run\\worktrees\\{number}.worktree.json",
+                "worktree_removed": True,
+            }
+            for number in range(100)
+        ]
+        compact = MODULE.compact_terminal_result(
+            {
+                "result": "error",
+                "reason": "worktree_cleanup_failed",
+                "detail": json.dumps(failures, sort_keys=True),
+                "cleanup_failures": failures,
+            }
+        )
+
+        self.assertLessEqual(
+            len(
+                json.dumps(
+                    {"event": "stack_pipeline_finished", **compact},
+                    sort_keys=True,
+                ).encode("utf-8")
+            )
+            + len(os.linesep.encode()),
+            MODULE.TERMINAL_RESULT_MAX_BYTES,
+        )
+        self.assertEqual("worktree_cleanup_failed", compact["reason"])
+        self.assertEqual(
+            100,
+            len(compact["cleanup_failures"])
+            + compact["cleanup_failures_omitted"],
+        )
+
+    def test_cleanup_failure_detail_truncation_keeps_full_result_evidence(self):
+        detail = "cannot retain tombstone " * 100
+        failure = {
+            "result": "failed",
+            "reason": "ownership_record_update_failed",
+            "detail": detail,
+            "number": 11,
+            "ownership_record": "11.worktree.json",
+            "worktree_removed": True,
+        }
+        pipeline = self.pipeline()
+        with mock.patch.object(
+            pipeline, "cleanup", return_value=[failure]
+        ):
+            result = pipeline.finish(
+                "complete",
+                snapshot={"result": "complete", "pull_requests": []},
+                passes=1,
+            )
+
+        compact = MODULE.compact_terminal_result(
+            result, result_path=pipeline.result_path
+        )
+        persisted = COMMON.read_json(pipeline.result_path)["pipeline_result"]
+        self.assertTrue(compact["cleanup_failure_details_truncated"])
+        self.assertNotIn("cleanup_failures_omitted", compact)
+        self.assertEqual(
+            MODULE.TERMINAL_TEXT_MAX_CHARS,
+            len(compact["cleanup_failures"][0]["detail"]),
+        )
+        self.assertTrue(
+            compact["cleanup_failures"][0]["detail"].endswith("...")
+        )
+        self.assertEqual(detail, persisted["cleanup_failures"][0]["detail"])
+        self.assertEqual(failure, persisted["cleanup"][0])
+
     def test_failed_review_replay_retains_dirty_workspace_and_result_evidence(self):
         self.stack = stack(members=(11, 12))
         pipeline = self.pipeline(kickoff([11, 12]))
@@ -2054,9 +2223,21 @@ class StackRunTest(StackFixture):
         self.assertEqual("worktree_is_dirty", result["cleanup"][0]["reason"])
         self.assertEqual(str(paths[11]), result["cleanup"][0]["worktree"])
         self.assertEqual(str(records[11]), result["cleanup"][0]["ownership_record"])
-        self.assertEqual({"number": 12, "result": "removed"}, result["cleanup"][1])
+        self.assertEqual(
+            {
+                "number": 12,
+                "result": "removed",
+                "ownership_record": str(records[12]),
+            },
+            result["cleanup"][1],
+        )
         self.assertEqual(b"synthetic unfinished change\n", evidence.read_bytes())
         self.assertEqual(original_record, records[11].read_bytes())
+        removed = COMMON.read_json(records[12])
+        self.assertEqual(pipeline.run_id, removed["run_id"])
+        self.assertEqual(str(paths[12]), removed["path"])
+        self.assertEqual("removed", removed["status"])
+        self.assertIsInstance(removed["removed_at"], str)
         saved = COMMON.read_json(pipeline.result_path)["pipeline_result"]
         self.assertEqual(result["cleanup"], saved["cleanup"])
         stage = saved["pull_requests"]["11"]["stages"][MODULE.STAGE_COPILOT_REVIEW]
@@ -3310,7 +3491,15 @@ class LauncherTest(unittest.TestCase):
         record = MODULE.worktree_ownership_path(self.launcher.run_directory, 11)
         COMMON.write_json_atomically(
             record,
-            {"run_id": self.launcher.run_id, "path": str(path)},
+            {
+                "run_id": self.launcher.run_id,
+                "repository": self.launcher.repository,
+                "number": 11,
+                "path": str(path),
+                "head_sha": head_of(11),
+                "status": "active",
+                "created_at": "2026-09-21T00:00:00Z",
+            },
         )
 
         def remove_worktree(command, *, check):
@@ -3329,8 +3518,131 @@ class LauncherTest(unittest.TestCase):
 
         self.assertEqual("removed", cleaned["result"])
         self.assertFalse(self.launcher.worktree_root.exists())
-        self.assertFalse(record.exists())
+        self.assertEqual(str(record), cleaned["ownership_record"])
+        retained = COMMON.read_json(record)
+        self.assertEqual(self.launcher.run_id, retained["run_id"])
+        self.assertEqual(self.launcher.repository, retained["repository"])
+        self.assertEqual(11, retained["number"])
+        self.assertEqual(str(path), retained["path"])
+        self.assertEqual(head_of(11), retained["head_sha"])
+        self.assertEqual("2026-09-21T00:00:00Z", retained["created_at"])
+        self.assertEqual("removed", retained["status"])
+        self.assertIsInstance(retained["removed_at"], str)
         self.assertTrue(self.launcher.run_directory.exists())
+
+        repeated = self.launcher.cleanup(11)
+
+        self.assertEqual(
+            {
+                "result": "removed",
+                "number": 11,
+                "ownership_record": str(record),
+                "already_removed": True,
+            },
+            repeated,
+        )
+
+    def test_verification_rejects_a_removed_ownership_tombstone(self):
+        path = MODULE.worktree_path(self.launcher.worktree_root, 11)
+        path.mkdir(parents=True)
+        record = MODULE.worktree_ownership_path(self.launcher.run_directory, 11)
+        COMMON.write_json_atomically(
+            record,
+            {
+                "run_id": self.launcher.run_id,
+                "path": str(path),
+                "status": "removed",
+                "removed_at": "2026-09-21T00:00:00Z",
+            },
+        )
+
+        verified = self.launcher.verify(self.request(), path)
+
+        self.assertEqual("failed", verified["result"])
+        self.assertEqual("worktree_ownership_missing", verified["reason"])
+
+    def test_malformed_ownership_status_cannot_authorize_worktree_actions(self):
+        path = MODULE.worktree_path(self.launcher.worktree_root, 11)
+        path.mkdir(parents=True)
+        record = MODULE.worktree_ownership_path(
+            self.launcher.run_directory, 11
+        )
+        for status in ([], {}):
+            with self.subTest(status=status):
+                COMMON.write_json_atomically(
+                    record,
+                    {
+                        "run_id": self.launcher.run_id,
+                        "path": str(path),
+                        "status": status,
+                    },
+                )
+                with (
+                    mock.patch.object(COMMON, "fetch_pr_head") as fetch,
+                    mock.patch.object(COMMON, "git_or_none") as git,
+                    mock.patch.object(COMMON, "run") as run,
+                    mock.patch.object(COMMON, "start_background") as start,
+                ):
+                    created = self.launcher.create(self.request())
+                    verified = self.launcher.verify(self.request(), path)
+                    cleaned = self.launcher.cleanup(11)
+                    if verified["result"] == "verified":
+                        self.launcher.start(self.request(), path)
+
+                self.assertEqual("failed", created["result"])
+                self.assertEqual(
+                    "worktree_is_not_owned_by_this_run", created["reason"]
+                )
+                self.assertEqual("failed", verified["result"])
+                self.assertEqual(
+                    "worktree_ownership_missing", verified["reason"]
+                )
+                self.assertEqual("failed", cleaned["result"])
+                self.assertEqual(
+                    "worktree_is_not_owned_by_this_run", cleaned["reason"]
+                )
+                fetch.assert_not_called()
+                git.assert_not_called()
+                run.assert_not_called()
+                start.assert_not_called()
+
+    def test_cleanup_keeps_every_registered_ownership_state_hashable(self):
+        path = MODULE.worktree_path(self.launcher.worktree_root, 11)
+        path.mkdir(parents=True)
+        record = MODULE.worktree_ownership_path(self.launcher.run_directory, 11)
+        execution = SimpleNamespace(
+            run_id=self.launcher.run_id,
+            record_state=mock.Mock(),
+        )
+
+        def remove_worktree(command, *, check):
+            self.assertFalse(check)
+            if command[3] == "status":
+                return subprocess.CompletedProcess(command, 0, "", "")
+            path.rmdir()
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            mock.patch.object(COMMON, "_EXECUTION", execution),
+            mock.patch.object(COMMON, "run", side_effect=remove_worktree),
+        ):
+            COMMON.write_json_atomically(
+                record,
+                {
+                    "run_id": self.launcher.run_id,
+                    "path": str(path),
+                    "status": "active",
+                },
+            )
+            cleaned = self.launcher.cleanup(11)
+
+        self.assertEqual("removed", cleaned["result"])
+        registered = {
+            call.args[0].resolve()
+            for call in execution.record_state.call_args_list
+        }
+        self.assertEqual({record.resolve()}, registered)
+        self.assertTrue(all(registered_path.is_file() for registered_path in registered))
 
     def owned_worktree(self):
         path = MODULE.worktree_path(self.launcher.worktree_root, 11)
@@ -3429,6 +3741,55 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual("worktree_remove_failed", cleaned["reason"])
         self.assertTrue(path.exists())
         self.assertTrue(record.exists())
+
+    def test_cleanup_does_not_record_removal_after_a_failed_remove(self):
+        path, record = self.owned_worktree()
+
+        def remove_then_fail(command, *, check):
+            self.assertFalse(check)
+            if command[3] == "status":
+                return subprocess.CompletedProcess(command, 0, "", "")
+            path.rmdir()
+            return subprocess.CompletedProcess(command, 1, "", "remove failed")
+
+        with mock.patch.object(COMMON, "run", side_effect=remove_then_fail):
+            cleaned = self.launcher.cleanup(11)
+
+        self.assertEqual("failed", cleaned["result"])
+        self.assertEqual("worktree_remove_failed", cleaned["reason"])
+        self.assertTrue(cleaned["worktree_removed"])
+        self.assertFalse(path.exists())
+        self.assertNotEqual("removed", COMMON.read_json(record).get("status"))
+
+    def test_cleanup_reports_tombstone_write_failure_without_claiming_removal(self):
+        path, record = self.owned_worktree()
+
+        def remove_worktree(command, *, check):
+            self.assertFalse(check)
+            if command[3] == "status":
+                return subprocess.CompletedProcess(command, 0, "", "")
+            path.rmdir()
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        original_write = COMMON.write_json_atomically
+
+        def fail_tombstone(target, payload):
+            if target == record and payload.get("status") == "removed":
+                raise OSError("cannot retain tombstone")
+            original_write(target, payload)
+
+        with (
+            mock.patch.object(COMMON, "run", side_effect=remove_worktree),
+            mock.patch.object(COMMON, "write_json_atomically", side_effect=fail_tombstone),
+        ):
+            cleaned = self.launcher.cleanup(11)
+
+        self.assertEqual("failed", cleaned["result"])
+        self.assertEqual("ownership_record_update_failed", cleaned["reason"])
+        self.assertTrue(cleaned["worktree_removed"])
+        self.assertFalse(path.exists())
+        self.assertTrue(record.exists())
+        self.assertNotEqual("removed", COMMON.read_json(record).get("status"))
 
     def test_cleanup_status_and_remove_use_hidden_windows_processes(self):
         path, _record = self.owned_worktree()

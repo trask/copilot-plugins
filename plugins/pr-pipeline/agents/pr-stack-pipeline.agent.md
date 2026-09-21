@@ -85,6 +85,8 @@ Write a concise final response from the complete `stack_pipeline_finished` event
 
 When `all_ci_passed` is false or `ci_warnings` is nonempty, say **completed WITH CI WARNINGS** for a complete workflow, never all CI green or all checks passed. Name each affected pull request and head, then its failed checks, diagnoses, reasons, and evidence. Read `artifacts.result` when `ci_warnings_omitted` or `ci_warning_details_truncated` is present. Preserve blocked or partial outcomes even when some warnings were accepted. Report any `ci_warning_revalidation_error`; do not assume those warnings are still current.
 
+Report every `cleanup_failures` entry as local finalization evidence without replacing a blocked or stopped run's top-level safety reason and detail. For `worktree_cleanup_failed`, say that cleanup evidence prevented the run from completing. When `cleanup_failures_omitted` or `cleanup_failure_details_truncated` is present, verify the full-result artifact's hash and run identity, then read `artifacts.result` for the complete cleanup evidence.
+
 Do not organize the response by pass or list every stage for every pull request when all are clear. Omit routine details: models, return codes, nonces, state paths, worktree paths, and log paths. The terminal event is bounded and links to `artifacts.result` for the full durable result.
 
 Add only what changed the stack or needs attention:

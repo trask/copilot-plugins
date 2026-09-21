@@ -2071,11 +2071,21 @@ def value_digest(value: object) -> str:
 
 def compact_path_evidence(paths: Sequence[str]) -> Mapping[str, object]:
     values = list(paths)
+    entries: list[list[object]] = []
+    previous = ""
+    for value in values:
+        prefix_length = 0
+        for previous_character, current_character in zip(previous, value):
+            if previous_character != current_character:
+                break
+            prefix_length += 1
+        entries.append([prefix_length, value[prefix_length:]])
+        previous = value
     return {
-        "representation": "exact",
+        "representation": "ordered-prefix-delta-v1",
         "count": len(values),
         "sha256": value_digest(values),
-        "paths": values,
+        "entries": entries,
     }
 
 
@@ -2380,9 +2390,18 @@ def policy_prompt(
     include_per_commit_paths: bool = False,
 ) -> str:
     path_scope = (
-        "Use `resolution_context_paths.paths` as conflict-location context, not a "
-        "filename permission set. Resolve the assigned member while preserving both "
-        "sides' intent and unaffected work. Make necessary scoped companion edits "
+        "`resolution_context_paths` uses `ordered-prefix-delta-v1`. Reconstruct its "
+        "ordered path list with `previous = \"\"`. For each `[prefix_length, suffix]` "
+        "entry, require a non-negative integer no greater than the number of Unicode "
+        "code points in `previous`, append `previous[:prefix_length] + suffix`, then "
+        "set `previous` to that path. Prefix lengths are Unicode code points, never "
+        "UTF-16 code units or UTF-8 bytes. Preserve order and duplicates. Before using "
+        "the list, require its length to equal `count` and its `sha256` to equal "
+        "SHA-256 over UTF-8 JSON with sorted keys, comma and colon separators, and "
+        "non-ASCII values preserved. Stop without changes if decoding, count, or digest "
+        "verification fails. Use the reconstructed paths as conflict-location context, "
+        "not a filename permission set. Resolve the assigned member while preserving "
+        "both sides' intent and unaffected work. Make necessary scoped companion edits "
         "and relocations, including test/support files, when the resolution requires "
         "them. Preserve test discovery, execution and coverage; a move neither proves "
         "nor disproves that. Run relevant validation and correct failures inside this "

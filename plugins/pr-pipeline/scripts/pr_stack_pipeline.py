@@ -1178,10 +1178,22 @@ def worktree_path(worktree_root: Path, number: int) -> Path:
 
 
 def owns_worktree(record: Any, run_id: str, path: Path) -> bool:
+    if not isinstance(record, dict):
+        return False
+    status = record.get("status")
+    return (
+        record.get("run_id") == run_id
+        and record.get("path") == str(path)
+        and (status is None or type(status) is str and status == "active")
+    )
+
+
+def removed_worktree(record: Any, run_id: str, path: Path) -> bool:
     return (
         isinstance(record, dict)
         and record.get("run_id") == run_id
         and record.get("path") == str(path)
+        and record.get("status") == "removed"
     )
 
 
@@ -1268,6 +1280,7 @@ class WorkerLauncher:
             if checked_out["result"] != "ready":
                 return {"result": "failed", **checked_out}
             record["head_sha"] = request["head_sha"]
+            record["status"] = "active"
             record["updated_at"] = utc_now()
             common.write_json_atomically(record_path, record)
             return {"result": "ready", "worktree": path, "reused": True}
@@ -1300,6 +1313,7 @@ class WorkerLauncher:
                 "number": number,
                 "path": str(path),
                 "head_sha": request["head_sha"],
+                "status": "active",
                 "created_at": utc_now(),
             },
         )
@@ -1491,9 +1505,16 @@ class WorkerLauncher:
     def cleanup(self, number: int) -> dict[str, Any]:
         path = worktree_path(self.worktree_root, number)
         record_path = worktree_ownership_path(self.run_directory, number)
-        if not path.exists():
-            return {"result": "absent", "number": number}
         record = common.read_json(record_path)
+        if not path.exists():
+            if removed_worktree(record, self.run_id, path):
+                return {
+                    "result": "removed",
+                    "number": number,
+                    "ownership_record": str(record_path),
+                    "already_removed": True,
+                }
+            return {"result": "absent", "number": number}
         if not owns_worktree(record, self.run_id, path):
             return {
                 "result": "failed",
@@ -1543,18 +1564,40 @@ class WorkerLauncher:
                 "reason": "worktree_remove_failed",
                 "detail": str(error),
             }
-        if not path.exists():
+        if removed.returncode == 0 and not path.exists():
             try:
-                record_path.unlink()
-            except OSError:
-                pass
+                common.write_json_atomically(
+                    record_path,
+                    {
+                        **record,
+                        "status": "removed",
+                        "removed_at": utc_now(),
+                    },
+                )
+            except (OSError, TypeError, ValueError) as error:
+                return {
+                    **preserved,
+                    "result": "failed",
+                    "reason": "ownership_record_update_failed",
+                    "detail": str(error),
+                    "worktree_removed": True,
+                }
             try:
                 self.worktree_root.rmdir()
             except OSError:
                 pass
-            return {"result": "removed", "number": number}
+            return {
+                "result": "removed",
+                "number": number,
+                "ownership_record": str(record_path),
+            }
         return {
             **preserved,
+            **(
+                {"result": "failed", "worktree_removed": True}
+                if not path.exists()
+                else {}
+            ),
             "reason": "worktree_remove_failed",
             "detail": removed.stderr.strip() or removed.stdout.strip() or "no output",
         }
@@ -3670,11 +3713,35 @@ class StackPipeline:
         passes: int = 0,
         phases: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        self.state["result"] = result
-        self.state["reason"] = reason
+        cleanup = self.cleanup()
+        cleanup_failures = [
+            item
+            for item in cleanup
+            if isinstance(item, dict) and item.get("result") == "failed"
+        ]
+        finished_result = result
+        finished_reason = reason
+        finished_detail = detail
+        if result == "complete" and cleanup_failures:
+            finished_result = "error"
+            finished_reason = "worktree_cleanup_failed"
+            finished_detail = json.dumps(
+                cleanup_failures, ensure_ascii=False, sort_keys=True
+            )
+        self.state["result"] = finished_result
+        self.state["reason"] = finished_reason
+        self.state["cleanup"] = cleanup
+        if finished_detail is not None:
+            self.state["detail"] = finished_detail
+        else:
+            self.state.pop("detail", None)
+        if cleanup_failures:
+            self.state["cleanup_failures"] = cleanup_failures
+        else:
+            self.state.pop("cleanup_failures", None)
         self.save()
         payload = {
-            "result": result,
+            "result": finished_result,
             "run_id": self.run_id,
             "repository": self.repository,
             "stack_number": self.kickoff["stackNumber"],
@@ -3685,12 +3752,14 @@ class StackPipeline:
             "pull_requests": self.state.get("pull_requests", {}),
             "phases": [summarize_phase(phase) for phase in phases or []],
             "propagations": self.propagations,
-            "cleanup": self.cleanup(),
+            "cleanup": cleanup,
         }
-        if reason is not None:
-            payload["reason"] = reason
-        if detail is not None:
-            payload["detail"] = detail
+        if finished_reason is not None:
+            payload["reason"] = finished_reason
+        if finished_detail is not None:
+            payload["detail"] = finished_detail
+        if cleanup_failures:
+            payload["cleanup_failures"] = cleanup_failures
         if snapshot is not None:
             payload["snapshot"] = snapshot
         if result in {"complete", "partial"} and snapshot is not None:
@@ -3720,7 +3789,7 @@ class StackPipeline:
                         **cancellation,
                         "status": "completed",
                         "completed_at": utc_now(),
-                        "pipeline_result": result,
+                        "pipeline_result": finished_result,
                     },
                 )
         finally:
@@ -4113,6 +4182,33 @@ def compact_terminal_result(
         }
         for warning in limited(warnings_source)
     ]
+    cleanup_failures_source = payload.get("cleanup_failures", [])
+    cleanup_failures = []
+    cleanup_failure_truncations = []
+    for failure in limited(cleanup_failures_source):
+        if not isinstance(failure, dict):
+            continue
+        fields = {
+            "result": failure.get("result"),
+            "reason": failure.get("reason"),
+            "detail": failure.get("detail"),
+            "number": failure.get("number"),
+            "worktree": failure.get("worktree"),
+            "ownership_record": failure.get("ownership_record"),
+            "worktree_removed": failure.get("worktree_removed"),
+        }
+        cleanup_failure_truncations.append(
+            any(
+                isinstance(value, str)
+                and len(value) > TERMINAL_TEXT_MAX_CHARS
+                for value in fields.values()
+            )
+        )
+        cleanup_failures.append({
+            key: clipped_text(value) if isinstance(value, str) else value
+            for key, value in fields.items()
+            if value is not None
+        })
     phases_source = payload.get("phases")
     phases_source = phases_source if isinstance(phases_source, list) else []
     stage_failure = {}
@@ -4197,6 +4293,16 @@ def compact_terminal_result(
             "reason": payload.get("reason"),
             "detail": clipped_text(payload.get("detail")),
             "stage_failure": stage_failure,
+            "cleanup_failures": cleanup_failures,
+            "cleanup_failure_details_truncated": (
+                True if any(cleanup_failure_truncations) else None
+            ),
+            "cleanup_failures_omitted": (
+                len(cleanup_failures_source) - len(cleanup_failures)
+                if isinstance(cleanup_failures_source, list)
+                and len(cleanup_failures_source) > len(cleanup_failures)
+                else None
+            ),
             "run_id": payload.get("run_id"),
             "repository": payload.get("repository"),
             "stack_number": payload.get("stack_number"),
@@ -4283,6 +4389,16 @@ def compact_terminal_result(
     while warnings and size() > TERMINAL_RESULT_MAX_BYTES:
         warnings.pop()
         compact["ci_warnings_omitted"] = len(warnings_source) - len(warnings)
+    while cleanup_failures and size() > TERMINAL_RESULT_MAX_BYTES:
+        cleanup_failures.pop()
+        cleanup_failure_truncations.pop()
+        compact["cleanup_failures_omitted"] = (
+            len(cleanup_failures_source) - len(cleanup_failures)
+        )
+        if any(cleanup_failure_truncations):
+            compact["cleanup_failure_details_truncated"] = True
+        else:
+            compact.pop("cleanup_failure_details_truncated", None)
     if size() > TERMINAL_RESULT_MAX_BYTES and compact.pop("stage_failure", None):
         compact["stage_failure_omitted"] = True
     if size() > TERMINAL_RESULT_MAX_BYTES:
