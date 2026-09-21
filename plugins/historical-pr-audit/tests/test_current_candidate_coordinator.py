@@ -29,7 +29,7 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
         }
         self.commands = []
 
-    def candidate(self, *, with_code=False):
+    def candidate(self, *, with_code=False, pipeline=False):
         runtime = self.runtime
         head, artifact_sha = METADATA["head_sha"], "4" * 40
         code_tip = "8" * 40 if with_code else head
@@ -43,7 +43,11 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
         }
         prompt = MODULE.build_worker_prompt(
             METADATA, audit_branch="trask-pr-audit-7", max_iterations=5,
-            pipeline={"run": None, "iteration": None, "max_iterations": None},
+            pipeline=(
+                {"run": "pipeline-1", "iteration": 1, "max_iterations": 2}
+                if pipeline
+                else {"run": None, "iteration": None, "max_iterations": None}
+            ),
         )
         pr = runtime.PullRequestSnapshot(
             **MODULE.expected_result_pull_request(METADATA),
@@ -107,7 +111,7 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
             },
         }
 
-    def execute(self, result, *, returncode=0):
+    def execute(self, result, *, returncode=0, observed=None, pipeline=False):
         code_tip = self.code[-1]["sha"] if self.code else METADATA["head_sha"]
         repository = mock.Mock()
         repository.identity.return_value = SimpleNamespace(branch=self.identity["branch"])
@@ -132,10 +136,34 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
                 self.assertEqual("push", command[3])
             return MODULE.subprocess.CompletedProcess(command, 0, "", "")
 
-        args = MODULE.build_parser().parse_args([
-            "agent-task", METADATA["pr_url"], "--repo-root", str(self.repo),
-            "--state", str(self.state_path),
-        ])
+        arguments = [
+            "agent-task",
+            METADATA["pr_url"],
+            "--repo-root",
+            str(self.repo),
+            "--state",
+            str(self.state_path),
+        ]
+        if pipeline:
+            arguments.extend(
+                [
+                    "--pipeline-run",
+                    "pipeline-1",
+                    "--pipeline-iteration",
+                    "1",
+                    "--pipeline-max-iterations",
+                    "2",
+                ]
+            )
+        args = MODULE.build_parser().parse_args(arguments)
+        metadata_values = iter([METADATA, METADATA, observed or METADATA])
+
+        def metadata(*_args):
+            try:
+                return next(metadata_values)
+            except StopIteration:
+                return observed or METADATA
+
         with (
             mock.patch.object(MODULE.subprocess, "Popen", side_effect=AssertionError("external execution")),
             mock.patch.object(MODULE, "require_tools"),
@@ -144,7 +172,7 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "discover_cloud_task", return_value=HELPER),
             mock.patch.object(MODULE, "load_candidate_runtime", return_value=self.runtime),
             mock.patch.object(self.runtime, "GitRepository", return_value=repository),
-            mock.patch.object(MODULE, "merged_metadata_for", return_value=METADATA),
+            mock.patch.object(MODULE, "merged_metadata_for", side_effect=metadata),
             mock.patch.object(MODULE, "require_clean_worktree"),
             mock.patch.object(MODULE, "prepared_branch_after_interruption", return_value={"branch_action": "created"}),
             mock.patch.object(MODULE, "local_identity", side_effect=lambda *_: dict(self.identity)),
@@ -154,8 +182,6 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "find_remote", return_value="origin"),
             mock.patch.object(MODULE, "remote_head", return_value=None),
             mock.patch.object(MODULE, "wait_for_remote_head", return_value=code_tip),
-            mock.patch.object(MODULE, "validate_success_result", side_effect=AssertionError("legacy success")),
-            mock.patch.object(MODULE, "validate_recovery_result_identity", side_effect=AssertionError("legacy recovery")),
             mock.patch.object(MODULE, "emit") as emit,
         ):
             MODULE.command_agent_task(args)
@@ -208,3 +234,28 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.WorkflowError, "wrong identity"):
             self.execute(result)
         self.assertEqual([], self.commands)
+
+    def test_source_drift_preserves_result_without_import_or_publication(self):
+        result = self.candidate(with_code=True, pipeline=True)
+        observed = {**METADATA, "head_sha": "3" * 40}
+
+        output = self.execute(result, observed=observed, pipeline=True)
+
+        self.assertEqual("head_moved", output["result"])
+        self.assertEqual(METADATA["head_sha"], output["expected_head_sha"])
+        self.assertEqual(observed["head_sha"], output["observed_head_sha"])
+        self.assertEqual("advance", output["next_action"])
+        self.assertEqual(1, output["pipeline_iteration"])
+        self.assertEqual(1, output["consumed_allowance"])
+        self.assertEqual(1, output["remaining_allowance"])
+        self.assertNotIn("stage_outcome", output)
+        self.assertFalse(output["source_mutation_performed"])
+        self.assertFalse(output["import_performed"])
+        self.assertFalse(output["rebase_performed"])
+        self.assertFalse(output["publication_performed"])
+        self.assertEqual([], self.commands)
+        state = MODULE.load_state(self.state_path)
+        self.assertEqual("head_moved", state["agent_task"]["status"])
+        self.assertEqual(result["task"], state["agent_task"]["task"])
+        self.assertEqual(result["generated"], state["agent_task"]["generated"])
+        self.assertTrue(Path(state["agent_task"]["result_file"]).is_file())

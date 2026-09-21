@@ -327,24 +327,6 @@ diff --git a/old.txt b/old.txt
         self.assertEqual(anchors["new.txt"]["RIGHT"], {1: 1, 2: 2})
         self.assertEqual(anchors["old.txt"]["LEFT"], {1: 1, 2: 2})
 
-    def test_extracts_a_left_anchored_excerpt_from_a_deleted_file(self):
-        diff = """\
-diff --git a/old.txt b/old.txt
-deleted file mode 100644
-index 1111111..0000000
---- a/old.txt
-+++ /dev/null
-@@ -1,2 +0,0 @@
--one
--two
-"""
-
-        excerpt = MODULE.extract_diff_excerpt(diff, "old.txt", "LEFT", 2)
-
-        self.assertIn("--- a/old.txt", excerpt)
-        self.assertIn("+++ /dev/null", excerpt)
-        self.assertIn("-two", excerpt)
-
     def test_fetches_the_authoritative_gh_pr_diff(self):
         pr = {
             "repo_name": "owner/repo",
@@ -1146,419 +1128,18 @@ class ManagedCoordinatorTest(unittest.TestCase):
         }
         self.identity = {"head": "4" * 40, "status": ""}
 
-    def result(self, **overrides):
-        request_id = "request-1"
-        generated_head = "3" * 40
-        value = {
-            "schema": MODULE.AGENT_TASK_RESULT_SCHEMA,
-            "status": "success",
-            "mode": "report",
-            "repository": {"name_with_owner": self.pr["repo_name"]},
-            "pull_request": MODULE.expected_cloud_pull_request(self.pr),
-            "requested_model": "gpt-5.6-sol",
-            "policy": MODULE.AGENT_TASK_POLICY_IDENTITY,
-            "task": {
-                "id": "task-1",
-                "url": "https://github.com/owner/repo/agent-tasks/1",
-                "state": "completed",
-                "base_ref": "feature",
-                "base_sha": self.pr["head_sha"],
-            },
-            "generated": {
-                "branch": "copilot/task-1",
-                "head_sha": generated_head,
-                "commits": [],
-            },
-            "application": {
-                "status": "not_applicable",
-                "final_local_head": self.identity["head"],
-            },
-            "report": {
-                "path": f".github/agent-task-reports/{request_id}.md",
-                "commit": generated_head,
-                "sha256": "5" * 64,
-            },
-            "attestation": {
-                "kind": "dispatcher_structural",
-                "structural_complete": True,
-            },
-            "error": None,
-        }
-        value.update(overrides)
-        return value
-
-    def report(self, *, candidate=False, **fields):
-        metadata = {
-            "Repository": self.pr["repo_name"],
-            "Pull request": f"#{self.pr['number']}",
-            "Head SHA": self.pr["head_sha"],
-            "Base SHA": self.pr["base"]["sha"],
-            "Review complete": "yes",
-            "Changed files reviewed": "2",
-        }
-        metadata.update(fields)
-        lines = ["# PR review report", ""]
-        lines.extend(f"- **{label}:** `{value}`" for label, value in metadata.items())
-        if not candidate:
-            lines.extend(["", "## No findings", ""])
-        else:
-            lines.extend(
-                [
-                    "",
-                    "## Candidate findings",
-                    "",
-                    "### [blocking] Wrong result",
-                    "",
-                    "- **File:** `src/one.py`",
-                    "- **Anchor:** `RIGHT:2`",
-                    "- **Confidence:** `0.98`",
-                    "",
-                    "The changed branch returns the wrong result.",
-                    "",
-                    "Evidence: the changed line reaches the failing branch.",
-                    "",
-                ]
-            )
-        return "\n".join(lines)
-
-    def test_worker_prompt_requires_artifact_commit_for_no_findings(self):
-        prompt = MODULE.build_worker_prompt(
-            self.pr,
-            {"login": "viewer"},
-            "gpt-5.6-sol",
-            ["src/one.py", "docs/two.md"],
-        )
-
-        self.assertEqual(MODULE.WORKER_PROMPT_VERSION, 5)
-        self.assertIn(
-            "Write exactly one human-readable Markdown report",
-            prompt,
-        )
-        self.assertIn(
-            "create the exact final commit required by the marketplace policy footer",
-            prompt,
-        )
-        self.assertIn("even when there are no findings", prompt)
-        self.assertIn(
-            "A chat response without that committed report is a failed task",
-            prompt,
-        )
-        self.assertIn("`{{MARKETPLACE_REPORT_PATH}}`", prompt)
-        self.assertNotIn("{{MARKETPLACE_VALIDATION_PATH}}", prompt)
-        self.assertNotIn('"command": "full-diff-reviewed"', prompt)
-        self.assertNotIn('"changed_files":', prompt)
-        self.assertNotIn('"candidates":', prompt)
-        self.assertNotIn("candidate-report.json", prompt)
-        self.assertNotIn("worker-validation.json", prompt)
-        self.assertIn("- **Review complete:** yes", prompt)
-        self.assertIn("## Candidate findings", prompt)
-
-    def test_validates_success_and_no_findings_reports(self):
-        result = self.result()
-        remote = MODULE.validate_success_result(
-            result,
-            pr=self.pr,
-            requested_model="gpt-5.6-sol",
-            identity=self.identity,
-        )
-        report = MODULE.validate_candidate_report(
-            self.report(),
-            pr=self.pr,
-            anchors=MODULE.parse_unified_diff(DIFF),
-            changed_paths=["src/one.py", "docs/two.md"],
-        )
-
-        self.assertEqual(report["candidates"], [])
-        self.assertEqual(remote["generated_head"], "3" * 40)
-
-    def test_validates_candidate_schema_and_changed_anchor(self):
-        report = MODULE.validate_candidate_report(
-            self.report(candidate=True),
-            pr=self.pr,
-            anchors=MODULE.parse_unified_diff(DIFF),
-            changed_paths=["src/one.py", "docs/two.md"],
-        )
-
-        self.assertEqual(report["candidates"][0]["candidate_id"], "candidate-001")
-        excerpt = MODULE.extract_diff_excerpt(DIFF, "src/one.py", "RIGHT", 2)
-        self.assertIn("+++ b/src/one.py", excerpt)
-        self.assertIn("+new four", excerpt)
-        self.assertNotIn("@@ -20,2 +21,2 @@", excerpt)
-
-        stale = self.report(candidate=True).replace("RIGHT:2", "RIGHT:999")
-        with self.assertRaisesRegex(MODULE.WorkflowError, "not a changed RIGHT line"):
-            MODULE.validate_candidate_report(
-                stale,
-                pr=self.pr,
-                anchors=MODULE.parse_unified_diff(DIFF),
-                changed_paths=["src/one.py", "docs/two.md"],
-            )
-
-    def test_rejects_malformed_candidates_and_credentials(self):
-        malformed = self.report(candidate=True).replace(
-            "- **Anchor:** `RIGHT:2`\n", ""
-        )
-        with self.assertRaisesRegex(MODULE.WorkflowError, "no reconstructable"):
-            MODULE.validate_candidate_report(
-                malformed,
-                pr=self.pr,
-                anchors=MODULE.parse_unified_diff(DIFF),
-                changed_paths=["src/one.py", "docs/two.md"],
-            )
-
-        credential = self.report(candidate=True) + (
-            "\ntoken=github_pat_" + "a" * 20
-        )
-        with self.assertRaisesRegex(MODULE.WorkflowError, "credentials"):
-            MODULE.validate_candidate_report(
-                credential,
-                pr=self.pr,
-                anchors=MODULE.parse_unified_diff(DIFF),
-                changed_paths=["src/one.py", "docs/two.md"],
-            )
-
-    def test_rejects_wrong_policy_repo_pr_head_and_model(self):
-        cases = [
-            ("policy", {"policy": {"id": "wrong", "version": 1, "sha256": "x"}}),
-            ("repository", {"repository": {"name_with_owner": "other/repo"}}),
-            ("pull request", {"pull_request": {}}),
-            ("model", {"requested_model": "gpt-5.6-terra"}),
-        ]
-        for label, change in cases:
-            with self.subTest(label=label):
-                with self.assertRaisesRegex(MODULE.WorkflowError, "does not match"):
-                    MODULE.validate_result_identity(
-                        self.result(**change),
-                        pr=self.pr,
-                        requested_model="gpt-5.6-sol",
-                        identity=self.identity,
-                    )
-
-    def test_rejects_malformed_results_tasks_and_incomplete_attestation(self):
-        with tempfile.TemporaryDirectory() as directory:
-            result_path = Path(directory) / "result.json"
-            result_path.write_text('{"schema":', encoding="utf-8")
-            with self.assertRaisesRegex(MODULE.WorkflowError, "invalid JSON"):
-                MODULE.load_agent_task_result(result_path)
-
-        malformed_task = self.result(task={})
-        with self.assertRaisesRegex(MODULE.WorkflowError, "malformed task"):
-            MODULE.validate_success_result(
-                malformed_task,
-                pr=self.pr,
-                requested_model="gpt-5.6-sol",
-                identity=self.identity,
-            )
-        incomplete = self.result(
-            attestation={
-                "kind": "dispatcher_structural",
-                "structural_complete": False,
-            }
-        )
-        with self.assertRaisesRegex(MODULE.WorkflowError, "malformed task|identity"):
-            MODULE.validate_success_result(
-                incomplete,
-                pr=self.pr,
-                requested_model="gpt-5.6-sol",
-                identity=self.identity,
-            )
-
-    def test_rejects_unexpected_report_commit_paths(self):
-        remote = MODULE.validate_success_result(
-            self.result(),
-            pr=self.pr,
-            requested_model="gpt-5.6-sol",
-            identity=self.identity,
-        )
-        commit = {
-            "sha": remote["generated_head"],
-            "parents": [{"sha": self.pr["head_sha"]}],
-            "files": [
-                {"filename": remote["report_path"]},
-                {"filename": "unexpected.txt"},
-            ],
-        }
-        with mock.patch.object(MODULE, "gh_json", return_value=commit):
-            with self.assertRaisesRegex(MODULE.WorkflowError, "exactly one"):
-                MODULE.validate_report_commit(self.pr, remote)
-
-        fixture = json.loads(
-            (
-                Path(__file__).parent
-                / "fixtures"
-                / "task-92e6f838-artifact-path-failure.json"
-            ).read_text(encoding="utf-8")
-        )
-        production_pr = {
-            **self.pr,
-            "head_sha": fixture["source_head"],
-        }
-        production_remote = {
-            **remote,
-            "generated_head": fixture["generated_commit"],
-            "report_path": fixture["assigned_paths"][0],
-        }
-        failed_commit = {
-            "sha": fixture["generated_commit"],
-            "parents": [{"sha": fixture["source_head"]}],
-            "files": [
-                {"filename": path}
-                for path in fixture["produced_paths"]
-            ],
-        }
-        with mock.patch.object(MODULE, "gh_json", return_value=failed_commit):
-            with self.assertRaisesRegex(MODULE.WorkflowError, "exactly one"):
-                MODULE.validate_report_commit(production_pr, production_remote)
-
-    def test_rejects_wrong_task_and_markdown_identity(self):
-        wrong_task = self.result()
-        wrong_task["task"]["base_sha"] = "9" * 40
-        with self.assertRaisesRegex(MODULE.WorkflowError, "malformed task"):
-            MODULE.validate_success_result(
-                wrong_task,
-                pr=self.pr,
-                requested_model="gpt-5.6-sol",
-                identity=self.identity,
-            )
-
-        wrong_report = self.report().replace("owner/repo", "other/repo")
-        with self.assertRaisesRegex(MODULE.WorkflowError, "Repository"):
-            MODULE.validate_candidate_report(
-                wrong_report,
-                pr=self.pr,
-                anchors=MODULE.parse_unified_diff(DIFF),
-                changed_paths=["src/one.py", "docs/two.md"],
-            )
-
-    def test_rejects_ambiguous_markdown_candidate_sections(self):
-        report = self.report(candidate=True) + "\n## No findings\n"
-        with self.assertRaisesRegex(MODULE.WorkflowError, "ambiguous"):
-            MODULE.validate_candidate_report(
-                report,
-                pr=self.pr,
-                anchors=MODULE.parse_unified_diff(DIFF),
-                changed_paths=["src/one.py", "docs/two.md"],
-            )
-
-    def test_candidate_section_stops_at_the_next_report_section(self):
-        report = self.report(candidate=True) + (
-            "\n## Discovery notes\n\nThis is not candidate evidence.\n"
-        )
-
-        candidates = MODULE.parse_markdown_candidates(
-            report,
-            anchors=MODULE.parse_unified_diff(DIFF),
-            changed_paths=["src/one.py", "docs/two.md"],
-        )
-
-        self.assertNotIn("Discovery notes", candidates[0]["report_excerpt"])
-
-    def test_rejects_candidate_anchor_ambiguous_between_diff_sides(self):
-        report = self.report(candidate=True).replace("RIGHT:2", "2")
-
-        with self.assertRaisesRegex(MODULE.WorkflowError, "ambiguous"):
-            MODULE.parse_markdown_candidates(
-                report,
-                anchors=MODULE.parse_unified_diff(DIFF),
-                changed_paths=["src/one.py", "docs/two.md"],
-            )
-
-    def test_rejects_candidate_without_concrete_evidence(self):
-        report = self.report(candidate=True).replace(
-            "The changed branch returns the wrong result.\n\n"
-            "Evidence: the changed line reaches the failing branch.",
-            "",
-        )
-
-        with self.assertRaisesRegex(MODULE.WorkflowError, "concrete Markdown evidence"):
-            MODULE.parse_markdown_candidates(
-                report,
-                anchors=MODULE.parse_unified_diff(DIFF),
-                changed_paths=["src/one.py", "docs/two.md"],
-            )
-
-    def test_rejects_duplicate_candidate_fields(self):
-        report = self.report(candidate=True).replace(
-            "- **Anchor:** `RIGHT:2`",
-            "- **Anchor:** `RIGHT:2`\n- **Anchor:** `LEFT:2`",
-        )
-
-        with self.assertRaisesRegex(MODULE.WorkflowError, "duplicate Anchor"):
-            MODULE.parse_markdown_candidates(
-                report,
-                anchors=MODULE.parse_unified_diff(DIFF),
-                changed_paths=["src/one.py", "docs/two.md"],
-            )
-
-    def test_rejects_oversized_report_and_candidate_fanout(self):
-        with self.assertRaisesRegex(MODULE.WorkflowError, "1 MiB"):
-            MODULE.parse_markdown_candidates(
-                "x" * (MODULE.MAX_REPORT_BYTES + 1),
-                anchors=MODULE.parse_unified_diff(DIFF),
-                changed_paths=["src/one.py", "docs/two.md"],
-            )
-
-        candidate_section = self.report(candidate=True).split(
-            "## Candidate findings\n\n",
-            1,
-        )[1]
-        report = "## Candidate findings\n\n" + (
-            candidate_section * (MODULE.MAX_CANDIDATES + 1)
-        )
-        with self.assertRaisesRegex(MODULE.WorkflowError, "candidate limit"):
-            MODULE.parse_markdown_candidates(
-                report,
-                anchors=MODULE.parse_unified_diff(DIFF),
-                changed_paths=["src/one.py", "docs/two.md"],
-            )
-
-    def test_extracts_candidate_from_task_47_markdown_fixture(self):
-        report = (
-            (
-                Path(__file__).parent
-                / "fixtures"
-                / "task-47d8715a-candidate-report.md"
-            ).read_text(encoding="utf-8")
-        )
-        path = (
-            "instrumentation/grpc-1.6/testing/src/main/java/"
-            "io/opentelemetry/instrumentation/grpc/v1_6/AbstractGrpcTest.java"
-        )
-        anchors = {path: {"RIGHT": {1754: 1}, "LEFT": {}}}
-
-        candidates = MODULE.parse_markdown_candidates(
-            report,
-            anchors=anchors,
-            changed_paths=[path],
-        )
-
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["path"], path)
-        self.assertEqual(candidates[0]["anchor"]["line"], 1754)
-        self.assertEqual(candidates[0]["anchor"]["side"], "RIGHT")
-        with self.assertRaisesRegex(MODULE.WorkflowError, "Repository"):
-            MODULE.validate_candidate_report(
-                report,
-                pr={
-                    **self.pr,
-                    "repo_name": "open-telemetry/opentelemetry-java-instrumentation",
-                    "number": 20130,
-                    "head_sha": "fc375c2363c743c1f63370b1ac85f55f973e3943",
-                },
-                anchors=anchors,
-                changed_paths=[path],
-            )
-
     def test_task_failure_is_deterministic(self):
         error = MODULE.task_failure_from_result(
-            self.result(
-                status="failure",
-                error={"code": "task_failed", "message": "worker stopped"},
-            )
+            {
+                "status": "failure",
+                "error": {"code": "task_failed", "message": "worker stopped"},
+            }
         )
         self.assertEqual(str(error), "Agent Task failed [task_failed]: worker stopped")
 
-    def hosted_check(self, *, nonempty=False, reject_all=False, incomplete=False):
+    def hosted_check(
+        self, *, nonempty=False, reject_all=False, incomplete=False, source_drift=False
+    ):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name).resolve()
@@ -1609,6 +1190,22 @@ class ManagedCoordinatorTest(unittest.TestCase):
                 },
             }
         runtime.verify_candidate_result.side_effect = verify
+        snapshot_check = (
+            [
+                None,
+                MODULE.WorkflowError(
+                    "live pull request state changed after hosted discovery",
+                    details={
+                        "reason": "head_changed",
+                        "expected_head_sha": self.pr["head_sha"],
+                        "observed_head_sha": "9" * 40,
+                        "source_mutation_performed": False,
+                    },
+                ),
+            ]
+            if source_drift
+            else None
+        )
         with (
             mock.patch.object(MODULE, "preflight", return_value=(
                 self.pr, "viewer", MODULE.parse_unified_diff(DIFF), None, None, [], [], DIFF,
@@ -1618,7 +1215,11 @@ class ManagedCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "state_path_for", return_value=state_path),
             mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
             mock.patch.object(MODULE, "load_candidate_runtime", return_value=runtime),
-            mock.patch.object(MODULE, "ensure_snapshot_unchanged"),
+            mock.patch.object(
+                MODULE,
+                "ensure_snapshot_unchanged",
+                side_effect=snapshot_check,
+            ),
             mock.patch.object(MODULE, "run", side_effect=invoke),
             mock.patch.object(MODULE, "emit") as emit,
         ):
@@ -1729,6 +1330,26 @@ class ManagedCoordinatorTest(unittest.TestCase):
         self.assertEqual("task-1", state["agent_task"]["task"]["id"])
         self.assertEqual(3, len(state["agent_task"]["recovery_files"]))
         self.assertTrue(all(Path(path).exists() for path in state["agent_task"]["recovery_files"]))
+
+    def test_source_drift_preserves_completed_discovery_without_mutation(self):
+        commands, state, payload = self.hosted_check(source_drift=True)
+
+        self.assertEqual(1, len(commands))
+        self.assertEqual("incomplete", payload["result"])
+        self.assertEqual("head_changed", payload["reason"])
+        self.assertEqual(self.pr["head_sha"], payload["expected_head_sha"])
+        self.assertEqual("9" * 40, payload["observed_head_sha"])
+        self.assertEqual(1, payload["consumed_allowance"])
+        self.assertEqual(0, payload["remaining_allowance"])
+        self.assertFalse(payload["source_mutation_performed"])
+        self.assertFalse(payload["review_mutation_performed"])
+        self.assertFalse(payload["adoption_performed"])
+        self.assertFalse(payload["rebase_performed"])
+        self.assertFalse(payload["publication_performed"])
+        self.assertRegex(payload["result_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual("head_changed", state["agent_task"]["status"])
+        self.assertEqual("task-1", state["agent_task"]["task"]["id"])
+        self.assertEqual("not_attempted", state["mutation"]["status"])
 
     def test_main_emits_workflow_error_details(self):
         error = MODULE.WorkflowError(

@@ -4,9 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
-import base64
-import binascii
 import datetime as dt
 import hashlib
 import json
@@ -19,8 +16,7 @@ import sys
 from types import ModuleType
 import tempfile
 import time
-from typing import Any, Iterable
-import urllib.parse
+from typing import Any
 import uuid
 
 
@@ -37,13 +33,6 @@ PR_URL_PATTERN = re.compile(
 SHORT_TARGET_PATTERN = re.compile(
     r"^(?P<owner>[^/\s]+)/(?P<repo>[^#/\s]+)#(?P<number>\d+)$"
 )
-HUNK_PATTERN = re.compile(
-    r"^@@ -(?P<old>\d+)(?:,(?P<old_count>\d+))? "
-    r"\+(?P<new>\d+)(?:,(?P<new_count>\d+))? @@"
-)
-CANDIDATE_KEYS = {"path", "line", "side", "body"}
-GITHUB_PR_DIFF = "github_pr_diff"
-CUMULATIVE_GIT_DIFF = "cumulative_git_diff"
 BARE_TARGET_PATTERN = re.compile(r"^#?(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
     "fc1c2217425c4ecfe9399ef72526041e01a31c79bd6ca43c907fc37b1957ba72"
@@ -54,26 +43,6 @@ CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
 AGENT_TASK_POLICY = "marketplace-agent-code-candidate-worker@1"
 AUDIT_OUTCOME_PATH = ".github/agent-task-output/audit-result.json"
 CANDIDATE_RESULT_SCHEMA = {"id": "github.copilot.agent-task-result", "version": 5}
-AGENT_TASK_POLICY_SHA256 = (
-    "7d48868140710139939cabc803a99f2122305e97dedbffa747e5f69903c16af1"
-)
-LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2 = {
-    "id": "marketplace-agent-apply-report-worker",
-    "version": 2,
-    "sha256": "411a9ba9a0931d40c685c6233639b15c31e0d6daa4b29706527424016367cad2",
-}
-AGENT_TASK_RESULT_SCHEMA = {
-    "id": "github.copilot.agent-task-result",
-    "version": 2,
-}
-LEGACY_AGENT_TASK_RESULT_SCHEMA = {
-    "id": "github.copilot.agent-task-result",
-    "version": 1,
-}
-AUDIT_REPORT_SCHEMA = {
-    "id": "github.copilot.historical-pr-audit-report",
-    "version": 1,
-}
 WORKER_PROMPT_VERSION = 2
 MODEL_ALIASES = {
     "luna": "gpt-5.6-luna",
@@ -81,14 +50,6 @@ MODEL_ALIASES = {
     "sol": "gpt-5.6-sol",
     "astra": "gpt-6-astra",
 }
-SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
-REPORT_PATH_PATTERN = re.compile(
-    r"^\.github/agent-task-reports/(?P<request_id>[A-Za-z0-9][A-Za-z0-9._-]*)\.md$"
-)
-RECEIPT_PATH_PATTERN = re.compile(
-    r"^\.github/agent-task-validations/(?P<request_id>[A-Za-z0-9][A-Za-z0-9._-]*)\.json$"
-)
-
 # Five commit identities travel through this workflow and none of them is
 # interchangeable with another:
 #
@@ -261,21 +222,6 @@ def gh_json(arguments: list[str]) -> Any:
         return json.loads(output) if output.strip() else None
     except json.JSONDecodeError as error:
         raise WorkflowError(f"gh returned invalid JSON: {error}") from error
-
-
-def graphql(query: str, variables: dict[str, str | int | None]) -> Any:
-    arguments = ["api", "graphql", "-f", f"query={query}"]
-    for name, value in variables.items():
-        if value is None:
-            arguments.extend(["-F", f"{name}=null"])
-        else:
-            flag = "-F" if isinstance(value, int) else "-f"
-            arguments.extend([flag, f"{name}={value}"])
-    payload = gh_json(arguments)
-    errors = payload.get("errors") if isinstance(payload, dict) else None
-    if errors:
-        raise WorkflowError(f"GraphQL failed: {json.dumps(errors, sort_keys=True)}")
-    return payload
 
 
 def utc_now() -> str:
@@ -624,423 +570,6 @@ def normalized_commits(raw_commits: Any) -> list[dict[str, str]]:
     return commits
 
 
-REVIEW_THREADS_QUERY = """
-query($owner:String!,$repo:String!,$number:Int!,$after:String){
-  repository(owner:$owner,name:$repo){
-    pullRequest(number:$number){
-      reviewThreads(first:50,after:$after){
-        pageInfo{hasNextPage endCursor}
-        nodes{
-          isResolved isOutdated path line originalLine
-          comments(first:50){nodes{author{login} body createdAt}}
-        }
-      }
-    }
-  }
-}
-"""
-
-
-def review_threads_for(target: dict[str, Any]) -> list[dict[str, Any]]:
-    after: str | None = None
-    threads: list[dict[str, Any]] = []
-    while True:
-        payload = graphql(
-            REVIEW_THREADS_QUERY,
-            {
-                "owner": target["owner"],
-                "repo": target["repo"],
-                "number": target["number"],
-                "after": after,
-            },
-        )
-        repository = (payload.get("data") or {}).get("repository") or {}
-        pull_request = repository.get("pullRequest") or {}
-        connection = pull_request.get("reviewThreads")
-        if connection is None:
-            return threads
-        threads.extend(connection.get("nodes") or [])
-        page = connection.get("pageInfo") or {}
-        if not page.get("hasNextPage"):
-            return threads
-        after = page.get("endCursor")
-
-
-def original_context_for(target: dict[str, Any]) -> dict[str, Any]:
-    """Capture the discussion the merged pull request carried when it merged."""
-    payload = gh_json(
-        [
-            "pr",
-            "view",
-            target["pr_url"],
-            "--repo",
-            target["repo_name"],
-            "--json",
-            "body,closingIssuesReferences,comments,reviews",
-        ]
-    )
-    if not isinstance(payload, dict):
-        raise WorkflowError("gh pr view did not return PR discussion")
-    return {
-        "body": payload.get("body") or "",
-        "closing_issues": payload.get("closingIssuesReferences") or [],
-        "issue_comments": payload.get("comments") or [],
-        "reviews": payload.get("reviews") or [],
-        "review_threads": review_threads_for(target),
-    }
-
-
-def commit_paths(repo_root: Path, sha: str) -> list[str]:
-    """List every repository path one commit touches, sorted and deduplicated.
-
-    `-m` makes a merge commit report its changes against each parent instead of
-    reporting nothing, and `--root` does the same for a repository's first
-    commit, so no commit answers with an empty list it does not deserve.
-    """
-    output = run(
-        [
-            "git",
-            "-C",
-            str(repo_root),
-            "-c",
-            "core.quotePath=false",
-            "diff-tree",
-            "--root",
-            "--no-commit-id",
-            "--name-only",
-            "-z",
-            "-r",
-            "-m",
-            sha,
-        ]
-    ).stdout
-    return sorted({path for path in output.split("\0") if path})
-
-
-def commit_provenance(
-    repo_root: Path, commits: list[dict[str, str]]
-) -> list[dict[str, Any]]:
-    return [
-        {**commit, "files": commit_paths(repo_root, commit["sha"])}
-        for commit in commits
-    ]
-
-
-def audit_commits(repo_root: Path, original_head_sha: str) -> list[dict[str, str]]:
-    """List the commits this audit added on top of the original head, oldest first."""
-    output = git(
-        repo_root,
-        "log",
-        "--reverse",
-        "--format=%H%x1f%s",
-        f"{original_head_sha}..HEAD",
-    )
-    commits = []
-    for line in output.splitlines():
-        if not line.strip():
-            continue
-        sha, _, message = line.partition("\x1f")
-        commits.append({"sha": sha.strip(), "message": message.strip()})
-    return commits
-
-
-def decode_diff_path(value: str) -> str | None:
-    value = value.rstrip()
-    if value == "/dev/null":
-        return None
-    if value.startswith('"'):
-        try:
-            value = ast.literal_eval(value)
-        except (SyntaxError, ValueError) as error:
-            raise WorkflowError(f"invalid quoted path in PR diff: {value}") from error
-        try:
-            value = value.encode("latin-1").decode("utf-8")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            pass
-    else:
-        value = value.split("\t", 1)[0]
-    if value.startswith(("a/", "b/")):
-        value = value[2:]
-    if not value:
-        raise WorkflowError("empty file path in PR diff")
-    return value
-
-
-def parse_unified_diff(diff_text: str) -> dict[str, dict[str, set[int]]]:
-    anchors: dict[str, dict[str, set[int]]] = {}
-    old_path: str | None = None
-    new_path: str | None = None
-    path: str | None = None
-    old_line = new_line = 0
-    old_remaining = new_remaining = 0
-    in_hunk = False
-
-    def finish_hunk() -> None:
-        nonlocal in_hunk
-        if in_hunk and (old_remaining or new_remaining):
-            raise WorkflowError("PR diff ended before a hunk's declared line counts")
-        in_hunk = False
-
-    for raw_line in diff_text.split("\n"):
-        raw_line = raw_line.removesuffix("\r")
-        if raw_line.startswith("diff --git "):
-            finish_hunk()
-            old_path = new_path = path = None
-            continue
-        if not in_hunk and raw_line.startswith("--- "):
-            old_path = decode_diff_path(raw_line[4:])
-            continue
-        if not in_hunk and raw_line.startswith("+++ "):
-            new_path = decode_diff_path(raw_line[4:])
-            path = new_path or old_path
-            if path is None:
-                raise WorkflowError("PR diff file has no usable path")
-            anchors.setdefault(path, {"LEFT": set(), "RIGHT": set()})
-            continue
-
-        hunk = HUNK_PATTERN.match(raw_line)
-        if hunk:
-            finish_hunk()
-            if path is None:
-                raise WorkflowError("PR diff hunk appeared before file headers")
-            old_line = int(hunk.group("old"))
-            new_line = int(hunk.group("new"))
-            old_remaining = int(hunk.group("old_count") or 1)
-            new_remaining = int(hunk.group("new_count") or 1)
-            in_hunk = True
-            continue
-        if not in_hunk:
-            continue
-        if raw_line.startswith("\\"):
-            continue
-        if raw_line.startswith("+"):
-            anchors[path]["RIGHT"].add(new_line)
-            new_line += 1
-            new_remaining -= 1
-        elif raw_line.startswith("-"):
-            anchors[path]["LEFT"].add(old_line)
-            old_line += 1
-            old_remaining -= 1
-        elif raw_line.startswith(" "):
-            old_line += 1
-            new_line += 1
-            old_remaining -= 1
-            new_remaining -= 1
-        else:
-            raise WorkflowError(f"unexpected line inside PR diff hunk: {raw_line!r}")
-        if old_remaining < 0 or new_remaining < 0:
-            raise WorkflowError("PR diff hunk contains more lines than declared")
-        if old_remaining == 0 and new_remaining == 0:
-            in_hunk = False
-
-    finish_hunk()
-    return anchors
-
-
-def fetch_pr_diff(pr: dict[str, Any]) -> str:
-    """Read the diff GitHub reports for the merged pull request itself."""
-    return gh(["pr", "diff", pr["pr_url"], "--repo", pr["repo_name"]]).stdout
-
-
-def cumulative_diff(repo_root: Path, base_sha: str, head_sha: str) -> str:
-    """Diff the original merge base against the current audit head.
-
-    The three-dot form matches the pull request diff even when the base advanced
-    after the head branch split. Both named commits are pinned, so no branch
-    that moved after the merge can reach this changeset.
-    """
-    return run(
-        [
-            "git",
-            "-C",
-            str(repo_root),
-            "diff",
-            "--no-color",
-            f"{base_sha}...{head_sha}",
-        ]
-    ).stdout
-
-
-def serialize_anchors(
-    anchors: dict[str, dict[str, set[int]]]
-) -> dict[str, dict[str, list[int]]]:
-    return {
-        path: {side: sorted(lines) for side, lines in sides.items()}
-        for path, sides in anchors.items()
-    }
-
-
-def load_candidate_input(path_value: str) -> list[dict[str, Any]]:
-    try:
-        text = (
-            sys.stdin.read()
-            if path_value == "-"
-            else cli_path(path_value).read_text(encoding="utf-8")
-        )
-    except OSError as error:
-        raise WorkflowError(f"could not read candidates JSON: {error}") from error
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError as error:
-        raise WorkflowError(f"candidates are not valid JSON: {error}") from error
-    if not isinstance(payload, list):
-        raise WorkflowError("candidates JSON must be an array")
-    return payload
-
-
-def load_text_input(path_value: str, label: str) -> str:
-    try:
-        text = (
-            sys.stdin.read()
-            if path_value == "-"
-            else cli_path(path_value).read_text(encoding="utf-8")
-        )
-    except OSError as error:
-        raise WorkflowError(f"could not read {label}: {error}") from error
-    if not text.strip():
-        raise WorkflowError(f"{label} must not be empty")
-    return text.strip()
-
-
-def validate_candidates(
-    candidates: list[dict[str, Any]],
-    anchors: dict[str, dict[str, list[int]]],
-) -> list[dict[str, Any]]:
-    if not candidates:
-        raise WorkflowError("at least one candidate is required")
-    normalized: list[dict[str, Any]] = []
-    for index, candidate in enumerate(candidates):
-        if not isinstance(candidate, dict):
-            raise WorkflowError(f"candidate {index} must be an object")
-        unknown = set(candidate) - CANDIDATE_KEYS
-        missing = CANDIDATE_KEYS - set(candidate)
-        if unknown or missing:
-            details = []
-            if unknown:
-                details.append(f"unexpected keys: {', '.join(sorted(unknown))}")
-            if missing:
-                details.append(f"missing keys: {', '.join(sorted(missing))}")
-            raise WorkflowError(
-                f"candidate {index} has invalid keys ({'; '.join(details)}); "
-                "expected exactly: path, line, side, body"
-            )
-        path = candidate["path"]
-        line = candidate["line"]
-        side = candidate["side"]
-        body = candidate["body"]
-        if not isinstance(path, str) or not path:
-            raise WorkflowError(f"candidate {index} has an invalid path")
-        if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
-            raise WorkflowError(f"candidate {index} has an invalid line")
-        if not isinstance(side, str) or side not in {"LEFT", "RIGHT"}:
-            raise WorkflowError(f"candidate {index} side must be LEFT or RIGHT")
-        if not isinstance(body, str) or not body.strip():
-            raise WorkflowError(f"candidate {index} body must not be empty")
-        if path not in anchors:
-            raise WorkflowError(
-                f"candidate {index} anchor path is not in the pinned diff: {path}; "
-                f"changed paths: {', '.join(sorted(anchors))}"
-            )
-        accepted_lines = anchors[path][side]
-        if line not in set(accepted_lines):
-            if accepted_lines:
-                nearest = min(accepted_lines, key=lambda value: (abs(value - line), value))
-                guidance = (
-                    f"nearest valid {side} line: {nearest}; "
-                    f"accepted {side} lines: {', '.join(map(str, accepted_lines))}"
-                )
-            else:
-                other_side = "LEFT" if side == "RIGHT" else "RIGHT"
-                other_lines = anchors[path][other_side]
-                guidance = f"{path} has no changed {side} lines"
-                if other_lines:
-                    guidance += (
-                        f"; accepted {other_side} lines: "
-                        f"{', '.join(map(str, other_lines))}"
-                    )
-            raise WorkflowError(
-                f"candidate {index} anchor is not a changed {side} line: "
-                f"{path}:{line}; {guidance}"
-            )
-        normalized.append({"path": path, "line": line, "side": side, "body": body.strip()})
-    return normalized
-
-
-def active_audit(state: dict[str, Any]) -> dict[str, Any]:
-    audit = state.get("audit")
-    if not audit:
-        raise WorkflowError("state has no audit")
-    if audit.get("status") == "published":
-        raise WorkflowError(
-            "this iteration is already published; run preflight to start the next one"
-        )
-    return audit
-
-
-def find_candidates(audit: dict[str, Any], ids: Iterable[int]) -> list[dict[str, Any]]:
-    by_id = {candidate["id"]: candidate for candidate in audit["candidates"]}
-    missing = [candidate_id for candidate_id in ids if candidate_id not in by_id]
-    if missing:
-        raise WorkflowError(f"candidates are not registered: {missing}")
-    return [by_id[candidate_id] for candidate_id in ids]
-
-
-def history_outcome(candidate: dict[str, Any]) -> str:
-    status = candidate.get("status")
-    if status == "handled":
-        return "addressed" if candidate.get("commit") else "no_code"
-    if status in {"dropped", "skipped"}:
-        return status
-    return "unresolved"
-
-
-def archive_audit(state: dict[str, Any]) -> None:
-    """Fold a finished iteration's resolved candidates into the carried-forward history.
-
-    Candidates an interrupted run never resolved are deliberately left out so a later
-    audit can raise them again.
-    """
-    audit = state.get("audit")
-    if not audit:
-        return
-    history = state.setdefault("history", [])
-    recorded = {entry["id"] for entry in history}
-    for candidate in audit.get("candidates") or []:
-        if candidate["id"] in recorded or candidate.get("status") not in {
-            "handled",
-            "dropped",
-        }:
-            continue
-        history.append(
-            {
-                "id": candidate["id"],
-                "iteration": audit.get("iteration"),
-                "path": candidate["path"],
-                "line": candidate["line"],
-                "side": candidate["side"],
-                "body": candidate["body"],
-                "outcome": history_outcome(candidate),
-                "detail": candidate.get("rationale") or candidate.get("summary"),
-                "commit": candidate.get("commit"),
-            }
-        )
-
-
-def compare_history_commits(
-    history: list[dict[str, Any]], commits: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    shas = {commit["sha"] for commit in commits}
-    return [
-        {
-            "history_id": entry["id"],
-            "commit": entry["commit"],
-            "in_audit_commits": entry["commit"] in shas,
-        }
-        for entry in history
-        if entry.get("commit")
-    ]
-
-
 def require_clean_worktree(repo_root: Path) -> None:
     dirty = git(repo_root, "status", "--porcelain=v1")
     if dirty:
@@ -1188,36 +717,6 @@ def realign_branch(repo_root: Path, branch: str, sha: str) -> None:
     git(repo_root, "switch", branch)
 
 
-def resume_head_for(state: dict[str, Any]) -> str:
-    """Name the commit a next-iteration preflight is allowed to resume from.
-
-    Only a published iteration leaves a head this audit can prove it created,
-    so every other stored state is refused rather than adopted. Without that
-    proof any local branch whose tip happens to contain the pinned original
-    head, such as a renamed live default branch, would look like the audit.
-    """
-    audit = state.get("audit")
-    if not isinstance(audit, dict):
-        raise WorkflowError(
-            "this state records no previous iteration to resume from; delete the "
-            "state file and start the audit again"
-        )
-    status = audit.get("status")
-    if status != "published":
-        raise WorkflowError(
-            f"the previous iteration is {status or 'in an unknown state'!r}, not "
-            "'published'; an iteration that never published leaves no head this "
-            "audit can prove it created, so this run refuses to resume from it"
-        )
-    published = audit.get("published_head_sha")
-    if not isinstance(published, str) or not published.strip():
-        raise WorkflowError(
-            "the previous iteration records no published head, so this run refuses "
-            "to resume from it"
-        )
-    return published.strip()
-
-
 def prepare_audit_branch(
     repo_root: Path,
     *,
@@ -1337,816 +836,6 @@ def prepare_audit_branch(
         "local_head": settled_head,
         "reference": reference,
     }
-
-
-def stored_audit_summary(state: dict[str, Any]) -> dict[str, Any] | None:
-    """Summarize the stored audit compactly enough to report a stop without reading state."""
-    audit = state.get("audit")
-    if not isinstance(audit, dict):
-        return None
-    return {
-        "id": audit.get("id"),
-        "status": audit.get("status"),
-        "iteration": audit.get("iteration"),
-        "branch": audit.get("branch"),
-        "iteration_head_sha": audit.get("iteration_head_sha"),
-        "published_head_sha": audit.get("published_head_sha"),
-        "outcome": audit.get("outcome"),
-        "clean_at_head_sha": audit.get("clean_at_head_sha"),
-        "candidate_statuses": count_by_status(audit.get("candidates")),
-        "batch_statuses": count_by_status(audit.get("batches")),
-    }
-
-
-def whole_number(value: Any, fallback: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return fallback
-    return value
-
-
-def invocation_scope(
-    state: dict[str, Any], args: argparse.Namespace
-) -> dict[str, Any] | None:
-    """Scope a standalone budget to one explicit user invocation."""
-    if getattr(args, "new_invocation", False):
-        spent = int(state.get("iterations", 0))
-        return {
-            "run": uuid.uuid4().hex,
-            "baseline": spent,
-        }
-    run = getattr(args, "invocation_run", None)
-    if not isinstance(run, str) or not run:
-        return None
-    recorded = state.get("invocation_budget")
-    if not isinstance(recorded, dict) or recorded.get("run") != run:
-        raise WorkflowError(
-            "invocation run does not match the active invocation; start a new "
-            "explicit invocation with --new-invocation"
-        )
-    spent = int(state.get("iterations", 0))
-    return {
-        "run": run,
-        "baseline": whole_number(recorded.get("baseline"), spent),
-    }
-
-
-def invocation_iterations(
-    state: dict[str, Any], scope: dict[str, Any] | None
-) -> int:
-    spent = int(state.get("iterations", 0))
-    if scope is None:
-        return spent
-    return max(0, spent - whole_number(scope.get("baseline"), spent))
-
-
-def stored_stop_envelope(
-    result: str, state_path: Path, state: dict[str, Any], max_iterations: int
-) -> dict[str, Any]:
-    """Carry enough of the stored state for the agent to report a stop it caused.
-
-    A stop reads state and changes nothing: no GitHub call, no branch move, no
-    archived iteration, and no rewritten result file. Everything the final
-    response needs therefore has to travel in this envelope.
-    """
-    pr = state.get("pr") or {}
-    iterations = int(state.get("iterations", 0))
-    invocation = (
-        state.get("invocation_budget")
-        if state.get("budget_scope") == "invocation"
-        else None
-    )
-    return {
-        "result": result,
-        "state": str(state_path),
-        "repo_root": state.get("repo_root"),
-        "context_path": state.get("context_path"),
-        "pr": {
-            "number": pr.get("number"),
-            "title": pr.get("title"),
-            "pr_url": pr.get("pr_url"),
-            "repo_name": pr.get("repo_name"),
-            "state": pr.get("state"),
-            "merged_at": pr.get("merged_at"),
-            "head_branch": pr.get("head_branch"),
-            "base_branch": pr.get("base_branch"),
-        },
-        "audit_branch": state.get("audit_branch"),
-        "audit": stored_audit_summary(state),
-        "original_head_sha": (state.get("original") or {}).get("head_sha"),
-        "history": state.get("history") or [],
-        "local_validation": state.get("local_validation") or [],
-        **stage_outcome_fields(state),
-        "iterations": iterations,
-        "completed_iterations": invocation_iterations(state, invocation),
-        "max_iterations": max_iterations,
-        "budget_scope": state.get("budget_scope", "lifetime"),
-        "invocation_run": (
-            invocation.get("run") if isinstance(invocation, dict) else None
-        ),
-        "pushed": False,
-    }
-
-
-def command_preflight(args: argparse.Namespace) -> None:
-    require_tools()
-    repo_root = resolve_repo_root(args.repo_root)
-    target = parse_target(args.target)
-    state_path = cli_path(args.state) if args.state else default_state_path(target)
-    state = load_state(state_path) if state_path.is_file() else None
-    audit_branch = audit_branch_name(target["number"])
-    context_path = context_path_for(state_path)
-    max_iterations = getattr(args, "max_iterations", DEFAULT_MAX_ITERATIONS)
-    budget_state = state if state is not None else {"iterations": 0}
-    invocation = invocation_scope(budget_state, args)
-    if (
-        state is not None
-        and invocation is None
-        and state.get("budget_scope") == "invocation"
-        and isinstance(state.get("invocation_budget"), dict)
-    ):
-        raise WorkflowError(
-            "an explicit standalone invocation is active; pass its --invocation-run "
-            "token to continue it, or use --new-invocation for a new user invocation"
-        )
-    if invocation is not None:
-        budget_state["invocation_budget"] = invocation
-        budget_state["budget_scope"] = "invocation"
-
-    # Both stops read stored state and answer from it alone. Anything below this
-    # point reads GitHub, moves the audit branch, archives the previous
-    # iteration, or overwrites a result file, and a run that must stop has no
-    # business doing any of it.
-    if state is not None:
-        clean_head = recorded_clean_at_head_sha(state)
-        if clean_head is not None:
-            emit(
-                {
-                    **stored_stop_envelope(
-                        "already_complete", state_path, state, max_iterations
-                    ),
-                    "clean_at_head_sha": clean_head,
-                }
-            )
-            return
-        if invocation_iterations(state, invocation) >= max_iterations:
-            emit(
-                stored_stop_envelope(
-                    "max_iterations_reached", state_path, state, max_iterations
-                )
-            )
-            return
-
-    resuming = bool(state and state.get("original"))
-    expected_resume_head = resume_head_for(state) if resuming else None
-
-    require_clean_worktree(repo_root)
-
-    metadata = merged_metadata_for(target)
-    if resuming:
-        original = state["original"]
-    else:
-        context = original_context_for(target)
-        diff_text = fetch_pr_diff(metadata)
-        refreshed = merged_metadata_for(target)
-        if (
-            refreshed["head_sha"] != metadata["head_sha"]
-            or refreshed["base_sha"] != metadata["base_sha"]
-        ):
-            raise WorkflowError(
-                "head_moved: the merged snapshot changed while the pull request diff "
-                f"was captured: expected {metadata['base_sha']}..{metadata['head_sha']}, "
-                f"got {refreshed['base_sha']}..{refreshed['head_sha']}"
-            )
-        original = {
-            "base_sha": metadata["base_sha"],
-            "head_sha": metadata["head_sha"],
-            "base_branch": metadata["base_branch"],
-            "head_branch": metadata["head_branch"],
-            "merge_commit": metadata["merge_commit"],
-            "merged_at": metadata["merged_at"],
-            "captured_at": utc_now(),
-            "commits": metadata["commits"],
-        }
-
-    branch_state = prepare_audit_branch(
-        repo_root,
-        pr=metadata,
-        audit_branch=audit_branch,
-        original_head_sha=original["head_sha"],
-        original_base_sha=original["base_sha"],
-        resuming=resuming,
-        expected_resume_head=expected_resume_head,
-    )
-    local_head = branch_state["local_head"]
-
-    if resuming:
-        diff_text = cumulative_diff(repo_root, original["base_sha"], local_head)
-        diff_source = CUMULATIVE_GIT_DIFF
-    else:
-        diff_source = GITHUB_PR_DIFF
-        original["commits"] = commit_provenance(repo_root, original["commits"])
-        write_result_file(
-            context_path,
-            {
-                "captured_at": original["captured_at"],
-                "pr": metadata,
-                "original": {
-                    key: value for key, value in original.items() if key != "commits"
-                },
-                "commits": original["commits"],
-                **context,
-            },
-            "context",
-        )
-    anchors = parse_unified_diff(diff_text)
-    commits_added = audit_commits(repo_root, original["head_sha"])
-
-    if state is None:
-        state = {
-            "version": STATE_VERSION,
-            "created_at": utc_now(),
-            "iterations": 0,
-            "next_candidate_id": 1,
-            "history": [],
-        }
-    if invocation is not None:
-        state["invocation_budget"] = invocation
-        state["budget_scope"] = "invocation"
-    elif "budget_scope" not in state:
-        state["budget_scope"] = "lifetime"
-    if not resuming:
-        state["context_counts"] = {
-            "issue_comments": len(context["issue_comments"]),
-            "review_threads": len(context["review_threads"]),
-            "reviews": len(context["reviews"]),
-            "closing_issues": len(context["closing_issues"]),
-        }
-    archive_audit(state)
-    state["iterations"] = int(state.get("iterations", 0))
-    history_commit_presence = compare_history_commits(state["history"], commits_added)
-    history_commits_missing = sum(
-        not entry["in_audit_commits"] for entry in history_commit_presence
-    )
-    iteration = state["iterations"] + 1
-    completed_iterations = invocation_iterations(state, invocation)
-    result = "ready"
-
-    diff_path = diff_path_for(state_path)
-    diff_path.parent.mkdir(parents=True, exist_ok=True)
-    diff_path.write_text(diff_text, encoding="utf-8", newline="")
-
-    audit_block = {
-        "branch": audit_branch,
-        "base_sha": original["base_sha"],
-        "head_sha": original["head_sha"],
-        "local_head": local_head,
-        "iteration_head_sha": local_head,
-        "diff_source": diff_source,
-        "branch_action": branch_state["branch_action"],
-        "head_ref_moved": metadata["head_sha"] != original["head_sha"],
-        "base_ref_moved": metadata["base_sha"] != original["base_sha"],
-    }
-    state.update(
-        {
-            "repo_root": str(repo_root),
-            "pr": metadata,
-            "original": original,
-            "context_path": str(context_path),
-            "audit_branch": audit_branch,
-            "audit": {
-                "id": f"pr-{metadata['number']}-audit-{iteration}",
-                "status": "active",
-                "iteration": iteration,
-                "iteration_head_sha": local_head,
-                "diff_path": str(diff_path),
-                "diff_source": diff_source,
-                "branch": audit_branch,
-                "audit_commits": commits_added,
-                "history_commit_presence": history_commit_presence,
-                "anchors": serialize_anchors(anchors),
-                "candidates": [],
-                "batches": [],
-            },
-        }
-    )
-    save_state(state_path, state)
-
-    changed_files = sorted(anchors)
-    counts = {
-        "changed_files": len(changed_files),
-        "original_commits": len(original["commits"]),
-        "audit_commits": len(commits_added),
-        "history": len(state["history"]),
-        "history_commits_missing": history_commits_missing,
-        **state.get("context_counts", {}),
-    }
-    preflight_path = preflight_path_for(state_path)
-    payload = {
-        "result": result,
-        "state": str(state_path),
-        "context_path": str(context_path),
-        "repo_root": str(repo_root),
-        "pr": metadata,
-        "original": original,
-        "audit": audit_block,
-        "head_sha": original["head_sha"],
-        "diff_path": str(diff_path),
-        "changed_files": changed_files,
-        "original_commits": original["commits"],
-        "audit_commits": commits_added,
-        "history": state["history"],
-        "history_commit_presence": history_commit_presence,
-        "iteration": iteration,
-        "completed_iterations": completed_iterations,
-        "max_iterations": max_iterations,
-        "budget_scope": state["budget_scope"],
-        "invocation_run": None if invocation is None else invocation["run"],
-    }
-    write_result_file(preflight_path, payload, "preflight")
-    emit(
-        {
-            "result": result,
-            "state": str(state_path),
-            "preflight_path": str(preflight_path),
-            "context_path": str(context_path),
-            "repo_root": str(repo_root),
-            "pr": {
-                "number": metadata["number"],
-                "title": metadata["title"],
-                "pr_url": metadata["pr_url"],
-                "repo_name": metadata["repo_name"],
-                "state": metadata["state"],
-                "merged_at": metadata["merged_at"],
-                "head_branch": metadata["head_branch"],
-                "base_branch": metadata["base_branch"],
-            },
-            "audit": audit_block,
-            "head_sha": original["head_sha"],
-            "diff_path": str(diff_path),
-            "diff_bytes": len(diff_text.encode("utf-8")),
-            "counts": counts,
-            "iteration": iteration,
-            "completed_iterations": completed_iterations,
-            "max_iterations": max_iterations,
-            "budget_scope": state["budget_scope"],
-            "invocation_run": None if invocation is None else invocation["run"],
-        }
-    )
-
-
-def command_candidates(args: argparse.Namespace) -> None:
-    path = cli_path(args.state)
-    state = load_state(path)
-    audit = active_audit(state)
-    if audit["candidates"]:
-        raise WorkflowError(
-            "candidates are already registered for this iteration; "
-            "run preflight to start the next one"
-        )
-    validated = validate_candidates(load_candidate_input(args.input), audit["anchors"])
-    next_id = int(state.get("next_candidate_id", 1))
-    registered = []
-    for candidate in validated:
-        registered.append({"id": next_id, "status": "pending", **candidate})
-        next_id += 1
-    audit["candidates"] = registered
-    state["next_candidate_id"] = next_id
-    save_state(path, state)
-    emit({"result": "registered", "state": str(path), "candidates": registered})
-
-
-def command_drop(args: argparse.Namespace) -> None:
-    path = cli_path(args.state)
-    state = load_state(path)
-    audit = active_audit(state)
-    candidates = find_candidates(audit, args.candidates)
-    rationale_file = getattr(args, "rationale_file", None)
-    rationale = (
-        load_text_input(rationale_file, "drop rationale")
-        if rationale_file
-        else args.rationale.strip()
-    )
-    if not rationale:
-        raise WorkflowError("drop rationale must not be empty")
-    for candidate in candidates:
-        candidate.update({"status": "dropped", "rationale": rationale})
-    save_state(path, state)
-    emit(
-        {
-            "result": "dropped",
-            "state": str(path),
-            "candidate_ids": args.candidates,
-            "rationale": rationale,
-        }
-    )
-
-
-def command_plan(args: argparse.Namespace) -> None:
-    path = cli_path(args.state)
-    state = load_state(path)
-    audit = active_audit(state)
-    candidates = find_candidates(audit, args.candidates)
-    dropped = [
-        candidate["id"] for candidate in candidates if candidate["status"] == "dropped"
-    ]
-    if dropped:
-        raise WorkflowError(f"dropped candidates cannot be planned: {dropped}")
-    batch = {
-        "id": args.batch,
-        "label": args.label,
-        "candidate_ids": args.candidates,
-        "paths": args.paths or [],
-        "validation": args.validation,
-        "status": "planned",
-    }
-    audit["batches"] = [item for item in audit["batches"] if item["id"] != args.batch]
-    audit["batches"].append(batch)
-    for candidate in candidates:
-        candidate["batch"] = args.batch
-    save_state(path, state)
-    emit({"result": "planned", "state": str(path), "batch": batch})
-
-
-def find_batch(audit: dict[str, Any], batch_id: str) -> dict[str, Any] | None:
-    for batch in audit.get("batches") or []:
-        if batch.get("id") == batch_id:
-            return batch
-    return None
-
-
-def planned_batch_paths(audit: dict[str, Any]) -> list[str]:
-    """Collect every path the planned batches of this iteration declared."""
-    paths: set[str] = set()
-    for batch in audit.get("batches") or []:
-        paths.update(path for path in (batch.get("paths") or []) if path)
-    return sorted(paths)
-
-
-def require_declared_commit_paths(
-    repo_root: Path, commit: str, paths: Iterable[str], *, label: str
-) -> list[str]:
-    """Refuse a commit that touches a path the plan never declared."""
-    declared = set(paths)
-    touched = commit_paths(repo_root, commit)
-    undeclared = [path for path in touched if path not in declared]
-    if undeclared:
-        raise WorkflowError(
-            f"commit {commit} touches paths {label} does not declare: {undeclared}; "
-            f"declared paths are {sorted(declared)}"
-        )
-    return touched
-
-
-def command_record(args: argparse.Namespace) -> None:
-    if not args.commit and not args.rationale:
-        raise WorkflowError("record requires either --commit or --rationale")
-    path = cli_path(args.state)
-    state = load_state(path)
-    audit = active_audit(state)
-    candidates = find_candidates(audit, args.candidates)
-    commit = args.commit
-    touched: list[str] = []
-    if commit:
-        repo_root = Path(state["repo_root"])
-        commit = git(repo_root, "rev-parse", commit)
-        batch = find_batch(audit, args.batch)
-        if batch is None:
-            raise WorkflowError(
-                f"batch {args.batch!r} was never planned; run plan before you record "
-                "a commit for it"
-            )
-        planned_ids = sorted(batch.get("candidate_ids") or [])
-        if planned_ids != sorted(args.candidates):
-            raise WorkflowError(
-                f"batch {args.batch!r} plans candidates {planned_ids}, so it cannot "
-                f"record {sorted(args.candidates)}"
-            )
-        declared = [item for item in (batch.get("paths") or []) if item]
-        if not declared:
-            raise WorkflowError(
-                f"batch {args.batch!r} declares no paths, so a commit cannot be "
-                "checked against it; plan the batch again with --paths"
-            )
-        touched = require_declared_commit_paths(
-            repo_root, commit, declared, label=f"batch {args.batch!r}"
-        )
-    for candidate in candidates:
-        candidate.update(
-            {
-                "batch": args.batch,
-                "status": "handled",
-                "commit": commit,
-                "rationale": args.rationale,
-                "summary": args.summary,
-            }
-        )
-    for batch in audit["batches"]:
-        if batch["id"] == args.batch:
-            batch["status"] = "approved"
-            if commit:
-                batch["commit"] = commit
-                batch["commit_paths"] = touched
-    save_state(path, state)
-    emit(
-        {
-            "result": "recorded",
-            "state": str(path),
-            "candidate_ids": args.candidates,
-            "commit": commit,
-            "commit_paths": touched,
-            "rationale": args.rationale,
-        }
-    )
-
-
-def command_skip(args: argparse.Namespace) -> None:
-    path = cli_path(args.state)
-    state = load_state(path)
-    audit = active_audit(state)
-    candidates = find_candidates(audit, args.candidates)
-    for candidate in candidates:
-        candidate.update(
-            {"batch": args.batch, "status": "skipped", "rationale": args.rationale}
-        )
-    for batch in audit["batches"]:
-        if batch["id"] == args.batch:
-            batch["status"] = "skipped"
-    save_state(path, state)
-    emit(
-        {
-            "result": "skipped",
-            "state": str(path),
-            "candidate_ids": args.candidates,
-            "rationale": args.rationale,
-        }
-    )
-
-
-def command_resolve(args: argparse.Namespace) -> None:
-    """Record that a whole pass found nothing, and keep the state that says so.
-
-    The state file survives this command on purpose. It carries the clean head,
-    the carried-forward history, and the local validation record, and a later
-    reader needs all of it to analyze the audit. A later `preflight` against
-    this state answers `already_complete` instead of starting an iteration, so
-    one audit branch stays one audit. Auditing the same pull request again is a
-    deliberate act: run `cleanup` and deal with the remote audit branch first.
-    """
-    if args.outcome != "clean":
-        raise WorkflowError("resolve outcome must be clean")
-    path = cli_path(args.state)
-    state = load_state(path)
-    audit = active_audit(state)
-    disallowed = [
-        {"id": candidate["id"], "status": candidate.get("status")}
-        for candidate in audit.get("candidates") or []
-        if candidate.get("status") != "dropped"
-    ]
-    if disallowed:
-        raise WorkflowError(
-            "an audit can be marked clean only with no candidates or when every "
-            f"candidate is dropped: {disallowed}"
-        )
-    repo_root = Path(state["repo_root"])
-    branch = current_branch(repo_root)
-    if branch != state["audit_branch"]:
-        raise WorkflowError(
-            f"audit branch mismatch: local {branch!r}, expected "
-            f"{state['audit_branch']!r}"
-        )
-    local_head = git(repo_root, "rev-parse", "HEAD")
-    if local_head != audit["iteration_head_sha"]:
-        raise WorkflowError(
-            "audit head changed before clean resolution: expected "
-            f"{audit['iteration_head_sha']}, got {local_head}"
-        )
-    audit["outcome"] = args.outcome
-    audit["clean_at_head_sha"] = audit["iteration_head_sha"]
-    save_state(path, state)
-    emit(
-        {
-            "result": "resolved",
-            "state": str(path),
-            "outcome": args.outcome,
-            "clean_at_head_sha": audit["clean_at_head_sha"],
-        }
-    )
-
-
-def local_validation_entry(
-    args: argparse.Namespace,
-    published_head_sha: str,
-    validation_commits: list[str] | None = None,
-) -> dict[str, Any]:
-    """Describe the local validation behind one publication.
-
-    Four answers are distinct and a reader needs all four. `passed` names the
-    commands that ran and passed, `partial` names the ones that passed next to
-    the reason the rest could not run, `skipped` carries the reason none ran,
-    and `unreported` says the publication claimed nothing either way. `rewrote`
-    names the subset that changed files, because a fixing command's rewrites
-    have to reach the commits being pushed, and `validation_commits` names the
-    commits that carry those rewrites.
-
-    Nothing here refuses a push. A historical snapshot often offers no command
-    that still runs, so a malformed claim is folded into a coherent record rather
-    than raised: naming a command as rewriting implies it ran, so it counts as
-    validated too.
-    """
-    entry: dict[str, Any] = {"head_sha": published_head_sha}
-    rewrote = [command.strip() for command in (args.rewrote or []) if command.strip()]
-    commands = [
-        command.strip() for command in (args.validated or []) if command.strip()
-    ]
-    for command in rewrote:
-        if command not in commands:
-            commands.append(command)
-    reason = (getattr(args, "not_validated", None) or "").strip()
-    if commands:
-        entry["status"] = "partial" if reason else "passed"
-        entry["commands"] = commands
-        entry["rewrote"] = rewrote
-        if reason:
-            entry["reason"] = reason
-    elif reason:
-        entry["status"] = "skipped"
-        entry["reason"] = reason
-    else:
-        entry["status"] = "unreported"
-    if validation_commits:
-        entry["validation_commits"] = list(validation_commits)
-    return entry
-
-
-def resolved_validation_commits(
-    repo_root: Path,
-    audit: dict[str, Any],
-    requested: list[str] | None,
-    new_commits: list[str],
-) -> list[str]:
-    """Admit the commits that carry a fixing command's rewrites.
-
-    A covering check that rewrites files runs after the batch commits it
-    validates, so its rewrites need a commit of their own. That commit belongs
-    to no candidate, which is why publication has to be told about it. It is
-    admitted only when it sits on this iteration and stays inside the paths the
-    batches already planned, so it can never smuggle in an undeclared change.
-    """
-    resolved: list[str] = []
-    for value in requested or []:
-        reference = value.strip()
-        if not reference:
-            continue
-        commit = git(repo_root, "rev-parse", reference)
-        if commit in resolved:
-            continue
-        if commit not in new_commits:
-            raise WorkflowError(
-                f"validation commit {commit} is not one of this iteration's commits "
-                f"({audit['iteration_head_sha']}..HEAD)"
-            )
-        require_declared_commit_paths(
-            repo_root, commit, planned_batch_paths(audit), label="any planned batch"
-        )
-        resolved.append(commit)
-    return resolved
-
-
-def command_publish(args: argparse.Namespace) -> None:
-    path = cli_path(args.state)
-    state = load_state(path)
-    audit = active_audit(state)
-    repo_root = Path(state["repo_root"])
-    require_clean_worktree(repo_root)
-
-    pending = [
-        candidate["id"]
-        for candidate in audit["candidates"]
-        if candidate["status"] == "pending"
-    ]
-    if pending:
-        raise WorkflowError(f"candidates are neither dropped nor handled: {pending}")
-    skipped = [
-        candidate["id"]
-        for candidate in audit["candidates"]
-        if candidate["status"] == "skipped"
-    ]
-    if skipped:
-        raise WorkflowError(
-            f"a batch was skipped by an unrecoverable validation failure: {skipped}; "
-            "this run must stop without publishing partial work"
-        )
-    handled = [
-        candidate
-        for candidate in audit["candidates"]
-        if candidate["status"] == "handled"
-    ]
-    incomplete = [
-        candidate["id"]
-        for candidate in handled
-        if not candidate.get("summary")
-        or not (candidate.get("commit") or candidate.get("rationale"))
-    ]
-    if incomplete:
-        raise WorkflowError(f"handled candidates lack publish data: {incomplete}")
-
-    commits: list[str] = []
-    for candidate in handled:
-        commit = candidate.get("commit")
-        if commit and commit not in commits:
-            commits.append(commit)
-
-    iteration_head_sha = audit["iteration_head_sha"]
-    local_head = git(repo_root, "rev-parse", "HEAD")
-    new_commits = [
-        line
-        for line in git(
-            repo_root, "rev-list", f"{iteration_head_sha}..HEAD"
-        ).splitlines()
-        if line
-    ]
-    validation_commits = resolved_validation_commits(
-        repo_root, audit, getattr(args, "validation_commit", None), new_commits
-    )
-    allowed = set(commits) | set(validation_commits)
-    unrecorded = [commit for commit in new_commits if commit not in allowed]
-    missing = [commit for commit in commits if commit not in set(new_commits)]
-    if unrecorded or missing:
-        raise WorkflowError(
-            "local commits do not match this iteration's records: "
-            f"unrecorded {unrecorded}, missing {missing}"
-        )
-    published_commits = commits + [
-        commit for commit in validation_commits if commit not in commits
-    ]
-    if not published_commits:
-        emit(
-            {
-                "result": "nothing_to_publish",
-                "state": str(path),
-                "head_sha": local_head,
-                "pushed": False,
-            }
-        )
-        return
-
-    pr = state["pr"]
-    audit_branch = state["audit_branch"]
-    if audit_branch in {pr["head_branch"], pr["base_branch"], state["original"]["head_branch"]}:
-        raise WorkflowError(
-            f"refusing to push {audit_branch!r}: it is the pull request's own branch "
-            "or its base branch"
-        )
-    branch = current_branch(repo_root)
-    if branch != audit_branch:
-        raise WorkflowError(
-            f"refusing to push: local branch is {branch!r}, expected {audit_branch!r}"
-        )
-    remote = find_remote(repo_root, pr["upstream_owner"], pr["upstream_repo"], push=True)
-    if (
-        remote_head(pr["upstream_owner"], pr["upstream_repo"], audit_branch)
-        != local_head
-    ):
-        run(
-            [
-                "git",
-                "-C",
-                str(repo_root),
-                "push",
-                remote,
-                f"HEAD:refs/heads/{audit_branch}",
-            ]
-        )
-    pushed_head = wait_for_remote_head(
-        pr["upstream_owner"], pr["upstream_repo"], audit_branch, local_head
-    )
-    if pushed_head != local_head:
-        raise WorkflowError(
-            f"audit branch mismatch: local {local_head}, remote {pushed_head}"
-        )
-
-    audit["status"] = "published"
-    audit["published_head_sha"] = local_head
-    audit["validation_commits"] = validation_commits
-    validation = local_validation_entry(args, local_head, validation_commits)
-    state.setdefault("local_validation", []).append(validation)
-    state["iterations"] = int(state.get("iterations", 0)) + 1
-    archive_audit(state)
-    save_state(path, state)
-    emit(
-        {
-            "result": "published",
-            "state": str(path),
-            "branch": audit_branch,
-            "head_sha": local_head,
-            "iteration_head_sha": iteration_head_sha,
-            "commits": published_commits,
-            "validation_commits": validation_commits,
-            "iterations": state["iterations"],
-            "local_validation": validation,
-            "pushed": True,
-        }
-    )
 
 
 def recorded_clean_at_head_sha(state: dict[str, Any]) -> str | None:
@@ -2352,25 +1041,6 @@ def parse_strict_json(value: str, *, description: str) -> Any:
         return json.loads(value, object_pairs_hook=unique_object)
     except (json.JSONDecodeError, ValueError) as error:
         raise WorkflowError(f"{description} is invalid JSON: {error}") from error
-
-
-def parse_markdown_report(value: str, *, description: str) -> Any:
-    stripped = value.strip()
-    if stripped.startswith("{"):
-        return parse_strict_json(stripped, description=description)
-    matches = list(
-        re.finditer(r"```json[ \t]*\r?\n(?P<payload>.*?)\r?\n```", value, re.DOTALL)
-    )
-    if len(matches) != 1:
-        raise WorkflowError(
-            f"{description} must contain exactly one fenced JSON payload"
-        )
-    outside = value[: matches[0].start()] + value[matches[0].end() :]
-    if "```" in outside:
-        raise WorkflowError(f"{description} contains an unexpected fenced block")
-    return parse_strict_json(
-        matches[0].group("payload").strip(), description=f"{description} payload"
-    )
 
 
 def load_json_object(path: Path, *, description: str) -> dict[str, Any]:
@@ -2621,7 +1291,7 @@ def execute_managed_agent_task(
 
 def load_agent_task_result(path: Path) -> dict[str, Any]:
     result = load_json_object(path, description="Agent Task result")
-    structural_keys = {
+    expected_keys = {
         "schema",
         "status",
         "mode",
@@ -2635,25 +1305,12 @@ def load_agent_task_result(path: Path) -> dict[str, Any]:
         "report",
         "attestation",
         "error",
+        "candidate",
+        "completion",
     }
-    legacy_keys = structural_keys - {"attestation"} | {"worker_receipt", "validation"}
-    candidate_keys = structural_keys | {"candidate", "completion"}
     if (
-        (
-            result.get("schema") == CANDIDATE_RESULT_SCHEMA
-            and set(result) != candidate_keys
-        )
-        or
-        (
-            result.get("schema") == AGENT_TASK_RESULT_SCHEMA
-            and set(result) != structural_keys
-        )
-        or (
-            result.get("schema") == LEGACY_AGENT_TASK_RESULT_SCHEMA
-            and set(result) != legacy_keys
-        )
-        or result.get("schema")
-        not in (AGENT_TASK_RESULT_SCHEMA, LEGACY_AGENT_TASK_RESULT_SCHEMA, CANDIDATE_RESULT_SCHEMA)
+        result.get("schema") != CANDIDATE_RESULT_SCHEMA
+        or set(result) != expected_keys
     ):
         raise WorkflowError("Agent Task result has an unsupported schema or fields")
     require_no_credentials(
@@ -2811,338 +1468,6 @@ def validate_candidate_result_identity(
             or any(not isinstance(error[key], str) or not error[key] for key in error)
         ):
             raise WorkflowError("Agent Task candidate failure has no diagnostic")
-
-
-def validate_success_result(
-    result: dict[str, Any],
-    *,
-    metadata: dict[str, Any],
-    requested_model: str,
-) -> dict[str, Any]:
-    expected_policy = {
-        "id": "marketplace-agent-apply-report-worker",
-        "version": 3,
-        "sha256": AGENT_TASK_POLICY_SHA256,
-    }
-    policy = result.get("policy")
-    legacy_applied = policy == LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2
-    task = result.get("task")
-    generated = result.get("generated")
-    application = result.get("application")
-    report = result.get("report")
-    attestation = result.get("attestation")
-    if (
-        result.get("status") != "success"
-        or result.get("error") is not None
-        or result.get("mode") != "apply_with_report"
-        or result.get("requested_model") != requested_model
-        or policy not in (expected_policy, LEGACY_STRUCTURAL_AGENT_TASK_POLICY_V2)
-        or result.get("repository") != {"name_with_owner": metadata["repo_name"]}
-        or result.get("pull_request") != expected_result_pull_request(metadata)
-        or not isinstance(task, dict)
-        or set(task) != {"id", "url", "state", "base_ref", "base_sha"}
-        or not isinstance(task.get("id"), str)
-        or not task["id"]
-        or task.get("state") != "completed"
-        or task.get("base_ref") != metadata["head_sha"]
-        or task.get("base_sha") != metadata["head_sha"]
-        or (
-            task.get("url") is not None
-            and (not isinstance(task["url"], str) or not task["url"])
-        )
-        or not isinstance(generated, dict)
-        or set(generated) != {"branch", "head_sha", "commits"}
-        or not isinstance(generated.get("branch"), str)
-        or not generated["branch"]
-        or not isinstance(generated.get("head_sha"), str)
-        or not SHA_PATTERN.fullmatch(generated["head_sha"])
-        or not isinstance(generated.get("commits"), list)
-        or not isinstance(application, dict)
-        or set(application) != {"status", "final_local_head"}
-        or application.get("status")
-        not in (
-            {"applied", "no_changes"}
-            if legacy_applied
-            else {"not_applied"}
-        )
-        or not isinstance(report, dict)
-        or set(report) != {"path", "commit", "sha256"}
-        or attestation
-        != {
-            "kind": "dispatcher_structural",
-            "structural_complete": True,
-        }
-    ):
-        raise WorkflowError("Agent Task result identity or success data is malformed")
-    commits = generated["commits"]
-    if (
-        any(not isinstance(commit, str) or not SHA_PATTERN.fullmatch(commit) for commit in commits)
-        or len(commits) != len(set(commits))
-    ):
-        raise WorkflowError("Agent Task generated commit list is malformed")
-    report_match = (
-        REPORT_PATH_PATTERN.fullmatch(report.get("path"))
-        if isinstance(report.get("path"), str)
-        else None
-    )
-    expected_local_head = commits[-1] if commits else metadata["head_sha"]
-    expected_application = (
-        {
-            "status": "applied" if commits else "no_changes",
-            "final_local_head": expected_local_head,
-        }
-        if legacy_applied
-        else {
-            "status": "not_applied",
-            "final_local_head": metadata["head_sha"],
-        }
-    )
-    if (
-        report_match is None
-        or report.get("commit") != generated["head_sha"]
-        or not isinstance(report.get("sha256"), str)
-        or not re.fullmatch(r"[0-9a-f]{64}", report["sha256"])
-        or application != expected_application
-    ):
-        raise WorkflowError("Agent Task artifact or application identity is malformed")
-    return {
-        "request_id": report_match.group("request_id"),
-        "task": task,
-        "generated_branch": generated["branch"],
-        "generated_head": generated["head_sha"],
-        "commits": commits,
-        "final_local_head": expected_local_head,
-        "requires_apply": not legacy_applied,
-        "report": report,
-        "structural_attestation": True,
-    }
-
-
-def fetch_committed_text(
-    repository: str, path: str, commit: str, *, description: str
-) -> str:
-    encoded_path = urllib.parse.quote(path, safe="/")
-    encoded_commit = urllib.parse.quote(commit, safe="")
-    payload = gh_json(
-        ["api", f"repos/{repository}/contents/{encoded_path}?ref={encoded_commit}"]
-    )
-    if (
-        not isinstance(payload, dict)
-        or payload.get("type") != "file"
-        or payload.get("encoding") != "base64"
-        or not isinstance(payload.get("content"), str)
-    ):
-        raise WorkflowError(f"GitHub returned a malformed committed {description}")
-    try:
-        return base64.b64decode(
-            "".join(payload["content"].split()), validate=True
-        ).decode("utf-8")
-    except (binascii.Error, UnicodeDecodeError) as error:
-        raise WorkflowError(
-            f"GitHub returned a malformed committed {description}: {error}"
-        ) from error
-
-
-def validate_audit_report(
-    content: str,
-    *,
-    request_id: str,
-    metadata: dict[str, Any],
-    audit_branch: str,
-    commits: list[str],
-    max_iterations: int,
-    pipeline: dict[str, str | None],
-) -> dict[str, Any]:
-    require_no_credentials(content, source="Agent Task audit report")
-    report = parse_markdown_report(content, description="Agent Task audit report")
-    expected_pr = {
-        "number": metadata["number"],
-        "url": metadata["pr_url"],
-        "base_sha": metadata["base_sha"],
-        "head_sha": metadata["head_sha"],
-        "title_sha256": sha256_text(metadata["title"]),
-        "body_sha256": sha256_text(metadata["body"]),
-    }
-    if (
-        not isinstance(report, dict)
-        or set(report)
-        != {
-            "schema",
-            "request_id",
-            "repository",
-            "source_pull_request",
-            "audit_branch",
-            "outcome",
-            "iterations",
-            "max_iterations",
-            "commits",
-            "pipeline",
-        }
-        or report.get("schema") != AUDIT_REPORT_SCHEMA
-        or report.get("request_id") != request_id
-        or report.get("repository") != metadata["repo_name"]
-        or report.get("source_pull_request") != expected_pr
-        or report.get("audit_branch") != audit_branch
-        or report.get("outcome") not in {"no_change", "clean", "max_iterations_reached"}
-        or report.get("max_iterations") != max_iterations
-        or not isinstance(report.get("iterations"), list)
-        or not report["iterations"]
-        or len(report["iterations"]) > max_iterations
-        or not isinstance(report.get("commits"), list)
-        or not isinstance(report.get("pipeline"), dict)
-    ):
-        raise WorkflowError("Agent Task audit report is malformed or has the wrong identity")
-    expected_pipeline = {
-        **pipeline,
-        "stage_outcome": (
-            None if report["outcome"] == "max_iterations_reached" else "cleared"
-        ),
-    }
-    if report["pipeline"] != expected_pipeline:
-        raise WorkflowError("Agent Task audit report has the wrong pipeline outcome")
-    report_commits: list[str] = []
-    for entry in report["commits"]:
-        if (
-            not isinstance(entry, dict)
-            or set(entry) != {"sha", "summary", "paths"}
-            or not isinstance(entry.get("sha"), str)
-            or not isinstance(entry.get("summary"), str)
-            or not entry["summary"].strip()
-            or not isinstance(entry.get("paths"), list)
-            or not entry["paths"]
-            or any(
-                not isinstance(path, str)
-                or not path
-                or path.startswith(("/", "\\"))
-                or ".." in Path(path).parts
-                or path.startswith(".github/agent-task-")
-                for path in entry["paths"]
-            )
-            or len(entry["paths"]) != len(set(entry["paths"]))
-        ):
-            raise WorkflowError("Agent Task audit report commit data is malformed")
-        report_commits.append(entry["sha"])
-    if report_commits != commits:
-        raise WorkflowError("Agent Task audit report commit order does not match the result")
-    if (report["outcome"] == "no_change") != (not commits):
-        raise WorkflowError("Agent Task audit report no-change outcome is inconsistent")
-    expected_head = metadata["head_sha"]
-    accounted_commits: list[str] = []
-    for index, iteration in enumerate(report["iterations"], start=1):
-        if (
-            not isinstance(iteration, dict)
-            or set(iteration)
-            != {"number", "head_before", "outcome", "finding_count", "commit_shas"}
-            or iteration.get("number") != index
-            or iteration.get("head_before") != expected_head
-            or iteration.get("outcome") not in {"clean", "fixed", "max_iterations_reached"}
-            or isinstance(iteration.get("finding_count"), bool)
-            or not isinstance(iteration.get("finding_count"), int)
-            or iteration["finding_count"] < 0
-            or not isinstance(iteration.get("commit_shas"), list)
-            or any(
-                not isinstance(sha, str)
-                or sha not in commits
-                or sha in accounted_commits
-                for sha in iteration["commit_shas"]
-            )
-        ):
-            raise WorkflowError("Agent Task audit report iteration history is malformed")
-        iteration_commits = iteration["commit_shas"]
-        iteration_outcome = iteration["outcome"]
-        is_last = index == len(report["iterations"])
-        if (
-            (iteration_outcome == "clean" and (
-                not is_last
-                or iteration["finding_count"] != 0
-                or iteration_commits
-            ))
-            or (
-                iteration_outcome == "fixed"
-                and (iteration["finding_count"] == 0 or not iteration_commits)
-            )
-            or (
-                iteration_outcome == "max_iterations_reached"
-                and (not is_last or iteration["finding_count"] == 0)
-            )
-        ):
-            raise WorkflowError("Agent Task audit report iteration outcome is inconsistent")
-        accounted_commits.extend(iteration_commits)
-        if iteration_commits:
-            expected_head = iteration_commits[-1]
-    if accounted_commits != commits:
-        raise WorkflowError(
-            "Agent Task audit report does not account for each generated commit once"
-        )
-    final_iteration = report["iterations"][-1]
-    if (
-        report["outcome"] == "no_change"
-        and (
-            len(report["iterations"]) != 1
-            or final_iteration["outcome"] != "clean"
-        )
-    ) or (
-        report["outcome"] == "clean"
-        and (
-            not commits
-            or final_iteration["outcome"] != "clean"
-            or not any(
-                iteration["outcome"] == "fixed"
-                for iteration in report["iterations"][:-1]
-            )
-        )
-    ) or (
-        report["outcome"] == "max_iterations_reached"
-        and (
-            len(report["iterations"]) != max_iterations
-            or final_iteration["outcome"] != "max_iterations_reached"
-        )
-    ):
-        raise WorkflowError(
-            "Agent Task audit report top-level outcome lacks its required final pass"
-        )
-    return report
-
-
-def validate_imported_commits(
-    repo_root: Path,
-    *,
-    base_sha: str,
-    commits: list[str],
-    report: dict[str, Any],
-) -> None:
-    actual = [
-        line
-        for line in git(
-            repo_root,
-            "rev-list",
-            "--reverse",
-            "--topo-order",
-            f"{base_sha}..{commits[-1]}",
-        ).splitlines()
-        if line
-    ] if commits else []
-    if actual != commits:
-        raise WorkflowError("imported history does not match generated.commits")
-    by_sha = {entry["sha"]: entry for entry in report["commits"]}
-    for commit in commits:
-        parents = git(repo_root, "rev-list", "--parents", "-n", "1", commit).split()
-        if len(parents) != 2 or parents[0] != commit:
-            raise WorkflowError(f"generated commit {commit} is not linear")
-        paths = [
-            path
-            for path in git(
-                repo_root,
-                "diff-tree",
-                "--no-commit-id",
-                "--name-only",
-                "-r",
-                commit,
-            ).splitlines()
-            if path
-        ]
-        if sorted(paths) != sorted(by_sha[commit]["paths"]):
-            raise WorkflowError(f"generated commit {commit} changed unexpected paths")
 
 
 def apply_verified_import(
@@ -3314,26 +1639,6 @@ def agent_task_artifacts(state_path: Path, attempt: int) -> dict[str, Path]:
     }
 
 
-def agent_task_recovery_command(
-    *,
-    target: dict[str, Any],
-    repo_root: Path,
-    state_path: Path,
-) -> str:
-    values = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "agent-task",
-        target["pr_url"],
-        "--repo-root",
-        str(repo_root),
-        "--state",
-        str(state_path),
-        "--recover",
-    ]
-    return " ".join(json.dumps(value) for value in values)
-
-
 def prepared_branch_after_interruption(
     repo_root: Path,
     *,
@@ -3374,119 +1679,6 @@ def record_missing_agent_task_result(
     agent_task.pop("recovery_command", None)
     save_state(state_path, state)
     return state
-
-
-def validate_recovery_result_identity(
-    result: dict[str, Any],
-    *,
-    metadata: dict[str, Any],
-    requested_model: str,
-) -> bool:
-    expected_policy = {
-        "id": "marketplace-agent-apply-report-worker",
-        "version": 3,
-        "sha256": AGENT_TASK_POLICY_SHA256,
-    }
-    if (
-        result.get("status") not in {"success", "error", "interrupted"}
-        or result.get("mode") != "apply_with_report"
-        or result.get("requested_model") != requested_model
-        or result.get("policy") != expected_policy
-        or result.get("repository") != {"name_with_owner": metadata["repo_name"]}
-        or result.get("pull_request") != expected_result_pull_request(metadata)
-    ):
-        raise WorkflowError("Agent Task recovery result has the wrong identity")
-    task = result.get("task")
-    generated = result.get("generated")
-    report = result.get("report")
-    attestation = result.get("attestation")
-    error = result.get("error")
-    if (
-        not isinstance(task, dict)
-        or set(task) != {"id", "url", "state", "base_ref", "base_sha"}
-        or not isinstance(generated, dict)
-        or set(generated) != {"branch", "head_sha", "commits"}
-        or not isinstance(report, dict)
-        or set(report) != {"path", "commit", "sha256"}
-        or not isinstance(report.get("path"), str)
-        or REPORT_PATH_PATTERN.fullmatch(report["path"]) is None
-        or not isinstance(attestation, dict)
-        or attestation.get("kind") != "dispatcher_structural"
-        or not isinstance(attestation.get("structural_complete"), bool)
-    ):
-        raise WorkflowError("Agent Task recovery result is malformed")
-    task_id = task.get("id")
-    if task_id is None:
-        if (
-            result.get("status") != "error"
-            or any(task.get(field) is not None for field in task)
-            or generated != {"branch": None, "head_sha": None, "commits": []}
-            or result.get("application")
-            != {
-                "status": "not_applied",
-                "final_local_head": metadata["head_sha"],
-            }
-            or report.get("commit") is not None
-            or report.get("sha256") is not None
-            or attestation.get("structural_complete") is not False
-            or not isinstance(error, dict)
-            or set(error) != {"code", "message"}
-            or not isinstance(error.get("code"), str)
-            or not error["code"]
-            or not isinstance(error.get("message"), str)
-            or not error["message"]
-        ):
-            raise WorkflowError("Agent Task creation failure is malformed")
-        return False
-    if (
-        not isinstance(task_id, str)
-        or not task_id
-        or task.get("base_ref") != metadata["head_sha"]
-        or task.get("base_sha") != metadata["head_sha"]
-        or (
-            task.get("url") is not None
-            and (not isinstance(task["url"], str) or not task["url"])
-        )
-    ):
-        raise WorkflowError("Agent Task recovery task identity is malformed")
-    return True
-
-
-def require_same_agent_task(
-    prior: dict[str, Any], current: dict[str, Any]
-) -> None:
-    prior_task = prior["task"]
-    current_task = current["task"]
-    if prior_task.get("id") != current_task.get("id"):
-        raise WorkflowError("Agent Task resume created or selected a replacement task")
-    for field, label in (
-        ("branch", "generated branch"),
-        ("head_sha", "generated head"),
-    ):
-        old = prior["generated"].get(field)
-        if old is not None and old != current["generated"].get(field):
-            raise WorkflowError(f"Agent Task resume changed the original {label}")
-    prior_commits = prior["generated"].get("commits")
-    if (
-        prior_commits or prior.get("status") == "success"
-    ) and prior_commits != current["generated"].get("commits"):
-        raise WorkflowError("Agent Task resume changed the original generated commits")
-    prior_report = prior.get("report")
-    current_report = current.get("report")
-    if isinstance(prior_report, dict):
-        if not isinstance(current_report, dict):
-            raise WorkflowError("Agent Task resume removed the original report")
-        for field in ("path", "commit", "sha256"):
-            old = prior_report.get(field)
-            if old is not None and old != current_report.get(field):
-                raise WorkflowError("Agent Task resume changed the original report")
-    prior_attestation = prior.get("attestation")
-    if (
-        isinstance(prior_attestation, dict)
-        and prior_attestation.get("structural_complete") is True
-        and prior_attestation != current.get("attestation")
-    ):
-        raise WorkflowError("Agent Task resume changed structural attestation")
 
 
 def preserve_agent_task_result(
@@ -3564,11 +1756,6 @@ def finish_agent_task(
 
 
 def command_agent_task(args: argparse.Namespace) -> None:
-    if getattr(args, "recover", False):
-        raise WorkflowError(
-            "resume and recovery are disabled; start a fresh invocation with "
-            "--new-invocation"
-        )
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
     target = parse_target(
@@ -3842,9 +2029,63 @@ def command_agent_task(args: argparse.Namespace) -> None:
             )
         live = merged_metadata_for(target)
         if not same_snapshot(metadata, live):
-            raise WorkflowError(
-                "merged pull request identity, title, or body changed before verified import"
+            current = load_state(state_path)
+            pipeline_iteration = args.pipeline_iteration
+            pipeline_max_iterations = args.pipeline_max_iterations
+            remaining_allowance = (
+                pipeline_max_iterations - pipeline_iteration
+                if pipeline_iteration is not None
+                and pipeline_max_iterations is not None
+                else 0
             )
+            source_drift = {
+                "expected_head_sha": metadata["head_sha"],
+                "observed_head_sha": live["head_sha"],
+                "pipeline_iteration": pipeline_iteration,
+                "pipeline_max_iterations": pipeline_max_iterations,
+                "consumed_allowance": 1,
+                "iterations_used": report["iterations_used"],
+                "remaining_allowance": remaining_allowance,
+                "source_mutation_performed": False,
+                "import_performed": False,
+                "rebase_performed": False,
+                "publication_performed": False,
+            }
+            remote["report_data"] = report
+            current["agent_task"].update(
+                {
+                    "status": "head_moved",
+                    "reserved_iterations": 0,
+                    "validated_stale_result": remote,
+                    "result_sha256": result_sha256,
+                    "source_drift": source_drift,
+                    "completed_at": utc_now(),
+                }
+            )
+            current["audit"]["status"] = "head_moved"
+            current["iterations"] = report["iterations_used"]
+            save_state(state_path, current)
+            emit(
+                {
+                    "result": "head_moved",
+                    "state": str(state_path),
+                    "pr": metadata["pr_url"],
+                    **source_drift,
+                    "task": result["task"],
+                    "generated": result["generated"],
+                    "result_file": str(result_path),
+                    "result_sha256": result_sha256,
+                    "next_action": (
+                        "advance" if remaining_allowance > 0 else "incomplete"
+                    ),
+                    **(
+                        {}
+                        if remaining_allowance > 0
+                        else {"stage_outcome": "incomplete"}
+                    ),
+                }
+            )
+            return
         current = load_state(state_path)
         if (
             current["agent_task"].get("status") != "running"
@@ -3911,11 +2152,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     agent_task.add_argument("--repo-root")
     agent_task.add_argument("--state")
-    agent_task.add_argument(
-        "--model",
-        choices=tuple(MODEL_ALIASES),
-        default="sol",
-    )
+    agent_task.add_argument("--model", choices=tuple(MODEL_ALIASES), default="sol")
     agent_task.add_argument(
         "--max-iterations",
         type=int,
@@ -3923,127 +2160,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_ITERATIONS,
     )
     agent_task.add_argument("--pipeline-run", help=argparse.SUPPRESS)
-    agent_task.add_argument("--pipeline-iteration", help=argparse.SUPPRESS)
-    agent_task.add_argument("--pipeline-max-iterations", help=argparse.SUPPRESS)
-    agent_task.add_argument("--recover", action="store_true", help=argparse.SUPPRESS)
-    invocation = agent_task.add_mutually_exclusive_group()
-    invocation.add_argument("--new-invocation", action="store_true")
-    invocation.add_argument("--invocation-run")
+    agent_task.add_argument(
+        "--pipeline-iteration", type=int, help=argparse.SUPPRESS
+    )
+    agent_task.add_argument(
+        "--pipeline-max-iterations", type=int, help=argparse.SUPPRESS
+    )
     agent_task.set_defaults(function=command_agent_task)
-
-    preflight = subparsers.add_parser(
-        "preflight",
-        help=(
-            "pin a merged pull request's own base and head commits, prepare the "
-            "audit branch, and snapshot the changeset for this pass"
-        ),
-    )
-    preflight.add_argument(
-        "target",
-        help="merged PR URL or owner/repo#number",
-    )
-    preflight.add_argument("--repo-root")
-    preflight.add_argument("--state")
-    preflight.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS)
-    invocation = preflight.add_mutually_exclusive_group()
-    invocation.add_argument(
-        "--new-invocation",
-        action="store_true",
-        help="start a fresh audit budget and return its invocation run token",
-    )
-    invocation.add_argument(
-        "--invocation-run",
-        help="reuse the invocation run token returned by its first preflight",
-    )
-    preflight.set_defaults(function=command_preflight)
-
-    candidates = subparsers.add_parser(
-        "candidates", help="register this iteration's candidate findings"
-    )
-    candidates.add_argument("--state", required=True)
-    candidates.add_argument(
-        "--input",
-        required=True,
-        help=(
-            "JSON array file, or - for standard input; each object must contain "
-            "exactly path (string), line (integer), side (LEFT or RIGHT), and "
-            "body (string)"
-        ),
-    )
-    candidates.set_defaults(function=command_candidates)
-
-    drop = subparsers.add_parser("drop", help="record evaluator-rejected candidates")
-    drop.add_argument("--state", required=True)
-    drop.add_argument("--candidates", type=int, nargs="+", required=True)
-    drop_rationale = drop.add_mutually_exclusive_group(required=True)
-    drop_rationale.add_argument("--rationale")
-    drop_rationale.add_argument(
-        "--rationale-file",
-        help="UTF-8 rationale file, or - for standard input",
-    )
-    drop.set_defaults(function=command_drop)
-
-    plan = subparsers.add_parser("plan", help="record one planned fix batch")
-    plan.add_argument("--state", required=True)
-    plan.add_argument("--batch", required=True)
-    plan.add_argument("--candidates", type=int, nargs="+", required=True)
-    plan.add_argument("--label", required=True)
-    plan.add_argument("--paths", nargs="*")
-    plan.add_argument("--validation")
-    plan.set_defaults(function=command_plan)
-
-    record = subparsers.add_parser("record", help="record a handled batch")
-    record.add_argument("--state", required=True)
-    record.add_argument("--batch", required=True)
-    record.add_argument("--candidates", type=int, nargs="+", required=True)
-    record.add_argument("--summary", required=True)
-    record.add_argument("--commit")
-    record.add_argument("--rationale")
-    record.set_defaults(function=command_record)
-
-    skip = subparsers.add_parser("skip", help="record a batch stopped by validation")
-    skip.add_argument("--state", required=True)
-    skip.add_argument("--batch", required=True)
-    skip.add_argument("--candidates", type=int, nargs="+", required=True)
-    skip.add_argument("--rationale", required=True)
-    skip.set_defaults(function=command_skip)
-
-    resolve = subparsers.add_parser("resolve", help="record a clean audit outcome")
-    resolve.add_argument("--state", required=True)
-    resolve.add_argument("--outcome", choices=["clean"], required=True)
-    resolve.set_defaults(function=command_resolve)
-
-    publish = subparsers.add_parser(
-        "publish", help="push the audit branch and verify the new head"
-    )
-    publish.add_argument("--state", required=True)
-    publish.add_argument(
-        "--validated",
-        action="append",
-        metavar="COMMAND",
-        help="a covering check that ran locally and passed; repeat for each one",
-    )
-    publish.add_argument(
-        "--not-validated",
-        metavar="REASON",
-        help="why the covering checks that did not run could not run; pass it "
-        "alone when none ran, or next to --validated for a partial report",
-    )
-    publish.add_argument(
-        "--rewrote",
-        action="append",
-        metavar="COMMAND",
-        help="a covering check that rewrote files; those rewrites must already be "
-        "in the commits this pushes",
-    )
-    publish.add_argument(
-        "--validation-commit",
-        action="append",
-        metavar="SHA",
-        help="a commit that carries only what a covering check rewrote; repeat for "
-        "each one, and keep every path inside the planned batch paths",
-    )
-    publish.set_defaults(function=command_publish)
 
     status = subparsers.add_parser("status", help="print compact workflow state")
     status_source = status.add_mutually_exclusive_group(required=True)
@@ -4055,7 +2178,6 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup = subparsers.add_parser("cleanup", help="delete completed external state")
     cleanup.add_argument("--state", required=True)
     cleanup.set_defaults(function=command_cleanup)
-
     return parser
 
 
@@ -4063,11 +2185,6 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
-        if args.command not in {"agent-task", "status", "cleanup"}:
-            raise WorkflowError(
-                f"legacy command {args.command!r} is disabled; start a fresh "
-                "agent-task invocation"
-            )
         args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:
@@ -4080,6 +2197,7 @@ def main() -> int:
 
 _EXECUTION = None
 EXECUTION_TERMINAL_RESULTS = frozenset({
+    "head_moved",
     "published",
     "nothing_to_publish",
 })
