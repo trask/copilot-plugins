@@ -19,6 +19,7 @@ import uuid
 SCHEMA = "github.copilot.foreground-execution.v1"
 PARENT_ENV = "TRASK_EXECUTION_PARENT"
 IS_WINDOWS = os.name == "nt"
+FORCED_DRAINAGE_ERROR = "owned Windows job required forced drainage"
 
 
 class ExecutionError(RuntimeError):
@@ -584,7 +585,7 @@ class OwnedProcess:
         self.stopping = False
         self.observation_complete = False
         self.owner_terminated = False
-        self.unexpected_descendants: list[dict[str, Any]] = []
+        self.observed_descendants: list[dict[str, Any]] = []
 
     @property
     def returncode(self):
@@ -682,16 +683,12 @@ class OwnedProcess:
                             deadline, {self.pid: self.process_binding}, check
                         )
                     )
-                    self.unexpected_descendants = [
+                    self.observed_descendants = [
                         item for item in processes
-                        if item["pid"] != self.pid and item["running"] and not self.stopping
+                        if item["pid"] != self.pid and item["running"]
                     ]
                     self.observation_complete = True
                     self.close_process_handle()
-                if self.unexpected_descendants and self.completion_error is None:
-                    self.completion_error = "child exited before a running descendant"
-                    self.owner.terminate()
-                    self.owner_terminated = True
                 if blocking:
                     if check is None:
                         self.owner.drain(deadline)
@@ -700,10 +697,6 @@ class OwnedProcess:
                 elif self.owner.active_count():
                     self._write_pending(code)
                     return False
-                if self.unexpected_descendants and not self.completion_error.endswith(
-                    "; the owned job was drained"
-                ):
-                    self.completion_error += "; the owned job was drained"
             elif not IS_WINDOWS:
                 try:
                     os.killpg(self.pid, 0)
@@ -714,11 +707,10 @@ class OwnedProcess:
             self.drained = True
             release_resources = True
             result = {**read(self.record), "exit_code": code, "local_drained": True}
+            if self.observed_descendants:
+                result["observed_descendants"] = self.observed_descendants
             if self.completion_error is not None:
-                result.update(
-                    completion_error=self.completion_error,
-                    unexpected_descendants=self.unexpected_descendants,
-                )
+                result["completion_error"] = self.completion_error
             write(self.record, result)
         except _OwnershipPending as pending:
             self._write_pending(code)
@@ -739,13 +731,10 @@ class OwnedProcess:
                     "exit_code": code,
                     "local_drained": False,
                     "drainage_error": message,
-                    **(
-                        {
-                            "completion_error": self.completion_error,
-                            "unexpected_descendants": self.unexpected_descendants,
-                        }
-                        if self.completion_error is not None else {}
-                    ),
+                    **({"completion_error": self.completion_error}
+                       if self.completion_error is not None else {}),
+                    **({"observed_descendants": self.observed_descendants}
+                       if self.observed_descendants else {}),
                 },
             )
             raise ExecutionError(message) from failure
@@ -763,11 +752,10 @@ class OwnedProcess:
 
     def _write_pending(self, code: int) -> None:
         result = {**read(self.record), "exit_code": code, "local_drained": False}
+        if self.observed_descendants:
+            result["observed_descendants"] = self.observed_descendants
         if self.completion_error is not None:
-            result.update(
-                completion_error=self.completion_error,
-                unexpected_descendants=self.unexpected_descendants,
-            )
+            result["completion_error"] = self.completion_error
         write(self.record, result)
 
     def terminate_tree(self, timeout=10.0):
@@ -777,6 +765,8 @@ class OwnedProcess:
         self.stopping = True
         if self.owner:
             if not self.owner_terminated:
+                if self.completion_error is None:
+                    self.completion_error = FORCED_DRAINAGE_ERROR
                 self.owner.terminate()
                 self.owner_terminated = True
         elif not IS_WINDOWS:
@@ -1180,7 +1170,13 @@ class Execution:
             try:
                 process.terminate_tree()
             except (OSError, subprocess.SubprocessError, ExecutionError) as cleanup:
-                raise ExecutionError(f"{type(failure).__name__}: {failure}; local drainage: {cleanup}") from failure
+                if not (
+                    process.drained
+                    and process.completion_error == str(cleanup)
+                ):
+                    raise ExecutionError(
+                        f"{type(failure).__name__}: {failure}; local drainage: {cleanup}"
+                    ) from failure
             raise
         finally:
             for _, stream in captured.values():
@@ -1193,6 +1189,7 @@ class Execution:
             str(failure) for failure in self.launch_failures if not failure["local_drained"]
         ]
         child_errors = []
+        forced_cleanup_errors = []
         for child in self.children:
             poll_failed = False
             try:
@@ -1223,7 +1220,10 @@ class Execution:
                     getattr(child, "drained", False) is True
                     and getattr(child, "completion_error", None) == str(failure)
                 ):
-                    child_errors.append(str(failure))
+                    if str(failure) == FORCED_DRAINAGE_ERROR:
+                        forced_cleanup_errors.append(str(failure))
+                    else:
+                        child_errors.append(str(failure))
                 else:
                     drainage_errors.append(str(failure))
         if not error and not cancelled and not (
@@ -1234,7 +1234,7 @@ class Execution:
             )
         ):
             error, code = "controller returned without a structured result", 1
-        if drainage_errors or child_errors:
+        if drainage_errors or child_errors or forced_cleanup_errors:
             code = 1
         child_records = sorted(self.directory.rglob("child-*.json"))
         if not IS_WINDOWS:
@@ -1332,7 +1332,7 @@ class Execution:
 
         retained = distinct_evidence(retained, "path", "retained evidence")
         remote_tasks = distinct_evidence(remote_tasks, "evidence", "dispatch observations")
-        if evidence_errors:
+        if evidence_errors or forced_cleanup_errors:
             code = 1
         outcome = (self.last_result or {}).get("result")
         confirmed = (
@@ -1342,12 +1342,15 @@ class Execution:
         payload = {
             "schema": SCHEMA, "run_id": self.run_id, "owner": self.owner,
             "terminal": True, "exit_code": code, "error": error,
-            "local_status": "cancelled_local" if cancelled and not drainage_errors else (
+            "local_status": (
+                "cancelled_local"
+                if cancelled and not drainage_errors and not evidence_errors
+                and not forced_cleanup_errors else
                 "failed" if code or error or drainage_errors else "finished"
             ),
             "local_children_drained": not drainage_errors,
             "drainage_errors": drainage_errors,
-            "finalization_errors": evidence_errors,
+            "finalization_errors": [*forced_cleanup_errors, *evidence_errors],
             "remote_status": "see_workflow_result" if confirmed else "unconfirmed",
             "remote_work_may_continue": not confirmed,
             "writer_ownership": "root_owned" if self.root != self.handle else "retained",

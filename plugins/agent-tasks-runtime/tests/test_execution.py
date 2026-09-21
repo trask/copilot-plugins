@@ -475,7 +475,7 @@ class ExecutionTest(unittest.TestCase):
         owner.terminate.assert_not_called()
         owner.drain.assert_called_once()
 
-    def test_running_descendant_failure_survives_wait_poll_and_finalization(self):
+    def test_running_descendant_naturally_drains_before_deadline(self):
         context = self.context()
         context.emit({"result": "complete"})
         record = context.directory / "child-test.json"
@@ -488,33 +488,36 @@ class ExecutionTest(unittest.TestCase):
         }
         owner = mock.Mock()
         owner.process.return_value = {**IDENTITY, "running": False}
-        owner.processes.return_value = [{**IDENTITY, "running": False}, descendant]
+        events = []
+        owner.processes.side_effect = lambda _deadline, _retained: (
+            events.append("observe")
+            or [{**IDENTITY, "running": False}, descendant]
+        )
+        process._handle.Close.side_effect = lambda: events.append("close")
+        owner.drain.side_effect = lambda _deadline: events.append("zero")
         child = self.windows_owned(process, owner, record)
         context.children.append(child)
-        message = "child exited before a running descendant; the owned job was drained"
 
-        with self.assertRaisesRegex(EXECUTION.ExecutionError, message):
-            child.wait()
-        with self.assertRaisesRegex(EXECUTION.ExecutionError, message):
-            child.wait()
-        with self.assertRaisesRegex(EXECUTION.ExecutionError, message):
-            child.poll()
+        self.assertEqual(0, child.wait())
+        self.assertEqual(0, child.wait())
+        self.assertEqual(0, child.poll())
 
         result = context.finish(0)
         receipt = EXECUTION.read(record)
-        owner.terminate.assert_called_once()
+        owner.terminate.assert_not_called()
         owner.drain.assert_called_once()
+        owner.close.assert_called_once()
+        self.assertEqual(["observe", "close", "zero"], events)
         self.assertTrue(child.drained)
         self.assertTrue(receipt["local_drained"])
-        self.assertEqual(message, receipt["completion_error"])
-        self.assertEqual([descendant], receipt["unexpected_descendants"])
-        self.assertEqual("failed", result["local_status"])
+        self.assertNotIn("completion_error", receipt)
+        self.assertEqual([descendant], receipt["observed_descendants"])
+        self.assertEqual("finished", result["local_status"])
         self.assertTrue(result["local_children_drained"])
-        self.assertIn(message, result["finalization_errors"])
-        self.assertEqual("retained", result["writer_ownership"])
-        self.assertTrue(result["remote_work_may_continue"])
+        self.assertEqual("released", result["writer_ownership"])
+        self.assertFalse(result["remote_work_may_continue"])
 
-    def test_finalization_drains_poll_detected_descendant_and_retains_ownership(self):
+    def test_finalization_naturally_drains_poll_detected_descendant(self):
         context = self.context()
         context.emit({"result": "complete"})
         record = context.directory / "child-test.json"
@@ -531,18 +534,18 @@ class ExecutionTest(unittest.TestCase):
         child = self.windows_owned(process, owner, record)
         context.children.append(child)
 
+        self.assertIsNone(child.poll())
+        self.assertIs(owner, child.owner)
         result = context.finish(0)
 
-        message = "child exited before a running descendant; the owned job was drained"
-        owner.terminate.assert_called_once()
+        owner.terminate.assert_not_called()
         owner.drain.assert_called_once()
         self.assertTrue(child.drained)
-        self.assertEqual(message, child.completion_error)
-        self.assertEqual("failed", result["local_status"])
+        self.assertIsNone(child.completion_error)
+        self.assertEqual("finished", result["local_status"])
         self.assertTrue(result["local_children_drained"])
-        self.assertIn(message, result["finalization_errors"])
-        self.assertEqual("retained", result["writer_ownership"])
-        self.assertTrue(result["remote_work_may_continue"])
+        self.assertEqual("released", result["writer_ownership"])
+        self.assertFalse(result["remote_work_may_continue"])
 
     def test_finalization_waits_for_poll_pending_accounting_without_cancelling(self):
         context = self.context()
@@ -582,25 +585,67 @@ class ExecutionTest(unittest.TestCase):
         owner.processes.return_value = [{**IDENTITY, "running": False}, descendant]
         owner.drain.side_effect = EXECUTION.ExecutionError("descendants remain")
         child = self.windows_owned(process, owner, record)
-        message = (
-            "child exited before a running descendant; local drainage: descendants remain"
-        )
 
-        with self.assertRaisesRegex(EXECUTION.ExecutionError, message):
+        with self.assertRaisesRegex(EXECUTION.ExecutionError, "descendants remain"):
             child.wait()
-        with self.assertRaisesRegex(EXECUTION.ExecutionError, message):
+        with self.assertRaisesRegex(EXECUTION.ExecutionError, "descendants remain"):
             child.wait()
 
         receipt = EXECUTION.read(record)
-        owner.terminate.assert_called_once()
+        owner.terminate.assert_not_called()
         self.assertFalse(child.drained)
         self.assertFalse(receipt["local_drained"])
-        self.assertEqual(
-            "child exited before a running descendant",
-            receipt["completion_error"],
-        )
-        self.assertEqual(message, receipt["drainage_error"])
-        self.assertEqual([descendant], receipt["unexpected_descendants"])
+        self.assertNotIn("completion_error", receipt)
+        self.assertEqual("descendants remain", receipt["drainage_error"])
+        self.assertEqual([descendant], receipt["observed_descendants"])
+
+    def test_forced_drainage_after_zero_exit_is_sticky_failure(self):
+        context = self.context()
+        context.emit({"result": "complete"})
+        record = context.directory / "child-test.json"
+        EXECUTION.write(record, {"process_identity": IDENTITY, "local_drained": False})
+        process = mock.Mock(pid=123, args=["python"])
+        process.wait.return_value = 0
+        process.poll.return_value = 0
+        descendant = {
+            "pid": 456, "creation_time": "789", "image": "helper.exe", "running": True,
+        }
+        owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
+        owner.processes.return_value = [{**IDENTITY, "running": False}, descendant]
+        owner.drain.side_effect = [
+            EXECUTION._OwnershipPending("descendant remains"),
+            None,
+        ]
+        child = self.windows_owned(process, owner, record)
+        context.children.append(child)
+
+        with self.assertRaises(subprocess.TimeoutExpired):
+            child.wait(timeout=0)
+        self.assertIs(owner, child.owner)
+        self.assertFalse(child.drained)
+
+        message = EXECUTION.FORCED_DRAINAGE_ERROR
+        with self.assertRaisesRegex(EXECUTION.ExecutionError, message):
+            child.terminate_tree(timeout=5.0)
+        with self.assertRaisesRegex(EXECUTION.ExecutionError, message):
+            child.wait()
+        with self.assertRaisesRegex(EXECUTION.ExecutionError, message):
+            child.poll()
+
+        result = context.finish(0)
+        receipt = EXECUTION.read(record)
+        owner.terminate.assert_called_once()
+        self.assertEqual(2, owner.drain.call_count)
+        self.assertTrue(child.drained)
+        self.assertTrue(receipt["local_drained"])
+        self.assertEqual(message, receipt["completion_error"])
+        self.assertEqual([descendant], receipt["observed_descendants"])
+        self.assertEqual("failed", result["local_status"])
+        self.assertTrue(result["local_children_drained"])
+        self.assertIn(message, result["finalization_errors"])
+        self.assertEqual("retained", result["writer_ownership"])
+        self.assertTrue(result["remote_work_may_continue"])
 
     def test_windows_observation_failure_is_sticky_and_never_records_drained(self):
         context = self.context()
@@ -759,7 +804,10 @@ class ExecutionTest(unittest.TestCase):
             "monotonic",
             side_effect=[100.0, 103.0, 109.0],
         ):
-            self.assertEqual(1, child.terminate_tree(timeout=10.0))
+            with self.assertRaisesRegex(
+                EXECUTION.ExecutionError, EXECUTION.FORCED_DRAINAGE_ERROR
+            ):
+                child.terminate_tree(timeout=10.0)
 
         self.assertEqual(
             [mock.call(timeout=7.0), mock.call(timeout=1.0)],
@@ -767,6 +815,8 @@ class ExecutionTest(unittest.TestCase):
         )
         process.kill.assert_not_called()
         owner.drain.assert_called_once_with(110.0)
+        self.assertTrue(child.drained)
+        self.assertTrue(EXECUTION.read(record)["local_drained"])
 
     def test_windows_process_observation_retries_vanished_member(self):
         owner = object.__new__(EXECUTION.WindowsOwner)
@@ -1165,7 +1215,7 @@ class ExecutionTest(unittest.TestCase):
 
         owner.active_count.assert_not_called()
 
-    def test_windows_cancellation_drains_running_descendants_without_completion_error(self):
+    def test_windows_forced_cancellation_drainage_is_sticky_failure(self):
         context = self.context()
         record = context.directory / "child-test.json"
         EXECUTION.write(record, {"process_identity": IDENTITY, "local_drained": False})
@@ -1179,11 +1229,14 @@ class ExecutionTest(unittest.TestCase):
         owner.processes.return_value = [{**IDENTITY, "running": False}, descendant]
         child = self.windows_owned(process, owner, record)
 
-        self.assertEqual(1, child.terminate_tree(timeout=5.0))
+        with self.assertRaisesRegex(
+            EXECUTION.ExecutionError, EXECUTION.FORCED_DRAINAGE_ERROR
+        ):
+            child.terminate_tree(timeout=5.0)
 
         owner.terminate.assert_called_once()
         owner.drain.assert_called_once()
-        self.assertIsNone(child.completion_error)
+        self.assertEqual(EXECUTION.FORCED_DRAINAGE_ERROR, child.completion_error)
         self.assertTrue(child.drained)
         self.assertTrue(EXECUTION.read(record)["local_drained"])
 
@@ -1279,6 +1332,54 @@ class ExecutionTest(unittest.TestCase):
 
         child.process.communicate.assert_not_called()
         child._wait.assert_not_called()
+        child.terminate_tree.assert_called_once_with()
+
+    def test_run_preserves_timeout_after_verified_forced_drainage(self):
+        context = self.context()
+        command = ["python", "child.py"]
+        child = mock.Mock()
+        child.record = context.directory / "child-test.json"
+        EXECUTION.write(child.record, {"process_identity": IDENTITY})
+        child.drained = True
+        child.completion_error = EXECUTION.FORCED_DRAINAGE_ERROR
+        child.terminate_tree.side_effect = EXECUTION.ExecutionError(
+            EXECUTION.FORCED_DRAINAGE_ERROR
+        )
+
+        with (
+            mock.patch.object(context, "start", return_value=child),
+            mock.patch.object(EXECUTION.time, "monotonic", side_effect=[100.0, 100.0]),
+            self.assertRaises(subprocess.TimeoutExpired) as failure,
+        ):
+            context.run(command, timeout=0)
+
+        self.assertEqual(0, failure.exception.timeout)
+        child.terminate_tree.assert_called_once_with()
+
+    def test_run_preserves_cancellation_after_verified_forced_drainage(self):
+        context = self.context()
+        command = ["python", "child.py"]
+        child = mock.Mock()
+        child.record = context.directory / "child-test.json"
+        EXECUTION.write(child.record, {"process_identity": IDENTITY})
+        child.drained = True
+        child.completion_error = EXECUTION.FORCED_DRAINAGE_ERROR
+        child.terminate_tree.side_effect = EXECUTION.ExecutionError(
+            EXECUTION.FORCED_DRAINAGE_ERROR
+        )
+
+        with (
+            mock.patch.object(context, "start", return_value=child),
+            mock.patch.object(
+                context, "check_cancel",
+                side_effect=EXECUTION.Cancelled("explicit local cancellation"),
+            ),
+            self.assertRaisesRegex(
+                EXECUTION.Cancelled, "explicit local cancellation"
+            ),
+        ):
+            context.run(command)
+
         child.terminate_tree.assert_called_once_with()
 
     def test_run_observes_cancellation_during_accounting_drain(self):
@@ -1714,6 +1815,101 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual(130, result["exit_code"])
         self.assertEqual("cancelled_local", result["local_status"])
         self.assertEqual("retained", result["writer_ownership"])
+
+    def test_controller_cancellation_preserves_status_after_forced_job_drainage(self):
+        namespace = {}
+
+        def controller():
+            context = namespace["_EXECUTION"]
+            record = context.directory / "child-cancel.json"
+            EXECUTION.write(record, {
+                "schema": EXECUTION.SCHEMA,
+                "root": str(context.root),
+                "run_id": context.run_id,
+                "process_identity": IDENTITY,
+                "local_drained": False,
+                "requires_execution_result": False,
+            })
+            process = mock.Mock(pid=123, args=["python"])
+            process.poll.return_value = None
+            process.wait.return_value = 1
+            owner = mock.Mock()
+            owner.process.return_value = {**IDENTITY, "running": False}
+            owner.processes.return_value = [{**IDENTITY, "running": False}]
+            context.children.append(self.windows_owned(process, owner, record))
+            EXECUTION.cancel(context.handle)
+            raise EXECUTION.Cancelled("explicit local cancellation")
+
+        with (
+            mock.patch.dict(EXECUTION.os.environ, {}, clear=True),
+            mock.patch.object(sys, "argv", ["controller.py", "run"]),
+        ):
+            self.assertEqual(
+                130, EXECUTION.controller_main(controller, namespace, handle=self.handle)
+            )
+
+        result = EXECUTION.status(self.handle)
+        child = EXECUTION.read(next(context for context in self.handle.with_name(
+            self.handle.name + ".d"
+        ).glob("child-*.json")))
+        self.assertEqual(130, result["exit_code"])
+        self.assertEqual("cancelled_local", result["local_status"])
+        self.assertTrue(result["local_children_drained"])
+        self.assertEqual([EXECUTION.FORCED_DRAINAGE_ERROR], result["finalization_errors"])
+        self.assertEqual("unconfirmed", result["remote_status"])
+        self.assertTrue(result["remote_work_may_continue"])
+        self.assertEqual("retained", result["writer_ownership"])
+        self.assertTrue(child["local_drained"])
+        self.assertEqual(EXECUTION.FORCED_DRAINAGE_ERROR, child["completion_error"])
+
+    def test_controller_cancellation_does_not_hide_job_observation_failure(self):
+        namespace = {}
+
+        def controller():
+            context = namespace["_EXECUTION"]
+            record = context.directory / "child-cancel.json"
+            EXECUTION.write(record, {
+                "schema": EXECUTION.SCHEMA,
+                "root": str(context.root),
+                "run_id": context.run_id,
+                "process_identity": IDENTITY,
+                "local_drained": False,
+                "requires_execution_result": False,
+            })
+            process = mock.Mock(pid=123, args=["python"])
+            process.poll.return_value = None
+            process.wait.return_value = 1
+            owner = mock.Mock()
+            owner.process.return_value = {**IDENTITY, "running": False}
+            owner.processes.side_effect = EXECUTION.ExecutionError(
+                "job observation failed"
+            )
+            context.children.append(self.windows_owned(process, owner, record))
+            EXECUTION.cancel(context.handle)
+            raise EXECUTION.Cancelled("explicit local cancellation")
+
+        with (
+            mock.patch.dict(EXECUTION.os.environ, {}, clear=True),
+            mock.patch.object(sys, "argv", ["controller.py", "run"]),
+        ):
+            self.assertEqual(
+                1, EXECUTION.controller_main(controller, namespace, handle=self.handle)
+            )
+
+        result = EXECUTION.status(self.handle)
+        child = EXECUTION.read(next(context for context in self.handle.with_name(
+            self.handle.name + ".d"
+        ).glob("child-*.json")))
+        self.assertEqual(1, result["exit_code"])
+        self.assertEqual("failed", result["local_status"])
+        self.assertFalse(result["local_children_drained"])
+        self.assertTrue(any("job observation failed" in item
+                            for item in result["drainage_errors"]))
+        self.assertEqual("unconfirmed", result["remote_status"])
+        self.assertTrue(result["remote_work_may_continue"])
+        self.assertEqual("retained", result["writer_ownership"])
+        self.assertFalse(child["local_drained"])
+        self.assertIn("job observation failed", child["drainage_error"])
 
     def test_matching_shell_exit_without_child_terminal_is_rejected(self):
         record = self.root / "child.json"

@@ -15,10 +15,13 @@ file-backed output and canonical terminal results, optional read-only status,
 explicit local cancellation and conservative branch-writer leases. Windows
 binds the suspended direct child's exact handle, job, generation and image
 before resume. Completion uses that retained binding and the handle's signaled
-state, with unavailable post-exit image data recorded explicitly. A zero
-active-job count is still required. A foreground timeout covers communication
-and owned-job drainage, and cancellation remains observable while drainage is
-pending.
+state, with unavailable post-exit image data recorded explicitly. The verified
+owned job is the completion unit, so members may briefly outlive the direct
+process while completion remains pending. Success requires complete verified
+membership and a zero active-job count within the original deadline. Forced or
+unverified drainage remains a failed operation even when cleanup later reaches
+zero. A foreground timeout covers communication and owned-job drainage, and
+cancellation remains observable while drainage is pending.
 
 Controllers remain foreground processes. Only the official execution tool may
 detach a root when the user explicitly requests survival beyond client exit.
@@ -49,8 +52,11 @@ matrix failed in job accounting for a cause that remains unexplained. A
 separate later cf40629 nested-process matrix stopped on its first case when a
 post-exit image query returned WinError 31. Independent handles prove that the
 direct and nested processes exited, but the library did not confirm job
-drainage. Neither failure qualifies the cases that did not run, and mocked
-coverage is not native qualification.
+drainage. A 9a79 matrix then observed verified live `conhost.exe` members after
+both Python generations exited and failed because the library immediately
+forced job drainage. It does not prove why those members existed or how long
+they would have remained naturally. None of these failures qualifies cases
+that did not run, and mocked coverage is not native qualification.
 
 ## Current contracts
 

@@ -79,9 +79,13 @@ Windows children use no-window launch, native generation checks and job
 membership. The suspended direct child is bound to its exact handle, job,
 generation and image before resume. After exit, that retained binding and the
 handle's signaled state prove identity without requiring image data to remain
-available. Completion still requires a zero active-job count; unverified
-drainage is an error. A foreground timeout covers communication and owned-job
-drainage, and cancellation remains observable while drainage is pending.
+available. The verified owned job is the completion unit, so a job member may
+briefly outlive the direct process while normal completion remains pending.
+Success still requires complete verified membership and a zero active-job count
+within the original deadline. Unverified or forced drainage is an operation
+failure even when cleanup later proves that the job reached zero. A foreground
+timeout covers communication and owned-job drainage, and cancellation remains
+observable while drainage is pending.
 Linux uses procfs generations and owned process groups; unresolved
 descendant drainage is reported rather than assumed.
 Other process-generation providers are unsupported.
@@ -95,8 +99,12 @@ An earlier native matrix failed in job accounting for a cause that remains
 unexplained. A separate later cf40629 nested-process matrix stopped on its first
 case when a post-exit image query returned WinError 31. Independent handles
 prove that the direct and nested processes exited, but the library did not
-confirm job drainage. Neither failure qualifies the cases that did not run, and
-mocked coverage is not native qualification.
+confirm job drainage. A 9a79 matrix then found verified live `conhost.exe`
+members after both Python generations exited and failed because the library
+immediately forced job drainage. That evidence does not explain why those
+members existed or how long they would have remained naturally. None of these
+failures qualifies cases that did not run, and mocked coverage is not native
+qualification.
 The legacy Pipeline `start` path retains its separate breakaway contract and
 fails before fallback when breakaway is denied.
 
