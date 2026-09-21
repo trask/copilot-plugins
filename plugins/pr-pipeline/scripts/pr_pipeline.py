@@ -12,14 +12,13 @@ from pathlib import Path
 import re
 import sys
 import subprocess
-import time
 import uuid
 from typing import Any, Callable
 
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "d1a383ea78a750b0e438da04d0b2417cda9dc5a135d3cb7f40dcce7cad4b6bb3"
+COMMON_SHA256 = "3310246018fccddc6f423d5d3f7530c38dfb96c0ac311d50650d8274a86140f1"
 
 
 def load_common() -> Any:
@@ -111,13 +110,8 @@ stage_models = common.stage_models
 stage_prompt = common.stage_prompt
 
 RUN_KIND = "pr-pipeline"
-MONITOR_SCHEMA = "github.copilot.pr-pipeline-monitor"
-MONITOR_VERSION = 1
 PROGRESS_EVENT = common.PROGRESS_EVENT
-PROGRESS_UPDATE_EVENT = common.PROGRESS_UPDATE_EVENT
-PROGRESS_HEARTBEAT_INTERVAL = common.PROGRESS_HEARTBEAT_INTERVAL
 TERMINAL_RESULT_MAX_BYTES = 8192
-WATCH_MAX_BYTES = 8192
 TERMINAL_COLLECTION_LIMIT = 12
 TERMINAL_TEXT_LIMIT = 512
 STAGE_LABELS = {
@@ -152,57 +146,21 @@ def run_directory_for(target: dict[str, Any], run_id: str) -> Path:
     return run_root() / run_slug(target) / run_id
 
 
-def progress_log_path(target: dict[str, Any], run_id: str) -> Path:
-    return run_directory_for(target, run_id) / "progress.jsonl"
-
-
-def launch_state_path(target: dict[str, Any], run_id: str) -> Path:
-    return run_directory_for(target, run_id) / "launch.json"
-
-
-def observer_state_path(target: dict[str, Any], run_id: str) -> Path:
-    return run_directory_for(target, run_id) / "observer.json"
-
-
-def scheduler_log_path(target: dict[str, Any], run_id: str) -> Path:
-    return run_directory_for(target, run_id) / "scheduler.log"
-
-
 def run_result_path(target: dict[str, Any], run_id: str) -> Path:
     return run_directory_for(target, run_id) / "result.json"
 
 
 def serialized_size(payload: Any) -> int:
-    return len((json.dumps(payload, sort_keys=True) + os.linesep).encode("utf-8"))
+    return common.serialized_size(payload)
 
 
 def bounded_value(value: Any, *, depth: int = 0) -> tuple[Any, bool]:
-    """Bound diagnostic previews; the artifact retains their exact values."""
-    if isinstance(value, str):
-        return (
-            value[:TERMINAL_TEXT_LIMIT] + "..."
-            if len(value) > TERMINAL_TEXT_LIMIT else value,
-            len(value) > TERMINAL_TEXT_LIMIT,
-        )
-    if not isinstance(value, (dict, list)):
-        return value, False
-    if depth >= 5:
-        return None, bool(value)
-    items = list(value.items()) if isinstance(value, dict) else list(enumerate(value))
-    limit = 32 if isinstance(value, dict) else TERMINAL_COLLECTION_LIMIT
-    truncated = len(items) > limit
-    result: Any = {} if isinstance(value, dict) else []
-    for key, item in items[:limit]:
-        preview, shortened = bounded_value(item, depth=depth + 1)
-        truncated |= shortened
-        if isinstance(result, dict):
-            if len(key) > TERMINAL_TEXT_LIMIT:
-                truncated = True
-                continue
-            result[key] = preview
-        else:
-            result.append(preview)
-    return result, truncated
+    return common.bounded_value(
+        value,
+        text_limit=TERMINAL_TEXT_LIMIT,
+        collection_limit=TERMINAL_COLLECTION_LIMIT,
+        depth=depth,
+    )
 
 
 def compact_stage(stage: dict[str, Any]) -> dict[str, Any]:
@@ -346,227 +304,10 @@ def persist_terminal_result(payload: dict[str, Any], path: Path) -> dict[str, An
             raise WorkflowError(f"terminal result already exists with different content: {path}")
     else:
         common.write_json_atomically(path, payload)
+    canonical, result_sha256 = common.canonical_terminal_payload(payload, path)
     return compact_terminal_result(
-        payload, result_path=path, result_sha256=hashlib.sha256(path.read_bytes()).hexdigest()
+        canonical, result_path=path, result_sha256=result_sha256
     )
-
-
-def bounded_watch_result(
-    payload: dict[str, Any], *, target: dict[str, Any], run_id: str
-) -> dict[str, Any]:
-    result = dict(payload)
-    updates = payload.get("updates", [])
-    if payload.get("finished") and not payload.get("monitor_failure"):
-        terminal = next(
-            (update.get("final_event") for update in reversed(updates)
-             if isinstance(update.get("final_event"), dict)),
-            None,
-        )
-        if terminal is None:
-            records = common.read_progress_log(progress_log_path(target, run_id))
-            terminal = next(
-                (record.get("final_event") for record in reversed(records)
-                 if record.get("terminal")), None,
-            )
-        if not isinstance(terminal, dict):
-            raise WorkflowError("terminal progress record has no final_event")
-        path = run_result_path(target, run_id).resolve()
-        if terminal.get("summary_version") != 1:
-            terminal = persist_terminal_result(terminal, path)
-        artifacts = terminal.get("artifacts") or {}
-        if not paths_match(artifacts.get("result"), path):
-            raise WorkflowError("terminal result artifact path does not match the run")
-        raw = path.read_bytes()
-        if hashlib.sha256(raw).hexdigest() != artifacts.get("result_sha256"):
-            raise WorkflowError("terminal result artifact hash does not match the summary")
-        original = json.loads(raw)
-        if original.get("run_id") != run_id:
-            raise WorkflowError("terminal result artifact identity does not match the run")
-        envelope = {
-            **result, "updates": [], "updates_omitted": len(updates),
-            "artifacts": {"progress": str(progress_log_path(target, run_id).resolve())},
-        }
-        terminal = compact_terminal_result(
-            original, result_path=path, result_sha256=artifacts["result_sha256"],
-            max_bytes=WATCH_MAX_BYTES - serialized_size(envelope) - 256,
-        )
-        result["final_event"] = terminal
-    result["updates"] = []
-    for update in updates[-TERMINAL_COLLECTION_LIMIT:]:
-        preview, truncated = bounded_value(
-            {key: value for key, value in update.items() if key != "final_event"}
-        )
-        if truncated:
-            preview["details_truncated"] = True
-        result["updates"].append(preview)
-    result["artifacts"] = {"progress": str(progress_log_path(target, run_id).resolve())}
-    # Keep the legacy terminal location when both copies fit the watch budget.
-    if result.get("final_event") and result["updates"] and updates[-1].get("terminal"):
-        result["updates"][-1]["final_event"] = result["final_event"]
-        if serialized_size(result) > WATCH_MAX_BYTES:
-            result["updates"][-1].pop("final_event")
-    while result["updates"] and serialized_size(result) > WATCH_MAX_BYTES - 64:
-        result["updates"].pop(0)
-    omitted = len(updates) - len(result["updates"])
-    if omitted:
-        result["updates_omitted"] = omitted
-    if serialized_size(result) > WATCH_MAX_BYTES:
-        raise WorkflowError("watch result identity exceeds the output byte limit")
-    return result
-
-
-def monitor_locator_path(run_id: str) -> Path:
-    return run_root() / "monitors" / f"{run_id}.json"
-
-
-def target_identity(target: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "owner": target["owner"],
-        "repo": target["repo"],
-        "number": target["number"],
-    }
-
-
-def targets_match(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    return (
-        str(left.get("owner") or "").casefold()
-        == str(right.get("owner") or "").casefold()
-        and str(left.get("repo") or "").casefold()
-        == str(right.get("repo") or "").casefold()
-        and left.get("number") == right.get("number")
-    )
-
-
-def paths_match(left: Any, right: Path) -> bool:
-    if not isinstance(left, str) or not left:
-        return False
-    try:
-        return Path(left).resolve() == right.resolve()
-    except OSError:
-        return False
-
-
-def monitor_locator(target: dict[str, Any], run_id: str) -> dict[str, Any]:
-    return {
-        "schema": MONITOR_SCHEMA,
-        "version": MONITOR_VERSION,
-        "run_id": run_id,
-        "target": target_identity(target),
-        "launch_path": str(launch_state_path(target, run_id)),
-        "event_log": str(progress_log_path(target, run_id)),
-    }
-
-
-def load_monitor_target(run_id: str) -> dict[str, Any]:
-    path = monitor_locator_path(run_id)
-    if not path.is_file() or path.is_symlink():
-        raise WorkflowError(f"monitor handle does not exist for run {run_id}")
-    locator = common.read_json(path)
-    if (
-        not isinstance(locator, dict)
-        or set(locator)
-        != {
-            "schema",
-            "version",
-            "run_id",
-            "target",
-            "launch_path",
-            "event_log",
-        }
-        or locator.get("schema") != MONITOR_SCHEMA
-        or locator.get("version") != MONITOR_VERSION
-        or locator.get("run_id") != run_id
-    ):
-        raise WorkflowError(f"monitor handle is malformed for run {run_id}")
-    identity = locator.get("target")
-    if (
-        not isinstance(identity, dict)
-        or set(identity) != {"owner", "repo", "number"}
-        or not isinstance(identity.get("owner"), str)
-        or not identity["owner"]
-        or not isinstance(identity.get("repo"), str)
-        or not identity["repo"]
-        or isinstance(identity.get("number"), bool)
-        or not isinstance(identity.get("number"), int)
-        or identity["number"] < 1
-    ):
-        raise WorkflowError(f"monitor handle has invalid target identity for run {run_id}")
-    target = build_target(identity["owner"], identity["repo"], identity["number"])
-    try:
-        run_directory_for(target, run_id).resolve().relative_to(run_root().resolve())
-    except ValueError as error:
-        raise WorkflowError(
-            f"monitor handle target escapes the run directory for run {run_id}"
-        ) from error
-    if (
-        not paths_match(locator.get("launch_path"), launch_state_path(target, run_id))
-        or not paths_match(locator.get("event_log"), progress_log_path(target, run_id))
-    ):
-        raise WorkflowError(f"monitor handle paths are invalid for run {run_id}")
-    return target
-
-
-def validate_launch_record(target: dict[str, Any], run_id: str) -> None:
-    path = launch_state_path(target, run_id)
-    if not path.is_file() or path.is_symlink():
-        raise WorkflowError(f"launch record does not exist for run {run_id}")
-    launch = common.read_json(path)
-    if (
-        not isinstance(launch, dict)
-        or launch.get("kind") != RUN_KIND
-        or launch.get("run_id") != run_id
-        or not isinstance(launch.get("target"), dict)
-        or not targets_match(launch["target"], target)
-        or not paths_match(launch.get("event_log"), progress_log_path(target, run_id))
-    ):
-        raise WorkflowError(f"launch record identity is invalid for run {run_id}")
-
-
-def watch_arguments(
-    run_id: str,
-    cursor: int,
-    *,
-    target: dict[str, Any] | None = None,
-) -> list[str]:
-    arguments = ["watch"]
-    if target is not None:
-        arguments.append(
-            f"{target['owner']}/{target['repo']}#{target['number']}"
-        )
-    arguments.extend(
-        [
-            "--run-id",
-            run_id,
-            "--cursor",
-            str(cursor),
-            "--wait-seconds",
-            str(int(PROGRESS_HEARTBEAT_INTERVAL)),
-        ]
-    )
-    return arguments
-
-
-def bind_next_watch(
-    payload: dict[str, Any],
-    *,
-    target: dict[str, Any],
-    run_id: str,
-    legacy_target: bool,
-) -> dict[str, Any]:
-    bound = {
-        **payload,
-        "run_id": run_id,
-        "target": f"{target['owner']}/{target['repo']}#{target['number']}",
-    }
-    if not payload.get("finished"):
-        bound["next_watch"] = {
-            "arguments": watch_arguments(
-                run_id,
-                int(payload.get("cursor", 0)),
-                target=target if legacy_target else None,
-            )
-        }
-    return bound
 
 
 def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -731,30 +472,17 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
     return {key: value for key, value in update.items() if value is not None}
 
 
-class ProgressReporter(common.ConversationProgressReporter):
+class ProgressReporter(common.ForegroundProgressReporter):
     def __init__(
         self,
         *,
         target: dict[str, Any] | None = None,
         result_path: Path | None = None,
-        event_log: Path | None = None,
         output: Callable[[dict[str, Any]], None] = emit,
-        wall_time: Callable[[], float] = time.time,
     ) -> None:
         self.result_path = result_path
         self.target = target
-
-        def transition(payload: dict[str, Any]) -> dict[str, Any] | None:
-            if target is not None:
-                payload = {**payload, "number": target["number"]}
-            return progress_transition(payload)
-
-        super().__init__(
-            transition=transition,
-            event_log=event_log,
-            output=output,
-            wall_time=wall_time,
-        )
+        super().__init__(output=output)
 
     def __call__(self, payload: dict[str, Any]) -> None:
         if payload.get("event") == "pipeline_finished" and self.result_path is not None:
@@ -1133,8 +861,6 @@ def run_pipeline(
 
     for sweep in range(1, MAX_SWEEPS + 1):
         pr = read_pull_request(target)
-        if common._EXECUTION is not None:
-            common._EXECUTION.claim_writers([(pr["head_repository"], pr["head_branch"])])
         if pr["state"] != "OPEN":
             return blocked_result(
                 pr=pr,
@@ -1522,145 +1248,16 @@ def run_pipeline(
     raise WorkflowError("the pipeline ended without a result")
 
 
-def scheduler_command(
-    args: argparse.Namespace,
-    target: dict[str, Any],
-    run_id: str,
-    event_log: Path,
-) -> list[str]:
-    command = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "run",
-        f"{target['owner']}/{target['repo']}#{target['number']}",
-        "--run-id",
-        run_id,
-        "--event-log",
-        str(event_log),
-        "--effort",
-        args.effort,
-        "--conflict-strategy",
-        args.conflict_strategy,
-        "--github-mutation-policy",
-        args.github_mutation_policy,
-    ]
-    for override in args.stage_model or []:
-        command.extend(["--stage-model", override])
-    return command
-
-
-def command_start(args: argparse.Namespace) -> None:
-    stage_models(args.stage_model, args.effort)
-    repo_root = resolve_repo_root()
-    target = resolve_target(args.target, repo_root)
-    run_id = uuid.uuid4().hex
-    event_log = progress_log_path(target, run_id)
-    launch_path = launch_state_path(target, run_id)
-    locator_path = monitor_locator_path(run_id)
-    if launch_path.exists() or locator_path.exists():
-        raise WorkflowError(f"run identity already exists: {run_id}")
-    started_at_epoch = time.time()
-    started_at = utc_now()
-    launch = {
-        "kind": RUN_KIND,
-        "run_id": run_id,
-        "target": target,
-        "pid": None,
-        "event_log": str(event_log),
-        "started_at": started_at,
-        "started_at_epoch": started_at_epoch,
-        "conflict_strategy": args.conflict_strategy,
-        "github_mutation_policy": args.github_mutation_policy,
-    }
-    common.write_json_atomically(launch_path, launch)
-    try:
-        process = common.start_detached(
-            scheduler_command(args, target, run_id, event_log),
-            cwd=repo_root,
-            log_path=scheduler_log_path(target, run_id),
-        )
-    except common.LaunchError as error:
-        common.write_json_atomically(
-            launch_path, {**launch, **error.launch_receipt, "error": str(error), "status": "launch_failed"}
-        )
-        raise
-    try:
-        common.write_json_atomically(
-            launch_path, {**launch, "pid": process.pid, **process.launch_receipt}
-        )
-        common.write_json_atomically(locator_path, monitor_locator(target, run_id))
-    except OSError:
-        process.terminate()
-        raise
-    emit(
-        {
-            "event": "pipeline_launched",
-            "run_id": run_id,
-            "target": f"{target['owner']}/{target['repo']}#{target['number']}",
-            "pid": process.pid,
-            **process.launch_receipt,
-            "cursor": 0,
-            "next_watch": {
-                "arguments": watch_arguments(
-                    run_id,
-                    0,
-                )
-            },
-            "conflict_strategy": args.conflict_strategy,
-            "github_mutation_policy": args.github_mutation_policy,
-        }
-    )
-
-
-def command_watch(args: argparse.Namespace) -> None:
-    if args.run_id is None:
-        raise WorkflowError("watch requires --run-id")
-    run_id = common.validate_run_id(args.run_id)
-    locator_path = monitor_locator_path(run_id)
-    legacy_target = not locator_path.exists()
-    if locator_path.exists():
-        target = load_monitor_target(run_id)
-        if args.target is not None and not targets_match(
-            parse_target(args.target), target
-        ):
-            raise WorkflowError(
-                f"watch target does not match monitor handle for run {run_id}"
-            )
-    elif args.target is not None:
-        target = parse_target(args.target)
-    else:
-        raise WorkflowError(f"monitor handle does not exist for run {run_id}")
-    validate_launch_record(target, run_id)
-    payload = common.watch_progress(
-        event_log=progress_log_path(target, run_id),
-        launch_path=launch_state_path(target, run_id),
-        observer_path=observer_state_path(target, run_id),
-        cursor=args.cursor,
-        wait_seconds=args.wait_seconds,
-    )
-    bound = bind_next_watch(
-        payload, target=target, run_id=run_id, legacy_target=legacy_target,
-    )
-    emit(bounded_watch_result(bound, target=target, run_id=run_id))
-
-
 def command_run(args: argparse.Namespace) -> None:
     common.ACTIVE_GITHUB_MUTATION_POLICY = args.github_mutation_policy
-    if common._EXECUTION is not None and args.run_id is not None:
-        args.run_id = common._EXECUTION.run_id
-        args.event_log = None
-        raise WorkflowError("foreground execution owns its fresh run identity; omit --run-id")
-    args.run_id = common.validate_run_id(args.run_id) if args.run_id else (
+    args.run_id = (
         common._EXECUTION.run_id if common._EXECUTION is not None else uuid.uuid4().hex
     )
     require_tools()
     repo_root = resolve_repo_root()
     target = resolve_target(args.target, repo_root)
-    event_log = Path(args.event_log).resolve() if args.event_log else None
     args.result_path = run_result_path(target, args.run_id)
-    reporter = ProgressReporter(
-        target=target, event_log=event_log, result_path=args.result_path
-    )
+    reporter = ProgressReporter(target=target, result_path=args.result_path)
     options = {
         "models": stage_models(args.stage_model, args.effort),
         "effort": args.effort,
@@ -1679,13 +1276,11 @@ def report_run_error(args: argparse.Namespace, error: str) -> None:
     event = {
         "event": "pipeline_finished", "result": "error", "error": error, "run_id": run_id,
     }
-    event_log = Path(args.event_log).resolve() if args.event_log else None
     result_path = getattr(args, "result_path", None) or (
-        event_log.with_name("result.json") if event_log
-        else run_root() / "errors" / run_id / "result.json"
+        run_root() / "errors" / run_id / "result.json"
     )
     try:
-        ProgressReporter(event_log=event_log, result_path=result_path)(event)
+        ProgressReporter(result_path=result_path)(event)
     except (WorkflowError, OSError, ValueError) as reporting_error:
         emit({
             "event": "pipeline_reporting_failed", "run_id": run_id,
@@ -1723,55 +1318,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("allow", "source-only"),
         default="allow",
     )
-    run_command.add_argument("--run-id", help=argparse.SUPPRESS)
-    run_command.add_argument("--event-log", help=argparse.SUPPRESS)
     run_command.set_defaults(function=command_run)
-
-    start = subparsers.add_parser(
-        "start", help="launch the scheduler and return a durable monitor handle"
-    )
-    start.add_argument(
-        "target",
-        nargs="?",
-        help=(
-            "PR URL, owner/repo#number, or a bare number when the repository is "
-            "known; omit only from a branch attached to the pull request"
-        ),
-    )
-    start.add_argument(
-        "--stage-model",
-        action="append",
-        help="pin one stage's model as <stage>=<model>; repeatable",
-    )
-    start.add_argument("--effort", default=DEFAULT_EFFORT)
-    start.add_argument(
-        "--conflict-strategy",
-        choices=common.CONFLICT_STRATEGIES,
-        default="auto",
-    )
-    start.add_argument(
-        "--github-mutation-policy",
-        choices=("allow", "source-only"),
-        default="allow",
-    )
-    start.set_defaults(function=command_start)
-
-    watch = subparsers.add_parser(
-        "watch", help="wait for progress or one five-minute heartbeat"
-    )
-    watch.add_argument(
-        "target",
-        nargs="?",
-        help="legacy exact owner/repo#number for runs created before monitor handles",
-    )
-    watch.add_argument("--run-id")
-    watch.add_argument("--cursor", type=int, default=0)
-    watch.add_argument(
-        "--wait-seconds",
-        type=float,
-        default=PROGRESS_HEARTBEAT_INTERVAL,
-    )
-    watch.set_defaults(function=command_watch)
     return parser
 
 
@@ -1781,39 +1328,9 @@ def main() -> int:
         args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:
-        if args.command == "watch":
-            emit(
-                {
-                    "event": PROGRESS_UPDATE_EVENT,
-                    "updates": [],
-                    "finished": True,
-                    "monitor_failure": str(error),
-                    "run_id": getattr(args, "run_id", None),
-                    "cursor": getattr(args, "cursor", 0),
-                }
-            )
-            return 1
-        if args.command == "start":
-            emit({"event": "pipeline_launch_failed", "error": str(error)})
-            return 1
         report_run_error(args, str(error))
         return 1
     except KeyboardInterrupt:
-        if args.command == "watch":
-            emit(
-                {
-                    "event": PROGRESS_UPDATE_EVENT,
-                    "updates": [],
-                    "finished": True,
-                    "monitor_failure": "interrupted",
-                    "run_id": getattr(args, "run_id", None),
-                    "cursor": getattr(args, "cursor", 0),
-                }
-            )
-            return 130
-        if args.command == "start":
-            emit({"event": "pipeline_launch_failed", "error": "interrupted"})
-            return 130
         report_run_error(args, "interrupted")
         return 130
 

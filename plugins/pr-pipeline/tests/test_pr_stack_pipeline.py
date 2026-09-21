@@ -1,4 +1,5 @@
 from contextlib import redirect_stdout
+import hashlib
 import importlib.util
 from io import StringIO
 import json
@@ -370,7 +371,6 @@ class ModelTest(unittest.TestCase):
                 github_mutation_policy="source-only",
                 run_id="a" * 32,
                 state_path=root / "state.json",
-                lock_path=root / "state.lock",
                 run_directory=root / "run",
             )
             pipeline.state = MODULE.new_state(
@@ -559,7 +559,6 @@ class StackFixture(unittest.TestCase):
             "report": self.events.append,
             "launcher": self.launcher,
             "state_path": self.root / "state.json",
-            "lock_path": self.root / "state.lock",
             "run_directory": self.root / "run",
             "read_stack": self.read_stack,
             "inspect": self.inspect,
@@ -1021,68 +1020,6 @@ class StackRunTest(StackFixture):
         self.assertIn(("cancel", 11), self.launcher.calls)
         self.assertEqual([], pipeline.state["active_workers"])
 
-    def test_cancellation_during_serialized_launch_stops_later_workers(self):
-        pipeline = self.pipeline()
-
-        def request_cancel(request):
-            if request["number"] == 11:
-                COMMON.write_json_atomically(
-                    pipeline.cancellation_path,
-                    {
-                        "kind": MODULE.RUN_KIND,
-                        "run_id": pipeline.run_id,
-                        "kickoff": pipeline.kickoff,
-                        "status": "requested",
-                    },
-                )
-
-        self.launcher.on_start = request_cancel
-        requests = [
-            pipeline.request_for(member, MODULE.STAGE_COPILOT_REVIEW, 1)
-            for member in self.stack["members"]
-        ]
-
-        with self.assertRaises(MODULE.PipelineCancelled):
-            pipeline.dispatch(requests, MODULE.STAGE_COPILOT_REVIEW, 1)
-
-        self.assertEqual(
-            [11], [call[1] for call in self.launcher.calls if call[0] == "start"]
-        )
-        self.assertIn(("cancel", 11), self.launcher.calls)
-        self.assertEqual([], pipeline.state["active_workers"])
-
-    def test_cancellation_during_parallel_execution_stops_all_live_workers(self):
-        self.launcher = FakeLauncher(alive_polls=100)
-        pipeline = self.pipeline()
-        requested = False
-
-        def cancel_on_first_wait(_seconds):
-            nonlocal requested
-            if not requested:
-                requested = True
-                COMMON.write_json_atomically(
-                    pipeline.cancellation_path,
-                    {
-                        "kind": MODULE.RUN_KIND,
-                        "run_id": pipeline.run_id,
-                        "kickoff": pipeline.kickoff,
-                        "status": "requested",
-                    },
-                )
-
-        pipeline.sleep = cancel_on_first_wait
-        with self.assertRaises(MODULE.PipelineCancelled):
-            pipeline.run_parallel_phase(
-                MODULE.STAGE_COPILOT_REVIEW, 1, self.stack["members"]
-            )
-        pipeline.cancel_active_workers()
-
-        self.assertEqual(
-            [11, 12, 13],
-            [call[1] for call in self.launcher.calls if call[0] == "cancel"],
-        )
-        self.assertEqual([], pipeline.state["active_workers"])
-
     # Stale results ------------------------------------------------------
 
     def test_a_result_from_an_old_dispatch_is_ignored(self):
@@ -1239,25 +1176,6 @@ class StackRunTest(StackFixture):
         self.assertEqual(12, result["blocked"]["number"])
         self.assertEqual("predecessor_head_is_not_contained", result["gates"][-1]["reason"])
         self.assertEqual("predecessor_alignment", result["propagations"][-1]["trigger"])
-
-    def test_cancellation_prevents_predecessor_alignment(self):
-        self.contains_pairs = set()
-        pipeline = self.pipeline()
-        self.clear.add((11, MODULE.STAGE_CI))
-        COMMON.write_json_atomically(
-            pipeline.cancellation_path,
-            {
-                "kind": MODULE.RUN_KIND,
-                "run_id": pipeline.run_id,
-                "kickoff": pipeline.kickoff,
-                "status": "requested",
-            },
-        )
-
-        with self.assertRaises(MODULE.PipelineCancelled):
-            pipeline.run_ci_phase(1, self.stack["members"])
-
-        self.assertEqual([], self.propagated)
 
     def test_an_already_clear_member_is_green_without_a_worker(self):
         self.clear.add((11, MODULE.STAGE_CI))
@@ -1470,34 +1388,6 @@ class StackRunTest(StackFixture):
         pipeline.monitor_ci_worker(launched["workers"][0], request)
 
         self.assertEqual([(11, "1" * 40)], self.propagated)
-
-    def test_cancellation_prevents_a_final_ci_propagation_after_worker_exit(self):
-        pipeline = self.pipeline()
-        member = self.stack["members"][0]
-        request = pipeline.request_for(member, MODULE.STAGE_CI, 1)
-        launched = pipeline.dispatch([request], MODULE.STAGE_CI, 1)
-        self.checkpoint_map[11] = [
-            {
-                "id": "push-1",
-                "head_sha": head_of(11),
-                "pipeline_run": "run-1",
-                "pipeline_iteration": 1,
-            }
-        ]
-        COMMON.write_json_atomically(
-            pipeline.cancellation_path,
-            {
-                "kind": MODULE.RUN_KIND,
-                "run_id": pipeline.run_id,
-                "kickoff": pipeline.kickoff,
-                "status": "requested",
-            },
-        )
-
-        with self.assertRaises(MODULE.PipelineCancelled):
-            pipeline.monitor_ci_worker(launched["workers"][0], request)
-
-        self.assertEqual([], self.propagated)
 
     def test_ci_monitor_reports_known_failure_diagnostics_once(self):
         self.launcher = FakeLauncher(alive_polls=2)
@@ -1906,29 +1796,6 @@ class StackRunTest(StackFixture):
         self.assertEqual("missing_dependencies", result["reason"])
         self.assertEqual([], self.launcher.calls)
 
-    def test_cancellation_before_first_launch_finishes_the_run_as_cancelled(self):
-        pipeline = self.pipeline()
-        COMMON.write_json_atomically(
-            pipeline.cancellation_path,
-            {
-                "kind": MODULE.RUN_KIND,
-                "run_id": pipeline.run_id,
-                "kickoff": pipeline.kickoff,
-                "status": "requested",
-            },
-        )
-
-        result = pipeline.execute()
-
-        self.assertEqual("cancelled", result["result"])
-        self.assertEqual("cancel_requested", result["reason"])
-        self.assertEqual([], self.launcher.calls)
-        self.assertEqual(
-            "cancelled",
-            COMMON.read_json(pipeline.result_path)["pipeline_result"]["result"],
-        )
-        self.assertFalse(pipeline.lock_path.exists())
-
     def test_a_stopped_launch_ends_the_run_with_a_partial_summary(self):
         self.launcher = FakeLauncher(fail_step="start", fail_number=11)
         pipeline = self.pipeline()
@@ -1943,7 +1810,7 @@ class StackRunTest(StackFixture):
             "PR Stack Pipeline: #11 - Pull request 11", result["session_title"]
         )
 
-    def test_runtime_error_cancels_workers_and_releases_the_lock(self):
+    def test_runtime_error_cancels_workers(self):
         self.launcher = FakeLauncher(alive_polls=100)
 
         def fail_progress(_repository, _number, _stage):
@@ -1958,7 +1825,6 @@ class StackRunTest(StackFixture):
         self.assertIn("GitHub unavailable", result["detail"])
         self.assertIn(("cancel", 11), self.launcher.calls)
         self.assertEqual([], pipeline.state["active_workers"])
-        self.assertFalse(pipeline.lock_path.exists())
         self.assertEqual(
             "error",
             COMMON.read_json(pipeline.result_path)["pipeline_result"]["result"],
@@ -2246,33 +2112,6 @@ class StackRunTest(StackFixture):
             saved["pull_requests"]["12"]["stages"][MODULE.STAGE_COPILOT_REVIEW]["clear"]
         )
 
-    def test_finish_releases_the_lock_when_result_persistence_fails(self):
-        pipeline = self.pipeline()
-        MODULE.acquire_lock(pipeline.lock_path, pipeline.run_id)
-        with (
-            mock.patch.object(
-                pipeline, "persist_result", side_effect=OSError("disk full")
-            ),
-            self.assertRaisesRegex(OSError, "disk full"),
-        ):
-            pipeline.finish("cancelled")
-        self.assertFalse(pipeline.lock_path.exists())
-
-    def test_a_duplicate_run_stops_on_the_lock(self):
-        self.clear_everything()
-        first = self.pipeline()
-        MODULE.acquire_lock(first.lock_path, "other-run")
-        with mock.patch.object(MODULE.common, "process_is_alive", return_value=True):
-            result = first.execute()
-
-        self.assertEqual("stopped", result["result"])
-        self.assertEqual("another_run_holds_the_lock", result["reason"])
-        self.assertEqual([], self.launcher.calls)
-        self.assertEqual(
-            "stopped",
-            COMMON.read_json(first.result_path)["pipeline_result"]["result"],
-        )
-
     def test_exact_run_path_refuses_a_sealed_state_from_an_older_owner(self):
         pipeline = self.pipeline()
         state = MODULE.new_state(
@@ -2298,6 +2137,20 @@ class StackRunTest(StackFixture):
         sealed = COMMON.read_json(pipeline.state_path)
         self.assertEqual("old-run", sealed["run_id"])
         self.assertEqual("old-nonce", sealed["active_workers"][0]["nonce"])
+
+    def test_stale_admission_lock_does_not_block_a_fresh_run(self):
+        self.clear_everything()
+        pipeline = self.pipeline()
+        stale_lock = self.root / "state.lock"
+        COMMON.write_json_atomically(
+            stale_lock,
+            {"run_id": "old-run", "pid": 123, "created_at": "2026-01-01T00:00:00Z"},
+        )
+
+        result = pipeline.execute()
+
+        self.assertEqual("complete", result["result"])
+        self.assertTrue(stale_lock.exists())
 
     def test_progress_events_name_every_phase(self):
         self.clear_everything()
@@ -2639,6 +2492,59 @@ class CiWarningTest(StackFixture):
             "event": "stack_pipeline_finished", **result,
         })["message"])
 
+    def test_terminal_result_is_deterministic_and_bound_to_the_canonical_artifact(self):
+        payload = {
+            "result": "blocked",
+            "reason": "stage_execution_failed",
+            "run_id": "run-1",
+            "repository": "owner/repo",
+            "stack_number": 77,
+            "start_pull_request": 11,
+            "selected": [11, 12, 13],
+            "passes": 1,
+            "phases": [{
+                "phase": MODULE.STAGE_SELF_REVIEW,
+                "stopped": {
+                    "number": 12,
+                    "stage": MODULE.STAGE_SELF_REVIEW,
+                    "reason": "stage_invocation_abandoned",
+                    "stage_result": {
+                        "stage": MODULE.STAGE_SELF_REVIEW,
+                        "status": {
+                            "agent_task": {
+                                "error": {
+                                    "code": "worker_failed",
+                                    "message": "retained local commit",
+                                }
+                            }
+                        },
+                    },
+                },
+            }],
+        }
+        path = self.root / "canonical-result.json"
+        COMMON.write_json_atomically(path, {
+            "kind": MODULE.RUN_KIND,
+            "run_id": payload["run_id"],
+            "kickoff": kickoff(),
+            "finished_at": "2026-09-21T00:00:00Z",
+            "pipeline_result": payload,
+        })
+
+        first = MODULE.compact_terminal_result(payload, result_path=path)
+        second = MODULE.compact_terminal_result(payload, result_path=path)
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+            first["artifacts"]["result_sha256"],
+        )
+        self.assertEqual("worker_failed: retained local commit", first["stage_failure"]["error"])
+        with self.assertRaisesRegex(MODULE.WorkflowError, "canonical artifact"):
+            MODULE.compact_terminal_result(
+                {**payload, "reason": "different"}, result_path=path
+            )
+
     def test_stack_worker_command_preserves_frozen_policy_for_ci(self):
         for policy in ("allow", "source-only"):
             with self.subTest(policy=policy):
@@ -2658,12 +2564,15 @@ class SnapshotTest(StackFixture):
     def test_completion_needs_all_five_markers_for_every_selected_member(self):
         self.clear_everything()
         pipeline = self.pipeline()
-        self.assertEqual("complete", pipeline.final_snapshot()["result"])
+        complete = pipeline.final_snapshot()
+        self.assertEqual("complete", complete["result"])
+        self.assertTrue(complete["all_ci_passed"])
 
         self.clear.discard((13, MODULE.STAGE_DESCRIPTION))
         snapshot = pipeline.final_snapshot()
         self.assertEqual("incomplete", snapshot["result"])
         self.assertEqual("stages_not_clear", snapshot["reason"])
+        self.assertNotIn("all_ci_passed", snapshot)
         self.assertEqual(
             ["pr-description"],
             [
@@ -2775,33 +2684,6 @@ class StateTest(unittest.TestCase):
         self.assertNotIn("active_workers", fresh)
         self.assertNotIn("recovered_from", fresh)
 
-    def test_a_lock_held_by_a_live_process_is_not_taken(self):
-        path = self.root / "state.lock"
-        MODULE.acquire_lock(path, "run-1", alive=lambda pid: True)
-
-        held = MODULE.acquire_lock(path, "run-2", alive=lambda pid: True)
-        self.assertEqual("held", held["result"])
-        self.assertEqual("run-1", held["holder"]["run_id"])
-
-    def test_a_lock_left_by_a_dead_process_is_taken(self):
-        path = self.root / "state.lock"
-        MODULE.acquire_lock(path, "run-1", alive=lambda pid: False)
-
-        taken = MODULE.acquire_lock(path, "run-2", alive=lambda pid: False)
-        self.assertEqual("acquired", taken["result"])
-
-        MODULE.release_lock(path, "run-2")
-        self.assertFalse(path.exists())
-
-    def test_a_lock_is_not_released_by_another_run(self):
-        path = self.root / "state.lock"
-        MODULE.acquire_lock(path, "run-1", alive=lambda pid: True)
-
-        MODULE.release_lock(path, "run-2")
-
-        self.assertTrue(path.exists())
-
-
 class WorktreePathTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -2889,407 +2771,6 @@ class WorktreePathTest(unittest.TestCase):
             run_directory / "worktrees" / "19871.worktree.json",
             MODULE.worktree_ownership_path(run_directory, 19871),
         )
-
-
-class ProgressProtocolTest(StackFixture):
-    def setUp(self):
-        super().setUp()
-        self.event_log = self.root / "progress.jsonl"
-
-    def reporter(self, now=1000.0):
-        output = []
-        reporter = MODULE.ProgressReporter(
-            event_log=self.event_log,
-            output=output.append,
-            wall_time=lambda: now,
-        )
-        return reporter, output
-
-    def test_transitions_include_pass_pr_stage_wait_and_next_action(self):
-        reporter, output = self.reporter()
-        reporter(
-            {
-                "event": "phase_started",
-                "phase": MODULE.STAGE_COPILOT_REVIEW,
-                "pull_request_pass": 1,
-                "numbers": [11, 12],
-            }
-        )
-        reporter(
-            {
-                "event": "worker_finished",
-                "stage": MODULE.STAGE_COPILOT_REVIEW,
-                "pull_request_pass": 1,
-                "number": 11,
-                "returncode": 1,
-                "accepted": True,
-            }
-        )
-
-        updates = MODULE.read_progress_log(self.event_log)
-        self.assertEqual(2, len(updates))
-        self.assertEqual(2, len(output))
-        self.assertIn("Pass 1/2", updates[0]["message"])
-        self.assertIn("#11, #12", updates[0]["message"])
-        self.assertEqual(MODULE.STAGE_COPILOT_REVIEW, updates[0]["stage"])
-        self.assertIn("starting workers", updates[0]["wait_reason"])
-        self.assertTrue(updates[0]["next_action"])
-        self.assertIn("failed for #11", updates[1]["message"])
-
-    def test_worker_exit_without_clearance_is_reported_as_result_collected(self):
-        reporter, _ = self.reporter()
-        reporter(
-            {
-                "event": "worker_finished",
-                "stage": MODULE.STAGE_DESCRIPTION,
-                "pull_request_pass": 2,
-                "number": 20073,
-                "returncode": 0,
-                "accepted": True,
-                "clear": False,
-                "reason": "not_cleared",
-                "status": "result_collected",
-                "clear_at_head_sha": "1" * 40,
-                "current_head_sha": "2" * 40,
-            }
-        )
-        reporter(
-            {
-                "event": "phase_finished",
-                "phase": MODULE.STAGE_DESCRIPTION,
-                "pull_request_pass": 2,
-                "numbers": [20073],
-                "clear": False,
-                "reasons": ["not_cleared"],
-            }
-        )
-
-        updates = MODULE.read_progress_log(self.event_log)
-        self.assertIn("result collected", updates[0]["message"])
-        self.assertNotIn("completed", updates[0]["message"])
-        self.assertIn("clearance was not verified", updates[1]["message"])
-        self.assertNotIn(" complete.", updates[1]["message"])
-
-    def test_stage_failure_is_not_reported_as_a_launch_failure(self):
-        reporter, _ = self.reporter()
-        reporter({
-            "event": "phase_finished",
-            "phase": MODULE.STAGE_CONFLICT,
-            "pull_request_pass": 1,
-            "numbers": [11],
-            "clear": False,
-            "stopped": {
-                "step": "stage_status",
-                "reason": "conflict_did_not_record_outcome",
-            },
-        })
-
-        update = MODULE.read_progress_log(self.event_log)[0]
-        self.assertEqual(
-            "Stop the pipeline and report the stage failure.", update["next_action"]
-        )
-        self.assertFalse(update["waiting"])
-
-    def test_stale_worker_progress_names_recorded_and_live_revisions(self):
-        reporter, _ = self.reporter()
-        reporter(
-            {
-                "event": "worker_finished",
-                "stage": MODULE.STAGE_COPILOT_REVIEW,
-                "pull_request_pass": 1,
-                "number": 11,
-                "returncode": 0,
-                "accepted": True,
-                "clear": False,
-                "reason": "clearance_is_for_an_older_head",
-                "clear_at_head_sha": "1" * 40,
-                "current_head_sha": "2" * 40,
-            }
-        )
-
-        message = MODULE.read_progress_log(self.event_log)[0]["message"]
-        self.assertIn("recorded 11111111, live 22222222", message)
-
-    def test_a_completed_resolver_skip_is_reported_without_a_start_event(self):
-        reporter, _ = self.reporter()
-        reporter(
-            {
-                "event": "phase_finished",
-                "phase": MODULE.STAGE_CONFLICT,
-                "pull_request_pass": 2,
-                "numbers": [11],
-                "action": "completed_this_run",
-            }
-        )
-
-        update = MODULE.read_progress_log(self.event_log)[0]
-        self.assertIn("not run again", update["message"])
-        self.assertEqual("phase_finished", update["source_event"])
-        self.assertEqual([11], update["pull_requests"])
-
-    def test_worker_progress_names_known_failure_diagnostics(self):
-        reporter, _ = self.reporter()
-        reporter(
-            {
-                "event": "worker_progress",
-                "stage": MODULE.STAGE_CI,
-                "pull_request_pass": 1,
-                "number": 11,
-                "phase": "diagnosing",
-                "action_checks": ["check:build"],
-                "pending_checks": ["check:test"],
-            }
-        )
-        update = MODULE.read_progress_log(self.event_log)[0]
-        self.assertIn("diagnosing 1 known failure", update["message"])
-        self.assertIn("diagnosing a known CI failure", update["wait_reason"])
-
-    def test_copilot_review_progress_names_all_live_substates(self):
-        expectations = {
-            "waiting_for_review": "waiting for Copilot's review",
-            "addressing_comments": "addressing Copilot review comments",
-            "validating": "validating Copilot review fixes",
-        }
-        for phase, phrase in expectations.items():
-            with self.subTest(phase=phase):
-                event_log = self.root / f"{phase}.jsonl"
-                reporter = MODULE.ProgressReporter(
-                    event_log=event_log,
-                    output=lambda _payload: None,
-                    wall_time=lambda: 1000.0,
-                )
-                reporter(
-                    {
-                        "event": "worker_progress",
-                        "stage": MODULE.STAGE_COPILOT_REVIEW,
-                        "pull_request_pass": 1,
-                        "number": 11,
-                        "phase": phase,
-                    }
-                )
-                update = MODULE.read_progress_log(event_log)[0]
-                self.assertIn("#11", update["message"])
-                self.assertIn(phrase, update["message"])
-                self.assertIn("#11", update["wait_reason"])
-
-    def test_real_scheduler_events_keep_pass_and_pull_request_context(self):
-        self.clear_everything()
-        reporter, _ = self.reporter()
-        pipeline = self.pipeline(report=reporter)
-
-        pipeline.execute()
-
-        updates = MODULE.read_progress_log(self.event_log)
-        finished = next(
-            update
-            for update in updates
-            if update["source_event"] == "worker_finished"
-        )
-        phase = next(
-            update
-            for update in updates
-            if update["source_event"] == "phase_finished"
-        )
-        self.assertEqual(1, finished["pull_request_pass"])
-        self.assertEqual([11], finished["pull_requests"])
-        self.assertEqual(1, phase["pull_request_pass"])
-        self.assertEqual([11], phase["pull_requests"])
-
-    def test_unchanged_wait_transitions_are_coalesced(self):
-        reporter, _ = self.reporter()
-        event = {
-            "event": "worker_wait_started",
-            "stage": MODULE.STAGE_CI,
-            "pull_request_pass": 1,
-            "number": 11,
-        }
-        reporter(event)
-        reporter(event)
-
-        self.assertEqual(1, len(MODULE.read_progress_log(self.event_log)))
-
-    def test_reporting_failures_do_not_escape_into_pipeline_control_flow(self):
-        def fail(_payload):
-            raise OSError("closed output")
-
-        reporter = MODULE.ProgressReporter(
-            event_log=self.root,
-            output=fail,
-        )
-        reporter({"event": "pass_started", "pull_request_pass": 1})
-        MODULE.report_safely(fail, "worker_active", number=11)
-
-    def test_scheduler_command_carries_the_monitor_handle_and_options(self):
-        args = MODULE.build_parser().parse_args(
-            [
-                "start",
-                "--kickoff",
-                json.dumps(kickoff()),
-                "--stage-model",
-                "ci-fix-loop=claude-sonnet-5",
-                "--effort",
-                "high",
-                "--conflict-strategy",
-                "merge",
-            ]
-        )
-        command = MODULE.scheduler_command(
-            args,
-            kickoff(),
-            self.root,
-            "a" * 32,
-            self.event_log,
-        )
-
-        self.assertIn("run", command)
-        self.assertIn("--run-id", command)
-        self.assertIn("a" * 32, command)
-        self.assertIn("--event-log", command)
-        self.assertIn("ci-fix-loop=claude-sonnet-5", command)
-        self.assertEqual(
-            "merge", command[command.index("--conflict-strategy") + 1]
-        )
-        self.assertEqual(
-            "allow", command[command.index("--github-mutation-policy") + 1]
-        )
-
-    def test_watch_emits_one_heartbeat_only_after_five_unchanged_minutes(self):
-        class Clock:
-            def __init__(self):
-                self.value = 1000.0
-
-            def now(self):
-                return self.value
-
-            def sleep(self, seconds):
-                self.value += seconds
-
-        clock = Clock()
-        reporter = MODULE.ProgressReporter(
-            event_log=self.event_log,
-            output=lambda _payload: None,
-            wall_time=clock.now,
-        )
-        reporter(
-            {
-                "event": "worker_wait_started",
-                "stage": MODULE.STAGE_CI,
-                "pull_request_pass": 1,
-                "number": 11,
-            }
-        )
-        launch = self.root / "launch.json"
-        observer = self.root / "observer.json"
-        COMMON.write_json_atomically(launch, {"pid": 123})
-
-        initial = MODULE.watch_progress(
-            event_log=self.event_log,
-            launch_path=launch,
-            observer_path=observer,
-            cursor=0,
-            wait_seconds=1,
-            wall_time=clock.now,
-            monotonic=clock.now,
-            sleep=clock.sleep,
-            alive=lambda _pid: True,
-        )
-        with mock.patch.object(COMMON, "PROGRESS_WATCH_POLL_INTERVAL", 299):
-            early = MODULE.watch_progress(
-                event_log=self.event_log,
-                launch_path=launch,
-                observer_path=observer,
-                cursor=initial["cursor"],
-                wait_seconds=299,
-                wall_time=clock.now,
-                monotonic=clock.now,
-                sleep=clock.sleep,
-                alive=lambda _pid: True,
-            )
-        due = MODULE.watch_progress(
-            event_log=self.event_log,
-            launch_path=launch,
-            observer_path=observer,
-            cursor=initial["cursor"],
-            wait_seconds=1,
-            wall_time=clock.now,
-            monotonic=clock.now,
-            sleep=clock.sleep,
-            alive=lambda _pid: True,
-        )
-        again = MODULE.watch_progress(
-            event_log=self.event_log,
-            launch_path=launch,
-            observer_path=observer,
-            cursor=initial["cursor"],
-            wait_seconds=1,
-            wall_time=clock.now,
-            monotonic=clock.now,
-            sleep=clock.sleep,
-            alive=lambda _pid: True,
-        )
-
-        self.assertEqual(1, len(initial["updates"]))
-        self.assertEqual([], early["updates"])
-        self.assertEqual("heartbeat", due["updates"][0]["kind"])
-        self.assertEqual(300, due["updates"][0]["elapsed_seconds"])
-        self.assertEqual([], again["updates"])
-
-    def test_watch_rechecks_the_journal_after_the_scheduler_exits(self):
-        reporter, _ = self.reporter()
-        reporter(
-            {
-                "event": "worker_wait_started",
-                "stage": MODULE.STAGE_CI,
-                "pull_request_pass": 1,
-                "number": 11,
-            }
-        )
-        launch = self.root / "launch.json"
-        observer = self.root / "observer.json"
-        COMMON.write_json_atomically(launch, {"pid": 123})
-        MODULE.watch_progress(
-            event_log=self.event_log,
-            launch_path=launch,
-            observer_path=observer,
-            cursor=0,
-            wait_seconds=1,
-            alive=lambda _pid: True,
-        )
-
-        def finish_before_exit(_pid):
-            reporter(
-                {
-                    "event": "stack_pipeline_finished",
-                    "result": "complete",
-                    "run_id": "run-1",
-                }
-            )
-            return False
-
-        result = MODULE.watch_progress(
-            event_log=self.event_log,
-            launch_path=launch,
-            observer_path=observer,
-            cursor=1,
-            wait_seconds=1,
-            alive=finish_before_exit,
-        )
-
-        self.assertTrue(result["finished"])
-        self.assertNotIn("monitor_failure", result)
-        self.assertEqual("complete", result["updates"][0]["final_event"]["result"])
-
-    def test_missing_launch_record_stops_the_monitor(self):
-        result = MODULE.watch_progress(
-            event_log=self.event_log,
-            launch_path=self.root / "missing.json",
-            observer_path=self.root / "observer.json",
-            cursor=0,
-            wait_seconds=1,
-        )
-
-        self.assertTrue(result["finished"])
-        self.assertEqual("launch_record_missing", result["monitor_failure"])
 
 
 class DependencyTest(unittest.TestCase):
@@ -3999,471 +3480,44 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertNotIn("clean_at_head_sha", self.text)
 
 
-class MonitorHandleTest(unittest.TestCase):
-    def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
-        self.payload = kickoff()
-        self.run_id = "a" * 32
-        self.run_root = mock.patch.object(MODULE, "run_root", return_value=self.root)
-        self.run_root.start()
-        self.addCleanup(self.run_root.stop)
-
-    def write_monitor_run(self, *, launch_run_id=None):
-        launch = {
-            "kind": MODULE.RUN_KIND,
-            "run_id": launch_run_id or self.run_id,
-            "kickoff": self.payload,
-            "pid": 4321,
-            "event_log": str(
-                MODULE.progress_log_path(self.payload, self.run_id)
-            ),
-            "github_mutation_policy": "source-only",
-        }
-        COMMON.write_json_atomically(
-            MODULE.launch_state_path(self.payload, self.run_id), launch
-        )
-        COMMON.write_json_atomically(
-            MODULE.monitor_locator_path(self.run_id),
-            MODULE.monitor_locator(self.payload, self.run_id),
-        )
-
-    def test_start_returns_a_versioned_run_only_watch_handle(self):
-        args = MODULE.build_parser().parse_args(
-            [
-                "start",
-                "--kickoff",
-                json.dumps(self.payload),
-                "--github-mutation-policy",
-                "source-only",
-            ]
-        )
-        output = StringIO()
-        process = SimpleNamespace(pid=4321, terminate=mock.Mock(), launch_receipt={"creationflags": 0, "process_identity": None})
-        with (
-            mock.patch.object(COMMON, "resolve_repo_root", return_value=self.root),
-            mock.patch.object(MODULE, "start_scheduler", return_value=process),
-            mock.patch.object(
-                MODULE.uuid, "uuid4", return_value=SimpleNamespace(hex=self.run_id)
-            ),
-            redirect_stdout(output),
-        ):
-            MODULE.command_start(args)
-
-        launch = COMMON.read_json(
-            MODULE.launch_state_path(self.payload, self.run_id)
-        )
-        locator = COMMON.read_json(MODULE.monitor_locator_path(self.run_id))
-        event = json.loads(output.getvalue())
-        self.assertEqual("source-only", launch["github_mutation_policy"])
-        self.assertEqual(MODULE.MONITOR_SCHEMA, locator["schema"])
-        self.assertEqual(MODULE.MONITOR_VERSION, locator["version"])
-        self.assertEqual(self.payload, locator["kickoff"])
-        self.assertEqual(
-            [
-                "watch",
-                "--run-id",
-                self.run_id,
-                "--cursor",
-                "0",
-                "--wait-seconds",
-                "300",
-            ],
-            event["next_watch"]["arguments"],
-        )
-        self.assertNotIn("--kickoff", event["next_watch"]["arguments"])
-
-    def test_denied_scheduler_launch_persists_receipt_without_success_event(self):
-        args = MODULE.build_parser().parse_args(["start", "--kickoff", json.dumps(self.payload)])
-        receipt = {
-            "creationflags": 0x09000204, "breakaway_requested": True,
-            "breakaway_accepted": False, "fallback_used": False,
-            "process_identity": None, "launch_error_code": 5,
-        }
-        with (
-            mock.patch.object(COMMON, "resolve_repo_root", return_value=self.root),
-            mock.patch.object(MODULE.uuid, "uuid4", return_value=SimpleNamespace(hex=self.run_id)),
-            mock.patch.object(MODULE, "start_scheduler", side_effect=COMMON.LaunchError(
-                "breakaway denied before fallback", receipt,
-            )) as start,
-            mock.patch.object(COMMON, "emit") as emit,
-            self.assertRaisesRegex(COMMON.LaunchError, "breakaway denied"),
-        ):
-            MODULE.command_start(args)
-        launch = COMMON.read_json(MODULE.launch_state_path(self.payload, self.run_id))
-        self.assertEqual("launch_failed", launch["status"])
-        self.assertEqual(receipt, {key: launch[key] for key in receipt})
-        start.assert_called_once()
-        emit.assert_not_called()
-
-    def test_watch_uses_only_the_exact_monitor_handle(self):
-        self.write_monitor_run()
-        args = MODULE.build_parser().parse_args(
-            ["watch", "--run-id", self.run_id, "--cursor", "4"]
-        )
-        output = StringIO()
-        with (
-            mock.patch.object(
-                MODULE,
-                "watch_progress",
-                return_value={
-                    "event": MODULE.PROGRESS_UPDATE_EVENT,
-                    "cursor": 5,
-                    "updates": [],
-                    "finished": False,
-                },
-            ) as watch,
-            redirect_stdout(output),
-        ):
-            MODULE.command_watch(args)
-
-        watch.assert_called_once_with(
-            event_log=MODULE.progress_log_path(self.payload, self.run_id),
-            launch_path=MODULE.launch_state_path(self.payload, self.run_id),
-            observer_path=MODULE.observer_state_path(self.payload, self.run_id),
-            cursor=4,
-            wait_seconds=MODULE.PROGRESS_HEARTBEAT_INTERVAL,
-        )
-        event = json.loads(output.getvalue())
-        self.assertEqual(self.run_id, event["run_id"])
-        self.assertEqual(
-            MODULE.watch_arguments(self.run_id, 5),
-            event["next_watch"]["arguments"],
-        )
-
-    def test_cursor_38_heartbeat_empty_and_monitor_failure_remain_distinct(self):
-        self.write_monitor_run()
-        cases = (
-            {"cursor": 38, "updates": [{"kind": "heartbeat", "waiting": True}], "finished": False},
-            {"cursor": 38, "updates": [], "finished": False},
-            {"cursor": 38, "updates": [], "finished": True, "monitor_failure": "scheduler_exited_without_final_event"},
-            {"cursor": 39, "updates": [{"terminal": True}], "finished": True, "final_event": {"result": "partial"}},
-        )
-        args = MODULE.build_parser().parse_args(["watch", "--run-id", self.run_id, "--cursor", "38"])
-        for recorded in cases:
-            with self.subTest(recorded=recorded):
-                output = StringIO()
-                with (
-                    mock.patch.object(MODULE, "watch_progress", return_value={
-                        "event": MODULE.PROGRESS_UPDATE_EVENT, **recorded,
-                    }),
-                    redirect_stdout(output),
-                ):
-                    MODULE.command_watch(args)
-                event = json.loads(output.getvalue())
-                self.assertEqual(recorded["finished"], event["finished"])
-                self.assertEqual(not recorded["finished"], "next_watch" in event)
-                self.assertEqual(recorded.get("monitor_failure"), event.get("monitor_failure"))
-                self.assertEqual(recorded.get("final_event"), event.get("final_event"))
-                if "monitor_failure" in recorded:
-                    self.assertNotIn("final_event", event)
-
-    def test_watch_never_scans_or_falls_back_to_another_run(self):
-        requested = "a" * 32
-        decoy = "b" * 32
-        COMMON.write_json_atomically(
-            MODULE.monitor_locator_path(decoy),
-            MODULE.monitor_locator(self.payload, decoy),
-        )
-        COMMON.write_json_atomically(
-            self.root / "latest.json",
-            {"run_id": decoy, "kickoff": self.payload},
-        )
-        args = MODULE.build_parser().parse_args(
-            ["watch", "--run-id", requested]
-        )
-        with self.assertRaisesRegex(
-            MODULE.WorkflowError,
-            f"monitor handle does not exist for run {requested}",
-        ):
-            MODULE.command_watch(args)
-
-    def test_watch_rejects_a_launch_record_from_another_run(self):
-        self.write_monitor_run(launch_run_id="b" * 32)
-        args = MODULE.build_parser().parse_args(
-            ["watch", "--run-id", self.run_id]
-        )
-        with self.assertRaisesRegex(
-            MODULE.WorkflowError,
-            f"launch record identity is invalid for run {self.run_id}",
-        ):
-            MODULE.command_watch(args)
-
-    def test_terminal_watch_has_no_next_command(self):
-        payload = MODULE.bind_next_watch(
-            {
-                "event": MODULE.PROGRESS_UPDATE_EVENT,
-                "cursor": 5,
-                "updates": [],
-                "finished": True,
-            },
-            kickoff=self.payload,
-            run_id=self.run_id,
-        )
-
-        self.assertNotIn("next_watch", payload)
-
-
-class CancelCommandTest(unittest.TestCase):
-    def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
-        self.payload = kickoff()
-        self.run_id = "a" * 32
-        self.run_root = mock.patch.object(MODULE, "run_root", return_value=self.root)
-        self.run_root.start()
-        self.addCleanup(self.run_root.stop)
-
-    def args(self):
-        return SimpleNamespace(
-            kickoff=json.dumps(self.payload),
-            kickoff_file=None,
-            run_id=self.run_id,
-            wait_seconds=0,
-        )
-
-    def write_launch(self, **overrides):
-        launch = {
-            "kind": MODULE.RUN_KIND,
-            "run_id": self.run_id,
-            "kickoff": self.payload,
-            "pid": 123,
-        }
-        launch.update(overrides)
-        COMMON.write_json_atomically(
-            MODULE.launch_state_path(self.payload, self.run_id), launch
-        )
-
-    def invoke(self, *, alive=True):
-        output = StringIO()
-        with (
-            mock.patch.object(COMMON, "process_is_alive", return_value=alive),
-            redirect_stdout(output),
-        ):
-            MODULE.command_cancel(self.args())
-        return json.loads(output.getvalue())
-
-    def test_unknown_run_is_safe_and_deterministic(self):
-        result = self.invoke()
-        self.assertEqual("unknown_run", result["result"])
-
-    def test_wrong_run_identity_is_rejected(self):
-        self.write_launch(run_id="b" * 32)
-        self.assertEqual("run_identity_mismatch", self.invoke()["result"])
-
-    def test_stale_run_records_a_safe_terminal_cancellation_result(self):
-        self.write_launch()
-        self.assertEqual("stale_run", self.invoke(alive=False)["result"])
-        request = COMMON.read_json(
-            MODULE.cancellation_request_path(self.payload, self.run_id)
-        )
-        self.assertEqual("stale", request["status"])
-
-    def test_repeated_cancellation_is_idempotent(self):
-        self.write_launch()
-        self.assertEqual("requested", self.invoke()["result"])
-        self.assertEqual("already_requested", self.invoke()["result"])
-
-    def test_finished_run_is_not_changed(self):
-        self.write_launch()
-        pipeline_result = {"result": "complete", "passes": 1}
-        COMMON.write_json_atomically(
-            MODULE.run_result_path(self.payload, self.run_id),
-            {
-                "kind": MODULE.RUN_KIND,
-                "run_id": self.run_id,
-                "kickoff": self.payload,
-                "pipeline_result": pipeline_result,
-            },
-        )
-        result = self.invoke()
-        self.assertEqual("already_finished", result["result"])
-        self.assertEqual(pipeline_result, result["pipeline_result"])
-
-    def test_malformed_existing_cancellation_record_is_not_overwritten(self):
-        self.write_launch()
-        path = MODULE.cancellation_request_path(self.payload, self.run_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("[]\n", encoding="utf-8")
-        self.assertEqual("cancellation_record_malformed", self.invoke()["result"])
-        self.assertEqual([], COMMON.read_json(path))
-
-
 class ParserTest(unittest.TestCase):
-    def test_the_progress_protocol_adds_start_and_watch_commands(self):
+    def test_only_run_is_a_pipeline_command(self):
         parser = MODULE.build_parser()
         action = next(
             action
             for action in parser._actions
             if isinstance(action, __import__("argparse")._SubParsersAction)
         )
-        self.assertEqual({"run", "start", "watch", "cancel"}, set(action.choices))
+        self.assertEqual({"run"}, set(action.choices))
+
+    def test_removed_commands_fail_before_side_effects(self):
+        for command in ("start", "watch", "cancel"):
+            side_effect = mock.Mock()
+            with (
+                self.subTest(command=command),
+                mock.patch.object(MODULE.sys, "argv", ["pr_stack_pipeline.py", command]),
+                mock.patch.object(MODULE, "load_kickoff", side_effect=side_effect),
+                self.assertRaises(SystemExit),
+            ):
+                MODULE.main()
+            side_effect.assert_not_called()
 
     def test_run_accepts_a_kickoff_payload_and_model_overrides(self):
         args = MODULE.build_parser().parse_args(
-            [
-                "run",
-                "--kickoff",
-                json.dumps(kickoff()),
-                "--stage-model",
-                "ci-fix-loop=claude-sonnet-5",
-            ]
+            ["run", "--kickoff", json.dumps(kickoff()), "--stage-model", "ci-fix-loop=claude-sonnet-5"]
         )
         self.assertEqual(kickoff(), MODULE.load_kickoff(args))
         self.assertEqual(["ci-fix-loop=claude-sonnet-5"], args.stage_model)
 
-    def test_watch_accepts_a_bounded_wait_and_cursor(self):
-        args = MODULE.build_parser().parse_args(
-            [
-                "watch",
-                "--run-id",
-                "a" * 32,
-                "--cursor",
-                "4",
-                "--wait-seconds",
-                "300",
-            ]
-        )
-        self.assertFalse(hasattr(args, "kickoff"))
-        self.assertEqual(4, args.cursor)
-        self.assertEqual(300, args.wait_seconds)
-
-    def test_the_run_emits_json_lines_ending_with_the_final_event(self):
-        args = MODULE.build_parser().parse_args(
-            ["run", "--kickoff", json.dumps(kickoff()), "--repo-root", "."]
-        )
-        output = StringIO()
-
-        class FakePipeline:
-            def __init__(self, *args, **kwargs):
-                self.report = kwargs["report"]
-
-            def execute(self):
-                self.report({"event": "pass_started", "pull_request_pass": 1})
-                return {"result": "complete", "run_id": "run-1"}
-
+    def test_execution_controls_use_the_runtime_entrypoint(self):
+        runtime = mock.Mock()
+        runtime.entrypoint.return_value = 17
         with (
-            mock.patch.object(MODULE.common, "require_tools"),
-            mock.patch.object(MODULE, "StackPipeline", FakePipeline),
-            redirect_stdout(output),
+            mock.patch.object(MODULE.sys, "argv", ["pr_stack_pipeline.py", "execution-cancel", "--handle", "x"]),
+            mock.patch.object(MODULE, "_load_execution", return_value=runtime),
         ):
-            MODULE.command_run(args)
-
-        events = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual(
-            ["pass_started", "stack_pipeline_finished"],
-            [event["event"] for event in events],
-        )
-        self.assertEqual("complete", events[-1]["result"])
-
-    def test_terminal_result_bounds_the_observed_large_worker_payload(self):
-        build_output = "BUILD OUTPUT\n" * 1800
-        stages = [
-            {
-                "stage": stage,
-                "clear": False,
-                "identity": "stale",
-                "outcome": "cleared",
-                "reason": "clearance_is_for_an_older_head",
-                "clear_at_head_sha": "1" * 40,
-                "status": {"build_output": build_output},
-            }
-            for stage in MODULE.STAGE_NAMES
-        ]
-        payload = {
-            "result": "partial",
-            "reason": "two_passes_finished",
-            "run_id": "run-1",
-            "repository": "owner/repo",
-            "stack_number": 77,
-            "start_pull_request": 11,
-            "selected": [11, 12],
-            "passes": 2,
-            "state_path": str(Path("state.json")),
-            "phases": [
-                {
-                    "phase": MODULE.STAGE_DESCRIPTION,
-                    "mode": MODULE.PHASE_PARALLEL,
-                    "dispatches": 2,
-                    "accepted": [11, 12],
-                    "clear": False,
-                    "reasons": ["not_cleared"],
-                }
-            ]
-            * 10,
-            "snapshot": {
-                "result": "incomplete",
-                "reason": "stages_not_clear",
-                "pull_requests": [
-                    {
-                        "number": number,
-                        "head_sha": str(number) * 40,
-                        "base_sha": "a" * 40,
-                        "uncleared": list(MODULE.STAGE_NAMES),
-                        "stages": stages,
-                    }
-                    for number in (11, 12)
-                ],
-            },
-            "propagations": [
-                {
-                    "number": 11,
-                    "head_sha": "3" * 40,
-                    "result": "published",
-                    "output": build_output,
-                }
-            ],
-        }
-
-        first = MODULE.compact_terminal_result(
-            payload, result_path=Path("result.json")
-        )
-        second = MODULE.compact_terminal_result(
-            payload, result_path=Path("result.json")
-        )
-        encoded = json.dumps(first, sort_keys=True, separators=(",", ":")).encode()
-
-        self.assertEqual(first, second)
-        self.assertLessEqual(len(encoded), MODULE.TERMINAL_RESULT_MAX_BYTES)
-        self.assertNotIn("BUILD OUTPUT", encoded.decode())
-        self.assertEqual(
-            "clearance_is_for_an_older_head",
-            first["snapshot"]["pull_requests"][0]["stages"][0]["reason"],
-        )
-        self.assertEqual("result.json", first["artifacts"]["result"])
-        self.assertEqual(
-            {
-                "number": 11,
-                "head_sha": "3" * 40,
-                "result": "published",
-            },
-            first["propagations"][0],
-        )
-
-    def test_an_error_is_a_terminal_json_event(self):
-        output = StringIO()
-        with (
-            mock.patch.object(
-                MODULE.common,
-                "require_tools",
-                side_effect=MODULE.WorkflowError("broken"),
-            ),
-            mock.patch.object(
-                __import__("sys"),
-                "argv",
-                ["pr_stack_pipeline.py", "run", "--kickoff", json.dumps(kickoff())],
-            ),
-            redirect_stdout(output),
-        ):
-            result = MODULE.main()
-
-        self.assertEqual(1, result)
-        event = json.loads(output.getvalue())
-        self.assertEqual("stack_pipeline_finished", event["event"])
-        self.assertEqual("error", event["result"])
-        self.assertEqual("broken", event["error"])
+            self.assertEqual(17, MODULE.execution_main())
+        runtime.entrypoint.assert_called_once_with(MODULE.main, MODULE.__dict__, commands=("run",))
 
 
 if __name__ == "__main__":

@@ -53,36 +53,29 @@ disconnection nor tool-shell exit establishes cancellation or completion.
 
 Stage sequencing remains in these schedulers. Children inherit the root run
 identity, bind their own process generations and write their own readiness.
-Root branch-writer leases cover the selected branches. Foreground stack locks
-never reclaim a stale or ambiguous owner. Output and results are file-backed;
-an unfinished or unverified child blocks completion. Cancelled or failed runs
-retain task identities, spent budgets and ownership rather than starting a
-replacement. Hosted tasks may continue after local cancellation.
+Output and results are file-backed. An unfinished or unverified child blocks
+completion. Cancelled or failed runs retain task identities and spent budgets
+rather than starting a replacement. Hosted tasks may continue after local
+cancellation.
 
 Both Pipeline and Conflict require the shared Runtime execution library;
 Conflict retains its dedicated hosted backend. No app-native Stop integration,
 automatic recovery, app-shutdown survival or remote cancellation is promised.
-The agent does not need to stay active or run watch calls.
+The agent does not need to stay active.
 Foreground roots create their own run ID. They reject `--run-id` so a fresh
 execution handle cannot point the scheduler at old stage paths.
 
-## Legacy monitoring
+## Terminal reporting
 
-`start` creates a random run ID and a versioned monitor handle. The handle binds the canonical target, launch record, and progress log. Each unfinished `watch` response returns the complete arguments for the next call. Callers pass those arguments unchanged. The helpers do not scan for a latest run or reconstruct a target from shared state.
+Both helpers persist the canonical result before deriving a terminal summary. `artifacts.result` names that file and `artifacts.result_sha256` hashes its exact bytes. Artifact failures are explicit reporting failures, never successful pipeline outcomes.
 
-On Windows, scheduler launch requests suspended, no-window breakaway and records the flags, result, PID, creation identity and available job membership. Denied breakaway fails before any fallback scheduler starts. No-window and a new process group do not prove lifetime independence. Workers have a separate scheduler-owned kill job. Watch compares the recorded process generation; missing, changed or unreadable identity is a monitoring failure, not workflow completion. A racing final journal event still wins. The inert lifetime tests qualify only the host where they run; a denied test-parent breakaway leaves that qualification unavailable.
-
-Standalone `watch` exposes its terminal summary directly as `final_event`, including on a repeated terminal watch with no new updates. Before publishing that summary, the scheduler saves the complete controller event to the run's `result.json`. `final_event.artifacts.result` names the canonical file; `result_sha256` in the same object hashes its exact bytes. Artifact failures are explicit reporting or monitoring failures, never successful pipeline outcomes.
-
-Both the standalone terminal summary and the entire watch response fit within 8,192 serialized UTF-8 bytes, including JSON escaping, spacing, and the trailing newline. This uses Stack Pipeline's terminal-summary budget. Collections and text previews carry `*_omitted` counts or flags and `*_details_truncated` flags. Read the exact full artifact when those flags affect the response. The summary aggregates published and retained commits and tracking errors across all runs, but the full artifact preserves their original locations and all diagnostic data. Routine successful-stage status/history is marked `diagnostics_omitted`; a clean no-change response does not need that detail.
+Terminal summaries fit within 8,192 serialized UTF-8 bytes, including JSON escaping, spacing, and the trailing newline. Collections and text previews carry `*_omitted` counts or flags and `*_details_truncated` flags. Read the exact full artifact when those flags affect the response. The standalone summary aggregates published and retained commits and tracking errors across all runs, but the full artifact preserves their original locations and all diagnostic data. Routine successful-stage status/history is marked `diagnostics_omitted`; a clean no-change response does not need that detail.
 
 When the stopping stage retains an `agent_task.error`, both summaries expose it separately as `stage_failure.error`, with the stage and, for Stack Pipeline, the affected pull request number. Structured errors use their nonempty string `code` and `message` fields, for example `stale_target: pull request target changed`. This diagnostic never replaces the top-level safety `reason` or `detail`. Error and stage-name previews are limited to 512 characters; `error_details_truncated` or `stage_details_truncated` inside `stage_failure`, or a top-level `stage_failure_omitted` flag, requires reading the full artifact. Historical stage errors are not substitutes for the terminal stop. If Stack terminal metadata alone exceeds the byte limit, reporting fails explicitly without changing the durable result.
 
-`artifacts.progress` on the watch envelope names the progress journal. `updates_omitted` and per-update `details_truncated` identify bounded progress previews. The cursor still covers all journaled records, and unfinished responses preserve `next_watch.arguments`. A compact terminal event may also appear in the last update when both copies fit, but consumers must use top-level `final_event`. No reporting omission changes stage execution or authorizes a relaunch.
-
 ## Stack controller
 
-Stack Pipeline uses the same clearance rules. Each run has its own scheduler state, monitor handle, stage state files, worker records, and worktrees. A stack-wide lock permits one active owner for the selected suffix, but no new run resumes or imports a sealed run. Each worker request binds one run ID, nonce, head, base, and role. Native-stack Conflict Resolver runs one task per member in order, collecting committed code only from each task's authoritative generated branch.
+Stack Pipeline uses the same clearance rules. Each run has its own scheduler state, stage state files, worker records, and worktrees. No branch or stack admission lock coordinates separate runs. An exact run state path is still sealed against replay, and ordinary atomic writes protect each run's files. Each worker request binds one run ID, nonce, head, base, and role. Native-stack Conflict Resolver runs one task per member in order, collecting committed code only from each task's authoritative generated branch.
 
 Stack worker cleanup removes only clean, owned worktrees through ordinary `git worktree remove`. Dirty worktrees, unreadable status, and removal failures retain the workspace and ownership record. The full `result.json` lists retained paths and reasons under `pipeline_result.cleanup`; it also preserves each worker's stage-result evidence under `pipeline_result.pull_requests`. Retention does not authorize replay, publication, or a replacement worker.
 
@@ -121,7 +114,7 @@ Required workflow-specific semantic outputs remain untrusted input checked by th
 | CI Fix | Candidate publication is pending. Only trusted GitHub checks and statuses bound to the exact published source SHA can record green. A coordinator-verified diagnosis of unrelated or pre-existing failures can instead clear orchestration with CI warnings at the exact head and base, never a clean marker. Unknown failures remain uncleared. The coordinator uses bounded polling and never runs candidate Gradle, Maven, tests, or builds locally. |
 | PR Description | A keep result clears without mutation. A replacement applies only when GitHub mutation policy is `allow`. Under `source-only`, the helper keeps the proposal but does not change title or body, so the stage remains uncleared. |
 
-The caller freezes `--github-mutation-policy` at `start`. Both single-PR and stack schedulers forward it to Copilot Review, Self Review, CI Fix, and PR Description. `allow` permits bounded, guarded failed-job reruns through CI Fix. `source-only` permits guarded source publication but forbids reruns, comments, reviews, thread changes, draft changes, title changes, body changes, and all other pull request metadata mutation. No policy permits empty commits as a rerun workaround.
+The caller freezes `--github-mutation-policy` at `run`. Both single-PR and stack schedulers forward it to Copilot Review, Self Review, CI Fix, and PR Description. `allow` permits bounded, guarded failed-job reruns through CI Fix. `source-only` permits guarded source publication but forbids reruns, comments, reviews, thread changes, draft changes, title changes, body changes, and all other pull request metadata mutation. No policy permits empty commits as a rerun workaround.
 
 CI warning clearance requires `stage_outcome: "warning"`, `clean_at_head_sha: null`, exact `warning_at_head_sha` and `warning_at_base_sha` markers, and a nonempty `ci_warnings` list. Each entry names its `check_key`, `name`, `diagnosis` of `unrelated` or `pre_existing`, nonempty `reason`, and nonempty string `evidence` list. The CI coordinator derives these warnings from a fresh completed hosted task. Pipeline reads only its run-bound status envelope, never a hosted report or an old task.
 

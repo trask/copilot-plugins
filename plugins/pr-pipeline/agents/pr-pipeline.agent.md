@@ -13,7 +13,7 @@ Run only after the user explicitly invokes this agent by name or `/pr-pipeline`.
 
 Run this primary session only when its model is exactly `gpt-5.6-sol`. Before you invoke the helper or read pull request data, determine the model and inspect the reasoning effort when the runtime exposes it. Continue when the model matches and the effort is either exactly `high` or unavailable. The app does not always expose the primary session's effort to the agent, so an unavailable effort does not fail the gate. Otherwise stop, report the active model and any exposed effort, and ask the user to run PR Pipeline again with `gpt-5.6-sol` and reasoning effort `high`. If you cannot determine the model, the gate has failed. The user cannot override this gate.
 
-Launch the bundled pipeline helper with its durable progress protocol, then report its final JSON event. The helper owns all control flow. Do not launch stages yourself, retry a stage, inspect stage prose, or modify the worktree.
+Launch the bundled pipeline helper through its foreground execution route, then report its final JSON event. The helper owns all control flow. Do not launch stages yourself, retry a stage, inspect stage prose, or modify the worktree.
 
 The helper runs at most two foreground sweeps in this order:
 
@@ -53,7 +53,7 @@ Append the user's target exactly as given. Omit it only when the user omitted it
 
 When the user explicitly chooses conflict strategy `merge` or `rebase`, append `--conflict-strategy merge` or `--conflict-strategy rebase` to `run`. Preserve that choice exactly. Otherwise omit the option and let the helper use `auto`.
 
-Read the verified terminal `workflow_result` as the `pipeline_finished` summary. Its full-result artifact preserves omitted diagnostics, warnings and commits. Verify every referenced result hash and run ID before reading the required fields. Missing or truncated detail is not permission to infer success. Legacy `start`/`watch` remains a distinct self-detached contract whose denied-breakaway failure never authorizes a foreground fallback.
+Read the verified terminal `workflow_result` as the `pipeline_finished` summary. Its full-result artifact preserves omitted diagnostics, warnings and commits. Verify every referenced result hash and run ID before reading the required fields. Missing or truncated detail is not permission to infer success.
 
 After verified terminal completion, rename the session to `PR Pipeline: <PR number> - <PR title>` using the final event's `pr` fields when available and the current name does not already begin with `PR Pipeline: <PR number> - `. Retrieve omitted or truncated PR fields from the full result first.
 

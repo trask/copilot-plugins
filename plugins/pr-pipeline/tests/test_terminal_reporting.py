@@ -1,4 +1,4 @@
-"""Formatter-only regressions shaped like the standalone terminal watch from PR 20071."""
+"""Regressions for terminal summaries derived from canonical results."""
 
 import copy
 from contextlib import redirect_stdout
@@ -95,7 +95,6 @@ class TerminalReportingTest(unittest.TestCase):
         self.addCleanup(patch.stop)
         self.target = MODULE.build_target("owner", "repo", 7)
         self.path = MODULE.run_result_path(self.target, RUN_ID)
-        self.event_log = MODULE.progress_log_path(self.target, RUN_ID)
 
     def summarize(self, original):
         result = MODULE.persist_terminal_result(original, self.path)
@@ -115,20 +114,13 @@ class TerminalReportingTest(unittest.TestCase):
 
     def watch(self, original):
         summary = self.summarize(original)
-        transition = MODULE.progress_transition(summary)
-        payload = MODULE.bind_next_watch(
-            {"event": "pipeline_update", "finished": True, "cursor": 14,
-             "updates": [transition]},
-            target=self.target, run_id=RUN_ID, legacy_target=False,
-        )
-        result = MODULE.bounded_watch_result(payload, target=self.target, run_id=RUN_ID)
-        self.assertEqual(14, result["cursor"])
-        self.assertTrue(result["finished"])
-        self.assertNotIn("next_watch", result)
+        result = {"final_event": summary}
         output = StringIO()
         with redirect_stdout(output):
             MODULE.emit(result)
-        self.assertLessEqual(len(output.getvalue().encode("utf-8")), MODULE.WATCH_MAX_BYTES)
+        self.assertLessEqual(
+            len(output.getvalue().encode("utf-8")), MODULE.TERMINAL_RESULT_MAX_BYTES,
+        )
         return result
 
     def test_clean_large_controller_shape_has_direct_terminal_result(self):
@@ -409,7 +401,8 @@ class TerminalReportingTest(unittest.TestCase):
         for message in ("broken", "interrupted"):
             with self.subTest(message=message):
                 path = self.root / message / "result.json"
-                args = MODULE.build_parser().parse_args(["run", "--run-id", RUN_ID])
+                args = MODULE.build_parser().parse_args(["run"])
+                args.run_id = RUN_ID
                 args.result_path = path
                 output = StringIO()
                 with redirect_stdout(output):
@@ -465,11 +458,11 @@ class TerminalReportingTest(unittest.TestCase):
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(MODULE.serialized_size(result), len(process.stdout))
-        self.assertLessEqual(len(process.stdout), MODULE.WATCH_MAX_BYTES)
+        self.assertLessEqual(len(process.stdout), MODULE.TERMINAL_RESULT_MAX_BYTES)
 
     def test_artifact_failure_never_emits_success(self):
         reporter = MODULE.ProgressReporter(
-            target=self.target, event_log=self.event_log, result_path=self.path,
+            target=self.target, result_path=self.path,
         )
         with mock.patch.object(MODULE.common, "write_json_atomically",
                                side_effect=OSError("disk full")), mock.patch.object(
@@ -477,102 +470,6 @@ class TerminalReportingTest(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "disk full"):
                 reporter(observed_clean_result())
         output.assert_not_called()
-        self.assertFalse(self.event_log.exists())
-
-    def test_reporter_persists_full_result_before_output_and_journals_compact_event(self):
-        original = observed_clean_result()
-
-        def output(payload):
-            self.assertEqual(original, json.loads(self.path.read_text()))
-            self.assertLessEqual(MODULE.serialized_size(payload), MODULE.TERMINAL_RESULT_MAX_BYTES)
-
-        MODULE.ProgressReporter(
-            target=self.target, result_path=self.path, event_log=self.event_log, output=output,
-        )(original)
-        record = MODULE.common.read_progress_log(self.event_log)[0]
-        self.assertEqual(1, record["final_event"]["summary_version"])
-        self.assertNotIn("diagnostic diagnostic", json.dumps(record))
-        payload = MODULE.common.watch_progress(
-            event_log=self.event_log,
-            launch_path=MODULE.launch_state_path(self.target, RUN_ID),
-            observer_path=MODULE.observer_state_path(self.target, RUN_ID),
-            cursor=1, wait_seconds=1,
-        )
-        self.assertEqual([], payload["updates"])
-        final = MODULE.bounded_watch_result(
-            payload, target=self.target, run_id=RUN_ID,
-        )["final_event"]
-        self.assertEqual("complete", final["result"])
-
-    def test_legacy_terminal_and_backlog_are_bounded_without_changing_cursor(self):
-        original = observed_clean_result()
-        terminal = MODULE.progress_transition(original)
-        updates = [
-            {"message": "warning " * 3000, "ci_warnings": [warning()] * 40}
-        ] * 100 + [terminal]
-        payload = {
-            "event": "pipeline_update", "finished": True, "cursor": 101, "updates": updates,
-        }
-        result = MODULE.bounded_watch_result(payload, target=self.target, run_id=RUN_ID)
-        self.assertEqual(101, result["cursor"])
-        self.assertTrue(result["updates_omitted"])
-        self.assertIn("progress", result["artifacts"])
-        self.assertEqual(original, json.loads(self.path.read_text()))
-        self.assertLessEqual(MODULE.serialized_size(result), MODULE.WATCH_MAX_BYTES)
-
-    def test_unfinished_watch_preserves_next_watch_and_truncation_flags(self):
-        payload = MODULE.bind_next_watch(
-            {"event": "pipeline_update", "finished": False, "cursor": 5,
-             "updates": [{"message": "x" * 5000, "ci_warnings": [warning()] * 40}]},
-            target=self.target, run_id=RUN_ID, legacy_target=False,
-        )
-        result = MODULE.bounded_watch_result(payload, target=self.target, run_id=RUN_ID)
-        self.assertEqual(payload["next_watch"], result["next_watch"])
-        self.assertEqual(5, result["cursor"])
-        self.assertFalse(result["finished"])
-        self.assertTrue(result["updates"][0]["details_truncated"])
-        self.assertNotIn("final_event", result)
-
-    def test_monitor_failure_has_no_invented_result_or_next_watch(self):
-        payload = {"event": "pipeline_update", "finished": True, "updates": [], "cursor": 4,
-                   "monitor_failure": "scheduler_exited_without_final_event"}
-        result = MODULE.bounded_watch_result(payload, target=self.target, run_id=RUN_ID)
-        self.assertEqual(payload["monitor_failure"], result["monitor_failure"])
-        self.assertNotIn("final_event", result)
-        self.assertNotIn("next_watch", result)
-        self.assertFalse(self.path.exists())
-
-    def test_missing_final_event_reaches_cli_monitor_failure_contract(self):
-        with (
-            mock.patch.object(sys, "argv", ["pr_pipeline.py", "watch", "--run-id", RUN_ID]),
-            mock.patch.object(MODULE, "validate_launch_record"),
-            mock.patch.object(MODULE, "load_monitor_target", return_value=self.target),
-            mock.patch.object(MODULE.common, "watch_progress", return_value={
-                "event": "pipeline_update", "finished": True, "cursor": 1, "updates": [],
-            }),
-        ):
-            locator = MODULE.monitor_locator_path(RUN_ID)
-            locator.parent.mkdir(parents=True)
-            locator.write_text("{}", encoding="utf-8")
-            output = StringIO()
-            with redirect_stdout(output):
-                code = MODULE.main()
-        self.assertEqual(1, code)
-        result = json.loads(output.getvalue())
-        self.assertTrue(result["finished"])
-        self.assertIn("no final_event", result["monitor_failure"])
-        self.assertNotIn("final_event", result)
-        self.assertNotIn("next_watch", result)
-
-    def test_missing_terminal_artifact_or_hash_mismatch_is_monitor_failure(self):
-        summary = self.summarize(observed_clean_result())
-        payload = {"finished": True, "updates": [MODULE.progress_transition(summary)]}
-        self.path.write_text("{}", encoding="utf-8")
-        with self.assertRaisesRegex(MODULE.WorkflowError, "hash"):
-            MODULE.bounded_watch_result(payload, target=self.target, run_id=RUN_ID)
-        self.path.unlink()
-        with self.assertRaises(FileNotFoundError):
-            MODULE.bounded_watch_result(payload, target=self.target, run_id=RUN_ID)
 
     def test_existing_result_is_immutable(self):
         original = observed_clean_result()

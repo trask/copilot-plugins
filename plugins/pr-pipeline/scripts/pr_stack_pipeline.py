@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
-from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
@@ -26,7 +25,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "d1a383ea78a750b0e438da04d0b2417cda9dc5a135d3cb7f40dcce7cad4b6bb3"
+COMMON_SHA256 = "3310246018fccddc6f423d5d3f7530c38dfb96c0ac311d50650d8274a86140f1"
 
 
 def load_common() -> Any:
@@ -62,8 +61,6 @@ class PipelineCancelled(RuntimeError):
 
 KICKOFF_VERSION = 1
 STATE_VERSION = 1
-MONITOR_SCHEMA = "github.copilot.pr-stack-pipeline-monitor"
-MONITOR_VERSION = 1
 MAX_PASSES = 2
 DEFAULT_EFFORT = common.DEFAULT_EFFORT
 READINESS_TIMEOUT = 300.0
@@ -77,8 +74,6 @@ WINDOWS_WORKTREE_PATH_BUDGET = 120
 WINDOWS_PR_NUMBER_RESERVE = 10
 CONFLICT_PROPAGATE_COMMAND = "descendant-propagate"
 PROGRESS_EVENT = common.PROGRESS_EVENT
-PROGRESS_UPDATE_EVENT = common.PROGRESS_UPDATE_EVENT
-PROGRESS_HEARTBEAT_INTERVAL = common.PROGRESS_HEARTBEAT_INTERVAL
 TERMINAL_RESULT_MAX_BYTES = 8192
 TERMINAL_RESULT_MAX_PULL_REQUESTS = 12
 TERMINAL_RESULT_MAX_PHASES = 10
@@ -304,10 +299,6 @@ def run_root() -> Path:
     return common.copilot_home() / "run" / RUN_KIND
 
 
-def lock_path_for(kickoff: dict[str, Any]) -> Path:
-    return run_root() / f"{run_slug(kickoff)}.lock"
-
-
 def run_directory_for(kickoff: dict[str, Any], run_id: str) -> Path:
     return run_root() / run_slug(kickoff) / run_id
 
@@ -347,32 +338,8 @@ def worktree_root_for(
     return validate_worktree_root(root, platform_name=platform_name)
 
 
-def progress_log_path(kickoff: dict[str, Any], run_id: str) -> Path:
-    return run_directory_for(kickoff, run_id) / "progress.jsonl"
-
-
-def launch_state_path(kickoff: dict[str, Any], run_id: str) -> Path:
-    return run_directory_for(kickoff, run_id) / "launch.json"
-
-
-def observer_state_path(kickoff: dict[str, Any], run_id: str) -> Path:
-    return run_directory_for(kickoff, run_id) / "observer.json"
-
-
-def scheduler_log_path(kickoff: dict[str, Any], run_id: str) -> Path:
-    return run_directory_for(kickoff, run_id) / "scheduler.log"
-
-
-def cancellation_request_path(kickoff: dict[str, Any], run_id: str) -> Path:
-    return run_directory_for(kickoff, run_id) / "cancel-request.json"
-
-
 def run_result_path(kickoff: dict[str, Any], run_id: str) -> Path:
     return run_directory_for(kickoff, run_id) / "result.json"
-
-
-def monitor_locator_path(run_id: str) -> Path:
-    return run_root() / "monitors" / f"{run_id}.json"
 
 
 def paths_match(left: Any, right: Path) -> bool:
@@ -382,92 +349,6 @@ def paths_match(left: Any, right: Path) -> bool:
         return Path(left).resolve() == right.resolve()
     except OSError:
         return False
-
-
-def monitor_locator(kickoff: dict[str, Any], run_id: str) -> dict[str, Any]:
-    return {
-        "schema": MONITOR_SCHEMA,
-        "version": MONITOR_VERSION,
-        "run_id": run_id,
-        "kickoff": kickoff,
-        "launch_path": str(launch_state_path(kickoff, run_id)),
-        "event_log": str(progress_log_path(kickoff, run_id)),
-    }
-
-
-def load_monitor_kickoff(run_id: str) -> dict[str, Any]:
-    path = monitor_locator_path(run_id)
-    if not path.is_file() or path.is_symlink():
-        raise WorkflowError(f"monitor handle does not exist for run {run_id}")
-    locator = common.read_json(path)
-    if (
-        not isinstance(locator, dict)
-        or set(locator)
-        != {
-            "schema",
-            "version",
-            "run_id",
-            "kickoff",
-            "launch_path",
-            "event_log",
-        }
-        or locator.get("schema") != MONITOR_SCHEMA
-        or locator.get("version") != MONITOR_VERSION
-        or locator.get("run_id") != run_id
-    ):
-        raise WorkflowError(f"monitor handle is malformed for run {run_id}")
-    kickoff = parse_kickoff(locator.get("kickoff"))
-    expected_launch = launch_state_path(kickoff, run_id)
-    expected_log = progress_log_path(kickoff, run_id)
-    if not paths_match(locator.get("launch_path"), expected_launch) or not paths_match(
-        locator.get("event_log"), expected_log
-    ):
-        raise WorkflowError(f"monitor handle paths are invalid for run {run_id}")
-    return kickoff
-
-
-def validate_launch_record(kickoff: dict[str, Any], run_id: str) -> dict[str, Any]:
-    launch = common.read_json(launch_state_path(kickoff, run_id))
-    if (
-        not isinstance(launch, dict)
-        or launch.get("kind") != RUN_KIND
-        or launch.get("run_id") != run_id
-        or launch.get("kickoff") != kickoff
-        or not paths_match(
-            launch.get("event_log"), progress_log_path(kickoff, run_id)
-        )
-    ):
-        raise WorkflowError(f"launch record identity is invalid for run {run_id}")
-    return launch
-
-
-def watch_arguments(run_id: str, cursor: int) -> list[str]:
-    return [
-        "watch",
-        "--run-id",
-        run_id,
-        "--cursor",
-        str(cursor),
-        "--wait-seconds",
-        str(int(PROGRESS_HEARTBEAT_INTERVAL)),
-    ]
-
-
-def bind_next_watch(
-    payload: dict[str, Any], *, kickoff: dict[str, Any], run_id: str
-) -> dict[str, Any]:
-    bound = {
-        **payload,
-        "run_id": run_id,
-        "repository": kickoff["repository"],
-        "stack_number": kickoff["stackNumber"],
-        "start_pull_request": kickoff["startPullRequest"],
-    }
-    if not payload.get("finished"):
-        bound["next_watch"] = {
-            "arguments": watch_arguments(run_id, int(payload.get("cursor", 0)))
-        }
-    return bound
 
 
 def format_pull_requests(numbers: list[int]) -> str:
@@ -812,20 +693,13 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
     return {key: value for key, value in update.items() if value is not None}
 
 
-class ProgressReporter(common.ConversationProgressReporter):
+class ProgressReporter(common.ForegroundProgressReporter):
     def __init__(
         self,
         *,
-        event_log: Path | None = None,
         output: Callable[[dict[str, Any]], None] = common.emit,
-        wall_time: Callable[[], float] = time.time,
     ) -> None:
-        super().__init__(
-            transition=progress_transition,
-            event_log=event_log,
-            output=output,
-            wall_time=wall_time,
-        )
+        super().__init__(output=output)
 
 
 STACK_QUERY = (
@@ -1046,95 +920,6 @@ def accept_completion(
         completion.get("nonce") == expected_nonce
         and completion.get("head_sha") == expected_head_sha
     )
-
-
-def lock_holder_is_live(
-    holder: dict[str, Any], *, alive: Callable[[int], bool] = common.process_is_alive
-) -> bool:
-    pid = holder.get("pid")
-    return isinstance(pid, int) and alive(pid)
-
-
-@contextmanager
-def lock_guard(path: Path):
-    guard_path = path.with_name(f"{path.name}.guard")
-    guard_path.parent.mkdir(parents=True, exist_ok=True)
-    with guard_path.open("a+b") as stream:
-        if os.name == "nt":
-            import msvcrt
-
-            if stream.seek(0, os.SEEK_END) == 0:
-                stream.write(b"\0")
-                stream.flush()
-            stream.seek(0)
-            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
-            try:
-                yield
-            finally:
-                stream.seek(0)
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-
-
-def acquire_lock(
-    path: Path,
-    run_id: str,
-    *,
-    alive: Callable[[int], bool] = common.process_is_alive,
-) -> dict[str, Any]:
-    holder = {"run_id": run_id, "pid": os.getpid(), "created_at": utc_now()}
-    if common._EXECUTION is not None:
-        holder["execution_root"] = str(common._EXECUTION.root)
-        holder["owner"] = common._EXECUTION.owner
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_guard(path):
-        existing = common.read_json(path)
-        if common._EXECUTION is not None and path.exists():
-            return {"result": "held", "holder": existing}
-        if isinstance(existing, dict) and lock_holder_is_live(
-            existing, alive=alive
-        ):
-            return {"result": "held", "holder": existing}
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-            json.dump(holder, stream, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        return {"result": "acquired", "holder": holder}
-
-
-def release_lock(path: Path, run_id: str) -> None:
-    with lock_guard(path):
-        existing = common.read_json(path)
-        if common._EXECUTION is not None:
-            if existing is None and not path.exists():
-                return
-            if (
-                not isinstance(existing, dict) or existing.get("run_id") != run_id
-                or existing.get("owner") != common._EXECUTION.owner
-                or existing.get("execution_root") != str(common._EXECUTION.root)
-            ):
-                raise WorkflowError("stack lock ownership changed before release")
-            path.unlink()
-            return
-        if isinstance(existing, dict) and existing.get("run_id") != run_id:
-            return
-        try:
-            path.unlink()
-        except OSError:
-            pass
 
 
 def new_state(kickoff: dict[str, Any], run_id: str, fingerprint: str) -> dict[str, Any]:
@@ -1854,9 +1639,7 @@ class StackPipeline:
         report: Callable[[dict[str, Any]], None] | None = None,
         launcher: Any | None = None,
         state_path: Path | None = None,
-        lock_path: Path | None = None,
         run_directory: Path | None = None,
-        cancellation_path: Path | None = None,
         result_path: Path | None = None,
         read_stack: Callable[..., dict[str, Any] | None] = read_native_stack,
         inspect: Callable[..., dict[str, Any]] = inspect_stage,
@@ -1885,11 +1668,8 @@ class StackPipeline:
         self.run_id = run_id or uuid.uuid4().hex
         self.report = report
         self.state_path = state_path or state_path_for(kickoff, self.run_id)
-        self.lock_path = lock_path or lock_path_for(kickoff)
         self.run_directory = run_directory or run_directory_for(kickoff, self.run_id)
-        self.cancellation_path = cancellation_path or (
-            self.run_directory / "cancel-request.json"
-        )
+        self.cancellation_path = self.run_directory / "cancel-request.json"
         self.result_path = result_path or (self.run_directory / "result.json")
         self.launcher = launcher or WorkerLauncher(
             repo_root=repo_root,
@@ -1967,14 +1747,7 @@ class StackPipeline:
     def cancellation_requested(self) -> bool:
         if common._EXECUTION is not None:
             common._EXECUTION.check_cancel()
-        request = common.read_json(self.cancellation_path)
-        return (
-            isinstance(request, dict)
-            and request.get("kind") == RUN_KIND
-            and request.get("run_id") == self.run_id
-            and request.get("kickoff") == self.kickoff
-            and request.get("status") == "requested"
-        )
+        return False
 
     def check_cancellation(self) -> None:
         if self.cancellation_requested():
@@ -3614,12 +3387,15 @@ class StackPipeline:
         if whole_stack:
             self.apply_native_stack_clearance(closing, pull_requests)
         complete = all(not entry["uncleared"] for entry in pull_requests)
+        ci_fields = stack_ci_warning_fields(pull_requests)
+        if complete and not ci_fields:
+            ci_fields["all_ci_passed"] = True
         return {
             "result": "complete" if complete else "incomplete",
             "reason": None if complete else "stages_not_clear",
             "fingerprint": opening["fingerprint"],
             "pull_requests": pull_requests,
-            **stack_ci_warning_fields(pull_requests),
+            **ci_fields,
         }
 
     # Run -----------------------------------------------------------------
@@ -3768,6 +3544,8 @@ class StackPipeline:
                     "ci_warnings": snapshot["ci_warnings"],
                     "all_ci_passed": False,
                 })
+            elif snapshot.get("all_ci_passed") is True:
+                payload["all_ci_passed"] = True
         else:
             try:
                 payload.update(self.current_ci_warnings())
@@ -3775,25 +3553,7 @@ class StackPipeline:
                 payload["ci_warning_revalidation_error"] = str(error)
         if self.session_title is not None:
             payload["session_title"] = self.session_title
-        try:
-            self.persist_result(payload)
-            cancellation = common.read_json(self.cancellation_path)
-            if (
-                isinstance(cancellation, dict)
-                and cancellation.get("run_id") == self.run_id
-                and cancellation.get("kickoff") == self.kickoff
-            ):
-                common.write_json_atomically(
-                    self.cancellation_path,
-                    {
-                        **cancellation,
-                        "status": "completed",
-                        "completed_at": utc_now(),
-                        "pipeline_result": finished_result,
-                    },
-                )
-        finally:
-            release_lock(self.lock_path, self.run_id)
+        self.persist_result(payload)
         return payload
 
     def execute(self) -> dict[str, Any]:
@@ -3848,10 +3608,6 @@ class StackPipeline:
                 detail=opening.get("detail"),
             )
         fingerprint = opening["fingerprint"]
-        if common._EXECUTION is not None:
-            common._EXECUTION.claim_writers([
-                (self.repository, member["head_branch"]) for member in opening["selected"]
-            ])
         if self.state_path.exists():
             self.state = new_state(self.kickoff, self.run_id, fingerprint)
             result = {
@@ -3864,25 +3620,6 @@ class StackPipeline:
                 "run_id": self.run_id,
                 "repository": self.repository,
                 "stack_number": self.kickoff["stackNumber"],
-                "state_path": str(self.state_path),
-                **(
-                    {"session_title": self.session_title}
-                    if self.session_title is not None
-                    else {}
-                ),
-            }
-            self.persist_result(result)
-            return result
-        lock = acquire_lock(self.lock_path, self.run_id)
-        if lock["result"] != "acquired":
-            self.state = new_state(self.kickoff, self.run_id, fingerprint)
-            result = {
-                "result": "stopped",
-                "reason": "another_run_holds_the_lock",
-                "run_id": self.run_id,
-                "repository": self.repository,
-                "stack_number": self.kickoff["stackNumber"],
-                "holder": lock["holder"],
                 "state_path": str(self.state_path),
                 **(
                     {"session_title": self.session_title}
@@ -4110,16 +3847,17 @@ def summarize_phase(phase: dict[str, Any]) -> dict[str, Any]:
 
 
 def clipped_text(value: Any, limit: int = TERMINAL_TEXT_MAX_CHARS) -> str | None:
-    if not isinstance(value, str) or not value:
-        return None
-    if len(value) <= limit:
-        return value
-    return value[: limit - 3] + "..."
+    return common.clipped_text(value, limit)
 
 
 def compact_terminal_result(
     payload: dict[str, Any], *, result_path: Path | str | None = None
 ) -> dict[str, Any]:
+    result_sha256 = None
+    if result_path is not None and Path(result_path).is_file():
+        payload, result_sha256 = common.canonical_terminal_payload(
+            payload, Path(result_path), envelope_key="pipeline_result"
+        )
     snapshot = payload.get("snapshot")
     snapshot_requests = (
         snapshot.get("pull_requests", []) if isinstance(snapshot, dict) else []
@@ -4283,6 +4021,7 @@ def compact_terminal_result(
         for key, value in {
             "result": str(result_path) if result_path is not None else None,
             "state": payload.get("state_path"),
+            "result_sha256": result_sha256,
         }.items()
         if value is not None
     }
@@ -4420,271 +4159,12 @@ def load_kickoff(args: argparse.Namespace) -> dict[str, Any]:
     return parse_kickoff(payload)
 
 
-validate_run_id = common.validate_run_id
-read_progress_log = common.read_progress_log
-watch_progress = common.watch_progress
-
-
-def scheduler_command(
-    args: argparse.Namespace,
-    kickoff: dict[str, Any],
-    repo_root: Path,
-    run_id: str,
-    event_log: Path,
-) -> list[str]:
-    command = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "run",
-        "--kickoff",
-        json.dumps(kickoff, separators=(",", ":")),
-        "--repo-root",
-        str(repo_root),
-        "--run-id",
-        run_id,
-        "--event-log",
-        str(event_log),
-        "--effort",
-        args.effort,
-        "--conflict-strategy",
-        args.conflict_strategy,
-        "--github-mutation-policy",
-        args.github_mutation_policy,
-    ]
-    for override in args.stage_model or []:
-        command.extend(["--stage-model", override])
-    return command
-
-
-def start_scheduler(
-    command: list[str], *, repo_root: Path, log_path: Path
-) -> subprocess.Popen[Any]:
-    return common.start_detached(command, cwd=repo_root, log_path=log_path)
-
-
-def command_start(args: argparse.Namespace) -> None:
-    common.stage_models(args.stage_model, args.effort)
-    kickoff = load_kickoff(args)
-    repo_root = (
-        Path(args.repo_root).resolve() if args.repo_root else common.resolve_repo_root()
-    )
-    run_id = uuid.uuid4().hex
-    event_log = progress_log_path(kickoff, run_id)
-    launch_path = launch_state_path(kickoff, run_id)
-    locator_path = monitor_locator_path(run_id)
-    if launch_path.exists() or locator_path.exists():
-        raise WorkflowError(f"run identity already exists: {run_id}")
-    started_at_epoch = time.time()
-    started_at = utc_now()
-    launch = {
-        "kind": RUN_KIND,
-        "run_id": run_id,
-        "kickoff": kickoff,
-        "pid": None,
-        "event_log": str(event_log),
-        "started_at": started_at,
-        "started_at_epoch": started_at_epoch,
-        "conflict_strategy": args.conflict_strategy,
-        "github_mutation_policy": args.github_mutation_policy,
-    }
-    common.write_json_atomically(
-        launch_path,
-        launch,
-    )
-    command = scheduler_command(args, kickoff, repo_root, run_id, event_log)
-    try:
-        process = start_scheduler(
-            command,
-            repo_root=repo_root,
-            log_path=scheduler_log_path(kickoff, run_id),
-        )
-    except common.LaunchError as error:
-        common.write_json_atomically(
-            launch_path, {**launch, **error.launch_receipt, "error": str(error), "status": "launch_failed"}
-        )
-        raise
-    try:
-        common.write_json_atomically(
-            launch_path,
-            {**launch, "pid": process.pid, **process.launch_receipt},
-        )
-        common.write_json_atomically(
-            locator_path, monitor_locator(kickoff, run_id)
-        )
-    except OSError:
-        process.terminate()
-        raise
-    common.emit(
-        {
-            "event": "stack_pipeline_launched",
-            "run_id": run_id,
-            "pid": process.pid,
-            **process.launch_receipt,
-            "cursor": 0,
-            "conflict_strategy": args.conflict_strategy,
-            "github_mutation_policy": args.github_mutation_policy,
-            "next_watch": {"arguments": watch_arguments(run_id, 0)},
-        }
-    )
-
-
-def command_watch(args: argparse.Namespace) -> None:
-    run_id = validate_run_id(args.run_id)
-    kickoff = load_monitor_kickoff(run_id)
-    validate_launch_record(kickoff, run_id)
-    common.emit(
-        bind_next_watch(
-            watch_progress(
-                event_log=progress_log_path(kickoff, run_id),
-                launch_path=launch_state_path(kickoff, run_id),
-                observer_path=observer_state_path(kickoff, run_id),
-                cursor=args.cursor,
-                wait_seconds=args.wait_seconds,
-            ),
-            kickoff=kickoff,
-            run_id=run_id,
-        )
-    )
-
-
-def command_cancel(args: argparse.Namespace) -> None:
-    kickoff = load_kickoff(args)
-    run_id = validate_run_id(args.run_id)
-    launch = common.read_json(launch_state_path(kickoff, run_id))
-    identity = {"kind": RUN_KIND, "run_id": run_id, "kickoff": kickoff}
-    if not isinstance(launch, dict):
-        common.emit(
-            {
-                "event": "stack_pipeline_cancel",
-                "result": "unknown_run",
-                "run_id": run_id,
-            }
-        )
-        return
-    if any(launch.get(key) != value for key, value in identity.items()):
-        common.emit(
-            {
-                "event": "stack_pipeline_cancel",
-                "result": "run_identity_mismatch",
-                "run_id": run_id,
-            }
-        )
-        return
-
-    result_path = run_result_path(kickoff, run_id)
-    durable_result = common.read_json(result_path)
-    if (
-        isinstance(durable_result, dict)
-        and all(durable_result.get(key) == value for key, value in identity.items())
-    ):
-        common.emit(
-            {
-                "event": "stack_pipeline_cancel",
-                "result": "already_finished",
-                "run_id": run_id,
-                "pipeline_result": durable_result.get("pipeline_result"),
-            }
-        )
-        return
-
-    request_path = cancellation_request_path(kickoff, run_id)
-    request = common.read_json(request_path)
-    if request is not None and (
-        not isinstance(request, dict)
-        or any(request.get(key) != value for key, value in identity.items())
-    ):
-        common.emit(
-            {
-                "event": "stack_pipeline_cancel",
-                "result": "cancellation_record_malformed",
-                "run_id": run_id,
-            }
-        )
-        return
-    repeated = isinstance(request, dict)
-    if not repeated:
-        request = {
-            **identity,
-            "status": "requested",
-            "requested_at": utc_now(),
-            "requesting_pid": os.getpid(),
-        }
-        common.write_json_atomically(request_path, request)
-
-    deadline = time.monotonic() + args.wait_seconds
-    while True:
-        durable_result = common.read_json(result_path)
-        if (
-            isinstance(durable_result, dict)
-            and all(durable_result.get(key) == value for key, value in identity.items())
-        ):
-            common.write_json_atomically(
-                request_path,
-                {
-                    **request,
-                    "status": "completed",
-                    "completed_at": utc_now(),
-                    "pipeline_result": durable_result.get("pipeline_result", {}).get(
-                        "result"
-                    ),
-                },
-            )
-            common.emit(
-                {
-                    "event": "stack_pipeline_cancel",
-                    "result": (
-                        "cancelled"
-                        if durable_result.get("pipeline_result", {}).get("result")
-                        == "cancelled"
-                        else "already_finished"
-                    ),
-                    "run_id": run_id,
-                    "pipeline_result": durable_result.get("pipeline_result"),
-                }
-            )
-            return
-        pid = launch.get("pid")
-        if not isinstance(pid, int) or not common.process_is_alive(pid):
-            common.write_json_atomically(
-                request_path,
-                {
-                    **request,
-                    "status": "stale",
-                    "completed_at": utc_now(),
-                    "result": "scheduler_not_running",
-                },
-            )
-            common.emit(
-                {
-                    "event": "stack_pipeline_cancel",
-                    "result": "stale_run",
-                    "run_id": run_id,
-                }
-            )
-            return
-        if time.monotonic() >= deadline:
-            common.emit(
-                {
-                    "event": "stack_pipeline_cancel",
-                    "result": "already_requested" if repeated else "requested",
-                    "run_id": run_id,
-                }
-            )
-            return
-        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
-
-
 def command_run(args: argparse.Namespace) -> None:
     common.ACTIVE_GITHUB_MUTATION_POLICY = args.github_mutation_policy
-    if common._EXECUTION is not None and args.run_id is not None:
-        args.run_id = common._EXECUTION.run_id
-        args.event_log = None
-        raise WorkflowError("foreground execution owns its fresh run identity; omit --run-id")
     common.require_tools()
     kickoff = load_kickoff(args)
     repo_root = Path(args.repo_root).resolve() if args.repo_root else common.resolve_repo_root()
-    event_log = Path(args.event_log).resolve() if args.event_log else None
-    reporter = ProgressReporter(event_log=event_log)
+    reporter = ProgressReporter()
     pipeline = StackPipeline(
         kickoff,
         repo_root,
@@ -4692,9 +4172,7 @@ def command_run(args: argparse.Namespace) -> None:
         effort=args.effort,
         conflict_strategy=args.conflict_strategy,
         github_mutation_policy=args.github_mutation_policy,
-        run_id=validate_run_id(args.run_id) if args.run_id else (
-            common._EXECUTION.run_id if common._EXECUTION is not None else None
-        ),
+        run_id=common._EXECUTION.run_id if common._EXECUTION is not None else None,
         report=reporter,
     )
     result = pipeline.execute()
@@ -4740,66 +4218,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("allow", "source-only"),
         default="allow",
     )
-    run.add_argument("--run-id", help=argparse.SUPPRESS)
-    run.add_argument("--event-log", help=argparse.SUPPRESS)
     run.set_defaults(function=command_run)
-
-    start = subparsers.add_parser(
-        "start", help="launch the scheduler and return a durable monitor handle"
-    )
-    start.add_argument(
-        "--kickoff",
-        help="the structured kickoff JSON; omit to read it from standard input",
-    )
-    start.add_argument(
-        "--kickoff-file", help="read the structured kickoff JSON from this file"
-    )
-    start.add_argument(
-        "--repo-root", help="the repository clone the run works from"
-    )
-    start.add_argument(
-        "--stage-model",
-        action="append",
-        help="pin one stage's model as <stage>=<model>; repeatable",
-    )
-    start.add_argument("--effort", default=DEFAULT_EFFORT)
-    start.add_argument(
-        "--conflict-strategy",
-        choices=common.CONFLICT_STRATEGIES,
-        default="auto",
-    )
-    start.add_argument(
-        "--github-mutation-policy",
-        choices=("allow", "source-only"),
-        default="allow",
-    )
-    start.set_defaults(function=command_start)
-
-    watch = subparsers.add_parser(
-        "watch", help="wait for progress or one five-minute heartbeat"
-    )
-    watch.add_argument("--run-id", required=True)
-    watch.add_argument("--cursor", type=int, default=0)
-    watch.add_argument(
-        "--wait-seconds",
-        type=float,
-        default=PROGRESS_HEARTBEAT_INTERVAL,
-    )
-    watch.set_defaults(function=command_watch)
-
-    cancel = subparsers.add_parser(
-        "cancel", help="durably cancel one started stack pipeline run"
-    )
-    cancel.add_argument(
-        "--kickoff",
-        help="the exact structured kickoff JSON used to start the run",
-    )
-    cancel.add_argument(
-        "--kickoff-file", help="read the structured kickoff JSON from this file"
-    )
-    cancel.add_argument("--run-id", required=True)
-    cancel.add_argument("--wait-seconds", type=float, default=30.0)
-    cancel.set_defaults(function=command_cancel)
     return parser
 
 
@@ -4809,83 +4228,20 @@ def main() -> int:
         args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:
-        if args.command == "watch":
-            common.emit(
-                {
-                    "event": PROGRESS_UPDATE_EVENT,
-                    "updates": [],
-                    "finished": True,
-                    "monitor_failure": str(error),
-                    "run_id": getattr(args, "run_id", None),
-                    "cursor": getattr(args, "cursor", 0),
-                }
-            )
-            return 1
-        if args.command == "start":
-            common.emit(
-                {
-                    "event": "stack_pipeline_launch_failed",
-                    "error": str(error),
-                }
-            )
-            return 1
-        if args.command == "cancel":
-            common.emit(
-                {
-                    "event": "stack_pipeline_cancel",
-                    "result": "error",
-                    "error": str(error),
-                }
-            )
-            return 1
         event = {
             "event": "stack_pipeline_finished",
             "result": "error",
             "error": str(error),
         }
-        event_log = getattr(args, "event_log", None)
-        ProgressReporter(
-            event_log=Path(event_log).resolve() if event_log else None
-        )(event)
+        ProgressReporter()(event)
         return 1
     except KeyboardInterrupt:
-        if args.command == "watch":
-            common.emit(
-                {
-                    "event": PROGRESS_UPDATE_EVENT,
-                    "updates": [],
-                    "finished": True,
-                    "monitor_failure": "interrupted",
-                    "run_id": getattr(args, "run_id", None),
-                    "cursor": getattr(args, "cursor", 0),
-                }
-            )
-            return 130
-        if args.command == "start":
-            common.emit(
-                {
-                    "event": "stack_pipeline_launch_failed",
-                    "error": "interrupted",
-                }
-            )
-            return 130
-        if args.command == "cancel":
-            common.emit(
-                {
-                    "event": "stack_pipeline_cancel",
-                    "result": "interrupted",
-                }
-            )
-            return 130
         event = {
             "event": "stack_pipeline_finished",
             "result": "error",
             "error": "interrupted",
         }
-        event_log = getattr(args, "event_log", None)
-        ProgressReporter(
-            event_log=Path(event_log).resolve() if event_log else None
-        )(event)
+        ProgressReporter()(event)
         return 130
 
 

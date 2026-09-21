@@ -129,10 +129,6 @@ PIPELINE_ITERATION_FLAG = "--pipeline-iteration"
 PIPELINE_MAX_ITERATIONS_FLAG = "--pipeline-max-iterations"
 CLEARING_OUTCOMES = frozenset({"cleared", "skipped"})
 PROGRESS_EVENT = "pipeline_progress"
-PROGRESS_UPDATE_EVENT = "pipeline_update"
-PROGRESS_HEARTBEAT_INTERVAL = 300.0
-PROGRESS_WATCH_POLL_INTERVAL = 1.0
-PROGRESS_LIVENESS_INTERVAL = 15.0
 RUN_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
 
 SHIM_SUFFIXES = (".cmd", ".bat")
@@ -140,12 +136,6 @@ SHIM_SUFFIXES = (".cmd", ".bat")
 
 class WorkflowError(RuntimeError):
     pass
-
-
-class LaunchError(WorkflowError):
-    def __init__(self, message: str, launch_receipt: dict[str, Any]) -> None:
-        super().__init__(message)
-        self.launch_receipt = launch_receipt
 
 
 class WindowsKillJob:
@@ -451,6 +441,74 @@ def emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, sort_keys=True), flush=True)
 
 
+def serialized_size(payload: Any) -> int:
+    return len((json.dumps(payload, sort_keys=True) + os.linesep).encode("utf-8"))
+
+
+def clipped_text(value: Any, limit: int = 512) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3] + "..."
+
+
+def bounded_value(
+    value: Any,
+    *,
+    text_limit: int = 512,
+    collection_limit: int = 12,
+    depth: int = 0,
+) -> tuple[Any, bool]:
+    """Return a deterministic preview while leaving canonical data untouched."""
+    if isinstance(value, str):
+        return (
+            value[:text_limit] + "..." if len(value) > text_limit else value,
+            len(value) > text_limit,
+        )
+    if not isinstance(value, (dict, list)):
+        return value, False
+    if depth >= 5:
+        return None, bool(value)
+    items = list(value.items()) if isinstance(value, dict) else list(enumerate(value))
+    limit = 32 if isinstance(value, dict) else collection_limit
+    truncated = len(items) > limit
+    result: Any = {} if isinstance(value, dict) else []
+    for key, item in items[:limit]:
+        preview, shortened = bounded_value(
+            item,
+            text_limit=text_limit,
+            collection_limit=collection_limit,
+            depth=depth + 1,
+        )
+        truncated |= shortened
+        if isinstance(result, dict):
+            if len(key) > text_limit:
+                truncated = True
+                continue
+            result[key] = preview
+        else:
+            result.append(preview)
+    return result, truncated
+
+
+def canonical_terminal_payload(
+    payload: dict[str, Any],
+    result_path: Path,
+    *,
+    envelope_key: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    path = result_path.resolve()
+    raw = path.read_bytes()
+    persisted = json.loads(raw)
+    canonical = persisted.get(envelope_key) if envelope_key else persisted
+    if canonical != payload:
+        raise WorkflowError(
+            f"terminal result does not match canonical artifact: {path}"
+        )
+    return canonical, hashlib.sha256(raw).hexdigest()
+
+
 def report_event(
     report: Callable[[dict[str, Any]], None] | None,
     event: str,
@@ -472,49 +530,19 @@ def report_safely(
             raise
 
 
-class ConversationProgressReporter:
-    """Mirror raw events and journal concise updates for a parent agent."""
+class ForegroundProgressReporter:
+    """Emit controller events through the active foreground execution."""
 
     def __init__(
         self,
         *,
-        transition: Callable[[dict[str, Any]], dict[str, Any] | None],
-        event_log: Path | None = None,
         output: Callable[[dict[str, Any]], None] = emit,
-        wall_time: Callable[[], float] = time.time,
     ) -> None:
-        self.transition = transition
-        self.event_log = event_log
         self.output = output
-        self.wall_time = wall_time
-        self.last_wait_signature: str | None = None
 
     def __call__(self, payload: dict[str, Any]) -> None:
         try:
             self.output(payload)
-        except (OSError, TypeError, ValueError):
-            if _EXECUTION is not None:
-                raise
-        if self.event_log is None:
-            return
-        update = self.transition(payload)
-        if update is None:
-            return
-        signature = json.dumps(update, sort_keys=True)
-        if update.get("waiting") and signature == self.last_wait_signature:
-            return
-        self.last_wait_signature = signature if update.get("waiting") else None
-        now = self.wall_time()
-        update["reported_at_epoch"] = now
-        if update.get("waiting"):
-            update["wait_started_at_epoch"] = now
-            update["wait_id"] = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:16]
-        try:
-            self.event_log.parent.mkdir(parents=True, exist_ok=True)
-            with self.event_log.open("a", encoding="utf-8", newline="\n") as stream:
-                stream.write(json.dumps(update, sort_keys=True) + "\n")
-                stream.flush()
-                os.fsync(stream.fileno())
         except (OSError, TypeError, ValueError):
             if _EXECUTION is not None:
                 raise
@@ -526,258 +554,11 @@ def validate_run_id(run_id: str) -> str:
     return run_id
 
 
-def read_progress_log(path: Path) -> list[dict[str, Any]]:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
-    records: list[dict[str, Any]] = []
-    for line in lines:
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict) and payload.get("event") == PROGRESS_EVENT:
-            records.append(payload)
-    return records
-
-
-def heartbeat_update(progress: dict[str, Any], now: float) -> dict[str, Any]:
-    started = progress.get("wait_started_at_epoch", progress.get("reported_at_epoch"))
-    elapsed = max(0, int(now - started)) if isinstance(started, (int, float)) else 0
-    minutes = max(1, elapsed // 60)
-    message = progress.get("message", "The pipeline is still running.").rstrip(".")
-    return {
-        **{
-            key: progress.get(key)
-            for key in (
-                "iteration",
-                "pull_request_pass",
-                "sweep",
-                "stage",
-                "pull_requests",
-                "wait_id",
-                "wait_reason",
-                "next_action",
-            )
-            if progress.get(key) is not None
-        },
-        "event": PROGRESS_EVENT,
-        "kind": "heartbeat",
-        "message": f"{message} ({minutes} minutes elapsed).",
-        "elapsed_seconds": elapsed,
-        "waiting": True,
-        "reported_at_epoch": now,
-    }
-
-
-def progress_update(
-    records: list[dict[str, Any]],
-    cursor: int,
-    observer_path: Path,
-    now: float,
-) -> dict[str, Any]:
-    updates = records[cursor:]
-    latest = updates[-1]
-    write_json_atomically(
-        observer_path,
-        {
-            "cursor": len(records),
-            "last_reported_at_epoch": now,
-            "wait_id": latest.get("wait_id") if latest.get("waiting") else None,
-        },
-    )
-    return {
-        "event": PROGRESS_UPDATE_EVENT,
-        "cursor": len(records),
-        "updates": updates,
-        "finished": any(update.get("terminal") for update in updates),
-    }
-
-
-def watch_progress(
-    *,
-    event_log: Path,
-    launch_path: Path,
-    observer_path: Path,
-    cursor: int,
-    wait_seconds: float,
-    wall_time: Callable[[], float] = time.time,
-    monotonic: Callable[[], float] = time.monotonic,
-    sleep: Callable[[float], None] = time.sleep,
-    alive: Callable[[int], bool] | None = None,
-) -> dict[str, Any]:
-    if cursor < 0:
-        raise WorkflowError("cursor cannot be negative")
-    if wait_seconds <= 0 or wait_seconds > PROGRESS_HEARTBEAT_INTERVAL:
-        raise WorkflowError(
-            f"wait-seconds must be greater than zero and at most "
-            f"{int(PROGRESS_HEARTBEAT_INTERVAL)}"
-        )
-    deadline = monotonic() + wait_seconds
-    last_liveness_check = float("-inf")
-    while True:
-        records = read_progress_log(event_log)
-        cursor = min(cursor, len(records))
-        if len(records) > cursor:
-            return progress_update(records, cursor, observer_path, wall_time())
-        latest = records[-1] if records else None
-        if latest is not None and latest.get("terminal"):
-            return {
-                "event": PROGRESS_UPDATE_EVENT,
-                "cursor": len(records),
-                "updates": [],
-                "finished": True,
-            }
-
-        launch = read_json(launch_path)
-        if not isinstance(launch, dict):
-            return {
-                "event": PROGRESS_UPDATE_EVENT,
-                "cursor": len(records),
-                "updates": [],
-                "finished": True,
-                "monitor_failure": "launch_record_missing",
-            }
-        pid = launch.get("pid")
-        current_monotonic = monotonic()
-        if (
-            isinstance(pid, int)
-            and current_monotonic - last_liveness_check >= PROGRESS_LIVENESS_INTERVAL
-        ):
-            last_liveness_check = current_monotonic
-            failure = None
-            if alive is not None:
-                running = alive(pid)
-            elif IS_WINDOWS:
-                expected = launch.get("process_identity")
-                if not isinstance(expected, dict) or not expected.get("creation_time"):
-                    running, failure = False, "scheduler_generation_unverified"
-                else:
-                    try:
-                        observed = windows_process_identity(pid)
-                    except OSError:
-                        running, failure = False, "scheduler_generation_unreadable"
-                    else:
-                        running = observed is not None and observed["running"]
-                        if observed is not None and observed["creation_time"] != expected["creation_time"]:
-                            running, failure = False, "scheduler_generation_changed"
-            else:
-                running = process_is_alive(pid)
-            if not running:
-                records = read_progress_log(event_log)
-                cursor = min(cursor, len(records))
-                if len(records) > cursor:
-                    return progress_update(records, cursor, observer_path, wall_time())
-                if records and records[-1].get("terminal"):
-                    return {
-                        "event": PROGRESS_UPDATE_EVENT,
-                        "cursor": len(records),
-                        "updates": [],
-                        "finished": True,
-                    }
-                return {
-                    "event": PROGRESS_UPDATE_EVENT,
-                    "cursor": len(records),
-                    "updates": [],
-                    "finished": True,
-                    "monitor_failure": failure or "scheduler_exited_without_final_event",
-                }
-
-        observer = read_json(observer_path)
-        last_reported = (
-            observer.get("last_reported_at_epoch")
-            if isinstance(observer, dict)
-            else launch.get("started_at_epoch")
-        )
-        now = wall_time()
-        if (
-            latest is not None
-            and isinstance(last_reported, (int, float))
-            and now - last_reported >= PROGRESS_HEARTBEAT_INTERVAL
-        ):
-            heartbeat = heartbeat_update(latest, now)
-            write_json_atomically(
-                observer_path,
-                {
-                    "cursor": len(records),
-                    "last_reported_at_epoch": now,
-                    "wait_id": latest.get("wait_id"),
-                },
-            )
-            return {
-                "event": PROGRESS_UPDATE_EVENT,
-                "cursor": len(records),
-                "updates": [heartbeat],
-                "finished": False,
-            }
-
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            return {
-                "event": PROGRESS_UPDATE_EVENT,
-                "cursor": len(records),
-                "updates": [],
-                "finished": False,
-            }
-        sleep(min(PROGRESS_WATCH_POLL_INTERVAL, remaining))
-
-
-def start_detached(
-    command: list[str], *, cwd: Path, log_path: Path
-) -> subprocess.Popen[Any]:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log = log_path.open("w", encoding="utf-8", newline="\n")
-    options: dict[str, Any] = {
-        "cwd": str(cwd),
-        "stdin": subprocess.DEVNULL,
-        "stdout": log,
-        "stderr": subprocess.STDOUT,
-    }
-    if IS_WINDOWS:
-        options["creationflags"] = (
-            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
-            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            | getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
-        )
-    else:
-        options["start_new_session"] = True
-    try:
-        process, used_breakaway = popen_with_windows_breakaway_fallback(
-            command,
-            options,
-            operation="detached scheduler",
-            require_breakaway=True,
-        )
-        try:
-            identity = windows_process_identity(process.pid) if IS_WINDOWS else None
-            if IS_WINDOWS and identity is None:
-                raise WorkflowError("scheduler process identity is unavailable")
-            process.launch_receipt = {
-                "creationflags": options.get("creationflags", 0),
-                "breakaway_requested": IS_WINDOWS,
-                "breakaway_accepted": bool(IS_WINDOWS and used_breakaway),
-                "fallback_used": False,
-                "process_identity": identity,
-            }
-            if IS_WINDOWS:
-                resume_windows_process(process.pid)
-        except BaseException:
-            process.terminate()
-            process.wait(timeout=10)
-            raise
-        return process
-    finally:
-        log.close()
-
-
 def popen_with_windows_breakaway_fallback(
     command: list[str],
     options: dict[str, Any],
     *,
     operation: str,
-    require_breakaway: bool = False,
 ) -> tuple[subprocess.Popen[Any], bool]:
     """Start once, retrying only a rejected Windows job breakaway request."""
     try:
@@ -790,18 +571,6 @@ def popen_with_windows_breakaway_fallback(
             or not options.get("creationflags", 0) & breakaway
         ):
             raise
-        if require_breakaway:
-            raise LaunchError(
-                f"{operation} requires Windows job breakaway for {command[0]}; "
-                "denied before fallback execution",
-                {
-                    "creationflags": options.get("creationflags", 0),
-                    "breakaway_requested": True, "breakaway_accepted": False,
-                    "fallback_used": False, "process_identity": None,
-                    "launch_error_code": getattr(error, "winerror", None),
-                },
-            ) from error
-
     fallback_options = dict(options)
     fallback_options["creationflags"] &= ~breakaway
     try:

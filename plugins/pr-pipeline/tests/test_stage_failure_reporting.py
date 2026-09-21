@@ -150,20 +150,12 @@ class StageFailureReportingTest(unittest.TestCase):
             STANDALONE.serialized_size(compact), STANDALONE.TERMINAL_RESULT_MAX_BYTES,
         )
         self.assertEqual(target["number"], compact["number"])
-        with (
-            mock.patch.object(STANDALONE, "run_result_path", return_value=path),
-            mock.patch.object(STANDALONE, "progress_log_path",
-                              return_value=self.root / "progress.jsonl"),
-        ):
-            watched = STANDALONE.bounded_watch_result(
-                {"finished": True, "cursor": 1, "updates": [
-                    STANDALONE.progress_transition(compact),
-                ]},
-                target=target, run_id=RUN_ID,
-            )
         self.assertEqual(original, json.loads(path.read_bytes()))
-        self.assertLessEqual(STANDALONE.serialized_size(watched), STANDALONE.WATCH_MAX_BYTES)
-        return watched["final_event"]
+        self.assertLessEqual(
+            STANDALONE.serialized_size(compact),
+            STANDALONE.TERMINAL_RESULT_MAX_BYTES,
+        )
+        return compact
 
     def test_stack_retains_nested_task_error_without_replacing_safety_fields(self):
         payload = stack_result()
