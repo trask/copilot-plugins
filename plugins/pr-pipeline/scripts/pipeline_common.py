@@ -1385,6 +1385,76 @@ def stage_status_summary(payload: Any) -> dict[str, Any]:
     return {key: payload[key] for key in STAGE_STATUS_FIELDS if key in payload}
 
 
+def proven_source_drift(
+    payload: Any,
+    *,
+    head_sha: str,
+    pipeline_run: str | None,
+) -> dict[str, Any] | None:
+    """Return bounded evidence that a completed candidate lost its source lease."""
+    if not isinstance(payload, dict) or not pipeline_run:
+        return None
+    task = payload.get("agent_task")
+    drift = task.get("source_drift") if isinstance(task, dict) else None
+    iteration = payload.get("pipeline_iteration")
+    maximum = payload.get("pipeline_max_iterations")
+    if (
+        not isinstance(task, dict)
+        or task.get("status") != "head_changed"
+        or not isinstance(task.get("task"), dict)
+        or task["task"].get("state") != "completed"
+        or not isinstance(drift, dict)
+        or payload.get("pipeline_run") != pipeline_run
+        or type(iteration) is not int
+        or type(maximum) is not int
+        or not 1 <= iteration <= maximum
+        or drift.get("pipeline_iteration") != iteration
+        or drift.get("pipeline_max_iterations") != maximum
+        or drift.get("consumed_allowance") != 1
+        or drift.get("remaining_allowance") != maximum - iteration
+        or drift.get("observed_head_sha") != head_sha
+        or drift.get("expected_head_sha") == head_sha
+    ):
+        return None
+    expected = drift.get("expected_head_sha")
+    observed = drift.get("observed_head_sha")
+    if not all(
+        isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value)
+        for value in (expected, observed)
+    ):
+        return None
+    mutation_guards = (
+        "mutation_performed",
+        "source_mutation_performed",
+        "review_mutation_performed",
+        "rebase_performed",
+        "publication_performed",
+    )
+    adoption_guards = ("recommendation_adopted", "adoption_performed")
+    if (
+        not any(drift.get(key) is False for key in mutation_guards[:2])
+        or not any(drift.get(key) is False for key in adoption_guards)
+        or drift.get("publication_performed") is not False
+        or any(drift.get(key) is not False for key in mutation_guards if key in drift)
+        or any(drift.get(key) is not False for key in adoption_guards if key in drift)
+    ):
+        return None
+    return {
+        key: drift[key]
+        for key in (
+            "expected_head_sha",
+            "observed_head_sha",
+            "pipeline_iteration",
+            "pipeline_max_iterations",
+            "consumed_allowance",
+            "remaining_allowance",
+            *mutation_guards,
+            *adoption_guards,
+        )
+        if key in drift
+    }
+
+
 def stage_failure_summary(stage_result: Any, *, text_limit: int = 512) -> dict[str, Any]:
     """Preview a retained task error without changing the controller's stop reason."""
     if not isinstance(stage_result, dict):
@@ -1611,6 +1681,11 @@ def inspect_stage(
         else None
     )
     outcome = payload.get("stage_outcome") if isinstance(payload, dict) else None
+    source_drift = proven_source_drift(
+        payload,
+        head_sha=head_sha,
+        pipeline_run=pipeline_run,
+    )
     warning_verification = (
         payload.get("warning_verification") if isinstance(payload, dict) else None
     )
@@ -1724,6 +1799,7 @@ def inspect_stage(
         )
     clear = (
         status.get("ok") is True
+        and source_drift is None
         and head_is_clear
         and base_is_clear
         and (outcome in CLEARING_OUTCOMES or warning_is_valid)
@@ -1769,6 +1845,8 @@ def inspect_stage(
         and warning_verification.get("result") == "stale"
     ):
         reason = "ci_warning_snapshot_changed"
+    elif source_drift is not None:
+        reason = "source_drift"
     else:
         reason = status.get("reason") or outcome or "not_cleared"
     return {
@@ -1788,6 +1866,7 @@ def inspect_stage(
         "installed": status["installed"],
         "status_state": status["state"],
         "status": stage_status_summary(payload),
+        **({"source_drift": source_drift} if source_drift is not None else {}),
         **(
             {"warning_verification": warning_verification}
             if entry["stage"] == STAGE_CI and isinstance(warning_verification, dict)

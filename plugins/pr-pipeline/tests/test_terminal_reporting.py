@@ -180,6 +180,53 @@ class TerminalReportingTest(unittest.TestCase):
         self.assertTrue(final["history_rewritten"])
         self.assertEqual(retained["sha"], final["local_head_sha"])
 
+    def test_source_drift_remains_in_canonical_and_compact_stage_results(self):
+        original = observed_clean_result()
+        drift = {
+            "expected_head_sha": "d" * 40,
+            "observed_head_sha": HEAD,
+            "pipeline_iteration": 1,
+            "pipeline_max_iterations": 2,
+            "consumed_allowance": 1,
+            "remaining_allowance": 1,
+            "mutation_performed": False,
+            "recommendation_adopted": False,
+            "publication_performed": False,
+        }
+        stage = original["stages"][-1]
+        stage.update({"clear": False, "outcome": None, "reason": "source_drift"})
+        stage["source_drift"] = drift
+        stage["status"]["agent_task"] = {
+            "status": "head_changed",
+            "source_drift": drift,
+        }
+        original["runs"][-1].update(
+            {
+                "clear": False,
+                "outcome": None,
+                "stage_reason": "source_drift",
+                "source_drift": drift,
+            }
+        )
+        original["result"] = "incomplete"
+        original["reason"] = "two_sweeps_finished"
+        original["sweeps"] = 2
+
+        final = self.watch(original)["final_event"]
+
+        self.assertEqual(drift, final["stages"][-1]["source_drift"])
+        self.assertEqual(
+            drift,
+            final["stages"][-1]["status"]["agent_task"]["source_drift"],
+        )
+        self.assertEqual(drift, final["runs"][-1]["source_drift"])
+        self.assertEqual(
+            drift,
+            json.loads(self.path.read_text(encoding="utf-8"))["stages"][-1][
+                "source_drift"
+            ],
+        )
+
     def test_published_review_sequence_reports_both_code_commits_not_output_commit(self):
         code_shas = [
             "1111111111111111111111111111111111111111",

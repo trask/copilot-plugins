@@ -32,6 +32,8 @@ Every stage is an installed Python coordinator subprocess. No model translates i
 
 Verified Review exhaustion is terminal `carried`, not clean. Pending feedback and spent allowance remain in its status while Self Review, CI and Description continue. Later sweeps cannot turn exhaustion into another allowance. The final result stays incomplete or partial while Review remains unresolved.
 
+When a stage proves that its completed hosted candidate was based on an older source head, the schedulers retain that evidence but do not adopt, import, rebase, or publish the candidate. The started stage allowance remains spent. The stage stays uncleared, and only a later sweep or pass that was already within the two-iteration limit may evaluate and clear the current snapshot.
+
 Both schedulers load `pipeline_common.py` from its pinned source bytes without reading or writing installed bytecode caches or changing interpreter-wide bytecode settings. A shared-source change requires updating both scheduler digest pins.
 
 Model overrides use canonical IDs, for example `--stage-model pr-description=gpt-6-astra`. PR Description supports `gpt-5.6-sol`, `gpt-5.6-luna`, `gpt-5.6-terra`, and `gpt-6-astra`; the other stages require `gpt-5.6-sol`. The scheduler rejects unsupported routes before launching a stage.

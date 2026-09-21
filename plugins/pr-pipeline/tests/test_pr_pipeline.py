@@ -126,6 +126,33 @@ def description_payload(head=HEAD, base=BASE) -> dict:
     }
 
 
+def source_drift_payload(
+    *, expected=NEXT_HEAD, observed=HEAD, iteration=1, maximum=2
+) -> dict:
+    return {
+        "stage_outcome": None,
+        "validated_head_sha": None,
+        "pipeline_run": PIPELINE_RUN,
+        "pipeline_iteration": iteration,
+        "pipeline_max_iterations": maximum,
+        "agent_task": {
+            "status": "head_changed",
+            "task": {"id": "task-1", "state": "completed"},
+            "source_drift": {
+                "expected_head_sha": expected,
+                "observed_head_sha": observed,
+                "pipeline_iteration": iteration,
+                "pipeline_max_iterations": maximum,
+                "consumed_allowance": 1,
+                "remaining_allowance": maximum - iteration,
+                "mutation_performed": False,
+                "recommendation_adopted": False,
+                "publication_performed": False,
+            },
+        },
+    }
+
+
 def stale_ci_warning_payload() -> dict:
     return {
         "stage_outcome": "pending",
@@ -943,6 +970,40 @@ class MarkerTest(unittest.TestCase):
         cached = ci_green_payload()
         del cached["clearance_verification"]
         self.assertFalse(self.status(MODULE.STAGE_CI, cached)["clear"])
+
+    def test_proven_source_drift_is_retained_without_clearance(self):
+        payload = source_drift_payload()
+
+        result = self.status(
+            MODULE.STAGE_DESCRIPTION,
+            payload,
+            run_id=PIPELINE_RUN,
+        )
+
+        self.assertFalse(result["clear"])
+        self.assertEqual("source_drift", result["reason"])
+        self.assertEqual(
+            payload["agent_task"]["source_drift"],
+            result["status"]["agent_task"]["source_drift"],
+        )
+        self.assertEqual(
+            payload["agent_task"]["source_drift"],
+            result["source_drift"],
+        )
+
+    def test_source_drift_that_performed_mutation_is_not_trusted(self):
+        payload = source_drift_payload()
+        payload["agent_task"]["source_drift"]["mutation_performed"] = True
+
+        result = self.status(
+            MODULE.STAGE_DESCRIPTION,
+            payload,
+            run_id=PIPELINE_RUN,
+        )
+
+        self.assertFalse(result["clear"])
+        self.assertEqual("not_cleared", result["reason"])
+        self.assertNotIn("source_drift", result)
 
     def test_ci_warning_clears_orchestration_without_a_clean_marker(self):
         for diagnosis in ("unrelated", "pre_existing"):
@@ -3116,6 +3177,67 @@ class SweepTest(unittest.TestCase):
         self.assertEqual("incomplete", result["result"])
         self.assertEqual("two_sweeps_finished", result["reason"])
         self.assertEqual(10, len(self.launched))
+
+    def test_source_drift_uses_the_existing_second_sweep_allowance(self):
+        original_run_stage = self.run_stage
+        original_inspect = self.inspect
+        drift = source_drift_payload(expected=HEAD, observed=NEXT_HEAD)[
+            "agent_task"
+        ]["source_drift"]
+
+        def run_stage(entry, *args, **kwargs):
+            result = original_run_stage(entry, *args, **kwargs)
+            if (
+                entry["stage"] == MODULE.STAGE_DESCRIPTION
+                and kwargs["sweep"] == 1
+            ):
+                self.clear_at[entry["stage"]] = None
+                self.sync_heads.append(NEXT_HEAD)
+            return result
+
+        def inspect(entry, selected, head, base, run_id=None):
+            result = original_inspect(entry, selected, head, base, run_id)
+            if (
+                entry["stage"] == MODULE.STAGE_DESCRIPTION
+                and head == NEXT_HEAD
+                and self.clear_at[entry["stage"]] is None
+            ):
+                result.update(
+                    {
+                        "outcome": None,
+                        "reason": "source_drift",
+                        "source_drift": drift,
+                        "status": {
+                            "agent_task": {
+                                "status": "head_changed",
+                                "source_drift": drift,
+                            }
+                        },
+                    }
+                )
+            return result
+
+        MODULE.run_stage.side_effect = run_stage
+        MODULE.inspect_stage.side_effect = inspect
+        MODULE.inspect_stages.side_effect = (
+            lambda selected, head, base, run_id=None: [
+                inspect(entry, selected, head, base, run_id)
+                for entry in MODULE.STAGES
+            ]
+        )
+
+        result = self.execute()
+
+        self.assertEqual("complete", result["result"])
+        self.assertEqual(2, result["sweeps"])
+        description_runs = [
+            record
+            for record in result["runs"]
+            if record["stage"] == MODULE.STAGE_DESCRIPTION
+        ]
+        self.assertEqual([1, 2], [record["sweep"] for record in description_runs])
+        self.assertEqual(drift, description_runs[0]["source_drift"])
+        self.assertTrue(description_runs[1]["clear"])
 
     def test_nonzero_stage_exit_blocks_later_stages(self):
         original = self.run_stage

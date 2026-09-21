@@ -13,12 +13,13 @@ import re
 import sys
 import subprocess
 import uuid
+from types import ModuleType
 from typing import Any, Callable
 
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "3310246018fccddc6f423d5d3f7530c38dfb96c0ac311d50650d8274a86140f1"
+COMMON_SHA256 = "c61b0c39607e3d0b93991ecc4127f366d211bef33ba0dbb625ec5e9411cc9cac"
 
 
 def load_common() -> Any:
@@ -250,6 +251,7 @@ def compact_terminal_result(
             key: record[key] for key in (
                 "stage", "sweep", "action", "outcome", "clear", "stage_reason",
                 "started_head_sha", "ended_head_sha", "history_rewritten",
+                "source_drift",
             ) if key in record
         }
         for record in runs
@@ -1083,6 +1085,10 @@ def run_pipeline(
                         "inspected_base_sha": current_pr["base_sha"],
                         "status": stage_result["status"],
                         "clearance_kind": stage_result.get("clearance_kind"),
+                        **(
+                            {"source_drift": stage_result["source_drift"]}
+                            if stage_result.get("source_drift") is not None else {}
+                        ),
                         **common.ci_warning_fields([stage_result]),
                         "retained_commits": retained_commits,
                     }
@@ -1125,6 +1131,10 @@ def run_pipeline(
                     "inspected_base_sha": current_pr["base_sha"],
                     "status": after["status"],
                     "clearance_kind": after.get("clearance_kind"),
+                    **(
+                        {"source_drift": after["source_drift"]}
+                        if after.get("source_drift") is not None else {}
+                    ),
                     **common.ci_warning_fields([after]),
                 }
             )
@@ -1340,12 +1350,35 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "complete",
     "incomplete",
 })
-EXECUTION_SHA256 = "bcca8dfa65d156b33081c2edf841b375a0620d4c1bdbc3cec3fd6501dc5cf53c"
+EXECUTION_SHA256 = "ce1ed0beed8d3daed64a31c453b8f010190cbe5648342f44b6a26a0a94c6ffb6"
+EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
+
+
+def load_execution_runtime(source_path: Path) -> ModuleType:
+    if (
+        not source_path.is_absolute()
+        or not source_path.is_file()
+        or source_path.is_symlink()
+        or source_path.parent.is_symlink()
+    ):
+        raise RuntimeError("execution Runtime source path is invalid")
+    source_path = source_path.resolve()
+    source = source_path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
+        raise RuntimeError("execution Runtime source digest changed")
+    module = ModuleType("_trask_foreground_execution")
+    module.__file__ = str(source_path)
+    sys.modules[module.__name__] = module
+    try:
+        exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
+    except BaseException:
+        sys.modules.pop(module.__name__, None)
+        raise
+    return module
 
 
 def _load_execution():
     """Load only the pinned shared foreground execution source."""
-    import types
     inventory = subprocess.run(
         ["copilot", "skill", "list", "--json"], check=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
@@ -1360,16 +1393,7 @@ def _load_execution():
     if len(matches) != 1:
         raise RuntimeError("shared execution Runtime is not uniquely installed and enabled")
     root = Path(matches[0]["path"])
-    source_path = root / "scripts" / "execution.py"
-    if not root.is_absolute() or any(path.is_symlink() for path in (root, source_path.parent, source_path)):
-        raise RuntimeError("shared execution Runtime path is invalid")
-    source = source_path.read_bytes()
-    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
-        raise RuntimeError("shared execution Runtime source digest changed")
-    module = types.ModuleType("trask_foreground_execution")
-    module.__file__ = str(source_path)
-    exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
-    return module
+    return load_execution_runtime(root / EXECUTION_RELATIVE_PATH)
 
 
 def execution_main():

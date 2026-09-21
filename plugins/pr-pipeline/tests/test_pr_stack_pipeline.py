@@ -1731,6 +1731,108 @@ class StackRunTest(StackFixture):
         )
         self.assertEqual("incomplete", result["snapshot"]["result"])
 
+    def test_source_drift_consumes_one_pass_and_later_pass_can_clear(self):
+        self.stack = stack(members=(11,))
+        self.clear_everything()
+        self.clear.remove((11, MODULE.STAGE_DESCRIPTION))
+        original_head = self.stack["members"][0]["head_sha"]
+        current_head = "f" * 40
+        source_drift = {
+            "expected_head_sha": original_head,
+            "observed_head_sha": current_head,
+            "pipeline_iteration": 1,
+            "pipeline_max_iterations": 2,
+            "consumed_allowance": 1,
+            "remaining_allowance": 1,
+            "mutation_performed": False,
+            "recommendation_adopted": False,
+            "publication_performed": False,
+        }
+
+        def inspect(entry, target, head_sha, base_sha=None):
+            result = self.inspect(entry, target, head_sha, base_sha)
+            if (
+                entry["stage"] == MODULE.STAGE_DESCRIPTION
+                and (target["number"], entry["stage"]) not in self.clear
+                and head_sha == current_head
+            ):
+                result.update(
+                    {
+                        "outcome": None,
+                        "reason": "source_drift",
+                        "source_drift": source_drift,
+                        "status": {
+                            "agent_task": {
+                                "status": "head_changed",
+                                "source_drift": source_drift,
+                            }
+                        },
+                    }
+                )
+            return result
+
+        def complete(request):
+            if request["stage"] != MODULE.STAGE_DESCRIPTION:
+                return
+            if request["pass"] == 1:
+                self.stack = stack(members=(11,), heads={11: current_head})
+            else:
+                self.clear.add((11, MODULE.STAGE_DESCRIPTION))
+
+        self.launcher.on_start = complete
+        pipeline = self.pipeline(kickoff(numbers=(11,)), inspect=inspect)
+
+        result = pipeline.execute()
+
+        self.assertEqual("complete", result["result"])
+        self.assertEqual(2, result["passes"])
+        description_requests = [
+            request
+            for request in self.launcher.started
+            if request["stage"] == MODULE.STAGE_DESCRIPTION
+        ]
+        self.assertEqual([1, 2], [request["pass"] for request in description_requests])
+        self.assertEqual(
+            ["1", "2"],
+            [
+                request["arguments"][
+                    request["arguments"].index("--pipeline-iteration") + 1
+                ]
+                for request in description_requests
+            ],
+        )
+        self.assertTrue(
+            all(
+                request["arguments"][
+                    request["arguments"].index("--pipeline-max-iterations") + 1
+                ] == "2"
+                for request in description_requests
+            )
+        )
+        recorded = result["pull_requests"]["11"]["stages"][MODULE.STAGE_DESCRIPTION]
+        self.assertTrue(recorded["clear"])
+        self.assertEqual(
+            source_drift,
+            recorded["superseded_candidates"][0]["source_drift"],
+        )
+        drift_phase = next(
+            phase
+            for phase in result["phases"]
+            if phase["phase"] == MODULE.STAGE_DESCRIPTION
+            and phase.get("source_drifts")
+        )
+        self.assertEqual(1, drift_phase["source_drifts"][0]["consumed_allowance"])
+        compact = MODULE.compact_terminal_result(
+            result, result_path=pipeline.result_path
+        )
+        compact_drift = next(
+            phase["source_drifts"][0]
+            for phase in compact["phases"]
+            if phase.get("source_drifts")
+        )
+        self.assertEqual(source_drift["expected_head_sha"], compact_drift["expected_head_sha"])
+        self.assertEqual(source_drift["observed_head_sha"], compact_drift["observed_head_sha"])
+
     def test_second_pass_does_not_relaunch_a_completed_conflict_resolution(self):
         self.completed.add((11, MODULE.STAGE_CONFLICT))
         def complete_with_current_clearance(request):

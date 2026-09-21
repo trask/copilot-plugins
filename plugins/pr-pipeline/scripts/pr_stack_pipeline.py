@@ -20,12 +20,13 @@ import subprocess
 import sys
 import time
 import uuid
+from types import ModuleType
 from typing import Any, Callable
 
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "3310246018fccddc6f423d5d3f7530c38dfb96c0ac311d50650d8274a86140f1"
+COMMON_SHA256 = "c61b0c39607e3d0b93991ecc4127f366d211bef33ba0dbb625ec5e9411cc9cac"
 
 
 def load_common() -> Any:
@@ -179,6 +180,7 @@ def stage_result_summary(stage_result: dict[str, Any]) -> dict[str, Any]:
             "run_id": (status or {}).get("run_id"),
             "pipeline_run": (status or {}).get("pipeline_run"),
             "native_stack_clearance": (status or {}).get("native_stack_clearance"),
+            "source_drift": stage_result.get("source_drift"),
             **common.ci_warning_fields([stage_result]),
             "outcome": stage_result.get("outcome"),
             "reason": stage_result.get("reason"),
@@ -1741,7 +1743,20 @@ class StackPipeline:
     ) -> None:
         pull_requests = self.state.setdefault("pull_requests", {})
         record = pull_requests.setdefault(str(number), {"stages": {}})
-        record["stages"][stage] = {**payload, "updated_at": utc_now()}
+        previous = record["stages"].get(stage, {})
+        superseded = list(previous.get("superseded_candidates") or [])
+        stage_result = payload.get("stage_result")
+        if (
+            isinstance(stage_result, dict)
+            and stage_result.get("source_drift") is not None
+            and stage_result not in superseded
+        ):
+            superseded.append(stage_result)
+        record["stages"][stage] = {
+            **payload,
+            **({"superseded_candidates": superseded} if superseded else {}),
+            "updated_at": utc_now(),
+        }
         self.save()
 
     def cancellation_requested(self) -> bool:
@@ -2131,6 +2146,7 @@ class StackPipeline:
             blocker is None
             and request["stage"] in {STAGE_CONFLICT, STAGE_DESCRIPTION}
             and stage_result.get("outcome") is None
+            and stage_result.get("source_drift") is None
         ):
             label = (
                 "conflict" if request["stage"] == STAGE_CONFLICT else "description"
@@ -3834,6 +3850,18 @@ def summarize_phase(phase: dict[str, Any]) -> dict[str, Any]:
         summary["reused"] = [item["number"] for item in reused]
     if reasons:
         summary["reasons"] = reasons
+    source_drifts = [
+        {
+            "number": completion["number"],
+            "stage": completion["stage"],
+            **completion["stage_result"]["source_drift"],
+        }
+        for completion in completions
+        if isinstance(completion.get("stage_result"), dict)
+        and isinstance(completion["stage_result"].get("source_drift"), dict)
+    ]
+    if source_drifts:
+        summary["source_drifts"] = source_drifts
     if phase.get("blocked") is not None:
         summary["blocked"] = phase["blocked"]
     if phase.get("action") is not None:
@@ -3995,6 +4023,13 @@ def compact_terminal_result(
                     ],
                     "stopped": compact_stopped,
                     "action": phase.get("action"),
+                    "source_drifts": limited(phase.get("source_drifts")),
+                    "source_drifts_omitted": (
+                        len(phase["source_drifts"]) - TERMINAL_RESULT_MAX_PULL_REQUESTS
+                        if isinstance(phase.get("source_drifts"), list)
+                        and len(phase["source_drifts"]) > TERMINAL_RESULT_MAX_PULL_REQUESTS
+                        else None
+                    ),
                 }.items()
                 if value not in (None, [], {})
             }
@@ -4250,12 +4285,35 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "complete",
     "partial",
 })
-EXECUTION_SHA256 = "bcca8dfa65d156b33081c2edf841b375a0620d4c1bdbc3cec3fd6501dc5cf53c"
+EXECUTION_SHA256 = "ce1ed0beed8d3daed64a31c453b8f010190cbe5648342f44b6a26a0a94c6ffb6"
+EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
+
+
+def load_execution_runtime(source_path: Path) -> ModuleType:
+    if (
+        not source_path.is_absolute()
+        or not source_path.is_file()
+        or source_path.is_symlink()
+        or source_path.parent.is_symlink()
+    ):
+        raise RuntimeError("execution Runtime source path is invalid")
+    source_path = source_path.resolve()
+    source = source_path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
+        raise RuntimeError("execution Runtime source digest changed")
+    module = ModuleType("_trask_foreground_execution")
+    module.__file__ = str(source_path)
+    sys.modules[module.__name__] = module
+    try:
+        exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
+    except BaseException:
+        sys.modules.pop(module.__name__, None)
+        raise
+    return module
 
 
 def _load_execution():
     """Load only the pinned shared foreground execution source."""
-    import types
     inventory = subprocess.run(
         ["copilot", "skill", "list", "--json"], check=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
@@ -4270,16 +4328,7 @@ def _load_execution():
     if len(matches) != 1:
         raise RuntimeError("shared execution Runtime is not uniquely installed and enabled")
     root = Path(matches[0]["path"])
-    source_path = root / "scripts" / "execution.py"
-    if not root.is_absolute() or any(path.is_symlink() for path in (root, source_path.parent, source_path)):
-        raise RuntimeError("shared execution Runtime path is invalid")
-    source = source_path.read_bytes()
-    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
-        raise RuntimeError("shared execution Runtime source digest changed")
-    module = types.ModuleType("trask_foreground_execution")
-    module.__file__ = str(source_path)
-    exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
-    return module
+    return load_execution_runtime(root / EXECUTION_RELATIVE_PATH)
 
 
 def execution_main():
