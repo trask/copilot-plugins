@@ -74,9 +74,12 @@ The execution record distinguishes finished, failed, locally cancelled and
 abandoned runs. A finished controller may still report pending review, exhaustion,
 blocked stages or CI warnings. No candidate or process exit means CI green.
 Windows children use no-window launch, native generation checks and job
-membership. Completion requires a zero active-job count; unverified drainage is
-an error. A foreground timeout covers communication and owned-job drainage,
-and cancellation remains observable while drainage is pending.
+membership. The suspended direct child is bound to its exact handle, job,
+generation and image before resume. After exit, that retained binding and the
+handle's signaled state prove identity without requiring image data to remain
+available. Completion still requires a zero active-job count; unverified
+drainage is an error. A foreground timeout covers communication and owned-job
+drainage, and cancellation remains observable while drainage is pending.
 Linux uses procfs generations and owned process groups; unresolved
 descendant drainage is reported rather than assumed.
 Other process-generation providers are unsupported.
@@ -86,9 +89,11 @@ graceful app-shutdown survival, automatic recovery or notifications after exit.
 Only one inert direct foreground process has been qualified across controlled
 client termination on the tested Windows host. Production trees, graceful
 cleanup, app exit, post-exit streams and remote cancellation remain unqualified.
-One later nested-process matrix stopped on its first failed case. Its evidence
-does not distinguish delayed job accounting from a briefly active descendant,
-and the other three cases did not run.
+One later nested-process matrix stopped on its first failed case because a
+post-exit image query returned WinError 31. Independent handles prove that the
+direct and nested processes exited, but the library did not confirm job
+drainage. The other three cases did not run, and mocked coverage of the repair
+is not native qualification.
 The legacy Pipeline `start` path retains its separate breakaway contract and
 fails before fallback when breakaway is denied.
 

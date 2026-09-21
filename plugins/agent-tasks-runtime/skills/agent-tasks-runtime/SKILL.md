@@ -13,10 +13,12 @@ library for local ownership without changing Conflict's dedicated hosted
 backend. It supplies fresh generation-bound root and child identities,
 file-backed output and canonical terminal results, optional read-only status,
 explicit local cancellation and conservative branch-writer leases. Windows
-completion requires a zero active-job count; job membership and exact process
-handles distinguish a running descendant from terminated accounting residue.
-A foreground timeout covers communication and owned-job drainage, and
-cancellation remains observable while drainage is pending.
+binds the suspended direct child's exact handle, job, generation and image
+before resume. Completion uses that retained binding and the handle's signaled
+state, with unavailable post-exit image data recorded explicitly. A zero
+active-job count is still required. A foreground timeout covers communication
+and owned-job drainage, and cancellation remains observable while drainage is
+pending.
 
 Controllers remain foreground processes. Only the official execution tool may
 detach a root when the user explicitly requests survival beyond client exit.
@@ -41,9 +43,10 @@ first-seen order. Conflicting hashes or observations keep their distinct
 versions and fail finalization; separate unknown task creations remain separate.
 No production lifetime or graceful app-shutdown guarantee follows from the
 single inert Windows controlled-client-exit qualification.
-A later nested-process matrix stopped on its first failed case. The retained
-evidence does not distinguish delayed job accounting from a briefly active
-descendant, and the other three cases remain unrun.
+A later nested-process matrix stopped on its first failed case when a post-exit
+image query returned WinError 31. Independent handles prove that the direct
+and nested processes exited, but the library did not confirm job drainage. The
+other three cases remain unrun, and mocked coverage is not native qualification.
 
 ## Current contracts
 

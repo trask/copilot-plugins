@@ -320,40 +320,121 @@ class WindowsOwner:
             return None
         raise ctypes.WinError(error)
 
-    def process(self, handle, pid: int) -> dict[str, Any]:
+    def _process_running(self, handle) -> bool:
+        import ctypes
+
+        state = self.kernel.WaitForSingleObject(handle, 0)
+        if state == 0:
+            return False
+        if state == 258:
+            return True
+        if state == 0xFFFFFFFF:
+            raise ctypes.WinError(ctypes.get_last_error())
+        raise ExecutionError(f"unexpected Windows process wait state: {state}")
+
+    def process(
+        self, handle, pid: int, binding: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         import ctypes
         from ctypes import wintypes
 
-        member = wintypes.BOOL()
-        if not self.kernel.IsProcessInJob(handle, self.handle, ctypes.byref(member)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        if not member.value:
-            raise ExecutionError("observed process handle is not a member of the owned Windows job")
+        expected = None
+        if binding is None:
+            member = wintypes.BOOL()
+            if not self.kernel.IsProcessInJob(handle, self.handle, ctypes.byref(member)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not member.value:
+                raise ExecutionError(
+                    "observed process handle is not a member of the owned Windows job"
+                )
+            job_provenance = "verified_handle"
+        else:
+            expected = binding.get("identity")
+            if (
+                binding.get("handle") is not handle
+                or not same_process(expected, expected)
+            ):
+                raise ExecutionError("owned Windows process binding is invalid or changed")
+            job_provenance = "cached_binding"
         times = [wintypes.FILETIME() for _ in range(4)]
         if not self.kernel.GetProcessTimes(
             handle, *(ctypes.byref(value) for value in times)
         ):
             raise ctypes.WinError(ctypes.get_last_error())
+        creation_time = str(
+            (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        )
+        if expected is not None and (
+            expected["pid"] != pid or expected["creation_time"] != creation_time
+        ):
+            raise ExecutionError("owned Windows process generation changed")
+        running = self._process_running(handle)
+        if not running:
+            return {
+                "pid": pid,
+                "creation_time": creation_time,
+                "image": expected["image"] if expected is not None else None,
+                "running": False,
+                "job_provenance": job_provenance,
+                "image_provenance": (
+                    "cached_binding"
+                    if expected is not None else
+                    "unavailable_after_exit"
+                ),
+            }
         image = ctypes.create_unicode_buffer(32768)
         size = wintypes.DWORD(len(image))
         if not self.kernel.QueryFullProcessImageNameW(
             handle, 0, image, ctypes.byref(size)
         ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        state = self.kernel.WaitForSingleObject(handle, 0)
-        if state not in (0, 258):
-            raise ctypes.WinError(ctypes.get_last_error())
-        return {
+            image_failure = ctypes.WinError(ctypes.get_last_error())
+            try:
+                running = self._process_running(handle)
+            except (OSError, ExecutionError) as state_failure:
+                raise ExecutionError(
+                    f"{image_failure}; process state query failed: {state_failure}"
+                ) from image_failure
+            if running:
+                raise image_failure
+            return {
+                "pid": pid,
+                "creation_time": creation_time,
+                "image": None,
+                "running": False,
+                "job_provenance": job_provenance,
+                "image_provenance": "unavailable_after_exit",
+            }
+        running = self._process_running(handle)
+        observed = {
             "pid": pid,
-            "creation_time": str(
-                (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
-            ),
+            "creation_time": creation_time,
             "image": os.path.normcase(image.value),
-            "running": state == 258,
+            "running": running,
+            "job_provenance": job_provenance,
+            "image_provenance": "queried_live",
+        }
+        if expected is not None and not same_process(expected, observed):
+            raise ExecutionError("owned Windows process identity changed")
+        return observed
+
+    def bind_process(self, handle, pid: int) -> dict[str, Any]:
+        observed = self.process(handle, pid)
+        if not observed["running"] or observed["image_provenance"] != "queried_live":
+            raise ExecutionError(
+                "owned Windows process exited before live identity binding"
+            )
+        return {
+            "handle": handle,
+            "identity": {
+                key: observed[key]
+                for key in ("pid", "creation_time", "image", "running")
+            },
+            "job_provenance": "verified_live_handle",
+            "image_provenance": "queried_live",
         }
 
     def processes(
-        self, deadline: float, retained: dict[int, Any],
+        self, deadline: float, retained: dict[int, dict[str, Any]],
         check: Callable[[], None] | None = None,
     ) -> list[dict[str, Any]]:
         while True:
@@ -368,8 +449,8 @@ class WindowsOwner:
             failure: BaseException | None = None
             try:
                 for pid in pids:
-                    handle = retained.get(pid)
-                    if handle is None:
+                    binding = retained.get(pid)
+                    if binding is None:
                         handle = self.open_process(pid)
                         if handle is None:
                             failure = ExecutionError(
@@ -377,8 +458,10 @@ class WindowsOwner:
                             )
                             break
                         opened.append(handle)
+                    else:
+                        handle = binding["handle"]
                     try:
-                        observed.append(self.process(handle, pid))
+                        observed.append(self.process(handle, pid, binding))
                     except (OSError, ExecutionError) as inspection:
                         failure = inspection
                         break
@@ -463,11 +546,27 @@ def resume_process(pid: int) -> None:
 
 
 class OwnedProcess:
-    def __init__(self, process: subprocess.Popen[Any], owner: WindowsOwner | None,
-                 record: Path, streams: list[Any]) -> None:
+    def __init__(
+        self, process: subprocess.Popen[Any], owner: WindowsOwner | None,
+        record: Path, streams: list[Any],
+        process_binding: dict[str, Any] | None = None,
+    ) -> None:
         self.process, self.owner, self.record, self.streams = process, owner, record, streams
         self.pid = process.pid
         self.launch_receipt = read(record)
+        if owner is not None:
+            if (
+                process_binding is None
+                or process_binding.get("handle") is not process._handle
+                or not same_process(
+                    self.launch_receipt.get("process_identity", {}),
+                    process_binding.get("identity"),
+                )
+            ):
+                raise ExecutionError("owned Windows process binding is absent or changed")
+        elif process_binding is not None:
+            raise ExecutionError("process binding cannot exist without a Windows owner")
+        self.process_binding = process_binding
         self.exit_code: int | None = None
         self.drained = False
         self.drainage_error: str | None = None
@@ -555,7 +654,9 @@ class OwnedProcess:
             if self.owner:
                 if not self.observation_complete:
                     handle = self.process._handle
-                    direct = self.owner.process(handle, self.pid)
+                    direct = self.owner.process(
+                        handle, self.pid, self.process_binding
+                    )
                     if (
                         not same_process(self.launch_receipt["process_identity"], direct)
                         or direct["running"]
@@ -564,9 +665,13 @@ class OwnedProcess:
                             "owned child generation or exit state changed before job drainage"
                         )
                     processes = (
-                        self.owner.processes(deadline, {self.pid: handle})
+                        self.owner.processes(
+                            deadline, {self.pid: self.process_binding}
+                        )
                         if check is None else
-                        self.owner.processes(deadline, {self.pid: handle}, check)
+                        self.owner.processes(
+                            deadline, {self.pid: self.process_binding}, check
+                        )
                     )
                     self.unexpected_descendants = [
                         item for item in processes
@@ -904,6 +1009,7 @@ class Execution:
             options["start_new_session"] = True
         root = load_handle(self.root)
         owner = None
+        process_binding = None
         process = None
         try:
             with guard(Path(root["cancel"]).with_suffix(".guard")):
@@ -911,7 +1017,12 @@ class Execution:
                 process = subprocess.Popen(command, **options)
                 if IS_WINDOWS:
                     owner = WindowsOwner(process)
-                identity = process_identity(process.pid)
+                    process_binding = owner.bind_process(
+                        process._handle, process.pid
+                    )
+                    identity = dict(process_binding["identity"])
+                else:
+                    identity = process_identity(process.pid)
                 if identity is None:
                     raise ExecutionError("child generation is unavailable")
                 write(record, {
@@ -929,22 +1040,46 @@ class Execution:
                 }, exclusive=True)
                 if IS_WINDOWS:
                     resume_process(process.pid)
-            owned = OwnedProcess(process, owner, record, streams)
+            owned = OwnedProcess(
+                process, owner, record, streams, process_binding
+            )
             self.children.append(owned)
             return owned
         except BaseException as failure:
             cleanup_errors = []
             if owner:
+                cleanup_deadline = time.monotonic() + 10.0
+                owner_terminated = False
                 try:
                     owner.terminate()
-                    owner.drain(time.monotonic() + 10.0)
+                    owner_terminated = True
+                except (OSError, ExecutionError) as cleanup:
+                    cleanup_errors.append(str(cleanup))
+                process_waited = False
+                if process is not None:
+                    try:
+                        if not owner_terminated and process.poll() is None:
+                            process.kill()
+                        process.wait(
+                            timeout=max(0.0, cleanup_deadline - time.monotonic())
+                        )
+                        process_waited = True
+                    except (OSError, subprocess.SubprocessError) as cleanup:
+                        cleanup_errors.append(str(cleanup))
+                    if process_waited:
+                        try:
+                            process._handle.Close()
+                        except OSError as cleanup:
+                            cleanup_errors.append(str(cleanup))
+                try:
+                    owner.drain(cleanup_deadline)
                 except (OSError, ExecutionError) as cleanup:
                     cleanup_errors.append(str(cleanup))
                 try:
                     owner.close()
                 except OSError as cleanup:
                     cleanup_errors.append(str(cleanup))
-            if process is not None:
+            elif process is not None:
                 try:
                     if process.poll() is None:
                         if IS_WINDOWS:
