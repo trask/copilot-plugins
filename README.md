@@ -84,6 +84,9 @@ graceful app-shutdown survival, automatic recovery or notifications after exit.
 Only one inert direct foreground process has been qualified across controlled
 client termination on the tested Windows host. Production trees, graceful
 cleanup, app exit, post-exit streams and remote cancellation remain unqualified.
+One later nested-process matrix stopped on its first failed case. Its evidence
+does not distinguish delayed job accounting from a briefly active descendant,
+and the other three cases did not run.
 The legacy Pipeline `start` path retains its separate breakaway contract and
 fails before fallback when breakaway is denied.
 

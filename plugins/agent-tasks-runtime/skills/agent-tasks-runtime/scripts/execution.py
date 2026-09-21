@@ -25,6 +25,10 @@ class ExecutionError(RuntimeError):
     pass
 
 
+class _OwnershipPending(ExecutionError):
+    pass
+
+
 class Cancelled(BaseException):
     pass
 
@@ -211,6 +215,22 @@ class WindowsOwner:
             wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
         ]
         kernel.QueryInformationJobObject.restype = wintypes.BOOL
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.IsProcessInJob.argtypes = [
+            wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL),
+        ]
+        kernel.IsProcessInJob.restype = wintypes.BOOL
+        kernel.GetProcessTimes.argtypes = [
+            wintypes.HANDLE, *[ctypes.POINTER(wintypes.FILETIME)] * 4,
+        ]
+        kernel.GetProcessTimes.restype = wintypes.BOOL
+        kernel.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel.CloseHandle.restype = wintypes.BOOL
         self.kernel = kernel
@@ -282,34 +302,92 @@ class WindowsOwner:
             if not complete and error != 234:
                 raise ctypes.WinError(error)
             if time.monotonic() >= deadline:
-                raise ExecutionError("owned Windows job process list did not stabilize")
+                raise _OwnershipPending("owned Windows job process list did not stabilize")
             capacity = max(capacity * 2, processes.assigned, processes.listed + 1)
 
-    def processes(self, deadline: float) -> list[dict[str, Any]]:
+    def open_process(self, pid: int):
+        import ctypes
+
+        handle = self.kernel.OpenProcess(0x00101000, False, pid)
+        if handle:
+            return handle
+        error = ctypes.get_last_error()
+        if error == 87:
+            return None
+        raise ctypes.WinError(error)
+
+    def process(self, handle, pid: int) -> dict[str, Any]:
+        import ctypes
+        from ctypes import wintypes
+
+        member = wintypes.BOOL()
+        if not self.kernel.IsProcessInJob(handle, self.handle, ctypes.byref(member)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not member.value:
+            raise ExecutionError("observed process handle is not a member of the owned Windows job")
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not self.kernel.GetProcessTimes(
+            handle, *(ctypes.byref(value) for value in times)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        image = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(image))
+        if not self.kernel.QueryFullProcessImageNameW(
+            handle, 0, image, ctypes.byref(size)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        state = self.kernel.WaitForSingleObject(handle, 0)
+        if state not in (0, 258):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return {
+            "pid": pid,
+            "creation_time": str(
+                (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+            ),
+            "image": os.path.normcase(image.value),
+            "running": state == 258,
+        }
+
+    def processes(self, deadline: float, retained: dict[int, Any]) -> list[dict[str, Any]]:
         while True:
             pids = self.process_ids(deadline)
             observed = []
-            missing = False
-            for pid in pids:
-                identity = process_identity(pid)
-                if identity is None:
-                    missing = True
-                    break
-                observed.append(identity)
-            confirmed = self.process_ids(deadline)
+            opened = []
+            failure: BaseException | None = None
+            try:
+                for pid in pids:
+                    handle = retained.get(pid)
+                    if handle is None:
+                        handle = self.open_process(pid)
+                        if handle is None:
+                            failure = ExecutionError(
+                                "owned Windows job process identity is unavailable"
+                            )
+                            break
+                        opened.append(handle)
+                    try:
+                        observed.append(self.process(handle, pid))
+                    except (OSError, ExecutionError) as inspection:
+                        failure = inspection
+                        break
+                confirmed = self.process_ids(deadline)
+            finally:
+                for handle in opened:
+                    if not self.kernel.CloseHandle(handle):
+                        import ctypes
+                        raise ctypes.WinError(ctypes.get_last_error())
             if confirmed != pids:
                 if time.monotonic() >= deadline:
-                    raise ExecutionError("owned Windows job membership did not stabilize")
+                    raise _OwnershipPending("owned Windows job membership did not stabilize")
                 continue
-            if missing:
-                raise ExecutionError("owned Windows job process identity is unavailable")
+            if failure is not None:
+                raise failure
             return observed
 
-    def drain(self, timeout: float) -> None:
-        deadline = time.monotonic() + timeout
+    def drain(self, deadline: float) -> None:
         while self.active_count():
             if time.monotonic() >= deadline:
-                raise ExecutionError("owned Windows job still has active processes")
+                raise _OwnershipPending("owned Windows job still has active processes")
             time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
 
 
@@ -375,19 +453,26 @@ class OwnedProcess:
         self.completion_error: str | None = None
         self.process_handle_closed = False
         self.stopping = False
+        self.observation_complete = False
+        self.owner_terminated = False
+        self.unexpected_descendants: list[dict[str, Any]] = []
 
     @property
     def returncode(self):
         return self.exit_code if self.exit_code is not None else self.process.returncode
 
     def poll(self):
-        if self.exit_code is not None:
-            return self.wait()
-        code = self.process.poll()
-        if code is None:
-            return None
-        self.exit_code = code
-        return self.wait()
+        if self.exit_code is None:
+            code = self.process.poll()
+            if code is None:
+                return None
+            self.exit_code = code
+        complete = self._complete(time.monotonic(), blocking=False)
+        if complete and self.completion_error is not None:
+            raise ExecutionError(self.completion_error)
+        if complete:
+            self.verify_execution(self.exit_code)
+        return self.exit_code if complete else None
 
     def terminate(self):
         return self.terminate_tree()
@@ -421,34 +506,54 @@ class OwnedProcess:
                 timeout=None if deadline is None else max(0.0, deadline - time.monotonic())
             )
         code = self.exit_code
-        if self.drainage_error is not None:
-            raise ExecutionError(self.drainage_error)
-        if self.completion_error is not None:
-            raise ExecutionError(self.completion_error)
-        if self.drained:
-            self.verify_execution(code)
-            return code
         if deadline is None:
             deadline = time.monotonic() + 10.0
-        unexpected: list[dict[str, Any]] = []
+        self._complete(deadline, blocking=True)
+        if self.completion_error is not None:
+            raise ExecutionError(self.completion_error)
+        self.verify_execution(code)
+        return code
+
+    def _complete(self, deadline: float, *, blocking: bool) -> bool:
+        code = self.exit_code
+        if code is None:
+            return False
+        if self.drainage_error is not None:
+            raise ExecutionError(self.drainage_error)
+        if self.drained:
+            return True
+        release_resources = False
         try:
             if self.owner:
-                processes = self.owner.processes(deadline)
-                direct = next((item for item in processes if item["pid"] == self.pid), None)
-                if direct is not None and not same_process(
-                    self.launch_receipt["process_identity"], direct
-                ):
-                    raise ExecutionError("owned child generation changed before job drainage")
-                unexpected = [
-                    item for item in processes
-                    if item["pid"] != self.pid and item["running"] and not self.stopping
-                ]
-                self.close_process_handle()
-                if unexpected:
+                if not self.observation_complete:
+                    handle = self.process._handle
+                    direct = self.owner.process(handle, self.pid)
+                    if (
+                        not same_process(self.launch_receipt["process_identity"], direct)
+                        or direct["running"]
+                    ):
+                        raise ExecutionError(
+                            "owned child generation or exit state changed before job drainage"
+                        )
+                    processes = self.owner.processes(deadline, {self.pid: handle})
+                    self.unexpected_descendants = [
+                        item for item in processes
+                        if item["pid"] != self.pid and item["running"] and not self.stopping
+                    ]
+                    self.observation_complete = True
+                    self.close_process_handle()
+                if self.unexpected_descendants and self.completion_error is None:
                     self.completion_error = "child exited before a running descendant"
                     self.owner.terminate()
-                self.owner.drain(max(0.0, deadline - time.monotonic()))
-                if unexpected:
+                    self.owner_terminated = True
+                if blocking:
+                    self.owner.drain(deadline)
+                elif self.owner.active_count():
+                    self._write_pending(code)
+                    return False
+                if self.unexpected_descendants and not self.completion_error.endswith(
+                    "; the owned job was drained"
+                ):
                     self.completion_error += "; the owned job was drained"
             elif not IS_WINDOWS:
                 try:
@@ -458,15 +563,22 @@ class OwnedProcess:
                 else:
                     raise ExecutionError("owned process group still has active descendants")
             self.drained = True
+            release_resources = True
             result = {**read(self.record), "exit_code": code, "local_drained": True}
             if self.completion_error is not None:
                 result.update(
                     completion_error=self.completion_error,
-                    unexpected_descendants=unexpected,
+                    unexpected_descendants=self.unexpected_descendants,
                 )
             write(self.record, result)
+        except _OwnershipPending as pending:
+            self._write_pending(code)
+            if blocking:
+                raise subprocess.TimeoutExpired(self.process.args, 0) from pending
+            return False
         except (OSError, subprocess.SubprocessError, ExecutionError) as failure:
             self.drained = False
+            release_resources = True
             message = str(failure)
             if self.completion_error is not None:
                 message = f"{self.completion_error}; local drainage: {message}"
@@ -481,7 +593,7 @@ class OwnedProcess:
                     **(
                         {
                             "completion_error": self.completion_error,
-                            "unexpected_descendants": unexpected,
+                            "unexpected_descendants": self.unexpected_descendants,
                         }
                         if self.completion_error is not None else {}
                     ),
@@ -489,18 +601,25 @@ class OwnedProcess:
             )
             raise ExecutionError(message) from failure
         finally:
-            if self.owner:
+            if release_resources and self.owner:
                 if self.exit_code is not None:
                     self.close_process_handle()
                 self.owner.close()
                 self.owner = None
-            for stream in self.streams:
-                stream.close()
-            self.streams.clear()
+            if release_resources:
+                for stream in self.streams:
+                    stream.close()
+                self.streams.clear()
+        return True
+
+    def _write_pending(self, code: int) -> None:
+        result = {**read(self.record), "exit_code": code, "local_drained": False}
         if self.completion_error is not None:
-            raise ExecutionError(self.completion_error)
-        self.verify_execution(code)
-        return code
+            result.update(
+                completion_error=self.completion_error,
+                unexpected_descendants=self.unexpected_descendants,
+            )
+        write(self.record, result)
 
     def terminate_tree(self, timeout=10.0):
         if self.drained:
@@ -508,7 +627,9 @@ class OwnedProcess:
         deadline = time.monotonic() + timeout
         self.stopping = True
         if self.owner:
-            self.owner.terminate()
+            if not self.owner_terminated:
+                self.owner.terminate()
+                self.owner_terminated = True
         elif not IS_WINDOWS:
             require_owner(self.launch_receipt["process_identity"])
             try:
@@ -525,7 +646,7 @@ class OwnedProcess:
                     os.killpg(self.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-            else:
+            elif self.owner is None:
                 self.process.kill()
             return self._wait(deadline)
 
@@ -781,7 +902,7 @@ class Execution:
             if owner:
                 try:
                     owner.terminate()
-                    owner.drain(10.0)
+                    owner.drain(time.monotonic() + 10.0)
                 except (OSError, ExecutionError) as cleanup:
                     cleanup_errors.append(str(cleanup))
                 try:
@@ -894,14 +1015,31 @@ class Execution:
         ]
         child_errors = []
         for child in self.children:
+            poll_failed = False
             try:
-                if child.poll() is None:
-                    child.terminate_tree()
-                    if not cancelled:
-                        drainage_errors.append("controller returned with a running child")
+                try:
+                    state = child.poll()
+                except (OSError, subprocess.SubprocessError, ExecutionError):
+                    poll_failed = True
+                    raise
+                if state is None:
+                    if child.exit_code is None:
+                        child.terminate_tree()
+                        if not cancelled:
+                            drainage_errors.append("controller returned with a running child")
+                    else:
+                        child.wait()
                 else:
                     child.wait()
             except (OSError, subprocess.SubprocessError, ExecutionError) as failure:
+                if (
+                    poll_failed and child.exit_code is not None
+                    and not child.drained and child.owner is not None
+                ):
+                    try:
+                        child.wait()
+                    except (OSError, subprocess.SubprocessError, ExecutionError) as cleanup:
+                        failure = cleanup
                 if (
                     getattr(child, "drained", False) is True
                     and getattr(child, "completion_error", None) == str(failure)

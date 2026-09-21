@@ -243,6 +243,7 @@ class ExecutionTest(unittest.TestCase):
         process.poll.return_value = None
         process.wait.return_value = 0
         owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
         owner.processes.return_value = []
         with (
             mock.patch.object(EXECUTION, "IS_WINDOWS", True),
@@ -266,8 +267,9 @@ class ExecutionTest(unittest.TestCase):
         process = mock.Mock(pid=123)
         process.wait.return_value = 0
         owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
         events = []
-        owner.processes.side_effect = lambda _deadline: (
+        owner.processes.side_effect = lambda _deadline, _retained: (
             events.append("observe") or [{**IDENTITY, "running": False}]
         )
         process._handle.Close.side_effect = lambda: events.append("close")
@@ -290,6 +292,7 @@ class ExecutionTest(unittest.TestCase):
         process = mock.Mock(pid=123)
         process.wait.return_value = 0
         owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
         owner.processes.return_value = [
             {**IDENTITY, "running": False},
             {"pid": 456, "creation_time": "789", "image": "nested.exe", "running": False},
@@ -313,6 +316,7 @@ class ExecutionTest(unittest.TestCase):
             "pid": 456, "creation_time": "789", "image": "nested.exe", "running": True,
         }
         owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
         owner.processes.return_value = [{**IDENTITY, "running": False}, descendant]
         child = EXECUTION.OwnedProcess(process, owner, record, [])
         context.children.append(child)
@@ -339,6 +343,60 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual("retained", result["writer_ownership"])
         self.assertTrue(result["remote_work_may_continue"])
 
+    def test_finalization_drains_poll_detected_descendant_and_retains_ownership(self):
+        context = self.context()
+        context.emit({"result": "complete"})
+        record = context.directory / "child-test.json"
+        EXECUTION.write(record, {"process_identity": IDENTITY, "local_drained": False})
+        process = mock.Mock(pid=123)
+        process.poll.return_value = 0
+        descendant = {
+            "pid": 456, "creation_time": "789", "image": "nested.exe", "running": True,
+        }
+        owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
+        owner.processes.return_value = [{**IDENTITY, "running": False}, descendant]
+        owner.active_count.return_value = 1
+        child = EXECUTION.OwnedProcess(process, owner, record, [])
+        context.children.append(child)
+
+        result = context.finish(0)
+
+        message = "child exited before a running descendant; the owned job was drained"
+        owner.terminate.assert_called_once()
+        owner.drain.assert_called_once()
+        self.assertTrue(child.drained)
+        self.assertEqual(message, child.completion_error)
+        self.assertEqual("failed", result["local_status"])
+        self.assertTrue(result["local_children_drained"])
+        self.assertIn(message, result["finalization_errors"])
+        self.assertEqual("retained", result["writer_ownership"])
+        self.assertTrue(result["remote_work_may_continue"])
+
+    def test_finalization_waits_for_poll_pending_accounting_without_cancelling(self):
+        context = self.context()
+        context.emit({"result": "complete"})
+        record = context.directory / "child-test.json"
+        EXECUTION.write(record, {"process_identity": IDENTITY, "local_drained": False})
+        process = mock.Mock(pid=123)
+        process.poll.return_value = 0
+        owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
+        owner.processes.return_value = [{**IDENTITY, "running": False}]
+        owner.active_count.return_value = 1
+        child = EXECUTION.OwnedProcess(process, owner, record, [])
+        context.children.append(child)
+
+        result = context.finish(0)
+
+        owner.terminate.assert_not_called()
+        owner.drain.assert_called_once()
+        self.assertTrue(child.drained)
+        self.assertEqual("finished", result["local_status"])
+        self.assertTrue(result["local_children_drained"])
+        self.assertEqual("released", result["writer_ownership"])
+        self.assertFalse(result["remote_work_may_continue"])
+
     def test_running_descendant_preserves_failure_when_cleanup_does_not_drain(self):
         context = self.context()
         record = context.directory / "child-test.json"
@@ -349,6 +407,7 @@ class ExecutionTest(unittest.TestCase):
             "pid": 456, "creation_time": "789", "image": "nested.exe", "running": True,
         }
         owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
         owner.processes.return_value = [{**IDENTITY, "running": False}, descendant]
         owner.drain.side_effect = EXECUTION.ExecutionError("descendants remain")
         child = EXECUTION.OwnedProcess(process, owner, record, [])
@@ -379,6 +438,7 @@ class ExecutionTest(unittest.TestCase):
         process = mock.Mock(pid=123)
         process.wait.return_value = 0
         owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
         owner.processes.side_effect = EXECUTION.ExecutionError("job observation failed")
         child = EXECUTION.OwnedProcess(process, owner, record, [])
 
@@ -391,6 +451,28 @@ class ExecutionTest(unittest.TestCase):
         self.assertFalse(child.drained)
         self.assertFalse(EXECUTION.read(record)["local_drained"])
 
+    def test_windows_direct_handle_must_remain_bound_to_the_owned_job(self):
+        context = self.context()
+        record = context.directory / "child-test.json"
+        EXECUTION.write(record, {"process_identity": IDENTITY, "local_drained": False})
+        process = mock.Mock(pid=123)
+        process.wait.return_value = 0
+        owner = mock.Mock()
+        owner.process.side_effect = EXECUTION.ExecutionError(
+            "observed process handle is not a member of the owned Windows job"
+        )
+        child = EXECUTION.OwnedProcess(process, owner, record, [])
+
+        with self.assertRaisesRegex(EXECUTION.ExecutionError, "not a member"):
+            child.wait()
+        with self.assertRaisesRegex(EXECUTION.ExecutionError, "not a member"):
+            child.poll()
+
+        owner.process.assert_called_once_with(process._handle, 123)
+        owner.processes.assert_not_called()
+        self.assertFalse(child.drained)
+        self.assertFalse(EXECUTION.read(record)["local_drained"])
+
     def test_windows_wait_and_drain_share_one_deadline(self):
         context = self.context()
         record = context.directory / "child-test.json"
@@ -398,15 +480,90 @@ class ExecutionTest(unittest.TestCase):
         process = mock.Mock(pid=123)
         process.wait.return_value = 0
         owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
         owner.processes.return_value = []
         child = EXECUTION.OwnedProcess(process, owner, record, [])
 
-        with mock.patch.object(EXECUTION.time, "monotonic", side_effect=[100.0, 102.0, 103.0]):
+        with mock.patch.object(EXECUTION.time, "monotonic", side_effect=[100.0, 102.0]):
             self.assertEqual(0, child.wait(timeout=10.0))
 
         self.assertEqual(8.0, process.wait.call_args.kwargs["timeout"])
-        owner.processes.assert_called_once_with(110.0)
-        owner.drain.assert_called_once_with(7.0)
+        owner.processes.assert_called_once_with(110.0, {123: process._handle})
+        owner.drain.assert_called_once_with(110.0)
+
+    def test_windows_poll_keeps_ownership_while_accounting_is_pending(self):
+        context = self.context()
+        record = context.directory / "child-test.json"
+        EXECUTION.write(record, {"process_identity": IDENTITY, "local_drained": False})
+        process = mock.Mock(pid=123)
+        process.poll.return_value = 0
+        owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
+        owner.processes.return_value = [{**IDENTITY, "running": False}]
+        owner.active_count.side_effect = [1, 0]
+        child = EXECUTION.OwnedProcess(process, owner, record, [])
+
+        self.assertIsNone(child.poll())
+        owner.drain.assert_not_called()
+        owner.close.assert_not_called()
+        self.assertIs(owner, child.owner)
+        self.assertFalse(child.drained)
+        self.assertFalse(EXECUTION.read(record)["local_drained"])
+
+        self.assertEqual(0, child.poll())
+        owner.drain.assert_not_called()
+        owner.close.assert_called_once()
+        self.assertTrue(child.drained)
+
+    def test_windows_poll_does_not_turn_truncated_membership_into_failure(self):
+        context = self.context()
+        record = context.directory / "child-test.json"
+        EXECUTION.write(record, {"process_identity": IDENTITY, "local_drained": False})
+        process = mock.Mock(pid=123)
+        process.poll.return_value = 0
+        owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
+        owner.processes.side_effect = EXECUTION._OwnershipPending("snapshot truncated")
+        child = EXECUTION.OwnedProcess(process, owner, record, [])
+
+        self.assertIsNone(child.poll())
+
+        self.assertIsNone(child.drainage_error)
+        self.assertIs(owner, child.owner)
+        self.assertFalse(child.process_handle_closed)
+        owner.close.assert_not_called()
+
+    def test_windows_zero_timeout_keeps_pending_job_for_repeated_wait(self):
+        context = self.context()
+        record = context.directory / "child-test.json"
+        EXECUTION.write(record, {"process_identity": IDENTITY, "local_drained": False})
+        process = mock.Mock(pid=123, args=["python"])
+        process.wait.return_value = 0
+        owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
+        owner.processes.return_value = [{**IDENTITY, "running": False}]
+        owner.drain.side_effect = [
+            EXECUTION._OwnershipPending("accounting pending"),
+            None,
+        ]
+        child = EXECUTION.OwnedProcess(process, owner, record, [])
+
+        with mock.patch.object(EXECUTION.time, "monotonic", side_effect=[10.0, 10.0]):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                child.wait(timeout=0)
+
+        self.assertIs(owner, child.owner)
+        self.assertFalse(child.drained)
+        self.assertIsNone(child.drainage_error)
+        owner.close.assert_not_called()
+
+        with mock.patch.object(EXECUTION.time, "monotonic", side_effect=[20.0]):
+            self.assertEqual(0, child.wait(timeout=1))
+        self.assertTrue(child.drained)
+        self.assertEqual(
+            [mock.call(10.0), mock.call(21.0)],
+            owner.drain.call_args_list,
+        )
 
     def test_windows_timeout_cleanup_does_not_reset_deadline(self):
         context = self.context()
@@ -418,13 +575,14 @@ class ExecutionTest(unittest.TestCase):
             1,
         ]
         owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
         owner.processes.return_value = []
         child = EXECUTION.OwnedProcess(process, owner, record, [])
 
         with mock.patch.object(
             EXECUTION.time,
             "monotonic",
-            side_effect=[100.0, 103.0, 109.0, 109.5],
+            side_effect=[100.0, 103.0, 109.0],
         ):
             self.assertEqual(1, child.terminate_tree(timeout=10.0))
 
@@ -432,37 +590,132 @@ class ExecutionTest(unittest.TestCase):
             [mock.call(timeout=7.0), mock.call(timeout=1.0)],
             process.wait.call_args_list,
         )
-        process.kill.assert_called_once()
-        owner.drain.assert_called_once_with(0.5)
+        process.kill.assert_not_called()
+        owner.drain.assert_called_once_with(110.0)
 
-    def test_windows_process_observation_retries_changed_membership(self):
+    def test_windows_process_observation_retries_vanished_member(self):
         owner = object.__new__(EXECUTION.WindowsOwner)
         owner.process_ids = mock.Mock(
             side_effect=[(123, 456), (123,), (123,), (123,)]
         )
+        owner.open_process = mock.Mock(return_value=None)
+        owner.process = mock.Mock(return_value={**IDENTITY, "running": False})
+        owner.kernel = types.SimpleNamespace(CloseHandle=mock.Mock(return_value=True))
 
-        def identity(pid):
-            if pid == 456:
-                return None
-            return {**IDENTITY, "running": False}
-
-        with mock.patch.object(EXECUTION, "process_identity", side_effect=identity):
-            self.assertEqual(
-                [{**IDENTITY, "running": False}],
-                owner.processes(EXECUTION.time.monotonic() + 1.0),
-            )
+        self.assertEqual(
+            [{**IDENTITY, "running": False}],
+            owner.processes(EXECUTION.time.monotonic() + 1.0, {123: 1230}),
+        )
+        owner.kernel.CloseHandle.assert_not_called()
 
     def test_windows_process_observation_rejects_stable_missing_identity(self):
         owner = object.__new__(EXECUTION.WindowsOwner)
-        owner.process_ids = mock.Mock(return_value=(456,))
-        with (
-            mock.patch.object(EXECUTION, "process_identity", return_value=None),
-            self.assertRaisesRegex(
-                EXECUTION.ExecutionError,
-                "owned Windows job process identity is unavailable",
-            ),
+        owner.process_ids = mock.Mock(side_effect=[(456,), (456,)])
+        owner.open_process = mock.Mock(return_value=None)
+        owner.kernel = types.SimpleNamespace(CloseHandle=mock.Mock(return_value=True))
+        with self.assertRaisesRegex(
+            EXECUTION.ExecutionError,
+            "owned Windows job process identity is unavailable",
         ):
-            owner.processes(EXECUTION.time.monotonic() + 1.0)
+            owner.processes(EXECUTION.time.monotonic() + 1.0, {})
+
+    def test_windows_process_observation_rejects_stable_nonmember_generation(self):
+        owner = object.__new__(EXECUTION.WindowsOwner)
+        owner.process_ids = mock.Mock(side_effect=[(456,), (456,)])
+        owner.open_process = mock.Mock(return_value=4560)
+        owner.process = mock.Mock(
+            side_effect=EXECUTION.ExecutionError(
+                "observed process handle is not a member of the owned Windows job"
+            )
+        )
+        owner.kernel = types.SimpleNamespace(CloseHandle=mock.Mock(return_value=True))
+
+        with self.assertRaisesRegex(EXECUTION.ExecutionError, "not a member"):
+            owner.processes(EXECUTION.time.monotonic() + 1.0, {})
+
+        owner.kernel.CloseHandle.assert_called_once_with(4560)
+
+    def test_windows_process_observation_closes_handle_after_query_failure(self):
+        owner = object.__new__(EXECUTION.WindowsOwner)
+        owner.process_ids = mock.Mock(side_effect=[(456,), (456,)])
+        owner.open_process = mock.Mock(return_value=4560)
+        owner.process = mock.Mock(side_effect=OSError("membership query denied"))
+        owner.kernel = types.SimpleNamespace(CloseHandle=mock.Mock(return_value=True))
+
+        with self.assertRaisesRegex(OSError, "membership query denied"):
+            owner.processes(EXECUTION.time.monotonic() + 1.0, {})
+
+        owner.kernel.CloseHandle.assert_called_once_with(4560)
+
+    def test_windows_process_identity_comes_from_handle_bound_to_exact_job(self):
+        owner = object.__new__(EXECUTION.WindowsOwner)
+        owner.handle = 900
+        calls = []
+
+        def is_process_in_job(handle, job, member):
+            calls.append(("member", handle, job))
+            member._obj.value = 1
+            return True
+
+        def get_process_times(handle, creation, _exit, _kernel, _user):
+            calls.append(("times", handle))
+            creation._obj.dwHighDateTime = 1
+            creation._obj.dwLowDateTime = 2
+            return True
+
+        def query_image(handle, _flags, image, _size):
+            calls.append(("image", handle))
+            image.value = "C:\\Python\\python.exe"
+            return True
+
+        def wait(handle, timeout):
+            calls.append(("wait", handle, timeout))
+            return 0
+
+        owner.kernel = types.SimpleNamespace(
+            IsProcessInJob=is_process_in_job,
+            GetProcessTimes=get_process_times,
+            QueryFullProcessImageNameW=query_image,
+            WaitForSingleObject=wait,
+        )
+
+        self.assertEqual(
+            {
+                "pid": 456,
+                "creation_time": str((1 << 32) | 2),
+                "image": EXECUTION.os.path.normcase("C:\\Python\\python.exe"),
+                "running": False,
+            },
+            owner.process(4560, 456),
+        )
+        self.assertEqual(
+            [
+                ("member", 4560, 900),
+                ("times", 4560),
+                ("image", 4560),
+                ("wait", 4560, 0),
+            ],
+            calls,
+        )
+
+    def test_windows_process_identity_rejects_nonmember_before_identity_queries(self):
+        owner = object.__new__(EXECUTION.WindowsOwner)
+        owner.handle = 900
+        identity_query = mock.Mock()
+
+        def is_process_in_job(_handle, _job, member):
+            member._obj.value = 0
+            return True
+
+        owner.kernel = types.SimpleNamespace(
+            IsProcessInJob=is_process_in_job,
+            GetProcessTimes=identity_query,
+        )
+
+        with self.assertRaisesRegex(EXECUTION.ExecutionError, "not a member"):
+            owner.process(4560, 456)
+
+        identity_query.assert_not_called()
 
     def test_windows_process_list_retries_until_complete(self):
         owner = object.__new__(EXECUTION.WindowsOwner)
@@ -497,7 +750,7 @@ class ExecutionTest(unittest.TestCase):
         with (
             mock.patch.object(EXECUTION.time, "monotonic", return_value=2.0),
             self.assertRaisesRegex(
-                EXECUTION.ExecutionError,
+                EXECUTION._OwnershipPending,
                 "owned Windows job process list did not stabilize",
             ),
         ):
@@ -513,6 +766,7 @@ class ExecutionTest(unittest.TestCase):
             "pid": 456, "creation_time": "789", "image": "nested.exe", "running": True,
         }
         owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
         owner.processes.return_value = [{**IDENTITY, "running": False}, descendant]
         child = EXECUTION.OwnedProcess(process, owner, record, [])
 
@@ -531,6 +785,7 @@ class ExecutionTest(unittest.TestCase):
         process = mock.Mock(pid=123)
         process.wait.return_value = 0
         owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
         owner.processes.return_value = []
         owner.drain.side_effect = EXECUTION.ExecutionError("descendants remain")
         child = EXECUTION.OwnedProcess(process, owner, record, [])

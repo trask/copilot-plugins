@@ -46,7 +46,7 @@ GITHUB_PR_DIFF = "github_pr_diff"
 CUMULATIVE_GIT_DIFF = "cumulative_git_diff"
 BARE_TARGET_PATTERN = re.compile(r"^#?(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "414c2e5b009ede125d1d57467c8ad04691bfe788200c324d8d18e1e0c954022c"
+    "35f94fcfd6d154615a27ec48e7e5f8bf18aff77622ac5796a72c2d88ece1724a"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -4083,7 +4083,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "published",
     "nothing_to_publish",
 })
-EXECUTION_SHA256 = "3149f1cf5b5e87ea4e10cd418d0c63a0e5102ff576df9f9909b048c185200631"
+EXECUTION_SHA256 = "936c6e656ddf30331de8bcca09ca31c8fec792f89095e12241b47b3d07d845ec"
 
 
 def _load_execution():

@@ -39,6 +39,9 @@ first-seen order. Conflicting hashes or observations keep their distinct
 versions and fail finalization; separate unknown task creations remain separate.
 No production lifetime or graceful app-shutdown guarantee follows from the
 single inert Windows controlled-client-exit qualification.
+A later nested-process matrix stopped on its first failed case. The retained
+evidence does not distinguish delayed job accounting from a briefly active
+descendant, and the other three cases remain unrun.
 
 ## Current contracts
 
