@@ -1180,7 +1180,13 @@ class ExecutionTest(unittest.TestCase):
             return True
 
         owner.kernel = types.SimpleNamespace(QueryInformationJobObject=query)
-        self.assertEqual(tuple(range(1, 10)), owner.process_ids(EXECUTION.time.monotonic() + 1.0))
+        with mock.patch.object(
+            ctypes, "get_last_error", return_value=0, create=True
+        ):
+            self.assertEqual(
+                tuple(range(1, 10)),
+                owner.process_ids(EXECUTION.time.monotonic() + 1.0),
+            )
         self.assertEqual([8, 16], calls)
 
     def test_windows_process_list_timeout_never_accepts_partial_membership(self):
@@ -1195,6 +1201,9 @@ class ExecutionTest(unittest.TestCase):
 
         owner.kernel = types.SimpleNamespace(QueryInformationJobObject=query)
         with (
+            mock.patch.object(
+                ctypes, "get_last_error", return_value=0, create=True
+            ),
             mock.patch.object(EXECUTION.time, "monotonic", return_value=2.0),
             self.assertRaisesRegex(
                 EXECUTION._OwnershipPending,
