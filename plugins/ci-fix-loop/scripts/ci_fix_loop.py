@@ -207,7 +207,7 @@ PROPAGATION_CONTAINMENT_RETRY_DELAYS = (1, 2, 4)
 EMPTY_RERUN_COMMIT_MESSAGE = "ci: rerun checks"
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "5f941bbf0443659d6b91e1259841025c0e98c5fad03b735318f90816baa0e08b"
+    "cdfa44334fab70c405fd22d3dbd0842f5c8e2fd0ee6ea438822aa620a6c118df"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -14515,7 +14515,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "sealed_ci_fix_completed",
     "complete",
 })
-EXECUTION_SHA256 = "1abed8d051205ea4bcd8d630c7b06a97ad7ca753fc5400fa4a03dbd2a3ea18ae"
+EXECUTION_SHA256 = "248cc03692aaa456618a666e859c7decb8053363349fbaa46cfcc568e9142a6e"
 EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
 
 

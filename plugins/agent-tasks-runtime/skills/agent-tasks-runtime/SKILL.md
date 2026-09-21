@@ -21,10 +21,11 @@ process while completion remains pending. Success requires complete verified
 membership and a zero active-job count within the original deadline. Forced or
 unverified drainage remains a failed operation even when cleanup later reaches
 zero. If opening an enumerated member races with its exit, Runtime retries only
-after a second Job Object snapshot proves that membership changed; a stable
-denial remains a failed operation. A foreground timeout covers communication
-and owned-job drainage, and cancellation remains observable while drainage is
-pending.
+after a second Job Object snapshot proves that membership changed. A live image
+query may be retried on the same generation-bound handle only while repeated
+Job Object snapshots prove exact stable membership; persistent denial remains a
+failed operation. A foreground timeout covers communication and owned-job
+drainage, and cancellation remains observable while drainage is pending.
 
 Controllers remain foreground processes. Only the official execution tool may
 detach a root when the user explicitly requests survival beyond client exit.

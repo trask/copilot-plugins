@@ -86,7 +86,9 @@ Success still requires complete verified membership and a zero active-job count
 within the original deadline. Unverified or forced drainage is an operation
 failure even when cleanup later proves that the job reached zero. An open
 failure for an enumerated member is retried only when a second Job Object
-snapshot proves that membership changed; a stable denial remains a failure. A
+snapshot proves that membership changed. A live image query may be retried on
+the same generation-bound handle only while repeated Job Object snapshots
+prove exact stable membership; persistent denial remains a failure. A
 foreground timeout covers communication and owned-job drainage, and
 cancellation remains observable while drainage is pending.
 Linux uses procfs generations and owned process groups; unresolved

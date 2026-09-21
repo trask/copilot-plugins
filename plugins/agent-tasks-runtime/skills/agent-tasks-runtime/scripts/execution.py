@@ -115,6 +115,7 @@ def _windows_process_running(kernel: Any, handle: Any) -> bool:
 def _windows_process_observation(
     kernel: Any, handle: Any, pid: int,
     expected: dict[str, Any] | None = None,
+    retry_image: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     import ctypes
     from ctypes import wintypes
@@ -144,11 +145,13 @@ def _windows_process_observation(
                 "unavailable_after_exit"
             ),
         }
-    image = ctypes.create_unicode_buffer(32768)
-    size = wintypes.DWORD(len(image))
-    if not kernel.QueryFullProcessImageNameW(
-        handle, 0, image, ctypes.byref(size)
-    ):
+    while True:
+        image = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(image))
+        if kernel.QueryFullProcessImageNameW(
+            handle, 0, image, ctypes.byref(size)
+        ):
+            break
         image_failure = ctypes.WinError(ctypes.get_last_error())
         try:
             running = _windows_process_running(kernel, handle)
@@ -157,6 +160,12 @@ def _windows_process_observation(
                 f"{image_failure}; process state query failed: {state_failure}"
             ) from image_failure
         if running:
+            if (
+                getattr(image_failure, "winerror", None) == 5
+                and retry_image is not None
+                and retry_image()
+            ):
+                continue
             raise image_failure
         return {
             "pid": pid,
@@ -391,7 +400,8 @@ class WindowsOwner:
         raise ctypes.WinError(error)
 
     def process(
-        self, handle, pid: int, binding: dict[str, Any] | None = None
+        self, handle, pid: int, binding: dict[str, Any] | None = None,
+        *, retry_image: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         import ctypes
         from ctypes import wintypes
@@ -420,7 +430,7 @@ class WindowsOwner:
                 raise ExecutionError("owned Windows process binding is invalid or changed")
             job_provenance = "cached_binding"
         observed = _windows_process_observation(
-            self.kernel, handle, pid, expected
+            self.kernel, handle, pid, expected, retry_image
         )
         observed["job_provenance"] = job_provenance
         return observed
@@ -447,13 +457,26 @@ class WindowsOwner:
         self, deadline: float, retained: dict[int, dict[str, Any]],
         check: Callable[[], None] | None = None,
     ) -> list[dict[str, Any]]:
-        while True:
-            if check is not None:
-                check()
-            pids = (
+        def snapshot() -> tuple[int, ...]:
+            return (
                 self.process_ids(deadline)
                 if check is None else self.process_ids(deadline, check)
             )
+
+        while True:
+            if check is not None:
+                check()
+            pids = snapshot()
+
+            def retry_image() -> bool:
+                if snapshot() != pids:
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                time.sleep(min(0.02, remaining))
+                return True
+
             observed = []
             opened = []
             failure: BaseException | None = None
@@ -475,14 +498,15 @@ class WindowsOwner:
                     else:
                         handle = binding["handle"]
                     try:
-                        observed.append(self.process(handle, pid, binding))
+                        observed.append(
+                            self.process(
+                                handle, pid, binding, retry_image=retry_image
+                            )
+                        )
                     except (OSError, ExecutionError) as inspection:
                         failure = inspection
                         break
-                confirmed = (
-                    self.process_ids(deadline)
-                    if check is None else self.process_ids(deadline, check)
-                )
+                confirmed = snapshot()
             finally:
                 for handle in opened:
                     if not self.kernel.CloseHandle(handle):

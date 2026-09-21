@@ -62,7 +62,7 @@ The artifact also binds:
 
 The coordinator checks the package and live identities twice before the loop. It starts no work if either pass differs. Within the invocation, its private state may retain the current iteration and budget. A crash or lost invocation is abandoned. No later invocation may resume, recover, import, or supersede it.
 
-Every hosted worker uses `gpt-5.6-sol` and `marketplace-agent-code-candidate-worker@1`. It may create zero or more linear code commits, then one optional path-only output commit under `.github/agent-task-output/`. Runtime 1.0.23 returns `github.copilot.agent-task-result` version 5 and candidate manifest version 1. The coordinator re-derives every commit parent, tree, patch digest, and changed path from fetched Git history. It imports only the manifest's code tip, never the output commit.
+Every hosted worker uses `gpt-5.6-sol` and `marketplace-agent-code-candidate-worker@1`. It may create zero or more linear code commits, then one optional path-only output commit under `.github/agent-task-output/`. Runtime 1.0.24 returns `github.copilot.agent-task-result` version 5 and candidate manifest version 1. The coordinator re-derives every commit parent, tree, patch digest, and changed path from fetched Git history. It imports only the manifest's code tip, never the output commit.
 
 If the same source ref advances after dispatch, the verified candidate is retained as `superseded`, the started iteration remains charged, and it is never imported or reused. The loop advances only through its remaining fixed allowance and otherwise reports an incomplete outcome.
 

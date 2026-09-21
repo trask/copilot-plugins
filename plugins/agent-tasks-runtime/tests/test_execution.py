@@ -871,6 +871,113 @@ class ExecutionTest(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError, "Access is denied"):
             owner.processes(EXECUTION.time.monotonic() + 1.0, {})
 
+    def test_windows_process_observation_retries_live_image_denial(self):
+        owner = object.__new__(EXECUTION.WindowsOwner)
+        owner.handle = 900
+        owner.process_ids = mock.Mock(side_effect=[(456,), (456,), (456,)])
+        owner.open_process = mock.Mock(return_value=4560)
+
+        def is_process_in_job(_handle, _job, member):
+            member._obj.value = 1
+            return True
+
+        def get_process_times(_handle, creation, _exit, _kernel, _user):
+            creation._obj.dwHighDateTime = 1
+            creation._obj.dwLowDateTime = 2
+            return True
+
+        def query_image(_handle, _flags, image, _size):
+            if owner.kernel.QueryFullProcessImageNameW.call_count == 2:
+                image.value = "C:\\Python\\python.exe"
+                return True
+            return False
+
+        owner.kernel = types.SimpleNamespace(
+            IsProcessInJob=mock.Mock(side_effect=is_process_in_job),
+            GetProcessTimes=mock.Mock(side_effect=get_process_times),
+            QueryFullProcessImageNameW=mock.Mock(side_effect=query_image),
+            WaitForSingleObject=mock.Mock(side_effect=[258, 258, 258]),
+            CloseHandle=mock.Mock(return_value=True),
+        )
+        image_failure = PermissionError(5, "Access is denied")
+        image_failure.winerror = 5
+        with (
+            mock.patch.object(
+                ctypes, "get_last_error", return_value=5, create=True
+            ),
+            mock.patch.object(
+                ctypes, "WinError", return_value=image_failure, create=True
+            ),
+            mock.patch.object(EXECUTION.time, "sleep"),
+        ):
+            self.assertEqual(
+                [
+                    {
+                        "pid": 456,
+                        "creation_time": str((1 << 32) | 2),
+                        "image": EXECUTION.os.path.normcase(
+                            "C:\\Python\\python.exe"
+                        ),
+                        "running": True,
+                        "job_provenance": "verified_handle",
+                        "image_provenance": "queried_live",
+                    }
+                ],
+                owner.processes(EXECUTION.time.monotonic() + 1.0, {}),
+            )
+
+        owner.kernel.IsProcessInJob.assert_called_once()
+        owner.kernel.GetProcessTimes.assert_called_once()
+        owner.kernel.QueryFullProcessImageNameW.assert_called()
+        self.assertEqual(2, owner.kernel.QueryFullProcessImageNameW.call_count)
+        owner.kernel.CloseHandle.assert_called_once_with(4560)
+
+    def test_windows_process_observation_rejects_persistent_live_image_denial(self):
+        owner = object.__new__(EXECUTION.WindowsOwner)
+        owner.handle = 900
+        owner.process_ids = mock.Mock(
+            side_effect=[(456,), (456,), (456,), (456,)]
+        )
+        owner.open_process = mock.Mock(return_value=4560)
+
+        def is_process_in_job(_handle, _job, member):
+            member._obj.value = 1
+            return True
+
+        def get_process_times(_handle, creation, _exit, _kernel, _user):
+            creation._obj.dwHighDateTime = 1
+            creation._obj.dwLowDateTime = 2
+            return True
+
+        owner.kernel = types.SimpleNamespace(
+            IsProcessInJob=mock.Mock(side_effect=is_process_in_job),
+            GetProcessTimes=mock.Mock(side_effect=get_process_times),
+            QueryFullProcessImageNameW=mock.Mock(return_value=False),
+            WaitForSingleObject=mock.Mock(side_effect=[258, 258, 258]),
+            CloseHandle=mock.Mock(return_value=True),
+        )
+        image_failure = PermissionError(5, "Access is denied")
+        image_failure.winerror = 5
+        with (
+            mock.patch.object(
+                ctypes, "get_last_error", return_value=5, create=True
+            ),
+            mock.patch.object(
+                ctypes, "WinError", return_value=image_failure, create=True
+            ),
+            mock.patch.object(
+                EXECUTION.time, "monotonic", side_effect=[0.0, 1.0]
+            ),
+            mock.patch.object(EXECUTION.time, "sleep"),
+            self.assertRaisesRegex(PermissionError, "Access is denied"),
+        ):
+            owner.processes(0.5, {})
+
+        owner.kernel.IsProcessInJob.assert_called_once()
+        owner.kernel.GetProcessTimes.assert_called_once()
+        self.assertEqual(2, owner.kernel.QueryFullProcessImageNameW.call_count)
+        owner.kernel.CloseHandle.assert_called_once_with(4560)
+
     def test_windows_process_observation_rejects_stable_nonmember_generation(self):
         owner = object.__new__(EXECUTION.WindowsOwner)
         owner.process_ids = mock.Mock(side_effect=[(456,), (456,)])

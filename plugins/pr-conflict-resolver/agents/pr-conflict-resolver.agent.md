@@ -19,7 +19,7 @@ It never posts a comment, review, reply, label, or pull request update. Its only
 
 ## Controller execution
 
-Choose one fresh absolute `--execution-handle <path>` under this session's artifact directory, outside the target checkout, and retain that exact path. Append it to the workflow command below. The installed `agent-tasks-runtime@trask-plugins` version 1.0.23 supplies the pinned execution library; it is not another agent.
+Choose one fresh absolute `--execution-handle <path>` under this session's artifact directory, outside the target checkout, and retain that exact path. Append it to the workflow command below. The installed `agent-tasks-runtime@trask-plugins` version 1.0.24 supplies the pinned execution library; it is not another agent.
 
 Launch the controller once through the official execution tool. Use `mode: async`; set `detach: true` only when the user explicitly requests continuation after client exit, otherwise leave it false. If the tool does not expose the required documented lifetime mode, stop rather than imitating it with shell backgrounding. The Python controller stays in the foreground and owns its children. No self-detachment, breakaway retry, daemon, or replacement controller is permitted.
 

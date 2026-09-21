@@ -35,7 +35,7 @@ SHORT_TARGET_PATTERN = re.compile(
 )
 BARE_TARGET_PATTERN = re.compile(r"^#?(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "5f941bbf0443659d6b91e1259841025c0e98c5fad03b735318f90816baa0e08b"
+    "cdfa44334fab70c405fd22d3dbd0842f5c8e2fd0ee6ea438822aa620a6c118df"
 )
 REQUIRED_CLOUD_TASK_RELATIVE_PATH = Path("scripts", "cloud_task.py")
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
@@ -2227,7 +2227,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "published",
     "nothing_to_publish",
 })
-EXECUTION_SHA256 = "1abed8d051205ea4bcd8d630c7b06a97ad7ca753fc5400fa4a03dbd2a3ea18ae"
+EXECUTION_SHA256 = "248cc03692aaa456618a666e859c7decb8053363349fbaa46cfcc568e9142a6e"
 EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
 
 
