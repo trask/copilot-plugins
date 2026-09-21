@@ -73,9 +73,10 @@ unresolved old owner safe to replace.
 The execution record distinguishes finished, failed, locally cancelled and
 abandoned runs. A finished controller may still report pending review, exhaustion,
 blocked stages or CI warnings. No candidate or process exit means CI green.
-Windows children use no-window launch and native generation/job accounting;
-unverified drainage is an error. Linux uses procfs generations and owned process
-groups; unresolved descendant drainage is reported rather than assumed.
+Windows children use no-window launch, native generation checks and job
+membership. Completion requires a zero active-job count; unverified drainage is
+an error. Linux uses procfs generations and owned process groups; unresolved
+descendant drainage is reported rather than assumed.
 Other process-generation providers are unsupported.
 
 This is not an app task manager. It promises no app-native Stop integration,

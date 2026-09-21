@@ -12,7 +12,9 @@ user-facing entrypoints pin its source bytes. Pipeline and Conflict use this
 library for local ownership without changing Conflict's dedicated hosted
 backend. It supplies fresh generation-bound root and child identities,
 file-backed output and canonical terminal results, optional read-only status,
-explicit local cancellation and conservative branch-writer leases.
+explicit local cancellation and conservative branch-writer leases. Windows
+completion requires a zero active-job count; job membership and exact process
+handles distinguish a running descendant from terminated accounting residue.
 
 Controllers remain foreground processes. Only the official execution tool may
 detach a root when the user explicitly requests survival beyond client exit.

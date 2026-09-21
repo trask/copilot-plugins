@@ -259,12 +259,58 @@ class WindowsOwner:
             raise ctypes.WinError(ctypes.get_last_error())
         return accounting.active
 
+    def process_ids(self, deadline: float) -> tuple[int, ...]:
+        import ctypes
+        from ctypes import wintypes
+
+        capacity = 8
+        while True:
+            class ProcessIds(ctypes.Structure):
+                _fields_ = [
+                    ("assigned", wintypes.DWORD),
+                    ("listed", wintypes.DWORD),
+                    ("ids", ctypes.c_size_t * capacity),
+                ]
+
+            processes = ProcessIds()
+            complete = self.kernel.QueryInformationJobObject(
+                self.handle, 3, ctypes.byref(processes), ctypes.sizeof(processes), None,
+            )
+            if complete and processes.listed == processes.assigned:
+                return tuple(sorted(processes.ids[index] for index in range(processes.listed)))
+            error = ctypes.get_last_error()
+            if not complete and error != 234:
+                raise ctypes.WinError(error)
+            if time.monotonic() >= deadline:
+                raise ExecutionError("owned Windows job process list did not stabilize")
+            capacity = max(capacity * 2, processes.assigned, processes.listed + 1)
+
+    def processes(self, deadline: float) -> list[dict[str, Any]]:
+        while True:
+            pids = self.process_ids(deadline)
+            observed = []
+            missing = False
+            for pid in pids:
+                identity = process_identity(pid)
+                if identity is None:
+                    missing = True
+                    break
+                observed.append(identity)
+            confirmed = self.process_ids(deadline)
+            if confirmed != pids:
+                if time.monotonic() >= deadline:
+                    raise ExecutionError("owned Windows job membership did not stabilize")
+                continue
+            if missing:
+                raise ExecutionError("owned Windows job process identity is unavailable")
+            return observed
+
     def drain(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
         while self.active_count():
             if time.monotonic() >= deadline:
                 raise ExecutionError("owned Windows job still has active processes")
-            time.sleep(0.02)
+            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
 
 
 def resume_process(pid: int) -> None:
@@ -323,17 +369,25 @@ class OwnedProcess:
         self.process, self.owner, self.record, self.streams = process, owner, record, streams
         self.pid = process.pid
         self.launch_receipt = read(record)
+        self.exit_code: int | None = None
         self.drained = False
         self.drainage_error: str | None = None
+        self.completion_error: str | None = None
+        self.process_handle_closed = False
         self.stopping = False
 
     @property
     def returncode(self):
-        return self.process.returncode
+        return self.exit_code if self.exit_code is not None else self.process.returncode
 
     def poll(self):
+        if self.exit_code is not None:
+            return self.wait()
         code = self.process.poll()
-        return None if code is None else self.wait()
+        if code is None:
+            return None
+        self.exit_code = code
+        return self.wait()
 
     def terminate(self):
         return self.terminate_tree()
@@ -353,20 +407,49 @@ class OwnedProcess:
             ):
                 raise ExecutionError("child exit lacks a matching sealed execution result")
 
+    def close_process_handle(self) -> None:
+        if not self.process_handle_closed:
+            self.process._handle.Close()
+            self.process_handle_closed = True
+
     def wait(self, timeout=None):
-        code = self.process.wait(timeout=timeout)
+        return self._wait(None if timeout is None else time.monotonic() + timeout)
+
+    def _wait(self, deadline: float | None):
+        if self.exit_code is None:
+            self.exit_code = self.process.wait(
+                timeout=None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+        code = self.exit_code
         if self.drainage_error is not None:
             raise ExecutionError(self.drainage_error)
+        if self.completion_error is not None:
+            raise ExecutionError(self.completion_error)
         if self.drained:
             self.verify_execution(code)
             return code
-        unexpected = False
+        if deadline is None:
+            deadline = time.monotonic() + 10.0
+        unexpected: list[dict[str, Any]] = []
         try:
             if self.owner:
-                unexpected = bool(self.owner.active_count()) and not self.stopping
+                processes = self.owner.processes(deadline)
+                direct = next((item for item in processes if item["pid"] == self.pid), None)
+                if direct is not None and not same_process(
+                    self.launch_receipt["process_identity"], direct
+                ):
+                    raise ExecutionError("owned child generation changed before job drainage")
+                unexpected = [
+                    item for item in processes
+                    if item["pid"] != self.pid and item["running"] and not self.stopping
+                ]
+                self.close_process_handle()
                 if unexpected:
+                    self.completion_error = "child exited before a running descendant"
                     self.owner.terminate()
-                self.owner.drain(timeout if timeout is not None else 10.0)
+                self.owner.drain(max(0.0, deadline - time.monotonic()))
+                if unexpected:
+                    self.completion_error += "; the owned job was drained"
             elif not IS_WINDOWS:
                 try:
                     os.killpg(self.pid, 0)
@@ -375,26 +458,54 @@ class OwnedProcess:
                 else:
                     raise ExecutionError("owned process group still has active descendants")
             self.drained = True
-            write(self.record, {**read(self.record), "exit_code": code, "local_drained": True})
+            result = {**read(self.record), "exit_code": code, "local_drained": True}
+            if self.completion_error is not None:
+                result.update(
+                    completion_error=self.completion_error,
+                    unexpected_descendants=unexpected,
+                )
+            write(self.record, result)
         except (OSError, subprocess.SubprocessError, ExecutionError) as failure:
             self.drained = False
-            self.drainage_error = str(failure)
-            raise
+            message = str(failure)
+            if self.completion_error is not None:
+                message = f"{self.completion_error}; local drainage: {message}"
+            self.drainage_error = message
+            write(
+                self.record,
+                {
+                    **read(self.record),
+                    "exit_code": code,
+                    "local_drained": False,
+                    "drainage_error": message,
+                    **(
+                        {
+                            "completion_error": self.completion_error,
+                            "unexpected_descendants": unexpected,
+                        }
+                        if self.completion_error is not None else {}
+                    ),
+                },
+            )
+            raise ExecutionError(message) from failure
         finally:
             if self.owner:
+                if self.exit_code is not None:
+                    self.close_process_handle()
                 self.owner.close()
                 self.owner = None
             for stream in self.streams:
                 stream.close()
             self.streams.clear()
-        if unexpected:
-            raise ExecutionError("child exited before its descendants; the owned job was drained")
+        if self.completion_error is not None:
+            raise ExecutionError(self.completion_error)
         self.verify_execution(code)
         return code
 
     def terminate_tree(self, timeout=10.0):
         if self.drained:
-            return self.process.returncode
+            return self._wait(time.monotonic())
+        deadline = time.monotonic() + timeout
         self.stopping = True
         if self.owner:
             self.owner.terminate()
@@ -407,7 +518,7 @@ class OwnedProcess:
         elif self.poll() is None:
             self.process.terminate()
         try:
-            return self.wait(timeout)
+            return self._wait(deadline)
         except subprocess.TimeoutExpired:
             if not IS_WINDOWS:
                 try:
@@ -416,7 +527,7 @@ class OwnedProcess:
                     pass
             else:
                 self.process.kill()
-            return self.wait(timeout)
+            return self._wait(deadline)
 
 
 class Execution:
@@ -781,6 +892,7 @@ class Execution:
         drainage_errors = [
             str(failure) for failure in self.launch_failures if not failure["local_drained"]
         ]
+        child_errors = []
         for child in self.children:
             try:
                 if child.poll() is None:
@@ -790,7 +902,13 @@ class Execution:
                 else:
                     child.wait()
             except (OSError, subprocess.SubprocessError, ExecutionError) as failure:
-                drainage_errors.append(str(failure))
+                if (
+                    getattr(child, "drained", False) is True
+                    and getattr(child, "completion_error", None) == str(failure)
+                ):
+                    child_errors.append(str(failure))
+                else:
+                    drainage_errors.append(str(failure))
         if not error and not cancelled and not (
             isinstance(self.last_result, dict)
             and (
@@ -799,7 +917,7 @@ class Execution:
             )
         ):
             error, code = "controller returned without a structured result", 1
-        if drainage_errors:
+        if drainage_errors or child_errors:
             code = 1
         child_records = sorted(self.directory.rglob("child-*.json"))
         if not IS_WINDOWS:
@@ -810,7 +928,7 @@ class Execution:
                     code = 1
         retained = []
         remote_tasks = []
-        evidence_errors = []
+        evidence_errors = list(child_errors)
         records = [self.record]
         child_executions = {}
         for handle in self.directory.rglob("handle-*.json"):
