@@ -46,7 +46,7 @@ class RuntimeSourceLoadingTest(unittest.TestCase):
 
     def assert_runtime(self, runtime):
         self.assertEqual(MODULE_NAME, runtime.__name__)
-        self.assertEqual(str(self.helper), runtime.__file__)
+        self.assertTrue(Path(runtime.__file__).samefile(self.helper))
         self.assertIsNone(runtime.__spec__)
         self.assertIsNone(runtime.__package__)
         self.assertIs(runtime, sys.modules[MODULE_NAME])
@@ -54,7 +54,9 @@ class RuntimeSourceLoadingTest(unittest.TestCase):
             MODULE_NAME,
             runtime.Options(report=False, model="fixture", prompt="fixture").__class__.__module__,
         )
-        self.assertEqual(str(self.helper), runtime.task_payload.__code__.co_filename)
+        self.assertTrue(
+            Path(runtime.task_payload.__code__.co_filename).samefile(self.helper)
+        )
         self.assertFalse(sys.dont_write_bytecode)
 
     def test_real_pinned_source_loads_without_creating_cache(self):
