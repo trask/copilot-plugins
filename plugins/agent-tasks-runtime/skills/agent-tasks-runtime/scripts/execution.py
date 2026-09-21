@@ -279,12 +279,16 @@ class WindowsOwner:
             raise ctypes.WinError(ctypes.get_last_error())
         return accounting.active
 
-    def process_ids(self, deadline: float) -> tuple[int, ...]:
+    def process_ids(
+        self, deadline: float, check: Callable[[], None] | None = None
+    ) -> tuple[int, ...]:
         import ctypes
         from ctypes import wintypes
 
         capacity = 8
         while True:
+            if check is not None:
+                check()
             class ProcessIds(ctypes.Structure):
                 _fields_ = [
                     ("assigned", wintypes.DWORD),
@@ -348,9 +352,17 @@ class WindowsOwner:
             "running": state == 258,
         }
 
-    def processes(self, deadline: float, retained: dict[int, Any]) -> list[dict[str, Any]]:
+    def processes(
+        self, deadline: float, retained: dict[int, Any],
+        check: Callable[[], None] | None = None,
+    ) -> list[dict[str, Any]]:
         while True:
-            pids = self.process_ids(deadline)
+            if check is not None:
+                check()
+            pids = (
+                self.process_ids(deadline)
+                if check is None else self.process_ids(deadline, check)
+            )
             observed = []
             opened = []
             failure: BaseException | None = None
@@ -370,7 +382,10 @@ class WindowsOwner:
                     except (OSError, ExecutionError) as inspection:
                         failure = inspection
                         break
-                confirmed = self.process_ids(deadline)
+                confirmed = (
+                    self.process_ids(deadline)
+                    if check is None else self.process_ids(deadline, check)
+                )
             finally:
                 for handle in opened:
                     if not self.kernel.CloseHandle(handle):
@@ -384,8 +399,14 @@ class WindowsOwner:
                 raise failure
             return observed
 
-    def drain(self, deadline: float) -> None:
-        while self.active_count():
+    def drain(
+        self, deadline: float, check: Callable[[], None] | None = None
+    ) -> None:
+        while True:
+            if check is not None:
+                check()
+            if not self.active_count():
+                return
             if time.monotonic() >= deadline:
                 raise _OwnershipPending("owned Windows job still has active processes")
             time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
@@ -500,21 +521,28 @@ class OwnedProcess:
     def wait(self, timeout=None):
         return self._wait(None if timeout is None else time.monotonic() + timeout)
 
-    def _wait(self, deadline: float | None):
+    def _wait(
+        self, deadline: float | None, check: Callable[[], None] | None = None
+    ):
         if self.exit_code is None:
             self.exit_code = self.process.wait(
                 timeout=None if deadline is None else max(0.0, deadline - time.monotonic())
             )
+        if check is not None:
+            check()
         code = self.exit_code
         if deadline is None:
             deadline = time.monotonic() + 10.0
-        self._complete(deadline, blocking=True)
+        self._complete(deadline, blocking=True, check=check)
         if self.completion_error is not None:
             raise ExecutionError(self.completion_error)
         self.verify_execution(code)
         return code
 
-    def _complete(self, deadline: float, *, blocking: bool) -> bool:
+    def _complete(
+        self, deadline: float, *, blocking: bool,
+        check: Callable[[], None] | None = None,
+    ) -> bool:
         code = self.exit_code
         if code is None:
             return False
@@ -535,7 +563,11 @@ class OwnedProcess:
                         raise ExecutionError(
                             "owned child generation or exit state changed before job drainage"
                         )
-                    processes = self.owner.processes(deadline, {self.pid: handle})
+                    processes = (
+                        self.owner.processes(deadline, {self.pid: handle})
+                        if check is None else
+                        self.owner.processes(deadline, {self.pid: handle}, check)
+                    )
                     self.unexpected_descendants = [
                         item for item in processes
                         if item["pid"] != self.pid and item["running"] and not self.stopping
@@ -547,7 +579,10 @@ class OwnedProcess:
                     self.owner.terminate()
                     self.owner_terminated = True
                 if blocking:
-                    self.owner.drain(deadline)
+                    if check is None:
+                        self.owner.drain(deadline)
+                    else:
+                        self.owner.drain(deadline, check)
                 elif self.owner.active_count():
                     self._write_pending(code)
                     return False
@@ -984,7 +1019,7 @@ class Execution:
                     break
                 except subprocess.TimeoutExpired:
                     sent = True
-            code = process.wait()
+            code = process._wait(deadline, self.check_cancel)
             values = {}
             for name, (path, stream) in captured.items():
                 stream.flush()

@@ -75,7 +75,9 @@ abandoned runs. A finished controller may still report pending review, exhaustio
 blocked stages or CI warnings. No candidate or process exit means CI green.
 Windows children use no-window launch, native generation checks and job
 membership. Completion requires a zero active-job count; unverified drainage is
-an error. Linux uses procfs generations and owned process groups; unresolved
+an error. A foreground timeout covers communication and owned-job drainage,
+and cancellation remains observable while drainage is pending.
+Linux uses procfs generations and owned process groups; unresolved
 descendant drainage is reported rather than assumed.
 Other process-generation providers are unsupported.
 

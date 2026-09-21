@@ -15,6 +15,8 @@ file-backed output and canonical terminal results, optional read-only status,
 explicit local cancellation and conservative branch-writer leases. Windows
 completion requires a zero active-job count; job membership and exact process
 handles distinguish a running descendant from terminated accounting residue.
+A foreground timeout covers communication and owned-job drainage, and
+cancellation remains observable while drainage is pending.
 
 Controllers remain foreground processes. Only the official execution tool may
 detach a root when the user explicitly requests survival beyond client exit.

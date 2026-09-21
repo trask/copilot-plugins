@@ -756,6 +756,18 @@ class ExecutionTest(unittest.TestCase):
         ):
             owner.process_ids(1.0)
 
+    def test_windows_drain_checks_cancellation_before_accounting(self):
+        owner = object.__new__(EXECUTION.WindowsOwner)
+        owner.active_count = mock.Mock()
+
+        def cancelled():
+            raise EXECUTION.Cancelled("explicit local cancellation")
+
+        with self.assertRaisesRegex(EXECUTION.Cancelled, "explicit local cancellation"):
+            owner.drain(EXECUTION.time.monotonic() + 1.0, cancelled)
+
+        owner.active_count.assert_not_called()
+
     def test_windows_cancellation_drains_running_descendants_without_completion_error(self):
         context = self.context()
         record = context.directory / "child-test.json"
@@ -806,7 +818,7 @@ class ExecutionTest(unittest.TestCase):
         child.process.text_mode = True
         child.process.encoding = "utf-8"
         child.process.errors = "strict"
-        child.wait.return_value = 0
+        child._wait.return_value = 0
 
         def start(command, **options):
             self.assertNotIn("capture_output", options)
@@ -820,6 +832,90 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual("durable stderr\n", result.stderr)
         for name, path in EXECUTION.read(child.record)["captured_output"].items():
             self.assertEqual(getattr(result, name), Path(path).read_text(encoding="utf-8"))
+
+    def test_run_does_not_reset_timeout_after_communicate(self):
+        context = self.context()
+        command = ["python", "child.py"]
+        record = context.directory / "child-test.json"
+        EXECUTION.write(record, {"process_identity": IDENTITY, "local_drained": False})
+        process = mock.Mock(pid=123, args=command)
+        process.communicate.return_value = (None, None)
+        process.wait.return_value = 0
+        owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
+        owner.processes.return_value = [{**IDENTITY, "running": False}]
+        owner.drain.side_effect = EXECUTION._OwnershipPending("accounting pending")
+        child = EXECUTION.OwnedProcess(process, owner, record, [])
+
+        with (
+            mock.patch.object(context, "start", return_value=child),
+            mock.patch.object(child, "terminate_tree") as cleanup,
+            mock.patch.object(
+                EXECUTION.time, "monotonic", side_effect=[100.0, 109.0, 109.5]
+            ),
+            self.assertRaises(subprocess.TimeoutExpired),
+        ):
+            context.run(command, timeout=10.0)
+
+        self.assertEqual(0.2, process.communicate.call_args.kwargs["timeout"])
+        process.wait.assert_called_once_with(timeout=0.5)
+        self.assertEqual(110.0, owner.processes.call_args.args[0])
+        self.assertEqual(110.0, owner.drain.call_args.args[0])
+        self.assertIs(context, owner.drain.call_args.args[1].__self__)
+        cleanup.assert_called_once_with()
+        self.assertFalse(child.drained)
+        self.assertIs(owner, child.owner)
+
+    def test_run_zero_timeout_never_starts_a_fresh_wait_budget(self):
+        context = self.context()
+        command = ["python", "child.py"]
+        child = mock.Mock()
+        child.record = context.directory / "child-test.json"
+        EXECUTION.write(child.record, {"process_identity": IDENTITY})
+
+        with (
+            mock.patch.object(context, "start", return_value=child),
+            mock.patch.object(EXECUTION.time, "monotonic", side_effect=[100.0, 100.0]),
+            self.assertRaises(subprocess.TimeoutExpired),
+        ):
+            context.run(command, timeout=0)
+
+        child.process.communicate.assert_not_called()
+        child._wait.assert_not_called()
+        child.terminate_tree.assert_called_once_with()
+
+    def test_run_observes_cancellation_during_accounting_drain(self):
+        context = self.context()
+        command = ["python", "child.py"]
+        record = context.directory / "child-test.json"
+        EXECUTION.write(record, {"process_identity": IDENTITY, "local_drained": False})
+        process = mock.Mock(pid=123, args=command)
+        process.communicate.return_value = (None, None)
+        process.wait.return_value = 0
+        owner = mock.Mock()
+        owner.process.return_value = {**IDENTITY, "running": False}
+        owner.processes.return_value = [{**IDENTITY, "running": False}]
+        owner.drain.side_effect = lambda _deadline, check: check()
+        child = EXECUTION.OwnedProcess(process, owner, record, [])
+        cancelled = EXECUTION.Cancelled("explicit local cancellation")
+
+        with (
+            mock.patch.object(context, "start", return_value=child),
+            mock.patch.object(
+                context, "check_cancel", side_effect=[None, None, cancelled]
+            ) as check_cancel,
+            mock.patch.object(child, "terminate_tree") as cleanup,
+            mock.patch.object(EXECUTION.time, "monotonic", return_value=100.0),
+            self.assertRaisesRegex(EXECUTION.Cancelled, "explicit local cancellation"),
+        ):
+            context.run(command)
+
+        process.wait.assert_called_once_with(timeout=None)
+        self.assertEqual(110.0, owner.drain.call_args.args[0])
+        self.assertIs(check_cancel, owner.drain.call_args.args[1])
+        cleanup.assert_called_once_with()
+        self.assertFalse(child.drained)
+        self.assertIs(owner, child.owner)
 
     def test_terminal_before_handle_seal_is_not_completion(self):
         context = self.context()
