@@ -54,6 +54,10 @@ common = load_common()
 WorkflowError = common.WorkflowError
 
 MAX_SWEEPS = 2
+CI_SNAPSHOT_CHANGED_REASONS = {
+    "clearance_verification": "ci_snapshot_changed",
+    "warning_verification": "ci_warning_snapshot_changed",
+}
 DEFAULT_STAGE_MODEL = common.DEFAULT_STAGE_MODEL
 DEFAULT_EFFORT = common.DEFAULT_EFFORT
 IS_WINDOWS = common.IS_WINDOWS
@@ -670,7 +674,10 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
             "next_action": (
                 "Finish the run."
                 if not uncleared
-                else "Start another sweep only if the head or base changed."
+                else (
+                    "Start another sweep only after a revision change or final "
+                    "CI snapshot drift."
+                )
             ),
             "waiting": False,
         }
@@ -1072,6 +1079,41 @@ def blocked_result(
 stage_blocker = common.stage_blocker
 
 
+def requires_ci_revalidation_sweep(stages: list[dict[str, Any]]) -> bool:
+    uncleared = [stage for stage in stages if stage.get("clear") is not True]
+    if len(uncleared) != 1 or uncleared[0].get("stage") != STAGE_CI:
+        return False
+    ci_stage = uncleared[0]
+    if ci_stage.get("installed") is not True or stage_blocker(
+        ci_stage, after_launch=False
+    ) is not None:
+        return False
+    status = ci_stage.get("status")
+    if not isinstance(status, dict):
+        return False
+    verifications = {
+        "clearance_verification": status.get("clearance_verification"),
+        "warning_verification": ci_stage.get("warning_verification"),
+    }
+    for field, reason in CI_SNAPSHOT_CHANGED_REASONS.items():
+        verification = verifications[field]
+        if not isinstance(verification, dict):
+            continue
+        expected = verification.get("expected_snapshot_sha256")
+        observed = verification.get("observed_snapshot_sha256")
+        if (
+            verification.get("result") == "stale"
+            and verification.get("reason") == reason
+            and isinstance(expected, str)
+            and re.fullmatch(r"[0-9a-f]{64}", expected) is not None
+            and isinstance(observed, str)
+            and re.fullmatch(r"[0-9a-f]{64}", observed) is not None
+            and observed != expected
+        ):
+            return True
+    return False
+
+
 def run_pipeline(
     target: dict[str, Any],
     repo_root: Path,
@@ -1460,7 +1502,11 @@ def run_pipeline(
                 "runs": runs,
                 **common.ci_warning_fields(stages),
             }
-        if not head_changed and not base_changed:
+        if (
+            not head_changed
+            and not base_changed
+            and not requires_ci_revalidation_sweep(stages)
+        ):
             return {
                 "result": "incomplete",
                 "reason": "stages_not_clear",

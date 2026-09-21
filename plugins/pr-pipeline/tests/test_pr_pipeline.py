@@ -101,6 +101,17 @@ def ci_green_payload(head=HEAD, base=BASE) -> dict:
     }
 
 
+def stale_ci_green_payload() -> dict:
+    return {
+        "stage_outcome": "pending", "outcome": None,
+        "clean_at_head_sha": None, "clean_at_base_sha": None,
+        "clearance_verification": {
+            "result": "stale", "reason": "ci_snapshot_changed",
+            "expected_snapshot_sha256": "e" * 64, "observed_snapshot_sha256": "f" * 64,
+        },
+    }
+
+
 def description_payload(head=HEAD, base=BASE) -> dict:
     return {
         "validated_head_sha": head,
@@ -1975,6 +1986,7 @@ class SweepTest(unittest.TestCase):
         self.completed: set[str] = set()
         self.attempt_ids = {MODULE.STAGE_CONFLICT: "old-attempt"}
         self.launched: list[tuple[str, int]] = []
+        self.launch_calls: list[dict] = []
         self.events: list[dict] = []
 
         self.patches = [
@@ -2016,6 +2028,14 @@ class SweepTest(unittest.TestCase):
         report=None,
     ):
         self.launched.append((entry["stage"], sweep))
+        self.launch_calls.append({
+            "stage": entry["stage"],
+            "model": model,
+            "effort": effort,
+            "run_id": run_id,
+            "sweep": sweep,
+            "conflict_strategy": conflict_strategy,
+        })
         self.clear_at[entry["stage"]] = self.sync_heads[-1]
         if entry["stage"] == MODULE.STAGE_CONFLICT:
             self.clear_base_at = self.base_sha
@@ -2123,6 +2143,49 @@ class SweepTest(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
+    def enable_ci_green(self, *, second_payload=None):
+        self.green_payload = None
+        ci_launches = 0
+        launch = self.run_stage
+
+        def run_stage(entry, *args, **kwargs):
+            nonlocal ci_launches
+            result = launch(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_CI:
+                ci_launches += 1
+                self.green_payload = copy.deepcopy(
+                    second_payload
+                    if ci_launches == 2 and second_payload is not None
+                    else ci_green_payload(self.sync_heads[-1], self.base_sha)
+                )
+            return result
+
+        def inspect(entry, selected, head, base, run_id=None):
+            if entry["stage"] != MODULE.STAGE_CI or self.green_payload is None:
+                return self.inspect(entry, selected, head, base, run_id)
+            return MODULE.common.inspect_stage(
+                entry, selected, head, base,
+                pipeline_run=run_id,
+                read_status=lambda *_: {
+                    "ok": True, "installed": True, "state": "state.json",
+                    "payload": self.green_payload,
+                },
+            )
+
+        for patch in (
+            mock.patch.object(MODULE, "run_stage", side_effect=run_stage),
+            mock.patch.object(MODULE, "inspect_stage", side_effect=inspect),
+            mock.patch.object(
+                MODULE, "inspect_stages",
+                side_effect=lambda selected, head, base, run_id=None: [
+                    inspect(entry, selected, head, base, run_id)
+                    for entry in MODULE.STAGES
+                ],
+            ),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
     def test_ci_warning_finishes_workflow_and_continues_description(self):
         self.enable_ci_warnings()
         result = self.execute()
@@ -2217,28 +2280,241 @@ class SweepTest(unittest.TestCase):
         self.assertFalse(result["all_ci_passed"])
         self.assertEqual(self.warning_payload["ci_warnings"], result["ci_warnings"])
 
-    def test_ci_snapshot_change_during_description_invalidates_final_completion(self):
+    def test_green_snapshot_change_during_description_uses_second_sweep(self):
+        self.enable_ci_green()
+        launch = MODULE.run_stage.side_effect
+
+        def run_stage(entry, *args, **kwargs):
+            result = launch(entry, *args, **kwargs)
+            if (
+                entry["stage"] == MODULE.STAGE_DESCRIPTION
+                and kwargs["sweep"] == 1
+            ):
+                self.green_payload = stale_ci_green_payload()
+            return result
+
+        MODULE.run_stage.side_effect = run_stage
+        result = self.execute()
+        self.assertEqual("complete", result["result"])
+        self.assertEqual(2, result["sweeps"])
+        self.assertEqual(
+            [
+                *[(stage, 1) for stage in MODULE.STAGE_NAMES],
+                (MODULE.STAGE_CI, 2),
+            ],
+            self.launched,
+        )
+        run_ids = {call["run_id"] for call in self.launch_calls}
+        self.assertEqual(1, len(run_ids))
+        self.assertTrue(next(iter(run_ids)))
+        ci = next(stage for stage in result["stages"] if stage["stage"] == MODULE.STAGE_CI)
+        self.assertEqual(
+            "ci_snapshot_current",
+            ci["status"]["clearance_verification"]["reason"],
+        )
+
+    def test_warning_snapshot_change_during_description_uses_second_sweep(self):
         self.enable_ci_warnings()
         launch = MODULE.run_stage.side_effect
 
         def run_stage(entry, *args, **kwargs):
             result = launch(entry, *args, **kwargs)
-            if entry["stage"] == MODULE.STAGE_DESCRIPTION:
+            if (
+                entry["stage"] == MODULE.STAGE_DESCRIPTION
+                and kwargs["sweep"] == 1
+            ):
                 self.warning_payload = stale_ci_warning_payload()
             return result
 
         MODULE.run_stage.side_effect = run_stage
         result = self.execute()
-        self.assertEqual("incomplete", result["result"])
-        self.assertEqual("stages_not_clear", result["reason"])
-        self.assertEqual(1, result["sweeps"])
+        self.assertEqual("complete", result["result"])
+        self.assertEqual(2, result["sweeps"])
+        self.assertFalse(result["all_ci_passed"])
+        self.assertEqual(self.warning_payload["ci_warnings"], result["ci_warnings"])
         ci = next(stage for stage in result["stages"] if stage["stage"] == MODULE.STAGE_CI)
-        self.assertEqual("ci_warning_snapshot_changed", ci["reason"])
-        self.assertNotIn("ci_warnings", result)
+        self.assertEqual("ci_warning", ci["clearance_kind"])
         self.assertEqual(
-            [(MODULE.STAGE_CI, 1)],
+            [
+                *[(stage, 1) for stage in MODULE.STAGE_NAMES],
+                (MODULE.STAGE_CI, 2),
+            ],
+            self.launched,
+        )
+        run_ids = {call["run_id"] for call in self.launch_calls}
+        self.assertEqual(1, len(run_ids))
+        self.assertTrue(next(iter(run_ids)))
+
+    def test_same_revision_sweep_gate_accepts_only_verified_ci_snapshot_drift(self):
+        def final_stages(ci):
+            return [
+                ci if entry["stage"] == MODULE.STAGE_CI
+                else clear_stage(entry["stage"])
+                for entry in MODULE.STAGES
+            ]
+
+        green = {
+            **uncleared_stage(MODULE.STAGE_CI),
+            "status": {
+                "clearance_verification": {
+                    "result": "stale",
+                    "reason": "ci_snapshot_changed",
+                    "expected_snapshot_sha256": "e" * 64,
+                    "observed_snapshot_sha256": "f" * 64,
+                },
+            },
+        }
+        warning = {
+            **uncleared_stage(MODULE.STAGE_CI),
+            "status": {},
+            "warning_verification": {
+                "result": "stale",
+                "reason": "ci_warning_snapshot_changed",
+                "expected_snapshot_sha256": "e" * 64,
+                "observed_snapshot_sha256": "f" * 64,
+            },
+        }
+        self.assertTrue(MODULE.requires_ci_revalidation_sweep(final_stages(green)))
+        self.assertTrue(MODULE.requires_ci_revalidation_sweep(final_stages(warning)))
+
+        rejected = {
+            "pending": uncleared_stage(MODULE.STAGE_CI, "pending"),
+            "failing": uncleared_stage(MODULE.STAGE_CI, "failed"),
+            "unknown": uncleared_stage(MODULE.STAGE_CI, "unknown"),
+            "exhausted": uncleared_stage(MODULE.STAGE_CI, "max_iterations_reached"),
+            "unknown stale reason": {
+                **green,
+                "status": {
+                    "clearance_verification": {
+                        **green["status"]["clearance_verification"],
+                        "reason": "unexpected_snapshot_reason",
+                    },
+                },
+            },
+            "malformed stale warning": {
+                **warning,
+                "warning_verification": {
+                    **warning["warning_verification"],
+                    "observed_snapshot_sha256": "not-a-hash",
+                },
+            },
+            "unchanged snapshot": {
+                **green,
+                "status": {
+                    "clearance_verification": {
+                        **green["status"]["clearance_verification"],
+                        "observed_snapshot_sha256": "e" * 64,
+                    },
+                },
+            },
+        }
+        for name, stage in rejected.items():
+            with self.subTest(name=name):
+                self.assertFalse(
+                    MODULE.requires_ci_revalidation_sweep(final_stages(stage))
+                )
+        self.assertFalse(
+            MODULE.requires_ci_revalidation_sweep(
+                [
+                    *final_stages(green),
+                    uncleared_stage(MODULE.STAGE_SELF_REVIEW),
+                ]
+            )
+        )
+
+    def test_second_same_revision_ci_drift_ends_incomplete(self):
+        self.enable_ci_green()
+        launch = MODULE.run_stage.side_effect
+        inspect_all = MODULE.inspect_stages.side_effect
+        final_inspections = 0
+
+        def run_stage(entry, *args, **kwargs):
+            result = launch(entry, *args, **kwargs)
+            if (
+                entry["stage"] == MODULE.STAGE_DESCRIPTION
+                and kwargs["sweep"] == 1
+            ):
+                self.green_payload = stale_ci_green_payload()
+            return result
+
+        def inspect_with_later_drift(*args, **kwargs):
+            nonlocal final_inspections
+            final_inspections += 1
+            if final_inspections == 2:
+                self.green_payload = stale_ci_green_payload()
+            return inspect_all(*args, **kwargs)
+
+        MODULE.run_stage.side_effect = run_stage
+        MODULE.inspect_stages.side_effect = inspect_with_later_drift
+        result = self.execute()
+        self.assertEqual("incomplete", result["result"])
+        self.assertEqual("two_sweeps_finished", result["reason"])
+        self.assertEqual(2, result["sweeps"])
+        self.assertEqual(
+            [(MODULE.STAGE_CI, 1), (MODULE.STAGE_CI, 2)],
             [item for item in self.launched if item[0] == MODULE.STAGE_CI],
         )
+
+    def assert_second_ci_outcome_remains_incomplete(self, second_payload):
+        self.enable_ci_green(second_payload=second_payload)
+        launch = MODULE.run_stage.side_effect
+
+        def run_stage(entry, *args, **kwargs):
+            result = launch(entry, *args, **kwargs)
+            if (
+                entry["stage"] == MODULE.STAGE_DESCRIPTION
+                and kwargs["sweep"] == 1
+            ):
+                self.green_payload = stale_ci_green_payload()
+            return result
+
+        MODULE.run_stage.side_effect = run_stage
+        result = self.execute()
+        self.assertEqual("incomplete", result["result"])
+        self.assertEqual("two_sweeps_finished", result["reason"])
+        self.assertEqual(2, result["sweeps"])
+        self.assertNotIn("all_ci_passed", result)
+        self.assertEqual(
+            [
+                *[(stage, 1) for stage in MODULE.STAGE_NAMES],
+                (MODULE.STAGE_CI, 2),
+            ],
+            self.launched,
+        )
+
+    def test_second_ci_pending_outcome_remains_incomplete(self):
+        self.assert_second_ci_outcome_remains_incomplete({
+            "stage_outcome": "pending",
+            "outcome": None,
+            "clean_at_head_sha": None,
+            "clean_at_base_sha": None,
+        })
+
+    def test_second_ci_failure_outcome_remains_incomplete(self):
+        self.assert_second_ci_outcome_remains_incomplete({
+            "stage_outcome": "failed",
+            "outcome": "failed",
+            "clean_at_head_sha": None,
+            "clean_at_base_sha": None,
+        })
+
+    def test_second_ci_unknown_outcome_remains_incomplete(self):
+        self.assert_second_ci_outcome_remains_incomplete({
+            "clean_at_head_sha": None,
+            "clean_at_base_sha": None,
+        })
+
+    def test_second_ci_exhausted_outcome_remains_incomplete(self):
+        self.assert_second_ci_outcome_remains_incomplete({
+            "stage_outcome": "carried",
+            "outcome": None,
+            "clean_at_head_sha": None,
+            "clean_at_base_sha": None,
+            "escalation": {
+                "reason": "max_iterations_reached",
+                "detail": "the CI repair allowance is exhausted",
+            },
+        })
 
     def test_blocked_result_rechecks_same_head_base_warning_snapshot(self):
         self.enable_ci_warnings()
