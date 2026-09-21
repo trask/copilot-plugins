@@ -1548,6 +1548,37 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "error": None,
         }
 
+    def verified_candidate(self, result, **_kwargs):
+        if result["task"]["state"] != "completed":
+            raise MODULE.WorkflowError("Self Review candidate rejected")
+        candidate = result["candidate"]
+        artifact = candidate["artifact_commit"]
+        return {
+            "contract": "candidate",
+            "task_id": result["task"]["id"],
+            "task_url": result["task"]["url"],
+            "session_id": result["completion"]["session"]["id"],
+            "generated_branch": result["generated"]["branch"],
+            "generated_head": result["generated"]["head_sha"],
+            "code_tip": candidate["generated"]["code_tip_sha"],
+            "commits": [item["sha"] for item in candidate["code_commits"]],
+            "final_local_head": candidate["generated"]["code_tip_sha"],
+            "requires_apply": True,
+            "candidate_manifest": candidate,
+            "completion": result["completion"],
+            "report_evidence": (
+                {
+                    "path": MODULE.AGENT_TASK_OUTPUT_RESULT,
+                    "commit": artifact["sha"],
+                    "patch_sha256": artifact["patch_sha256"],
+                }
+                if artifact is not None
+                and MODULE.AGENT_TASK_OUTPUT_RESULT in artifact["changed_paths"]
+                else None
+            ),
+            "structural_attestation": True,
+        }
+
     def candidate_creation_failure(self):
         failure = self.candidate_result()
         failure.update(
@@ -1695,7 +1726,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             )
 
 
-    def test_current_creation_failure_is_audit_only_and_later_call_is_fresh(self):
+    def test_current_creation_failure_retains_ownership_without_retry(self):
         state_path = self.directory / "cca-disabled-state.json"
         helper = self.directory / "cloud_task.py"
         helper.write_text("# helper\n", encoding="utf-8")
@@ -1741,12 +1772,16 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 ],
             ),
         ):
-            for _ in range(2):
-                with self.assertRaisesRegex(
-                    MODULE.WorkflowError,
-                    r"Agent Task failed \[api_failure\]: start Agent Task failed",
-                ):
-                    MODULE.command_agent_task(args)
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                r"Agent Task failed \[api_failure\]: start Agent Task failed",
+            ):
+                MODULE.command_agent_task(args)
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "unfinished Agent Task already owns this state",
+            ):
+                MODULE.command_agent_task(args)
 
         state = MODULE.load_state(state_path)
         task = state["agent_task"]
@@ -1773,9 +1808,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual("not_created", task["task_id_status"])
         self.assertNotIn("recovery_command", task)
         self.assertNotIn("retry_command", task)
-        self.assertEqual(1, len(state["managed_task_history"]))
-        self.assertEqual("run-1", state["managed_task_history"][0]["run_id"])
-        self.assertEqual("run-2", task["run_id"])
+        self.assertNotIn("managed_task_history", state)
+        self.assertEqual("run-1", task["run_id"])
         self.assertTrue(
             all("--apply-with-report" in command for command in commands)
         )
@@ -2082,7 +2116,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "local_identity",
                 return_value=self.preflight["identity"],
             ),
-            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
+            mock.patch.object(
+                MODULE,
+                "verify_runtime_candidate",
+                return_value=self.verified_candidate(result),
+            ),
             mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
             mock.patch.object(
                 MODULE, "metadata_for", return_value=self.preflight["pr"]
@@ -2150,7 +2188,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "local_identity",
                 return_value=self.preflight["identity"],
             ),
-            mock.patch.object(MODULE, "validate_generated_history", return_value={}),
+            mock.patch.object(
+                MODULE,
+                "verify_runtime_candidate",
+                return_value=self.verified_candidate(result),
+            ),
             mock.patch.object(MODULE, "fetch_committed_text", return_value=report),
             mock.patch.object(
                 MODULE, "metadata_for", return_value=self.preflight["pr"]
@@ -2273,8 +2315,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ),
             mock.patch.object(
                 MODULE,
-                "validate_candidate_history",
-                return_value={},
+                "verify_runtime_candidate",
+                return_value=self.verified_candidate(result),
+            ),
+            mock.patch.object(
+                MODULE, "apply_verified_candidate_import", return_value=False
             ),
             mock.patch.object(
                 MODULE,
@@ -2403,6 +2448,36 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "iterations_used": min(fixes + 1, max_iterations) if len(commands) == 1 else 1,
             })
 
+        def verify_candidate(result, **_kwargs):
+            if result["task"]["state"] != "completed":
+                raise MODULE.WorkflowError("Self Review candidate rejected")
+            candidate = result["candidate"]
+            artifact = candidate["artifact_commit"]
+            return {
+                "contract": "candidate",
+                "task_id": result["task"]["id"],
+                "task_url": result["task"]["url"],
+                "session_id": result["completion"]["session"]["id"],
+                "generated_branch": result["generated"]["branch"],
+                "generated_head": result["generated"]["head_sha"],
+                "code_tip": candidate["generated"]["code_tip_sha"],
+                "commits": [item["sha"] for item in candidate["code_commits"]],
+                "final_local_head": candidate["generated"]["code_tip_sha"],
+                "requires_apply": True,
+                "candidate_manifest": candidate,
+                "completion": result["completion"],
+                "report_evidence": (
+                    {
+                        "path": MODULE.AGENT_TASK_OUTPUT_RESULT,
+                        "commit": artifact["sha"],
+                        "patch_sha256": artifact["patch_sha256"],
+                    }
+                    if artifact is not None
+                    else None
+                ),
+                "structural_attestation": True,
+            }
+
         with (
             mock.patch.object(MODULE, "ACTIVE_GITHUB_MUTATION_POLICY", "allow"),
             mock.patch.object(MODULE, "require_tools"),
@@ -2415,10 +2490,15 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "git", side_effect=outcome_git),
             mock.patch.object(MODULE, "local_identity", side_effect=lambda _: dict(identity)),
             mock.patch.object(
-                MODULE, "validate_candidate_history",
-                side_effect=lambda *a, **kw: {
-                    sha: ["src/app.py"] for sha in kw["remote"]["commits"]
-                },
+                MODULE, "verify_runtime_candidate", side_effect=verify_candidate
+            ),
+            mock.patch.object(
+                MODULE,
+                "apply_verified_candidate_import",
+                side_effect=lambda *a, **kw: identity.update(
+                    head=kw["remote"]["final_local_head"]
+                )
+                or bool(kw["remote"]["commits"]),
             ),
             mock.patch.object(MODULE, "metadata_for", side_effect=lambda _: dict(live)),
             mock.patch.object(MODULE, "remote_head", side_effect=lambda *a: live["head_sha"]),
@@ -2428,11 +2508,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
             mock.patch.object(MODULE, "publish_shared_state") as shared,
             mock.patch.object(MODULE, "emit", emitted.append),
-            mock.patch.object(MODULE, "update_pr_metadata") as metadata,
         ):
             yield args, commands, emitted
             shared.assert_not_called()
-            metadata.assert_not_called()
 
     def test_pipeline_waits_for_fixes_then_a_terminal_clean_pass(self):
         with self.pipeline_run() as (args, commands, emitted):
@@ -2655,7 +2733,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ):
                 MODULE.command_pipeline(args)
             apply.assert_not_called()
-            MODULE.validate_candidate_history.assert_not_called()
+            MODULE.verify_runtime_candidate.assert_not_called()
             MODULE.metadata_for.assert_not_called()
             self.assertEqual(1, len(commands))
             self.assertFalse(emitted)
@@ -2766,6 +2844,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         git("init", "-q")
         git("config", "user.name", "Test")
         git("config", "user.email", "test@example.com")
+        git("remote", "add", "origin", "https://github.com/owner/repo.git")
         source = self.repo_root / "source.txt"
         source.write_text("source\n", encoding="utf-8")
         git("add", "source.txt")
@@ -2780,15 +2859,52 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         result_path.write_text("{}\n", encoding="utf-8")
         identity = MODULE.local_identity(self.repo_root)
         self.assertEqual("", identity["branch"])
-        self.assertTrue(
-            MODULE.apply_verified_candidate_import(
-                self.repo_root,
-                result_path=result_path,
-                result_sha256=MODULE.sha256_file(result_path),
-                preflight={"identity": identity, "pr": {"head_sha": source_head}},
-                remote={"final_local_head": code_tip, "commits": [code_tip]},
-            )
+        runtime_path = (
+            Path(__file__).parents[2]
+            / "agent-tasks-runtime"
+            / "skills"
+            / "agent-tasks-runtime"
+            / "scripts"
+            / "cloud_task.py"
         )
+        runtime = MODULE.load_cloud_task_runtime(runtime_path)
+        repository = MODULE.candidate_git_repository(runtime)
+        repository.repository_name = mock.Mock(return_value="owner/repo")
+
+        def guarded(_result, *, root, git, **_kwargs):
+            snapshot = git.snapshot(root)
+            self.assertIsNone(snapshot.branch)
+            git.fast_forward(snapshot, code_tip)
+            return {
+                "application": "fast_forwarded",
+                "final_local_head": code_tip,
+            }
+
+        runtime.guarded_fast_forward_candidate = mock.Mock(side_effect=guarded)
+        preflight = copy.deepcopy(self.preflight)
+        preflight["identity"] = identity
+        preflight["pr"]["head_sha"] = source_head
+        with (
+            mock.patch.object(
+                MODULE, "load_candidate_runtime", return_value=runtime
+            ),
+            mock.patch.object(
+                MODULE, "candidate_git_repository", return_value=repository
+            ),
+            mock.patch.object(MODULE, "load_agent_task_result", return_value={}),
+        ):
+            self.assertTrue(
+                MODULE.apply_verified_candidate_import(
+                    self.repo_root,
+                    helper=runtime_path,
+                    requested_model="gpt-5.6-sol",
+                    prompt="frozen prompt",
+                    result_path=result_path,
+                    result_sha256=MODULE.sha256_file(result_path),
+                    preflight=preflight,
+                    remote={"final_local_head": code_tip, "commits": [code_tip]},
+                )
+            )
         self.assertEqual(
             {"branch": "", "head": code_tip, "status": ""},
             MODULE.local_identity(self.repo_root),
@@ -2801,7 +2917,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
 
 
-    def test_current_candidate_accepts_push_already_at_verified_head(self):
+    def test_current_candidate_is_superseded_when_pr_already_advanced(self):
         state_path = self.directory / "push-recovery-state.json"
         helper = self.directory / "cloud_task.py"
         helper.write_text("# helper\n", encoding="utf-8")
@@ -2859,8 +2975,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ),
             mock.patch.object(
                 MODULE,
-                "validate_candidate_history",
-                return_value={fix: ["src/app.py"]},
+                "verify_runtime_candidate",
+                return_value=self.verified_candidate(result),
             ),
             mock.patch.object(
                 MODULE,
@@ -2868,10 +2984,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 return_value=False,
             ),
             mock.patch.object(MODULE, "metadata_for", return_value=live),
+            mock.patch.object(
+                MODULE, "same_ref_forward_head_drift", return_value=True
+            ),
             mock.patch.object(MODULE, "remote_head", return_value=fix),
             mock.patch.object(MODULE, "wait_for_remote_head", return_value=fix),
             mock.patch.object(MODULE, "publish_shared_state"),
-            mock.patch.object(MODULE, "emit"),
+            mock.patch.object(MODULE, "emit") as emit,
             mock.patch.object(
                 MODULE.secrets,
                 "token_hex",
@@ -2883,7 +3002,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(len(commands), 1)
         self.assertNotIn("push", commands[0])
         state = MODULE.load_state(state_path)
-        self.assertEqual(state["agent_task"]["published_head_sha"], fix)
+        self.assertEqual("source_changed", emit.call_args.args[0]["result"])
+        self.assertEqual("superseded", state["agent_task"]["status"])
+        self.assertEqual(fix, state["agent_task"]["superseded_by_head_sha"])
 
 
 
@@ -5392,6 +5513,7 @@ class CandidateContractTest(unittest.TestCase):
                 "head_branch": "feature",
                 "head_sha": self.head,
                 "cross_repository": False,
+                "state": "OPEN",
             },
         }
 
@@ -5495,11 +5617,39 @@ class CandidateContractTest(unittest.TestCase):
         }
 
     def validate(self, result):
-        return MODULE.validate_candidate_success_result(
-            result,
-            preflight=self.preflight,
-            requested_model="gpt-5.6-sol",
+        candidate = result["candidate"]
+        artifact = candidate["artifact_commit"]
+        verified = {
+            "task": result["task"],
+            "completion": result["completion"],
+            "candidate": candidate,
+            "artifact_commit": artifact,
+            "code_tip": candidate["generated"]["code_tip_sha"],
+            "commits": [item["sha"] for item in candidate["code_commits"]],
+        }
+        runtime = SimpleNamespace(
+            CloudError=RuntimeError,
+            PullRequestSnapshot=lambda **values: SimpleNamespace(**values),
+            Options=lambda **values: SimpleNamespace(**values),
+            GitRepository=mock.Mock(return_value=object()),
+            verify_current_candidate=mock.Mock(return_value=verified),
         )
+        with mock.patch.object(
+            MODULE, "load_candidate_runtime", return_value=runtime
+        ):
+            remote = MODULE.verify_runtime_candidate(
+                result,
+                helper=Path("cloud_task.py"),
+                repo_root=Path("repo"),
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+                prompt="frozen prompt",
+            )
+        runtime.verify_current_candidate.assert_called_once()
+        options = runtime.verify_current_candidate.call_args.kwargs["options"]
+        self.assertEqual("frozen prompt", options.prompt)
+        self.assertEqual(MODULE.AGENT_TASK_POLICY, options.policy)
+        return remote
 
     def test_accepts_missing_malformed_or_arbitrary_advisory_report(self):
         cases = [
@@ -5544,70 +5694,60 @@ class CandidateContractTest(unittest.TestCase):
         self.assertEqual(self.code, fixed["final_local_head"])
         self.assertEqual(self.output, fixed["generated_head"])
 
-    def test_rejects_stale_or_mismatched_candidate_identity(self):
-        cases = []
-        stale = self.result()
-        stale["candidate"]["base"]["sha"] = "9" * 40
-        cases.append(stale)
-        wrong_task = self.result()
-        wrong_task["completion"]["task"]["id"] = "other"
-        cases.append(wrong_task)
-        platform_error = self.result()
-        platform_error["error"] = {"code": "worker_failed", "message": "failed"}
-        cases.append(platform_error)
-        for value in cases:
-            with self.subTest(value=value), self.assertRaises(MODULE.WorkflowError):
-                self.validate(value)
-
-    def test_rederives_manifest_coverage_and_excludes_output_commit(self):
-        result = self.result(output_paths=[MODULE.AGENT_TASK_OUTPUT_REPORT])
-        remote = self.validate(result)
-        parents = {
-            self.code: f"{self.code} {self.head}",
-            self.output: f"{self.output} {self.code}",
-        }
-        paths = {
-            self.code: ["src/app.py"],
-            self.output: [MODULE.AGENT_TASK_OUTPUT_REPORT],
-        }
-
-        def git_side_effect(_root, *arguments):
-            if arguments[0] == "rev-list" and arguments[1] == "--reverse":
-                return f"{self.code}\n{self.output}"
-            if arguments[0] == "rev-list":
-                return parents[arguments[-1]]
-            if arguments[0] == "show":
-                return "a" * 40
-            raise AssertionError(arguments)
-
+    def test_runtime_rejection_is_fail_closed(self):
+        runtime = SimpleNamespace(
+            CloudError=RuntimeError,
+            PullRequestSnapshot=lambda **values: SimpleNamespace(**values),
+            Options=lambda **values: SimpleNamespace(**values),
+            GitRepository=mock.Mock(return_value=object()),
+            verify_current_candidate=mock.Mock(
+                side_effect=RuntimeError("candidate identity changed")
+            ),
+        )
         with (
-            mock.patch.object(MODULE, "git", side_effect=git_side_effect),
-            mock.patch.object(
-                MODULE,
-                "git_z_paths",
-                side_effect=lambda _root, *args: paths[args[-1]],
-            ),
-            mock.patch.object(
-                MODULE,
-                "run",
-                return_value=SimpleNamespace(stdout="patch\n"),
-            ),
+            mock.patch.object(MODULE, "load_candidate_runtime", return_value=runtime),
+            self.assertRaisesRegex(MODULE.WorkflowError, "candidate rejected"),
         ):
-            coverage = MODULE.validate_candidate_history(
-                Path("repo"), base_sha=self.head, remote=remote
+            MODULE.verify_runtime_candidate(
+                self.result(),
+                helper=Path("cloud_task.py"),
+                repo_root=Path("repo"),
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+                prompt="frozen prompt",
             )
 
+    def test_runtime_manifest_coverage_excludes_output_commit(self):
+        result = self.result(output_paths=[MODULE.AGENT_TASK_OUTPUT_REPORT])
+        remote = self.validate(result)
+        coverage = {
+            item["sha"]: item["changed_paths"]
+            for item in remote["candidate_manifest"]["code_commits"]
+        }
         self.assertEqual({self.code: ["src/app.py"]}, coverage)
 
     def test_guarded_import_targets_only_the_code_tip(self):
-        remote = self.validate(
-            self.result(output_paths=[MODULE.AGENT_TASK_OUTPUT_REPORT])
+        result = self.result(output_paths=[MODULE.AGENT_TASK_OUTPUT_REPORT])
+        remote = self.validate(result)
+        imported = {
+            "application": "fast_forwarded",
+            "final_local_head": self.code,
+        }
+        runtime = SimpleNamespace(
+            CloudError=RuntimeError,
+            PullRequestSnapshot=lambda **values: SimpleNamespace(**values),
+            Options=lambda **values: SimpleNamespace(**values),
+            GitRepository=mock.Mock(return_value=object()),
+            guarded_fast_forward_candidate=mock.Mock(return_value=imported),
         )
         with tempfile.TemporaryDirectory() as directory:
             result_path = Path(directory) / "result.json"
-            result_path.write_text("result", encoding="utf-8")
+            result_path.write_text(json.dumps(result), encoding="utf-8")
             digest = MODULE.sha256_file(result_path)
             with (
+                mock.patch.object(
+                    MODULE, "load_candidate_runtime", return_value=runtime
+                ),
                 mock.patch.object(
                     MODULE,
                     "local_identity",
@@ -5616,11 +5756,13 @@ class CandidateContractTest(unittest.TestCase):
                         {"branch": "feature", "head": self.code, "status": ""},
                     ],
                 ),
-                mock.patch.object(MODULE, "run") as run_command,
             ):
                 self.assertTrue(
                     MODULE.apply_verified_candidate_import(
                         Path("repo"),
+                        helper=Path("cloud_task.py"),
+                        requested_model="gpt-5.6-sol",
+                        prompt="frozen prompt",
                         result_path=result_path,
                         result_sha256=digest,
                         preflight=self.preflight,
@@ -5628,8 +5770,10 @@ class CandidateContractTest(unittest.TestCase):
                     )
                 )
 
-        self.assertEqual(self.code, run_command.call_args.args[0][-1])
-        self.assertNotIn(self.output, run_command.call_args.args[0])
+        call = runtime.guarded_fast_forward_candidate.call_args
+        self.assertEqual(result, call.args[0])
+        self.assertEqual("frozen prompt", call.kwargs["options"].prompt)
+        self.assertEqual(MODULE.AGENT_TASK_POLICY, call.kwargs["options"].policy)
 
 
 class SourceDriftClassificationTest(unittest.TestCase):

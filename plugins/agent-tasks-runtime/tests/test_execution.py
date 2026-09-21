@@ -3,10 +3,12 @@ import importlib.util
 import io
 import json
 import ctypes
+import concurrent.futures
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -1964,6 +1966,130 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual(0, result["returncode"])
         run.assert_called_once()
         self.assertEqual(["python", "stage.py"], run.call_args.args[0])
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows process ownership regression")
+class WindowsRealProcessTest(unittest.TestCase):
+    def test_real_process_tree_is_owned_drained_and_cancelled_without_console_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            script = root / "process_tree.py"
+            script.write_text(
+                "import json\n"
+                "import os\n"
+                "from pathlib import Path\n"
+                "import subprocess\n"
+                "import sys\n"
+                "import time\n"
+                "\n"
+                "mode, ready = sys.argv[1:]\n"
+                "if mode == 'grandchild':\n"
+                "    if ready == 'normal':\n"
+                "        time.sleep(0.8)\n"
+                "    else:\n"
+                "        while True:\n"
+                "            time.sleep(1)\n"
+                "else:\n"
+                "    child = subprocess.Popen(\n"
+                "        [sys.executable, __file__, 'grandchild', mode],\n"
+                "        stdin=subprocess.DEVNULL,\n"
+                "        stdout=subprocess.DEVNULL,\n"
+                "        stderr=subprocess.DEVNULL,\n"
+                "        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000),\n"
+                "    )\n"
+                "    Path(ready).write_text(\n"
+                "        json.dumps({'parent': os.getpid(), 'grandchild': child.pid}),\n"
+                "        encoding='utf-8',\n"
+                "    )\n"
+                "    time.sleep(0.5 if mode == 'normal' else 0.25)\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            context = EXECUTION.Execution(
+                root / "execution.json",
+                command=[sys.executable, str(script)],
+                terminal_results=frozenset({"complete"}),
+            )
+            launches = []
+            real_popen = EXECUTION.subprocess.Popen
+
+            def tracked_popen(*args, **kwargs):
+                launches.append(kwargs.get("creationflags", 0))
+                return real_popen(*args, **kwargs)
+
+            def await_payload(path):
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if path.is_file():
+                        return json.loads(path.read_text(encoding="utf-8"))
+                    time.sleep(0.02)
+                self.fail(f"process fixture did not become ready: {path}")
+
+            with (
+                mock.patch.object(EXECUTION.subprocess, "Popen", side_effect=tracked_popen),
+                mock.patch.object(
+                    EXECUTION, "resume_process", wraps=EXECUTION.resume_process
+                ) as resume,
+                concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool,
+            ):
+                normal_ready = root / "normal.json"
+                normal = pool.submit(
+                    context.run,
+                    [sys.executable, str(script), "normal", str(normal_ready)],
+                )
+                normal_processes = await_payload(normal_ready)
+                normal_child = context.children[0]
+                self.assertTrue(
+                    {normal_processes["parent"], normal_processes["grandchild"]}.issubset(
+                        normal_child.owner.process_ids(time.monotonic() + 5)
+                    ),
+                )
+                self.assertEqual(0, normal.result(timeout=10).returncode)
+                self.assertTrue(EXECUTION.read(normal_child.record)["local_drained"])
+                self.assertTrue(normal_child.observed_descendants)
+
+                cancel_ready = root / "cancel.json"
+                cancelled = pool.submit(
+                    context.run,
+                    [sys.executable, str(script), "cancel", str(cancel_ready)],
+                )
+                cancel_processes = await_payload(cancel_ready)
+                cancelled_child = context.children[1]
+                deadline = time.monotonic() + 10
+                while (
+                    cancelled_child.process.poll() is None
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.02)
+                self.assertIsNotNone(cancelled_child.process.returncode)
+                self.assertIn(
+                    cancel_processes["grandchild"],
+                    cancelled_child.owner.process_ids(time.monotonic() + 5),
+                )
+                self.assertIsNone(cancelled_child.poll())
+                self.assertFalse(cancelled.done())
+                self.assertEqual(
+                    "cancel_requested",
+                    EXECUTION.cancel(context.handle)["result"],
+                )
+                with self.assertRaises(EXECUTION.Cancelled):
+                    cancelled.result(timeout=10)
+
+            self.assertEqual(2, len(launches))
+            for flags in launches:
+                self.assertTrue(flags & getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+                self.assertTrue(flags & 4)
+            self.assertEqual(
+                [child.pid for child in context.children],
+                [call.args[0] for call in resume.call_args_list],
+            )
+            for pid in cancel_processes.values():
+                identity = EXECUTION.process_identity(pid)
+                self.assertTrue(identity is None or not identity["running"])
+            context.emit({"result": "complete"})
+            terminal = context.finish(130, cancelled=True)
+            self.assertEqual("cancelled_local", terminal["local_status"])
+            self.assertTrue(terminal["local_children_drained"])
 
 
 class ExecutionBootstrapTest(unittest.TestCase):

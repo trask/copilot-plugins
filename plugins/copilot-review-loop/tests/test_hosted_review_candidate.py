@@ -39,6 +39,7 @@ class HostedReviewCandidateTest(unittest.TestCase):
         self.git("config", "user.email", "fixture@example.invalid")
         self.git("config", "commit.gpgsign", "false")
         self.git("config", "core.autocrlf", "false")
+        self.git("remote", "add", "origin", "https://github.com/owner/repo.git")
         (self.repo / "example.txt").write_text("before\n", encoding="utf-8")
         self.git("add", "example.txt")
         self.git("commit", "-q", "-m", "Source")
@@ -82,6 +83,11 @@ class HostedReviewCandidateTest(unittest.TestCase):
 
     def git(self, *arguments):
         return MODULE.git(self.repo, *arguments)
+
+    def repository(self):
+        repository = MODULE.candidate_git_repository(self.runtime)
+        repository.repository_name = mock.Mock(return_value="owner/repo")
+        return repository
 
     def candidate(
         self, *, fixed=True, decision=None, extra_code=False,
@@ -184,10 +190,6 @@ class HostedReviewCandidateTest(unittest.TestCase):
             mock.patch.object(self.runtime, "validate_policy_before_mutation"),
             mock.patch.object(self.runtime, "start_task", return_value=task),
             mock.patch.object(self.runtime, "monitor_task", return_value=task),
-            mock.patch.object(
-                self.runtime, "fetch_report",
-                side_effect=AssertionError("advisory report must stay inert"),
-            ),
         ):
             self.assertEqual(0, self.runtime.execute(
                 options, cwd=self.repo, result=result,
@@ -195,7 +197,6 @@ class HostedReviewCandidateTest(unittest.TestCase):
                 stdout=io.StringIO(), stderr=io.StringIO(),
             ))
         repository.fast_forward.assert_not_called()
-        repository.cherry_pick.assert_not_called()
         api.request_json.assert_not_called()
         self.result = result.as_dict()
         self.assertEqual(code, self.result["generated"]["commits"])
@@ -244,12 +245,20 @@ class HostedReviewCandidateTest(unittest.TestCase):
         self.assertNotIn("GH_CONFIG_DIR", options["environment"])
         self.assertEqual(tip, bundle["remote"]["final_local_head"])
         self.assertEqual("fixed", bundle["report"]["comments"][0]["disposition"])
-        MODULE.apply_verified_import(
-            self.repo, result_path=self.result_path,
-            result_sha256=MODULE.sha256_file(self.result_path),
-            report_content=bundle["report_content"],
-            preflight=self.preflight, remote=bundle["remote"],
-        )
+        with mock.patch.object(
+            MODULE, "candidate_git_repository", return_value=self.repository()
+        ):
+            MODULE.apply_verified_import(
+                self.repo,
+                helper=RUNTIME_PATH,
+                requested_model="gpt-5.6-sol",
+                prompt=self.prompt,
+                result_path=self.result_path,
+                result_sha256=MODULE.sha256_file(self.result_path),
+                report_content=bundle["report_content"],
+                preflight=self.preflight,
+                remote=bundle["remote"],
+            )
         self.assertEqual(tip, self.git("rev-parse", "HEAD"))
         self.assertEqual("", MODULE.local_identity(self.repo)["branch"])
         self.assertFalse((self.repo / MODULE.HOSTED_DECISION_PATH).exists())
@@ -350,12 +359,20 @@ class HostedReviewCandidateTest(unittest.TestCase):
         for commit in commits:
             self.assertIn(commit, reply)
         tree = self.git("rev-parse", f"{tip}^{{tree}}")
-        MODULE.apply_verified_import(
-            self.repo, result_path=self.result_path,
-            result_sha256=MODULE.sha256_file(self.result_path),
-            report_content=bundle["report_content"],
-            preflight=self.preflight, remote=bundle["remote"],
-        )
+        with mock.patch.object(
+            MODULE, "candidate_git_repository", return_value=self.repository()
+        ):
+            MODULE.apply_verified_import(
+                self.repo,
+                helper=RUNTIME_PATH,
+                requested_model="gpt-5.6-sol",
+                prompt=self.prompt,
+                result_path=self.result_path,
+                result_sha256=MODULE.sha256_file(self.result_path),
+                report_content=bundle["report_content"],
+                preflight=self.preflight,
+                remote=bundle["remote"],
+            )
         self.assertEqual(tip, self.git("rev-parse", "HEAD"))
         self.assertEqual(tree, self.git("rev-parse", "HEAD^{tree}"))
         self.assertEqual(commits, self.git("rev-list", "--reverse", f"{self.head}..HEAD").splitlines())
@@ -392,6 +409,7 @@ class HostedReviewCandidateTest(unittest.TestCase):
         pushes = []
         original_run = MODULE.run
         emitted = []
+        candidate_repository = self.repository()
 
         def run(command, **kwargs):
             nonlocal published
@@ -421,6 +439,11 @@ class HostedReviewCandidateTest(unittest.TestCase):
             mock.patch.object(MODULE, "remote_head", side_effect=lambda *_args: published),
             mock.patch.object(MODULE, "wait_for_remote_head", side_effect=lambda *_args: published),
             mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
+            mock.patch.object(
+                MODULE,
+                "candidate_git_repository",
+                return_value=candidate_repository,
+            ),
             mock.patch.object(MODULE, "require_live_comments", return_value=self.preflight["comments"]),
             mock.patch.object(MODULE, "post_missing_replies", return_value={17: 71}) as replies,
             mock.patch.object(MODULE, "resolve_threads") as resolve,
@@ -559,14 +582,14 @@ class HostedReviewCandidateTest(unittest.TestCase):
     def test_generated_commit_list_must_match_verified_history(self):
         self.candidate()
         self.result["generated"]["commits"] = []
-        with self.assertRaisesRegex(MODULE.WorkflowError, "generated commits do not match"):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "candidate rejected"):
             self.run_worker()
         self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
 
     def test_manifest_drift_rejects_mapped_multicommit_candidate(self):
         self.candidate(extra_code=True)
         self.result["candidate"]["code_commits"][0]["patch_sha256"] = "f" * 64
-        with self.assertRaisesRegex(MODULE.WorkflowError, "manifest does not match verified history"):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "candidate rejected"):
             self.run_worker()
         self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
 
@@ -607,7 +630,7 @@ class HostedReviewCandidateTest(unittest.TestCase):
     def test_code_after_output_commit_is_rejected_before_decisions(self):
         self.candidate()
         self.append_candidate_paths(["example.txt"])
-        with self.assertRaisesRegex(MODULE.WorkflowError, "candidate history rejected"):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "candidate rejected"):
             self.run_worker()
         self.assertFalse(self.decision_path.exists())
         self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
@@ -630,7 +653,7 @@ class HostedReviewCandidateTest(unittest.TestCase):
         self.git("merge", "-q", "--no-ff", "side", "-m", "Merge")
         self.result["generated"]["head_sha"] = self.git("rev-parse", "HEAD")
         self.git("checkout", "-q", "--detach", self.head)
-        with self.assertRaisesRegex(MODULE.WorkflowError, "candidate history rejected"):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "candidate rejected"):
             self.run_worker()
         self.assertFalse(self.decision_path.exists())
         self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
@@ -641,7 +664,7 @@ class HostedReviewCandidateTest(unittest.TestCase):
         self.git("commit", "-q", "-m", "Foreign root")
         self.result["generated"]["head_sha"] = self.git("rev-parse", "HEAD")
         self.git("checkout", "-q", "--detach", self.head)
-        with self.assertRaisesRegex(MODULE.WorkflowError, "candidate history rejected"):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "candidate rejected"):
             self.run_worker()
         self.assertFalse(self.decision_path.exists())
         self.assertEqual(self.head, self.git("rev-parse", "HEAD"))

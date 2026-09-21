@@ -108,13 +108,10 @@ class CompleteCiObservationTest(unittest.TestCase):
                 self.runs = after_task
             return MODULE.subprocess.CompletedProcess(command, 0, "", "")
 
-        import_candidate = MODULE.apply_verified_candidate_import
-
-        def apply_candidate(*args, **kwargs):
-            imported = import_candidate(*args, **kwargs)
+        def apply_candidate(*_args, **kwargs):
             if after_import is not None:
                 self.runs = after_import
-            return imported
+            return bool(kwargs["remote"]["commits"])
 
         args = MODULE.build_parser().parse_args([
             "agent-task", self.preflight["pr"]["pr_url"],
@@ -129,7 +126,11 @@ class CompleteCiObservationTest(unittest.TestCase):
             mock.patch.object(MODULE, "discover_cloud_task", return_value=self.fixture.root / "cloud_task.py"),
             mock.patch.object(MODULE, "run", side_effect=run) as dispatch,
             mock.patch.object(MODULE, "local_identity", return_value=self.preflight["identity"]),
-            mock.patch.object(MODULE, "validate_candidate_history", return_value={}),
+            mock.patch.object(
+                MODULE,
+                "verify_runtime_candidate",
+                side_effect=self.fixture.verified_candidate,
+            ),
             mock.patch.object(MODULE, "remote_head", return_value=self.fixture.head),
             mock.patch.object(MODULE, "publication_lock", return_value=contextlib.nullcontext()),
             mock.patch.object(MODULE, "fetch_committed_text", return_value=json.dumps(diagnosis)),

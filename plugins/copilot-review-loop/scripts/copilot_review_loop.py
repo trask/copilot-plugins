@@ -189,7 +189,7 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "fc1c2217425c4ecfe9399ef72526041e01a31c79bd6ca43c907fc37b1957ba72"
+    "21338db268e9e0d73418b3b35e97fdf8e3409a963782a94de8d4fbb170bb4e71"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -933,9 +933,6 @@ def last_helper_activity(state: dict[str, Any]) -> str | None:
 def save_state(path: Path, state: dict[str, Any]) -> None:
     if _EXECUTION is not None:
         _EXECUTION.record_state(path, state)
-        pr = state.get("pr")
-        if isinstance(pr, dict) and pr:
-            _EXECUTION.claim_writers([(pr.get("head_repository") or f"{pr['head_owner']}/{pr['head_repo']}", pr["head_branch"])])
     path.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = utc_now()
     handle, temporary_name = tempfile.mkstemp(
@@ -5301,6 +5298,9 @@ def validate_generated_history(
 def apply_verified_import(
     repo_root: Path,
     *,
+    helper: Path,
+    requested_model: str,
+    prompt: str,
     result_path: Path,
     result_sha256: str,
     report_content: str,
@@ -5314,40 +5314,47 @@ def apply_verified_import(
     identity = local_identity(repo_root)
     expected_branch = preflight["identity"]["branch"]
     source_head = preflight["pr"]["head_sha"]
-    final_head = remote["final_local_head"]
-    if identity["branch"] != expected_branch or identity["status"]:
+    if (
+        identity["branch"] != expected_branch
+        or identity["status"]
+        or identity["head"] != source_head
+    ):
         raise WorkflowError(
             "local repository identity drifted before verified import"
         )
-    if identity["head"] == final_head:
-        return False
-    if not remote["requires_apply"]:
-        raise WorkflowError(
-            "legacy Agent Task result claims an import that is not present locally"
+    runtime = load_candidate_runtime(helper)
+    pr = preflight["pr"]
+    snapshot = runtime.PullRequestSnapshot(
+        state=pr["state"],
+        cross_repository=pr["cross_repository"],
+        **expected_cloud_pull_request(preflight),
+    )
+    options = runtime.Options(
+        report=False,
+        model=requested_model,
+        prompt=prompt,
+        apply_with_report=True,
+        policy=HOSTED_DECISION_POLICY,
+    )
+    try:
+        imported = runtime.guarded_fast_forward_candidate(
+            load_agent_task_result(result_path),
+            options=options,
+            pull_request=snapshot,
+            root=repo_root,
+            git=candidate_git_repository(runtime),
         )
-    if identity["head"] != source_head:
-        raise WorkflowError(
-            "local HEAD is neither the pinned source nor verified final commit"
-        )
-    if remote["commits"]:
-        run(
-            [
-                "git",
-                "-C",
-                str(repo_root),
-                "merge",
-                "--ff-only",
-                final_head,
-            ]
-        )
+    except runtime.CloudError as error:
+        raise WorkflowError(f"hosted review candidate import rejected: {error}") from error
     final_identity = local_identity(repo_root)
     if (
         final_identity["branch"] != expected_branch
         or final_identity["status"]
-        or final_identity["head"] != final_head
+        or final_identity["head"] != imported["final_local_head"]
+        or imported["final_local_head"] != remote["final_local_head"]
     ):
         raise WorkflowError("verified Agent Task import did not reach the expected HEAD")
-    return bool(remote["commits"])
+    return imported["application"] == "fast_forwarded"
 
 
 def historical_fix_context(
@@ -7479,188 +7486,87 @@ def render_canonical_review_report(report: dict[str, Any]) -> str:
     ) + "\n"
 
 
-def load_candidate_runtime(helper: Path) -> ModuleType:
-    try:
-        source = helper.read_bytes()
-    except OSError as error:
-        raise WorkflowError(f"could not read the pinned Agent Tasks runtime: {error}") from error
+def load_cloud_task_runtime(source_path: Path) -> ModuleType:
+    if (
+        not source_path.is_absolute()
+        or not source_path.is_file()
+        or source_path.is_symlink()
+        or source_path.parent.is_symlink()
+    ):
+        raise RuntimeError("cloud-task Runtime source path is invalid")
+    source_path = source_path.resolve()
+    source = source_path.read_bytes()
     if hashlib.sha256(source).hexdigest() != REQUIRED_CLOUD_TASK_SHA256:
-        raise WorkflowError("shared Agent Tasks runtime integrity changed")
-    name = "_copilot_review_candidate_runtime"
-    spec = importlib.util.spec_from_file_location(name, helper)
-    if spec is None or spec.loader is None:
-        raise WorkflowError("could not load the pinned Agent Tasks runtime")
-    code = compile(source, str(helper), "exec", dont_inherit=True)
-    module = importlib.util.module_from_spec(spec)
-    previous = sys.modules.get(name)
-    sys.modules[name] = module
+        raise RuntimeError("cloud-task Runtime source digest changed")
+    module = ModuleType("_trask_agent_tasks_runtime")
+    module.__file__ = str(source_path)
+    sys.modules[module.__name__] = module
     try:
-        exec(code, module.__dict__)
+        exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
     except BaseException:
-        if previous is None:
-            sys.modules.pop(name, None)
-        else:
-            sys.modules[name] = previous
+        sys.modules.pop(module.__name__, None)
         raise
     return module
+
+
+def load_candidate_runtime(helper: Path) -> ModuleType:
+    try:
+        return load_cloud_task_runtime(helper)
+    except (OSError, RuntimeError) as error:
+        raise WorkflowError(f"could not load the pinned Agent Tasks runtime: {error}") from error
 
 
 def candidate_git_repository(runtime: ModuleType) -> Any:
     def runner(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         cwd = kwargs.get("cwd")
         return run(
-            command, cwd=Path(cwd) if cwd is not None else None,
-            input_text=kwargs.get("input"), check=False,
+            command,
+            cwd=Path(cwd) if cwd is not None else None,
+            input_text=kwargs.get("input"),
+            check=False,
         )
 
-    return runtime.GitRepository(runner=runner)
+    class CandidateGitRepository(runtime.GitRepository):
+        def snapshot(
+            self, cwd: Path, *, allow_detached: bool = False
+        ) -> Any:
+            return super().snapshot(cwd, allow_detached=True)
 
-
-def validate_hosted_completion(
-    result: dict[str, Any], *, preflight: dict[str, Any],
-    requested_model: str, submitted_prompt: str,
-) -> str:
-    pr = preflight["pr"]
-    task = result["task"]
-    generated = result["generated"]
-    completion = result.get("completion")
-    if not isinstance(completion, dict) or set(completion) != {
-        "request", "task", "session", "repository", "refs",
-    }:
-        raise WorkflowError("hosted review completion evidence is malformed")
-    session = completion.get("session")
-    completed_task = completion.get("task")
-    repository = completion.get("repository")
-    digest = sha256_text(submitted_prompt)
-    if (
-        completion["request"]
-        != {"requested_model": requested_model, "prompt_sha256": digest}
-        or completion["refs"]
-        != {"base": task["base_ref"], "generated": generated["branch"]}
-        or not isinstance(session, dict)
-        or set(session) != {
-            "id", "state", "actual_model", "created_at", "updated_at",
-            "completed_at", "prompt_sha256",
-        }
-        or not isinstance(session.get("id"), str) or not session["id"]
-        or session["state"] != "completed"
-        or session["actual_model"] not in {
-            requested_model, f"sweagent-capi:{requested_model}",
-        }
-        or session["prompt_sha256"] != digest
-        or not isinstance(completed_task, dict)
-        or set(completed_task) != {
-            "id", "state", "created_at", "updated_at", "completed_at",
-            "raw_response_sha256",
-        }
-        or completed_task["id"] != task["id"]
-        or completed_task["state"] != "completed"
-        or not isinstance(completed_task["raw_response_sha256"], str)
-        or SHA256_PATTERN.fullmatch(completed_task["raw_response_sha256"]) is None
-        or not isinstance(repository, dict)
-        or set(repository) != {"name_with_owner", "id", "owner"}
-        or repository["name_with_owner"] != pr["repo_name"]
-        or type(repository["id"]) is not int or repository["id"] <= 0
-        or not isinstance(repository["owner"], dict)
-        or set(repository["owner"]) != {"login", "id"}
-        or repository["owner"]["login"] != pr["repo_name"].split("/")[0]
-        or type(repository["owner"]["id"]) is not int
-        or repository["owner"]["id"] <= 0
-    ):
-        raise WorkflowError("hosted review completion identity drifted")
-    for owner in (session, completed_task):
-        for field in ("created_at", "updated_at", "completed_at"):
-            value = owner[field]
-            if value is None and field != "created_at":
-                continue
-            try:
-                if not isinstance(value, str) or not value:
-                    raise ValueError("missing timestamp")
-                timestamp = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-                if timestamp.tzinfo is None:
-                    raise ValueError("missing timezone")
-            except ValueError as error:
-                raise WorkflowError("hosted review completion timestamp is invalid") from error
-    return session["id"]
+    return CandidateGitRepository(runner=runner)
 
 
 def validate_hosted_candidate(
     result: dict[str, Any], *, runtime: ModuleType, repo_root: Path,
-    preflight: dict[str, Any], requested_model: str, submitted_prompt: str,
+    preflight: dict[str, Any], requested_model: str, prompt: str,
 ) -> tuple[dict[str, Any], dict[str, list[str]]]:
     pr = preflight["pr"]
-    if (
-        result.get("schema") != CANDIDATE_AGENT_TASK_RESULT_SCHEMA
-        or result.get("policy") != {
-            "id": runtime.MARKETPLACE_CODE_CANDIDATE_POLICY_ID,
-            "version": runtime.MARKETPLACE_CODE_CANDIDATE_POLICY_VERSION,
-            "sha256": runtime.MARKETPLACE_CODE_CANDIDATE_POLICY_HASH,
-        }
-        or result.get("requested_model") != requested_model
-        or result.get("mode") != "code_candidate"
-        or result.get("repository") != {"name_with_owner": pr["repo_name"]}
-        or result.get("pull_request") != expected_cloud_pull_request(preflight)
-        or result.get("status") != "success" or result.get("error") is not None
-        or result.get("report") is not None
-        or result.get("application")
-        != {"status": "not_applied", "final_local_head": pr["head_sha"]}
-        or result.get("attestation")
-        != {"kind": "dispatcher_candidate", "structural_complete": True}
-    ):
-        raise WorkflowError("hosted review candidate identity or policy is invalid")
-    task = result.get("task")
-    generated = result.get("generated")
-    base_ref = pr["head_sha"] if pr["cross_repository"] else pr["head_branch"]
-    if (
-        not isinstance(task, dict)
-        or set(task) != {"id", "url", "state", "base_ref", "base_sha"}
-        or not isinstance(task.get("id"), str) or not task["id"]
-        or task["state"] != "completed"
-        or task["base_ref"] != base_ref or task["base_sha"] != pr["head_sha"]
-        or (task["url"] is not None and (
-            not isinstance(task["url"], str) or not task["url"]
-        ))
-        or not isinstance(generated, dict)
-        or set(generated) != {"branch", "head_sha", "commits"}
-        or not isinstance(generated["branch"], str) or not generated["branch"]
-        or not isinstance(generated["head_sha"], str)
-        or SHA_PATTERN.fullmatch(generated["head_sha"]) is None
-        or not isinstance(generated["commits"], list)
-    ):
-        raise WorkflowError("hosted review task or generated identity is invalid")
-    session_id = validate_hosted_completion(
-        result, preflight=preflight, requested_model=requested_model,
-        submitted_prompt=submitted_prompt,
+    snapshot = runtime.PullRequestSnapshot(
+        state=pr["state"],
+        cross_repository=pr["cross_repository"],
+        **expected_cloud_pull_request(preflight),
+    )
+    options = runtime.Options(
+        report=False,
+        model=requested_model,
+        prompt=prompt,
+        apply_with_report=True,
+        policy=HOSTED_DECISION_POLICY,
     )
     try:
-        repository = candidate_git_repository(runtime)
-        commits = repository.cloud_commits(
-            repo_root, pr["head_sha"], generated["head_sha"]
-        )
-        history = repository.candidate_history(
-            repo_root, pr["head_sha"], commits, report_only=False
+        verified = runtime.verify_current_candidate(
+            result,
+            options=options,
+            pull_request=snapshot,
+            root=repo_root,
+            git=candidate_git_repository(runtime),
         )
     except runtime.CloudError as error:
-        raise WorkflowError(f"hosted review candidate history rejected: {error}") from error
-    expected_manifest = {
-        "schema": runtime.CANDIDATE_MANIFEST_SCHEMA,
-        "repository": {"name_with_owner": pr["repo_name"]},
-        "task": {"id": task["id"], "session_id": session_id},
-        "base": {"ref": base_ref, "sha": pr["head_sha"]},
-        "generated": {
-            "ref": generated["branch"], "head_sha": generated["head_sha"],
-            "code_tip_sha": history.code_head,
-        },
-        "code_commits": list(history.code_commits),
-        "artifact_commit": history.artifact_commit,
-    }
-    code_commits = [item["sha"] for item in history.code_commits]
-    artifact = history.artifact_commit
-    if result.get("candidate") != expected_manifest:
-        raise WorkflowError("hosted review candidate manifest does not match verified history")
-    if generated["commits"] != code_commits:
-        raise WorkflowError("hosted review generated commits do not match verified code commits")
-    if artifact is None or artifact["sha"] != generated["head_sha"]:
+        raise WorkflowError(f"hosted review candidate rejected: {error}") from error
+    task = verified["task"]
+    completion = verified["completion"]
+    candidate = verified["candidate"]
+    artifact = verified["artifact_commit"]
+    if artifact is None or artifact["sha"] != result["generated"]["head_sha"]:
         raise WorkflowError("hosted review candidate requires a final decisions artifact commit")
     if HOSTED_DECISION_PATH not in artifact["changed_paths"]:
         raise WorkflowError(
@@ -7668,21 +7574,23 @@ def validate_hosted_candidate(
         )
     if any(
         path.startswith(".github/agent-task-")
-        for item in history.code_commits for path in item["changed_paths"]
+        for item in candidate["code_commits"] for path in item["changed_paths"]
     ):
         raise WorkflowError("hosted review code commits contain reserved Agent Task paths")
-    for commit in code_commits:
+    for commit in verified["commits"]:
         require_no_credentials(
             git(repo_root, "show", "-s", "--format=%B", commit),
             source=f"candidate commit {commit} message",
         )
     return {
         "task_id": task["id"], "task_url": task["url"],
-        "session_id": session_id, "generated_branch": generated["branch"],
-        "generated_head": generated["head_sha"], "commits": code_commits,
-        "final_local_head": history.code_head, "requires_apply": True,
+        "session_id": completion["session"]["id"],
+        "generated_branch": result["generated"]["branch"],
+        "generated_head": result["generated"]["head_sha"],
+        "commits": verified["commits"],
+        "final_local_head": verified["code_tip"], "requires_apply": True,
         "structural_attestation": True,
-    }, {item["sha"]: item["changed_paths"] for item in history.code_commits}
+    }, {item["sha"]: item["changed_paths"] for item in candidate["code_commits"]}
 
 
 def run_hosted_decision_worker(
@@ -7700,17 +7608,6 @@ def run_hosted_decision_worker(
         raise WorkflowError("hosted review prompt version is not current; retained requests cannot be replayed")
     prompt_sha256 = sha256_file(prompt_path)
     pr = preflight["pr"]
-    snapshot = runtime.PullRequestSnapshot(
-        state=pr["state"], cross_repository=pr["cross_repository"],
-        **expected_cloud_pull_request(preflight),
-    )
-    submitted = runtime.task_payload(
-        runtime.Options(
-            report=False, model=requested_model, prompt=prompt,
-            apply_with_report=True, policy=HOSTED_DECISION_POLICY,
-        ),
-        report_path=runtime.OUTPUT_REPORT_PATH, pull_request=snapshot,
-    )["prompt"]
     command = [
         sys.executable, str(helper), "--apply-with-report", "--model", "sol",
         "--pr", pr["pr_url"], "--prompt-file", str(prompt_path),
@@ -7737,7 +7634,7 @@ def run_hosted_decision_worker(
         raise WorkflowError("hosted review changed its pinned source, GitHub, or dispatch identity")
     remote, paths = validate_hosted_candidate(
         result, runtime=runtime, repo_root=repo_root, preflight=preflight,
-        requested_model=requested_model, submitted_prompt=submitted,
+        requested_model=requested_model, prompt=prompt,
     )
     decision_content = git(
         repo_root, "show", f"{remote['generated_head']}:{HOSTED_DECISION_PATH}"
@@ -8969,6 +8866,9 @@ def command_agent_task(args: argparse.Namespace) -> None:
         require_live_comments(preflight)
         imported = apply_verified_import(
             repo_root,
+            helper=helper,
+            requested_model=requested_model,
+            prompt=prompt,
             result_path=result_path,
             result_sha256=result_sha256,
             report_content=report_content,
@@ -9526,12 +9426,35 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "source_changed",
     "review_comments_pending_preparation",
 })
-EXECUTION_SHA256 = "bcca8dfa65d156b33081c2edf841b375a0620d4c1bdbc3cec3fd6501dc5cf53c"
+EXECUTION_SHA256 = "ce1ed0beed8d3daed64a31c453b8f010190cbe5648342f44b6a26a0a94c6ffb6"
+EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
+
+
+def load_execution_runtime(source_path: Path) -> ModuleType:
+    if (
+        not source_path.is_absolute()
+        or not source_path.is_file()
+        or source_path.is_symlink()
+        or source_path.parent.is_symlink()
+    ):
+        raise RuntimeError("execution Runtime source path is invalid")
+    source_path = source_path.resolve()
+    source = source_path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
+        raise RuntimeError("execution Runtime source digest changed")
+    module = ModuleType("_trask_foreground_execution")
+    module.__file__ = str(source_path)
+    sys.modules[module.__name__] = module
+    try:
+        exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
+    except BaseException:
+        sys.modules.pop(module.__name__, None)
+        raise
+    return module
 
 
 def _load_execution():
     """Load only the pinned shared foreground execution source."""
-    import types
     inventory = subprocess.run(
         ["copilot", "skill", "list", "--json"], check=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
@@ -9546,16 +9469,9 @@ def _load_execution():
     if len(matches) != 1:
         raise RuntimeError("shared execution Runtime is not uniquely installed and enabled")
     root = Path(matches[0]["path"])
-    source_path = root / "scripts" / "execution.py"
-    if not root.is_absolute() or any(path.is_symlink() for path in (root, source_path.parent, source_path)):
+    if not root.is_absolute() or root.is_symlink():
         raise RuntimeError("shared execution Runtime path is invalid")
-    source = source_path.read_bytes()
-    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
-        raise RuntimeError("shared execution Runtime source digest changed")
-    module = types.ModuleType("trask_foreground_execution")
-    module.__file__ = str(source_path)
-    exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
-    return module
+    return load_execution_runtime(root / EXECUTION_RELATIVE_PATH)
 
 
 def execution_main():

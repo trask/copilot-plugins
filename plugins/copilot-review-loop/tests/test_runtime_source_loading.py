@@ -19,7 +19,7 @@ RUNTIME = (
     Path(__file__).parents[2] / "agent-tasks-runtime" / "skills"
     / "agent-tasks-runtime" / "scripts" / "cloud_task.py"
 )
-MODULE_NAME = "_copilot_review_candidate_runtime"
+MODULE_NAME = "_trask_agent_tasks_runtime"
 
 
 class RuntimeSourceLoadingTest(unittest.TestCase):
@@ -46,10 +46,9 @@ class RuntimeSourceLoadingTest(unittest.TestCase):
 
     def assert_runtime(self, runtime):
         self.assertEqual(MODULE_NAME, runtime.__name__)
-        self.assertEqual(MODULE_NAME, runtime.__spec__.name)
         self.assertEqual(str(self.helper), runtime.__file__)
-        self.assertEqual(str(self.helper), runtime.__spec__.origin)
-        self.assertEqual("", runtime.__package__)
+        self.assertIsNone(runtime.__spec__)
+        self.assertIsNone(runtime.__package__)
         self.assertIs(runtime, sys.modules[MODULE_NAME])
         self.assertEqual(
             MODULE_NAME,
@@ -115,18 +114,18 @@ class RuntimeSourceLoadingTest(unittest.TestCase):
         existing = ModuleType(MODULE_NAME)
         sys.modules[MODULE_NAME] = existing
         self.helper.write_bytes(b"raise AssertionError('unverified source executed')\n")
-        with self.assertRaisesRegex(MODULE.WorkflowError, "integrity changed"):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "digest changed"):
             MODULE.load_candidate_runtime(self.helper)
         self.assertIs(existing, sys.modules[MODULE_NAME])
         self.assertFalse(self.cache.parent.exists())
 
     def test_missing_source_fails_with_workflow_error(self):
         self.helper.unlink()
-        with self.assertRaisesRegex(MODULE.WorkflowError, "could not read"):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "source path is invalid"):
             MODULE.load_candidate_runtime(self.helper)
         self.assertNotIn(MODULE_NAME, sys.modules)
 
-    def test_execution_failure_restores_module_registration(self):
+    def test_execution_failure_removes_module_registration(self):
         source = b"raise RuntimeError('fixture initialization failed')\n"
         self.helper.write_bytes(source)
         for existing in (None, ModuleType(MODULE_NAME)):
@@ -143,7 +142,7 @@ class RuntimeSourceLoadingTest(unittest.TestCase):
                     self.assertRaisesRegex(RuntimeError, "fixture initialization failed"),
                 ):
                     MODULE.load_candidate_runtime(self.helper)
-                self.assertIs(existing, sys.modules.get(MODULE_NAME))
+                self.assertNotIn(MODULE_NAME, sys.modules)
         self.assertFalse(self.cache.parent.exists())
 
 

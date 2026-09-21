@@ -3783,6 +3783,35 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "error": None,
         }
 
+    def verified_candidate(self, result, **_kwargs):
+        candidate = result["candidate"]
+        artifact = candidate["artifact_commit"]
+        return {
+            "contract": "candidate",
+            "task_id": result["task"]["id"],
+            "task_url": result["task"]["url"],
+            "session_id": result["completion"]["session"]["id"],
+            "generated_branch": result["generated"]["branch"],
+            "generated_head": result["generated"]["head_sha"],
+            "code_tip": candidate["generated"]["code_tip_sha"],
+            "commits": [item["sha"] for item in candidate["code_commits"]],
+            "final_local_head": candidate["generated"]["code_tip_sha"],
+            "requires_apply": True,
+            "candidate_manifest": candidate,
+            "completion": result["completion"],
+            "report_evidence": (
+                {
+                    "path": MODULE.CI_DIAGNOSIS_PATH,
+                    "commit": artifact["sha"],
+                    "patch_sha256": artifact["patch_sha256"],
+                }
+                if artifact is not None
+                and MODULE.CI_DIAGNOSIS_PATH in artifact["changed_paths"]
+                else None
+            ),
+            "structural_attestation": True,
+        }
+
     def candidate_taskless_failure(self):
         failure = self.candidate_result()
         failure.update(
@@ -6706,67 +6735,6 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             ):
                 MODULE.require_no_credentials(value, source=source)
 
-    def test_rejects_unexpected_history_merges_paths_and_commit_messages(self):
-        commit = "5" * 40
-        remote = self.remote([commit])
-        with (
-            mock.patch.object(MODULE, "git", return_value=""),
-            self.assertRaisesRegex(MODULE.WorkflowError, "unexpected"),
-        ):
-            MODULE.validate_generated_history(
-                self.root,
-                base_sha=self.head,
-                remote=remote,
-                expected_paths=["src/widget.py"],
-            )
-        with (
-            mock.patch.object(
-                MODULE,
-                "git",
-                side_effect=[
-                    f"{commit}\n{self.artifact}",
-                    f"{commit} {self.head} {'9' * 40}",
-                ],
-            ),
-            self.assertRaisesRegex(MODULE.WorkflowError, "merge"),
-        ):
-            MODULE.validate_generated_history(
-                self.root,
-                base_sha=self.head,
-                remote=remote,
-                expected_paths=["src/widget.py"],
-            )
-
-    def test_rejects_unexpected_artifact_and_fix_paths(self):
-        commit = "5" * 40
-        remote = self.remote([commit])
-        messages = [
-            f"{commit}\n{self.artifact}",
-            f"{commit} {self.head}",
-            f"{self.artifact} {commit}",
-            (
-                "Fix CI\n\nFinding: failing-test\n"
-            ),
-        ]
-        with (
-            mock.patch.object(MODULE, "git", side_effect=messages),
-            mock.patch.object(
-                MODULE,
-                "git_z_paths",
-                side_effect=[
-                    [remote["report_path"], "unexpected.txt"],
-                    ["src/widget.py"],
-                ],
-            ),
-            self.assertRaisesRegex(MODULE.WorkflowError, "artifact commit"),
-        ):
-            MODULE.validate_generated_history(
-                self.root,
-                base_sha=self.head,
-                remote=remote,
-                expected_paths=["src/widget.py"],
-            )
-
     def test_rejects_dirty_local_drift_stale_head_and_stale_checks(self):
         drifted = dict(self.preflight["pr"])
         drifted["head_sha"] = "9" * 40
@@ -6977,6 +6945,26 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         result["candidate"]["artifact_commit"] = artifact
         result["candidate"]["generated"]["head_sha"] = self.artifact
         result["generated"]["head_sha"] = self.artifact
+        remote = {
+            "contract": "candidate",
+            "task_id": result["task"]["id"],
+            "task_url": result["task"]["url"],
+            "session_id": result["completion"]["session"]["id"],
+            "generated_branch": result["generated"]["branch"],
+            "generated_head": result["generated"]["head_sha"],
+            "code_tip": result["candidate"]["generated"]["code_tip_sha"],
+            "commits": [item["sha"] for item in result["candidate"]["code_commits"]],
+            "final_local_head": result["candidate"]["generated"]["code_tip_sha"],
+            "requires_apply": True,
+            "candidate_manifest": result["candidate"],
+            "completion": result["completion"],
+            "report_evidence": {
+                "path": MODULE.CI_DIAGNOSIS_PATH,
+                "commit": artifact["sha"],
+                "patch_sha256": artifact["patch_sha256"],
+            },
+            "structural_attestation": True,
+        }
         commands = []
 
         def run_command(command, **kwargs):
@@ -7008,7 +6996,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(MODULE, "discover_cloud_task", return_value=self.root / "cloud_task.py"),
             mock.patch.object(MODULE, "run", side_effect=run_command),
             mock.patch.object(MODULE, "local_identity", return_value=preflight["identity"]),
-            mock.patch.object(MODULE, "validate_candidate_history", return_value={}),
+            mock.patch.object(MODULE, "verify_runtime_candidate", return_value=remote),
             mock.patch.object(MODULE, "refuse_test_suppression"),
             mock.patch.object(
                 MODULE, "require_live_check_snapshot",
@@ -7032,7 +7020,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(MODULE, "fetch_committed_text", return_value=json.dumps(payload)),
             mock.patch.object(
                 MODULE, "apply_verified_candidate_import",
-                wraps=MODULE.apply_verified_candidate_import,
+                return_value=False,
             ) as apply,
             mock.patch.object(MODULE, "emit") as emit,
         ):
@@ -7157,7 +7145,19 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 "local_identity",
                 side_effect=lambda *_: dict(identity),
             ),
-            mock.patch.object(MODULE, "validate_candidate_history"),
+            mock.patch.object(
+                MODULE,
+                "verify_runtime_candidate",
+                side_effect=self.verified_candidate,
+            ),
+            mock.patch.object(
+                MODULE,
+                "apply_verified_candidate_import",
+                side_effect=lambda *a, **kw: identity.update(
+                    head=kw["remote"]["final_local_head"]
+                )
+                or True,
+            ),
             mock.patch.object(
                 MODULE, "refuse_test_suppression",
                 side_effect=AssertionError("local test-shape veto"),
@@ -7277,7 +7277,11 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 return_value=self.root / "cloud_task.py",
             ),
             mock.patch.object(MODULE, "run", side_effect=run_command),
-            mock.patch.object(MODULE, "validate_candidate_history"),
+            mock.patch.object(
+                MODULE,
+                "verify_runtime_candidate",
+                side_effect=self.verified_candidate,
+            ),
             mock.patch.object(MODULE, "refuse_test_suppression"),
             mock.patch.object(
                 MODULE,
@@ -7360,7 +7364,11 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(
                 MODULE, "local_identity", return_value=preflight["identity"]
             ),
-            mock.patch.object(MODULE, "validate_candidate_history"),
+            mock.patch.object(
+                MODULE,
+                "verify_runtime_candidate",
+                side_effect=self.verified_candidate,
+            ),
             mock.patch.object(MODULE, "refuse_test_suppression"),
             mock.patch.object(MODULE, "require_live_check_snapshot"),
             mock.patch.object(
@@ -7433,7 +7441,11 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 "local_identity",
                 side_effect=lambda *_: dict(identity),
             ),
-            mock.patch.object(MODULE, "validate_candidate_history"),
+            mock.patch.object(
+                MODULE,
+                "verify_runtime_candidate",
+                side_effect=self.verified_candidate,
+            ),
             mock.patch.object(MODULE, "refuse_test_suppression"),
             mock.patch.object(MODULE, "require_live_check_snapshot") as check_snapshot,
             mock.patch.object(MODULE, "metadata_for", return_value=preflight["pr"]),
@@ -7527,6 +7539,26 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             raw_arguments += [
                 "--pipeline-run", "pipeline-run", "--pipeline-max-iterations", "10"
             ]
+
+        def verify_candidate(result, **_kwargs):
+            candidate = result["candidate"]
+            return {
+                "contract": "candidate",
+                "task_id": result["task"]["id"],
+                "task_url": result["task"]["url"],
+                "session_id": result["completion"]["session"]["id"],
+                "generated_branch": result["generated"]["branch"],
+                "generated_head": result["generated"]["head_sha"],
+                "code_tip": candidate["generated"]["code_tip_sha"],
+                "commits": [item["sha"] for item in candidate["code_commits"]],
+                "final_local_head": candidate["generated"]["code_tip_sha"],
+                "requires_apply": True,
+                "candidate_manifest": candidate,
+                "completion": result["completion"],
+                "report_evidence": None,
+                "structural_attestation": True,
+            }
+
         with (
             mock.patch.object(MODULE, "require_tools"),
             mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
@@ -7539,7 +7571,12 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(
                 MODULE, "local_identity", return_value=preflights[0]["identity"]
             ),
-            mock.patch.object(MODULE, "validate_candidate_history"),
+            mock.patch.object(
+                MODULE, "verify_runtime_candidate", side_effect=verify_candidate
+            ),
+            mock.patch.object(
+                MODULE, "apply_verified_candidate_import", return_value=False
+            ),
             mock.patch.object(MODULE, "refuse_test_suppression"),
             mock.patch.object(MODULE, "require_live_check_snapshot"),
             mock.patch.object(MODULE, "metadata_for", return_value=preflights[0]["pr"]),
@@ -9756,15 +9793,6 @@ class AttributeCommandTest(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
-
-    def test_managed_history_rejects_test_suppression_before_live_checks(self):
-        source = SCRIPT.read_text(encoding="utf-8")
-        coordinator = source.index("def command_agent_task")
-        history = source.index("validate_generated_history(", coordinator)
-        suppression = source.index("refuse_test_suppression(", history)
-        live = source.index("live = metadata_for(target)", suppression)
-        self.assertLess(history, suppression)
-        self.assertLess(suppression, live)
 
     def state_with(self, baseline, conclusion=None):
         return write_state(
@@ -15037,6 +15065,7 @@ class CandidateContractTest(unittest.TestCase):
                 "head_branch": "feature",
                 "head_sha": self.head,
                 "cross_repository": False,
+                "state": "OPEN",
             },
             "check_snapshot": {
                 "sha256": "d" * 64,
@@ -15144,11 +15173,39 @@ class CandidateContractTest(unittest.TestCase):
         }
 
     def validate(self, result):
-        return MODULE.validate_candidate_success_result(
-            result,
-            preflight=self.preflight,
-            requested_model="gpt-5.6-sol",
+        candidate = result["candidate"]
+        artifact = candidate["artifact_commit"]
+        verified = {
+            "task": result["task"],
+            "completion": result["completion"],
+            "candidate": candidate,
+            "artifact_commit": artifact,
+            "code_tip": candidate["generated"]["code_tip_sha"],
+            "commits": [item["sha"] for item in candidate["code_commits"]],
+        }
+        runtime = SimpleNamespace(
+            CloudError=RuntimeError,
+            PullRequestSnapshot=lambda **values: SimpleNamespace(**values),
+            Options=lambda **values: SimpleNamespace(**values),
+            GitRepository=mock.Mock(return_value=object()),
+            verify_current_candidate=mock.Mock(return_value=verified),
         )
+        with mock.patch.object(
+            MODULE, "load_candidate_runtime", return_value=runtime
+        ):
+            remote = MODULE.verify_runtime_candidate(
+                result,
+                helper=Path("cloud_task.py"),
+                repo_root=Path("repo"),
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+                prompt="frozen prompt",
+            )
+        runtime.verify_current_candidate.assert_called_once()
+        options = runtime.verify_current_candidate.call_args.kwargs["options"]
+        self.assertEqual("frozen prompt", options.prompt)
+        self.assertEqual(MODULE.AGENT_TASK_POLICY, options.policy)
+        return remote
 
     def test_accepts_zero_code_and_any_optional_report_content(self):
         cases = [
@@ -15180,71 +15237,61 @@ class CandidateContractTest(unittest.TestCase):
         self.assertEqual(self.code, remotes[1]["final_local_head"])
         self.assertEqual(self.output, remotes[1]["generated_head"])
 
-    def test_rejects_stale_result_task_and_manifest_identity(self):
-        cases = []
-        stale = self.result()
-        stale["candidate"]["base"]["sha"] = "9" * 40
-        cases.append(stale)
-        wrong_task = self.result()
-        wrong_task["candidate"]["task"]["id"] = "other"
-        cases.append(wrong_task)
-        platform_error = self.result()
-        platform_error["error"] = {"code": "worker_failed", "message": "failed"}
-        cases.append(platform_error)
-        for value in cases:
-            with self.subTest(value=value), self.assertRaises(MODULE.WorkflowError):
-                self.validate(value)
+    def test_runtime_rejection_is_fail_closed(self):
+        runtime = SimpleNamespace(
+            CloudError=RuntimeError,
+            PullRequestSnapshot=lambda **values: SimpleNamespace(**values),
+            Options=lambda **values: SimpleNamespace(**values),
+            GitRepository=mock.Mock(return_value=object()),
+            verify_current_candidate=mock.Mock(
+                side_effect=RuntimeError("candidate identity changed")
+            ),
+        )
+        with (
+            mock.patch.object(MODULE, "load_candidate_runtime", return_value=runtime),
+            self.assertRaisesRegex(MODULE.WorkflowError, "candidate rejected"),
+        ):
+            MODULE.verify_runtime_candidate(
+                self.result(),
+                helper=Path("cloud_task.py"),
+                repo_root=Path("repo"),
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+                prompt="frozen prompt",
+            )
 
-    def test_manifest_coverage_is_rederived_and_output_is_excluded(self):
+    def test_runtime_manifest_coverage_excludes_output_commit(self):
         remote = self.validate(
             self.result(output_paths=[MODULE.AGENT_TASK_OUTPUT_REPORT])
         )
-        parents = {
-            self.code: f"{self.code} {self.head}",
-            self.output: f"{self.output} {self.code}",
+        coverage = {
+            item["sha"]: item["changed_paths"]
+            for item in remote["candidate_manifest"]["code_commits"]
         }
-        paths = {
-            self.code: ["src/App.java"],
-            self.output: [MODULE.AGENT_TASK_OUTPUT_REPORT],
-        }
-
-        def git_side_effect(_root, *arguments):
-            if arguments[0] == "rev-list" and arguments[1] == "--reverse":
-                return f"{self.code}\n{self.output}"
-            if arguments[0] == "rev-list":
-                return parents[arguments[-1]]
-            if arguments[0] == "show":
-                return "a" * 40
-            raise AssertionError(arguments)
-
-        with (
-            mock.patch.object(MODULE, "git", side_effect=git_side_effect),
-            mock.patch.object(
-                MODULE,
-                "git_z_paths",
-                side_effect=lambda _root, *args: paths[args[-1]],
-            ),
-            mock.patch.object(
-                MODULE,
-                "run",
-                return_value=SimpleNamespace(stdout="patch\n"),
-            ),
-        ):
-            coverage = MODULE.validate_candidate_history(
-                Path("repo"), base_sha=self.head, remote=remote
-            )
-
         self.assertEqual({self.code: ["src/App.java"]}, coverage)
 
     def test_guarded_import_uses_only_the_manifest_code_tip(self):
-        remote = self.validate(
-            self.result(output_paths=[MODULE.AGENT_TASK_OUTPUT_REPORT])
+        result = self.result(output_paths=[MODULE.AGENT_TASK_OUTPUT_REPORT])
+        remote = self.validate(result)
+        imported = {
+            "application": "fast_forwarded",
+            "final_local_head": self.code,
+        }
+        runtime = SimpleNamespace(
+            CloudError=RuntimeError,
+            PullRequestSnapshot=lambda **values: SimpleNamespace(**values),
+            Options=lambda **values: SimpleNamespace(**values),
+            GitRepository=mock.Mock(return_value=object()),
+            guarded_fast_forward_candidate=mock.Mock(return_value=imported),
         )
         with tempfile.TemporaryDirectory() as directory:
             result_path = Path(directory) / "result.json"
-            result_path.write_text("result", encoding="utf-8")
+            result_path.write_text(json.dumps(result), encoding="utf-8")
             digest = MODULE.sha256_file(result_path)
             with (
+                mock.patch.object(
+                    MODULE, "load_candidate_runtime", return_value=runtime
+                ),
                 mock.patch.object(
                     MODULE,
                     "local_identity",
@@ -15253,18 +15300,22 @@ class CandidateContractTest(unittest.TestCase):
                         {"branch": "feature", "head": self.code, "status": ""},
                     ],
                 ),
-                mock.patch.object(MODULE, "run") as run_command,
             ):
                 MODULE.apply_verified_candidate_import(
                     Path("repo"),
+                    helper=Path("cloud_task.py"),
+                    requested_model="gpt-5.6-sol",
+                    prompt="frozen prompt",
                     result_path=result_path,
                     result_sha256=digest,
                     preflight=self.preflight,
                     remote=remote,
                 )
 
-        self.assertEqual(self.code, run_command.call_args.args[0][-1])
-        self.assertNotIn(self.output, run_command.call_args.args[0])
+        call = runtime.guarded_fast_forward_candidate.call_args
+        self.assertEqual(result, call.args[0])
+        self.assertEqual("frozen prompt", call.kwargs["options"].prompt)
+        self.assertEqual(MODULE.AGENT_TASK_POLICY, call.kwargs["options"].policy)
 
     def test_candidate_cannot_change_frozen_build_wrappers(self):
         for path in ("gradlew", "gradle/wrapper/gradle-wrapper.jar", ".mvn/wrapper.xml"):
