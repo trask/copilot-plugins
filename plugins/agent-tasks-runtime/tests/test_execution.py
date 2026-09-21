@@ -179,7 +179,6 @@ class ExecutionTest(unittest.TestCase):
             EXECUTION.os.environ, {"COPILOT_HOME": str(self.root / "home")}
         ):
             context = self.context()
-            context.claim_writers([("owner/repo", "branch")])
             before = {
                 path: path.read_bytes()
                 for path in self.root.rglob("*")
@@ -514,7 +513,6 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual([descendant], receipt["observed_descendants"])
         self.assertEqual("finished", result["local_status"])
         self.assertTrue(result["local_children_drained"])
-        self.assertEqual("released", result["writer_ownership"])
         self.assertFalse(result["remote_work_may_continue"])
 
     def test_finalization_naturally_drains_poll_detected_descendant(self):
@@ -544,7 +542,6 @@ class ExecutionTest(unittest.TestCase):
         self.assertIsNone(child.completion_error)
         self.assertEqual("finished", result["local_status"])
         self.assertTrue(result["local_children_drained"])
-        self.assertEqual("released", result["writer_ownership"])
         self.assertFalse(result["remote_work_may_continue"])
 
     def test_finalization_waits_for_poll_pending_accounting_without_cancelling(self):
@@ -568,7 +565,6 @@ class ExecutionTest(unittest.TestCase):
         self.assertTrue(child.drained)
         self.assertEqual("finished", result["local_status"])
         self.assertTrue(result["local_children_drained"])
-        self.assertEqual("released", result["writer_ownership"])
         self.assertFalse(result["remote_work_may_continue"])
 
     def test_running_descendant_preserves_failure_when_cleanup_does_not_drain(self):
@@ -644,7 +640,6 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual("failed", result["local_status"])
         self.assertTrue(result["local_children_drained"])
         self.assertIn(message, result["finalization_errors"])
-        self.assertEqual("retained", result["writer_ownership"])
         self.assertTrue(result["remote_work_may_continue"])
 
     def test_windows_observation_failure_is_sticky_and_never_records_drained(self):
@@ -1431,14 +1426,6 @@ class ExecutionTest(unittest.TestCase):
         self.assertFalse(result["terminal"])
         self.assertEqual("terminal_unsealed", result["status"])
 
-    def test_writer_release_failure_cannot_seal_success(self):
-        context = self.context()
-        context.emit({"result": "complete"})
-        with mock.patch.object(context, "release_writers", side_effect=OSError("lease error")):
-            result = context.finish(0)
-        self.assertEqual("failed", result["local_status"])
-        self.assertIn("lease error", result["finalization_errors"])
-        self.assertTrue(result["local_children_drained"])
 
     def test_cancel_retains_remote_identity_and_domain_budget(self):
         context = self.context()
@@ -1451,27 +1438,9 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual(str(state), result["retained_evidence"][0]["path"])
         self.assertTrue(result["remote_work_may_continue"])
 
-    def test_writer_lease_is_shared_and_unresolved_owner_cannot_be_replaced(self):
-        with mock.patch.dict(EXECUTION.os.environ, {"COPILOT_HOME": str(self.root / "home")}):
-            context = self.context()
-            context.claim_writers([("Owner/Repo", "branch")])
-            second = EXECUTION.Execution(self.root / "second.json", command=["python"])
-            with self.assertRaisesRegex(EXECUTION.ExecutionError, "unresolved execution owner"):
-                second.claim_writers([("owner/repo", "branch")])
-            context.finish(130, cancelled=True)
-            with self.assertRaisesRegex(EXECUTION.ExecutionError, "unresolved execution owner"):
-                second.claim_writers([("owner/repo", "branch")])
 
-    def test_successful_owner_releases_only_its_own_writer_lease(self):
-        with mock.patch.dict(EXECUTION.os.environ, {"COPILOT_HOME": str(self.root / "home")}):
-            context = self.context()
-            context.claim_writers([("owner/repo", "branch")])
-            context.emit({"result": "complete"})
-            context.finish(0)
-            second = EXECUTION.Execution(self.root / "second.json", command=["python"])
-            second.claim_writers([("owner/repo", "branch")])
 
-    def test_unconfirmed_child_blocks_root_release_for_allowed_domain_outcomes(self):
+    def test_unconfirmed_child_blocks_root_completion_for_allowed_domain_outcomes(self):
         cases = (
             {"local_status": "failed", "exit_code": 1, "remote_work_may_continue": True},
             {"local_status": "cancelled_local", "exit_code": 130, "remote_work_may_continue": True},
@@ -1485,7 +1454,6 @@ class ExecutionTest(unittest.TestCase):
                     with mock.patch.dict(EXECUTION.os.environ, {"COPILOT_HOME": str(directory / "home")}):
                         context = EXECUTION.Execution(directory / "root.json", command=["python"],
                                                       terminal_results=frozenset({domain}))
-                        context.claim_writers([("owner/repo", "branch")])
                         _, result_path, state, record = self.child_evidence(context, **child_outcome)
                         before = state.read_bytes()
                         context.emit({"result": domain})
@@ -1493,17 +1461,14 @@ class ExecutionTest(unittest.TestCase):
                         self.assertEqual("failed", result["local_status"])
                         self.assertEqual(1, result["exit_code"])
                         self.assertTrue(result["remote_work_may_continue"])
-                        self.assertEqual("retained", result["writer_ownership"])
                         self.assertEqual({"result": domain}, result["workflow_result"])
                         self.assertEqual(before, state.read_bytes())
                         self.assertIn(str(record), result["child_records"])
                         self.assertIn(str(result_path), [item["path"] for item in result["retained_evidence"]])
                         self.assertIn("task-stage", [item["task"]["id"] for item in result["remote_tasks"]])
                         following = EXECUTION.Execution(directory / "following.json", command=["python"])
-                        with self.assertRaisesRegex(EXECUTION.ExecutionError, "unresolved execution owner"):
-                            following.claim_writers([("owner/repo", "branch")])
 
-    def test_missing_malformed_stale_or_unsealed_child_evidence_cannot_release(self):
+    def test_missing_malformed_stale_or_unsealed_child_evidence_cannot_complete(self):
         for defect in ("missing_handle", "missing_result", "missing_receipt", "malformed",
                        "stale", "unsealed", "digest", "generation", "command",
                        "missing_remote_status", "malformed_generation"):
@@ -1512,7 +1477,6 @@ class ExecutionTest(unittest.TestCase):
                 with mock.patch.dict(EXECUTION.os.environ, {"COPILOT_HOME": str(directory / "home")}):
                     context = EXECUTION.Execution(directory / "root.json", command=["python"],
                                                   terminal_results=frozenset({"incomplete"}))
-                    context.claim_writers([("owner/repo", "branch")])
                     handle, result_path, state, record = self.child_evidence(context)
                     if defect == "missing_handle":
                         handle.unlink()
@@ -1549,17 +1513,13 @@ class ExecutionTest(unittest.TestCase):
                     result = context.finish(0)
                     self.assertEqual(1, result["exit_code"])
                     self.assertTrue(result["remote_work_may_continue"])
-                    self.assertEqual("retained", result["writer_ownership"])
                     self.assertTrue(result["finalization_errors"])
                     self.assertEqual(before, state.read_bytes())
                     following = EXECUTION.Execution(directory / "following.json", command=["python"])
-                    with self.assertRaisesRegex(EXECUTION.ExecutionError, "unresolved execution owner"):
-                        following.claim_writers([("owner/repo", "branch")])
 
     def test_unconfirmed_grandchild_overrides_a_settled_intermediate_result(self):
         with mock.patch.dict(EXECUTION.os.environ, {"COPILOT_HOME": str(self.root / "home")}):
             context = self.context()
-            context.claim_writers([("owner/repo", "branch")])
             _, parent_result, _, _ = self.child_evidence(context)
             _, failed_result, state, record = self.child_evidence(
                 context, directory=parent_result.parent, name="grandchild",
@@ -1569,7 +1529,6 @@ class ExecutionTest(unittest.TestCase):
             context.emit({"result": "complete"})
             result = context.finish(0)
             self.assertEqual(1, result["exit_code"])
-            self.assertEqual("retained", result["writer_ownership"])
             self.assertTrue(result["remote_work_may_continue"])
             self.assertIn(str(record), result["child_records"])
             self.assertIn(str(failed_result), [item["path"] for item in result["retained_evidence"]])
@@ -1577,14 +1536,7 @@ class ExecutionTest(unittest.TestCase):
             self.assertEqual(before, state.read_bytes())
             replacement_owner = {**IDENTITY, "pid": 789, "creation_time": "new controller"}
             with mock.patch.object(EXECUTION, "process_identity", return_value=replacement_owner):
-                following = EXECUTION.Execution(self.root / "following.json", command=["python"])
-            for old_owner in (None, {**IDENTITY, "creation_time": "reused PID"}):
-                with self.subTest(old_owner=old_owner), mock.patch.object(
-                    EXECUTION, "process_identity",
-                    side_effect=lambda pid: old_owner if pid == IDENTITY["pid"] else replacement_owner,
-                ):
-                    with self.assertRaisesRegex(EXECUTION.ExecutionError, "unresolved execution owner"):
-                        following.claim_writers([("owner/repo", "branch")])
+                EXECUTION.Execution(self.root / "following.json", command=["python"])
 
     def test_dispatch_evidence_is_unique_for_direct_and_nested_children(self):
         for nested in (False, True):
@@ -1593,7 +1545,6 @@ class ExecutionTest(unittest.TestCase):
                 with mock.patch.dict(EXECUTION.os.environ, {"COPILOT_HOME": str(directory / "home")}):
                     context = EXECUTION.Execution(directory / "root.json", command=["python"],
                                                   terminal_results=frozenset({"partial"}))
-                    context.claim_writers([("owner/repo", "branch")])
                     children = [self.child_evidence(context, remote_work_may_continue=True)]
                     if nested:
                         children.append(self.child_evidence(
@@ -1615,10 +1566,7 @@ class ExecutionTest(unittest.TestCase):
                                          item["sha256"])
                     self.assertEqual(before, {path: path.read_bytes() for path in before})
                     self.assertTrue(result["remote_work_may_continue"])
-                    self.assertEqual("retained", result["writer_ownership"])
                     following = EXECUTION.Execution(directory / "following.json", command=["python"])
-                    with self.assertRaisesRegex(EXECUTION.ExecutionError, "unresolved execution owner"):
-                        following.claim_writers([("owner/repo", "branch")])
 
     def test_dispatch_evidence_keeps_distinct_unknown_creation_paths(self):
         context = self.context()
@@ -1646,7 +1594,6 @@ class ExecutionTest(unittest.TestCase):
                 with mock.patch.dict(EXECUTION.os.environ, {"COPILOT_HOME": str(directory / "home")}):
                     context = EXECUTION.Execution(directory / "root.json", command=["python"],
                                                   terminal_results=frozenset({"complete"}))
-                    context.claim_writers([("owner/repo", "branch")])
                     _, result_path, state, _ = self.child_evidence(context)
                     dispatch = result_path.with_name(result_path.name + ".dispatch.json")
                     before = state.read_bytes()
@@ -1668,7 +1615,6 @@ class ExecutionTest(unittest.TestCase):
                     with mock.patch.object(EXECUTION, "read", side_effect=changing):
                         result = context.finish(0)
                     self.assertEqual(1, result["exit_code"])
-                    self.assertEqual("retained", result["writer_ownership"])
                     self.assertTrue(result["remote_work_may_continue"])
                     self.assertEqual(["task-stage", "changed-task"],
                                      [item["task"]["id"] for item in result["remote_tasks"]])
@@ -1680,37 +1626,26 @@ class ExecutionTest(unittest.TestCase):
                         self.assertIn(f"conflicting retained evidence: {dispatch}", result["finalization_errors"])
                     self.assertEqual(before, state.read_bytes())
                     following = EXECUTION.Execution(directory / "following.json", command=["python"])
-                    with self.assertRaisesRegex(EXECUTION.ExecutionError, "unresolved execution owner"):
-                        following.claim_writers([("owner/repo", "branch")])
 
-    def test_settled_children_allow_incomplete_or_partial_to_release(self):
+    def test_settled_children_allow_incomplete_or_partial_completion(self):
         for domain in ("incomplete", "partial"):
             with self.subTest(domain=domain):
                 directory = self.root / domain
                 with mock.patch.dict(EXECUTION.os.environ, {"COPILOT_HOME": str(directory / "home")}):
                     context = EXECUTION.Execution(directory / "root.json", command=["python"],
                                                   terminal_results=frozenset({domain}))
-                    context.claim_writers([("owner/repo", "branch")])
                     _, parent_result, _, _ = self.child_evidence(context)
                     self.child_evidence(context, directory=parent_result.parent, name="grandchild")
                     context.emit({"result": domain})
                     result = context.finish(0)
                     self.assertEqual(0, result["exit_code"])
                     self.assertFalse(result["remote_work_may_continue"])
-                    self.assertEqual("released", result["writer_ownership"])
                     self.assertEqual({"result": domain}, result["workflow_result"])
                     self.assertEqual("already_finished", EXECUTION.cancel(context.handle)["result"])
                     self.assertFalse(Path(context.record["cancel"]).exists())
                     replacement_owner = {**IDENTITY, "pid": 789, "creation_time": "new controller"}
                     with mock.patch.object(EXECUTION, "process_identity", return_value=replacement_owner):
-                        following = EXECUTION.Execution(directory / "following.json", command=["python"])
-                    with mock.patch.object(
-                        EXECUTION, "process_identity",
-                        side_effect=lambda pid: (
-                            None if domain == "incomplete" else {**IDENTITY, "creation_time": "reused PID"}
-                        ) if pid == IDENTITY["pid"] else replacement_owner,
-                    ):
-                        following.claim_writers([("owner/repo", "branch")])
+                        EXECUTION.Execution(directory / "following.json", command=["python"])
 
     def test_missing_process_identity_fields_never_match(self):
         for invalid in ({}, None, {**IDENTITY, "pid": True},
@@ -1721,7 +1656,6 @@ class ExecutionTest(unittest.TestCase):
     def test_cancellation_before_sealing_overrides_verified_settled_children(self):
         with mock.patch.dict(EXECUTION.os.environ, {"COPILOT_HOME": str(self.root / "home")}):
             context = self.context()
-            context.claim_writers([("owner/repo", "branch")])
             self.child_evidence(context)
             context.emit({"result": "complete"})
             load = EXECUTION.load_handle
@@ -1740,20 +1674,16 @@ class ExecutionTest(unittest.TestCase):
             self.assertTrue(admitted)
             self.assertEqual(130, result["exit_code"])
             self.assertEqual("cancelled_local", result["local_status"])
-            self.assertEqual("retained", result["writer_ownership"])
             self.assertTrue(result["remote_work_may_continue"])
             following = EXECUTION.Execution(self.root / "following.json", command=["python"])
-            with self.assertRaisesRegex(EXECUTION.ExecutionError, "unresolved execution owner"):
-                following.claim_writers([("owner/repo", "branch")])
 
-    def test_terminal_write_failure_does_not_release_branch_ownership(self):
+    def test_terminal_write_failure_does_not_seal_result(self):
         for fail_seal in (False, True):
             with self.subTest(fail_seal=fail_seal), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
                 with mock.patch.dict(EXECUTION.os.environ, {"COPILOT_HOME": str(root / "home")}):
                     context = EXECUTION.Execution(root / "first.json", command=["python"],
                                                   terminal_results=frozenset({"complete"}))
-                    context.claim_writers([("owner/repo", "branch")])
                     context.emit({"result": "complete"})
                     original = EXECUTION.write
 
@@ -1768,17 +1698,13 @@ class ExecutionTest(unittest.TestCase):
                             context.finish(0)
                     self.assertFalse(EXECUTION.status(context.handle)["terminal"])
                     second = EXECUTION.Execution(root / "second.json", command=["python"])
-                    with self.assertRaisesRegex(EXECUTION.ExecutionError, "unresolved execution owner"):
-                        second.claim_writers([("owner/repo", "branch")])
 
-    def test_zero_exit_with_unknown_workflow_outcome_retains_ownership(self):
+    def test_zero_exit_with_unknown_workflow_outcome_stays_unconfirmed(self):
         with mock.patch.dict(EXECUTION.os.environ, {"COPILOT_HOME": str(self.root / "home")}):
             context = self.context()
-            context.claim_writers([("owner/repo", "branch")])
             context.emit({"result": "invocation_abandoned", "task_id": "known-task"})
             result = context.finish(0)
             self.assertTrue(result["remote_work_may_continue"])
-            self.assertEqual("retained", result["writer_ownership"])
             self.assertEqual("known-task", result["workflow_result"]["task_id"])
 
     def test_finalization_failure_keeps_original_error_in_file_backed_stderr(self):
@@ -1823,7 +1749,6 @@ class ExecutionTest(unittest.TestCase):
         result = context.finish(0)
         self.assertEqual(130, result["exit_code"])
         self.assertEqual("cancelled_local", result["local_status"])
-        self.assertEqual("retained", result["writer_ownership"])
 
     def test_controller_cancellation_preserves_status_after_forced_job_drainage(self):
         namespace = {}
@@ -1867,7 +1792,6 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual([EXECUTION.FORCED_DRAINAGE_ERROR], result["finalization_errors"])
         self.assertEqual("unconfirmed", result["remote_status"])
         self.assertTrue(result["remote_work_may_continue"])
-        self.assertEqual("retained", result["writer_ownership"])
         self.assertTrue(child["local_drained"])
         self.assertEqual(EXECUTION.FORCED_DRAINAGE_ERROR, child["completion_error"])
 
@@ -1916,7 +1840,6 @@ class ExecutionTest(unittest.TestCase):
                             for item in result["drainage_errors"]))
         self.assertEqual("unconfirmed", result["remote_status"])
         self.assertTrue(result["remote_work_may_continue"])
-        self.assertEqual("retained", result["writer_ownership"])
         self.assertFalse(child["local_drained"])
         self.assertIn("job observation failed", child["drainage_error"])
 
@@ -2044,11 +1967,10 @@ class ExecutionTest(unittest.TestCase):
 
 
 class ExecutionBootstrapTest(unittest.TestCase):
-    def test_every_controller_and_backend_verifies_the_same_source_without_a_window(self):
-        paths = list(ROOT.glob("plugins/*/scripts/*.py"))
-        paths.append(SCRIPT.with_name("cloud_task.py"))
+    def test_runtime_backend_verifies_the_execution_source_without_a_window(self):
+        paths = [SCRIPT.with_name("cloud_task.py")]
         adapters = [path for path in paths if "def _load_execution():" in path.read_text(encoding="utf-8")]
-        self.assertEqual(11, len(adapters))
+        self.assertEqual(1, len(adapters))
         inventory = json.dumps([{"name": "agent-tasks-runtime", "source": "plugin",
                                  "enabled": True, "path": str(SCRIPT.parent.parent)}])
         for index, path in enumerate(adapters):
@@ -2073,61 +1995,17 @@ class ExecutionBootstrapTest(unittest.TestCase):
                     launch.return_value.stdout = "[]"
                     with self.assertRaisesRegex(RuntimeError, "uniquely installed"):
                         module._load_execution()
-                if path.name not in {"cloud_task.py", "cloud_conflict_task.py"}:
-                    self.assertIsInstance(module.EXECUTION_TERMINAL_RESULTS, frozenset)
-                    self.assertNotIn("invocation_abandoned", module.EXECUTION_TERMINAL_RESULTS)
-                    self.assertNotIn("error", module.EXECUTION_TERMINAL_RESULTS)
-                    command = "run" if path.name in {
-                        "pr_pipeline.py", "pr_stack_pipeline.py", "pr_reviewer.py",
-                    } else ("pipeline" if path.name == "ci_fix_loop.py" else "agent-task")
-                    shared = mock.Mock()
-                    shared.entrypoint.return_value = 0
-                    with (
-                        mock.patch.object(module, "_load_execution", return_value=shared),
-                        mock.patch.object(module, "main") as main,
-                        mock.patch.object(sys, "argv", [str(path), command, "--execution-handle", "unused"]),
-                    ):
-                        self.assertEqual(0, module.execution_main())
-                        main.assert_not_called()
-                        self.assertIs(main, shared.entrypoint.call_args.args[0])
-                    if path.name in {"pr_pipeline.py", "pr_stack_pipeline.py"}:
-                        with (
-                            mock.patch.object(module.common, "_EXECUTION",
-                                              types.SimpleNamespace(run_id="b" * 32)),
-                            mock.patch.object(module.common, "require_tools") as tools,
-                        ):
-                            arguments = types.SimpleNamespace(github_mutation_policy="allow", run_id="a" * 32)
-                            with self.assertRaisesRegex(module.WorkflowError, "omit --run-id"):
-                                module.command_run(arguments)
-                            self.assertEqual("b" * 32, arguments.run_id)
-                            tools.assert_not_called()
-                        with (
-                            mock.patch.object(module, "_load_execution") as loader,
-                            mock.patch.object(module, "main", return_value=7),
-                            mock.patch.object(sys, "argv", [str(path), "start"]),
-                        ):
-                            self.assertEqual(7, module.execution_main())
-                            loader.assert_not_called()
-                    else:
-                        pr = {"head_owner": "fork", "head_repo": "repo", "head_branch": "feature"}
-                        state = {"pr": pr}
-                        expected = ("fork/repo", "feature")
-                        if path.name == "historical_pr_audit.py":
-                            state = {"pr": {"repo_name": "owner/repo"}, "audit_branch": "audit"}
-                            expected = ("owner/repo", "audit")
-                        elif path.name in {"pr_description.py", "pr_reviewer.py"}:
-                            state = {"pr": {"head": {"repository": "fork/repo", "ref": "feature"}}}
-                        execution = mock.Mock()
-                        with tempfile.TemporaryDirectory() as directory, mock.patch.object(module, "_EXECUTION", execution):
-                            state_path = Path(directory) / "state.json"
-                            saved = getattr(module, "save_state", None) or module.save_run_state
-                            saved(state_path, state)
-                            execution.claim_writers.assert_called_once_with([expected])
-                            execution.record_state.assert_called_once_with(state_path, state)
-                            if path.name == "pr_conflict_resolver.py":
-                                execution.reset_mock()
-                                saved(state_path, {"pr": {"number": 1, "head_branch": None}})
-                                execution.claim_writers.assert_not_called()
+    def test_execution_has_no_persistent_writer_reservation_api(self):
+        self.assertFalse(hasattr(EXECUTION.Execution, "claim_writers"))
+        self.assertFalse(hasattr(EXECUTION.Execution, "release_writers"))
+        with tempfile.TemporaryDirectory() as directory:
+            context = EXECUTION.Execution(
+                (Path(directory) / "execution.json").resolve(),
+                command=["python"],
+            )
+            context.emit({"result": "complete"})
+            result = context.finish(0)
+        self.assertNotIn("writer_ownership", result)
 
 
 if __name__ == "__main__":

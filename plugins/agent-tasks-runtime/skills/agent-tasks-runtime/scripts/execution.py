@@ -896,49 +896,6 @@ class Execution:
             raise ExecutionError("child readiness belongs to another execution")
         return status(path)
 
-    def claim_writers(self, writers: list[tuple[str, str]]) -> None:
-        root = load_handle(self.root)
-        home = Path(os.environ.get("COPILOT_HOME") or Path.home() / ".copilot")
-        directory = home / "run" / "foreground-execution" / "writers"
-        ledger_path = self.root.with_name(self.root.name + ".d") / "writers.json"
-        with guard(ledger_path.with_suffix(".guard")):
-            ledger = read(ledger_path) if ledger_path.exists() else {"leases": []}
-            for repository, branch in sorted(set(writers)):
-                if not repository or "/" not in repository or not branch:
-                    raise ExecutionError("writer lease requires exact repository and branch")
-                key = [repository.casefold(), branch]
-                path = directory / f"{digest(key)}.json"
-                expected = {"schema": SCHEMA, "key": key, "run_id": self.run_id,
-                            "root": str(self.root), "owner": root["owner"]}
-                with guard(path.with_suffix(".guard")):
-                    if path.exists():
-                        lease = read(path)
-                        if lease != expected:
-                            released = False
-                            if lease.get("schema") == SCHEMA and lease.get("key") == key and lease.get("release"):
-                                prior = status(Path(lease["root"]))
-                                released = (
-                                    prior.get("terminal") is True
-                                    and prior.get("run_id") == lease.get("run_id")
-                                    and prior.get("owner") == lease.get("owner")
-                                    and prior.get("exit_code") == 0
-                                    and prior.get("local_status") == "finished"
-                                    and prior.get("local_children_drained") is True
-                                    and prior.get("writer_ownership") == "released"
-                                    and prior.get("remote_work_may_continue") is False
-                                    and digest(read(Path(prior["result_file"]))) == lease["release"]
-                                )
-                            if not released:
-                                raise ExecutionError(
-                                    f"branch has another or unresolved execution owner: {repository}:{branch}"
-                                )
-                            write(path, expected)
-                    else:
-                        write(path, expected, exclusive=True)
-                if str(path) not in ledger["leases"]:
-                    ledger["leases"].append(str(path))
-                    write(ledger_path, ledger)
-
     def record_state(self, path: Path, state: dict[str, Any]) -> None:
         paths = self.record.setdefault("domain_states", [])
         if str(path.resolve()) not in paths:
@@ -955,25 +912,6 @@ class Execution:
             "status": "creating" if task is None else "observing",
             "task": task, "remote_status": "unknown" if task is None else "unconfirmed",
         })
-
-    def release_writers(self, result: dict[str, Any]) -> None:
-        if self.root != self.handle:
-            return
-        ledger_path = self.directory / "writers.json"
-        if not ledger_path.exists():
-            return
-        with guard(ledger_path.with_suffix(".guard")):
-            for value in read(ledger_path)["leases"]:
-                path = Path(value)
-                with guard(path.with_suffix(".guard")):
-                    lease = read(path)
-                    if (
-                        lease.get("schema") != SCHEMA or lease.get("run_id") != self.run_id
-                        or lease["root"] != str(self.root) or lease["owner"] != self.owner
-                    ):
-                        raise ExecutionError("writer ownership changed before release")
-                    # A release becomes effective only when this exact terminal result is sealed.
-                    write(path, {**lease, "release": digest(result)})
 
     def start(self, command: list[str], *, require_execution: bool = False, **options: Any) -> OwnedProcess:
         self.check_cancel()
@@ -1353,7 +1291,6 @@ class Execution:
             "finalization_errors": [*forced_cleanup_errors, *evidence_errors],
             "remote_status": "see_workflow_result" if confirmed else "unconfirmed",
             "remote_work_may_continue": not confirmed,
-            "writer_ownership": "root_owned" if self.root != self.handle else "retained",
             "workflow_result": self.last_result,
             "domain_states": state_paths,
             "child_records": [str(source) for source in child_records],
@@ -1377,15 +1314,6 @@ class Execution:
                     remote_status="unconfirmed", remote_work_may_continue=True,
                 )
                 confirmed = False
-            if confirmed:
-                try:
-                    if self.root == self.handle:
-                        payload["writer_ownership"] = "released"
-                    self.release_writers(payload)
-                except (OSError, ExecutionError) as failure:
-                    payload.update(exit_code=1, local_status="failed", remote_status="unconfirmed",
-                                   remote_work_may_continue=True, writer_ownership="retained")
-                    payload["finalization_errors"].append(str(failure))
             write(Path(self.record["result"]), payload, exclusive=True)
             self.record.update(
                 status=payload["local_status"],

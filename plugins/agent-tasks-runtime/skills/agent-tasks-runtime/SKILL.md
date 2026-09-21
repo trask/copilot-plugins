@@ -7,12 +7,12 @@ description: Internal GitHub Agent Tasks runtime dependency for Trask pull reque
 
 This is the shared runtime dependency for Trask PR agents, not a user workflow. Consumer coordinators discover it through `copilot skill list --json`, verify the exact source digest, and invoke the helper. Do not invoke its scripts manually during an agent workflow.
 
-`scripts/execution.py` is the shared foreground execution library. All nine
-user-facing entrypoints pin its source bytes. Pipeline and Conflict use this
-library for local ownership without changing Conflict's dedicated hosted
-backend. It supplies fresh generation-bound root and child identities,
-file-backed output and canonical terminal results, optional read-only status,
-explicit local cancellation and conservative branch-writer leases. Windows
+`scripts/execution.py` is the shared foreground execution library. Consumer
+entrypoints pin its source bytes. Pipeline and Conflict use this library for
+local execution without changing Conflict's dedicated hosted backend. It
+supplies fresh generation-bound root and child identities, file-backed output
+and canonical terminal results, optional read-only status and explicit local
+cancellation. Windows
 binds the suspended direct child's exact handle, job, generation and image
 before resume. Completion uses that retained binding and the handle's signaled
 state, with unavailable post-exit image data recorded explicitly. The verified
@@ -30,18 +30,15 @@ automatic recovery or app-native Stop integration. Readiness comes from the
 controller, not the tool acknowledgement. Completion comes from a verified
 terminal file, not shell exit or model prose. An unsealed root whose exact
 generation has exited without available image data remains abandoned and
-remotely unconfirmed; status observation does not release its writer ownership.
+remotely unconfirmed.
 
 Cancellation fences later owned subprocess launches and publication. It does
 not retract an admitted remote mutation or prove remote task cancellation.
 Dispatch observations retain creation uncertainty and known task identities.
 Domain state retains its original budgets and pending outcomes. Failed,
-cancelled or abandoned ownership cannot be adopted by a new invocation.
-Writer releases take effect only with the owner's exact sealed terminal
-result. A missing or unsealed result keeps the branch unavailable even when
-the controller has exited.
+cancelled or abandoned execution cannot be adopted by a new invocation.
 Failed, cancelled, missing or remotely unconfirmed child execution evidence
-keeps root ownership retained, including when Pipeline reports `incomplete`
+keeps the root result unconfirmed, including when Pipeline reports `incomplete`
 or Stack Pipeline reports `partial`.
 Terminal diagnostics retain identical evidence once per source path, in
 first-seen order. Conflicting hashes or observations keep their distinct
@@ -86,6 +83,29 @@ Ordinary code-candidate consumers require an open PR and current source identity
 
 Historical Audit explicitly supplies `--allow-merged-pr` with its trusted immutable merged-PR snapshot. This code-candidate exception requires `trask-pr-audit-<number>` at that exact historical head and dispatches from the immutable SHA. Worker output cannot enable it. It does not relax ordinary open-PR guards or permit report-recommendation consumers to use merged sources.
 
-Each call is fresh. No task ID, prior result, resume, monitor-only mode or retained historical invocation can become execution input. Interrupted work remains immutable evidence. A same-active-call exact-lease publication confirmation is different from later retained-state re-entry.
+Each call is fresh. The executable rejects task IDs, prior results, resume,
+monitor-only mode, dispatch-only mode and retired policy selectors before it
+resolves a repository or starts a task. Interrupted work remains immutable
+evidence. Conflict Resolver has its own pinned runtime and versioned request
+contract.
 
-Older apply/report and semantic formats remain compatibility code. Current consumers explicitly select the two version-5 contracts above; they do not normalize, repair or import old results into a new invocation. Conflict Resolver has its own pinned runtime and versioned request contract.
+## Consumer APIs
+
+`verify_current_candidate(...)` rederives the version-5 candidate manifest
+from Git and compares the task, session, prompt, repository, source and
+generated history with the frozen request. `verify_candidate_result(...)`
+remains as the compatibility name for current consumers.
+
+`guarded_fast_forward_candidate(...)` accepts only the code-candidate policy.
+It runs the same verification, requires a clean branch at the frozen pull
+request head, checks the identity again immediately before `git merge
+--ff-only`, and confirms the final HEAD. It never imports the output-only
+artifact commit and it does not reserve or lock a branch.
+
+The repository owns the Runtime source-pin specification in
+`tools/runtime-loader-pins.json`. Run
+`python tools/runtime_loader_pins.py check` after Runtime changes,
+`python tools/runtime_loader_pins.py update` to refresh the recorded source
+digests, and `python tools/runtime_loader_pins.py generate cloud-task` or
+`generate execution` to print a self-contained byte-verifying Python loader
+for a consumer migration.
