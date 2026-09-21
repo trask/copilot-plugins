@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+from types import ModuleType
 from typing import Any, Iterable
 
 
@@ -70,7 +71,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "c72c8a0836d790128ce3f1e93ed7d1da3c01fbf465f96da3dbe0aa03dae14d04"
+    "d54c367ecddad68f8510917c1685913a034f1f1338607204eb9bf8245d6115cf"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@10"
@@ -825,15 +826,6 @@ def last_helper_activity(state: dict[str, Any]) -> str | None:
 def save_state(path: Path, state: dict[str, Any]) -> None:
     if _EXECUTION is not None:
         _EXECUTION.record_state(path, state)
-        pr = state.get("pr")
-        if isinstance(pr, dict) and pr.get("head_branch"):
-            _EXECUTION.claim_writers([(pr.get("head_repository") or f"{pr['head_owner']}/{pr['head_repo']}", pr["head_branch"])])
-        request = ((state.get("agent_task") or {}).get("preflight") or {}).get("request") or {}
-        native = request.get("native_stack")
-        if isinstance(native, dict):
-            _EXECUTION.claim_writers([
-                (member["repository"], member["head_ref"]) for member in native["members"]
-            ])
     path.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = utc_now()
     handle, temporary_name = tempfile.mkstemp(
@@ -6748,10 +6740,6 @@ def command_descendant_propagate(args: argparse.Namespace) -> None:
     stack = stack_membership(pr).get("stack")
     require_authorized_stack(request, pr, stack)
     partial = propagation_stack(stack, request["fixed_pr"], request["fixed_head"], request["selected"])
-    if _EXECUTION is not None:
-        _EXECUTION.claim_writers([
-            (request["repository"], member["head_branch"]) for member in partial["members"]
-        ])
     if external_stack_dependents(pr, partial):
         raise WorkflowError("external dependents prevent authorized descendant publication")
     if not partial["members"]:
@@ -10215,12 +10203,35 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "head_changed",
     "no_descendants",
 })
-EXECUTION_SHA256 = "bcca8dfa65d156b33081c2edf841b375a0620d4c1bdbc3cec3fd6501dc5cf53c"
+EXECUTION_SHA256 = "ce1ed0beed8d3daed64a31c453b8f010190cbe5648342f44b6a26a0a94c6ffb6"
+EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
+
+
+def load_execution_runtime(source_path: Path) -> ModuleType:
+    if (
+        not source_path.is_absolute()
+        or not source_path.is_file()
+        or source_path.is_symlink()
+        or source_path.parent.is_symlink()
+    ):
+        raise RuntimeError("execution Runtime source path is invalid")
+    source_path = source_path.resolve()
+    source = source_path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
+        raise RuntimeError("execution Runtime source digest changed")
+    module = ModuleType("_trask_foreground_execution")
+    module.__file__ = str(source_path)
+    sys.modules[module.__name__] = module
+    try:
+        exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
+    except BaseException:
+        sys.modules.pop(module.__name__, None)
+        raise
+    return module
 
 
 def _load_execution():
     """Load only the pinned shared foreground execution source."""
-    import types
     inventory = subprocess.run(
         ["copilot", "skill", "list", "--json"], check=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
@@ -10235,16 +10246,9 @@ def _load_execution():
     if len(matches) != 1:
         raise RuntimeError("shared execution Runtime is not uniquely installed and enabled")
     root = Path(matches[0]["path"])
-    source_path = root / "scripts" / "execution.py"
-    if not root.is_absolute() or any(path.is_symlink() for path in (root, source_path.parent, source_path)):
+    if not root.is_absolute() or root.is_symlink():
         raise RuntimeError("shared execution Runtime path is invalid")
-    source = source_path.read_bytes()
-    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
-        raise RuntimeError("shared execution Runtime source digest changed")
-    module = types.ModuleType("trask_foreground_execution")
-    module.__file__ = str(source_path)
-    exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
-    return module
+    return load_execution_runtime(root / EXECUTION_RELATIVE_PATH)
 
 
 def execution_main():

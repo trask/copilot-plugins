@@ -19,6 +19,14 @@ from unittest import mock
 SCRIPT = Path(__file__).parents[1] / "scripts" / "pr_conflict_resolver.py"
 CLOUD_SCRIPT = Path(__file__).parents[1] / "scripts" / "cloud_conflict_task.py"
 AGENT = Path(__file__).parents[1] / "agents" / "pr-conflict-resolver.agent.md"
+RUNTIME_SCRIPT = (
+    Path(__file__).parents[2]
+    / "agent-tasks-runtime"
+    / "skills"
+    / "agent-tasks-runtime"
+    / "scripts"
+    / "execution.py"
+)
 SPEC = importlib.util.spec_from_file_location("pr_conflict_resolver", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -59,6 +67,13 @@ def decode_compact_path_evidence(evidence):
 
 
 class WindowsSubprocessTest(unittest.TestCase):
+    def test_embedded_loaders_accept_current_execution_runtime(self):
+        resolver_execution = MODULE.load_execution_runtime(RUNTIME_SCRIPT)
+        conflict_execution = CLOUD_MODULE.load_execution_runtime(RUNTIME_SCRIPT)
+
+        self.assertTrue(callable(resolver_execution.entrypoint))
+        self.assertTrue(callable(conflict_execution.controller_main))
+
     def windows_patches(self, completed):
         return (
             mock.patch.object(MODULE, "IS_WINDOWS", True),
@@ -922,7 +937,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "c72c8a0836d790128ce3f1e93ed7d1da3c01fbf465f96da3dbe0aa03dae14d04",
+            "d54c367ecddad68f8510917c1685913a034f1f1338607204eb9bf8245d6115cf",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -5558,6 +5573,38 @@ class PushRangeVerificationTest(unittest.TestCase):
 
 
 class StateFileTest(unittest.TestCase):
+    def test_execution_records_state_without_persistent_writer_reservations(self):
+        directory = temporary_directory(self)
+        path = directory / "state.json"
+        execution = SimpleNamespace(record_state=mock.Mock())
+        state = {
+            "version": MODULE.STATE_VERSION,
+            "pr": {
+                "head_owner": "owner",
+                "head_repo": "repo",
+                "head_branch": "feature",
+            },
+            "agent_task": {
+                "preflight": {
+                    "request": {
+                        "native_stack": {
+                            "members": [
+                                {
+                                    "repository": "owner/repo",
+                                    "head_ref": "feature",
+                                }
+                            ]
+                        }
+                    }
+                }
+            },
+        }
+
+        with mock.patch.object(MODULE, "_EXECUTION", execution):
+            MODULE.save_state(path, state)
+
+        execution.record_state.assert_called_once_with(path, state)
+
     def test_a_saved_state_round_trips_and_gains_a_timestamp(self):
         directory = temporary_directory(self)
         path = directory / "nested" / "state.json"
