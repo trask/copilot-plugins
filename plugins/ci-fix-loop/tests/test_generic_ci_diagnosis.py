@@ -159,9 +159,28 @@ class GenericCiDiagnosisTest(unittest.TestCase):
                     self.assertIsNone(MODULE.read_ci_diagnosis(self.preflight, self.remote))
                 read.assert_not_called()
 
-    def test_incomplete_duplicate_unknown_or_empty_recommendations_fail_closed(self):
+    def test_omitted_failures_become_explicit_unknown_entries(self):
+        entries, _ = self.diagnosis(self.entries[:1])
+        self.assertEqual("transient", entries[0]["diagnosis"])
+        self.assertEqual("unknown", entries[1]["diagnosis"])
+        self.assertEqual(
+            "worker supplied no diagnosis for this frozen failure",
+            entries[1]["reason"],
+        )
+        self.assertEqual([], entries[1]["evidence"])
+
+        entries, _ = self.diagnosis([])
+        self.assertEqual(
+            ["unknown", "unknown"],
+            [entry["diagnosis"] for entry in entries],
+        )
+        self.assertEqual("unfixable", MODULE.ci_diagnosis_outcome(entries))
+        mixed, _ = self.diagnosis(self.entries[:1])
+        self.assertEqual("unfixable", MODULE.ci_diagnosis_outcome(mixed))
+
+    def test_duplicate_foreign_or_malformed_recommendations_fail_closed(self):
         malformed = [
-            [], self.entries[:1], [self.entries[0], self.entries[0]],
+            [self.entries[0], self.entries[0]],
             [{**self.entries[0], "check_key": "unknown"}, self.entries[1]],
             [{**self.entries[0], "diagnosis": "green"}, self.entries[1]],
             [{**self.entries[0], "reason": " "}, self.entries[1]],
@@ -422,12 +441,6 @@ class GenericCiDiagnosisTest(unittest.TestCase):
             changed = {**state, field: "f" * 40}
             self.assertIsNone(MODULE.stage_outcome(changed))
         self.assertIsNone(MODULE.stage_outcome({**state, "ci_warnings": []}))
-
-    def test_ci_churn_during_readonly_summary_is_not_a_mutation_claim(self):
-        before = {"pull_request": "same", "checks": "old", "reviews": "same"}
-        self.assertTrue(MODULE.same_triage_github_state(before, {**before, "checks": "new"}))
-        self.assertFalse(MODULE.same_triage_github_state(before, {**before, "reviews": "new"}))
-        self.assertFalse(MODULE.same_triage_github_state(before, None))
 
     def test_controller_observes_after_recommendation_and_keeps_one_wait_budget(self):
         repository = self.root / "repo"

@@ -60,7 +60,7 @@ LEGACY_OWNER_AUTHORIZATION_FILE_SCHEMA = (
     "github.copilot.ci-fix-loop-legacy-owner-authorization-file.v1"
 )
 SEALED_CI_FIX_INVOCATION_SCHEMA = (
-    "github.copilot.ci-fix-loop-sealed-invocation.v3"
+    "github.copilot.ci-fix-loop-sealed-invocation.v4"
 )
 SEALED_CI_FIX_MUTATION_POLICY = {
     "id": "allow",
@@ -569,9 +569,6 @@ def sealed_ci_fix_admission(
         ),
         "result": artifact_path.with_name(
             f"ci-fix-loop-sealed-{invocation_id}-result.json"
-        ),
-        "stack_start_result": artifact_path.with_name(
-            f"ci-fix-loop-sealed-{invocation_id}-stack-start-result.json"
         ),
         "loop_result": artifact_path.with_name(
             f"ci-fix-loop-sealed-{invocation_id}-loop-result.json"

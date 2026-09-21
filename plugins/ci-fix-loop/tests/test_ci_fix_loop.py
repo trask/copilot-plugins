@@ -44,59 +44,6 @@ PERMISSION_MODULE = importlib.util.module_from_spec(PERMISSION_SPEC)
 PERMISSION_SPEC.loader.exec_module(PERMISSION_MODULE)
 
 
-def reconciled_forward_head_task(root):
-    root = Path(root)
-    root.mkdir(parents=True, exist_ok=True)
-    prompt_path = root / "legacy-prompt.txt"
-    result_path = root / "legacy-result.json"
-    triage_result_path = root / "legacy-triage-result.json"
-    prompt_path.write_text("legacy prompt\n", encoding="utf-8")
-    triage_result_path.write_text("{}\n", encoding="utf-8")
-    started_at = "2026-09-17T17:16:45.254471Z"
-    finished_at = "2026-09-17T20:20:06.098081Z"
-    return {
-        "dispatch_monitor": {
-            "schema": MODULE.HOSTED_DISPATCH_MONITOR_SCHEMA,
-            "status": "owner_lost",
-            "started_at": started_at,
-            "timeout_seconds": None,
-            "discovery_interval_seconds": None,
-            "baseline_task_ids": None,
-            "helper_pid": None,
-            "helper_exit_code": None,
-            "finished_at": finished_at,
-            "failure": MODULE.RECONCILED_FORWARD_HEAD_FAILURE,
-            "legacy_evidence": {
-                "blocked_coordinator_observed_at": "2026-09-17T18:15:55Z",
-                "prompt_sha256": MODULE.sha256_file(prompt_path),
-                "triage_result_sha256": MODULE.sha256_file(triage_result_path),
-                "result_absent": True,
-                "matching_process_ids": [],
-                "eligibility_artifact_sha256": "1" * 64,
-                "package_manifest_sha256": "2" * 64,
-                "authorization_token": "3" * 64,
-                "snapshot_sha256": "4" * 64,
-                "forward_head_provenance_sha256": "5" * 64,
-                "old_task_result_imported": False,
-            },
-        },
-        "error": MODULE.RECONCILED_FORWARD_HEAD_OWNER_ERROR,
-        "failed_at": finished_at,
-        "iteration_allowance": 1,
-        "model": "gpt-5.6-sol",
-        "phase": "hosted_fix",
-        "policy": MODULE.AGENT_TASK_POLICY,
-        "prompt_file": str(prompt_path),
-        "result_file": str(result_path),
-        "run_id": "a" * 32,
-        "started_at": started_at,
-        "status": "failed",
-        "task_id": None,
-        "task_id_status": "unknown",
-        "triage_result_file": str(triage_result_path),
-    }
-
-
 class AgentCommandAdmissionTest(unittest.TestCase):
     def test_execution_controls_bind_original_artifact_owner_and_root(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1057,7 +1004,7 @@ class SealedCiFixCommandTest(unittest.TestCase):
             self.assertNotEqual(first["state"], second["state"])
             self.assertEqual(
                 set(first),
-                {"state", "result", "stack_start_result", "loop_result"},
+                {"state", "result", "loop_result"},
             )
             self.assertIn("a" * 32, first["state"])
             self.assertIn("b" * 32, second["state"])
@@ -1139,23 +1086,7 @@ class SealedCiFixCommandTest(unittest.TestCase):
                 snapshot,
                 artifact,
             ) = self.fixture(root)
-            stack_calls = []
             loop_calls = []
-
-            def stack_start(arguments):
-                stack_calls.append(arguments)
-                MODULE.emit(
-                    {
-                        "result": "single",
-                        "target": "https://github.com/owner/repo/pull/7",
-                        "reason": "sealed_single_pull_request",
-                        "pr": {
-                            "number": 7,
-                            "pr_url": "https://github.com/owner/repo/pull/7",
-                            "repo_name": "owner/repo",
-                        },
-                    }
-                )
 
             def loop(arguments):
                 loop_calls.append(arguments)
@@ -1176,7 +1107,11 @@ class SealedCiFixCommandTest(unittest.TestCase):
                 for patch in self.run_patches(repo, package, snapshot):
                     stack.enter_context(patch)
                 stack.enter_context(
-                    mock.patch.object(MODULE, "command_stack_start", stack_start)
+                    mock.patch.object(
+                        MODULE,
+                        "command_stack_start",
+                        side_effect=AssertionError("sealed single-PR flow must not start a stack"),
+                    )
                 )
                 stack.enter_context(mock.patch.object(MODULE, "command_loop", loop))
                 output = io.StringIO()
@@ -1185,14 +1120,10 @@ class SealedCiFixCommandTest(unittest.TestCase):
                         SimpleNamespace(invocation_artifact=str(artifact_path))
                     )
 
-            self.assertEqual(1, len(stack_calls))
             self.assertEqual(1, len(loop_calls))
             self.assertEqual("sol", loop_calls[0].model)
             self.assertTrue(loop_calls[0].new_invocation)
-            self.assertEqual(
-                artifact["outputs"]["stack_start_result"],
-                loop_calls[0].preflight_result_file,
-            )
+            self.assertIsNone(loop_calls[0].preflight_result_file)
             result = json.loads(
                 Path(artifact["outputs"]["result"]).read_text(encoding="utf-8")
             )
@@ -1241,20 +1172,6 @@ class SealedCiFixCommandTest(unittest.TestCase):
             )
             legacy_bytes = legacy_state.read_bytes()
 
-            def stack_start(_arguments):
-                MODULE.emit(
-                    {
-                        "result": "single",
-                        "target": "https://github.com/owner/repo/pull/7",
-                        "reason": "sealed_single_pull_request",
-                        "pr": {
-                            "number": 7,
-                            "pr_url": "https://github.com/owner/repo/pull/7",
-                            "repo_name": "owner/repo",
-                        },
-                    }
-                )
-
             def loop(_arguments):
                 self.write_terminal_state(state_path)
                 MODULE.emit(
@@ -1274,7 +1191,11 @@ class SealedCiFixCommandTest(unittest.TestCase):
                     )
                 )
                 stack.enter_context(
-                    mock.patch.object(MODULE, "command_stack_start", stack_start)
+                    mock.patch.object(
+                        MODULE,
+                        "command_stack_start",
+                        side_effect=AssertionError("sealed single-PR flow must not start a stack"),
+                    )
                 )
                 stack.enter_context(mock.patch.object(MODULE, "command_loop", loop))
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -1286,88 +1207,6 @@ class SealedCiFixCommandTest(unittest.TestCase):
             self.assertEqual(artifact["outputs"]["state"], str(state_path))
             self.assertEqual("green", MODULE.load_state(state_path)["outcome"])
 
-    def test_ineligible_owner_stops_before_checkout_or_state_write(self):
-        with tempfile.TemporaryDirectory(prefix="sealed owner precheck ") as directory:
-            root = Path(directory)
-            repo = root / "repo"
-            repo.mkdir()
-            state_path = root / "state.json"
-            task = reconciled_forward_head_task(root / "legacy evidence")
-            task["recovery_command"] = "do not supersede"
-            MODULE.save_state(
-                state_path,
-                {
-                    "version": MODULE.STATE_VERSION,
-                    "agent_task": task,
-                },
-            )
-            state_before = state_path.read_bytes()
-            with (
-                mock.patch.object(MODULE, "git", return_value=""),
-                mock.patch.object(MODULE, "metadata_for") as metadata,
-                mock.patch.object(MODULE, "checkout_pr") as checkout,
-                self.assertRaisesRegex(
-                    MODULE.WorkflowError,
-                    "unfinished Agent Task",
-                ),
-            ):
-                MODULE.agent_task_preflight(
-                    repo,
-                    {"repo_name": "owner/repo", "number": 7},
-                    state_path=state_path,
-                )
-
-            metadata.assert_not_called()
-            checkout.assert_not_called()
-            self.assertEqual(state_before, state_path.read_bytes())
-
-    def test_missing_preflight_result_stops_before_loop_and_cannot_repeat(self):
-        with tempfile.TemporaryDirectory(prefix="sealed missing ") as directory:
-            root = Path(directory)
-            repo, _, artifact_path, package, snapshot, artifact = self.fixture(root)
-            fake = {
-                "status": "succeeded",
-                "outcome": {"result": "single"},
-            }
-            loop = mock.Mock()
-            with contextlib.ExitStack() as stack:
-                for patch in self.run_patches(repo, package, snapshot):
-                    stack.enter_context(patch)
-                stack.enter_context(
-                    mock.patch.object(
-                        MODULE,
-                        "execute_managed_command",
-                        side_effect=[fake],
-                    )
-                )
-                stack.enter_context(mock.patch.object(MODULE, "command_loop", loop))
-                with self.assertRaisesRegex(
-                    MODULE.WorkflowError,
-                    "stopped during stack_start",
-                ):
-                    MODULE.command_run_sealed_ci_fix(
-                        SimpleNamespace(invocation_artifact=str(artifact_path))
-                    )
-
-            loop.assert_not_called()
-            result_path = Path(artifact["outputs"]["result"])
-            result = json.loads(result_path.read_text(encoding="utf-8"))
-            self.assertEqual("failed", result["status"])
-            self.assertEqual("stack_start", result["stage"])
-            with contextlib.ExitStack() as stack:
-                for patch in self.run_patches(repo, package, snapshot):
-                    stack.enter_context(patch)
-                execute = stack.enter_context(
-                    mock.patch.object(MODULE, "execute_managed_command")
-                )
-                with self.assertRaisesRegex(
-                    MODULE.WorkflowError,
-                    "one-time file",
-                ):
-                    MODULE.command_run_sealed_ci_fix(
-                        SimpleNamespace(invocation_artifact=str(artifact_path))
-                    )
-            execute.assert_not_called()
 
     def test_stale_second_identity_pass_stops_before_loop(self):
         with tempfile.TemporaryDirectory(prefix="sealed stale ") as directory:
@@ -1475,23 +1314,16 @@ class SealedCiFixCommandTest(unittest.TestCase):
             self.assertEqual("package_pass_2", result["stage"])
             self.assertEqual(1, result["steps"]["package_passes"])
 
-    def test_timeout_is_terminal_and_unexpected_loss_retains_running_owner(self):
+    def test_loop_failure_is_terminal_and_unexpected_loss_retains_running_owner(self):
         with tempfile.TemporaryDirectory(prefix="sealed timeout ") as directory:
             root = Path(directory)
             repo, _, artifact_path, package, snapshot, artifact = self.fixture(root)
             with contextlib.ExitStack() as stack:
                 for patch in self.run_patches(repo, package, snapshot):
                     stack.enter_context(patch)
-                stack.enter_context(
-                    mock.patch.object(
-                        MODULE,
-                        "command_stack_start",
-                        side_effect=MODULE.WorkflowError("owned timeout"),
-                    )
-                )
                 with self.assertRaisesRegex(
                     MODULE.WorkflowError,
-                    "stopped during stack_start",
+                    "stopped during loop",
                 ):
                     MODULE.command_run_sealed_ci_fix(
                         SimpleNamespace(invocation_artifact=str(artifact_path))
@@ -1502,7 +1334,7 @@ class SealedCiFixCommandTest(unittest.TestCase):
             self.assertEqual("failed", result["status"])
             self.assertTrue(result["terminal"])
             self.assertEqual(os.getpid(), result["owner"]["process_id"])
-            self.assertIsNone(result["steps"]["loop"])
+            self.assertEqual("failed", result["steps"]["loop"]["status"])
 
         with tempfile.TemporaryDirectory(prefix="sealed owner loss ") as directory:
             root = Path(directory)
@@ -1570,70 +1402,6 @@ class SealedCiFixCommandTest(unittest.TestCase):
             ):
                 MODULE.require_sealed_initial_preflight(arguments, stale)
 
-    def test_sealed_state_rejects_active_or_recoverable_ownership(self):
-        with tempfile.TemporaryDirectory(prefix="sealed state ") as directory:
-            root = Path(directory)
-            state_path = root / "state.json"
-            state = {
-                "version": MODULE.STATE_VERSION,
-                "agent_task": {"status": "running"},
-            }
-            MODULE.save_state(state_path, state)
-            with self.assertRaisesRegex(
-                MODULE.WorkflowError,
-                "active workflow ownership",
-            ):
-                MODULE.sealed_ci_fix_state_identity(state_path)
-
-            state["agent_task"] = {
-                "status": "failed",
-                "recovery_command": "do not supersede",
-            }
-            MODULE.save_state(state_path, state)
-            with self.assertRaisesRegex(
-                MODULE.WorkflowError,
-                "active workflow ownership",
-            ):
-                MODULE.sealed_ci_fix_state_identity(state_path)
-
-            reconciled = reconciled_forward_head_task(root / "legacy evidence")
-            state["agent_task"] = reconciled
-            state["coordinator"] = {"status": "blocked"}
-            MODULE.save_state(state_path, state)
-            with self.assertRaisesRegex(
-                MODULE.WorkflowError,
-                "active workflow ownership",
-            ):
-                MODULE.sealed_ci_fix_state_identity(state_path)
-
-            near_misses = {
-                "recovery command": lambda task: task.update(
-                    {"recovery_command": "do not supersede"}
-                ),
-                "task identity": lambda task: task.update({"task_id": "task-7"}),
-                "imported result": lambda task: task["dispatch_monitor"][
-                    "legacy_evidence"
-                ].update({"old_task_result_imported": True}),
-                "missing provenance": lambda task: task["dispatch_monitor"][
-                    "legacy_evidence"
-                ].pop("forward_head_provenance_sha256"),
-                "changed prompt": lambda task: Path(task["prompt_file"]).write_text(
-                    "changed\n", encoding="utf-8"
-                ),
-            }
-            for name, mutate in near_misses.items():
-                with self.subTest(name=name):
-                    candidate = reconciled_forward_head_task(
-                        root / f"near miss {name}"
-                    )
-                    mutate(candidate)
-                    state["agent_task"] = candidate
-                    MODULE.save_state(state_path, state)
-                    with self.assertRaisesRegex(
-                        MODULE.WorkflowError,
-                        "active workflow ownership",
-                    ):
-                        MODULE.sealed_ci_fix_state_identity(state_path)
 
 
 class WindowsSubprocessTest(unittest.TestCase):
@@ -2773,43 +2541,6 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             self.assertEqual("hosted_helper_timeout", task["dispatch_monitor"]["failure"])
             owner.close.assert_called_once_with()
 
-    def test_dead_hosted_owner_is_finalized_without_recovery(self):
-        with tempfile.TemporaryDirectory() as directory:
-            state_path = Path(directory) / "state.json"
-            state = {
-                "version": MODULE.STATE_VERSION,
-                "agent_task": {
-                    "run_id": "run-1",
-                    "status": "running",
-                    "phase": "hosted_fix",
-                    "recovery_command": "must disappear",
-                    "retry_command": "must disappear",
-                    "dispatch_identity": self.identity(),
-                    "dispatch_monitor": {
-                        "status": "running",
-                        "helper_pid": 19,
-                    },
-                },
-            }
-            MODULE.save_state(state_path, state)
-
-            with mock.patch.object(
-                MODULE, "process_is_running", return_value=False
-            ):
-                reconciled = MODULE.reconcile_dead_hosted_owner(
-                    state_path,
-                    MODULE.load_state(state_path),
-                    repo_root=Path(directory),
-                    target={"repo_name": "owner/repo", "number": 7},
-                )
-
-            task = reconciled["agent_task"]
-            self.assertEqual("failed", task["status"])
-            self.assertEqual("known", task["task_id_status"])
-            self.assertEqual("task-1", task["task_id"])
-            self.assertEqual("owner_lost", task["dispatch_monitor"]["status"])
-            self.assertNotIn("recovery_command", task)
-            self.assertNotIn("retry_command", task)
 
     def test_active_helper_is_waited_to_completion_before_returning_its_output(self):
         class FakeProcess:
@@ -2885,68 +2616,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             self.assertEqual("exited", task["dispatch_monitor"]["status"])
             owner.close.assert_called_once_with()
 
-    def test_live_hosted_owner_is_not_reclassified(self):
-        with tempfile.TemporaryDirectory() as directory:
-            state_path = Path(directory) / "state.json"
-            state = {
-                "version": MODULE.STATE_VERSION,
-                "agent_task": {
-                    "run_id": "run-1",
-                    "status": "running",
-                    "phase": "hosted_fix",
-                    "dispatch_monitor": {
-                        "status": "running",
-                        "helper_pid": 19,
-                    },
-                },
-            }
-            MODULE.save_state(state_path, state)
 
-            with mock.patch.object(
-                MODULE, "process_is_running", return_value=True
-            ):
-                reconciled = MODULE.reconcile_dead_hosted_owner(
-                    state_path,
-                    MODULE.load_state(state_path),
-                    repo_root=Path(directory),
-                    target={"repo_name": "owner/repo", "number": 7},
-                )
-
-            self.assertEqual("running", reconciled["agent_task"]["status"])
-
-    def test_dead_hosted_owner_without_dispatch_identity_stays_unknown(self):
-        with tempfile.TemporaryDirectory() as directory:
-            state_path = Path(directory) / "state.json"
-            state = {
-                "version": MODULE.STATE_VERSION,
-                "agent_task": {
-                    "run_id": "run-1",
-                    "status": "running",
-                    "phase": "hosted_fix",
-                    "recovery_command": "must disappear",
-                    "dispatch_monitor": {
-                        "status": "running",
-                        "helper_pid": 19,
-                    },
-                },
-            }
-            MODULE.save_state(state_path, state)
-
-            with mock.patch.object(
-                MODULE, "process_is_running", return_value=False
-            ):
-                reconciled = MODULE.reconcile_dead_hosted_owner(
-                    state_path,
-                    MODULE.load_state(state_path),
-                    repo_root=Path(directory),
-                    target={"repo_name": "owner/repo", "number": 7},
-                )
-
-            task = reconciled["agent_task"]
-            self.assertEqual("failed", task["status"])
-            self.assertEqual("unknown", task["task_id_status"])
-            self.assertIsNone(task["task_id"])
-            self.assertNotIn("recovery_command", task)
 
     def legacy_owner_state(self, directory):
         root = Path(directory)
@@ -3026,108 +2696,8 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             },
         }
 
-    def test_normal_agent_task_entry_does_not_finalize_legacy_owner(self):
-        with tempfile.TemporaryDirectory() as directory:
-            state_path = Path(directory) / "state.json"
-            repo, identity, state = self.legacy_owner_state(directory)
-            MODULE.save_state(state_path, state)
-            with (
-                mock.patch.object(
-                    MODULE, "metadata_for"
-                ) as metadata,
-            ):
-                reconciled = MODULE.reconcile_dead_hosted_owner(
-                    state_path,
-                    MODULE.load_state(state_path),
-                    repo_root=repo,
-                    target={"repo_name": "owner/repo", "number": 7},
-                )
 
-            task = reconciled["agent_task"]
-            self.assertEqual("running", task["status"])
-            self.assertNotIn("dispatch_monitor", task)
-            self.assertNotIn("task_id_status", task)
-            self.assertEqual(1, reconciled["iterations"])
-            self.assertIn("recovery_command", task)
-            metadata.assert_not_called()
 
-    def test_legacy_owner_stays_active_while_exact_helper_process_exists(self):
-        with tempfile.TemporaryDirectory() as directory:
-            state_path = Path(directory) / "state.json"
-            repo, identity, state = self.legacy_owner_state(directory)
-            MODULE.save_state(state_path, state)
-            with (
-                mock.patch.object(MODULE, "local_identity", return_value=identity),
-                mock.patch.object(
-                    MODULE, "metadata_for", return_value=state["agent_task"]["preflight"]["pr"]
-                ),
-                mock.patch.object(MODULE, "require_live_pr_snapshot"),
-                mock.patch.object(MODULE, "require_live_check_snapshot"),
-                mock.patch.object(
-                    MODULE, "command_fragment_process_ids", return_value=[77]
-                ),
-            ):
-                reconciled = MODULE.reconcile_dead_hosted_owner(
-                    state_path,
-                    MODULE.load_state(state_path),
-                    repo_root=repo,
-                    target={"repo_name": "owner/repo", "number": 7},
-                )
-
-            self.assertEqual("running", reconciled["agent_task"]["status"])
-            self.assertIn("recovery_command", reconciled["agent_task"])
-
-    def test_legacy_owner_snapshot_requires_exact_zero_owner_evidence(self):
-        with tempfile.TemporaryDirectory() as directory:
-            state_path = Path(directory) / "state.json"
-            repo, identity, state = self.legacy_owner_state(directory)
-            MODULE.save_state(state_path, state)
-            with (
-                mock.patch.object(MODULE, "local_identity", return_value=identity),
-                mock.patch.object(
-                    MODULE,
-                    "metadata_for",
-                    return_value=state["agent_task"]["preflight"]["pr"],
-                ),
-                mock.patch.object(MODULE, "require_live_pr_snapshot"),
-                mock.patch.object(MODULE, "require_live_check_snapshot"),
-                mock.patch.object(
-                    MODULE, "command_fragment_process_ids", return_value=[]
-                ),
-            ):
-                snapshot = MODULE.legacy_hosted_owner_reconciliation_snapshot(
-                    state_path=state_path,
-                    repo_root=repo,
-                    target=MODULE.parse_target("owner/repo#7"),
-                )
-
-            self.assertEqual(
-                MODULE.LEGACY_OWNER_RECONCILIATION_SNAPSHOT_SCHEMA,
-                snapshot["schema"],
-            )
-            self.assertEqual(MODULE.sha256_file(state_path), snapshot["state"]["sha256"])
-            self.assertEqual([], snapshot["matching_process_ids"])
-            self.assertEqual("run-1", snapshot["owner"])
-
-            with (
-                mock.patch.object(MODULE, "local_identity", return_value=identity),
-                mock.patch.object(
-                    MODULE,
-                    "metadata_for",
-                    return_value=state["agent_task"]["preflight"]["pr"],
-                ),
-                mock.patch.object(MODULE, "require_live_pr_snapshot"),
-                mock.patch.object(MODULE, "require_live_check_snapshot"),
-                mock.patch.object(
-                    MODULE, "command_fragment_process_ids", return_value=[77]
-                ),
-                self.assertRaisesRegex(MODULE.WorkflowError, "still owns"),
-            ):
-                MODULE.legacy_hosted_owner_reconciliation_snapshot(
-                    state_path=state_path,
-                    repo_root=repo,
-                    target=MODULE.parse_target("owner/repo#7"),
-                )
 
     def forward_provenance_fixture(self):
         retained_head = "1" * 40
@@ -3291,210 +2861,9 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             workflow_run,
         )
 
-    def test_forward_head_provenance_requires_disjoint_completed_task_history(self):
-        (
-            pinned,
-            live,
-            expectations,
-            forward,
-            orphan,
-            task,
-            branch,
-            workflow_run,
-        ) = self.forward_provenance_fixture()
-        with (
-            mock.patch.object(
-                MODULE,
-                "github_linear_history",
-                side_effect=[forward, orphan],
-            ),
-            mock.patch.object(
-                MODULE,
-                "agent_task_api_json",
-                return_value=task,
-            ),
-            mock.patch.object(
-                MODULE,
-                "gh_json",
-                side_effect=[branch, workflow_run],
-            ),
-        ):
-            provenance = MODULE.legacy_forward_head_provenance(
-                target=MODULE.parse_target("owner/repo#7"),
-                pinned_pr=pinned,
-                live_pr=live,
-                expectations=expectations,
-            )
 
-        self.assertEqual("independent_forward_head", provenance["mode"])
-        self.assertEqual(pinned["head_sha"], provenance["separation"]["merge_base"])
-        self.assertEqual([], provenance["separation"]["shared_generated_commits"])
-        self.assertEqual([], provenance["separation"]["overlapping_changed_paths"])
-        self.assertFalse(provenance["separation"]["old_result_imported"])
-        self.assertEqual("task-1", provenance["orphan"]["task_id"])
 
-        orphan["commits"][0]["files"][0]["filename"] = "src/forward.java"
-        with (
-            mock.patch.object(
-                MODULE,
-                "github_linear_history",
-                side_effect=[forward, orphan],
-            ),
-            mock.patch.object(
-                MODULE,
-                "agent_task_api_json",
-                return_value=task,
-            ),
-            mock.patch.object(MODULE, "gh_json", return_value=branch),
-            self.assertRaisesRegex(MODULE.WorkflowError, "overlaps orphan"),
-        ):
-            MODULE.legacy_forward_head_provenance(
-                target=MODULE.parse_target("owner/repo#7"),
-                pinned_pr=pinned,
-                live_pr=live,
-                expectations=expectations,
-            )
 
-    def test_forward_head_provenance_rejects_active_task_and_actor_drift(self):
-        (
-            pinned,
-            live,
-            expectations,
-            forward,
-            orphan,
-            task,
-            branch,
-            workflow_run,
-        ) = self.forward_provenance_fixture()
-        task["state"] = "in_progress"
-        with (
-            mock.patch.object(
-                MODULE,
-                "github_linear_history",
-                side_effect=[forward, orphan],
-            ),
-            mock.patch.object(
-                MODULE,
-                "agent_task_api_json",
-                return_value=task,
-            ),
-            self.assertRaisesRegex(MODULE.WorkflowError, "completed"),
-        ):
-            MODULE.legacy_forward_head_provenance(
-                target=MODULE.parse_target("owner/repo#7"),
-                pinned_pr=pinned,
-                live_pr=live,
-                expectations=expectations,
-            )
-
-        task["state"] = "completed"
-        workflow_run["actor"]["login"] = "other"
-        with (
-            mock.patch.object(
-                MODULE,
-                "github_linear_history",
-                side_effect=[forward, orphan],
-            ),
-            mock.patch.object(
-                MODULE,
-                "agent_task_api_json",
-                return_value=task,
-            ),
-            mock.patch.object(
-                MODULE,
-                "gh_json",
-                side_effect=[branch, workflow_run],
-            ),
-            self.assertRaisesRegex(MODULE.WorkflowError, "actor evidence"),
-        ):
-            MODULE.legacy_forward_head_provenance(
-                target=MODULE.parse_target("owner/repo#7"),
-                pinned_pr=pinned,
-                live_pr=live,
-                expectations=expectations,
-            )
-
-    def test_forward_head_reconciliation_requires_complete_exact_argv(self):
-        arguments = SimpleNamespace(
-            expected_forward_head_sha="1" * 40,
-            expected_forward_tree_sha=None,
-            expected_forward_actor=None,
-            expected_forward_run_id=None,
-            expected_orphan_task_id=None,
-            expected_orphan_session_id=None,
-            expected_orphan_branch=None,
-            expected_orphan_head_sha=None,
-        )
-        with self.assertRaisesRegex(MODULE.WorkflowError, "every exact provenance"):
-            MODULE.legacy_forward_expectations_from_args(arguments)
-
-    def test_forward_history_rejects_non_linear_or_diverged_commits(self):
-        base = "1" * 40
-        head = "2" * 40
-        compare = {
-            "status": "ahead",
-            "ahead_by": 1,
-            "behind_by": 0,
-            "total_commits": 1,
-            "merge_base_commit": {"sha": base},
-            "commits": [{"sha": head}],
-        }
-        commit = {
-            "sha": head,
-            "commit": {
-                "tree": {"sha": "3" * 40},
-                "author": {
-                    "name": "Owner",
-                    "email": "owner@example.test",
-                    "date": "2026-09-17T19:10:19Z",
-                },
-                "committer": {
-                    "name": "Owner",
-                    "email": "owner@example.test",
-                    "date": "2026-09-17T19:10:19Z",
-                },
-                "message": "Forward",
-                "verification": {
-                    "verified": False,
-                    "reason": "unsigned",
-                    "signature": None,
-                    "verified_at": None,
-                },
-            },
-            "parents": [{"sha": base}, {"sha": "4" * 40}],
-            "author": {"login": "owner"},
-            "committer": {"login": "owner"},
-            "files": [
-                {
-                    "filename": "src/file.java",
-                    "status": "modified",
-                    "sha": "5" * 40,
-                    "additions": 1,
-                    "deletions": 1,
-                    "changes": 2,
-                }
-            ],
-        }
-        with (
-            mock.patch.object(MODULE, "gh_json", side_effect=[compare, commit]),
-            self.assertRaisesRegex(MODULE.WorkflowError, "identity is invalid"),
-        ):
-            MODULE.github_linear_history(
-                "owner/repo",
-                base_sha=base,
-                head_sha=head,
-            )
-
-        compare["status"] = "diverged"
-        with (
-            mock.patch.object(MODULE, "gh_json", return_value=compare),
-            self.assertRaisesRegex(MODULE.WorkflowError, "forward-only"),
-        ):
-            MODULE.github_linear_history(
-                "owner/repo",
-                base_sha=base,
-                head_sha=head,
-            )
 
     def test_package_manifest_verifies_exact_installed_helper_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4110,26 +3479,6 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             self.assertEqual("running", MODULE.load_state(state_path)["agent_task"]["status"])
 
 
-class StatelessLegacyCommandTest(unittest.TestCase):
-    def test_legacy_reconciliation_commands_fail_before_tools(self):
-        commands = (
-            MODULE.command_prepare_legacy_owner_reconciliation,
-            MODULE.command_verify_sealed_legacy_owner_reconciliation,
-            MODULE.command_verify_legacy_owner_reconciliation,
-            MODULE.command_apply_sealed_legacy_owner_reconciliation,
-            MODULE.command_apply_legacy_owner_reconciliation,
-        )
-        with mock.patch.object(MODULE, "require_tools") as require_tools:
-            for command in commands:
-                with self.subTest(command=command.__name__):
-                    with self.assertRaisesRegex(
-                        MODULE.WorkflowError,
-                        "start a fresh sealed CI Fix invocation",
-                    ):
-                        command(SimpleNamespace())
-        require_tools.assert_not_called()
-
-
 class ManagedAgentTaskContractTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -4204,25 +3553,6 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "stack_guard": None,
             "check_snapshot": snapshot,
         }
-        summary = (
-            f"{MODULE.triage_identity_line(self.preflight)}\n"
-            "The test failure is the root failure.\n"
-        )
-
-        def fake_triage(**kwargs):
-            kwargs["summary_path"].write_text(summary, encoding="utf-8")
-            kwargs["result_path"].write_text("{}\n", encoding="utf-8")
-            return summary
-
-        self.triage_worker = mock.patch.object(
-            MODULE, "run_local_triage_worker", side_effect=fake_triage
-        )
-        self.retained_triage = mock.patch.object(
-            MODULE, "validate_retained_local_triage", return_value=summary
-        )
-        self.github_fingerprint = mock.patch.object(
-            MODULE, "github_triage_fingerprint", return_value={"state": "pinned"}
-        )
         self.hosted_helper = mock.patch.object(
             MODULE,
             "run_hosted_helper",
@@ -4237,14 +3567,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 self.trusted_evidence(commit_sha)
             ),
         )
-        self.triage_worker_mock = self.triage_worker.start()
-        self.retained_triage_mock = self.retained_triage.start()
-        self.github_fingerprint.start()
         self.hosted_helper_mock = self.hosted_helper.start()
         self.trusted_validation_mock = self.trusted_validation.start()
-        self.addCleanup(self.triage_worker.stop)
-        self.addCleanup(self.retained_triage.stop)
-        self.addCleanup(self.github_fingerprint.stop)
         self.addCleanup(self.hosted_helper.stop)
         self.addCleanup(self.trusted_validation.stop)
 
@@ -4663,7 +3987,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.61", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.62", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -4699,34 +4023,6 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.WorkflowError, "exactly one"):
             MODULE.parse_markdown_report("# Result", description="test report")
 
-    def test_prompt_pins_snapshot_allowance_model_policy_and_worker_boundary(self):
-        prompt = MODULE.build_worker_prompt(
-            self.preflight,
-            iteration_allowance=1,
-            prior_history=[],
-            requested_model="gpt-5.6-sol",
-            ci_evidence=(
-                f"{MODULE.triage_identity_line(self.preflight)}\n"
-                "The test failure is the root failure.\n"
-            ),
-        )
-        self.assertIn("sole repository worker", prompt)
-        self.assertIn(self.preflight["check_snapshot"]["sha256"], prompt)
-        self.assertIn('"iteration_allowance": 1', prompt)
-        self.assertIn("Never select a marketplace `custom_agent`", prompt)
-        self.assertIn("use Cloud Sandboxes", prompt)
-        self.assertIn("worker prompt version 9", prompt)
-        self.assertIn("validate them in this hosted task", prompt)
-        self.assertIn("never executes candidate validation commands", prompt)
-        self.assertIn("rerun checks, post comments, reviews or replies", prompt)
-        self.assertIn("resolve threads, change labels, or change any GitHub metadata", prompt)
-        self.assertNotIn("AssertionError: expected 2", prompt)
-        self.assertIn(MODULE.AGENT_TASK_OUTPUT_REPORT, prompt)
-        self.assertNotIn("{{MARKETPLACE_SEMANTIC_PATH}}", prompt)
-        self.assertNotIn('"commit_index"', prompt)
-        self.assertNotIn("MARKETPLACE_REPORT_PATH", prompt)
-        self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
-        MODULE.require_no_credentials(prompt, source="prompt")
 
     def test_failed_log_download_is_scoped_to_the_exact_job(self):
         check = self.preflight["check_snapshot"]["failures"][0]
@@ -7523,20 +6819,6 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             MODULE.require_outside_repository(self.root / "result.json", self.root)
         MODULE.require_outside_repository(self.root.parent / "result.json", self.root)
 
-    def test_recovery_command_preserves_task_identity_inputs(self):
-        command = MODULE.agent_task_recovery_command(
-            target="owner/repo#7",
-            repo_root=self.root,
-            state_path=self.root.parent / "state.json",
-            model="sol",
-        )
-        self.assertIn("agent-task", command)
-        self.assertIn("--resume", command)
-        self.assertIn("--state", command)
-        source = SCRIPT.read_text(encoding="utf-8")
-        self.assertNotIn('"--input-result-file"', source)
-        self.assertIn('"--result-file"', source)
-        self.assertIn('"--policy"', source)
 
     def test_preserve_artifacts_keeps_exact_files_and_records_manifest(self):
         state_path = self.root / "state.json"
@@ -7595,234 +6877,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("recovery_command", stored)
         self.assertNotIn("recovery_files", stored)
 
-    def test_recovery_command_can_preserve_artifacts(self):
-        command = MODULE.agent_task_recovery_command(
-            target="owner/repo#7",
-            repo_root=self.root,
-            state_path=self.root.parent / "state.json",
-            model="sol",
-            preserve_artifacts=True,
-        )
-        args = MODULE.build_parser().parse_args(
-            [
-                "agent-task",
-                "owner/repo#7",
-                "--resume",
-                "--preserve-artifacts",
-            ]
-        )
 
-        self.assertIn('"--resume"', command)
-        self.assertIn('"--preserve-artifacts"', command)
-        self.assertTrue(args.preserve_artifacts)
 
-    def test_recovery_rejects_a_failed_result_with_mismatched_identity(self):
-        failed = self.result()
-        failed["status"] = "error"
-        failed["task"]["state"] = "in_progress"
-        failed["application"] = {
-            "status": "not_applied",
-            "final_local_head": self.head,
-        }
-        failed["semantic_output"] = None
-        failed["attestation"]["structural_complete"] = False
-        failed["error"] = {"code": "worker_failed", "message": "transient failure"}
-        with self.assertRaisesRegex(MODULE.WorkflowError, "cannot prove"):
-            MODULE.validate_recovery_result_identity(
-                failed,
-                preflight=self.preflight,
-                requested_model="gpt-5.6-sol",
-            )
 
-    def test_failed_open_pr_task_cannot_resume_or_start_a_replacement(self):
-        repo = self.root / "repo"
-        repo.mkdir()
-        state_path = self.root / "state.json"
-        preflight = copy.deepcopy(self.preflight)
-        preflight["repository_root"] = str(repo)
-        report = self.report()
-        failed = self.result()
-        failed["status"] = "error"
-        failed["task"]["state"] = "in_progress"
-        failed["application"] = {
-            "status": "not_applied",
-            "final_local_head": self.head,
-        }
-        failed["semantic_output"] = None
-        failed["attestation"]["structural_complete"] = False
-        failed["error"] = {"code": "worker_failed", "message": "transient failure"}
-        helper_commands = []
 
-        def run_helper(command, **kwargs):
-            helper_commands.append(command)
-            result_file = Path(command[command.index("--result-file") + 1])
-            result_file.write_text(json.dumps(failed), encoding="utf-8")
-            return MODULE.subprocess.CompletedProcess(command, 1, "", "")
-
-        arguments = [
-            "agent-task",
-            self.preflight["pr"]["pr_url"],
-            "--repo-root",
-            str(repo),
-            "--state",
-            str(state_path),
-        ]
-        with (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
-            mock.patch.object(
-                MODULE, "resolve_target", return_value={"repo_name": "owner/repo", "number": 7}
-            ),
-            mock.patch.object(
-                MODULE,
-                "agent_task_preflight",
-                return_value=preflight,
-            ),
-            mock.patch.object(MODULE, "discover_cloud_task", return_value=self.root / "cloud_task.py"),
-            mock.patch.object(MODULE, "run", side_effect=run_helper),
-            mock.patch.object(MODULE, "local_identity", return_value=preflight["identity"]),
-            mock.patch.object(
-                MODULE, "fetch_committed_text", return_value=report
-            ),
-            mock.patch.object(MODULE, "validate_generated_history"),
-            mock.patch.object(MODULE, "refuse_test_suppression"),
-            mock.patch.object(MODULE, "require_live_check_snapshot"),
-            mock.patch.object(MODULE, "metadata_for", return_value=preflight["pr"]),
-            mock.patch.object(MODULE, "emit") as emit,
-        ):
-            with self.assertRaisesRegex(MODULE.WorkflowError, "transient failure"):
-                MODULE.command_agent_task(MODULE.build_parser().parse_args(arguments))
-            with self.assertRaisesRegex(
-                MODULE.WorkflowError, "resume is disabled"
-            ):
-                MODULE.command_agent_task(
-                    MODULE.build_parser().parse_args([*arguments, "--resume"])
-                )
-
-        self.assertEqual(1, len(helper_commands))
-        self.assertNotIn("--resume-apply-with-report", helper_commands[0])
-        state = MODULE.load_state(state_path)
-        self.assertEqual("failed", state["agent_task"]["status"])
-        self.assertNotIn("recovery_command", state["agent_task"])
-        self.assertNotIn("retry_command", state["agent_task"])
-        self.assertFalse(state["agent_task"].get("artifacts_removed", False))
-        self.assertTrue(Path(state["agent_task"]["result_file"]).is_file())
-        emit.assert_not_called()
-
-    def test_legacy_resume_fails_before_tools_state_or_checkout(self):
-        state_path = self.root / "resume-must-not-exist.json"
-        arguments = MODULE.build_parser().parse_args(
-            [
-                "agent-task",
-                "owner/repo#7",
-                "--repo-root",
-                str(self.root),
-                "--state",
-                str(state_path),
-                "--resume",
-            ]
-        )
-        with (
-            mock.patch.object(MODULE, "require_tools") as require_tools,
-            mock.patch.object(MODULE, "resolve_repo_root") as resolve_repo_root,
-            mock.patch.object(MODULE, "resolve_target") as resolve_target,
-            mock.patch.object(MODULE, "checkout_pr") as checkout_pr,
-            mock.patch.object(MODULE, "save_state") as save_state,
-            self.assertRaisesRegex(
-                MODULE.WorkflowError,
-                "start a fresh sealed CI Fix invocation",
-            ),
-        ):
-            MODULE.command_agent_task(arguments)
-
-        require_tools.assert_not_called()
-        resolve_repo_root.assert_not_called()
-        resolve_target.assert_not_called()
-        checkout_pr.assert_not_called()
-        save_state.assert_not_called()
-        self.assertFalse(state_path.exists())
-
-    def test_taskless_failure_is_terminal_for_its_invocation(self):
-        repo = self.root / "repo"
-        repo.mkdir()
-        state_path = self.root / "state.json"
-        preflight = copy.deepcopy(self.preflight)
-        preflight["repository_root"] = str(repo)
-        log_directory = self.root / "state--ci-fix-logs--retry"
-        log_path = log_directory / "failed.log"
-        preflight["check_snapshot"]["failures"][0]["log_path"] = str(log_path)
-        failed = self.candidate_taskless_failure()
-        helper_commands = []
-
-        def preflight_for_retry(*_args, **_kwargs):
-            log_directory.mkdir(exist_ok=True)
-            log_path.write_bytes(b"AssertionError: expected 2\n")
-            return preflight
-
-        def run_helper(command, **kwargs):
-            helper_commands.append(command)
-            result_file = Path(command[command.index("--result-file") + 1])
-            result_file.write_text(json.dumps(failed), encoding="utf-8")
-            return MODULE.subprocess.CompletedProcess(command, 1, "", "")
-
-        arguments = [
-            "agent-task",
-            self.preflight["pr"]["pr_url"],
-            "--repo-root",
-            str(repo),
-            "--state",
-            str(state_path),
-            "--max-iterations",
-            "1",
-        ]
-        with (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
-            mock.patch.object(
-                MODULE,
-                "resolve_target",
-                return_value={"repo_name": "owner/repo", "number": 7},
-            ),
-            mock.patch.object(
-                MODULE,
-                "agent_task_preflight",
-                side_effect=preflight_for_retry,
-            ),
-            mock.patch.object(
-                MODULE,
-                "discover_cloud_task",
-                return_value=self.root / "cloud_task.py",
-            ),
-            mock.patch.object(MODULE, "run", side_effect=run_helper),
-            mock.patch.object(
-                MODULE,
-                "local_identity",
-                return_value=preflight["identity"],
-            ),
-            mock.patch.object(MODULE, "require_live_check_snapshot"),
-        ):
-            with self.assertRaisesRegex(
-                MODULE.WorkflowError,
-                r"Agent Task failed \[api_failure\]: start Agent Task failed",
-            ):
-                MODULE.command_agent_task(
-                    MODULE.build_parser().parse_args(arguments)
-                )
-            with self.assertRaisesRegex(
-                MODULE.WorkflowError,
-                "unfinished Agent Task",
-            ):
-                MODULE.command_agent_task(
-                    MODULE.build_parser().parse_args(arguments)
-                )
-
-        self.assertEqual(1, len(helper_commands))
-        self.triage_worker_mock.assert_not_called()
-        self.assertEqual(0, self.retained_triage_mock.call_count)
-        state = MODULE.load_state(state_path)
-        self.assertEqual(1, state["iterations"])
-        self.assertEqual("not_created", state["agent_task"]["task_id_status"])
-        self.assertNotIn("managed_task_history", state)
 
     def test_taskless_retry_exemption_requires_the_same_stable_snapshot(self):
         task = {"preflight": copy.deepcopy(self.preflight)}
@@ -7832,57 +6890,6 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertTrue(MODULE.task_matches_preflight(task, self.preflight))
         self.assertFalse(MODULE.task_matches_preflight(task, changed))
 
-    def test_controller_evidence_failure_dispatches_no_hosted_task(self):
-        repo = self.root / "repo"
-        repo.mkdir()
-        state_path = self.root / "state.json"
-        preflight = copy.deepcopy(self.preflight)
-        preflight["repository_root"] = str(repo)
-        self.triage_worker_mock.side_effect = MODULE.WorkflowError(
-            "triage failed"
-        )
-        arguments = MODULE.build_parser().parse_args(
-            [
-                "agent-task",
-                self.preflight["pr"]["pr_url"],
-                "--repo-root",
-                str(repo),
-                "--state",
-                str(state_path),
-            ]
-        )
-        with (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=repo),
-            mock.patch.object(
-                MODULE,
-                "resolve_target",
-                return_value={"repo_name": "owner/repo", "number": 7},
-            ),
-            mock.patch.object(
-                MODULE, "agent_task_preflight", return_value=preflight
-            ),
-            mock.patch.object(
-                MODULE, "local_identity", return_value=preflight["identity"]
-            ),
-            mock.patch.object(MODULE, "require_live_check_snapshot"),
-            mock.patch.object(
-                MODULE, "controller_ci_evidence", side_effect=MODULE.WorkflowError("evidence unavailable")
-            ),
-            mock.patch.object(MODULE, "discover_cloud_task") as discover,
-            self.assertRaisesRegex(MODULE.WorkflowError, "evidence unavailable"),
-        ):
-            MODULE.command_agent_task(arguments)
-
-        discover.assert_called_once()
-        self.hosted_helper_mock.assert_not_called()
-        self.triage_worker_mock.assert_not_called()
-        state = MODULE.load_state(state_path)
-        self.assertEqual("failed", state["agent_task"]["status"])
-        self.assertEqual(
-            "not_created", state["agent_task"]["task_id_status"]
-        )
-        self.assertNotIn("retry_command", state["agent_task"])
 
     def test_hosted_timeout_with_known_task_has_no_generic_recovery(self):
         repo = self.root / "repo"
@@ -7954,7 +6961,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("retry_command", task)
         self.assertNotIn("recovery_command", task)
 
-    def hosted_diagnosis_flow(self, diagnosis, *, changed=False, candidate=False):
+    def hosted_diagnosis_flow(
+        self, diagnosis, *, changed=False, candidate=False, source_changed=False
+    ):
         repo = self.root / "repo"
         repo.mkdir()
         state_path = self.root / "diagnosis-state.json"
@@ -8008,7 +7017,16 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     else changed_error if changed else None
                 ),
             ),
-            mock.patch.object(MODULE, "metadata_for", return_value=preflight["pr"]),
+            mock.patch.object(
+                MODULE,
+                "metadata_for",
+                return_value=(
+                    {**preflight["pr"], "head_sha": "6" * 40}
+                    if source_changed
+                    else preflight["pr"]
+                ),
+            ),
+            mock.patch.object(MODULE, "commit_contains", return_value=True),
             mock.patch.object(MODULE, "remote_head", return_value=self.head),
             mock.patch.object(MODULE, "ci_snapshot_runs", return_value={}),
             mock.patch.object(MODULE, "fetch_committed_text", return_value=json.dumps(payload)),
@@ -8072,6 +7090,17 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertFalse(state["agent_task"]["imported"])
         apply.assert_not_called()
         self.assertIsNone(MODULE.stage_outcome(state))
+
+    def test_forward_source_drift_supersedes_candidate_and_charges_iteration(self):
+        payload, state, apply = self.hosted_diagnosis_flow(
+            "transient", candidate=True, source_changed=True
+        )
+        self.assertEqual("source_changed", payload["result"])
+        self.assertEqual("superseded", state["agent_task"]["status"])
+        self.assertFalse(state["agent_task"]["imported"])
+        self.assertEqual("6" * 40, state["agent_task"]["superseded_by_head_sha"])
+        self.assertEqual(1, state["iterations"])
+        apply.assert_not_called()
 
     def test_managed_fix_publishes_only_the_verified_fix_commit(self):
         repo = self.root / "repo"
@@ -9585,7 +8614,7 @@ class TrustedValidationRunnerTest(unittest.TestCase):
         self.assertTrue(raised.exception.details["source_identity_drift"])
 
 
-class LocalCiLogTriageTest(unittest.TestCase):
+class HostedCiEvidencePromptTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -9638,67 +8667,10 @@ class LocalCiLogTriageTest(unittest.TestCase):
             },
             "check_snapshot": snapshot,
         }
-        self.summary = (
-            f"{MODULE.triage_identity_line(self.preflight)}\n"
-            "The unit-test assertion is the root failure.\n"
-        )
+        self.summary = "The unit-test assertion is the root failure.\n"
 
-    def test_prompt_references_log_file_without_embedding_log_text(self):
-        summary_path = self.artifacts / "summary.md"
 
-        prompt = MODULE.build_triage_prompt(
-            self.preflight, summary_path=summary_path
-        )
 
-        self.assertIn(json.dumps(str(self.log_path)), prompt)
-        self.assertIn("rg or grep", prompt)
-        self.assertIn("bounded line ranges", prompt)
-        self.assertNotIn(self.log_text, prompt)
-
-    def test_materialized_workspace_contains_only_pinned_logs(self):
-        state_path = Path(self.temporary.name) / "state.json"
-        state_path.write_text('{"coordinator":"private"}\n', encoding="utf-8")
-
-        workspace = MODULE.materialize_local_triage_workspace(
-            self.preflight,
-            state_path=state_path,
-            run_id="run-1",
-        )
-
-        moved_log = Path(
-            self.preflight["check_snapshot"]["failures"][0]["log_path"]
-        )
-        self.assertEqual(workspace, moved_log.parent)
-        self.assertEqual([moved_log], list(workspace.iterdir()))
-        self.assertFalse(self.log_path.exists())
-        self.assertNotEqual(state_path.parent, workspace)
-
-    def test_summary_is_bounded_nonempty_and_snapshot_bound(self):
-        summary_path = self.artifacts / "summary.md"
-        summary_path.write_text(self.summary, encoding="utf-8", newline="")
-        self.assertEqual(
-            self.summary,
-            MODULE.validate_triage_summary(summary_path, self.preflight),
-        )
-
-        invalid = {
-            "empty": "",
-            "stale": "<!-- ci-fix-loop-triage-v1 snapshot=bad head=bad -->\ntext\n",
-            "marker only": f"{MODULE.triage_identity_line(self.preflight)}\n",
-            "reserved boundary": (
-                f"{MODULE.triage_identity_line(self.preflight)}\n"
-                f"{MODULE.TRIAGE_SUMMARY_BOUNDARIES[1]}\n"
-            ),
-            "oversized": (
-                f"{MODULE.triage_identity_line(self.preflight)}\n"
-                + "x" * MODULE.MAX_TRIAGE_SUMMARY_BYTES
-            ),
-        }
-        for name, content in invalid.items():
-            with self.subTest(name=name):
-                summary_path.write_text(content, encoding="utf-8", newline="")
-                with self.assertRaises(MODULE.WorkflowError):
-                    MODULE.validate_triage_summary(summary_path, self.preflight)
 
     def test_hosted_prompt_receives_summary_unchanged_and_no_raw_log(self):
         prompt = MODULE.build_worker_prompt(
@@ -9716,353 +8688,11 @@ class LocalCiLogTriageTest(unittest.TestCase):
         self.assertNotIn(self.log_text, prompt)
         self.assertNotIn(str(self.log_path), prompt)
 
-    def test_github_fingerprint_ignores_unrelated_repository_activity(self):
-        pull_request = {
-            "id": 17,
-            "node_id": "PR_node",
-            "number": 7,
-            "state": "open",
-            "locked": False,
-            "active_lock_reason": None,
-            "title": "Fix widget",
-            "body": "",
-            "draft": True,
-            "maintainer_can_modify": True,
-            "closed_at": None,
-            "merged_at": None,
-            "user": {"id": 11, "node_id": "U_owner", "login": "owner", "type": "User"},
-            "merged_by": None,
-            "head": {
-                "label": "owner:feature",
-                "ref": "feature",
-                "sha": self.preflight["pr"]["head_sha"],
-                "user": {
-                    "id": 11,
-                    "node_id": "U_owner",
-                    "login": "owner",
-                    "type": "User",
-                },
-                "repo": {
-                    "id": 21,
-                    "node_id": "R_fork",
-                    "full_name": "owner/repo",
-                    "private": False,
-                    "fork": True,
-                    "pushed_at": "2026-09-17T19:10:31Z",
-                },
-            },
-            "base": {
-                "label": "owner:main",
-                "ref": "main",
-                "sha": "3" * 40,
-                "user": {
-                    "id": 11,
-                    "node_id": "U_owner",
-                    "login": "owner",
-                    "type": "User",
-                },
-                "repo": {
-                    "id": 22,
-                    "node_id": "R_upstream",
-                    "full_name": "owner/repo",
-                    "private": False,
-                    "fork": False,
-                    "pushed_at": "2026-09-18T01:12:00Z",
-                    "stargazers_count": 100,
-                },
-            },
-            "requested_reviewers": [],
-            "requested_teams": [],
-            "auto_merge": None,
-            "mergeable": True,
-            "rebaseable": False,
-            "mergeable_state": "blocked",
-            "merge_commit_sha": "4" * 40,
-        }
 
-        def fingerprint():
-            def api_response(arguments):
-                path = arguments[-1]
-                if path == "repos/owner/repo/pulls/7":
-                    return copy.deepcopy(pull_request)
-                if path == "repos/owner/repo/issues/7":
-                    return {"id": 7}
-                return []
 
-            with (
-                mock.patch.object(
-                    MODULE,
-                    "metadata_for",
-                    return_value=self.preflight["pr"],
-                ),
-                mock.patch.object(
-                    MODULE,
-                    "fetch_rollup",
-                    return_value=(self.preflight["pr"]["head_sha"], []),
-                ),
-                mock.patch.object(MODULE, "gh_json", side_effect=api_response),
-            ):
-                return MODULE.github_triage_fingerprint(
-                    {"repo_name": "owner/repo", "number": 7},
-                    self.preflight,
-                )
 
-        before = fingerprint()
-        pull_request["base"]["repo"]["pushed_at"] = "2026-09-18T01:14:39Z"
-        pull_request["base"]["repo"]["stargazers_count"] = 101
-        pull_request["mergeable_state"] = "unknown"
-        pull_request["merge_commit_sha"] = "5" * 40
-        after_external_activity = fingerprint()
 
-        self.assertEqual(before, after_external_activity)
 
-        pull_request["requested_reviewers"] = [
-            {
-                "id": 12,
-                "node_id": "U_reviewer",
-                "login": "reviewer",
-                "type": "User",
-            }
-        ]
-        self.assertNotEqual(
-            before,
-            fingerprint(),
-        )
-
-    def test_local_worker_uses_default_agent_and_verified_artifacts(self):
-        prompt_path = self.artifacts / "prompt.txt"
-        summary_path = self.artifacts / "summary.md"
-        result_path = self.artifacts / "result.json"
-        prompt_path.write_text(
-            MODULE.build_triage_prompt(
-                self.preflight, summary_path=summary_path
-            ),
-            encoding="utf-8",
-            newline="",
-        )
-        summary_path.write_text(self.summary, encoding="utf-8", newline="")
-        identity = self.preflight["identity"]
-        github = {"pull_request": "pinned"}
-        attestation = {"session_id": "session-1", "events_sha256": "a" * 64}
-        completed = MODULE.subprocess.CompletedProcess(["copilot"], 0, "", "")
-        with (
-            mock.patch.object(MODULE, "run", return_value=completed) as run,
-            mock.patch.object(MODULE, "local_identity", return_value=identity),
-            mock.patch.object(
-                MODULE, "github_triage_fingerprint", return_value=github
-            ),
-            mock.patch.object(
-                MODULE,
-                "local_session_model_attestation",
-                return_value=attestation,
-            ),
-        ):
-            summary = MODULE.run_local_triage_worker(
-                repo_root=self.root,
-                target={"repo_name": "owner/repo", "number": 7},
-                preflight=self.preflight,
-                prompt_path=prompt_path,
-                summary_path=summary_path,
-                result_path=result_path,
-                run_id="run-1",
-                session_id="session-1",
-                before_source=identity,
-                before_github=github,
-            )
-
-        self.assertEqual(self.summary, summary)
-        command = run.call_args.args[0]
-        self.assertEqual("copilot", command[0])
-        self.assertNotIn("--agent", command)
-        self.assertIn("--no-custom-instructions", command)
-        self.assertIn("--no-remote", command)
-        self.assertNotIn("--allow-all-paths", command)
-        self.assertEqual(self.artifacts, run.call_args.kwargs["cwd"])
-        self.assertEqual("", run.call_args.kwargs["env"]["GH_TOKEN"])
-        self.assertEqual("", run.call_args.kwargs["env"]["GITHUB_TOKEN"])
-        self.assertNotEqual(
-            str(Path.home() / ".config" / "gh"),
-            run.call_args.kwargs["env"]["GH_CONFIG_DIR"],
-        )
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-        self.assertEqual(MODULE.LOCAL_TRIAGE_RESULT_SCHEMA, result["schema"])
-        self.assertEqual(MODULE.LOCAL_TRIAGE_MODEL, result["worker"]["model"])
-
-    def test_local_worker_fails_closed_on_source_change(self):
-        prompt_path = self.artifacts / "prompt.txt"
-        summary_path = self.artifacts / "summary.md"
-        result_path = self.artifacts / "result.json"
-        prompt_path.write_text("prompt\n", encoding="utf-8", newline="")
-        summary_path.write_text(self.summary, encoding="utf-8", newline="")
-        completed = MODULE.subprocess.CompletedProcess(["copilot"], 0, "", "")
-        with (
-            mock.patch.object(MODULE, "run", return_value=completed),
-            mock.patch.object(
-                MODULE,
-                "local_identity",
-                return_value={"branch": "feature", "head": "9" * 40, "status": ""},
-            ),
-            mock.patch.object(
-                MODULE,
-                "github_triage_fingerprint",
-                return_value={"pull_request": "pinned"},
-            ),
-            self.assertRaisesRegex(MODULE.WorkflowError, "repository source"),
-        ):
-            MODULE.run_local_triage_worker(
-                repo_root=self.root,
-                target={"repo_name": "owner/repo", "number": 7},
-                preflight=self.preflight,
-                prompt_path=prompt_path,
-                summary_path=summary_path,
-                result_path=result_path,
-                run_id="run-1",
-                session_id="session-1",
-                before_source=self.preflight["identity"],
-                before_github={"pull_request": "pinned"},
-            )
-
-    def test_local_worker_never_traverses_replaced_gh_config_directory(self):
-        prompt_path = self.artifacts / "prompt.txt"
-        summary_path = self.artifacts / "summary.md"
-        result_path = self.artifacts / "result.json"
-        prompt_path.write_text("prompt\n", encoding="utf-8", newline="")
-        preserved_entry = None
-
-        def replace_config(_command, **kwargs):
-            nonlocal preserved_entry
-            config_dir = Path(kwargs["env"]["GH_CONFIG_DIR"])
-            preserved_entry = config_dir / "keep.txt"
-            preserved_entry.write_text("keep\n", encoding="utf-8")
-            return MODULE.subprocess.CompletedProcess(["copilot"], 0, "", "")
-
-        with (
-            mock.patch.object(MODULE, "run", side_effect=replace_config),
-            mock.patch.object(
-                Path,
-                "is_junction",
-                autospec=True,
-                side_effect=lambda path: path.name.endswith("--gh-config"),
-            ),
-            self.assertRaisesRegex(
-                MODULE.WorkflowError,
-                "replaced its GitHub configuration directory",
-            ),
-        ):
-            MODULE.run_local_triage_worker(
-                repo_root=self.root,
-                target={"repo_name": "owner/repo", "number": 7},
-                preflight=self.preflight,
-                prompt_path=prompt_path,
-                summary_path=summary_path,
-                result_path=result_path,
-                run_id="run-1",
-                session_id="session-1",
-                before_source=self.preflight["identity"],
-                before_github={"pull_request": "pinned"},
-            )
-
-        self.assertIsNotNone(preserved_entry)
-        self.assertTrue(preserved_entry.is_file())
-
-    def test_local_session_attests_model_effort_and_assistant_event(self):
-        copilot_home = self.artifacts / "copilot-home"
-        events_path = (
-            copilot_home / "session-state" / "session-1" / "events.jsonl"
-        )
-        events_path.parent.mkdir(parents=True)
-        events_path.write_text(
-            "\n".join(
-                json.dumps(event)
-                for event in (
-                    {
-                        "type": "session.start",
-                        "data": {
-                            "sessionId": "session-1",
-                            "selectedModel": MODULE.LOCAL_TRIAGE_MODEL,
-                            "reasoningEffort": (
-                                MODULE.LOCAL_TRIAGE_REASONING_EFFORT
-                            ),
-                        },
-                    },
-                    {
-                        "type": "assistant.message",
-                        "data": {
-                            "model": MODULE.LOCAL_TRIAGE_MODEL,
-                            "content": "complete",
-                        },
-                    },
-                )
-            )
-            + "\n",
-            encoding="utf-8",
-            newline="",
-        )
-
-        with mock.patch.dict(
-            os.environ, {"COPILOT_HOME": str(copilot_home)}
-        ):
-            attestation = MODULE.local_session_model_attestation("session-1")
-
-        self.assertEqual(
-            MODULE.LOCAL_TRIAGE_MODEL, attestation["startup_model"]
-        )
-        self.assertEqual(
-            MODULE.LOCAL_TRIAGE_REASONING_EFFORT,
-            attestation["startup_reasoning_effort"],
-        )
-        self.assertEqual(1, attestation["assistant_message_count"])
-
-    def test_local_session_rejects_model_changes(self):
-        copilot_home = self.artifacts / "changed-model-home"
-        events_path = (
-            copilot_home / "session-state" / "session-2" / "events.jsonl"
-        )
-        events_path.parent.mkdir(parents=True)
-        events_path.write_text(
-            "\n".join(
-                json.dumps(event)
-                for event in (
-                    {
-                        "type": "session.start",
-                        "data": {
-                            "sessionId": "session-2",
-                            "selectedModel": MODULE.LOCAL_TRIAGE_MODEL,
-                            "reasoningEffort": (
-                                MODULE.LOCAL_TRIAGE_REASONING_EFFORT
-                            ),
-                        },
-                    },
-                    {
-                        "type": "session.model_change",
-                        "data": {
-                            "newModel": "claude-sonnet-5",
-                            "reasoningEffort": "high",
-                        },
-                    },
-                    {
-                        "type": "assistant.message",
-                        "data": {
-                            "model": "claude-sonnet-5",
-                            "content": "complete",
-                        },
-                    },
-                )
-            )
-            + "\n",
-            encoding="utf-8",
-            newline="",
-        )
-
-        with (
-            mock.patch.dict(
-                os.environ, {"COPILOT_HOME": str(copilot_home)}
-            ),
-            self.assertRaisesRegex(
-                MODULE.WorkflowError, "model attestation mismatch"
-            ),
-        ):
-            MODULE.local_session_model_attestation("session-2")
 
 
 class EscalationCatalogTest(unittest.TestCase):
@@ -16662,6 +15292,37 @@ class CandidateContractTest(unittest.TestCase):
             mock.patch.object(MODULE, "gh_json", return_value=[{"workflow_runs": []}]),
         ):
             MODULE.require_live_check_snapshot(self.preflight)
+
+
+class SourceDriftClassificationTest(unittest.TestCase):
+    def test_accepts_only_verified_same_ref_forward_movement(self):
+        expected = {
+            "number": 7,
+            "repo_name": "owner/repo",
+            "title": "Title",
+            "body": "Body",
+            "head_owner": "owner",
+            "head_repo": "repo",
+            "head_branch": "feature",
+            "head_sha": "1" * 40,
+            "base_branch": "main",
+            "base_sha": "2" * 40,
+            "state": "OPEN",
+        }
+        actual = {**expected, "head_sha": "3" * 40}
+        with mock.patch.object(MODULE, "commit_contains", return_value=True) as contains:
+            self.assertTrue(MODULE.same_ref_forward_head_drift(expected, actual))
+        contains.assert_called_once_with(
+            "owner/repo", expected["head_sha"], actual["head_sha"]
+        )
+
+        with mock.patch.object(MODULE, "commit_contains") as contains:
+            self.assertFalse(
+                MODULE.same_ref_forward_head_drift(
+                    expected, {**actual, "title": "Changed"}
+                )
+            )
+        contains.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -47,7 +47,7 @@ When a pipeline position includes `github-mutation-policy: source-only`, pass `-
 
 The coordinator is the only workflow entry point. It owns review requests, bounded polling with backoff and jitter, debounce, stable actionable snapshots, restart state, publication, replies, thread resolution, and iteration transitions.
 
-For each fixing iteration, the coordinator freezes the exact repository, pull request, head, base, title, body, comments, suppressed findings, threads, reviews, and advertised refs. It assigns request-bound opaque IDs to the findings. Its hosted `marketplace-agent-code-candidate-worker@1` task uses worker prompt version 10 and decision-report schema version 3. Each fixed decision explicitly attributes its code commits using one-based indexes. A no-change decision includes only a concise reason and proposed reply, with no fix mapping. The worker never writes commit SHAs, parents, changed paths, patch digests, finding fingerprints, repository or pull request identity, validation claims, model or session metadata, canonical report fields, or GitHub mutation outcomes.
+For each fixing iteration, the coordinator freezes the exact repository, pull request, head, base, title, body, comments, suppressed findings, threads, reviews, and advertised refs. It assigns request-bound opaque IDs to the findings. Its hosted `marketplace-agent-code-candidate-worker@1` task uses worker prompt version 11 and decision-report schema version 3. Each decision names an exact finding ID and disposition. A no-change decision also includes a concise reason and proposed reply. The worker never writes commit SHAs, indexes, parents, changed paths, patch digests, finding fingerprints, repository or pull request identity, validation claims, model or session metadata, canonical report fields, or GitHub mutation outcomes.
 
 ```json
 {
@@ -58,8 +58,7 @@ For each fixing iteration, the coordinator freezes the exact repository, pull re
   "decisions": [
     {
       "finding_id": "finding-opaque-request-bound-id",
-      "disposition": "fixed",
-      "fixes": [{"commit_index": 1}, {"commit_index": 2}]
+      "disposition": "fixed"
     }
   ]
 }
@@ -67,7 +66,9 @@ For each fixing iteration, the coordinator freezes the exact repository, pull re
 
 The hosted worker owns semantic diagnosis, candidate edits, and candidate validation. It creates zero or more linear, single-parent code commits and one separate final output commit containing `.github/agent-task-output/review-decisions.json`. A no-code result requires that artifact and only no-change decisions. Optional Markdown is advisory only. The local controller never executes candidate tests, builds, formatters, or a second semantic diagnosis.
 
-Indexes select only the dispatcher-verified code commits in oldest-first order. Every fixed finding needs a nonempty, increasing list of unique indexes. Shared commits may address several findings, but every generated code commit must be explicitly accounted for. Unknown findings, invalid indexes, missing mappings, and unaccounted commits fail before import. Unversioned prompt-version-9 decisions remain rejected; the controller never invents a mapping for them.
+Every fixed finding receives the complete dispatcher-verified code commit and path history. Every generated code commit is therefore accounted for mechanically. Unknown, duplicate, foreign, missing, or malformed decisions fail before import.
+
+Prior history in each hosted prompt is bounded by entry count and UTF-8 size, while every currently unresolved finding remains present and persisted history is unchanged. If the same source ref advances after dispatch, the verified candidate is retained as `superseded`, consumes that iteration, and is never imported or reused; only a remaining iteration may continue.
 
 The pinned Runtime returns result schema version 5 without applying any commits. The controller reuses that pinned Runtime's history verifier to derive and compare the candidate's exact parents, trees, paths, and patch digests. It checks the task, completed session, actual model, submitted prompt, source base, generated ref, and finding identities before fast-forwarding to the exact code tip. It never squashes, amends, or rewrites candidate commits. The final output commit is never imported. Canonical report version 4 records each finding's complete list of verified commits and exact per-commit paths; replies and retained history keep every attributed commit. The canonical report, prompt, result, and copied decisions remain outside the source repository. Before import and publication, source identity, live PR metadata, comments, head and base refs must still match the frozen request. Draft status is preserved.
 
