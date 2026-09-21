@@ -390,7 +390,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pins_shared_helper_and_policy_integrity(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "aa2541e819774dd16ac6a449e79c4488379eb35ca23d80cb8b270a5697b40658",
+            "414c2e5b009ede125d1d57467c8ad04691bfe788200c324d8d18e1e0c954022c",
         )
         self.assertEqual(
             MODULE.AGENT_TASK_POLICY_SHA256,

@@ -41,7 +41,7 @@ COPILOT_LOGINS = {
 }
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "aa2541e819774dd16ac6a449e79c4488379eb35ca23d80cb8b270a5697b40658"
+    "414c2e5b009ede125d1d57467c8ad04691bfe788200c324d8d18e1e0c954022c"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -2614,7 +2614,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "existing_pending_review",
     "created_pending_review",
 })
-EXECUTION_SHA256 = "9e0c178a9bf054bb618af32374e7201d48fbddfcfcee2db22fd03bd3f42bfe06"
+EXECUTION_SHA256 = "d759c5bb640a0530d4fd233d6256a77d63224219d5f2013aa454bfff53304f3e"
 
 
 def _load_execution():

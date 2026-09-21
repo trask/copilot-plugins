@@ -843,7 +843,7 @@ class Execution:
                     retained.append({"path": path, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()})
                     value = read(source)
                     if value.get("schema") == "github.copilot.dispatch-observation.v1":
-                        remote_tasks.append({"evidence": path, **value})
+                        remote_tasks.append({**value, "evidence": path})
                 except (OSError, ValueError, ExecutionError) as failure:
                     evidence_errors.append(f"{path}: {failure}")
             else:
@@ -874,11 +874,29 @@ class Execution:
                     if source.is_file():
                         observation = read(source)
                         retained.append({"path": str(source), "sha256": hashlib.sha256(source.read_bytes()).hexdigest()})
-                        remote_tasks.append({"evidence": str(source), **observation})
+                        remote_tasks.append({**observation, "evidence": str(source)})
             except (OSError, ValueError, ExecutionError) as failure:
                 evidence_errors.append(f"{source}: {failure}")
         for handle in sorted(child_executions.keys() - bound_children):
             evidence_errors.append(f"child execution has no verified launch receipt: {handle}")
+
+        def distinct_evidence(items: list[dict[str, Any]], path_key: str,
+                              label: str) -> list[dict[str, Any]]:
+            seen: dict[str, list[dict[str, Any]]] = {}
+            distinct = []
+            for item in items:
+                path = item[path_key]
+                versions = seen.setdefault(path, [])
+                if item in versions:
+                    continue
+                if versions:
+                    evidence_errors.append(f"conflicting {label}: {path}")
+                versions.append(item)
+                distinct.append(item)
+            return distinct
+
+        retained = distinct_evidence(retained, "path", "retained evidence")
+        remote_tasks = distinct_evidence(remote_tasks, "evidence", "dispatch observations")
         if evidence_errors:
             code = 1
         outcome = (self.last_result or {}).get("result")

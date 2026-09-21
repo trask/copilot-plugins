@@ -902,7 +902,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "dd3ea7ce7678a781ba7650d6a79eb9a660635d5c5e453b214c24cc28663358d8",
+            "82f41ff45383c40d1965d7028933174f97d931c678e55aa268bc30aee182d259",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,

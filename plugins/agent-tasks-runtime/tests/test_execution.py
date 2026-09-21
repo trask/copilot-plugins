@@ -463,6 +463,103 @@ class ExecutionTest(unittest.TestCase):
                     with self.assertRaisesRegex(EXECUTION.ExecutionError, "unresolved execution owner"):
                         following.claim_writers([("owner/repo", "branch")])
 
+    def test_dispatch_evidence_is_unique_for_direct_and_nested_children(self):
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                directory = self.root / str(nested)
+                with mock.patch.dict(EXECUTION.os.environ, {"COPILOT_HOME": str(directory / "home")}):
+                    context = EXECUTION.Execution(directory / "root.json", command=["python"],
+                                                  terminal_results=frozenset({"partial"}))
+                    context.claim_writers([("owner/repo", "branch")])
+                    children = [self.child_evidence(context, remote_work_may_continue=True)]
+                    if nested:
+                        children.append(self.child_evidence(
+                            context, directory=children[0][1].parent,
+                            name="grandchild", remote_work_may_continue=True,
+                        ))
+                    before = {state: state.read_bytes() for _, _, state, _ in children}
+                    context.emit({"result": "partial"})
+                    result = context.finish(0)
+                    dispatch_paths = sorted(str(path.with_name(path.name + ".dispatch.json"))
+                                            for _, path, _, _ in children)
+                    self.assertEqual(dispatch_paths, [item["evidence"] for item in result["remote_tasks"]])
+                    expected_paths = [str(path) for _, path, _, _ in children] + sorted(
+                        dispatch_paths + [str(state) for _, _, state, _ in children]
+                    )
+                    self.assertEqual(expected_paths, [item["path"] for item in result["retained_evidence"]])
+                    for item in result["retained_evidence"]:
+                        self.assertEqual(hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest(),
+                                         item["sha256"])
+                    self.assertEqual(before, {path: path.read_bytes() for path in before})
+                    self.assertTrue(result["remote_work_may_continue"])
+                    self.assertEqual("retained", result["writer_ownership"])
+                    following = EXECUTION.Execution(directory / "following.json", command=["python"])
+                    with self.assertRaisesRegex(EXECUTION.ExecutionError, "unresolved execution owner"):
+                        following.claim_writers([("owner/repo", "branch")])
+
+    def test_dispatch_evidence_keeps_distinct_unknown_creation_paths(self):
+        context = self.context()
+        children = [self.child_evidence(context, name=name, remote_work_may_continue=True)
+                    for name in ("first", "second")]
+        paths = []
+        for _, result_path, _, _ in children:
+            path = result_path.with_name(result_path.name + ".dispatch.json")
+            EXECUTION.write(path, {
+                "schema": "github.copilot.dispatch-observation.v1",
+                "request_id": None, "task": None, "remote_status": "unknown",
+                "evidence": "payload-must-not-supply-the-evidence-path",
+            })
+            paths.append(str(path))
+        context.emit({"result": "complete"})
+        result = context.finish(0)
+        self.assertEqual(sorted(paths), [item["evidence"] for item in result["remote_tasks"]])
+        self.assertTrue(all(item["task"] is None for item in result["remote_tasks"]))
+        self.assertTrue(result["remote_work_may_continue"])
+
+    def test_dispatch_evidence_conflicts_fail_closed_without_dropping_versions(self):
+        for change_bytes in (False, True):
+            with self.subTest(change_bytes=change_bytes):
+                directory = self.root / str(change_bytes)
+                with mock.patch.dict(EXECUTION.os.environ, {"COPILOT_HOME": str(directory / "home")}):
+                    context = EXECUTION.Execution(directory / "root.json", command=["python"],
+                                                  terminal_results=frozenset({"complete"}))
+                    context.claim_writers([("owner/repo", "branch")])
+                    _, result_path, state, _ = self.child_evidence(context)
+                    dispatch = result_path.with_name(result_path.name + ".dispatch.json")
+                    before = state.read_bytes()
+                    original = EXECUTION.read
+                    reads = 0
+
+                    def changing(path):
+                        nonlocal reads
+                        value = original(path)
+                        if path == dispatch:
+                            reads += 1
+                            if reads == 1 and change_bytes:
+                                EXECUTION.write(path, {**value, "task": {"id": "changed-task"}})
+                            elif reads == 2 and not change_bytes:
+                                return {**value, "task": {"id": "changed-task"}}
+                        return value
+
+                    context.emit({"result": "complete"})
+                    with mock.patch.object(EXECUTION, "read", side_effect=changing):
+                        result = context.finish(0)
+                    self.assertEqual(1, result["exit_code"])
+                    self.assertEqual("retained", result["writer_ownership"])
+                    self.assertTrue(result["remote_work_may_continue"])
+                    self.assertEqual(["task-stage", "changed-task"],
+                                     [item["task"]["id"] for item in result["remote_tasks"]])
+                    self.assertIn(f"conflicting dispatch observations: {dispatch}", result["finalization_errors"])
+                    versions = [item for item in result["retained_evidence"] if item["path"] == str(dispatch)]
+                    self.assertEqual(2 if change_bytes else 1, len(versions))
+                    if change_bytes:
+                        self.assertNotEqual(versions[0]["sha256"], versions[1]["sha256"])
+                        self.assertIn(f"conflicting retained evidence: {dispatch}", result["finalization_errors"])
+                    self.assertEqual(before, state.read_bytes())
+                    following = EXECUTION.Execution(directory / "following.json", command=["python"])
+                    with self.assertRaisesRegex(EXECUTION.ExecutionError, "unresolved execution owner"):
+                        following.claim_writers([("owner/repo", "branch")])
+
     def test_settled_children_allow_incomplete_or_partial_to_release(self):
         for domain in ("incomplete", "partial"):
             with self.subTest(domain=domain):

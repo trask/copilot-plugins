@@ -32,6 +32,9 @@ the controller has exited.
 Failed, cancelled, missing or remotely unconfirmed child execution evidence
 keeps root ownership retained, including when Pipeline reports `incomplete`
 or Stack Pipeline reports `partial`.
+Terminal diagnostics retain identical evidence once per source path, in
+first-seen order. Conflicting hashes or observations keep their distinct
+versions and fail finalization; separate unknown task creations remain separate.
 No production lifetime or graceful app-shutdown guarantee follows from the
 single inert Windows controlled-client-exit qualification.
 
