@@ -44,6 +44,14 @@ RUNTIME_SPEC.loader.exec_module(RUNTIME)
 
 
 class WindowsSubprocessTest(unittest.TestCase):
+    def test_embedded_loaders_accept_current_runtime_sources(self):
+        cloud = MODULE.load_cloud_task_runtime(RUNTIME_SCRIPT)
+        execution = MODULE.load_execution_runtime(RUNTIME_SCRIPT.with_name("execution.py"))
+
+        self.assertTrue(callable(cloud.verify_current_candidate))
+        self.assertTrue(callable(cloud.guarded_fast_forward_candidate))
+        self.assertTrue(callable(execution.entrypoint))
+
     def test_run_hides_windows_console_processes(self):
         completed = MODULE.subprocess.CompletedProcess(["git"], 0, "", "")
         with (
@@ -148,6 +156,21 @@ def agent_task_result(preflight=None, **overrides):
     pr = preflight["pr"]
     generated_head = "3" * 40
     base_ref = pr["head_sha"] if pr["cross_repository"] else pr["head"]["ref"]
+    prompt = MODULE.build_worker_prompt(preflight)
+    snapshot = RUNTIME.PullRequestSnapshot(
+        **MODULE.expected_cloud_pull_request(preflight),
+        state="OPEN",
+        cross_repository=pr["cross_repository"],
+    )
+    options = RUNTIME.Options(
+        report=True,
+        model="gpt-5.6-sol",
+        prompt=prompt,
+        policy=MODULE.AGENT_TASK_POLICY,
+    )
+    prompt_sha256 = MODULE.sha256_text(
+        RUNTIME.task_payload(options, RUNTIME.OUTPUT_REPORT_PATH, snapshot)["prompt"]
+    )
     result = {
         "schema": MODULE.AGENT_TASK_RESULT_SCHEMA,
         "status": "success",
@@ -202,7 +225,7 @@ def agent_task_result(preflight=None, **overrides):
         "completion": {
             "request": {
                 "requested_model": "gpt-5.6-sol",
-                "prompt_sha256": "8" * 64,
+                "prompt_sha256": prompt_sha256,
             },
             "task": {
                 "id": "task-1",
@@ -219,7 +242,7 @@ def agent_task_result(preflight=None, **overrides):
                 "created_at": "2026-09-18T12:00:01Z",
                 "updated_at": "2026-09-18T12:01:00Z",
                 "completed_at": "2026-09-18T12:01:00Z",
-                "prompt_sha256": "8" * 64,
+                "prompt_sha256": prompt_sha256,
             },
             "repository": {
                 "name_with_owner": pr["repo_name"],
@@ -239,6 +262,65 @@ def agent_task_result(preflight=None, **overrides):
     }
     result.update(overrides)
     return result
+
+
+def candidate_repository(result, identity):
+    candidate = result["candidate"]
+    repository = mock.Mock()
+    repository.head.return_value = identity["head"]
+    repository.cloud_commits.return_value = [
+        *[entry["sha"] for entry in candidate["code_commits"]],
+        candidate["artifact_commit"]["sha"],
+    ]
+    repository.candidate_history.return_value = SimpleNamespace(
+        code_head=candidate["generated"]["code_tip_sha"],
+        code_commits=tuple(candidate["code_commits"]),
+        artifact_commit=candidate["artifact_commit"],
+    )
+    return repository
+
+
+def result_with_prompt_identity(result, preflight, prompt):
+    value = copy.deepcopy(result)
+    pr = preflight["pr"]
+    snapshot = RUNTIME.PullRequestSnapshot(
+        **MODULE.expected_cloud_pull_request(preflight),
+        state="OPEN",
+        cross_repository=pr["cross_repository"],
+    )
+    options = RUNTIME.Options(
+        report=True,
+        model=value["requested_model"],
+        prompt=prompt,
+        policy=MODULE.AGENT_TASK_POLICY,
+    )
+    prompt_sha256 = MODULE.sha256_text(
+        RUNTIME.task_payload(options, RUNTIME.OUTPUT_REPORT_PATH, snapshot)["prompt"]
+    )
+    value["completion"]["request"]["prompt_sha256"] = prompt_sha256
+    value["completion"]["session"]["prompt_sha256"] = prompt_sha256
+    return value
+
+
+def validate_description_result(
+    result,
+    *,
+    preflight,
+    requested_model,
+    identity,
+):
+    prompt = MODULE.build_worker_prompt(preflight)
+    result = result_with_prompt_identity(result, preflight, prompt)
+    return MODULE.validate_success_result(
+        result,
+        helper=RUNTIME_SCRIPT,
+        repo_root=ROOT,
+        prompt=prompt,
+        preflight=preflight,
+        requested_model=requested_model,
+        runtime=RUNTIME,
+        repository=candidate_repository(result, identity),
+    )
 
 
 class AgentTaskCoordinatorTest(unittest.TestCase):
@@ -372,11 +454,19 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         helper.write_text("# helper\n", encoding="utf-8")
         index = self.directory / "owner--repo--7.json"
         emitted = []
+        self.last_runtime_result = result
 
         def helper_run(command, **kwargs):
             self.helper_commands.append(command)
             result_path = Path(command[command.index("--result-file") + 1])
-            result_path.write_text(json.dumps(result), encoding="utf-8")
+            prompt_path = Path(command[command.index("--prompt-file") + 1])
+            value = result_with_prompt_identity(
+                result,
+                self.preflight,
+                prompt_path.read_text(encoding="utf-8"),
+            )
+            self.last_runtime_result = value
+            result_path.write_text(json.dumps(value), encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, "ignored report", "")
 
         def validated_no_change(path, state, **kwargs):
@@ -410,6 +500,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "refresh_run_index"),
             mock.patch.object(MODULE, "local_identity", return_value=self.identity),
             mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "load_cloud_task_runtime", return_value=RUNTIME),
+            mock.patch.object(
+                RUNTIME,
+                "GitRepository",
+                side_effect=lambda: candidate_repository(
+                    self.last_runtime_result, self.identity
+                ),
+            ),
             mock.patch.object(MODULE, "run", side_effect=helper_run),
             mock.patch.object(
                 MODULE,
@@ -582,12 +680,18 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         report_content = self.proposal_report()
         result = self.result(report_content)
         self.preflight["changed_files"] = ["src/app.py"]
-        remote = MODULE.validate_success_result(
-            result,
-            preflight=self.preflight,
-            requested_model="gpt-5.6-sol",
-            identity=self.identity,
-        )
+        with mock.patch.object(
+            RUNTIME,
+            "verify_current_candidate",
+            wraps=RUNTIME.verify_current_candidate,
+        ) as verify_current_candidate:
+            remote = validate_description_result(
+                result,
+                preflight=self.preflight,
+                requested_model="gpt-5.6-sol",
+                identity=self.identity,
+            )
+        verify_current_candidate.assert_called_once()
         expected = json.loads(report_content)["proposal"]
         proposal = MODULE.recommendation_from_outputs(
             preflight=self.preflight,
@@ -619,7 +723,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 value = self.result(self.proposal_report())
                 mutate(value)
                 with self.assertRaises(MODULE.WorkflowError):
-                    MODULE.validate_success_result(
+                    validate_description_result(
                         value,
                         preflight=self.preflight,
                         requested_model="gpt-5.6-sol",
@@ -630,7 +734,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         value = self.result(self.proposal_report())
         value["attestation"]["structural_complete"] = False
         with self.assertRaises(MODULE.WorkflowError):
-            MODULE.validate_success_result(
+            validate_description_result(
                 value,
                 preflight=self.preflight,
                 requested_model="gpt-5.6-sol",
@@ -815,6 +919,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                         )
                         self.assertEqual("head_changed", emitted[-1]["result"])
                         self.assertEqual("incomplete", emitted[-1]["next_action"])
+                        self.assertEqual(
+                            "superseded", emitted[-1]["candidate_status"]
+                        )
                         self.assertFalse(emitted[-1]["mutation_performed"])
                         self.assertFalse(emitted[-1]["recommendation_adopted"])
                         self.assertFalse(emitted[-1]["publication_performed"])
@@ -850,6 +957,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
         self.assertEqual("head_changed", emitted[-1]["result"])
         self.assertEqual("advance", emitted[-1]["next_action"])
+        self.assertEqual("superseded", emitted[-1]["candidate_status"])
         self.assertEqual(1, emitted[-1]["pipeline_iteration"])
         self.assertEqual(1, emitted[-1]["remaining_allowance"])
         self.assertNotIn("stage_outcome", emitted[-1])
@@ -1095,6 +1203,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.helper_commands.append(command)
             result = self.result(report)
             result["application"]["final_local_head"] = self.identity["head"]
+            prompt_path = Path(command[command.index("--prompt-file") + 1])
+            result = result_with_prompt_identity(
+                result,
+                self.preflight,
+                prompt_path.read_text(encoding="utf-8"),
+            )
+            self.last_runtime_result = result
             result_path = Path(command[command.index("--result-file") + 1])
             result_path.write_text(json.dumps(result), encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, "", "")
@@ -1311,6 +1426,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.helper_commands.append(command)
             result = self.result(report)
             result["application"]["final_local_head"] = self.identity["head"]
+            prompt_path = Path(command[command.index("--prompt-file") + 1])
+            result = result_with_prompt_identity(
+                result,
+                self.preflight,
+                prompt_path.read_text(encoding="utf-8"),
+            )
+            self.last_runtime_result = result
             Path(command[command.index("--result-file") + 1]).write_text(
                 json.dumps(result), encoding="utf-8"
             )
@@ -1407,7 +1529,7 @@ class RecommendationContractTest(unittest.TestCase):
         return result
 
     def remote(self, *, report=False):
-        return MODULE.validate_success_result(
+        return validate_description_result(
             self.result(report=report),
             preflight=self.preflight,
             requested_model="gpt-5.6-sol",
@@ -1416,7 +1538,7 @@ class RecommendationContractTest(unittest.TestCase):
 
     def test_runtime_policy_and_proposal_versions_are_pinned(self):
         self.assertEqual(
-            "fc1c2217425c4ecfe9399ef72526041e01a31c79bd6ca43c907fc37b1957ba72",
+            "21338db268e9e0d73418b3b35e97fdf8e3409a963782a94de8d4fbb170bb4e71",
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
         )
         self.assertEqual(
@@ -1473,7 +1595,7 @@ class RecommendationContractTest(unittest.TestCase):
         )
 
         result = envelope.as_dict()
-        remote = MODULE.validate_success_result(
+        remote = validate_description_result(
             result,
             preflight=self.preflight,
             requested_model="gpt-5.6-sol",
@@ -1744,7 +1866,7 @@ class RecommendationContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(
                     MODULE.WorkflowError, "required title and body"
                 ):
-                    MODULE.validate_success_result(
+                    validate_description_result(
                         result,
                         preflight=self.preflight,
                         requested_model="gpt-5.6-sol",
@@ -1757,7 +1879,7 @@ class RecommendationContractTest(unittest.TestCase):
         )
         result["candidate"]["artifact_commit"]["changed_paths"].sort()
         with self.assertRaisesRegex(MODULE.WorkflowError, "required title and body"):
-            MODULE.validate_success_result(
+            validate_description_result(
                 result,
                 preflight=self.preflight,
                 requested_model="gpt-5.6-sol",
@@ -1796,7 +1918,7 @@ class RecommendationContractTest(unittest.TestCase):
                 result = self.result()
                 mutate(result)
                 with self.assertRaises(MODULE.WorkflowError):
-                    MODULE.validate_success_result(
+                    validate_description_result(
                         result,
                         preflight=self.preflight,
                         requested_model="gpt-5.6-sol",

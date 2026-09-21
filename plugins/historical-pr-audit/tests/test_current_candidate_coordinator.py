@@ -23,7 +23,7 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.state_path = self.root / "state.json"
-        self.runtime = MODULE.load_candidate_runtime(HELPER)
+        self.runtime = MODULE.load_cloud_task_runtime(HELPER)
         self.identity = {
             "branch": "trask-pr-audit-7", "head": METADATA["head_sha"], "status": "",
         }
@@ -115,12 +115,23 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
         code_tip = self.code[-1]["sha"] if self.code else METADATA["head_sha"]
         repository = mock.Mock()
         repository.identity.return_value = SimpleNamespace(branch=self.identity["branch"])
-        repository.head.return_value = METADATA["head_sha"]
+        repository.head.side_effect = lambda *_: self.identity["head"]
+        repository.snapshot.side_effect = lambda *_: self.runtime.WorktreeSnapshot(
+            self.repo,
+            METADATA["repo_name"],
+            "origin",
+            self.identity["branch"],
+            self.identity["head"],
+        )
         repository.cloud_commits.return_value = [
             *[entry["sha"] for entry in self.code], self.artifact["sha"],
         ]
         repository.candidate_history.return_value = SimpleNamespace(
             code_head=code_tip, code_commits=self.code, artifact_commit=self.artifact,
+        )
+        repository.fast_forward.side_effect = lambda _snapshot, tip: (
+            self.commands.append(["runtime", "fast-forward", tip]),
+            self.identity.update(head=tip),
         )
 
         def hosted(*args, **kwargs):
@@ -170,7 +181,7 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo),
             mock.patch.object(MODULE, "invocation_state_path", return_value=(self.state_path, "fresh")),
             mock.patch.object(MODULE, "discover_cloud_task", return_value=HELPER),
-            mock.patch.object(MODULE, "load_candidate_runtime", return_value=self.runtime),
+            mock.patch.object(MODULE, "load_cloud_task_runtime", return_value=self.runtime),
             mock.patch.object(self.runtime, "GitRepository", return_value=repository),
             mock.patch.object(MODULE, "merged_metadata_for", side_effect=metadata),
             mock.patch.object(MODULE, "require_clean_worktree"),
@@ -183,8 +194,22 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "remote_head", return_value=None),
             mock.patch.object(MODULE, "wait_for_remote_head", return_value=code_tip),
             mock.patch.object(MODULE, "emit") as emit,
+            mock.patch.object(
+                self.runtime,
+                "verify_current_candidate",
+                wraps=self.runtime.verify_current_candidate,
+            ) as verify_current_candidate,
+            mock.patch.object(
+                self.runtime,
+                "guarded_fast_forward_candidate",
+                wraps=self.runtime.guarded_fast_forward_candidate,
+            ) as guarded_fast_forward_candidate,
         ):
             MODULE.command_agent_task(args)
+        self.verify_current_candidate_calls = verify_current_candidate.call_count
+        self.guarded_fast_forward_candidate_calls = (
+            guarded_fast_forward_candidate.call_count
+        )
         return emit.call_args.args[0]
 
     def test_fresh_no_code_clean_uses_current_candidate_and_creates_no_remote_branch(self):
@@ -196,14 +221,18 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
         self.assertEqual(0, state["agent_task"]["reserved_iterations"])
         self.assertEqual("completed", state["agent_task"]["status"])
         self.assertFalse(state["agent_task"]["reusable_task"])
+        self.assertEqual(2, self.verify_current_candidate_calls)
+        self.assertEqual(1, self.guarded_fast_forward_candidate_calls)
 
     def test_fresh_code_candidate_imports_only_code_tip_and_publishes_audit_branch(self):
         output = self.execute(self.candidate(with_code=True))
         self.assertEqual("published", output["result"])
         self.assertEqual("8" * 40, output["head_sha"])
-        self.assertEqual(["merge", "--ff-only", "8" * 40], self.commands[0][3:])
+        self.assertEqual(["runtime", "fast-forward", "8" * 40], self.commands[0])
         self.assertIn("HEAD:refs/heads/trask-pr-audit-7", self.commands[1])
         self.assertEqual(2, output["iterations"])
+        self.assertEqual(2, self.verify_current_candidate_calls)
+        self.assertEqual(1, self.guarded_fast_forward_candidate_calls)
 
     def test_current_creation_and_completed_task_failures_preserve_diagnostics_without_import(self):
         source = self.candidate()
@@ -231,7 +260,7 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
     def test_legacy_result_is_not_admitted_to_current_workflow(self):
         result = self.candidate()
         result["mode"] = "apply_with_report"
-        with self.assertRaisesRegex(MODULE.WorkflowError, "wrong identity"):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "candidate rejected"):
             self.execute(result)
         self.assertEqual([], self.commands)
 
@@ -248,6 +277,7 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
         self.assertEqual(1, output["pipeline_iteration"])
         self.assertEqual(1, output["consumed_allowance"])
         self.assertEqual(1, output["remaining_allowance"])
+        self.assertEqual("superseded", output["candidate_status"])
         self.assertNotIn("stage_outcome", output)
         self.assertFalse(output["source_mutation_performed"])
         self.assertFalse(output["import_performed"])
@@ -256,6 +286,8 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
         self.assertEqual([], self.commands)
         state = MODULE.load_state(self.state_path)
         self.assertEqual("head_moved", state["agent_task"]["status"])
+        self.assertEqual("superseded", state["agent_task"]["candidate_status"])
+        self.assertEqual(5, state["agent_task"]["reserved_iterations"])
         self.assertEqual(result["task"], state["agent_task"]["task"])
         self.assertEqual(result["generated"], state["agent_task"]["generated"])
         self.assertTrue(Path(state["agent_task"]["result_file"]).is_file())

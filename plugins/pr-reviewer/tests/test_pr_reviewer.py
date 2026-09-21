@@ -14,9 +14,24 @@ SPEC = importlib.util.spec_from_file_location("pr_reviewer", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+RUNTIME_ROOT = (
+    SCRIPT.parents[2]
+    / "agent-tasks-runtime"
+    / "skills"
+    / "agent-tasks-runtime"
+    / "scripts"
+)
 
 
 class WindowsSubprocessTest(unittest.TestCase):
+    def test_embedded_loaders_accept_current_runtime_sources(self):
+        cloud = MODULE.load_cloud_task_runtime(RUNTIME_ROOT / "cloud_task.py")
+        execution = MODULE.load_execution_runtime(RUNTIME_ROOT / "execution.py")
+
+        self.assertTrue(callable(cloud.verify_current_candidate))
+        self.assertTrue(callable(cloud.guarded_fast_forward_candidate))
+        self.assertTrue(callable(execution.entrypoint))
+
     def test_run_hides_windows_console_processes(self):
         completed = MODULE.subprocess.CompletedProcess(["gh"], 0, "", "")
         with (
@@ -1189,7 +1204,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
                     "changed_paths": [MODULE.DISCOVERY_PATH if phase == 1 else MODULE.CRITIQUE_PATH],
                 },
             }
-        runtime.verify_candidate_result.side_effect = verify
+        runtime.verify_current_candidate.side_effect = verify
         snapshot_check = (
             [
                 None,
@@ -1214,7 +1229,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "local_identity", return_value=self.identity),
             mock.patch.object(MODULE, "state_path_for", return_value=state_path),
             mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
-            mock.patch.object(MODULE, "load_candidate_runtime", return_value=runtime),
+            mock.patch.object(MODULE, "load_cloud_task_runtime", return_value=runtime),
             mock.patch.object(
                 MODULE,
                 "ensure_snapshot_unchanged",
@@ -1341,6 +1356,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
         self.assertEqual("9" * 40, payload["observed_head_sha"])
         self.assertEqual(1, payload["consumed_allowance"])
         self.assertEqual(0, payload["remaining_allowance"])
+        self.assertEqual("superseded", payload["candidate_status"])
         self.assertFalse(payload["source_mutation_performed"])
         self.assertFalse(payload["review_mutation_performed"])
         self.assertFalse(payload["adoption_performed"])
@@ -1348,6 +1364,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
         self.assertFalse(payload["publication_performed"])
         self.assertRegex(payload["result_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual("head_changed", state["agent_task"]["status"])
+        self.assertEqual("superseded", state["agent_task"]["candidate_status"])
         self.assertEqual("task-1", state["agent_task"]["task"]["id"])
         self.assertEqual("not_attempted", state["mutation"]["status"])
 

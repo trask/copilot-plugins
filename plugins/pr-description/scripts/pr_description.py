@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import ModuleType
 from typing import Any
 import urllib.parse
 
@@ -55,11 +56,11 @@ SHARED_STATE_CONFIG = Path(".copilot/extensions/pr-flight/state-repo.json")
 SHARED_STATE_VERSION = 1
 SHARED_STATE_MAX_ATTEMPTS = 3
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "fc1c2217425c4ecfe9399ef72526041e01a31c79bd6ca43c907fc37b1957ba72"
+    "21338db268e9e0d73418b3b35e97fdf8e3409a963782a94de8d4fbb170bb4e71"
 )
+REQUIRED_CLOUD_TASK_RELATIVE_PATH = Path("scripts", "cloud_task.py")
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
-CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
 AGENT_TASK_POLICY = "marketplace-agent-report-recommendation-worker@1"
 AGENT_TASK_POLICY_SHA256 = (
     "07aeb40461735368b72a570123a1afcb12d21f3a6b70cfa3dfd4e6dc2e6308ab"
@@ -281,8 +282,8 @@ def discover_cloud_task() -> Path:
             "the shared Agent Tasks runtime skill has no absolute installation path"
         )
     skill_root = Path(skill_path)
-    scripts = skill_root / CLOUD_TASK_RELATIVE_PATH.parent
-    helper = skill_root / CLOUD_TASK_RELATIVE_PATH
+    scripts = skill_root / REQUIRED_CLOUD_TASK_RELATIVE_PATH.parent
+    helper = skill_root / REQUIRED_CLOUD_TASK_RELATIVE_PATH
     if (
         skill_root.is_symlink()
         or scripts.is_symlink()
@@ -423,9 +424,6 @@ def last_helper_activity(state: dict[str, Any]) -> str | None:
 def save_state(path: Path, state: dict[str, Any]) -> None:
     if _EXECUTION is not None:
         _EXECUTION.record_state(path, state)
-        pr = state.get("pr")
-        if isinstance(pr, dict) and pr:
-            _EXECUTION.claim_writers([(pr["head"]["repository"], pr["head"]["ref"])])
     path.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = utc_now()
     handle, temporary_name = tempfile.mkstemp(
@@ -447,9 +445,6 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
 def create_state(path: Path, state: dict[str, Any]) -> None:
     if _EXECUTION is not None:
         _EXECUTION.record_state(path, state)
-        pr = state.get("pr")
-        if isinstance(pr, dict) and pr:
-            _EXECUTION.claim_writers([(pr["head"]["repository"], pr["head"]["ref"])])
     path.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = utc_now()
     try:
@@ -1547,6 +1542,32 @@ def expected_cloud_pull_request(preflight: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def load_cloud_task_runtime(source_path: Path) -> ModuleType:
+    if (
+        not source_path.is_absolute()
+        or not source_path.is_file()
+        or source_path.is_symlink()
+        or source_path.parent.is_symlink()
+    ):
+        raise RuntimeError("cloud-task Runtime source path is invalid")
+    source_path = source_path.resolve()
+    source = source_path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != REQUIRED_CLOUD_TASK_SHA256:
+        raise RuntimeError("cloud-task Runtime source digest changed")
+    module = ModuleType("_trask_agent_tasks_runtime")
+    module.__file__ = str(source_path)
+    sys.modules[module.__name__] = module
+    try:
+        exec(
+            compile(source, str(source_path), "exec", dont_inherit=True),
+            module.__dict__,
+        )
+    except BaseException:
+        sys.modules.pop(module.__name__, None)
+        raise
+    return module
+
+
 def load_agent_task_result(path: Path) -> dict[str, Any]:
     try:
         content = path.read_text(encoding="utf-8")
@@ -1627,140 +1648,15 @@ def valid_candidate_path(value: Any) -> bool:
     )
 
 
-def candidate_commit_metadata(
-    value: Any, *, description: str
-) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != {
-        "sha",
-        "parent_sha",
-        "tree_sha",
-        "patch_sha256",
-        "changed_paths",
-    }:
-        raise WorkflowError(f"{description} metadata is malformed")
-    for field in ("sha", "parent_sha", "tree_sha"):
-        if (
-            not isinstance(value.get(field), str)
-            or SHA_PATTERN.fullmatch(value[field]) is None
-        ):
-            raise WorkflowError(f"{description} has an invalid {field}")
-    if (
-        not isinstance(value.get("patch_sha256"), str)
-        or SHA256_PATTERN.fullmatch(value["patch_sha256"]) is None
-    ):
-        raise WorkflowError(f"{description} has an invalid patch digest")
-    paths = value.get("changed_paths")
-    if (
-        not isinstance(paths, list)
-        or not paths
-        or paths != sorted(set(paths))
-        or any(not valid_candidate_path(path) for path in paths)
-    ):
-        raise WorkflowError(f"{description} has invalid changed paths")
-    return value
-
-
-def validate_candidate_completion(
-    value: Any,
-    *,
-    task_id: str,
-    session_id: str,
-    repository: str,
-    requested_model: str,
-    base_ref: str,
-    generated_ref: str,
-) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != {
-        "request",
-        "task",
-        "session",
-        "repository",
-        "refs",
-    }:
-        raise WorkflowError("Agent Task completion evidence is malformed")
-    request = value.get("request")
-    task = value.get("task")
-    session = value.get("session")
-    repository_identity = value.get("repository")
-    refs = value.get("refs")
-    prompt_sha256 = (
-        request.get("prompt_sha256") if isinstance(request, dict) else None
-    )
-    if (
-        not isinstance(request, dict)
-        or set(request) != {"requested_model", "prompt_sha256"}
-        or request.get("requested_model") != requested_model
-        or not isinstance(prompt_sha256, str)
-        or SHA256_PATTERN.fullmatch(prompt_sha256) is None
-        or not isinstance(task, dict)
-        or set(task)
-        != {
-            "id",
-            "state",
-            "created_at",
-            "updated_at",
-            "completed_at",
-            "raw_response_sha256",
-        }
-        or task.get("id") != task_id
-        or task.get("state") != "completed"
-        or not isinstance(task.get("created_at"), str)
-        or not task["created_at"]
-        or any(
-            item is not None and not isinstance(item, str)
-            for item in (task.get("updated_at"), task.get("completed_at"))
-        )
-        or not isinstance(task.get("raw_response_sha256"), str)
-        or SHA256_PATTERN.fullmatch(task["raw_response_sha256"]) is None
-        or not isinstance(session, dict)
-        or set(session)
-        != {
-            "id",
-            "state",
-            "actual_model",
-            "created_at",
-            "updated_at",
-            "completed_at",
-            "prompt_sha256",
-        }
-        or session.get("id") != session_id
-        or session.get("state") != "completed"
-        or session.get("actual_model")
-        not in {requested_model, f"sweagent-capi:{requested_model}"}
-        or not isinstance(session.get("created_at"), str)
-        or not session["created_at"]
-        or any(
-            item is not None and not isinstance(item, str)
-            for item in (session.get("updated_at"), session.get("completed_at"))
-        )
-        or session.get("prompt_sha256") != prompt_sha256
-        or not isinstance(repository_identity, dict)
-        or set(repository_identity) != {"name_with_owner", "id", "owner"}
-        or repository_identity.get("name_with_owner") != repository
-        or isinstance(repository_identity.get("id"), bool)
-        or not isinstance(repository_identity.get("id"), int)
-        or not isinstance(repository_identity.get("owner"), dict)
-        or set(repository_identity["owner"]) != {"login", "id"}
-        or not isinstance(repository_identity["owner"].get("login"), str)
-        or repository_identity["owner"]["login"].casefold()
-        != repository.partition("/")[0].casefold()
-        or isinstance(repository_identity["owner"].get("id"), bool)
-        or not isinstance(repository_identity["owner"].get("id"), int)
-        or refs != {"base": base_ref, "generated": generated_ref}
-    ):
-        raise WorkflowError(
-            "Agent Task completion evidence does not match the pinned request"
-        )
-    return value
-
-
-def validate_result_identity(
+def validate_failure_result_identity(
     result: dict[str, Any],
     *,
     preflight: dict[str, Any],
     requested_model: str,
     identity: dict[str, str],
 ) -> None:
+    if result.get("status") == "success":
+        raise WorkflowError("successful Agent Task results require Runtime verification")
     expected_policy = {
         "id": "marketplace-agent-report-recommendation-worker",
         "version": 1,
@@ -1789,80 +1685,42 @@ def validate_result_identity(
 def validate_success_result(
     result: dict[str, Any],
     *,
+    helper: Path,
+    repo_root: Path,
+    prompt: str,
     preflight: dict[str, Any],
     requested_model: str,
-    identity: dict[str, str],
+    runtime: ModuleType | None = None,
+    repository: Any = None,
 ) -> dict[str, Any]:
-    validate_result_identity(
-        result,
-        preflight=preflight,
-        requested_model=requested_model,
-        identity=identity,
-    )
     if result.get("status") != "success" or result.get("error") is not None:
         raise task_failure_from_result(result)
-    task = result.get("task")
-    generated = result.get("generated")
-    candidate = result.get("candidate")
     pr = preflight["pr"]
-    expected_base_ref = (
-        pr["head_sha"] if pr["cross_repository"] else pr["head"]["ref"]
+    runtime = runtime or load_cloud_task_runtime(helper)
+    snapshot = runtime.PullRequestSnapshot(
+        **expected_cloud_pull_request(preflight),
+        state=pr["state"].upper(),
+        cross_repository=pr["cross_repository"],
     )
-    if (
-        not isinstance(task, dict)
-        or set(task) != {"id", "url", "state", "base_ref", "base_sha"}
-        or not isinstance(task.get("id"), str)
-        or not task["id"]
-        or task.get("state") != "completed"
-        or task.get("base_ref") != expected_base_ref
-        or task.get("base_sha") != pr["head_sha"]
-        or (
-            task.get("url") is not None
-            and (not isinstance(task.get("url"), str) or not task["url"])
-        )
-        or not isinstance(generated, dict)
-        or set(generated) != {"branch", "head_sha", "commits"}
-        or not isinstance(generated.get("branch"), str)
-        or not generated["branch"]
-        or not isinstance(generated.get("head_sha"), str)
-        or SHA_PATTERN.fullmatch(generated["head_sha"]) is None
-        or generated.get("commits") != []
-        or not isinstance(candidate, dict)
-        or set(candidate)
-        != {
-            "schema",
-            "repository",
-            "task",
-            "base",
-            "generated",
-            "code_commits",
-            "artifact_commit",
-        }
-        or candidate.get("schema") != AGENT_TASK_CANDIDATE_MANIFEST_SCHEMA
-        or candidate.get("repository") != {"name_with_owner": pr["repo_name"]}
-        or candidate.get("base")
-        != {"ref": expected_base_ref, "sha": pr["head_sha"]}
-        or not isinstance(candidate.get("task"), dict)
-        or set(candidate["task"]) != {"id", "session_id"}
-        or candidate["task"].get("id") != task["id"]
-        or not isinstance(candidate["task"].get("session_id"), str)
-        or not candidate["task"]["session_id"]
-        or candidate.get("code_commits") != []
-        or not isinstance(candidate.get("generated"), dict)
-        or set(candidate["generated"]) != {"ref", "head_sha", "code_tip_sha"}
-        or candidate["generated"].get("ref") != generated["branch"]
-        or candidate["generated"].get("head_sha") != generated["head_sha"]
-        or candidate["generated"].get("code_tip_sha") != pr["head_sha"]
-        or result.get("attestation")
-        != {"kind": "dispatcher_candidate", "structural_complete": True}
-    ):
-        raise WorkflowError(
-            "Agent Task recommendation candidate manifest is malformed or stale"
-        )
-    artifact = candidate_commit_metadata(
-        candidate.get("artifact_commit"),
-        description="recommendation output commit",
+    options = runtime.Options(
+        report=True,
+        model=requested_model,
+        prompt=prompt,
+        policy=AGENT_TASK_POLICY,
     )
+    try:
+        verified = runtime.verify_current_candidate(
+            result,
+            options=options,
+            pull_request=snapshot,
+            root=repo_root,
+            git=repository or runtime.GitRepository(),
+        )
+    except runtime.CloudError as error:
+        raise WorkflowError(f"description candidate rejected: {error}") from error
+    artifact = verified["artifact_commit"]
+    if artifact is None:
+        raise WorkflowError("Agent Task recommendation has no output commit")
     allowed_paths = {
         AGENT_TASK_OUTPUT_TITLE,
         AGENT_TASK_OUTPUT_BODY,
@@ -1872,7 +1730,6 @@ def validate_success_result(
     paths = set(artifact["changed_paths"])
     if (
         artifact["parent_sha"] != pr["head_sha"]
-        or artifact["sha"] != generated["head_sha"]
         or not required_paths.issubset(paths)
         or not paths.issubset(allowed_paths)
     ):
@@ -1880,26 +1737,17 @@ def validate_success_result(
             "Agent Task recommendation must contain one output-only commit with "
             "the required title and body paths"
         )
-    completion = validate_candidate_completion(
-        result.get("completion"),
-        task_id=task["id"],
-        session_id=candidate["task"]["session_id"],
-        repository=pr["repo_name"],
-        requested_model=requested_model,
-        base_ref=expected_base_ref,
-        generated_ref=generated["branch"],
-    )
     return {
         "contract": "recommendation_candidate",
-        "task_id": task["id"],
-        "task_url": task["url"],
-        "session_id": candidate["task"]["session_id"],
-        "generated_branch": generated["branch"],
-        "generated_head": generated["head_sha"],
-        "code_tip": pr["head_sha"],
-        "commits": [],
-        "candidate_manifest": candidate,
-        "completion": completion,
+        "task_id": verified["task"]["id"],
+        "task_url": result["task"]["url"],
+        "session_id": verified["completion"]["session"]["id"],
+        "generated_branch": result["generated"]["branch"],
+        "generated_head": result["generated"]["head_sha"],
+        "code_tip": verified["code_tip"],
+        "commits": verified["commits"],
+        "candidate_manifest": verified["candidate"],
+        "completion": verified["completion"],
         "output_commit": artifact,
         "report_evidence": (
             {
@@ -2625,12 +2473,13 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "result file"
             )
         result = load_agent_task_result(artifacts["result"])
-        validate_result_identity(
-            result,
-            preflight=preflight,
-            requested_model=requested_model,
-            identity=identity,
-        )
+        if result.get("status") != "success":
+            validate_failure_result_identity(
+                result,
+                preflight=preflight,
+                requested_model=requested_model,
+                identity=identity,
+            )
         if process.returncode != 0 and result.get("status") == "success":
             raise WorkflowError(
                 f"managed cloud helper exited {process.returncode} despite a success result"
@@ -2639,9 +2488,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
             raise task_failure_from_result(result)
         remote = validate_success_result(
             result,
+            helper=helper,
+            repo_root=repo_root,
+            prompt=prompt,
             preflight=preflight,
             requested_model=requested_model,
-            identity=identity,
         )
         if local_identity(repo_root) != identity:
             raise WorkflowError(
@@ -2681,6 +2532,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 ),
                 "consumed_allowance": 1,
                 "remaining_allowance": remaining_allowance,
+                "candidate_status": "superseded",
                 "mutation_performed": False,
                 "recommendation_adopted": False,
                 "publication_performed": False,
@@ -2688,6 +2540,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             current["agent_task"].update(
                 {
                     "status": "head_changed",
+                    "candidate_status": "superseded",
                     "task": result["task"],
                     "generated": result["generated"],
                     "candidate_manifest": remote["candidate_manifest"],
@@ -3165,12 +3018,38 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "validated",
     "source_only_no_mutation",
 })
-EXECUTION_SHA256 = "bcca8dfa65d156b33081c2edf841b375a0620d4c1bdbc3cec3fd6501dc5cf53c"
+EXECUTION_SHA256 = "ce1ed0beed8d3daed64a31c453b8f010190cbe5648342f44b6a26a0a94c6ffb6"
+EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
+
+
+def load_execution_runtime(source_path: Path) -> ModuleType:
+    if (
+        not source_path.is_absolute()
+        or not source_path.is_file()
+        or source_path.is_symlink()
+        or source_path.parent.is_symlink()
+    ):
+        raise RuntimeError("execution Runtime source path is invalid")
+    source_path = source_path.resolve()
+    source = source_path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
+        raise RuntimeError("execution Runtime source digest changed")
+    module = ModuleType("_trask_foreground_execution")
+    module.__file__ = str(source_path)
+    sys.modules[module.__name__] = module
+    try:
+        exec(
+            compile(source, str(source_path), "exec", dont_inherit=True),
+            module.__dict__,
+        )
+    except BaseException:
+        sys.modules.pop(module.__name__, None)
+        raise
+    return module
 
 
 def _load_execution():
     """Load only the pinned shared foreground execution source."""
-    import types
     inventory = subprocess.run(
         ["copilot", "skill", "list", "--json"], check=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
@@ -3185,16 +3064,9 @@ def _load_execution():
     if len(matches) != 1:
         raise RuntimeError("shared execution Runtime is not uniquely installed and enabled")
     root = Path(matches[0]["path"])
-    source_path = root / "scripts" / "execution.py"
-    if not root.is_absolute() or any(path.is_symlink() for path in (root, source_path.parent, source_path)):
+    if not root.is_absolute() or root.is_symlink():
         raise RuntimeError("shared execution Runtime path is invalid")
-    source = source_path.read_bytes()
-    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
-        raise RuntimeError("shared execution Runtime source digest changed")
-    module = types.ModuleType("trask_foreground_execution")
-    module.__file__ = str(source_path)
-    exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
-    return module
+    return load_execution_runtime(root / EXECUTION_RELATIVE_PATH)
 
 
 def execution_main():

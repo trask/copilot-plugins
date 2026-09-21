@@ -35,11 +35,11 @@ SHORT_TARGET_PATTERN = re.compile(
 )
 BARE_TARGET_PATTERN = re.compile(r"^#?(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "fc1c2217425c4ecfe9399ef72526041e01a31c79bd6ca43c907fc37b1957ba72"
+    "21338db268e9e0d73418b3b35e97fdf8e3409a963782a94de8d4fbb170bb4e71"
 )
+REQUIRED_CLOUD_TASK_RELATIVE_PATH = Path("scripts", "cloud_task.py")
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
-CLOUD_TASK_RELATIVE_PATH = Path("scripts") / "cloud_task.py"
 AGENT_TASK_POLICY = "marketplace-agent-code-candidate-worker@1"
 AUDIT_OUTCOME_PATH = ".github/agent-task-output/audit-result.json"
 CANDIDATE_RESULT_SCHEMA = {"id": "github.copilot.agent-task-result", "version": 5}
@@ -395,9 +395,6 @@ def last_helper_activity(state: dict[str, Any]) -> str | None:
 def save_state(path: Path, state: dict[str, Any]) -> None:
     if _EXECUTION is not None:
         _EXECUTION.record_state(path, state)
-        pr = state.get("pr")
-        if isinstance(pr, dict) and pr:
-            _EXECUTION.claim_writers([(pr["repo_name"], state["audit_branch"])])
     path.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = utc_now()
     handle, temporary_name = tempfile.mkstemp(
@@ -1092,8 +1089,8 @@ def discover_cloud_task() -> Path:
             "the shared Agent Tasks runtime skill has no absolute installation path"
         )
     skill_root = Path(skill_path)
-    scripts = skill_root / CLOUD_TASK_RELATIVE_PATH.parent
-    helper = skill_root / CLOUD_TASK_RELATIVE_PATH
+    scripts = skill_root / REQUIRED_CLOUD_TASK_RELATIVE_PATH.parent
+    helper = skill_root / REQUIRED_CLOUD_TASK_RELATIVE_PATH
     if (
         skill_root.is_symlink()
         or scripts.is_symlink()
@@ -1338,20 +1335,30 @@ def expected_result_pull_request(metadata: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def load_candidate_runtime(helper: Path) -> ModuleType:
-    source = helper.read_bytes()
+def load_cloud_task_runtime(source_path: Path) -> ModuleType:
+    if (
+        not source_path.is_absolute()
+        or not source_path.is_file()
+        or source_path.is_symlink()
+        or source_path.parent.is_symlink()
+    ):
+        raise RuntimeError("cloud-task Runtime source path is invalid")
+    source_path = source_path.resolve()
+    source = source_path.read_bytes()
     if hashlib.sha256(source).hexdigest() != REQUIRED_CLOUD_TASK_SHA256:
-        raise WorkflowError("Agent Tasks runtime source digest changed")
-    name = "_historical_audit_candidate_runtime"
-    runtime = ModuleType(name)
-    runtime.__file__ = str(helper)
-    sys.modules[name] = runtime
+        raise RuntimeError("cloud-task Runtime source digest changed")
+    module = ModuleType("_trask_agent_tasks_runtime")
+    module.__file__ = str(source_path)
+    sys.modules[module.__name__] = module
     try:
-        exec(compile(source, str(helper), "exec"), runtime.__dict__)
+        exec(
+            compile(source, str(source_path), "exec", dont_inherit=True),
+            module.__dict__,
+        )
     except BaseException:
-        sys.modules.pop(name, None)
+        sys.modules.pop(module.__name__, None)
         raise
-    return runtime
+    return module
 
 
 def validate_audit_candidate(
@@ -1359,7 +1366,7 @@ def validate_audit_candidate(
     metadata: dict[str, Any], requested_model: str, prompt: str,
     max_iterations: int,
 ) -> tuple[dict[str, Any], str, dict[str, Any]]:
-    runtime = load_candidate_runtime(helper)
+    runtime = load_cloud_task_runtime(helper)
     snapshot = runtime.PullRequestSnapshot(
         **expected_result_pull_request(metadata), state="MERGED",
         cross_repository=(
@@ -1371,7 +1378,7 @@ def validate_audit_candidate(
         allow_merged_pr=True, policy=AGENT_TASK_POLICY,
     )
     try:
-        verified = runtime.verify_candidate_result(
+        verified = runtime.verify_current_candidate(
             result, options=options, pull_request=snapshot,
             root=repo_root, git=runtime.GitRepository(),
         )
@@ -1405,7 +1412,7 @@ def validate_audit_candidate(
         "task": verified["task"], "commits": verified["commits"],
         "generated_branch": result["generated"]["branch"],
         "generated_head": result["generated"]["head_sha"],
-        "final_local_head": verified["code_tip"], "requires_apply": True,
+        "final_local_head": verified["code_tip"],
         "report": {"path": AUDIT_OUTCOME_PATH, "commit": artifact["sha"],
                    "sha256": sha256_text(content)},
         "candidate": verified["candidate"], "completion": verified["completion"],
@@ -1413,11 +1420,13 @@ def validate_audit_candidate(
     return remote, content, report
 
 
-def validate_candidate_result_identity(
+def validate_failed_candidate_result_identity(
     result: dict[str, Any], *, helper: Path, metadata: dict[str, Any],
     requested_model: str,
 ) -> None:
-    runtime = load_candidate_runtime(helper)
+    if result.get("status") == "success":
+        raise WorkflowError("successful Agent Task results require Runtime verification")
+    runtime = load_cloud_task_runtime(helper)
     options = runtime.Options(
         report=False, model=requested_model, prompt="", apply_with_report=True,
         allow_merged_pr=True, policy=AGENT_TASK_POLICY,
@@ -1473,6 +1482,10 @@ def validate_candidate_result_identity(
 def apply_verified_import(
     repo_root: Path,
     *,
+    helper: Path,
+    metadata: dict[str, Any],
+    requested_model: str,
+    prompt: str,
     expected_branch: str,
     source_head: str,
     result_path: Path,
@@ -1485,38 +1498,47 @@ def apply_verified_import(
     if sha256_text(report_content) != remote["report"]["sha256"]:
         raise WorkflowError("Agent Task report changed after report validation")
     identity = local_identity(repo_root)
-    final_head = remote["final_local_head"]
-    if identity["branch"] != expected_branch or identity["status"]:
+    if (
+        identity["branch"] != expected_branch
+        or identity["status"]
+        or identity["head"] != source_head
+    ):
         raise WorkflowError("local audit branch drifted before verified import")
-    if identity["head"] == final_head:
-        return False
-    if not remote["requires_apply"]:
-        raise WorkflowError(
-            "legacy Agent Task result claims an import that is not present locally"
+    runtime = load_cloud_task_runtime(helper)
+    expected_pull_request = expected_result_pull_request(metadata)
+    snapshot = runtime.PullRequestSnapshot(
+        **expected_pull_request,
+        state="MERGED",
+        cross_repository=(
+            expected_pull_request["head_repository"] != metadata["repo_name"]
+        ),
+    )
+    options = runtime.Options(
+        report=False,
+        model=requested_model,
+        prompt=prompt,
+        apply_with_report=True,
+        allow_merged_pr=True,
+        policy=AGENT_TASK_POLICY,
+    )
+    try:
+        imported = runtime.guarded_fast_forward_candidate(
+            load_agent_task_result(result_path),
+            options=options,
+            pull_request=snapshot,
+            root=repo_root,
+            git=runtime.GitRepository(),
         )
-    if identity["head"] != source_head:
-        raise WorkflowError(
-            "local audit HEAD is neither the pinned source nor verified final commit"
-        )
-    if remote["commits"]:
-        run(
-            [
-                "git",
-                "-C",
-                str(repo_root),
-                "merge",
-                "--ff-only",
-                final_head,
-            ]
-        )
+    except runtime.CloudError as error:
+        raise WorkflowError(f"historical candidate import rejected: {error}") from error
     final_identity = local_identity(repo_root)
     if (
         final_identity["branch"] != expected_branch
         or final_identity["status"]
-        or final_identity["head"] != final_head
+        or final_identity["head"] != imported["final_local_head"]
     ):
         raise WorkflowError("verified Agent Task import did not reach the expected HEAD")
-    return bool(remote["commits"])
+    return imported["application"] == "fast_forwarded"
 
 
 def publish_agent_task_result(
@@ -1954,9 +1976,13 @@ def command_agent_task(args: argparse.Namespace) -> None:
     result: dict[str, Any] | None = None
     try:
         result = load_agent_task_result(result_path)
-        validate_candidate_result_identity(
-            result, helper=helper, metadata=metadata, requested_model=requested_model,
-        )
+        if result.get("status") != "success":
+            validate_failed_candidate_result_identity(
+                result,
+                helper=helper,
+                metadata=metadata,
+                requested_model=requested_model,
+            )
     except BaseException as error:
         failed = load_state(state_path)
         if result is not None:
@@ -2014,15 +2040,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
         )
         result_sha256 = sha256_file(result_path)
         identity = local_identity(repo_root)
-        allowed_local_heads = (
-            {metadata["head_sha"], remote["final_local_head"]}
-            if remote["requires_apply"]
-            else {remote["final_local_head"]}
-        )
         if (
             identity["branch"] != audit_branch
             or identity["status"]
-            or identity["head"] not in allowed_local_heads
+            or identity["head"] != metadata["head_sha"]
         ):
             raise WorkflowError(
                 "local audit branch drifted before report validation"
@@ -2046,6 +2067,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "consumed_allowance": 1,
                 "iterations_used": report["iterations_used"],
                 "remaining_allowance": remaining_allowance,
+                "candidate_status": "superseded",
                 "source_mutation_performed": False,
                 "import_performed": False,
                 "rebase_performed": False,
@@ -2055,7 +2077,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             current["agent_task"].update(
                 {
                     "status": "head_moved",
-                    "reserved_iterations": 0,
+                    "candidate_status": "superseded",
                     "validated_stale_result": remote,
                     "result_sha256": result_sha256,
                     "source_drift": source_drift,
@@ -2104,6 +2126,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
         save_state(state_path, current)
         imported = apply_verified_import(
             repo_root,
+            helper=helper,
+            metadata=metadata,
+            requested_model=requested_model,
+            prompt=prompt_path.read_text(encoding="utf-8"),
             expected_branch=audit_branch,
             source_head=metadata["head_sha"],
             result_path=result_path,
@@ -2201,12 +2227,38 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "published",
     "nothing_to_publish",
 })
-EXECUTION_SHA256 = "bcca8dfa65d156b33081c2edf841b375a0620d4c1bdbc3cec3fd6501dc5cf53c"
+EXECUTION_SHA256 = "ce1ed0beed8d3daed64a31c453b8f010190cbe5648342f44b6a26a0a94c6ffb6"
+EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
+
+
+def load_execution_runtime(source_path: Path) -> ModuleType:
+    if (
+        not source_path.is_absolute()
+        or not source_path.is_file()
+        or source_path.is_symlink()
+        or source_path.parent.is_symlink()
+    ):
+        raise RuntimeError("execution Runtime source path is invalid")
+    source_path = source_path.resolve()
+    source = source_path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
+        raise RuntimeError("execution Runtime source digest changed")
+    module = ModuleType("_trask_foreground_execution")
+    module.__file__ = str(source_path)
+    sys.modules[module.__name__] = module
+    try:
+        exec(
+            compile(source, str(source_path), "exec", dont_inherit=True),
+            module.__dict__,
+        )
+    except BaseException:
+        sys.modules.pop(module.__name__, None)
+        raise
+    return module
 
 
 def _load_execution():
     """Load only the pinned shared foreground execution source."""
-    import types
     inventory = subprocess.run(
         ["copilot", "skill", "list", "--json"], check=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
@@ -2221,16 +2273,9 @@ def _load_execution():
     if len(matches) != 1:
         raise RuntimeError("shared execution Runtime is not uniquely installed and enabled")
     root = Path(matches[0]["path"])
-    source_path = root / "scripts" / "execution.py"
-    if not root.is_absolute() or any(path.is_symlink() for path in (root, source_path.parent, source_path)):
+    if not root.is_absolute() or root.is_symlink():
         raise RuntimeError("shared execution Runtime path is invalid")
-    source = source_path.read_bytes()
-    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
-        raise RuntimeError("shared execution Runtime source digest changed")
-    module = types.ModuleType("trask_foreground_execution")
-    module.__file__ = str(source_path)
-    exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
-    return module
+    return load_execution_runtime(root / EXECUTION_RELATIVE_PATH)
 
 
 def execution_main():

@@ -41,7 +41,7 @@ Discovery returns `review-candidates.json` with a complete/incomplete outcome an
 
 The retired Markdown discovery protocol is unsupported. Start a fresh structured discovery run; old Markdown reports cannot seed or resume one.
 
-If the source changes after a hosted phase starts, the helper returns an incomplete `head_changed` result, preserves the stale task evidence, and creates no review.
+If the source changes after a hosted phase starts, the helper returns an incomplete `head_changed` result, preserves the stale task evidence, marks the candidate superseded, and creates no review.
 
 Never run another local repository command. Never read, search, import, analyze, build, test, install or execute PR code locally. Never invoke `gh pr diff`, another agent, Cloud Sandboxes, or direct Agent Tasks APIs. Do not filter candidates, assess their merits, draft comments or rewrite hosted comment text. All semantic work stays hosted. Stop on helper failure and report its retained state and exact error.
 

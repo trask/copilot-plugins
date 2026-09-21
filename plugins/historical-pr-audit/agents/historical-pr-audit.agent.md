@@ -51,7 +51,7 @@ On an explicit stop request, run `execution-cancel --handle <path>` once. This r
 - State, prompt, and result paths stay outside the repository. On failure, report the invocation-local state, retained audit files, task URL, and generated branch. Do not improvise or delete them.
 - Every top-level call is fresh. Any retained invocation state, including validated or publication-failed state with a matching `--invocation-run`, is rejected unchanged. Only the still-active call may confirm an exact remote tip after a lost push response.
 - The helper removes short-lived prompt and result files only after verified import and publication succeed. Failed invocation files remain durable audit evidence.
-- If the merged source changes after the hosted task starts, the helper records `head_moved`, preserves the stale task and result, and performs no import or publication. A caller may advance only when its existing iteration allowance has another sweep; otherwise the audit is incomplete.
+- If the merged source changes after the hosted task starts, the helper records `head_moved`, preserves the stale task and result, marks the candidate superseded, and performs no import or publication. A caller may advance only when its existing iteration allowance has another sweep; otherwise the audit is incomplete.
 - Retired local workflow commands are unsupported. Historical artifacts cannot be resumed or imported into the hosted route; start a fresh current-policy invocation.
 - The coordinator still performs its own candidate verification. A later Runtime release should expose the same immutable merged-PR verification as a shared helper so this plugin can drop that local duplication without changing its policy or result contract.
 

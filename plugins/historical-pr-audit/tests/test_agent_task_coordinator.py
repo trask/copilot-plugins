@@ -14,6 +14,13 @@ SPEC = importlib.util.spec_from_file_location("historical_pr_audit_agent_task", 
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+RUNTIME_ROOT = (
+    ROOT.parent
+    / "agent-tasks-runtime"
+    / "skills"
+    / "agent-tasks-runtime"
+    / "scripts"
+)
 
 VALIDATION = [
     {
@@ -43,6 +50,16 @@ METADATA = {
 }
 
 
+class RuntimeLoaderTest(unittest.TestCase):
+    def test_embedded_loaders_accept_current_runtime_sources(self):
+        cloud = MODULE.load_cloud_task_runtime(RUNTIME_ROOT / "cloud_task.py")
+        execution = MODULE.load_execution_runtime(RUNTIME_ROOT / "execution.py")
+
+        self.assertTrue(callable(cloud.verify_current_candidate))
+        self.assertTrue(callable(cloud.guarded_fast_forward_candidate))
+        self.assertTrue(callable(execution.entrypoint))
+
+
 class CandidateOutcomeTest(unittest.TestCase):
     def validate(self, outcome, *, commits=None):
         verified = {
@@ -53,18 +70,21 @@ class CandidateOutcomeTest(unittest.TestCase):
         }
         runtime = SimpleNamespace(
             PullRequestSnapshot=SimpleNamespace, Options=SimpleNamespace,
-            GitRepository=mock.Mock, verify_candidate_result=mock.Mock(return_value=verified),
+            GitRepository=mock.Mock,
+            verify_current_candidate=mock.Mock(return_value=verified),
             CloudError=RuntimeError,
         )
         with (
-            mock.patch.object(MODULE, "load_candidate_runtime", return_value=runtime),
+            mock.patch.object(MODULE, "load_cloud_task_runtime", return_value=runtime),
             mock.patch.object(MODULE, "git", return_value=json.dumps(outcome)),
         ):
-            return MODULE.validate_audit_candidate(
+            value = MODULE.validate_audit_candidate(
                 {"generated": {"branch": "copilot/fresh", "head_sha": "3" * 40}},
                 helper=Path("helper.py"), repo_root=Path("repo"), metadata=METADATA,
                 requested_model="gpt-5.6-sol", prompt="audit", max_iterations=5,
             )
+        runtime.verify_current_candidate.assert_called_once()
+        return value
 
     def test_clean_code_and_no_code_account_for_hosted_passes(self):
         for commits, expected in (([], "no_change"), (["2" * 40], "clean")):
@@ -200,7 +220,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pins_shared_helper_and_current_policy(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "fc1c2217425c4ecfe9399ef72526041e01a31c79bd6ca43c907fc37b1957ba72",
+            "21338db268e9e0d73418b3b35e97fdf8e3409a963782a94de8d4fbb170bb4e71",
         )
         self.assertEqual(
             MODULE.AGENT_TASK_POLICY,
