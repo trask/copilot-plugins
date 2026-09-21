@@ -155,7 +155,14 @@ def process_identity(pid: int) -> dict[str, Any] | None:
 
 
 def same_process(expected: dict[str, Any], observed: dict[str, Any] | None) -> bool:
-    return observed is not None and all(
+    if (
+        not isinstance(expected, dict) or not isinstance(observed, dict)
+        or type(expected.get("pid")) is not int or expected["pid"] <= 0
+        or not isinstance(expected.get("creation_time"), str) or not expected["creation_time"]
+        or not isinstance(expected.get("image"), str) or not expected["image"]
+    ):
+        return False
+    return all(
         expected.get(key) == observed.get(key) for key in ("pid", "creation_time", "image")
     )
 
@@ -794,8 +801,9 @@ class Execution:
             error, code = "controller returned without a structured result", 1
         if drainage_errors:
             code = 1
+        child_records = sorted(self.directory.rglob("child-*.json"))
         if not IS_WINDOWS:
-            for source in self.directory.rglob("child-*.json"):
+            for source in child_records:
                 child = read(source)
                 if child.get("root") == str(self.root) and not child.get("local_drained"):
                     drainage_errors.append(f"descendant drainage is unconfirmed: {source}")
@@ -804,12 +812,27 @@ class Execution:
         remote_tasks = []
         evidence_errors = []
         records = [self.record]
+        child_executions = {}
         for handle in self.directory.rglob("handle-*.json"):
             try:
                 child = load_handle(handle)
                 if child["root"] != str(self.root) or child["run_id"] != self.run_id:
                     raise ExecutionError("retained child evidence belongs to a different execution")
                 records.append(child)
+                terminal = status(handle)
+                child_executions[str(handle)] = child
+                if terminal.get("terminal") is True:
+                    retained.append({
+                        "path": terminal["result_file"], "sha256": terminal["result_sha256"],
+                    })
+                if (
+                    terminal.get("terminal") is not True
+                    or terminal.get("exit_code") != 0
+                    or terminal.get("local_status") != "finished"
+                    or terminal.get("local_children_drained") is not True
+                    or terminal.get("remote_work_may_continue") is not False
+                ):
+                    raise ExecutionError("child execution is unfinished, failed, cancelled, or remotely unconfirmed")
             except (OSError, ValueError, KeyError, ExecutionError) as failure:
                 evidence_errors.append(f"{handle}: {failure}")
         state_paths = sorted({path for record in records for path in record.get("domain_states", [])})
@@ -826,9 +849,25 @@ class Execution:
             else:
                 retained.append({"path": path, "missing": True})
                 evidence_errors.append(f"recorded state is missing: {path}")
-        for child in self.children:
+        bound_children = set()
+        for source in child_records:
             try:
-                record = read(child.record)
+                record = read(source)
+                handle = record.get("handle")
+                child = child_executions.get(handle) if isinstance(handle, str) else None
+                if record.get("requires_execution_result") or child is not None:
+                    if (
+                        record.get("schema") != SCHEMA
+                        or record.get("root") != str(self.root) or record.get("run_id") != self.run_id
+                    ):
+                        raise ExecutionError("child launch receipt belongs to a different execution")
+                    if (
+                        child is None or record.get("command_sha256") != child.get("command_sha256")
+                        or not same_process(record.get("process_identity", {}), child.get("owner"))
+                    ):
+                        evidence_errors.append(f"required child execution evidence is absent or changed: {source}")
+                    else:
+                        bound_children.add(handle)
                 result_file = record.get("result_file")
                 if isinstance(result_file, str):
                     source = Path(result_file + ".dispatch.json")
@@ -837,7 +876,9 @@ class Execution:
                         retained.append({"path": str(source), "sha256": hashlib.sha256(source.read_bytes()).hexdigest()})
                         remote_tasks.append({"evidence": str(source), **observation})
             except (OSError, ValueError, ExecutionError) as failure:
-                evidence_errors.append(f"{child.record}: {failure}")
+                evidence_errors.append(f"{source}: {failure}")
+        for handle in sorted(child_executions.keys() - bound_children):
+            evidence_errors.append(f"child execution has no verified launch receipt: {handle}")
         if evidence_errors:
             code = 1
         outcome = (self.last_result or {}).get("result")
@@ -859,7 +900,7 @@ class Execution:
             "writer_ownership": "root_owned" if self.root != self.handle else "retained",
             "workflow_result": self.last_result,
             "domain_states": state_paths,
-            "child_records": [str(child.record) for child in self.children],
+            "child_records": [str(source) for source in child_records],
             "launch_failures": self.launch_failures,
             "retained_evidence": retained,
             "remote_tasks": remote_tasks,

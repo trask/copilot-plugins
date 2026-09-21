@@ -29,6 +29,9 @@ cancelled or abandoned ownership cannot be adopted by a new invocation.
 Writer releases take effect only with the owner's exact sealed terminal
 result. A missing or unsealed result keeps the branch unavailable even when
 the controller has exited.
+Failed, cancelled, missing or remotely unconfirmed child execution evidence
+keeps root ownership retained, including when Pipeline reports `incomplete`
+or Stack Pipeline reports `partial`.
 No production lifetime or graceful app-shutdown guarantee follows from the
 single inert Windows controlled-client-exit qualification.
 
