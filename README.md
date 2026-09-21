@@ -61,7 +61,9 @@ Do not add another detach layer. The tool acknowledgement does not prove
 readiness, and tool-shell exit does not prove workflow completion. Optional
 status reads verify process generation and the canonical terminal-result hash;
 they do not drive the workflow. The handle's `.d` directory holds stdout,
-stderr, progress, child evidence and results.
+stderr, progress, child evidence and results. An unsealed root observed only
+after its executable image becomes unavailable remains abandoned and remotely
+unconfirmed; that observation does not release writer ownership.
 
 Client or observer disconnection is not cancellation. Explicit plugin cancellation
 fences new launches and publication, but cannot undo an admitted remote request
@@ -89,11 +91,12 @@ graceful app-shutdown survival, automatic recovery or notifications after exit.
 Only one inert direct foreground process has been qualified across controlled
 client termination on the tested Windows host. Production trees, graceful
 cleanup, app exit, post-exit streams and remote cancellation remain unqualified.
-One later nested-process matrix stopped on its first failed case because a
-post-exit image query returned WinError 31. Independent handles prove that the
-direct and nested processes exited, but the library did not confirm job
-drainage. The other three cases did not run, and mocked coverage of the repair
-is not native qualification.
+An earlier native matrix failed in job accounting for a cause that remains
+unexplained. A separate later cf40629 nested-process matrix stopped on its first
+case when a post-exit image query returned WinError 31. Independent handles
+prove that the direct and nested processes exited, but the library did not
+confirm job drainage. Neither failure qualifies the cases that did not run, and
+mocked coverage is not native qualification.
 The legacy Pipeline `start` path retains its separate breakaway contract and
 fails before fallback when breakaway is denied.
 

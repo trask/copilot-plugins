@@ -25,7 +25,9 @@ detach a root when the user explicitly requests survival beyond client exit.
 There is no fallback from denied legacy breakaway, self-detach layer, daemon,
 automatic recovery or app-native Stop integration. Readiness comes from the
 controller, not the tool acknowledgement. Completion comes from a verified
-terminal file, not shell exit or model prose.
+terminal file, not shell exit or model prose. An unsealed root whose exact
+generation has exited without available image data remains abandoned and
+remotely unconfirmed; status observation does not release its writer ownership.
 
 Cancellation fences later owned subprocess launches and publication. It does
 not retract an admitted remote mutation or prove remote task cancellation.
@@ -42,11 +44,13 @@ Terminal diagnostics retain identical evidence once per source path, in
 first-seen order. Conflicting hashes or observations keep their distinct
 versions and fail finalization; separate unknown task creations remain separate.
 No production lifetime or graceful app-shutdown guarantee follows from the
-single inert Windows controlled-client-exit qualification.
-A later nested-process matrix stopped on its first failed case when a post-exit
-image query returned WinError 31. Independent handles prove that the direct
-and nested processes exited, but the library did not confirm job drainage. The
-other three cases remain unrun, and mocked coverage is not native qualification.
+single inert Windows controlled-client-exit qualification. An earlier native
+matrix failed in job accounting for a cause that remains unexplained. A
+separate later cf40629 nested-process matrix stopped on its first case when a
+post-exit image query returned WinError 31. Independent handles prove that the
+direct and nested processes exited, but the library did not confirm job
+drainage. Neither failure qualifies the cases that did not run, and mocked
+coverage is not native qualification.
 
 ## Current contracts
 

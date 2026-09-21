@@ -55,7 +55,7 @@ SHARED_STATE_CONFIG = Path(".copilot/extensions/pr-flight/state-repo.json")
 SHARED_STATE_VERSION = 1
 SHARED_STATE_MAX_ATTEMPTS = 3
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "c775ba3ca92c28eba1444bfe09d63fb704a0fba009c76cda8e87aa36f342facd"
+    "a3eb90898b86fcc528f7a3a403aac560b4df1852a56cc98a99b6c2d9fdb8d86c"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -5586,7 +5586,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "validated",
     "source_only_no_mutation",
 })
-EXECUTION_SHA256 = "06a49d5f5b1e4ec4cf69576ad79e77edb34ab3050c540d6617712c94364deb07"
+EXECUTION_SHA256 = "4190af0dcc27e127a88203f67e27ecaa590356fb376db559cec584aa87d92714"
 
 
 def _load_execution():

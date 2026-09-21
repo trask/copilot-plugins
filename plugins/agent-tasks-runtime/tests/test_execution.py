@@ -18,6 +18,7 @@ SPEC = importlib.util.spec_from_file_location("foreground_execution_test", SCRIP
 EXECUTION = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = EXECUTION
 SPEC.loader.exec_module(EXECUTION)
+ORIGINAL_PROCESS_IDENTITY = EXECUTION.process_identity
 IDENTITY = {"pid": 123, "creation_time": "456", "image": "python.exe", "running": True}
 
 
@@ -172,6 +173,154 @@ class ExecutionTest(unittest.TestCase):
             self.assertEqual("abandoned", result["status"])
             with self.assertRaises(EXECUTION.ExecutionError):
                 EXECUTION.cancel(self.handle)
+
+    def test_unsealed_exited_root_with_unavailable_image_is_abandoned(self):
+        with mock.patch.dict(
+            EXECUTION.os.environ, {"COPILOT_HOME": str(self.root / "home")}
+        ):
+            context = self.context()
+            context.claim_writers([("owner/repo", "branch")])
+            before = {
+                path: path.read_bytes()
+                for path in self.root.rglob("*")
+                if path.is_file()
+            }
+            observed = {
+                "pid": IDENTITY["pid"],
+                "creation_time": IDENTITY["creation_time"],
+                "image": None,
+                "running": False,
+                "image_provenance": "unavailable_after_exit",
+            }
+            with mock.patch.object(
+                EXECUTION, "process_identity", return_value=observed
+            ):
+                result = EXECUTION.status(context.handle)
+
+            self.assertFalse(result["terminal"])
+            self.assertEqual("abandoned", result["status"])
+            self.assertEqual("unconfirmed", result["remote_status"])
+            self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+    def test_windows_process_identity_accepts_already_signaled_handle_without_image(self):
+        handle = object()
+
+        def get_process_times(observed, creation, _exit, _kernel, _user):
+            self.assertIs(handle, observed)
+            creation._obj.dwHighDateTime = 1
+            creation._obj.dwLowDateTime = 2
+            return True
+
+        kernel = types.SimpleNamespace(
+            OpenProcess=mock.Mock(return_value=handle),
+            GetProcessTimes=mock.Mock(side_effect=get_process_times),
+            QueryFullProcessImageNameW=mock.Mock(),
+            WaitForSingleObject=mock.Mock(return_value=0),
+            CloseHandle=mock.Mock(return_value=True),
+        )
+        with (
+            mock.patch.object(EXECUTION, "IS_WINDOWS", True),
+            mock.patch.object(ctypes, "WinDLL", return_value=kernel, create=True),
+        ):
+            self.assertEqual(
+                {
+                    "pid": 456,
+                    "creation_time": str((1 << 32) | 2),
+                    "image": None,
+                    "running": False,
+                    "image_provenance": "unavailable_after_exit",
+                },
+                ORIGINAL_PROCESS_IDENTITY(456),
+            )
+
+        kernel.GetProcessTimes.assert_called_once()
+        self.assertIs(handle, kernel.GetProcessTimes.call_args.args[0])
+        kernel.WaitForSingleObject.assert_called_once_with(handle, 0)
+        kernel.QueryFullProcessImageNameW.assert_not_called()
+        kernel.CloseHandle.assert_called_once_with(handle)
+
+    def test_windows_process_identity_handles_live_to_exited_image_race_on_same_handle(self):
+        handle = object()
+
+        def get_process_times(observed, creation, _exit, _kernel, _user):
+            self.assertIs(handle, observed)
+            creation._obj.dwHighDateTime = 1
+            creation._obj.dwLowDateTime = 2
+            return True
+
+        def query_image(observed, _flags, _image, _size):
+            self.assertIs(handle, observed)
+            return False
+
+        kernel = types.SimpleNamespace(
+            OpenProcess=mock.Mock(return_value=handle),
+            GetProcessTimes=mock.Mock(side_effect=get_process_times),
+            QueryFullProcessImageNameW=mock.Mock(side_effect=query_image),
+            WaitForSingleObject=mock.Mock(side_effect=[258, 0]),
+            CloseHandle=mock.Mock(return_value=True),
+        )
+        image_failure = OSError("image unavailable")
+        image_failure.winerror = 31
+        with (
+            mock.patch.object(EXECUTION, "IS_WINDOWS", True),
+            mock.patch.object(ctypes, "WinDLL", return_value=kernel, create=True),
+            mock.patch.object(
+                ctypes, "get_last_error", return_value=31, create=True
+            ),
+            mock.patch.object(
+                ctypes, "WinError", return_value=image_failure, create=True
+            ),
+        ):
+            self.assertEqual(
+                {
+                    "pid": 456,
+                    "creation_time": str((1 << 32) | 2),
+                    "image": None,
+                    "running": False,
+                    "image_provenance": "unavailable_after_exit",
+                },
+                ORIGINAL_PROCESS_IDENTITY(456),
+            )
+
+        self.assertEqual(
+            [mock.call(handle, 0), mock.call(handle, 0)],
+            kernel.WaitForSingleObject.call_args_list,
+        )
+        kernel.CloseHandle.assert_called_once_with(handle)
+
+    def test_windows_process_identity_rejects_unavailable_image_while_handle_live(self):
+        handle = object()
+
+        def get_process_times(observed, creation, _exit, _kernel, _user):
+            self.assertIs(handle, observed)
+            creation._obj.dwHighDateTime = 1
+            creation._obj.dwLowDateTime = 2
+            return True
+
+        kernel = types.SimpleNamespace(
+            OpenProcess=mock.Mock(return_value=handle),
+            GetProcessTimes=mock.Mock(side_effect=get_process_times),
+            QueryFullProcessImageNameW=mock.Mock(return_value=False),
+            WaitForSingleObject=mock.Mock(side_effect=[258, 258]),
+            CloseHandle=mock.Mock(return_value=True),
+        )
+        image_failure = OSError("image unavailable")
+        image_failure.winerror = 31
+        with (
+            mock.patch.object(EXECUTION, "IS_WINDOWS", True),
+            mock.patch.object(ctypes, "WinDLL", return_value=kernel, create=True),
+            mock.patch.object(
+                ctypes, "get_last_error", return_value=31, create=True
+            ),
+            mock.patch.object(
+                ctypes, "WinError", return_value=image_failure, create=True
+            ),
+            self.assertRaises(OSError) as failure,
+        ):
+            ORIGINAL_PROCESS_IDENTITY(456)
+
+        self.assertIs(image_failure, failure.exception)
+        kernel.CloseHandle.assert_called_once_with(handle)
 
     def test_child_binds_parent_generation_command_and_shared_cancellation(self):
         root = self.context()
@@ -735,6 +884,8 @@ class ExecutionTest(unittest.TestCase):
 
     def test_windows_bound_exited_process_uses_cached_image_without_query(self):
         owner = object.__new__(EXECUTION.WindowsOwner)
+        owner.handle = 900
+        owner._binding_token = object()
         handle = object()
         identity = {
             "pid": 456,
@@ -759,6 +910,8 @@ class ExecutionTest(unittest.TestCase):
         )
         binding = {
             "handle": handle,
+            "owner_token": owner._binding_token,
+            "job_handle": owner.handle,
             "identity": identity,
             "job_provenance": "verified_live_handle",
             "image_provenance": "queried_live",
@@ -775,6 +928,63 @@ class ExecutionTest(unittest.TestCase):
         )
         owner.kernel.IsProcessInJob.assert_not_called()
         owner.kernel.QueryFullProcessImageNameW.assert_not_called()
+
+    def test_windows_bound_process_rejects_cross_owner_or_invalidated_job(self):
+        owner = object.__new__(EXECUTION.WindowsOwner)
+        owner.handle = 900
+        owner._binding_token = object()
+        handle = object()
+
+        def is_process_in_job(observed, job, member):
+            self.assertIs(handle, observed)
+            self.assertEqual(900, job)
+            member._obj.value = 1
+            return True
+
+        def get_process_times(observed, creation, _exit, _kernel, _user):
+            self.assertIs(handle, observed)
+            creation._obj.dwHighDateTime = 1
+            creation._obj.dwLowDateTime = 2
+            return True
+
+        def query_image(observed, _flags, image, _size):
+            self.assertIs(handle, observed)
+            image.value = "C:\\Python\\python.exe"
+            return True
+
+        kernel = types.SimpleNamespace(
+            IsProcessInJob=mock.Mock(side_effect=is_process_in_job),
+            GetProcessTimes=mock.Mock(side_effect=get_process_times),
+            QueryFullProcessImageNameW=mock.Mock(side_effect=query_image),
+            WaitForSingleObject=mock.Mock(return_value=258),
+        )
+        owner.kernel = kernel
+        binding = owner.bind_process(handle, 456)
+        kernel.IsProcessInJob.reset_mock()
+        kernel.GetProcessTimes.reset_mock()
+        kernel.QueryFullProcessImageNameW.reset_mock()
+        kernel.WaitForSingleObject.reset_mock()
+
+        other = object.__new__(EXECUTION.WindowsOwner)
+        other.handle = owner.handle
+        other._binding_token = object()
+        other.kernel = kernel
+        with self.assertRaisesRegex(EXECUTION.ExecutionError, "binding is invalid"):
+            other.process(handle, 456, binding)
+
+        owner.handle = 901
+        with self.assertRaisesRegex(EXECUTION.ExecutionError, "binding is invalid"):
+            owner.process(handle, 456, binding)
+
+        owner.handle = None
+        owner._binding_token = None
+        with self.assertRaisesRegex(EXECUTION.ExecutionError, "binding is invalid"):
+            owner.process(handle, 456, binding)
+
+        kernel.IsProcessInJob.assert_not_called()
+        kernel.GetProcessTimes.assert_not_called()
+        kernel.QueryFullProcessImageNameW.assert_not_called()
+        kernel.WaitForSingleObject.assert_not_called()
 
     def test_windows_live_member_exit_during_image_query_has_explicit_provenance(self):
         owner = object.__new__(EXECUTION.WindowsOwner)
@@ -854,6 +1064,8 @@ class ExecutionTest(unittest.TestCase):
 
     def test_windows_bound_process_rejects_wrong_generation(self):
         owner = object.__new__(EXECUTION.WindowsOwner)
+        owner.handle = 900
+        owner._binding_token = object()
         handle = object()
 
         def get_process_times(_handle, creation, _exit, _kernel, _user):
@@ -868,6 +1080,8 @@ class ExecutionTest(unittest.TestCase):
         )
         binding = {
             "handle": handle,
+            "owner_token": owner._binding_token,
+            "job_handle": owner.handle,
             "identity": {
                 "pid": 456,
                 "creation_time": str((1 << 32) | 2),

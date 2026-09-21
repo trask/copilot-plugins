@@ -22,15 +22,15 @@ ORDINARY_AGENT_TASK_PLUGINS = {
     "copilot-review-loop": "copilot_review_loop.py",
 }
 ORDINARY_HELPER_SHA256 = (
-    "c775ba3ca92c28eba1444bfe09d63fb704a0fba009c76cda8e87aa36f342facd"
+    "a3eb90898b86fcc528f7a3a403aac560b4df1852a56cc98a99b6c2d9fdb8d86c"
 )
 CI_FIX_RELEASE_BOUNDARY_HELPER_SHA256 = (
-    "c775ba3ca92c28eba1444bfe09d63fb704a0fba009c76cda8e87aa36f342facd"
+    "a3eb90898b86fcc528f7a3a403aac560b4df1852a56cc98a99b6c2d9fdb8d86c"
 )
 RUNTIME_PLUGIN = "agent-tasks-runtime"
 RUNTIME_SKILL = ROOT / "plugins" / RUNTIME_PLUGIN / "skills" / RUNTIME_PLUGIN
 CONFLICT_HELPER_SHA256 = (
-    "86df6daa48adbece331ea56095016e6dab13033a00fd7706a80d768f90e8514a"
+    "e72be646c85143e593d1775581586c177bc99e59e1bd99593db8a4f3fe5af12c"
 )
 EXPECTED_PACKAGE_VERSIONS = {
     "agent-tasks-runtime": "1.0.21",

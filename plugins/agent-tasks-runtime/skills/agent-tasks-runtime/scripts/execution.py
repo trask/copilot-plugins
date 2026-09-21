@@ -98,6 +98,85 @@ def guard(path: Path):
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
+def _windows_process_running(kernel: Any, handle: Any) -> bool:
+    import ctypes
+
+    state = kernel.WaitForSingleObject(handle, 0)
+    if state == 0:
+        return False
+    if state == 258:
+        return True
+    if state == 0xFFFFFFFF:
+        raise ctypes.WinError(ctypes.get_last_error())
+    raise ExecutionError(f"unexpected Windows process wait state: {state}")
+
+
+def _windows_process_observation(
+    kernel: Any, handle: Any, pid: int,
+    expected: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    import ctypes
+    from ctypes import wintypes
+
+    times = [wintypes.FILETIME() for _ in range(4)]
+    if not kernel.GetProcessTimes(
+        handle, *(ctypes.byref(value) for value in times)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    creation_time = str(
+        (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+    )
+    if expected is not None and (
+        expected["pid"] != pid or expected["creation_time"] != creation_time
+    ):
+        raise ExecutionError("Windows process generation changed")
+    running = _windows_process_running(kernel, handle)
+    if not running:
+        return {
+            "pid": pid,
+            "creation_time": creation_time,
+            "image": expected["image"] if expected is not None else None,
+            "running": False,
+            "image_provenance": (
+                "cached_binding"
+                if expected is not None else
+                "unavailable_after_exit"
+            ),
+        }
+    image = ctypes.create_unicode_buffer(32768)
+    size = wintypes.DWORD(len(image))
+    if not kernel.QueryFullProcessImageNameW(
+        handle, 0, image, ctypes.byref(size)
+    ):
+        image_failure = ctypes.WinError(ctypes.get_last_error())
+        try:
+            running = _windows_process_running(kernel, handle)
+        except (OSError, ExecutionError) as state_failure:
+            raise ExecutionError(
+                f"{image_failure}; process state query failed: {state_failure}"
+            ) from image_failure
+        if running:
+            raise image_failure
+        return {
+            "pid": pid,
+            "creation_time": creation_time,
+            "image": None,
+            "running": False,
+            "image_provenance": "unavailable_after_exit",
+        }
+    running = _windows_process_running(kernel, handle)
+    observed = {
+        "pid": pid,
+        "creation_time": creation_time,
+        "image": os.path.normcase(image.value),
+        "running": running,
+        "image_provenance": "queried_live",
+    }
+    if expected is not None and not same_process(expected, observed):
+        raise ExecutionError("Windows process identity changed")
+    return observed
+
+
 def process_identity(pid: int) -> dict[str, Any] | None:
     if pid <= 0:
         return None
@@ -138,22 +217,10 @@ def process_identity(pid: int) -> dict[str, Any] | None:
             return None
         raise ctypes.WinError(error)
     try:
-        times = [wintypes.FILETIME() for _ in range(4)]
-        if not kernel.GetProcessTimes(handle, *(ctypes.byref(value) for value in times)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        image = ctypes.create_unicode_buffer(32768)
-        size = wintypes.DWORD(len(image))
-        if not kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(size)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        state = kernel.WaitForSingleObject(handle, 0)
-        if state not in (0, 258):
-            raise ctypes.WinError(ctypes.get_last_error())
-        return {
-            "pid": pid,
-            "creation_time": str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime),
-            "image": os.path.normcase(image.value),
-            "running": state == 258,
-        }
+        observed = _windows_process_observation(kernel, handle, pid)
+        if observed["image_provenance"] == "queried_live":
+            observed.pop("image_provenance")
+        return observed
     finally:
         kernel.CloseHandle(handle)
 
@@ -237,6 +304,7 @@ class WindowsOwner:
         self.handle = kernel.CreateJobObjectW(None, None)
         if not self.handle:
             raise ctypes.WinError(ctypes.get_last_error())
+        self._binding_token = object()
         try:
             limits = Extended()
             limits.basic.flags = 0x2000
@@ -259,6 +327,7 @@ class WindowsOwner:
                 import ctypes
                 raise ctypes.WinError(ctypes.get_last_error())
             self.handle = None
+            self._binding_token = None
 
     def active_count(self) -> int:
         import ctypes
@@ -320,18 +389,6 @@ class WindowsOwner:
             return None
         raise ctypes.WinError(error)
 
-    def _process_running(self, handle) -> bool:
-        import ctypes
-
-        state = self.kernel.WaitForSingleObject(handle, 0)
-        if state == 0:
-            return False
-        if state == 258:
-            return True
-        if state == 0xFFFFFFFF:
-            raise ctypes.WinError(ctypes.get_last_error())
-        raise ExecutionError(f"unexpected Windows process wait state: {state}")
-
     def process(
         self, handle, pid: int, binding: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -350,71 +407,21 @@ class WindowsOwner:
             job_provenance = "verified_handle"
         else:
             expected = binding.get("identity")
+            binding_token = getattr(self, "_binding_token", None)
             if (
-                binding.get("handle") is not handle
+                self.handle is None
+                or binding_token is None
+                or binding.get("owner_token") is not binding_token
+                or binding.get("job_handle") != self.handle
+                or binding.get("handle") is not handle
                 or not same_process(expected, expected)
             ):
                 raise ExecutionError("owned Windows process binding is invalid or changed")
             job_provenance = "cached_binding"
-        times = [wintypes.FILETIME() for _ in range(4)]
-        if not self.kernel.GetProcessTimes(
-            handle, *(ctypes.byref(value) for value in times)
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        creation_time = str(
-            (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        observed = _windows_process_observation(
+            self.kernel, handle, pid, expected
         )
-        if expected is not None and (
-            expected["pid"] != pid or expected["creation_time"] != creation_time
-        ):
-            raise ExecutionError("owned Windows process generation changed")
-        running = self._process_running(handle)
-        if not running:
-            return {
-                "pid": pid,
-                "creation_time": creation_time,
-                "image": expected["image"] if expected is not None else None,
-                "running": False,
-                "job_provenance": job_provenance,
-                "image_provenance": (
-                    "cached_binding"
-                    if expected is not None else
-                    "unavailable_after_exit"
-                ),
-            }
-        image = ctypes.create_unicode_buffer(32768)
-        size = wintypes.DWORD(len(image))
-        if not self.kernel.QueryFullProcessImageNameW(
-            handle, 0, image, ctypes.byref(size)
-        ):
-            image_failure = ctypes.WinError(ctypes.get_last_error())
-            try:
-                running = self._process_running(handle)
-            except (OSError, ExecutionError) as state_failure:
-                raise ExecutionError(
-                    f"{image_failure}; process state query failed: {state_failure}"
-                ) from image_failure
-            if running:
-                raise image_failure
-            return {
-                "pid": pid,
-                "creation_time": creation_time,
-                "image": None,
-                "running": False,
-                "job_provenance": job_provenance,
-                "image_provenance": "unavailable_after_exit",
-            }
-        running = self._process_running(handle)
-        observed = {
-            "pid": pid,
-            "creation_time": creation_time,
-            "image": os.path.normcase(image.value),
-            "running": running,
-            "job_provenance": job_provenance,
-            "image_provenance": "queried_live",
-        }
-        if expected is not None and not same_process(expected, observed):
-            raise ExecutionError("owned Windows process identity changed")
+        observed["job_provenance"] = job_provenance
         return observed
 
     def bind_process(self, handle, pid: int) -> dict[str, Any]:
@@ -425,6 +432,8 @@ class WindowsOwner:
             )
         return {
             "handle": handle,
+            "owner_token": self._binding_token,
+            "job_handle": self.handle,
             "identity": {
                 key: observed[key]
                 for key in ("pid", "creation_time", "image", "running")
