@@ -1440,7 +1440,6 @@ class RecommendationContractTest(unittest.TestCase):
         fixture = self.result()
         pr = self.preflight["pr"]
         envelope = RUNTIME.ResultEnvelope(
-            schema_version=fixture["schema"]["version"],
             mode=fixture["mode"],
             requested_model=fixture["requested_model"],
             repository=fixture["repository"]["name_with_owner"],
